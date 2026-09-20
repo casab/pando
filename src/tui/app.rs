@@ -23,7 +23,7 @@ use crate::cache;
 use crate::config::Config;
 use crate::log_tail::LogTail;
 use crate::paths::PandoPaths;
-use crate::state::{Phase, State, WorktreeRecord};
+use crate::state::{self, Aggregate, ProcessRecord, State, WorktreeRecord};
 use crate::worktree::{self, BranchEntry, EnrichUpdate, PrInfo, Worktree};
 
 /// How long a status message stays on the header before the counts return.
@@ -249,6 +249,13 @@ impl LogTails {
         self.open.remove(name);
     }
 
+    /// Forgets every tail of a worktree, whatever process it belonged to.
+    /// A start replaces the log files, so what was read of them is gone.
+    pub fn forget_worktree(&mut self, name: &str) {
+        let prefix = format!("{name}/");
+        self.open.retain(|key, _| !key.starts_with(&prefix));
+    }
+
     /// The tail for `name`, opening it if it is not already, and marking it
     /// as the most recently used.
     pub fn touch(&mut self, name: &str, path: std::path::PathBuf) -> &mut LogTail {
@@ -304,6 +311,10 @@ pub struct App {
     pub refreshing: bool,
     /// Open log tails, keyed by worktree, for the detail pane.
     pub log_tails: LogTails,
+    /// Which of the selected worktree's processes the tail is showing, by
+    /// index into its process list. Clamped on every read, because the
+    /// list changes under it as processes start and stop.
+    pub tail_index: usize,
     /// Whether the detail pane's tail has the arrow keys.
     pub tail_focus: bool,
     /// Lines scrolled back from the end of the tail.
@@ -347,6 +358,7 @@ impl App {
             state: State::new(),
             refreshing: false,
             log_tails: LogTails::default(),
+            tail_index: 0,
             tail_focus: false,
             tail_scroll: 0,
             state_warning: None,
@@ -554,6 +566,7 @@ impl App {
             KeyCode::Char('r') => self.restart_selected(),
             KeyCode::Char('o') => self.open_selected_url(),
             KeyCode::Char('l') => self.toggle_tail_focus(),
+            KeyCode::Tab => self.cycle_tail(),
             KeyCode::Char('R') => {
                 self.spawn_discovery();
                 self.set_status("refreshing…");
@@ -680,9 +693,60 @@ impl App {
         self.state.worktrees.get(name)
     }
 
-    /// The process this phase shows: the first one recorded.
-    pub fn phase_of(&self, name: &str) -> Option<&Phase> {
-        Some(&self.record_for(name)?.processes.values().next()?.phase)
+    /// The phase of a whole worktree: failed if any of its processes is,
+    /// then starting, then running. One row, one answer, however many
+    /// processes it runs.
+    pub fn phase_of(&self, name: &str) -> Option<Aggregate> {
+        state::aggregate_phase(self.record_for(name)?)
+    }
+
+    /// The selected worktree's processes, in config order, with the log
+    /// each one writes.
+    pub fn processes_of(&self, name: &str) -> Vec<(String, ProcessRecord)> {
+        self.record_for(name)
+            .map(|record| {
+                record
+                    .processes
+                    .iter()
+                    .map(|(process, p)| (process.clone(), p.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The process whose log the tail is showing, and the key its tail is
+    /// kept under. `None` when the selected worktree is running nothing.
+    pub fn tail_target(&self) -> Option<(String, String, std::path::PathBuf)> {
+        let name = self.selected_worktree().map(|w| w.name.clone())?;
+        let processes = self.processes_of(&name);
+        if processes.is_empty() {
+            return None;
+        }
+        let (process, record) = &processes[self.tail_index.min(processes.len() - 1)];
+        Some((
+            format!("{name}/{process}"),
+            process.clone(),
+            record.log_path.clone(),
+        ))
+    }
+
+    /// Moves the tail to the next process of the selected worktree.
+    fn cycle_tail(&mut self) {
+        let Some(name) = self.selected_worktree().map(|w| w.name.clone()) else {
+            self.set_error("nothing selected");
+            return;
+        };
+        let processes = self.processes_of(&name);
+        if processes.len() < 2 {
+            self.set_error(match processes.len() {
+                0 => format!("{name} is running nothing to tail"),
+                _ => format!("{name} runs one process: {}", processes[0].0),
+            });
+            return;
+        }
+        self.tail_index = (self.tail_index + 1) % processes.len();
+        self.tail_scroll = 0;
+        self.set_status(format!("log: {}", processes[self.tail_index].0));
     }
 
     /// The URL a worktree serves on, from the role `share` and this key
@@ -828,9 +892,8 @@ impl App {
 
     fn scroll_tail(&mut self, delta: isize) {
         let lines = self
-            .selected_worktree()
-            .map(|w| w.name.clone())
-            .and_then(|name| self.log_tails.get(&name).map(|t| t.lines().len()))
+            .tail_target()
+            .and_then(|(key, _, _)| self.log_tails.get(&key).map(|t| t.lines().len()))
             .unwrap_or(0);
         let max = lines.saturating_sub(1);
         // Negative is "up", which in a tail means further back.
@@ -841,17 +904,10 @@ impl App {
     /// Reads whatever the selected worktree's log has grown by. Cheap: an
     /// offset-based read of one file, nothing forked.
     fn poll_log_tail(&mut self) -> bool {
-        let Some(name) = self.selected_worktree().map(|w| w.name.clone()) else {
+        let Some((key, _, path)) = self.tail_target() else {
             return false;
         };
-        let Some(record) = self.state.worktrees.get(&name) else {
-            return false;
-        };
-        let Some(process) = record.processes.values().next() else {
-            return false;
-        };
-        let path = process.log_path.clone();
-        self.log_tails.touch(&name, path).poll().unwrap_or(false)
+        self.log_tails.touch(&key, path).poll().unwrap_or(false)
     }
 
     // ---- background work -------------------------------------------------
@@ -964,12 +1020,15 @@ impl App {
 
     fn move_cursor(&mut self, delta: isize) {
         // The tail belongs to a row, so moving off it starts at the end of
-        // the next one's log rather than wherever the last one was scrolled.
+        // the next one's log rather than wherever the last one was
+        // scrolled — and at that worktree's first process, not at whatever
+        // index the last one happened to be showing.
         if self.tail_focus {
             self.scroll_tail(delta);
             return;
         }
         self.tail_scroll = 0;
+        self.tail_index = 0;
         if self.filtered_indices.is_empty() {
             return;
         }
@@ -1286,7 +1345,7 @@ impl App {
                         }
                         // The log is new, so whatever was tailed for this
                         // worktree is about the run that just ended.
-                        self.log_tails.forget(&name);
+                        self.log_tails.forget_worktree(&name);
                         self.tail_scroll = 0;
                         self.spawn_refresh();
                     }
@@ -1410,6 +1469,7 @@ impl App {
             state: State::new(),
             refreshing: false,
             log_tails: LogTails::default(),
+            tail_index: 0,
             tail_focus: false,
             tail_scroll: 0,
             state_warning: None,
@@ -1504,6 +1564,7 @@ fn base64(input: &[u8]) -> String {
 pub mod tests {
     use super::*;
     use crate::project::ProjectRef;
+    use crate::state::Phase;
     use crate::worktree::BranchSource;
     use std::path::PathBuf;
 
@@ -1566,6 +1627,29 @@ pub mod tests {
             },
         );
         app.state.worktrees.insert(name.to_string(), record);
+    }
+
+    /// Gives a worktree a second process, as a workspace start would have.
+    pub fn with_second_process(app: &mut App, name: &str, process: &str, phase: Phase) {
+        let record = app
+            .state
+            .worktrees
+            .get_mut(name)
+            .expect("the worktree has a record");
+        let port = 17_343 + record.processes.len() as u16;
+        record.ports.insert(process.to_string(), port);
+        record.processes.insert(
+            process.to_string(),
+            ProcessRecord {
+                pid: 4343,
+                pgid: 4343,
+                started_at: Utc::now(),
+                log_path: PathBuf::from(format!("/does/not/exist/{process}.log")),
+                ready_port: Some(port),
+                ready_timeout_s: None,
+                phase,
+            },
+        );
     }
 
     pub fn running_phase() -> Phase {
@@ -2249,6 +2333,56 @@ pub mod tests {
         assert!(rx.try_recv().is_err());
         assert!(app.modal.is_some());
         assert!(app.active_status().unwrap().0.contains("type a command"));
+    }
+
+    // ---- several processes -----------------------------------------------
+
+    #[test]
+    fn tab_switches_the_tail_between_processes() {
+        let mut app = test_app(&["feat+one"]);
+        with_process(&mut app, "feat+one", running_phase());
+        with_second_process(&mut app, "feat+one", "api", running_phase());
+
+        let (_, first, _) = app.tail_target().expect("a process to tail");
+        assert_eq!(first, "api", "config order, which is the row order");
+
+        press(&mut app, KeyCode::Tab);
+        let (key_of, second, path) = app.tail_target().expect("a process to tail");
+        assert_eq!(second, "dev");
+        assert_eq!(
+            key_of, "feat+one/dev",
+            "one tail per process, not per worktree"
+        );
+        assert!(path.ends_with("dev.log"));
+
+        // And round it goes.
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.tail_target().unwrap().1, "api");
+    }
+
+    #[test]
+    fn tab_on_a_worktree_with_one_process_says_so_rather_than_cycling() {
+        let mut app = test_app(&["feat+one"]);
+        with_process(&mut app, "feat+one", running_phase());
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.tail_target().unwrap().1, "dev");
+        let (message, is_error) = app.active_status().expect("something was said");
+        assert!(message.contains("one process"), "{message}");
+        assert!(is_error);
+    }
+
+    #[test]
+    fn moving_to_another_worktree_starts_at_its_first_process() {
+        let mut app = test_app(&["feat+one", "feat+two"]);
+        with_process(&mut app, "feat+one", running_phase());
+        with_second_process(&mut app, "feat+one", "api", running_phase());
+        with_process(&mut app, "feat+two", running_phase());
+
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.tail_target().unwrap().1, "dev");
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.tail_target().unwrap().0, "feat+two/dev");
+        assert_eq!(app.tail_index, 0, "the index belongs to the row");
     }
 
     // ---- the log tail ----------------------------------------------------

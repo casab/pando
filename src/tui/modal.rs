@@ -332,7 +332,7 @@ fn render_remove(
 
 /// Every key the list view answers to. Scrollable, because a tmux split is
 /// often shorter than the keymap.
-const HELP: [(&str, &str); 16] = [
+const HELP: [(&str, &str); 17] = [
     ("j / ↓", "move down"),
     ("k / ↑", "move up"),
     ("g / G", "first / last"),
@@ -342,6 +342,7 @@ const HELP: [(&str, &str); 16] = [
     ("r", "restart it"),
     ("o", "open its URL"),
     ("l", "scroll the log tail"),
+    ("tab", "switch the log to the next process"),
     ("n", "new worktree"),
     ("d", "remove the selected worktree"),
     ("y", "copy the worktree path"),

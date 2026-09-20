@@ -12,7 +12,7 @@ use ratatui::widgets::{Block, BorderType, List, ListItem, Paragraph};
 
 use super::app::{App, Mode};
 use crate::log_tail::LogLevel;
-use crate::state::Phase;
+use crate::state::{Aggregate, Phase, ProcessRecord};
 use crate::theme::{
     blue, border, cyan, green, highlight_bg, magenta, orange, red, surface, text, text_dim,
     text_muted, yellow,
@@ -140,10 +140,14 @@ pub fn render(f: &mut Frame, app: &mut App) {
 // `KEEP_ALWAYS` rows are the pane's reason to exist and are never shed.
 const KEEP_ALWAYS: u8 = 0;
 const KEEP_URL: u8 = 1;
-const KEEP_PR: u8 = 2;
-const KEEP_HEAD: u8 = 3;
-const KEEP_AGE: u8 = 4;
-const KEEP_PATH: u8 = 5;
+/// One row per process, for a worktree that runs more than one. Worth more
+/// than the git metadata below: which half of a pair is down is what the
+/// pane is being looked at for.
+const KEEP_PROCESSES: u8 = 2;
+const KEEP_PR: u8 = 3;
+const KEEP_HEAD: u8 = 4;
+const KEEP_AGE: u8 = 5;
+const KEEP_PATH: u8 = 6;
 
 /// A blank line plus the log's header, and the fewest log lines worth the
 /// space they take.
@@ -233,6 +237,11 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
         ),
     ));
     rows.push((KEEP_ALWAYS, status_row(app, &name, width)));
+    // Below the worktree's own status, and shed before the URL: with one
+    // process there are none of these at all.
+    for line in process_rows(app, &name, width) {
+        rows.push((KEEP_PROCESSES, line));
+    }
     if let Some(url) = app.url_of(&name) {
         rows.push((
             KEEP_URL,
@@ -326,43 +335,35 @@ fn status_row<'a>(app: &App, name: &str, width: usize) -> Line<'a> {
             )],
         );
     };
-    let record = app.record_for(name);
-    let pid = record
-        .and_then(|r| r.processes.values().next())
-        .map(|p| p.pid);
+    let age = uptime(chrono::Utc::now().signed_duration_since(phase.since()));
+    // A worktree running one process has no rows below to carry its pid,
+    // and with several it would be the wrong one to show.
+    let processes = app.processes_of(name);
+    let pid = match processes.as_slice() {
+        [(_, only)] => format!("pid {}  ", only.pid),
+        _ => String::new(),
+    };
     match phase {
-        Phase::Running { since } => detail_row(
+        Aggregate::Running { .. } => detail_row(
             "status",
             vec![
                 Span::styled(
                     "● running",
                     Style::new().fg(green()).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    format!(
-                        "  pid {}  up {}",
-                        pid.unwrap_or(0),
-                        uptime(chrono::Utc::now().signed_duration_since(*since))
-                    ),
-                    Style::new().fg(text_muted()),
-                ),
+                Span::styled(format!("  {pid}up {age}"), Style::new().fg(text_muted())),
             ],
         ),
-        Phase::Starting { since } => detail_row(
+        Aggregate::Starting { .. } => detail_row(
             "status",
             vec![
                 Span::styled("◌ starting", Style::new().fg(yellow())),
-                Span::styled(
-                    format!(
-                        "  pid {}  for {}",
-                        pid.unwrap_or(0),
-                        uptime(chrono::Utc::now().signed_duration_since(*since))
-                    ),
-                    Style::new().fg(text_muted()),
-                ),
+                Span::styled(format!("  {pid}for {age}"), Style::new().fg(text_muted())),
             ],
         ),
-        Phase::Failed { reason, .. } => detail_row(
+        // Named: `failed` on a worktree running three processes is a
+        // question until it says which one.
+        Aggregate::Failed { .. } => detail_row(
             "status",
             vec![
                 Span::styled(
@@ -370,11 +371,84 @@ fn status_row<'a>(app: &App, name: &str, width: usize) -> Line<'a> {
                     Style::new().fg(red()).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    format!("  {}", truncate(reason, width.saturating_sub(19))),
+                    format!(
+                        "  {}",
+                        truncate(
+                            &phase.reason().unwrap_or_default(),
+                            width.saturating_sub(19)
+                        )
+                    ),
                     Style::new().fg(text_dim()),
                 ),
             ],
         ),
+    }
+}
+
+/// One row per process, under the worktree's own status: what each of them
+/// is doing, and which one the tail below is showing.
+fn process_rows<'a>(app: &App, name: &str, width: usize) -> Vec<Line<'a>> {
+    let processes = app.processes_of(name);
+    if processes.len() < 2 {
+        // One process has nothing to disambiguate: the status row above is
+        // already its status, and a pane in a tmux split has no rows to
+        // spare for saying the same thing twice.
+        return Vec::new();
+    }
+    let shown = app.tail_target().map(|(_, process, _)| process);
+    let label_width = processes
+        .iter()
+        .map(|(process, _)| process.chars().count())
+        .max()
+        .unwrap_or(0);
+    processes
+        .iter()
+        .map(|(process, record)| {
+            let (glyph, color) = run_marker(Some(&phase_as_aggregate(process, record)));
+            let marker = if shown.as_deref() == Some(process.as_str()) {
+                "▸"
+            } else {
+                " "
+            };
+            let detail = match &record.phase {
+                Phase::Running { since } => format!(
+                    "running   pid {}  up {}",
+                    record.pid,
+                    uptime(chrono::Utc::now().signed_duration_since(*since))
+                ),
+                Phase::Starting { since } => format!(
+                    "starting  for {}",
+                    uptime(chrono::Utc::now().signed_duration_since(*since))
+                ),
+                Phase::Failed { reason, .. } => format!("failed    {reason}"),
+            };
+            Line::from(vec![
+                Span::styled(format!(" {marker} "), Style::new().fg(text_muted())),
+                Span::styled(glyph, Style::new().fg(color)),
+                Span::styled(
+                    format!(" {process:<label_width$}  "),
+                    Style::new().fg(text_dim()),
+                ),
+                Span::styled(
+                    truncate(&detail, width.saturating_sub(label_width + 7)),
+                    Style::new().fg(text_muted()),
+                ),
+            ])
+        })
+        .collect()
+}
+
+/// One process's phase as the aggregate of itself, so the same colours and
+/// glyphs are used for a row and for the worktree above it.
+fn phase_as_aggregate(process: &str, record: &ProcessRecord) -> Aggregate {
+    match &record.phase {
+        Phase::Running { since } => Aggregate::Running { since: *since },
+        Phase::Starting { since } => Aggregate::Starting { since: *since },
+        Phase::Failed { at, reason } => Aggregate::Failed {
+            process: process.to_string(),
+            at: *at,
+            reason: reason.clone(),
+        },
     }
 }
 
@@ -411,28 +485,42 @@ fn ports_row<'a>(app: &App, name: &str, width: usize) -> Option<Line<'a>> {
 }
 
 fn tail_header<'a>(app: &App, name: &str, width: usize) -> Line<'a> {
-    let count = app
-        .log_tails
-        .get(name)
+    let target = app.tail_target();
+    let count = target
+        .as_ref()
+        .and_then(|(key, _, _)| app.log_tails.get(key))
         .map(|t| t.lines().len())
         .unwrap_or(0);
+    let processes = app.processes_of(name).len();
+    let label = match &target {
+        Some((_, process, _)) if processes > 1 => format!(" log {process}"),
+        _ => " log".to_string(),
+    };
     let hint = if app.tail_focus {
         "  j/k scroll, l to leave"
+    } else if processes > 1 {
+        "  l to scroll, tab to switch"
     } else {
         "  l to scroll"
     };
     Line::from(vec![
-        Span::styled(" log", Style::new().fg(text_muted())),
+        Span::styled(label.clone(), Style::new().fg(text_muted())),
         Span::styled(
-            truncate(&format!("  {count} lines{hint}"), width.saturating_sub(4)),
+            truncate(
+                &format!("  {count} lines{hint}"),
+                width.saturating_sub(label.chars().count()),
+            ),
             Style::new().fg(text_muted()),
         ),
     ])
 }
 
 /// The last lines of the dev log, coloured by level.
-fn tail_lines<'a>(app: &App, name: &str, rows: usize, width: usize) -> Vec<Line<'a>> {
-    let Some(tail) = app.log_tails.get(name) else {
+fn tail_lines<'a>(app: &App, _name: &str, rows: usize, width: usize) -> Vec<Line<'a>> {
+    let Some(tail) = app
+        .tail_target()
+        .and_then(|(key, _, _)| app.log_tails.get(&key))
+    else {
         return vec![Line::styled(
             truncate(" (no log yet)", width),
             Style::new().fg(text_muted()),
@@ -628,7 +716,7 @@ fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
         .map(|&idx| {
             let wt = &app.worktrees[idx];
             let ours = app.created_by_pando.get(&wt.name).copied().unwrap_or(false);
-            let (run_glyph, run_color) = run_marker(app.phase_of(&wt.name));
+            let (run_glyph, run_color) = run_marker(app.phase_of(&wt.name).as_ref());
             let mut spans = vec![
                 Span::styled(
                     if ours { "● " } else { "○ " },
@@ -674,11 +762,11 @@ fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 /// What the dev process is doing, in one cell.
-fn run_marker(phase: Option<&Phase>) -> (&'static str, ratatui::style::Color) {
+fn run_marker(phase: Option<&Aggregate>) -> (&'static str, ratatui::style::Color) {
     match phase {
-        Some(Phase::Running { .. }) => ("● ", green()),
-        Some(Phase::Starting { .. }) => ("◌ ", yellow()),
-        Some(Phase::Failed { .. }) => ("✗ ", red()),
+        Some(Aggregate::Running { .. }) => ("● ", green()),
+        Some(Aggregate::Starting { .. }) => ("◌ ", yellow()),
+        Some(Aggregate::Failed { .. }) => ("✗ ", red()),
         None => ("  ", text_muted()),
     }
 }
@@ -753,11 +841,12 @@ fn pr_color(pr: &PrInfo) -> ratatui::style::Color {
 }
 
 /// Key hints, most valuable first. The essential ones are never dropped.
-const HINTS: [(&str, &str, bool); 10] = [
+const HINTS: [(&str, &str, bool); 11] = [
     ("j/k", "move", true),
     ("s", "start", true),
     ("x", "stop", true),
     ("r", "restart", false),
+    ("tab", "log", false),
     ("o", "open", false),
     ("n", "new", false),
     ("d", "remove", false),
@@ -772,6 +861,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         _ if app.tail_focus => hint_line(
             &[
                 ("j/k", "scroll", true),
+                ("tab", "next process", false),
                 ("l", "leave the log", true),
                 ("q", "quit", true),
             ],
@@ -920,7 +1010,7 @@ pub fn truncate_line(line: Line<'static>, width: usize) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::app::tests::{running_phase, test_app, with_process, wt};
+    use crate::tui::app::tests::{running_phase, test_app, with_process, with_second_process, wt};
     use crate::tui::app::{BranchLoadState, Modal, RemoveBlocker};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -969,6 +1059,17 @@ mod tests {
                 reason: "process exited — something else is listening on port 17342; stop it, \
                          or `pando stop` the worktree that owns it"
                     .into(),
+            },
+        );
+        // And a worktree running two processes, which adds a row per
+        // process to a pane that may have room for none of them.
+        with_second_process(
+            &mut app,
+            "feat+one",
+            "api",
+            crate::state::Phase::Failed {
+                at: chrono::Utc::now(),
+                reason: "process exited".into(),
             },
         );
         app.tail_focus = true;
@@ -1345,12 +1446,94 @@ mod tests {
 
         let mut app = test_app(&["feat+one"]);
         with_process(&mut app, "feat+one", running_phase());
-        app.log_tails.touch("feat+one", log).poll().unwrap();
+        // Keyed by worktree *and* process: a worktree has one log per
+        // process, and the tail shows one of them at a time.
+        let (key, process, _) = app.tail_target().expect("a process to tail");
+        assert_eq!(process, "dev");
+        app.log_tails.touch(&key, log).poll().unwrap();
 
         let rendered = text_of(&draw(&mut app, 120, 24));
         assert!(rendered.contains("ready in 412ms"), "{rendered}");
         assert!(rendered.contains("Error: it broke"), "{rendered}");
         assert!(rendered.contains("3 lines"), "{rendered}");
+    }
+
+    #[test]
+    fn the_detail_pane_lists_every_process_with_its_phase() {
+        let mut app = test_app(&["feat+one"]);
+        with_process(&mut app, "feat+one", running_phase());
+        with_second_process(
+            &mut app,
+            "feat+one",
+            "api",
+            crate::state::Phase::Failed {
+                at: chrono::Utc::now(),
+                reason: "process exited".into(),
+            },
+        );
+        let rendered = text_of(&draw(&mut app, 120, 24));
+        assert!(
+            rendered.contains("✗ failed") && rendered.contains("api: process exited"),
+            "the worktree is failed, and says which process: {rendered}"
+        );
+        assert!(
+            rendered.contains("api") && rendered.contains("dev"),
+            "both processes have a row: {rendered}"
+        );
+        assert!(
+            rendered.contains("pid 4242"),
+            "each row carries its own pid: {rendered}"
+        );
+    }
+
+    // One process has nothing to disambiguate, and a tmux split has no rows
+    // to spare for saying the same thing twice.
+    #[test]
+    fn one_process_gets_no_row_of_its_own() {
+        let mut app = test_app(&["feat+one"]);
+        with_process(&mut app, "feat+one", running_phase());
+        let rendered = text_of(&draw(&mut app, 120, 24));
+        assert_eq!(
+            rendered.matches("running").count(),
+            1,
+            "the status row is the process's status: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_list_row_shows_the_aggregate_not_the_first_process() {
+        let mut app = test_app(&["feat+one"]);
+        with_process(&mut app, "feat+one", running_phase());
+        with_second_process(
+            &mut app,
+            "feat+one",
+            "api",
+            crate::state::Phase::Failed {
+                at: chrono::Utc::now(),
+                reason: "process exited".into(),
+            },
+        );
+        let rendered = text_of(&draw(&mut app, 120, 24));
+        assert!(
+            rendered.contains("● ✗ feat+one"),
+            "a worktree with a dead process is not running: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_tail_header_names_the_process_it_is_showing() {
+        let mut app = test_app(&["feat+one"]);
+        with_process(&mut app, "feat+one", running_phase());
+        with_second_process(&mut app, "feat+one", "api", running_phase());
+        let rendered = text_of(&draw(&mut app, 120, 24));
+        assert!(rendered.contains("log api"), "{rendered}");
+        assert!(
+            rendered.contains("tab to switch"),
+            "and says how to see the other one: {rendered}"
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let rendered = text_of(&draw(&mut app, 120, 24));
+        assert!(rendered.contains("log dev"), "{rendered}");
     }
 
     // Level colours are what make an error findable in a wall of output.
