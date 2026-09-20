@@ -1,0 +1,10 @@
+# Design docs and plan files are local-only. Never commit or push them.
+docs/
+plans/
+*.plan.md
+
+# Local-only notes (origin project path); never published
+CLAUDE.local.md
+
+# macOS
+.DS_Store
