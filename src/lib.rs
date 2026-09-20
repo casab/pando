@@ -10,6 +10,7 @@
 //!       → cli · tui
 //! ```
 
+pub mod config;
 pub mod paths;
 pub mod project;
 #[cfg(test)]
