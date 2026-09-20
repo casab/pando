@@ -513,3 +513,66 @@ fn port_env(var: &str) -> PortsSpec {
         "web".to_string(),
     )]))
 }
+
+/// Whether `python3` is on PATH. Tests that need a process which really
+/// binds a port skip with a message rather than failing on a machine
+/// without it.
+pub fn python3_available() -> bool {
+    Command::new("python3")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// A dev "server" for tests and demos: it binds its port, says so, and
+/// stays up. Real enough to drive readiness, observed ports, and the log
+/// tail, and available on every machine that has python3.
+///
+/// Deliberately free of `{` and `}` except the placeholder itself: braces
+/// are pando's template syntax, and a command full of them would need
+/// escaping everywhere it appears.
+pub fn listener_on_port_env() -> String {
+    "python3 -u -c \"import os,socket,time;p=int(os.environ['PORT']);s=socket.socket();\
+     s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind(('127.0.0.1',p));\
+     s.listen(5);print('listening on',p);time.sleep(3600)\""
+        .to_string()
+}
+
+/// The same listener with its port coming from a template rather than the
+/// environment — the positional shape Django and Rails use.
+pub fn listener_on_port_template() -> String {
+    "python3 -u -c \"import socket,time;s=socket.socket();\
+     s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind(('127.0.0.1',{port:web}));\
+     s.listen(5);print('listening on {port:web}');time.sleep(3600)\""
+        .to_string()
+}
+
+/// The pando-home config the `--listener` fixture writes: a dev process
+/// that needs no framework installed and no real server.
+///
+/// The command is a TOML literal string, so the quotes inside it survive
+/// exactly as written.
+pub fn listener_config() -> String {
+    let mut out = String::new();
+    out.push_str("# written by scripts/fixture-repo.sh --listener\n");
+    out.push_str("[project]\nprovision = [\".env\"]\n");
+    // A no-op stand-in for a real install: the demo needs a hook that runs,
+    // logs, and records a fingerprint, not a package manager.
+    out.push_str("install = \"true\"\n\n[dev]\ncmd = '''");
+    out.push_str(&listener_on_port_env());
+    out.push_str("'''\nports = { PORT = \"web\" }\n");
+    out
+}
+
+/// Writes `listener_config` into an injected pando home for `root`.
+pub fn write_listener_config(home: &Path, root: &Path) -> PathBuf {
+    let project = ProjectRef::from_root(root).unwrap();
+    let dir = home.join("projects").join(&project.id);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("pando.toml");
+    std::fs::write(&path, listener_config()).unwrap();
+    path
+}

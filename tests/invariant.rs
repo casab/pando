@@ -110,7 +110,18 @@ impl Harness {
     }
 }
 
+/// Nothing a test started outlives it, even when an assertion panics.
+impl Drop for Harness {
+    fn drop(&mut self) {
+        let _ = actions::stop_all(&self.paths);
+    }
+}
+
 fn harness() -> Harness {
+    harness_with("[project]\nprovision = [\".env\", \".env.local\"]\n")
+}
+
+fn harness_with(config_toml: &str) -> Harness {
     let dir = TempDir::new().unwrap();
     // Canonical throughout: on macOS the temp dir is /var/... but git (and
     // every path pando canonicalises) says /private/var/..., and the
@@ -123,14 +134,9 @@ fn harness() -> Harness {
     // Provisioning is the only thing that writes inside a worktree at all,
     // so the invariant is tested with it turned on.
     paths.ensure_home().unwrap();
-    std::fs::write(
-        paths.config_file(),
-        "[project]\nprovision = [\".env\", \".env.local\"]\n",
-    )
-    .unwrap();
+    std::fs::write(paths.config_file(), config_toml).unwrap();
     let loaded = config::load(&paths).unwrap();
     assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
-    assert_eq!(loaded.config.project.provision.len(), 2);
 
     let baseline = tree(&root);
     assert!(
@@ -416,4 +422,150 @@ fn an_uncommitted_gitignore_edit_does_not_authorise_a_write_into_a_worktree() {
         !branch_exists(&h.root, "feat/u"),
         "a branch pando created in this call must be deleted by the unwind"
     );
+}
+
+/// The whole Phase 2 lifecycle, with the tree snapshot checked after every
+/// step.
+///
+/// The dev process is a real one that really binds a port, so readiness,
+/// observed ports, and the log tail are all exercised — and every one of
+/// them is a chance to write a file where pando must not.
+#[test]
+fn starting_and_stopping_never_writes_into_the_repository() {
+    if !common::python3_available() {
+        eprintln!("skipping: python3 is not installed");
+        return;
+    }
+    let mut toml = String::new();
+    toml.push_str("[project]\nprovision = [\".env\", \".env.local\"]\n");
+    // The simplest install step that can succeed. It still writes a log,
+    // a fingerprint, and a hook record — all of which must land in the home.
+    toml.push_str("install = \"true\"\n\n[dev]\ncmd = '''");
+    toml.push_str(&common::listener_on_port_template());
+    toml.push_str("'''\nports = [\"web\"]\n");
+
+    let h = harness_with(&toml);
+    assert_eq!(h.config.project.install.as_deref(), Some("true"));
+    h.assert_untouched("setup", None);
+
+    let name = actions::new(&h.paths, &h.config, "feat/one", None, &|_| {}).unwrap();
+    let worktree = h.config.worktrees_dir(&h.paths).join(&name);
+    h.assert_untouched("new with an install step", Some(&worktree));
+    assert!(
+        h.paths.log_file(&name, "install").exists(),
+        "the install hook logs under pando's home"
+    );
+
+    let outcome = actions::start(&h.paths, &h.config, &name, &|_| {}).unwrap();
+    let port = outcome.process().ports["web"];
+    h.assert_untouched("start", Some(&worktree));
+
+    // Wait for it to really be listening, which is when observed ports and
+    // the Running phase appear — the states with the most to write.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut running = false;
+    while std::time::Instant::now() < deadline {
+        let state = actions::refresh(&h.paths).state;
+        if matches!(
+            state.worktrees[&name].processes["dev"].phase,
+            state::Phase::Running { .. }
+        ) && state.worktrees[&name].observed_ports.contains(&port)
+        {
+            running = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        running,
+        "the listener never came up on {port}: {:?}",
+        std::fs::read_to_string(h.paths.log_file(&name, "dev"))
+    );
+    h.assert_untouched("refresh while running", Some(&worktree));
+
+    // The read paths a human and a machine use.
+    let mut out = Vec::new();
+    pando::cli::status_json(&h.paths, None, &mut out).unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(status["worktrees"][0]["ports"]["web"], port);
+    h.assert_untouched("status --json", Some(&worktree));
+
+    let mut out = Vec::new();
+    pando::cli::logs(&h.paths, &name, "dev", 5, false, false, &mut out).unwrap();
+    assert!(
+        String::from_utf8_lossy(&out).contains("listening on"),
+        "the log has the process's own output"
+    );
+    h.assert_untouched("logs --tail 5", Some(&worktree));
+
+    let mut out = Vec::new();
+    pando::cli::ls_text_at(&h.paths, &mut out, 200).unwrap();
+    h.assert_untouched("ls", Some(&worktree));
+
+    assert_eq!(
+        actions::stop(&h.paths, &name).unwrap(),
+        actions::StopOutcome::Stopped
+    );
+    h.assert_untouched("stop", Some(&worktree));
+
+    let restarted = actions::restart(&h.paths, &h.config, &name, &|_| {}).unwrap();
+    assert_eq!(
+        restarted.process().ports["web"],
+        port,
+        "a restart keeps the port, so the URL keeps working"
+    );
+    h.assert_untouched("restart", Some(&worktree));
+
+    actions::stop(&h.paths, &name).unwrap();
+    h.assert_untouched("stop again", Some(&worktree));
+
+    actions::rm(&h.paths, &name, false, false).unwrap();
+    h.assert_untouched("rm", None);
+    assert!(!worktree.exists());
+    assert!(
+        !h.paths.logs_dir(&name).exists(),
+        "rm wipes the logs it wrote"
+    );
+}
+
+/// Everything the lifecycle writes is under the home: nothing is scattered
+/// next to the repository, and nothing is left in the worktree.
+#[test]
+fn every_file_the_lifecycle_writes_is_under_pandos_home() {
+    let h = harness_with("[project]\ninstall = \"true\"\n\n[dev]\ncmd = \"sleep 30\"\n");
+    let name = actions::new(&h.paths, &h.config, "feat/one", None, &|_| {}).unwrap();
+    let outcome = actions::start(&h.paths, &h.config, &name, &|_| {}).unwrap();
+    actions::refresh(&h.paths);
+
+    for path in [
+        h.paths.config_file(),
+        h.paths.state_file(),
+        h.paths.log_file(&name, "dev"),
+        h.paths.log_file(&name, "install"),
+    ] {
+        assert!(path.exists(), "{} should have been written", path.display());
+        assert!(
+            path.starts_with(&h.home),
+            "{} escaped pando's home",
+            path.display()
+        );
+    }
+    let store = state::load(&h.paths.state_file()).unwrap();
+    let record = &store.worktrees[&name];
+    assert!(record.hooks.contains_key("install"));
+    assert_eq!(record.processes["dev"].pid, outcome.process().record.pid);
+
+    actions::stop(&h.paths, &name).unwrap();
+    h.assert_untouched("the whole lifecycle", None);
+}
+
+// A failed install keeps the worktree — and still writes nothing into it.
+#[test]
+fn a_failed_install_leaves_the_repository_and_the_worktree_alone() {
+    let h = harness_with("[project]\ninstall = \"echo nope >&2 && exit 1\"\n");
+    let err = actions::new(&h.paths, &h.config, "feat/one", None, &|_| {}).unwrap_err();
+    assert!(format!("{err:#}").contains("install"), "{err:#}");
+    let worktree = h.config.worktrees_dir(&h.paths).join("feat+one");
+    assert!(worktree.is_dir(), "the worktree survives a failed install");
+    h.assert_untouched("a failed install", Some(&worktree));
 }

@@ -20,7 +20,9 @@ fn main() {
         }
         return;
     }
-    let with_origin = args.any(|a| a == "--with-origin");
+    let rest: Vec<String> = args.collect();
+    let with_origin = rest.iter().any(|a| a == "--with-origin");
+    let with_listener = rest.iter().any(|a| a == "--listener");
 
     let Some(kind) = Kind::parse(&requested) else {
         eprintln!("unknown fixture {requested:?}. Known kinds:");
@@ -46,6 +48,12 @@ fn main() {
 
     if let Some(remote) = &fixture.remote {
         eprintln!("origin: {}", remote.display());
+    }
+    // A dev process that needs no real framework installed, so the manual
+    // demo can start, watch, and stop something that really binds a port.
+    if with_listener {
+        let config = common::write_listener_config(&parent.join("pando-home"), &fixture.root);
+        eprintln!("listener config: {}", config.display());
     }
     eprintln!(
         "built the {} fixture. Try:\n  cd {}\n  PANDO_HOME={} pando ls",

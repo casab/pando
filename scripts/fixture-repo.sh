@@ -5,7 +5,12 @@
 #   scripts/fixture-repo.sh                 # the default "plain" fixture
 #   scripts/fixture-repo.sh next-pnpm-compose
 #   scripts/fixture-repo.sh plain --with-origin
+#   scripts/fixture-repo.sh next-pnpm-compose --listener
 #   scripts/fixture-repo.sh --list
+#
+# --listener also writes a pando-home config whose dev process is a python
+# listener, so `pando start` has something real to start without installing
+# the fixture's framework.
 #
 # Mutating pando commands are only ever run against one of these, never
 # against a real repository. The recipe lives in tests/common/mod.rs; this
