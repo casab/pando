@@ -136,6 +136,17 @@ fn porcelain_text(root: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Every path `git worktree list` reports, the main checkout included,
+/// resolved the way paths are compared elsewhere. A state record whose path
+/// is not in here belongs to a worktree git has forgotten; a prunable entry,
+/// whose directory is gone, is still listed and so still counts.
+pub fn porcelain_paths(root: &Path) -> Result<Vec<PathBuf>> {
+    Ok(parse_porcelain(&porcelain_text(root)?)
+        .iter()
+        .map(|e| crate::paths::resolve_for_compare(&e.path))
+        .collect())
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PorcelainEntry {
     pub path: PathBuf,

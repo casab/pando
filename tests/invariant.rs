@@ -199,7 +199,7 @@ fn every_command_leaves_the_repository_untouched() {
     assert_eq!(printed, worktree.canonicalize().unwrap());
     h.assert_untouched("path", Some(&worktree));
 
-    actions::created_by_pando(&h.paths);
+    actions::created_by_pando(&h.paths, &actions::ls(&h.paths).unwrap());
     h.assert_untouched("created_by_pando", Some(&worktree));
 
     actions::rm(&h.paths, &name, false, false).unwrap();

@@ -160,7 +160,9 @@ pub fn load(path: &Path) -> Result<State> {
         .with_context(|| format!("parse state file {}", path.display()))?;
     if state.version != STATE_VERSION {
         anyhow::bail!(
-            "state file {} is version {}, this pando speaks version {STATE_VERSION}",
+            "state file {} is version {}, this pando speaks version {STATE_VERSION} — upgrade \
+             pando, or move that file aside to start over (worktrees pando created will then \
+             read as adopted)",
             path.display(),
             state.version
         );

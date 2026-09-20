@@ -49,6 +49,10 @@ pub struct Snapshot {
     pub main: Worktree,
     pub worktrees: Vec<Worktree>,
     pub created_by_pando: BTreeMap<String, bool>,
+    /// Why the ownership map may be wrong — the same one line `ls` prints
+    /// and `rm` refuses with, so the TUI never shows "adopted" about a
+    /// state file it could not read without saying so.
+    pub warning: Option<String>,
     pub default_base: Option<String>,
 }
 
@@ -196,6 +200,9 @@ pub struct App {
     pub default_base: Option<String>,
     pub worktrees: Vec<Worktree>,
     pub created_by_pando: BTreeMap<String, bool>,
+    /// The last ownership warning shown, so a standing one is reported when
+    /// it appears or changes rather than on every refresh.
+    pub state_warning: Option<String>,
     pub prs: HashMap<String, PrInfo>,
     pub list_state: ListState,
     pub filter: String,
@@ -226,6 +233,7 @@ impl App {
             default_base: None,
             worktrees: Vec::new(),
             created_by_pando: BTreeMap::new(),
+            state_warning: None,
             prs: HashMap::new(),
             list_state: ListState::default(),
             filter: String::new(),
@@ -612,6 +620,12 @@ impl App {
         self.main = Some(snapshot.main);
         self.default_base = snapshot.default_base;
         self.created_by_pando = snapshot.created_by_pando;
+        if snapshot.warning != self.state_warning {
+            if let Some(message) = snapshot.warning.clone() {
+                self.set_error(message);
+            }
+            self.state_warning = snapshot.warning;
+        }
         self.refilter();
         fresh
     }
@@ -921,6 +935,7 @@ impl App {
             default_base: Some("main".into()),
             worktrees,
             created_by_pando: BTreeMap::new(),
+            state_warning: None,
             prs: HashMap::new(),
             list_state: ListState::default(),
             filter: String::new(),
@@ -947,10 +962,12 @@ impl App {
 /// the base a new branch would fork from. Runs off the UI thread.
 pub fn snapshot(paths: &PandoPaths) -> Result<Snapshot> {
     let discovery = worktree::discover_all(&paths.project)?;
+    let owned = actions::created_by_pando(paths, &discovery.worktrees);
     Ok(Snapshot {
         main: discovery.main,
         worktrees: discovery.worktrees,
-        created_by_pando: actions::created_by_pando(paths),
+        created_by_pando: owned.by_name,
+        warning: owned.warning,
         default_base: worktree::resolve_base_branch(paths.root()),
     })
 }
@@ -1330,6 +1347,7 @@ pub mod tests {
             main: wt("acme-shop"),
             worktrees: vec![refreshed, wt("feat+two")],
             created_by_pando: BTreeMap::new(),
+            warning: None,
             default_base: Some("main".into()),
         });
 
@@ -1351,9 +1369,38 @@ pub mod tests {
             main: wt("acme-shop"),
             worktrees: vec![moved],
             created_by_pando: BTreeMap::new(),
+            warning: None,
             default_base: None,
         });
         assert_eq!(fresh, vec!["feat+one"]);
+    }
+
+    // The ownership map is what the Remove modal's "pando did not create
+    // this" warning reads, so a state file the refresh could not use has to
+    // reach the user rather than turning every row silently adopted.
+    #[test]
+    fn a_state_warning_from_a_refresh_reaches_the_status_line() {
+        let mut app = test_app(&["feat+one"]);
+        let snapshot = |warning: Option<&str>| Snapshot {
+            main: wt("acme-shop"),
+            worktrees: vec![wt("feat+one")],
+            created_by_pando: BTreeMap::new(),
+            warning: warning.map(str::to_string),
+            default_base: None,
+        };
+
+        app.apply_snapshot(snapshot(Some("state file /s is version 3")));
+        let (message, is_error) = app.active_status().unwrap();
+        assert!(message.contains("version 3"), "{message}");
+        assert!(is_error, "a state file pando cannot use is an error");
+
+        // A standing warning is not re-announced on every refresh.
+        app.status = None;
+        app.apply_snapshot(snapshot(Some("state file /s is version 3")));
+        assert!(app.active_status().is_none());
+
+        app.apply_snapshot(snapshot(None));
+        assert_eq!(app.state_warning, None);
     }
 
     #[test]

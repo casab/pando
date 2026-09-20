@@ -86,9 +86,18 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
     }
 }
 
+/// Always stderr, never the listing: `ls --json`'s stdout has to stay
+/// parseable, and this is not part of the documented shape.
+fn warn_about(owned: &actions::Ownership) {
+    if let Some(warning) = &owned.warning {
+        eprintln!("pando: {warning}");
+    }
+}
+
 pub fn ls_text<W: Write>(paths: &PandoPaths, out: &mut W) -> Result<()> {
     let worktrees = actions::ls(paths)?;
-    let owned = actions::created_by_pando(paths);
+    let owned = actions::created_by_pando(paths, &worktrees);
+    warn_about(&owned);
     if worktrees.is_empty() {
         writeln!(out, "no worktrees — `pando new <branch>` creates one")?;
         return Ok(());
@@ -105,7 +114,7 @@ pub fn ls_text<W: Write>(paths: &PandoPaths, out: &mut W) -> Result<()> {
             ellipsize(&w.name, 24),
             ellipsize(w.branch.as_deref().unwrap_or("(detached)"), 24),
             w.head_sha.as_deref().unwrap_or("-"),
-            state_word(w, owned.get(&w.name).copied().unwrap_or(false)),
+            state_word(w, owned.by_name.get(&w.name).copied().unwrap_or(false)),
             w.path.display()
         )?;
     }
@@ -169,7 +178,8 @@ struct PrOut {
 
 pub fn ls_json<W: Write>(paths: &PandoPaths, out: &mut W) -> Result<()> {
     let worktrees = actions::ls(paths)?;
-    let owned = actions::created_by_pando(paths);
+    let owned = actions::created_by_pando(paths, &worktrees);
+    warn_about(&owned);
     // Cache only: the CLI never spawns `gh`, so `ls --json` stays fast and
     // works offline. The TUI is what refreshes this.
     let prs = cache::load_prs(&paths.pr_cache_file());
@@ -194,7 +204,7 @@ pub fn ls_json<W: Write>(paths: &PandoPaths, out: &mut W) -> Result<()> {
                         url: p.url.clone(),
                     });
                 WorktreeOut {
-                    created_by_pando: owned.get(&w.name).copied().unwrap_or(false),
+                    created_by_pando: owned.by_name.get(&w.name).copied().unwrap_or(false),
                     name: w.name,
                     path: w.path.display().to_string(),
                     branch: w.branch,

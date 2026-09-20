@@ -83,6 +83,10 @@ pub fn new(
     // pando cannot use has to refuse while there is still nothing to undo.
     let _lock = state::lock(&paths.lock_file())?;
     let mut store = state::load(&paths.state_file())?;
+    // Under the lock, so the porcelain read cannot race a concurrent `new`
+    // whose record is already saved but whose worktree this process has not
+    // seen yet.
+    drop_stale_worktree_records(&mut store, &root);
 
     std::fs::create_dir_all(&worktrees_dir)
         .with_context(|| format!("create {}", worktrees_dir.display()))?;
@@ -207,11 +211,11 @@ pub fn rm(paths: &PandoPaths, name: &str, yes: bool, force: bool) -> Result<()> 
     paths.ensure_home()?;
     let _lock = state::lock(&paths.lock_file())?;
     let mut store = state::load(&paths.state_file())?;
+    drop_stale_worktree_records(&mut store, paths.root());
     let created_by_pando = store
         .worktrees
         .get(name)
-        .map(|r| r.created_by_pando)
-        .unwrap_or(false);
+        .is_some_and(|r| r.created_by_pando && record_is_for(r, target));
     if !created_by_pando && !yes {
         bail!(
             "pando did not create {name} ({}) — pass --yes to remove it anyway",
@@ -293,18 +297,75 @@ pub fn path(paths: &PandoPaths, name: &str) -> Result<PathBuf> {
         .with_context(|| format!("no worktree named {name:?}"))
 }
 
+/// Which worktrees pando created, and anything that stopped the answer
+/// being certain.
+#[derive(Debug, Default, Clone)]
+pub struct Ownership {
+    pub by_name: std::collections::BTreeMap<String, bool>,
+    /// The one-line reason the map may be empty or wrong — the same message
+    /// `rm` refuses with, so a listing never says "adopted" about a state
+    /// file `rm` would not touch.
+    pub warning: Option<String>,
+}
+
 /// Which worktrees pando created, from state. A read path, so it reconciles
 /// first; it takes no lock, because it mutates nothing on disk.
-pub fn created_by_pando(paths: &PandoPaths) -> std::collections::BTreeMap<String, bool> {
-    let Ok(mut store) = state::load(&paths.state_file()) else {
-        return Default::default();
+///
+/// `worktrees` is what git currently reports: a record only vouches for a
+/// worktree at the same path it was written for, so a record left behind by
+/// a worktree removed outside pando cannot adopt a later namesake.
+pub fn created_by_pando(paths: &PandoPaths, worktrees: &[Worktree]) -> Ownership {
+    let mut store = match state::load(&paths.state_file()) {
+        Ok(store) => store,
+        Err(e) => {
+            return Ownership {
+                by_name: Default::default(),
+                warning: Some(format!("{e:#}")),
+            };
+        }
     };
     state::reconcile(&mut store, crate::process::is_alive);
-    store
+    let by_name = store
         .worktrees
         .iter()
-        .map(|(k, v)| (k.clone(), v.created_by_pando))
-        .collect()
+        .map(|(name, record)| {
+            let ours = record.created_by_pando
+                && worktrees
+                    .iter()
+                    .any(|w| &w.name == name && record_is_for(record, w));
+            (name.clone(), ours)
+        })
+        .collect();
+    Ownership {
+        by_name,
+        warning: None,
+    }
+}
+
+/// Whether a state record is really about this worktree. Keying on the
+/// directory basename alone is not enough: the record a worktree removed
+/// outside pando leaves behind would otherwise vouch for any later worktree
+/// of the same name, anywhere on disk.
+fn record_is_for(record: &WorktreeRecord, wt: &Worktree) -> bool {
+    // A prunable entry's directory is gone, so `Worktree::path` is whatever
+    // git recorded rather than a canonical path. Comparing it would start
+    // demanding `--yes` for pando's own prunable worktrees, so the name is
+    // trusted for those — clearing a prunable entry removes no directory.
+    wt.prunable
+        || crate::paths::resolve_for_compare(&record.path)
+            == crate::paths::resolve_for_compare(&wt.path)
+}
+
+/// Drops records for worktrees git no longer lists. Callers hold the flock;
+/// best effort, because a porcelain that cannot be read is not a reason to
+/// refuse the command that is running.
+fn drop_stale_worktree_records(store: &mut state::State, root: &Path) {
+    let Ok(live) = worktree::porcelain_paths(root) else {
+        return;
+    };
+    store
+        .worktrees
+        .retain(|_, record| live.contains(&crate::paths::resolve_for_compare(&record.path)));
 }
 
 fn resolve_create_source(
@@ -1131,10 +1192,10 @@ mod tests {
             ],
         );
 
-        let map = created_by_pando(&fx.paths);
-        assert_eq!(map.get("feat+one"), Some(&true));
+        let owned = created_by_pando(&fx.paths, &ls(&fx.paths).unwrap());
+        assert_eq!(owned.by_name.get("feat+one"), Some(&true));
         assert_eq!(
-            map.get("adopted"),
+            owned.by_name.get("adopted"),
             None,
             "an adopted worktree has no record"
         );
@@ -1155,6 +1216,80 @@ mod tests {
 
         rm(&fx.paths, &name, false, false).unwrap();
         assert!(!elsewhere.join(&name).exists());
+    }
+
+    // `ls` labels a worktree "adopted" from the same file `rm` keys its
+    // confirmation off. When that file cannot be read, both have to say the
+    // same thing rather than one shrugging and the other failing.
+    #[test]
+    fn created_by_pando_reports_a_state_file_it_cannot_use() {
+        let fx = fixture();
+        let name = new(&fx.paths, &fx.config, "feat/one", None, &noop).unwrap();
+        std::fs::write(fx.paths.state_file(), r#"{"version":3,"worktrees":{}}"#).unwrap();
+
+        let owned = created_by_pando(&fx.paths, &ls(&fx.paths).unwrap());
+        assert!(owned.by_name.is_empty());
+        let warning = owned
+            .warning
+            .expect("a state file pando cannot use must be reported, not swallowed");
+        assert!(warning.contains("version 3"), "{warning}");
+
+        let err = rm(&fx.paths, &name, true, false).unwrap_err();
+        assert_eq!(
+            warning,
+            format!("{err:#}"),
+            "the listing and rm must give the same line"
+        );
+    }
+
+    // A record is keyed by basename, and the worktree it was written for can
+    // be removed behind pando's back. The record that survives must not then
+    // vouch for a different worktree that happens to share the name — `rm`
+    // would delete a directory pando never created, without asking.
+    #[test]
+    fn a_stale_record_does_not_make_an_unrelated_worktree_ours() {
+        let fx = fixture();
+        let name = new(&fx.paths, &fx.config, "feat/x", None, &noop).unwrap();
+        let ours = fx.worktrees_dir().join(&name);
+        git(
+            &fx.root,
+            &["worktree", "remove", "--force", ours.to_str().unwrap()],
+        );
+        assert!(
+            fx.state().worktrees.contains_key(&name),
+            "the record outlives the worktree git forgot"
+        );
+
+        let elsewhere = fx.root.parent().unwrap().join("elsewhere").join(&name);
+        std::fs::create_dir_all(elsewhere.parent().unwrap()).unwrap();
+        git(
+            &fx.root,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                elsewhere.to_str().unwrap(),
+                "feat/x",
+            ],
+        );
+
+        let owned = created_by_pando(&fx.paths, &ls(&fx.paths).unwrap());
+        assert_eq!(
+            owned.by_name.get(&name),
+            Some(&false),
+            "a record for a directory that is gone must not vouch for another one"
+        );
+        assert!(owned.warning.is_none(), "{:?}", owned.warning);
+
+        let err = rm(&fx.paths, &name, false, false).unwrap_err();
+        assert!(format!("{err:#}").contains("--yes"), "{err:#}");
+        assert!(
+            elsewhere.is_dir(),
+            "the adopted worktree must still be there"
+        );
+
+        rm(&fx.paths, &name, true, false).unwrap();
+        assert!(!elsewhere.exists());
     }
 
     // A refused `rm` must change nothing at all. Unlinking the provisioned

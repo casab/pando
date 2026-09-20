@@ -308,3 +308,33 @@ fn a_pando_home_inside_the_repository_is_refused() {
     assert!(!e.root.join(".pando").exists());
     assert_eq!(status_porcelain(&e.root), "", "the fixture must stay clean");
 }
+
+// `adopted` in the listing and `rm`'s confirmation rule read the same state
+// file. When it cannot be read, the listing has to say so rather than call
+// every worktree adopted with exit 0 while `rm` fails hard on the same file.
+#[test]
+fn ls_warns_when_the_state_file_cannot_be_used() {
+    let e = env();
+    e.pando(&["new", "feat/one"]);
+    let listed: serde_json::Value =
+        serde_json::from_str(&stdout(&e.pando(&["ls", "--json"]))).expect("valid json");
+    let id = listed["project"]["id"].as_str().expect("a project id");
+    let state = e.home.join("projects").join(id).join("state.json");
+    std::fs::write(&state, r#"{"version":3,"worktrees":{}}"#).unwrap();
+
+    let out = e.pando(&["ls"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("adopted"), "{}", stdout(&out));
+    assert!(stderr(&out).contains("version 3"), "{}", stderr(&out));
+
+    let out = e.pando(&["ls", "--json"]);
+    assert_eq!(code(&out), EXIT_OK);
+    assert!(stderr(&out).contains("version 3"), "{}", stderr(&out));
+    serde_json::from_str::<serde_json::Value>(&stdout(&out))
+        .expect("the warning must go to stderr, leaving stdout parseable");
+
+    // The same one line `rm` refuses with, so the two never disagree.
+    let out = e.pando(&["rm", "feat+one", "--yes"]);
+    assert_eq!(code(&out), EXIT_ERROR);
+    assert!(stderr(&out).contains("version 3"), "{}", stderr(&out));
+}
