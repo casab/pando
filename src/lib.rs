@@ -9,3 +9,6 @@
 //!       → actions
 //!       → cli · tui
 //! ```
+
+pub mod paths;
+pub mod project;
