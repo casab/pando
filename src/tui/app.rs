@@ -1176,6 +1176,16 @@ impl App {
         let page = self.viewer_height.max(1) / 2;
         let viewer_height = self.viewer_height;
 
+        // While a query is being typed every key belongs to it, esc
+        // included — so this comes before anything else.
+        if self
+            .log_view()
+            .is_some_and(|view| view.search_mode == SearchMode::Typing)
+        {
+            self.handle_search_typing_key(key, viewer_height);
+            return;
+        }
+
         // A digit builds a count prefix and does nothing else. A leading
         // zero is not a count, so `0` stays free.
         if let KeyCode::Char(c @ '0'..='9') = key.code {
@@ -1284,6 +1294,77 @@ impl App {
                 view.new_below = 0;
             }
             KeyCode::Char('w') => view.wrap = !view.wrap,
+            KeyCode::Char('/') => {
+                view.search_mode = SearchMode::Typing;
+                view.search = SearchState::default();
+                view.filter_to_matches = false;
+            }
+            // Any modifier: ctrl-n is the same "next match" as n, which is
+            // what a reader's fingers reach for either way.
+            KeyCode::Char('n') if view.search_mode == SearchMode::Active => {
+                step_match(view, true, count, viewer_height);
+            }
+            KeyCode::Char('N') if view.search_mode == SearchMode::Active => {
+                step_match(view, false, count, viewer_height);
+            }
+            KeyCode::Char('p') if ctrl && view.search_mode == SearchMode::Active => {
+                step_match(view, false, count, viewer_height);
+            }
+            KeyCode::Char('f') => {
+                view.log_filter = view.log_filter.cycle();
+                view.scroll = 0;
+                view.follow = true;
+                view.new_below = 0;
+                // The new filter may hide lines that matched under the old
+                // one; drop them, or the search cursor lands on a row that
+                // is no longer painted.
+                if view.search_mode == SearchMode::Active {
+                    recompute_matches(view);
+                }
+            }
+            // Collapse to the matching lines, grep-style, or expand back.
+            // Either way, land at the top.
+            KeyCode::Char('&')
+                if view.search_mode == SearchMode::Active && !view.search.query.is_empty() =>
+            {
+                view.filter_to_matches = !view.filter_to_matches;
+                view.scroll = 0;
+                view.cursor = 0;
+                view.follow = false;
+                view.search.cursor = 0;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_search_typing_key(&mut self, key: KeyEvent, viewer_height: usize) {
+        let Some(view) = self.log_view_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                view.search_mode = SearchMode::Inactive;
+                view.search = SearchState::default();
+                view.filter_to_matches = false;
+            }
+            KeyCode::Enter => {
+                view.search_mode = SearchMode::Active;
+                if let Some(&first) = view.search.matches.first() {
+                    let rank = filtered_rank(view, first);
+                    view.cursor = rank;
+                    view.scroll = rank.saturating_sub(viewer_height / 2);
+                    view.follow = false;
+                    view.search.cursor = 0;
+                }
+            }
+            KeyCode::Backspace => {
+                view.search.query.pop();
+                recompute_matches(view);
+            }
+            KeyCode::Char(c) => {
+                view.search.query.push(c);
+                recompute_matches(view);
+            }
             _ => {}
         }
     }
@@ -1350,6 +1431,26 @@ impl App {
                     .count();
                 view.scroll = view.scroll.saturating_sub(visible_evicted);
                 view.cursor = view.cursor.saturating_sub(visible_evicted);
+            }
+        }
+        // A line that just arrived may match, so the live count has to stay
+        // honest — but recomputing resets the ordinal to the first match,
+        // which would yank the reader back to match 1 on every tick. Put
+        // the cursor back on the *line* it was on.
+        if grew && view.search_mode == SearchMode::Active && !view.search.query.is_empty() {
+            let was = view.search.matches.get(view.search.cursor).copied();
+            recompute_matches(view);
+            if let Some(line) = was {
+                view.search.cursor = view
+                    .search
+                    .matches
+                    .iter()
+                    .position(|&at| at == line)
+                    .unwrap_or_else(|| {
+                        view.search
+                            .cursor
+                            .min(view.search.matches.len().saturating_sub(1))
+                    });
             }
         }
         if view.follow {
@@ -1951,6 +2052,65 @@ impl App {
         app.refilter();
         app
     }
+}
+
+/// Rebuilds the match set for the current query, under the current level
+/// filter. Resets the ordinal, so callers that care about staying on the
+/// same *line* have to put it back.
+fn recompute_matches(view: &mut LogView) {
+    view.search.cursor = 0;
+    if view.search.query.is_empty() {
+        view.search.matches.clear();
+        return;
+    }
+    let lowered = view.search.query.to_lowercase();
+    view.search.matches = view
+        .tail
+        .lines()
+        .iter()
+        .enumerate()
+        .filter(|(_, parsed)| {
+            view.log_filter.passes(parsed.level) && parsed.plain_lower.contains(&lowered)
+        })
+        .map(|(at, _)| at)
+        .collect();
+}
+
+/// Where absolute buffer index `at` sits in the *visible* list: how many
+/// lines before it the filter keeps. `scroll` and `cursor` are positions in
+/// that list, so a match has to be translated before it can be jumped to.
+fn filtered_rank(view: &LogView, at: usize) -> usize {
+    view.tail
+        .lines()
+        .iter()
+        .take(at)
+        .filter(|parsed| view.log_filter.passes(parsed.level))
+        .count()
+}
+
+/// Moves to the next (or previous) match, `count` of them along, wrapping
+/// at both ends, and centres the viewport on it.
+fn step_match(view: &mut LogView, forward: bool, count: usize, viewer_height: usize) {
+    let len = view.search.matches.len();
+    if len == 0 {
+        return;
+    }
+    view.search.cursor = if forward {
+        (view.search.cursor + count) % len
+    } else {
+        (view.search.cursor + len - (count % len)) % len
+    };
+    let at = view.search.matches[view.search.cursor];
+    // Collapsed, the visible list *is* the match list, so the ordinal is
+    // already the rank.
+    let rank = if view.collapsed() {
+        view.search.cursor
+    } else {
+        filtered_rank(view, at)
+    };
+    view.cursor = rank;
+    view.scroll = rank.saturating_sub(viewer_height / 2);
+    view.follow = false;
 }
 
 /// Sends a question to the UI thread and waits for the answer.
@@ -3247,6 +3407,277 @@ pub mod tests {
         write_log(&app, "feat+one", "dev", &["one", "two", "three"]);
         app.handle_event(AppEvent::Tick);
         assert_eq!(viewer(&app).tail.lines().len(), 3);
+    }
+
+    // ---- search and the level filter -------------------------------------
+
+    fn search_for(app: &mut App, query: &str) {
+        press(app, KeyCode::Char('/'));
+        for c in query.chars() {
+            press(app, KeyCode::Char(c));
+        }
+        press(app, KeyCode::Enter);
+    }
+
+    #[test]
+    fn search_is_case_insensitive_and_lands_on_the_first_match() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(
+            &app,
+            "feat+one",
+            "dev",
+            &["plain", "Compiled in 30ms", "plain", "compiled again"],
+        );
+        open_viewer(&mut app, 80, 12);
+        search_for(&mut app, "COMPILED");
+        assert_eq!(viewer(&app).search.matches, vec![1, 3]);
+        assert_eq!(viewer(&app).cursor, 1, "the viewer jumps to the first one");
+        assert!(!viewer(&app).follow);
+        assert_eq!(viewer(&app).search_mode, SearchMode::Active);
+    }
+
+    #[test]
+    fn n_and_capital_n_step_the_matches_and_wrap() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(
+            &app,
+            "feat+one",
+            "dev",
+            &["hit a", "miss", "hit b", "miss", "hit c"],
+        );
+        open_viewer(&mut app, 80, 12);
+        search_for(&mut app, "hit");
+        assert_eq!(viewer(&app).search.cursor, 0);
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(viewer(&app).cursor, 2);
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(viewer(&app).cursor, 4);
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(viewer(&app).cursor, 0, "and it wraps");
+        press(&mut app, KeyCode::Char('N'));
+        assert_eq!(viewer(&app).cursor, 4, "backwards too");
+        type_str(&mut app, "2");
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(viewer(&app).cursor, 2, "a count steps that many matches");
+    }
+
+    #[test]
+    fn ctrl_n_and_ctrl_p_step_the_matches_as_well() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["hit a", "miss", "hit b"]);
+        open_viewer(&mut app, 80, 12);
+        search_for(&mut app, "hit");
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_eq!(viewer(&app).cursor, 2);
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert_eq!(viewer(&app).cursor, 0);
+    }
+
+    #[test]
+    fn escape_while_typing_clears_the_search_and_keeps_the_viewer_open() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["hit"]);
+        open_viewer(&mut app, 80, 12);
+        press(&mut app, KeyCode::Char('/'));
+        type_str(&mut app, "hi");
+        assert_eq!(viewer(&app).search.query, "hi");
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(viewer(&app).search.query, "h");
+        press(&mut app, KeyCode::Esc);
+        assert!(
+            app.log_view().is_some(),
+            "esc clears the query, not the view"
+        );
+        assert_eq!(viewer(&app).search_mode, SearchMode::Inactive);
+        assert!(viewer(&app).search.query.is_empty());
+    }
+
+    #[test]
+    fn a_query_with_no_matches_leaves_the_cursor_where_it_was() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["one", "two", "three"]);
+        open_viewer(&mut app, 80, 12);
+        press(&mut app, KeyCode::Char('g'));
+        search_for(&mut app, "nothing here");
+        assert!(viewer(&app).search.matches.is_empty());
+        assert_eq!(viewer(&app).cursor, 0);
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(viewer(&app).cursor, 0, "stepping nothing moves nothing");
+    }
+
+    #[test]
+    fn f_cycles_the_level_filter_and_the_viewer_shows_only_what_passes() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(
+            &app,
+            "feat+one",
+            "dev",
+            &["just info", "WARN slow", "ERROR boom", "more info"],
+        );
+        open_viewer(&mut app, 80, 12);
+        assert_eq!(viewer(&app).visible_len(), 4);
+
+        press(&mut app, KeyCode::Char('f'));
+        assert_eq!(viewer(&app).log_filter, LogFilter::WarnPlus);
+        assert_eq!(viewer(&app).visible_len(), 2);
+
+        press(&mut app, KeyCode::Char('f'));
+        assert_eq!(viewer(&app).log_filter, LogFilter::ErrorOnly);
+        assert_eq!(viewer(&app).visible_len(), 1);
+
+        press(&mut app, KeyCode::Char('f'));
+        assert_eq!(viewer(&app).log_filter, LogFilter::All);
+        assert!(viewer(&app).follow, "a filter change returns to the tail");
+    }
+
+    // dwt's `search_with_filter_skips_hidden_matches_and_maps_scroll_to_
+    // filtered_position`: the scroll and cursor are positions in the
+    // *filtered* list, so a match's absolute index has to be translated.
+    #[test]
+    fn search_under_a_filter_skips_hidden_matches_and_maps_the_position() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(
+            &app,
+            "feat+one",
+            "dev",
+            &[
+                "target in an info line",
+                "just info",
+                "WARN target in a warn line",
+                "just info",
+                "ERROR target in an error line",
+            ],
+        );
+        open_viewer(&mut app, 80, 12);
+        press(&mut app, KeyCode::Char('f')); // warn+
+        search_for(&mut app, "target");
+        assert_eq!(
+            viewer(&app).search.matches,
+            vec![2, 4],
+            "the info line matches the query but not the filter"
+        );
+        assert_eq!(
+            viewer(&app).cursor,
+            0,
+            "line 2 is the first of the two lines the filter shows"
+        );
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(viewer(&app).cursor, 1, "and line 4 is the second");
+    }
+
+    #[test]
+    fn changing_the_filter_drops_matches_it_now_hides() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(
+            &app,
+            "feat+one",
+            "dev",
+            &["target info", "WARN target", "plain"],
+        );
+        open_viewer(&mut app, 80, 12);
+        search_for(&mut app, "target");
+        assert_eq!(viewer(&app).search.matches, vec![0, 1]);
+        press(&mut app, KeyCode::Char('f'));
+        assert_eq!(
+            viewer(&app).search.matches,
+            vec![1],
+            "the cursor can never land on a row that is not painted"
+        );
+    }
+
+    #[test]
+    fn ampersand_collapses_the_view_to_the_matches_and_expands_again() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(
+            &app,
+            "feat+one",
+            "dev",
+            &["hit a", "miss", "hit b", "miss", "hit c"],
+        );
+        open_viewer(&mut app, 80, 12);
+        search_for(&mut app, "hit");
+        press(&mut app, KeyCode::Char('&'));
+        assert!(viewer(&app).collapsed());
+        assert_eq!(viewer(&app).visible_len(), 3, "only the matches");
+        assert_eq!(viewer(&app).cursor, 0, "and it lands at the top");
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(
+            viewer(&app).cursor,
+            1,
+            "stepping stays in the collapsed list"
+        );
+        press(&mut app, KeyCode::Char('&'));
+        assert!(!viewer(&app).collapsed());
+        assert_eq!(viewer(&app).visible_len(), 5);
+    }
+
+    #[test]
+    fn ampersand_does_nothing_without_an_active_search() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["a", "b"]);
+        open_viewer(&mut app, 80, 12);
+        press(&mut app, KeyCode::Char('&'));
+        assert!(!viewer(&app).filter_to_matches);
+        assert_eq!(viewer(&app).visible_len(), 2);
+    }
+
+    #[test]
+    fn matches_are_realigned_when_the_ring_buffer_evicts() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["hit a", "filler", "hit b"]);
+        open_viewer(&mut app, 80, 12);
+        search_for(&mut app, "hit");
+        assert_eq!(viewer(&app).search.matches, vec![0, 2]);
+
+        // A tail with room for three lines, so two more evict two.
+        let path = app.paths.log_file("feat+one", "dev");
+        let view = app.log_view_mut().expect("the viewer is open");
+        view.tail = LogTail::new(path.clone(), 3);
+        view.tail.poll().unwrap();
+        view.search.matches = vec![0, 2];
+        view.follow = false;
+        write_log(
+            &app,
+            "feat+one",
+            "dev",
+            &["hit a", "filler", "hit b", "more", "and more"],
+        );
+        app.handle_event(AppEvent::Tick);
+
+        let view = viewer(&app);
+        assert_eq!(view.tail.lines().len(), 3);
+        assert_eq!(
+            view.search.matches,
+            vec![0],
+            "the match at index 0 fell out; index 2 moved down to 0"
+        );
+        assert!(view.search.cursor < view.search.matches.len().max(1));
+    }
+
+    #[test]
+    fn a_new_matching_line_joins_the_search_without_moving_the_reader() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["hit a", "plain", "hit b"]);
+        open_viewer(&mut app, 80, 12);
+        search_for(&mut app, "hit");
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(viewer(&app).search.cursor, 1);
+        let was = viewer(&app).cursor;
+
+        write_log(
+            &app,
+            "feat+one",
+            "dev",
+            &["hit a", "plain", "hit b", "hit c"],
+        );
+        app.handle_event(AppEvent::Tick);
+        assert_eq!(viewer(&app).search.matches, vec![0, 2, 3]);
+        assert_eq!(
+            viewer(&app).search.cursor,
+            1,
+            "the reader stays on the match they were on"
+        );
+        assert_eq!(viewer(&app).cursor, was);
     }
 
     #[test]

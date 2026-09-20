@@ -362,11 +362,16 @@ const HELP: [(&str, &str); 18] = [
 
 /// And every key the log viewer answers to, shown instead of the list's
 /// while it is open.
-const HELP_LOG: [(&str, &str); 10] = [
+const HELP_LOG: [(&str, &str); 15] = [
     ("j / k", "move the cursor down / up"),
     ("ctrl-d/u", "half a page down / up"),
     ("<n>j/k/G", "repeat n times, or jump to line n"),
     ("g / G", "top / follow the live tail"),
+    ("/", "search (⏎ to confirm, esc to clear)"),
+    ("n / N", "next / previous match"),
+    ("ctrl-n/p", "next / previous match"),
+    ("&", "collapse to the matches, grep-style"),
+    ("f", "cycle the level filter: all, warn+, errors"),
     ("w", "wrap long lines, or truncate them"),
     ("tab", "next log source"),
     ("S-tab", "previous log source"),

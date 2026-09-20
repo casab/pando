@@ -12,12 +12,12 @@ use ratatui::widgets::{
     Block, BorderType, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
 
-use super::app::{App, LogFilter, LogView, Mode};
-use crate::log_tail::{LogLevel, ParsedLine};
+use super::app::{App, LogFilter, LogView, Mode, SearchMode};
+use crate::log_tail::LogLevel;
 use crate::state::{Aggregate, Phase, ProcessRecord};
 use crate::theme::{
-    blue, border, cyan, green, highlight_bg, magenta, orange, red, surface, text, text_dim,
-    text_muted, yellow,
+    blue, border, cyan, green, highlight_bg, magenta, orange, red, search_cursor_bg,
+    search_match_bg, surface, text, text_dim, text_muted, yellow,
 };
 use crate::worktree::{PrInfo, PrState, Worktree};
 
@@ -512,14 +512,27 @@ fn viewer_rows(
     let lines = view.tail.lines();
     let body_height = body_height.max(1);
     let last_rank = visible.len().saturating_sub(1);
+    let query = view.search.query.clone();
+    let matched: std::collections::HashSet<usize> = view.search.matches.iter().copied().collect();
+    let search_cursor = view.search.matches.get(view.search.cursor).copied();
     let build = |rank: usize, at: usize| -> Vec<Line<'static>> {
         let Some(parsed) = lines.get(at) else {
             return Vec::new();
         };
+        let styled = if !query.is_empty() && matched.contains(&at) {
+            highlight_search_in_line(
+                parsed.styled.clone(),
+                &parsed.plain,
+                &query,
+                Some(at) == search_cursor,
+            )
+        } else {
+            parsed.styled.clone()
+        };
         let at_cursor = rank == cursor;
         // The cursor line always renders in full: with wrap off it is the
         // one line that expands, so the line being read stays readable.
-        let rows = line_rows(parsed, width, view.wrap || at_cursor);
+        let rows = line_rows(styled, width, view.wrap || at_cursor);
         if at_cursor {
             cursor_highlight_rows(rows, width)
         } else {
@@ -592,13 +605,93 @@ fn viewer_rows(
 
 /// One log line as visual rows: wrapped to the width, or truncated to a
 /// single row when wrap is off.
-fn line_rows(parsed: &ParsedLine, width: usize, wrap: bool) -> Vec<Line<'static>> {
-    let line = parsed.styled.clone();
+fn line_rows(line: Line<'static>, width: usize, wrap: bool) -> Vec<Line<'static>> {
     if wrap {
         wrap_line_to_rows(line, width)
     } else {
         vec![truncate_line(line, width)]
     }
+}
+
+/// Paints the search query wherever it occurs in a line — every hit in the
+/// match background, the one the search cursor is on in the cursor
+/// background.
+///
+/// The offsets are computed in a lowercased copy and mapped back, because
+/// `to_lowercase` is not length-preserving (`İ` is two bytes and lowercases
+/// to three), and slicing the original at lowercased offsets would cut a
+/// character in half and panic.
+fn highlight_search_in_line(
+    line: Line<'static>,
+    plain: &str,
+    query: &str,
+    is_cursor: bool,
+) -> Line<'static> {
+    let bg = if is_cursor {
+        search_cursor_bg()
+    } else {
+        search_match_bg()
+    };
+
+    let mut lowered = String::with_capacity(plain.len());
+    let mut back: Vec<usize> = Vec::with_capacity(plain.len() + 1);
+    for (at, ch) in plain.char_indices() {
+        for lower in ch.to_lowercase() {
+            for _ in 0..lower.len_utf8() {
+                back.push(at);
+            }
+            lowered.push(lower);
+        }
+    }
+    back.push(plain.len()); // the end maps to the end
+
+    let needle = query.to_lowercase();
+    if needle.is_empty() {
+        return line;
+    }
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut from = 0usize;
+    while let Some(at) = lowered[from..].find(&needle) {
+        let start = from + at;
+        let end = start + needle.len();
+        ranges.push((back[start], back[end]));
+        from = end;
+    }
+    if ranges.is_empty() {
+        return line;
+    }
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut span_start = 0usize;
+    for span in line.spans {
+        let text: &str = span.content.as_ref();
+        let len = text.len();
+        let span_end = span_start + len;
+        let mut offset = 0usize;
+        for &(start, end) in &ranges {
+            if end <= span_start || start >= span_end {
+                continue;
+            }
+            let local_start = start.saturating_sub(span_start).max(offset);
+            let local_end = (end - span_start).min(len);
+            if local_start > offset {
+                spans.push(Span::styled(
+                    text[offset..local_start].to_string(),
+                    span.style,
+                ));
+            }
+            spans.push(Span::styled(
+                text[local_start..local_end].to_string(),
+                span.style.bg(bg),
+            ));
+            offset = local_end;
+        }
+        if offset < len {
+            spans.push(Span::styled(text[offset..].to_string(), span.style));
+        }
+        span_start = span_end;
+    }
+    Line::from(spans)
 }
 
 /// Hard char-wrap a styled line into rows of at most `width` chars, keeping
@@ -708,6 +801,47 @@ fn viewer_footer(
     has_tabs: bool,
     width: usize,
 ) -> Line<'static> {
+    // While a query is being typed, or once it is live, the footer is the
+    // search bar: it is the only row the viewer can spare.
+    match view.search_mode {
+        SearchMode::Typing => {
+            return truncate_line(
+                Line::from(vec![
+                    Span::styled("/", Style::new().fg(orange()).add_modifier(Modifier::BOLD)),
+                    Span::styled(view.search.query.clone(), Style::new().fg(text())),
+                    Span::styled("▏", Style::new().fg(orange())),
+                ]),
+                width,
+            );
+        }
+        SearchMode::Active => {
+            let total = view.search.matches.len();
+            let at = if total == 0 {
+                0
+            } else {
+                view.search.cursor + 1
+            };
+            let hint = if view.filter_to_matches {
+                "  [grep] n/N next/prev · & expand · esc clear"
+            } else {
+                "  n/N next/prev · & grep · esc clear"
+            };
+            return truncate_line(
+                Line::from(vec![
+                    Span::styled("/", Style::new().fg(orange())),
+                    Span::styled(view.search.query.clone(), Style::new().fg(text())),
+                    Span::styled(
+                        format!("  [{at}/{total}]"),
+                        Style::new().fg(yellow()).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(hint.to_string(), Style::new().fg(text_muted())),
+                ]),
+                width,
+            );
+        }
+        SearchMode::Inactive => {}
+    }
+
     let (badge, badge_style) = if let Some(count) = view.count_prefix {
         (
             count.to_string(),
@@ -2167,6 +2301,102 @@ mod tests {
             1,
             "to exactly one row:\n{truncated}"
         );
+    }
+
+    // ---- search ----------------------------------------------------------
+
+    fn content(line: &Line<'static>) -> String {
+        line.spans.iter().map(|s| s.content.to_string()).collect()
+    }
+
+    /// Only the parts of the line that got a background.
+    fn highlighted(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .filter(|s| s.style.bg.is_some())
+            .map(|s| s.content.to_string())
+            .collect()
+    }
+
+    fn type_into(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+    }
+
+    #[test]
+    fn the_search_bar_shows_the_query_while_it_is_typed() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["compiled in 30ms"]);
+        app.open_log_viewer();
+        draw(&mut app, 80, 12);
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        type_into(&mut app, "comp");
+        let painted = text_of(&draw(&mut app, 80, 12));
+        assert!(painted.contains("/comp"), "{painted}");
+    }
+
+    #[test]
+    fn an_active_search_shows_which_match_the_cursor_is_on() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["hit a", "plain", "hit b"]);
+        app.open_log_viewer();
+        draw(&mut app, 80, 12);
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        type_into(&mut app, "hit");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let painted = text_of(&draw(&mut app, 80, 12));
+        assert!(painted.contains("[1/2]"), "{painted}");
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        let painted = text_of(&draw(&mut app, 80, 12));
+        assert!(painted.contains("[2/2]"), "{painted}");
+    }
+
+    #[test]
+    fn a_match_is_painted_and_the_one_under_the_search_cursor_differently() {
+        let line = Line::raw("compiled in 30ms");
+        let plain = highlight_search_in_line(line.clone(), "compiled in 30ms", "compiled", false);
+        assert_eq!(highlighted(&plain), "compiled");
+        let backgrounds: Vec<_> = plain.spans.iter().filter_map(|s| s.style.bg).collect();
+        assert_eq!(backgrounds, vec![search_match_bg()]);
+
+        let under_cursor = highlight_search_in_line(line, "compiled in 30ms", "compiled", true);
+        let backgrounds: Vec<_> = under_cursor
+            .spans
+            .iter()
+            .filter_map(|s| s.style.bg)
+            .collect();
+        assert_eq!(backgrounds, vec![search_cursor_bg()]);
+    }
+
+    // `to_lowercase` is not length-preserving: `İ` is two bytes and
+    // lowercases to three. Slicing the original at lowercased offsets cuts
+    // a character in half and panics.
+    #[test]
+    fn highlighting_does_not_panic_when_lowercasing_grows_a_character() {
+        let result = highlight_search_in_line(Line::raw("İx"), "İx", "i", false);
+        assert_eq!(content(&result), "İx");
+        assert_eq!(highlighted(&result), "");
+    }
+
+    #[test]
+    fn highlighting_lands_on_the_original_range_after_a_growing_character() {
+        let result = highlight_search_in_line(Line::raw("İé"), "İé", "é", false);
+        assert_eq!(content(&result), "İé");
+        assert_eq!(highlighted(&result), "é");
+    }
+
+    // The real crash surface: a coloured line arrives already split into
+    // spans, so the offset has to be tracked across them.
+    #[test]
+    fn highlighting_crosses_spans_after_a_growing_character() {
+        let line = Line::from(vec![
+            Span::styled("İ ".to_string(), Style::new().fg(text_dim())),
+            Span::styled("GET".to_string(), Style::new().fg(cyan())),
+        ]);
+        let result = highlight_search_in_line(line, "İ GET", "get", false);
+        assert_eq!(content(&result), "İ GET");
+        assert_eq!(highlighted(&result), "GET");
     }
 
     #[test]
