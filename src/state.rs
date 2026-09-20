@@ -300,6 +300,105 @@ pub fn advance_phases(
     changed
 }
 
+/// A worktree's phase, aggregated across every process it runs.
+///
+/// A worktree is one thing in a list and one row in the TUI, however many
+/// processes it has, so the several phases have to become one. Failed wins,
+/// because a half-running worktree is not running; Starting comes next,
+/// because something is still on its way up; only when every process is
+/// Running is the worktree Running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Aggregate {
+    /// Since the *first* process started coming up: that is how long the
+    /// worktree as a whole has been starting.
+    Starting { since: DateTime<Utc> },
+    /// Since the *last* process reached Running: that is the moment the
+    /// worktree as a whole became ready.
+    Running { since: DateTime<Utc> },
+    /// Named, because "failed" without which process is a question rather
+    /// than an answer — and carrying that process's own reason, including
+    /// the hint the classifier wrote for it.
+    Failed {
+        process: String,
+        at: DateTime<Utc>,
+        reason: String,
+    },
+}
+
+impl Aggregate {
+    /// The one word a listing shows.
+    pub fn word(&self) -> &'static str {
+        match self {
+            Aggregate::Starting { .. } => "starting",
+            Aggregate::Running { .. } => "running",
+            Aggregate::Failed { .. } => "failed",
+        }
+    }
+
+    /// When this phase began.
+    pub fn since(&self) -> DateTime<Utc> {
+        match self {
+            Aggregate::Starting { since } | Aggregate::Running { since } => *since,
+            Aggregate::Failed { at, .. } => *at,
+        }
+    }
+
+    /// Why a worktree is failed, with the process it happened to in front
+    /// of it. `None` for anything that has not failed.
+    pub fn reason(&self) -> Option<String> {
+        match self {
+            Aggregate::Failed {
+                process, reason, ..
+            } => Some(format!("{process}: {reason}")),
+            _ => None,
+        }
+    }
+}
+
+/// The phase of a whole worktree, or `None` when it is running nothing.
+///
+/// The failure reported is the *earliest* one: with a web process that died
+/// because its api never came up, the api's failure is the one that
+/// explains the worktree, and the classifier's hint for it is the one worth
+/// showing. Ties go to the first name in order, so the answer is stable
+/// across reads.
+pub fn aggregate_phase(record: &WorktreeRecord) -> Option<Aggregate> {
+    if record.processes.is_empty() {
+        return None;
+    }
+    let mut failed: Option<(&str, DateTime<Utc>, &str)> = None;
+    let mut earliest_start: Option<DateTime<Utc>> = None;
+    let mut latest_running: Option<DateTime<Utc>> = None;
+    for (name, proc) in &record.processes {
+        match &proc.phase {
+            Phase::Failed { at, reason } => {
+                if failed.is_none_or(|(_, first, _)| *at < first) {
+                    failed = Some((name.as_str(), *at, reason.as_str()));
+                }
+            }
+            Phase::Starting { since } => {
+                earliest_start = Some(earliest_start.map_or(*since, |e| e.min(*since)));
+            }
+            Phase::Running { since } => {
+                latest_running = Some(latest_running.map_or(*since, |l| l.max(*since)));
+            }
+        }
+    }
+    if let Some((process, at, reason)) = failed {
+        return Some(Aggregate::Failed {
+            process: process.to_string(),
+            at,
+            reason: reason.to_string(),
+        });
+    }
+    if let Some(since) = earliest_start {
+        return Some(Aggregate::Starting { since });
+    }
+    Some(Aggregate::Running {
+        since: latest_running.expect("a record with processes is in one of the three phases"),
+    })
+}
+
 pub struct StateLock {
     _file: std::fs::File,
 }
@@ -383,6 +482,144 @@ mod tests {
         rec.processes.insert("dev".into(), running(pid));
         rec.ports.insert("web".into(), 17_000);
         rec
+    }
+
+    // ---- the aggregate phase ---------------------------------------------
+
+    /// A worktree running `web` and `api` in the phases given.
+    fn two_processes(web: Phase, api: Phase) -> WorktreeRecord {
+        let mut rec = WorktreeRecord::new("/abs/feat+x", true);
+        rec.processes.insert("web".into(), process(1, web));
+        rec.processes.insert("api".into(), process(2, api));
+        rec
+    }
+
+    fn failed(at_hour: u32, reason: &str) -> Phase {
+        Phase::Failed {
+            at: at(at_hour),
+            reason: reason.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_worktree_running_nothing_has_no_phase() {
+        let rec = WorktreeRecord::new("/abs/feat+x", true);
+        assert_eq!(aggregate_phase(&rec), None);
+    }
+
+    #[test]
+    fn one_process_is_its_own_aggregate() {
+        let rec = record_with(1);
+        assert_eq!(
+            aggregate_phase(&rec),
+            Some(Aggregate::Running { since: at(9) })
+        );
+    }
+
+    /// Every combination of two processes' phases, and what the worktree
+    /// reads as. Failed beats Starting beats Running: a worktree with a
+    /// dead api is not "running", and one still bringing a process up is
+    /// not ready.
+    #[test]
+    fn the_aggregate_of_two_phases_is_the_worst_of_them() {
+        let starting = || Phase::Starting { since: at(10) };
+        let running = || Phase::Running { since: at(11) };
+        let broken = || failed(12, "process exited");
+        let cases: [(Phase, Phase, &str); 9] = [
+            (running(), running(), "running"),
+            (running(), starting(), "starting"),
+            (running(), broken(), "failed"),
+            (starting(), running(), "starting"),
+            (starting(), starting(), "starting"),
+            (starting(), broken(), "failed"),
+            (broken(), running(), "failed"),
+            (broken(), starting(), "failed"),
+            (broken(), broken(), "failed"),
+        ];
+        for (web, api, expected) in cases {
+            let rec = two_processes(web.clone(), api.clone());
+            let aggregate = aggregate_phase(&rec).expect("two processes have a phase");
+            assert_eq!(
+                aggregate.word(),
+                expected,
+                "web {web:?} and api {api:?} should read as {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_aggregate_names_the_process_that_failed() {
+        let rec = two_processes(
+            Phase::Running { since: at(11) },
+            failed(12, "process exited — the command was not found"),
+        );
+        let aggregate = aggregate_phase(&rec).expect("a phase");
+        assert_eq!(
+            aggregate,
+            Aggregate::Failed {
+                process: "api".into(),
+                at: at(12),
+                reason: "process exited — the command was not found".into(),
+            }
+        );
+        assert_eq!(
+            aggregate.reason().as_deref(),
+            Some("api: process exited — the command was not found"),
+            "the hint belongs to the process it was read from"
+        );
+        assert_eq!(aggregate.since(), at(12));
+    }
+
+    // The classifier runs per log, so the reason shown must be the failing
+    // process's own — not the first one's in name order.
+    #[test]
+    fn the_earliest_failure_is_the_one_that_explains_the_worktree() {
+        let rec = two_processes(
+            failed(13, "timeout: nothing bound port 17000 in 30s"),
+            failed(12, "process exited — port 17001 is already in use"),
+        );
+        let aggregate = aggregate_phase(&rec).expect("a phase");
+        assert_eq!(
+            aggregate.reason().as_deref(),
+            Some("api: process exited — port 17001 is already in use"),
+            "the api died first and took the web process with it"
+        );
+    }
+
+    #[test]
+    fn starting_dates_from_the_first_process_and_running_from_the_last() {
+        let rec = two_processes(
+            Phase::Starting { since: at(9) },
+            Phase::Starting { since: at(11) },
+        );
+        assert_eq!(
+            aggregate_phase(&rec),
+            Some(Aggregate::Starting { since: at(9) }),
+            "the worktree has been coming up since the first one started"
+        );
+
+        let rec = two_processes(
+            Phase::Running { since: at(9) },
+            Phase::Running { since: at(11) },
+        );
+        assert_eq!(
+            aggregate_phase(&rec),
+            Some(Aggregate::Running { since: at(11) }),
+            "and it was only ready when the last one was"
+        );
+    }
+
+    #[test]
+    fn a_process_still_starting_holds_the_whole_worktree_back() {
+        let rec = two_processes(
+            Phase::Running { since: at(9) },
+            Phase::Starting { since: at(11) },
+        );
+        assert_eq!(
+            aggregate_phase(&rec),
+            Some(Aggregate::Starting { since: at(11) })
+        );
+        assert_eq!(aggregate_phase(&rec).unwrap().reason(), None);
     }
 
     fn share(tunnel_pid: u32) -> ShareRecord {
