@@ -7,7 +7,7 @@ mod common;
 use std::path::Path;
 use std::process::{Command, Output};
 
-use common::{Kind, build, git, status_porcelain};
+use common::{Kind, build, build_with_origin, git, status_porcelain};
 use tempfile::TempDir;
 
 const EXIT_OK: i32 = 0;
@@ -218,11 +218,49 @@ fn removing_a_worktree_pando_did_not_create_needs_yes() {
     assert!(!adopted.exists());
 }
 
+// A fixture with a real origin is what makes the tracking rules testable:
+// a forked branch must not end up with the base as its upstream.
+#[test]
+fn a_new_branch_created_through_the_cli_does_not_track_its_base() {
+    let dir = TempDir::new().unwrap();
+    let fixture = build_with_origin(Kind::Plain, dir.path());
+    let home = dir.path().join("pando-home");
+    assert!(fixture.remote.is_some());
+
+    let out = Command::new(env!("CARGO_BIN_EXE_pando"))
+        .env("PANDO_HOME", &home)
+        .current_dir(&fixture.root)
+        .args(["new", "feat/one"])
+        .output()
+        .expect("run pando");
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+
+    let upstream = common::git_raw(
+        &fixture.root,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "feat/one@{upstream}",
+        ],
+    );
+    assert!(
+        !upstream.status.success(),
+        "a forked branch must have no upstream, got {:?}",
+        String::from_utf8_lossy(&upstream.stdout)
+    );
+    assert_eq!(status_porcelain(&fixture.root), "");
+}
+
 #[test]
 fn every_fixture_kind_builds_a_clean_repository() {
     let dir = TempDir::new().unwrap();
     for kind in Kind::ALL {
         let fixture = build(kind, &dir.path().join(kind.dir_name()));
+        assert!(
+            fixture.remote.is_none(),
+            "{kind:?} was built without an origin"
+        );
         assert!(
             fixture.root.join(".gitignore").is_file(),
             "{:?} has no .gitignore",
