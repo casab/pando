@@ -234,7 +234,10 @@ fn asker(yes: bool) -> impl Fn(&actions::Question) -> Result<actions::Answer> {
             return match question.preselect {
                 Some(index) => {
                     notice(&format!("--yes: taking {:?}", question.options[index].0));
-                    Ok(actions::Answer::Choice(index))
+                    // Not `Choice`: nobody chose it, so the line written to
+                    // the config says a flag took it rather than claiming a
+                    // confidence the rules never had.
+                    Ok(actions::Answer::Auto(index))
                 }
                 None => Err(needs_answer(question)),
             };
@@ -256,37 +259,51 @@ fn needs_answer(question: &actions::Question) -> anyhow::Error {
 /// A numbered prompt on stderr, so a piped stdout is still only the
 /// command's own output.
 fn prompt(question: &actions::Question) -> Result<actions::Answer> {
+    prompt_with(question, &mut std::io::stderr(), || {
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line)? == 0 {
+            // The terminal went away mid-question.
+            return Ok(None);
+        }
+        Ok(Some(line))
+    })
+}
+
+/// [`prompt`] with its terminal injected. `read` gives the next line, or
+/// `None` when there is no more input.
+fn prompt_with(
+    question: &actions::Question,
+    out: &mut impl Write,
+    mut read: impl FnMut() -> Result<Option<String>>,
+) -> Result<actions::Answer> {
     let width = question
         .options
         .iter()
         .map(|(value, _)| value.chars().count())
         .max()
         .unwrap_or(0);
-    eprintln!("pando: {}", question.prompt);
+    writeln!(out, "pando: {}", question.prompt)?;
     for (i, (value, why)) in question.options.iter().enumerate() {
         let marker = if question.preselect == Some(i) {
             "*"
         } else {
             " "
         };
-        eprintln!("  {marker}{}) {value:<width$}  {why}", i + 1);
+        writeln!(out, "  {marker}{}) {value:<width$}  {why}", i + 1)?;
     }
     if question.allow_custom {
-        eprintln!("   c) something else — type the command");
+        writeln!(out, "   c) something else — type the command")?;
     }
     let default = question.preselect.map(|i| i + 1);
     loop {
         match default {
-            Some(n) => eprint!("  [{n}] > "),
-            None => eprint!("  > "),
+            Some(n) => write!(out, "  [{n}] > ")?,
+            None => write!(out, "  > ")?,
         }
-        use std::io::Write as _;
-        let _ = std::io::stderr().flush();
-        let mut line = String::new();
-        if std::io::stdin().read_line(&mut line)? == 0 {
-            // The terminal went away mid-question.
+        out.flush()?;
+        let Some(line) = read()? else {
             return Err(needs_answer(question));
-        }
+        };
         let line = line.trim();
         if line.is_empty()
             && let Some(index) = question.preselect
@@ -294,30 +311,45 @@ fn prompt(question: &actions::Question) -> Result<actions::Answer> {
             return Ok(actions::Answer::Choice(index));
         }
         if question.allow_custom && (line == "c" || line == "C") {
-            eprint!("  command > ");
-            let _ = std::io::stderr().flush();
-            let mut custom = String::new();
-            std::io::stdin().read_line(&mut custom)?;
-            let custom = custom.trim().to_string();
+            write!(out, "  command > ")?;
+            out.flush()?;
+            let custom = read()?.unwrap_or_default().trim().to_string();
             if !custom.is_empty() {
                 return Ok(actions::Answer::Custom(custom));
             }
-            eprintln!("pando: an empty command is not an answer");
+            writeln!(out, "pando: an empty command is not an answer")?;
             continue;
         }
-        match line.parse::<usize>() {
-            Ok(n) if n >= 1 && n <= question.options.len() => {
-                return Ok(actions::Answer::Choice(n - 1));
+        // A number is a choice, always — even one that is out of range.
+        // Letting it fall through to "then it must be a command" is how a
+        // fat-fingered `5` on a four-option question became `cmd = "5"`,
+        // written down as an answer and never questioned again. A command
+        // that really is only digits is still reachable through `c`.
+        match line.parse::<i64>() {
+            Ok(_) if !question.options.is_empty() => {
+                let chosen = line
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| *n >= 1 && *n <= question.options.len());
+                match chosen {
+                    Some(n) => return Ok(actions::Answer::Choice(n - 1)),
+                    None => writeln!(
+                        out,
+                        "pando: pick a number between 1 and {}",
+                        question.options.len()
+                    )?,
+                }
             }
-            // A line that is not a number is taken as the command itself,
-            // so nobody has to discover that `c` exists first.
+            // Anything else is taken as the command itself, so nobody has
+            // to discover that `c` exists first.
             _ if question.allow_custom && !line.is_empty() => {
                 return Ok(actions::Answer::Custom(line.to_string()));
             }
-            _ => eprintln!(
+            _ => writeln!(
+                out,
                 "pando: pick a number between 1 and {}",
                 question.options.len()
-            ),
+            )?,
         }
     }
 }
@@ -337,10 +369,14 @@ pub fn render_needs_answer(needs: &actions::NeedsAnswer) -> String {
         ));
     }
     if needs.question.options.is_empty() {
+        // `--yes` takes the first option, and there is no first option, so
+        // offering it is an instruction to run the same failure again.
         out.push_str(
             "  (pando found no candidates for this)
+pando: answer it in pando.toml — nothing pando can accept for you exists here
 ",
         );
+        return out;
     }
     out.push_str(
         "pando: answer it in pando.toml, or rerun with --yes to take the first option
@@ -1210,6 +1246,101 @@ mod tests {
         let text = capture(|b| ls_text_at(&fx.paths, b, 200));
         assert!(text.contains("feat+one"), "{text}");
         assert!(text.contains(" -"), "{text}");
+    }
+
+    // ---- questions -------------------------------------------------------
+
+    fn dev_question(options: &[&str]) -> actions::Question {
+        actions::Question {
+            slot: crate::detect::Slot::DevCmd,
+            prompt: "Which command starts the local development server?".to_string(),
+            options: options
+                .iter()
+                .map(|v| (v.to_string(), "a signal".to_string()))
+                .collect(),
+            preselect: (!options.is_empty()).then_some(0),
+            allow_custom: true,
+        }
+    }
+
+    /// The prompt driven by a script of typed lines, as a terminal would.
+    fn answer_with(
+        question: &actions::Question,
+        lines: &[&str],
+    ) -> (Result<actions::Answer>, String) {
+        let mut typed = lines.iter().map(|l| format!("{l}\n"));
+        let mut out = Vec::new();
+        let answer = prompt_with(question, &mut out, || Ok(typed.next()));
+        (answer, String::from_utf8(out).unwrap())
+    }
+
+    // A fat-fingered number used to fall through to "it must be a command",
+    // so `5` on a four-option question became `cmd = "5"`, dated as if a
+    // human had meant it, and `start` reported success over a shell error.
+    #[test]
+    fn a_number_at_the_prompt_is_always_a_choice() {
+        let question = dev_question(&["pnpm dev", "pnpm dev:web"]);
+        let (answer, printed) = answer_with(&question, &["5", "0", "99", "2"]);
+        assert_eq!(answer.unwrap(), actions::Answer::Choice(1));
+        assert_eq!(
+            printed.matches("pick a number between 1 and 2").count(),
+            3,
+            "every out-of-range number reprints the range: {printed}"
+        );
+        assert!(
+            !printed.contains("command > "),
+            "and none of them is a command: {printed}"
+        );
+    }
+
+    // The way a command that is only digits is still reachable.
+    #[test]
+    fn a_number_typed_after_c_is_taken_as_the_command() {
+        let question = dev_question(&["pnpm dev", "pnpm dev:web"]);
+        let (answer, _) = answer_with(&question, &["c", "5"]);
+        assert_eq!(answer.unwrap(), actions::Answer::Custom("5".to_string()));
+    }
+
+    // Unchanged: anything that is not a number is the command itself, so
+    // nobody has to discover that `c` exists first.
+    #[test]
+    fn a_line_that_is_not_a_number_is_still_the_command() {
+        let question = dev_question(&["pnpm dev"]);
+        let (answer, _) = answer_with(&question, &["./my-own-server"]);
+        assert_eq!(
+            answer.unwrap(),
+            actions::Answer::Custom("./my-own-server".to_string())
+        );
+    }
+
+    // With nothing on offer, a number cannot be a choice at all.
+    #[test]
+    fn a_question_with_no_options_takes_a_number_as_the_command() {
+        let question = dev_question(&[]);
+        let (answer, _) = answer_with(&question, &["5"]);
+        assert_eq!(answer.unwrap(), actions::Answer::Custom("5".to_string()));
+    }
+
+    // `--yes` takes the first option; it cannot take one that is not there.
+    #[test]
+    fn a_question_with_nothing_to_offer_does_not_point_at_yes() {
+        let needs = actions::NeedsAnswer {
+            question: dev_question(&[]),
+        };
+        let text = render_needs_answer(&needs);
+        assert!(
+            !text.contains("--yes"),
+            "there is nothing for --yes to take: {text}"
+        );
+        assert!(text.contains("pando.toml"), "{text}");
+    }
+
+    #[test]
+    fn a_question_with_options_still_points_at_yes() {
+        let needs = actions::NeedsAnswer {
+            question: dev_question(&["pnpm dev", "pnpm dev:web"]),
+        };
+        assert!(render_needs_answer(&needs).contains("--yes"));
     }
 
     // ---- status ----------------------------------------------------------

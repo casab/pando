@@ -454,6 +454,10 @@ pub enum Note {
     Detected(String),
     /// A human answered the question: `# answered: 2026-09-20`.
     Answered,
+    /// `--yes` took the first of this many options. Deliberately not
+    /// `Detected`: no rule decided this, a flag did, and the file has to
+    /// say so or it claims a confidence nothing had.
+    TookFirst(usize),
 }
 
 impl Note {
@@ -463,6 +467,9 @@ impl Note {
         match self {
             Note::Detected(why) => format!("  # detected: {why}"),
             Note::Answered => format!("  # answered: {}", Utc::now().format("%Y-%m-%d")),
+            Note::TookFirst(options) => {
+                format!("  # answered: --yes took the first of {options} options")
+            }
         }
     }
 }

@@ -444,6 +444,11 @@ pub struct Question {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Answer {
     Choice(usize),
+    /// The first option, taken because `--yes` was passed rather than
+    /// because anyone chose it. Written down as exactly that: a config that
+    /// claims a rule decided something a flag decided is a config nobody
+    /// can review.
+    Auto(usize),
     Custom(String),
 }
 
@@ -549,16 +554,14 @@ pub fn resolve(
             (candidate, config::Note::Detected(why))
         } else {
             let question = question_for(proposal);
+            let offered = question.options.len();
             match ask(&question)? {
                 Answer::Choice(index) => {
-                    let candidate = proposal
-                        .candidates
-                        .get(index)
-                        .with_context(|| format!("option {index} is not on offer"))?
-                        .clone();
+                    let candidate = pick(proposal, index)?;
                     let why = candidate.why.clone();
                     (candidate, config::Note::Detected(why))
                 }
+                Answer::Auto(index) => (pick(proposal, index)?, config::Note::TookFirst(offered)),
                 Answer::Custom(value) => {
                     (detect::custom(*slot, value.trim()), config::Note::Answered)
                 }
@@ -574,6 +577,15 @@ pub fn resolve(
         detect::apply(*slot, &candidate, &mut config);
     }
     Ok(config)
+}
+
+/// The candidate an answer chose, by index.
+fn pick(proposal: &detect::Proposal, index: usize) -> Result<detect::Candidate> {
+    proposal
+        .candidates
+        .get(index)
+        .with_context(|| format!("option {index} is not on offer"))
+        .cloned()
 }
 
 fn question_for(proposal: &detect::Proposal) -> Question {

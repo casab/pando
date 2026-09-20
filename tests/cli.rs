@@ -925,3 +925,37 @@ fn follow_keeps_printing_once_the_log_is_longer_than_the_tail() {
     drop(rx);
     let _ = reader.join();
 }
+
+// `--yes` takes the first option of a question nothing decided, so the line
+// it writes may not claim the rules detected it.
+#[test]
+fn yes_records_that_it_took_the_first_option_rather_than_detecting_one() {
+    let e = env_of(Kind::NextMessy);
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+    let out = e.pando(&["start", "feat+one", "--yes"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+
+    let text = std::fs::read_to_string(e.config_file()).unwrap();
+    let cmd = text
+        .lines()
+        .find(|l| l.starts_with("cmd = "))
+        .unwrap_or_else(|| panic!("no dev command was written: {text}"));
+    assert!(
+        cmd.contains("--yes took the first of 4 options"),
+        "the comment has to say a flag chose it: {cmd}"
+    );
+    assert!(
+        !cmd.contains("# detected:"),
+        "the rules did not decide this one: {cmd}"
+    );
+    // And the same for the port question, which had three.
+    let ports = text
+        .lines()
+        .find(|l| l.starts_with("ports = "))
+        .unwrap_or_else(|| panic!("no ports were written: {text}"));
+    assert!(
+        ports.contains("--yes took the first of 3 options"),
+        "{ports}"
+    );
+    assert_eq!(code(&e.pando(&["stop"])), EXIT_OK);
+}
