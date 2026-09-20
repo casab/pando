@@ -4,7 +4,7 @@
 //! direction is inner to outer with no upward imports:
 //!
 //! ```text
-//! paths → project · config · ports · process · state
+//! paths → project · config · ports · process · state · template
 //!       → worktree · cache · log_tail · observe
 //!       → actions
 //!       → cli · tui
@@ -21,6 +21,7 @@ pub mod ports;
 pub mod process;
 pub mod project;
 pub mod state;
+pub mod template;
 #[cfg(test)]
 pub(crate) mod testutil;
 pub mod theme;

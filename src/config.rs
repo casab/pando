@@ -146,10 +146,36 @@ impl PortsSpec {
     }
 
     /// Role names in declaration order, whichever form was written.
+    ///
+    /// Deduplicated: two environment variables may point at the same role
+    /// (`PORT` and `NEXT_PUBLIC_PORT` both meaning `web`), and that is one
+    /// port, not two.
     pub fn roles(&self) -> Vec<String> {
-        match self {
+        let mut out: Vec<String> = Vec::new();
+        let names: Vec<String> = match self {
             PortsSpec::List(v) => v.clone(),
             PortsSpec::Map(m) => m.values().cloned().collect(),
+        };
+        for name in names {
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+        out
+    }
+
+    /// The environment the map form is sugar for: `ports = { PORT = "web" }`
+    /// means `env.PORT = "{port:web}"`.
+    ///
+    /// Expanded here, once, so the rest of pando only ever sees roles plus
+    /// env templates and never has to know which form was written.
+    pub fn env_templates(&self) -> BTreeMap<String, String> {
+        match self {
+            PortsSpec::List(_) => BTreeMap::new(),
+            PortsSpec::Map(m) => m
+                .iter()
+                .map(|(var, role)| (var.clone(), format!("{{port:{role}}}")))
+                .collect(),
         }
     }
 }
@@ -1071,6 +1097,35 @@ prelude = "nvm use"
         let dev = loaded.config.processes.get("dev").expect("processes.dev");
         assert_eq!(dev.cmd, "pnpm dev");
         assert_eq!(dev.ports.roles(), vec!["web".to_string()]);
+    }
+
+    #[test]
+    fn the_map_form_of_ports_is_sugar_for_a_role_plus_an_env_template() {
+        let spec = PortsSpec::Map(BTreeMap::from([("PORT".to_string(), "web".to_string())]));
+        assert_eq!(spec.roles(), vec!["web".to_string()]);
+        assert_eq!(
+            spec.env_templates(),
+            BTreeMap::from([("PORT".to_string(), "{port:web}".to_string())])
+        );
+
+        let list = PortsSpec::List(vec!["web".to_string(), "api".to_string()]);
+        assert_eq!(list.roles(), vec!["web".to_string(), "api".to_string()]);
+        assert!(
+            list.env_templates().is_empty(),
+            "the list form puts the port in the command, not the environment"
+        );
+    }
+
+    // Two variables naming one role is one port: a framework that wants both
+    // `PORT` and `NEXT_PUBLIC_PORT` must get the same number in each.
+    #[test]
+    fn two_env_vars_for_one_role_are_still_one_role() {
+        let spec = PortsSpec::Map(BTreeMap::from([
+            ("PORT".to_string(), "web".to_string()),
+            ("NEXT_PUBLIC_PORT".to_string(), "web".to_string()),
+        ]));
+        assert_eq!(spec.roles(), vec!["web".to_string()]);
+        assert_eq!(spec.env_templates().len(), 2);
     }
 
     #[test]

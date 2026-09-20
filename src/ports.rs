@@ -89,6 +89,98 @@ fn next_base(base: u16, n: usize) -> u16 {
     }
 }
 
+/// Ports for one worktree's roles, and whether they had to move.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Assignment {
+    pub ports: std::collections::BTreeMap<String, u16>,
+    /// True when ports this worktree owned were taken and a new window had
+    /// to be found. The caller says so, because a URL the developer had
+    /// bookmarked has just changed.
+    pub reassigned: bool,
+}
+
+/// Assigns a port per role for `name`, recording them in state.
+///
+/// Ports are stable per worktree: once assigned they are reused on every
+/// later start, so a bookmarked URL keeps working across a stop. They move
+/// only when something else has taken them in the meantime.
+///
+/// The freeness test is the OS probe *and* "not recorded for another
+/// worktree of this project" — a stopped worktree still owns its ports, and
+/// the OS probe alone would hand them to the next caller.
+///
+/// The worktree's record must already exist: only the caller knows its path
+/// and whether pando created it.
+pub fn assign(
+    paths: &crate::paths::PandoPaths,
+    store: &mut crate::state::State,
+    name: &str,
+    roles: &[String],
+) -> anyhow::Result<Assignment> {
+    use anyhow::Context as _;
+    use std::collections::{BTreeMap, HashSet};
+
+    if roles.is_empty() {
+        if let Some(record) = store.worktrees.get_mut(name) {
+            record.ports.clear();
+        }
+        return Ok(Assignment {
+            ports: BTreeMap::new(),
+            reassigned: false,
+        });
+    }
+
+    let taken_by_others: HashSet<u16> = store
+        .worktrees
+        .iter()
+        .filter(|(other, _)| other.as_str() != name)
+        .flat_map(|(_, record)| record.ports.values().copied())
+        .collect();
+
+    let record = store
+        .worktrees
+        .get_mut(name)
+        .with_context(|| format!("no state record for {name}"))?;
+
+    // Reuse only when the recorded set is exactly the roles being asked for:
+    // a worktree that grew a second role gets one consecutive window rather
+    // than a port here and a port there.
+    let recorded: Vec<u16> = roles
+        .iter()
+        .filter_map(|role| record.ports.get(role).copied())
+        .collect();
+    if recorded.len() == roles.len() && record.ports.len() == roles.len() {
+        let usable = recorded
+            .iter()
+            .all(|p| is_port_free(*p) && !taken_by_others.contains(p));
+        if usable {
+            return Ok(Assignment {
+                ports: record.ports.clone(),
+                reassigned: false,
+            });
+        }
+    }
+
+    let had_ports = !record.ports.is_empty();
+    let base = derive_base(paths.project_id(), name);
+    let window = reserve(base, roles.len(), |port| {
+        is_port_free(port) && !taken_by_others.contains(&port)
+    })
+    .with_context(|| {
+        format!(
+            "no free run of {} ports for {name} in {PORT_MIN}..={PORT_MAX}",
+            roles.len()
+        )
+    })?;
+
+    let ports: BTreeMap<String, u16> = roles.iter().cloned().zip(window).collect();
+    record.ports = ports.clone();
+    Ok(Assignment {
+        ports,
+        reassigned: had_ports,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,6 +315,140 @@ mod tests {
         for pair in ports.windows(2) {
             assert_eq!(pair[1], pair[0] + 1);
         }
+    }
+
+    // ---- assign ----------------------------------------------------------
+
+    fn assign_fixture() -> (tempfile::TempDir, crate::paths::PandoPaths) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("acme-shop");
+        std::fs::create_dir_all(&root).unwrap();
+        let project = crate::project::ProjectRef::from_root(&root).unwrap();
+        let paths = crate::paths::PandoPaths::new(dir.path().join("pando-home"), project);
+        (dir, paths)
+    }
+
+    fn with_record(store: &mut crate::state::State, name: &str) {
+        store.worktrees.insert(
+            name.to_string(),
+            crate::state::WorktreeRecord::new(format!("/tmp/{name}"), true),
+        );
+    }
+
+    fn roles(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn assign_records_a_port_per_role_and_reuses_it() {
+        let (_dir, paths) = assign_fixture();
+        let mut store = crate::state::State::new();
+        with_record(&mut store, "feat+one");
+
+        let first = assign(&paths, &mut store, "feat+one", &roles(&["web", "api"])).unwrap();
+        assert_eq!(first.ports.len(), 2);
+        assert!(!first.reassigned);
+        assert_eq!(first.ports["api"], first.ports["web"] + 1, "consecutive");
+        assert_eq!(
+            store.worktrees["feat+one"].ports, first.ports,
+            "the assignment is recorded, so a stopped worktree keeps its ports"
+        );
+
+        let second = assign(&paths, &mut store, "feat+one", &roles(&["web", "api"])).unwrap();
+        assert_eq!(second.ports, first.ports, "ports are stable per worktree");
+        assert!(!second.reassigned);
+    }
+
+    // The OS probe alone would hand a stopped worktree's ports to the next
+    // caller, and the URL the developer had open would start serving someone
+    // else's branch.
+    #[test]
+    fn a_second_worktree_never_takes_the_ports_another_one_owns() {
+        let (_dir, paths) = assign_fixture();
+        let mut store = crate::state::State::new();
+        with_record(&mut store, "feat+one");
+        with_record(&mut store, "feat+two");
+
+        let one = assign(&paths, &mut store, "feat+one", &roles(&["web"])).unwrap();
+        // Force the collision: pretend both hash to the same base.
+        store.worktrees.get_mut("feat+two").unwrap().ports.clear();
+        let two = assign(&paths, &mut store, "feat+two", &roles(&["web"])).unwrap();
+        assert_ne!(one.ports["web"], two.ports["web"]);
+
+        // And explicitly: a worktree asking for a port already recorded
+        // elsewhere is moved off it.
+        let stolen = one.ports["web"];
+        store
+            .worktrees
+            .get_mut("feat+two")
+            .unwrap()
+            .ports
+            .insert("web".to_string(), stolen);
+        let again = assign(&paths, &mut store, "feat+two", &roles(&["web"])).unwrap();
+        assert_ne!(
+            again.ports["web"], stolen,
+            "a port recorded for another worktree is not free"
+        );
+        assert!(again.reassigned);
+    }
+
+    #[test]
+    fn a_recorded_port_that_something_else_bound_moves_and_says_so() {
+        let (_dir, paths) = assign_fixture();
+        let mut store = crate::state::State::new();
+        with_record(&mut store, "feat+one");
+
+        // Bind first and record that port as this worktree's, rather than
+        // assigning and then racing to bind what was just probed free — the
+        // range overlaps the OS ephemeral range, so that race is real.
+        let squatter = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let held = squatter.local_addr().unwrap().port();
+        store
+            .worktrees
+            .get_mut("feat+one")
+            .unwrap()
+            .ports
+            .insert("web".to_string(), held);
+
+        let moved = assign(&paths, &mut store, "feat+one", &roles(&["web"])).unwrap();
+        assert_ne!(moved.ports["web"], held, "a bound port is not reusable");
+        assert!(
+            moved.reassigned,
+            "a moved port is worth telling the user about"
+        );
+        drop(squatter);
+    }
+
+    // A worktree that grows a role gets one consecutive window rather than
+    // its old port plus whatever happened to be next to it.
+    #[test]
+    fn adding_a_role_reassigns_the_whole_window() {
+        let (_dir, paths) = assign_fixture();
+        let mut store = crate::state::State::new();
+        with_record(&mut store, "feat+one");
+        assign(&paths, &mut store, "feat+one", &roles(&["web"])).unwrap();
+        let grown = assign(&paths, &mut store, "feat+one", &roles(&["web", "api"])).unwrap();
+        assert_eq!(grown.ports.len(), 2);
+        assert_eq!(grown.ports["api"], grown.ports["web"] + 1);
+        assert_eq!(store.worktrees["feat+one"].ports.len(), 2);
+    }
+
+    #[test]
+    fn a_process_with_no_roles_gets_no_ports() {
+        let (_dir, paths) = assign_fixture();
+        let mut store = crate::state::State::new();
+        with_record(&mut store, "feat+one");
+        let assigned = assign(&paths, &mut store, "feat+one", &[]).unwrap();
+        assert!(assigned.ports.is_empty());
+        assert!(store.worktrees["feat+one"].ports.is_empty());
+    }
+
+    #[test]
+    fn assigning_for_a_worktree_with_no_record_is_an_error() {
+        let (_dir, paths) = assign_fixture();
+        let mut store = crate::state::State::new();
+        let err = assign(&paths, &mut store, "ghost", &roles(&["web"])).unwrap_err();
+        assert!(format!("{err:#}").contains("ghost"));
     }
 
     #[test]
