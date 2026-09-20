@@ -449,7 +449,10 @@ fn kept_width(items: &[(usize, bool)], separator: usize, keep: &[bool]) -> usize
 /// A centred popup that keeps a minimum width, so a narrow split gets a
 /// readable box rather than a sliver.
 pub fn centered_rect(percent_x: u16, min_width: u16, height: u16, area: Rect) -> Rect {
-    let target = area.width * percent_x / 100;
+    // In u32: a percentage of a width past 1092 overflows a u16 before the
+    // division brings it back — a panic in debug, and silently the wrong
+    // popup width in release.
+    let target = (area.width as u32 * percent_x as u32 / 100) as u16;
     let width = target.max(min_width).min(area.width);
     let [_, middle, _] = Layout::vertical([
         Constraint::Fill(1),
@@ -552,6 +555,17 @@ mod tests {
                 draw(&mut app, width, height);
             }
         }
+        // Well past the width where a percentage of it stops fitting in a
+        // u16 (1093 * 60 overflows), and as tall again: a large display with
+        // a small font really does reach four digits.
+        for width in [1092u16, 1093, 1500, 2000, 3000] {
+            for height in [1u16, 3, 40] {
+                draw(&mut app, width, height);
+            }
+        }
+        for height in [1092u16, 1093, 3000] {
+            draw(&mut app, 80, height);
+        }
     }
 
     #[test]
@@ -572,10 +586,13 @@ mod tests {
         for modal in modals {
             let mut app = test_app(&["feat+one"]);
             app.modal = Some(modal);
-            for width in [1u16, 4, 20, 41, 80, 200] {
+            for width in [1u16, 4, 20, 41, 80, 200, 1092, 1093, 1500, 2000, 3000] {
                 for height in [1u16, 3, 8, 24] {
                     draw(&mut app, width, height);
                 }
+            }
+            for height in [1092u16, 1093, 3000] {
+                draw(&mut app, 80, height);
             }
         }
     }
