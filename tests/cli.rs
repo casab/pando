@@ -870,17 +870,21 @@ fn follow_keeps_printing_once_the_log_is_longer_than_the_tail() {
     std::fs::create_dir_all(log.parent().unwrap()).unwrap();
     std::fs::write(&log, "l1\nl2\nl3\nl4\nl5\n").unwrap();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_pando"))
-        .env("PANDO_HOME", &e.home)
-        .current_dir(&e.root)
-        .args(["logs", "feat+one", "--tail", "3", "-f"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("run pando logs -f");
+    // Under a guard: an assertion that panics part way through must not
+    // leave a follower running for the rest of the day.
+    let mut child = Follower(
+        Command::new(env!("CARGO_BIN_EXE_pando"))
+            .env("PANDO_HOME", &e.home)
+            .current_dir(&e.root)
+            .args(["logs", "feat+one", "--tail", "3", "-f"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("run pando logs -f"),
+    );
 
     let (tx, rx) = mpsc::channel::<String>();
-    let out = child.stdout.take().expect("piped stdout");
+    let out = child.0.stdout.take().expect("piped stdout");
     let reader = std::thread::spawn(move || {
         for line in BufReader::new(out).lines().map_while(Result::ok) {
             if tx.send(line).is_err() {
@@ -920,10 +924,20 @@ fn follow_keeps_printing_once_the_log_is_longer_than_the_tail() {
     assert_eq!(printed("the first line after a truncation"), "fresh-1");
     assert_eq!(printed("the second line after a truncation"), "fresh-2");
 
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(child);
     drop(rx);
     let _ = reader.join();
+}
+
+/// A `logs -f` child that is killed when it goes out of scope, however the
+/// test ended.
+struct Follower(std::process::Child);
+
+impl Drop for Follower {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 // `--yes` takes the first option of a question nothing decided, so the line
