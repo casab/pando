@@ -471,8 +471,17 @@ where
         })?,
         None => DocumentMut::new(),
     };
+    // What the document looks like before the edit, not what the file's own
+    // bytes look like: `toml_edit` normalises some things on the way through
+    // (a file with no trailing newline gains one), and comparing against the
+    // raw bytes would make an edit that changed nothing rewrite the file
+    // anyway.
+    let before = doc.to_string();
     edit(&mut doc)?;
     let body = doc.to_string();
+    if existing.is_some() && body == before {
+        return Ok(());
+    }
     // A header parsed into an empty document becomes its *trailing* trivia,
     // so the first table pando adds would land above it. Prepending the text
     // is the one way it stays at the top; every later patch then carries it
@@ -484,8 +493,8 @@ where
         None if body.trim().is_empty() => return Ok(()),
         None => format!("{NEW_FILE_HEADER}{body}"),
     };
-    // A patch that changes nothing does not touch the file, so mtime-driven
-    // watchers stay quiet and a read-only run stays read-only.
+    // And a file whose bytes already say exactly this is left alone too, so
+    // mtime-driven watchers stay quiet and a re-run stays quiet with them.
     if existing.as_deref() == Some(rendered.as_str()) {
         return Ok(());
     }
@@ -866,6 +875,29 @@ prelude = "nvm use"
             !f.paths.config_file().with_extension("toml.tmp").exists(),
             "the temp file must be renamed away"
         );
+    }
+
+    // The no-op path compares the rendered document with the file's own
+    // bytes, so anything `toml_edit` normalises on the way through would
+    // make an empty patch rewrite the file. These are the shapes that
+    // normalisation would show up in.
+    #[test]
+    fn an_empty_patch_rewrites_nothing_whatever_the_file_looks_like() {
+        for (label, original) in [
+            ("no trailing newline", "[project]\nbase = \"main\""),
+            ("crlf line endings", "[project]\r\nbase = \"main\"\r\n"),
+            (
+                "blank lines and indentation",
+                "\n\n[project]\n  base = \"main\"\n\n\n",
+            ),
+            ("comments only", "# nothing but a comment\n"),
+            ("an empty file", ""),
+        ] {
+            let f = fixture();
+            write_home(&f, original);
+            patch(&f.paths, |_doc| Ok(())).unwrap();
+            assert_eq!(home_text(&f), original, "{label}");
+        }
     }
 
     #[test]
