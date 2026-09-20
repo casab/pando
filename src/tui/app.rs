@@ -1220,6 +1220,21 @@ impl App {
                 self.modal = Some(Modal::Help);
                 return;
             }
+            // Esc unwinds one layer at a time: a live search first — which
+            // is what the search bar's own hint promises — and only then
+            // the viewer. `q` always leaves.
+            KeyCode::Esc
+                if self
+                    .log_view()
+                    .is_some_and(|view| view.search_mode == SearchMode::Active) =>
+            {
+                if let Some(view) = self.log_view_mut() {
+                    view.search_mode = SearchMode::Inactive;
+                    view.search = SearchState::default();
+                    view.filter_to_matches = false;
+                }
+                return;
+            }
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.close_log_viewer();
                 return;
@@ -3762,6 +3777,37 @@ pub mod tests {
         );
         assert_eq!(viewer(&app).search_mode, SearchMode::Inactive);
         assert!(viewer(&app).search.query.is_empty());
+    }
+
+    // The search bar promises "esc clear", so esc has to clear rather than
+    // throw away the whole viewer and the reading position with it. One
+    // layer at a time; a second esc leaves.
+    #[test]
+    fn escape_on_a_live_search_clears_it_and_a_second_one_leaves() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["hit a", "plain", "hit b"]);
+        open_viewer(&mut app, 80, 12);
+        search_for(&mut app, "hit");
+        assert_eq!(viewer(&app).search_mode, SearchMode::Active);
+
+        press(&mut app, KeyCode::Esc);
+        assert!(app.log_view().is_some(), "the viewer stays open");
+        assert_eq!(viewer(&app).search_mode, SearchMode::Inactive);
+        assert!(viewer(&app).search.matches.is_empty());
+
+        press(&mut app, KeyCode::Esc);
+        assert!(app.log_view().is_none(), "and the next one leaves");
+    }
+
+    #[test]
+    fn q_leaves_the_viewer_even_with_a_search_running() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["hit"]);
+        open_viewer(&mut app, 80, 12);
+        search_for(&mut app, "hit");
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.log_view().is_none());
+        assert!(!app.should_quit);
     }
 
     #[test]
