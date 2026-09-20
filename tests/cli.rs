@@ -338,3 +338,44 @@ fn ls_warns_when_the_state_file_cannot_be_used() {
     assert_eq!(code(&out), EXIT_ERROR);
     assert!(stderr(&out).contains("version 3"), "{}", stderr(&out));
 }
+
+// The committed file is the one a teammate can change under you, so the
+// worst it may do is drop out with a warning. Every read-only command has
+// to keep working.
+#[test]
+fn a_committed_pando_toml_pando_cannot_use_does_not_stop_ls() {
+    let e = env();
+    for bad in [
+        "[dev]\ncmd = \"x\"\n\n[processes.api]\ncmd = \"y\"\n",
+        "[project]\nprovision = [\"../shared/.env\"]\n",
+        "[project]\nbase = \"main\"\nnope = 1\n",
+        "[project\nbase =\n",
+    ] {
+        std::fs::write(e.root.join("pando.toml"), bad).unwrap();
+        let out = e.pando(&["ls"]);
+        assert_eq!(code(&out), EXIT_OK, "{bad:?} stderr: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("ignoring"),
+            "{bad:?} should warn: {}",
+            stderr(&out)
+        );
+        assert!(stdout(&out).contains("no worktrees"), "{}", stdout(&out));
+    }
+
+    // pando's own file is a different matter: it fails hard, and says which.
+    std::fs::remove_file(e.root.join("pando.toml")).unwrap();
+    let home_config = e.home.join("projects");
+    std::fs::create_dir_all(&home_config).unwrap();
+    let out = e.pando(&["ls", "--json"]);
+    let listed: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("valid json");
+    let id = listed["project"]["id"].as_str().unwrap();
+    std::fs::create_dir_all(home_config.join(id)).unwrap();
+    std::fs::write(
+        home_config.join(id).join("pando.toml"),
+        "[project]\nnope = 1\n",
+    )
+    .unwrap();
+    let out = e.pando(&["ls"]);
+    assert_eq!(code(&out), EXIT_ERROR, "stdout: {}", stdout(&out));
+    assert!(stderr(&out).contains("nope"), "{}", stderr(&out));
+}

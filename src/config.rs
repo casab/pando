@@ -300,22 +300,61 @@ pub struct Loaded {
 pub fn load(paths: &PandoPaths) -> Result<Loaded> {
     let mut warnings = Vec::new();
     let committed_path = paths.root().join("pando.toml");
+    let home_path = paths.config_file();
+
+    let mut committed = read_table(&committed_path, &mut warnings);
+    if let Some(table) = committed.as_mut() {
+        strip_forbidden_committed_keys(table, &committed_path, &mut warnings);
+    }
+    let home = read_table(&home_path, &mut warnings);
+
+    // A committed file belongs to the team, and to whichever pando wrote
+    // it — a key this build has never heard of is what a *newer* pando's
+    // config looks like. Dropping that layer with a warning is the same
+    // treatment a file that does not even parse already gets; bricking
+    // `pando ls` for everyone who pulled it is not.
+    if let Some(table) = &committed
+        && let Err(e) = build(table.clone(), &paths.project)
+    {
+        warnings.push(format!("ignoring {}: {e:#}", committed_path.display()));
+        committed = None;
+    }
+
     let mut merged = Table::new();
-
-    if let Some(mut table) = read_table(&committed_path, &mut warnings) {
-        strip_forbidden_committed_keys(&mut table, &committed_path, &mut warnings);
+    if let Some(table) = committed.clone() {
         merge_tables(&mut merged, table);
     }
-    if let Some(table) = read_table(&paths.config_file(), &mut warnings) {
+    if let Some(table) = home.clone() {
         merge_tables(&mut merged, table);
     }
 
-    let config: Config = Value::Table(merged)
-        .try_into()
-        .context("parse pando.toml")?;
+    match build(merged, &paths.project) {
+        Ok(config) => Ok(Loaded { config, warnings }),
+        // The home layer is pando's own file, so it still fails hard — but
+        // when each layer is fine alone and only the merge is not, neither
+        // file explains it and both are named.
+        Err(e) => {
+            let layers_conflict = committed.is_some()
+                && home.is_some_and(|table| build(table, &paths.project).is_ok());
+            if layers_conflict {
+                bail!(
+                    "{e:#} — {} and {} cannot both apply",
+                    committed_path.display(),
+                    home_path.display()
+                );
+            }
+            bail!("{e:#} — in {}", home_path.display())
+        }
+    }
+}
+
+/// One layer on its own: deserialise, normalise, validate. A layer that
+/// cannot survive this is not merged into anything.
+fn build(table: Table, project: &ProjectRef) -> Result<Config> {
+    let config: Config = Value::Table(table).try_into().context("parse pando.toml")?;
     let config = normalize(config)?;
-    validate(&config, &paths.project)?;
-    Ok(Loaded { config, warnings })
+    validate(&config, project)?;
+    Ok(config)
 }
 
 /// Only ever writes the pando-home copy. A committed `pando.toml` is never
@@ -814,6 +853,69 @@ auth_cmd = "./scripts/dev-cookie.sh"
         assert_eq!(loaded.config, Config::default());
         assert_eq!(loaded.warnings.len(), 1);
         assert!(loaded.warnings[0].contains("ignoring"));
+    }
+
+    // A committed file is someone else's work, and often a newer pando's.
+    // A key this build does not know, or a value it will not accept, must
+    // not stop `pando ls` for everyone who pulled it — the layer is dropped
+    // with a warning, exactly as a file that does not even parse already is.
+    #[test]
+    fn a_committed_file_that_does_not_validate_is_dropped_with_a_warning() {
+        let f = fixture();
+        for bad in [
+            "[dev]\ncmd = \"x\"\n\n[processes.api]\ncmd = \"y\"\n",
+            "[project]\nprovision = [\"../shared/.env\"]\n",
+            "[project]\nbase = \"main\"\nnope = 1\n",
+        ] {
+            write_committed(&f, bad);
+            let loaded = load(&f.paths).unwrap_or_else(|e| panic!("{bad:?} bricked load: {e:#}"));
+            assert_eq!(
+                loaded.config,
+                Config::default(),
+                "the whole layer is dropped: {bad:?}"
+            );
+            assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
+            assert!(
+                loaded.warnings[0].contains("ignoring"),
+                "{:?}",
+                loaded.warnings
+            );
+        }
+    }
+
+    // The home layer is pando's own file, so a problem there is pando's bug
+    // or the user's edit, and still fails hard.
+    #[test]
+    fn a_home_file_that_does_not_validate_still_fails() {
+        let f = fixture();
+        write_home(&f, "[project]\nbase = \"main\"\nnope = 1\n");
+        let err = load(&f.paths).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("nope"), "{msg}");
+        assert!(
+            msg.contains(&f.paths.config_file().display().to_string()),
+            "the failing file should be named: {msg}"
+        );
+    }
+
+    // Each layer is fine on its own and only the merge is not, so neither
+    // file explains it alone and both are named.
+    #[test]
+    fn a_conflict_that_only_appears_after_merging_names_both_files() {
+        let f = fixture();
+        write_committed(&f, "[dev]\ncmd = \"pnpm dev\"\n");
+        write_home(&f, "[processes.api]\ncmd = \"node api\"\n");
+        let err = load(&f.paths).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("may not both be set"), "{msg}");
+        assert!(
+            msg.contains(&f.root.join("pando.toml").display().to_string()),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(&f.paths.config_file().display().to_string()),
+            "{msg}"
+        );
     }
 
     #[test]
