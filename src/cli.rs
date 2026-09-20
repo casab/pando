@@ -76,18 +76,32 @@ pub enum Command {
     },
     /// Print a worktree's absolute path.
     Path { name: String },
-    /// Start a worktree's dev process.
+    /// Start a worktree's processes.
     Start {
         name: String,
         /// Accept pando's own recommendation for anything it would ask.
         /// Without it, an unanswerable question exits 3.
         #[arg(long)]
         yes: bool,
+        /// One process by name, instead of every one config declares. The
+        /// rest are left exactly as they are, on the ports they have.
+        #[arg(long)]
+        only: Option<String>,
     },
     /// Stop a worktree's processes, or every worktree's when given no name.
-    Stop { name: Option<String> },
+    Stop {
+        name: Option<String>,
+        /// One process by name. The others keep running.
+        #[arg(long, requires = "name")]
+        only: Option<String>,
+    },
     /// Stop and start again, keeping the ports.
-    Restart { name: String },
+    Restart {
+        name: String,
+        /// One process by name. The others are not restarted.
+        #[arg(long)]
+        only: Option<String>,
+    },
     /// What is running, and on which ports.
     Status {
         name: Option<String>,
@@ -159,9 +173,9 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             writeln!(out, "{}", actions::path(paths, &name)?.display())?;
             Ok(())
         }
-        Command::Start { name, yes } => {
+        Command::Start { name, yes, only } => {
             let config = &actions::resolve_process(paths, config, &asker(yes), &notice)?;
-            let report = actions::start(paths, config, &name, None, &notice)?;
+            let report = actions::start(paths, config, &name, only.as_deref(), &notice)?;
             if report.reassigned {
                 eprintln!("pando: the ports {name} had were taken; it moved to new ones");
             }
@@ -173,10 +187,13 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             }
             Ok(())
         }
-        Command::Stop { name } => match name {
+        Command::Stop { name, only } => match name {
             Some(name) => {
-                match actions::stop(paths, &name, None)? {
-                    actions::StopOutcome::Stopped(_) => writeln!(out, "stopped {name}")?,
+                match actions::stop(paths, &name, only.as_deref())? {
+                    actions::StopOutcome::Stopped(processes) => {
+                        notice(&format!("stopped {}", processes.join(", ")));
+                        writeln!(out, "stopped {name}")?;
+                    }
                     actions::StopOutcome::NotRunning => writeln!(out, "{name} was not running")?,
                 }
                 Ok(())
@@ -191,8 +208,8 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
                 Ok(())
             }
         },
-        Command::Restart { name } => {
-            let report = actions::restart(paths, config, &name, None, &notice)?;
+        Command::Restart { name, only } => {
+            let report = actions::restart(paths, config, &name, only.as_deref(), &notice)?;
             writeln!(out, "restarted {name}{}", url_suffix(report.url.as_deref()))?;
             Ok(())
         }
@@ -595,12 +612,15 @@ fn ports_cell(record: Option<&WorktreeRecord>) -> String {
         .join(" ")
 }
 
+/// One word for a whole worktree, however many processes it runs: the
+/// aggregate, so a row never reads `running` while one of its processes is
+/// dead.
 fn status_cell(record: Option<&WorktreeRecord>) -> String {
     let Some(record) = record else {
         return "-".to_string();
     };
-    match record.processes.values().next() {
-        Some(p) => phase_word(&p.phase).to_string(),
+    match crate::state::aggregate_phase(record) {
+        Some(aggregate) => aggregate.word().to_string(),
         None => "-".to_string(),
     }
 }
@@ -881,38 +901,73 @@ pub fn status_text<W: Write>(paths: &PandoPaths, only: Option<&str>, out: &mut W
         .unwrap_or(4);
     for w in shown {
         let record = refreshed.state.worktrees.get(&w.name);
-        let detail = match record {
-            Some(r) if !r.processes.is_empty() => {
-                let (_, p) = r.processes.iter().next().expect("not empty");
-                process_line(p, r)
-            }
-            Some(r) if !r.ports.is_empty() => {
-                format!("stopped   {}", ports_text(&r.ports))
-            }
-            _ => "stopped".to_string(),
-        };
-        writeln!(out, "{:<width$}  {detail}", w.name)?;
+        writeln!(out, "{:<width$}  {}", w.name, worktree_line(record))?;
+        // One line per process under it, so a worktree that is `failed`
+        // says which of its processes is, and each one's pid is reachable.
+        let Some(record) = record else { continue };
+        let process_width = record
+            .processes
+            .keys()
+            .map(|name| name.chars().count())
+            .max()
+            .unwrap_or(0);
+        for (name, p) in &record.processes {
+            writeln!(
+                out,
+                "  {:<process_width$}  {}",
+                name,
+                process_line(p),
+                process_width = process_width
+            )?;
+        }
     }
     Ok(())
 }
 
-fn process_line(p: &ProcessRecord, record: &WorktreeRecord) -> String {
+/// The worktree's own line: its aggregate phase, its ports, and the one URL
+/// it serves on.
+fn worktree_line(record: Option<&WorktreeRecord>) -> String {
+    let Some(record) = record else {
+        return "stopped".to_string();
+    };
     let ports = ports_text(&record.ports);
-    match &p.phase {
-        Phase::Running { since } => {
-            let url = worktree_url(record).unwrap_or_default();
-            format!(
-                "running   {ports}  {url}  pid {}  up {}",
-                p.pid,
-                human_duration(Utc::now().signed_duration_since(*since))
-            )
+    let Some(aggregate) = crate::state::aggregate_phase(record) else {
+        if record.ports.is_empty() {
+            return "stopped".to_string();
         }
-        Phase::Starting { since } => format!(
-            "starting  {ports}  pid {}  for {}",
+        // The ports survive a stop, and saying so is how a developer knows
+        // the URL they bookmarked will still be theirs.
+        return format!("stopped   {ports}");
+    };
+    let age = human_duration(Utc::now().signed_duration_since(aggregate.since()));
+    match aggregate {
+        crate::state::Aggregate::Running { .. } => {
+            let url = worktree_url(record).unwrap_or_default();
+            format!("running   {ports}  {url}  up {age}")
+        }
+        crate::state::Aggregate::Starting { .. } => format!("starting  {ports}  for {age}"),
+        // Named: `failed` on a worktree running three processes is a
+        // question until it says which one.
+        crate::state::Aggregate::Failed { .. } => format!(
+            "failed    {ports}  {}",
+            aggregate.reason().unwrap_or_default()
+        ),
+    }
+}
+
+fn process_line(p: &ProcessRecord) -> String {
+    match &p.phase {
+        Phase::Running { since } => format!(
+            "running   pid {}  up {}",
             p.pid,
             human_duration(Utc::now().signed_duration_since(*since))
         ),
-        Phase::Failed { reason, .. } => format!("failed    {ports}  {reason}"),
+        Phase::Starting { since } => format!(
+            "starting  pid {}  for {}",
+            p.pid,
+            human_duration(Utc::now().signed_duration_since(*since))
+        ),
+        Phase::Failed { reason, .. } => format!("failed    {reason}"),
     }
 }
 
@@ -1486,6 +1541,152 @@ mod tests {
         let text = capture(|b| status_text(&fx.paths, None, b));
         assert!(text.contains("feat+one"), "{text}");
         assert!(text.contains("stopped"), "{text}");
+    }
+
+    /// A worktree running `web` and `api`, recorded as a refresh would
+    /// leave it. `pid` is this test process, which really is alive, so the
+    /// read path does not turn the phase into a failure underneath.
+    fn with_two_processes(fx: &Fx, name: &str, api_phase: Phase) {
+        let mut store = crate::state::load(&fx.paths.state_file()).unwrap();
+        let record = store.worktrees.get_mut(name).unwrap();
+        record.ports.insert("web".to_string(), 17_342);
+        record.ports.insert("api".to_string(), 17_343);
+        record.observed_ports = vec![17_342, 17_343];
+        record.processes.insert(
+            "web".to_string(),
+            crate::state::ProcessRecord {
+                pid: std::process::id(),
+                pgid: 999_998,
+                started_at: Utc::now(),
+                log_path: fx.paths.log_file(name, "web"),
+                ready_port: Some(17_342),
+                ready_timeout_s: None,
+                phase: Phase::Running { since: Utc::now() },
+            },
+        );
+        record.processes.insert(
+            "api".to_string(),
+            crate::state::ProcessRecord {
+                pid: std::process::id(),
+                pgid: 999_997,
+                started_at: Utc::now(),
+                log_path: fx.paths.log_file(name, "api"),
+                ready_port: Some(17_343),
+                ready_timeout_s: None,
+                phase: api_phase,
+            },
+        );
+        crate::state::save(&fx.paths.state_file(), &store).unwrap();
+    }
+
+    #[test]
+    fn status_text_lists_every_process_under_its_worktree() {
+        let fx = fixture();
+        let name = actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
+        with_two_processes(&fx, &name, Phase::Running { since: Utc::now() });
+
+        let text = capture(|b| status_text(&fx.paths, None, b));
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            3,
+            "one worktree line and two process lines:\n{text}"
+        );
+        assert!(lines[0].starts_with("feat+one"), "{text}");
+        assert!(lines[0].contains("running"), "{text}");
+        assert!(
+            lines[0].contains("api 17343") && lines[0].contains("web 17342"),
+            "the worktree line carries every role: {text}"
+        );
+        assert!(
+            lines[0].contains("http://localhost:17342"),
+            "and one URL, the web role's: {text}"
+        );
+        // Indented, in config order, each with its own pid.
+        assert!(lines[1].starts_with("  api"), "{text}");
+        assert!(lines[2].starts_with("  web"), "{text}");
+        for line in &lines[1..] {
+            assert!(
+                line.contains(&format!("pid {}", std::process::id())),
+                "{text}"
+            );
+            assert!(line.contains("running"), "{text}");
+        }
+    }
+
+    #[test]
+    fn status_text_says_which_process_failed() {
+        let fx = fixture();
+        let name = actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
+        with_two_processes(
+            &fx,
+            &name,
+            Phase::Failed {
+                at: Utc::now(),
+                reason: "process exited".to_string(),
+            },
+        );
+
+        let text = capture(|b| status_text(&fx.paths, None, b));
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(
+            lines[0].contains("failed") && lines[0].contains("api: process exited"),
+            "a worktree with a dead api is failed, and says which: {text}"
+        );
+        assert!(
+            lines[1].contains("api") && lines[1].contains("failed"),
+            "{text}"
+        );
+        assert!(
+            lines[2].contains("web") && lines[2].contains("running"),
+            "the process that is still up says so: {text}"
+        );
+    }
+
+    #[test]
+    fn the_listing_shows_the_aggregate_not_the_first_process() {
+        let fx = fixture();
+        let name = actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
+        // `api` sorts first and is running; `web` is the failed one, so a
+        // row that showed the first process would read "running".
+        with_two_processes(&fx, &name, Phase::Running { since: Utc::now() });
+        let mut store = crate::state::load(&fx.paths.state_file()).unwrap();
+        store
+            .worktrees
+            .get_mut(&name)
+            .unwrap()
+            .processes
+            .get_mut("web")
+            .unwrap()
+            .phase = Phase::Failed {
+            at: Utc::now(),
+            reason: "process exited".to_string(),
+        };
+        crate::state::save(&fx.paths.state_file(), &store).unwrap();
+
+        let text = capture(|b| ls_text_at(&fx.paths, b, 200));
+        assert!(
+            text.contains("failed"),
+            "the row is the worst of its processes: {text}"
+        );
+    }
+
+    #[test]
+    fn logs_read_the_source_they_are_asked_for() {
+        let fx = fixture();
+        write_log(&fx, "feat+one", "web", "web line\n");
+        write_log(&fx, "feat+one", "api", "api line\n");
+        let text = capture(|b| logs(&fx.paths, "feat+one", "api", 5, false, false, b));
+        assert_eq!(text, "api line\n");
+
+        let mut out = Vec::new();
+        let err = logs(&fx.paths, "feat+one", "worker", 5, false, false, &mut out).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("worker"), "{msg}");
+        assert!(
+            msg.contains("api") && msg.contains("web"),
+            "an unknown source lists the ones there are: {msg}"
+        );
     }
 
     #[test]

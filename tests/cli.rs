@@ -665,6 +665,100 @@ fn start_status_logs_and_stop_work_from_the_cli() {
     assert_eq!(status_porcelain(&e.root), "");
 }
 
+/// Two processes, each with its own role, in the long `[processes.<name>]`
+/// form the workspace shape uses.
+const PAIR: &str = "[processes.web]\ncmd = \"echo web-ok && sleep 30\"\nports = { PORT = \"web\" }\n\
+                    \n[processes.api]\ncmd = \"echo api-ok && sleep 30\"\nports = { API_PORT = \"api\" }\n";
+
+fn status_of(e: &Env) -> serde_json::Value {
+    serde_json::from_str(&stdout(&e.pando(&["status", "--json"]))).expect("status --json parses")
+}
+
+#[test]
+fn only_starts_and_stops_one_process_of_a_pair() {
+    let e = env();
+    e.write_config(PAIR);
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+
+    let out = e.pando(&["start", "feat+one", "--only", "api"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    let v = status_of(&e);
+    let wt = &v["worktrees"][0];
+    assert_eq!(
+        wt["processes"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        vec!["api"],
+        "only the process it named was started"
+    );
+    let ports = wt["ports"].clone();
+    assert!(
+        ports["web"].is_number() && ports["api"].is_number(),
+        "every role is reserved, whatever was started: {ports}"
+    );
+
+    // The text form: one line for the worktree, one for each process.
+    let out = e.pando(&["status"]);
+    let text = stdout(&out);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    assert!(lines[1].trim_start().starts_with("api"), "{text}");
+
+    let out = e.pando(&["start", "feat+one", "--only", "web"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    let v = status_of(&e);
+    let wt = &v["worktrees"][0];
+    assert_eq!(
+        wt["processes"].as_object().unwrap().len(),
+        2,
+        "and now both are running"
+    );
+    assert_eq!(wt["ports"], ports, "starting the second never moved a port");
+
+    // Stopping one leaves the other exactly as it was.
+    let out = e.pando(&["stop", "feat+one", "--only", "web"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    let v = status_of(&e);
+    assert_eq!(
+        v["worktrees"][0]["processes"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        vec!["api"],
+        "the api never stopped"
+    );
+
+    // And a restart of the one that is left keeps its port.
+    let before = status_of(&e)["worktrees"][0]["processes"]["api"]["pid"].clone();
+    let out = e.pando(&["restart", "feat+one", "--only", "api"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    let v = status_of(&e);
+    assert_ne!(v["worktrees"][0]["processes"]["api"]["pid"], before);
+    assert_eq!(v["worktrees"][0]["ports"], ports);
+
+    assert_eq!(code(&e.pando(&["stop", "feat+one"])), EXIT_OK);
+    assert_eq!(status_porcelain(&e.root), "");
+}
+
+#[test]
+fn an_only_nothing_answers_to_names_the_processes_there_are() {
+    let e = env();
+    e.write_config(PAIR);
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+
+    let out = e.pando(&["start", "feat+one", "--only", "worker"]);
+    assert_eq!(code(&out), EXIT_ERROR, "stdout: {}", stdout(&out));
+    assert!(stderr(&out).contains("api, web"), "{}", stderr(&out));
+
+    // And `--only` without a worktree to apply it to is a usage error, not
+    // a silent stop of everything.
+    let out = e.pando(&["stop", "--only", "api"]);
+    assert_eq!(code(&out), EXIT_USAGE, "stdout: {}", stdout(&out));
+}
+
 #[test]
 fn restart_keeps_the_port_and_replaces_the_process() {
     let e = env();
