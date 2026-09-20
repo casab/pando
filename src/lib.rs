@@ -12,6 +12,8 @@
 
 pub mod config;
 pub mod paths;
+pub mod process;
 pub mod project;
 #[cfg(test)]
 pub(crate) mod testutil;
+pub mod theme;
