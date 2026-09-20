@@ -279,6 +279,19 @@ pub fn paths_for(home: &Path, root: &Path) -> PandoPaths {
     PandoPaths::new(home, ProjectRef::from_root(root).unwrap())
 }
 
+/// The lockfile pnpm writes for a manifest with no dependencies, byte for
+/// byte (pnpm 12.5.1). A stub is not good enough: pnpm rewrites one it
+/// considers malformed even under `--frozen-lockfile`, and then the
+/// fixture's own worktree is dirty for reasons that have nothing to do
+/// with what is being tested.
+const PNPM_LOCK: &str = "lockfileVersion: '9.0'\n\nsettings:\n  autoInstallPeers: true\n  \
+                         excludeLinksFromLockfile: false\n\nimporters:\n\n  .: {}\n";
+
+/// The same for a workspace: pnpm lists every importer it resolved.
+const PNPM_LOCK_WORKSPACE: &str = "lockfileVersion: '9.0'\n\nsettings:\n  autoInstallPeers: true\n  \
+     excludeLinksFromLockfile: false\n\nimporters:\n\n  .: {}\n\n  apps/api: {}\n\n  \
+     apps/web: {}\n";
+
 /// Tracked files, written before the initial commit.
 fn files_for(kind: Kind) -> Vec<(&'static str, &'static str)> {
     match kind {
@@ -300,7 +313,7 @@ fn files_for(kind: Kind) -> Vec<(&'static str, &'static str)> {
 }
 "#,
             ),
-            ("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"),
+            ("pnpm-lock.yaml", PNPM_LOCK),
             (".nvmrc", "22\n"),
             (
                 ".env.example",
@@ -403,7 +416,7 @@ func main() {
 "#,
             ),
             ("pnpm-workspace.yaml", "packages:\n  - 'apps/*'\n"),
-            ("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"),
+            ("pnpm-lock.yaml", PNPM_LOCK_WORKSPACE),
             (
                 "apps/web/package.json",
                 "{\n  \"name\": \"web\",\n  \"scripts\": { \"dev\": \"vite\" }\n}\n",
@@ -447,7 +460,7 @@ func main() {
 }
 "#,
             ),
-            ("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"),
+            ("pnpm-lock.yaml", PNPM_LOCK),
             (".nvmrc", "22\n"),
             ("worker.js", "setInterval(() => {}, 1000);\n"),
             ("scripts/dev.sh", "#!/bin/sh\nexec npm run dev:web\n"),

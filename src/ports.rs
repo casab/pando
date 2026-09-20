@@ -7,7 +7,15 @@
 //! with the same branch name do not collide by default.
 
 pub const PORT_MIN: u16 = 17_000;
-pub const PORT_MAX: u16 = 56_998;
+/// The top of the range, kept below every ephemeral floor pando has to
+/// share a machine with: macOS allocates outgoing ports from 49152 and
+/// Linux from 32768. A base above that can be taken by an unrelated
+/// outgoing connection between the moment pando promises it to a worktree
+/// and the moment the dev server binds it. Measured over 20 000 derived
+/// bases, the old ceiling put 19.5% of them above macOS's floor and 60.5%
+/// above Linux's; this leaves 1971 bases, which is still hundreds of times
+/// more worktrees than anyone has.
+pub const PORT_MAX: u16 = 32_767;
 
 /// Gap between consecutive bases: enough room for a web port plus an api,
 /// database, and cache port without reaching the next worktree's base.
