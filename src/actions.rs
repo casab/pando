@@ -93,7 +93,8 @@ pub fn new(
     let mut store = state::load(&paths.state_file())?;
     // Under the lock, so the porcelain read cannot race a concurrent `new`
     // whose record is already saved but whose worktree this process has not
-    // seen yet.
+    // seen yet. Every record it may drop is signalled first.
+    sweep_orphaned_groups(&store)?;
     drop_stale_worktree_records(&mut store, &root);
 
     std::fs::create_dir_all(&worktrees_dir)
@@ -326,6 +327,8 @@ pub fn rm(paths: &PandoPaths, name: &str, yes: bool, force: bool) -> Result<()> 
     paths.ensure_home()?;
     let _lock = state::lock(&paths.lock_file())?;
     let mut store = state::load(&paths.state_file())?;
+    // Before any record is dropped, whichever worktree it belongs to.
+    sweep_orphaned_groups(&store)?;
     drop_stale_worktree_records(&mut store, paths.root());
     let created_by_pando = store
         .worktrees
@@ -660,6 +663,9 @@ pub fn start(
             proc::stop(pgid, STOP_GRACE)?;
         }
     }
+    // And every *other* worktree's dead-leader group, because `reconcile`
+    // drops those records too.
+    sweep_orphaned_groups(&store)?;
     state::reconcile(&mut store, proc::is_alive);
 
     // A record only vouches for the worktree it was written for; a stale one
@@ -751,6 +757,9 @@ pub fn stop(paths: &PandoPaths, name: &str) -> Result<StopOutcome> {
     let _lock = state::lock(&paths.lock_file())?;
     let mut store = state::load(&paths.state_file())?;
     let outcome = stop_recorded(&mut store, name)?;
+    // `reconcile` drops dead-leader records for every worktree in the
+    // project, not only this one, so every one of them is signalled first.
+    sweep_orphaned_groups(&store)?;
     state::reconcile(&mut store, proc::is_alive);
     state::save(&paths.state_file(), &store)?;
     Ok(outcome)
@@ -758,6 +767,12 @@ pub fn stop(paths: &PandoPaths, name: &str) -> Result<StopOutcome> {
 
 /// Stops every worktree pando has a process for, returning their names.
 pub fn stop_all(paths: &PandoPaths) -> Result<Vec<String>> {
+    stop_all_with(paths, |pgid| proc::stop(pgid, STOP_GRACE))
+}
+
+/// [`stop_all`] with the signal injected, so a test can drive the path
+/// where a group refuses to die without needing one that really does.
+pub fn stop_all_with(paths: &PandoPaths, stop: impl Fn(i32) -> Result<()>) -> Result<Vec<String>> {
     paths.ensure_home()?;
     let _lock = state::lock(&paths.lock_file())?;
     let mut store = state::load(&paths.state_file())?;
@@ -768,19 +783,37 @@ pub fn stop_all(paths: &PandoPaths) -> Result<Vec<String>> {
         .map(|(name, _)| name.clone())
         .collect();
     let mut stopped = Vec::new();
+    let mut failures = Vec::new();
     for name in names {
-        // One worktree that will not die must not leave the rest running.
-        match stop_recorded(&mut store, &name) {
+        // One worktree that will not die must not leave the rest running —
+        // and must not lose its record either. The failures are collected
+        // and reported once every other group has been signalled.
+        match stop_recorded_with(&mut store, &name, &stop) {
             Ok(StopOutcome::Stopped) => stopped.push(name),
             Ok(StopOutcome::NotRunning) => {}
-            Err(e) => {
-                state::save(&paths.state_file(), &store)?;
-                return Err(e.context(format!("stopping {name}")));
-            }
+            Err(e) => failures.push(format!("stopping {name}: {e:#}")),
         }
     }
-    state::reconcile(&mut store, proc::is_alive);
+    // Nothing is dropped while a group is still unaccounted for: the pgid
+    // in that record is the only way back to it.
+    let mut sweep_failed = None;
+    if failures.is_empty() {
+        match sweep_orphaned_groups(&store) {
+            Ok(()) => {
+                state::reconcile(&mut store, proc::is_alive);
+            }
+            Err(e) => sweep_failed = Some(e),
+        }
+    }
+    // Saved either way, so the groups that *were* signalled do not come
+    // back as phantom records on the next read.
     state::save(&paths.state_file(), &store)?;
+    if !failures.is_empty() {
+        bail!("{}", failures.join("; "));
+    }
+    if let Some(e) = sweep_failed {
+        return Err(e);
+    }
     Ok(stopped)
 }
 
@@ -791,19 +824,85 @@ pub fn stop_all(paths: &PandoPaths) -> Result<Vec<String>> {
 /// process's parent by then, so "failed" only ever meant "its leader is
 /// gone" — the group can still be serving.
 fn stop_recorded(store: &mut state::State, name: &str) -> Result<StopOutcome> {
+    stop_recorded_with(store, name, |pgid| proc::stop(pgid, STOP_GRACE))
+}
+
+fn stop_recorded_with(
+    store: &mut state::State,
+    name: &str,
+    stop: impl Fn(i32) -> Result<()>,
+) -> Result<StopOutcome> {
     let Some(record) = store.worktrees.get_mut(name) else {
         return Ok(StopOutcome::NotRunning);
     };
     if record.processes.is_empty() {
         return Ok(StopOutcome::NotRunning);
     }
-    let groups: Vec<i32> = record.processes.values().map(|p| p.pgid).collect();
-    record.processes.clear();
-    record.observed_ports.clear();
-    for pgid in groups {
-        proc::stop(pgid, STOP_GRACE)?;
+    let groups: Vec<(String, i32)> = record
+        .processes
+        .iter()
+        .map(|(process, p)| (process.clone(), p.pgid))
+        .collect();
+    let mut failures = Vec::new();
+    for (process, pgid) in groups {
+        // Signal first, drop second. A record cleared for a group that was
+        // never signalled is a process nothing can find again.
+        match stop(pgid) {
+            Ok(()) => {
+                record.processes.remove(&process);
+            }
+            Err(e) => failures.push(format!("{process} (group {pgid}): {e:#}")),
+        }
+    }
+    if record.processes.is_empty() {
+        record.observed_ports.clear();
+    }
+    if !failures.is_empty() {
+        bail!("{name}: {}", failures.join("; "));
     }
     Ok(StopOutcome::Stopped)
+}
+
+/// Signals every process group in the project whose leader is dead, so that
+/// no record is ever dropped without being signalled first.
+///
+/// `reconcile` drops dead-leader records for *every* worktree in the state
+/// file, while an action only signals the worktree it was asked about. That
+/// seam is how a sibling worktree — one whose `bash -lc` exited while a
+/// child it backgrounded still holds a port — loses its record and leaves a
+/// process nothing can find again. So the sweep is global, and runs before
+/// anything that drops records.
+///
+/// One group that will not die does not stop the sweep: the rest are still
+/// signalled and the failures are reported together. A caller that gets an
+/// error must not go on to drop records.
+fn sweep_orphaned_groups(store: &state::State) -> Result<()> {
+    let mut failures = Vec::new();
+    for (name, record) in &store.worktrees {
+        for (process, p) in &record.processes {
+            if proc::is_alive(p.pid) {
+                continue;
+            }
+            // Unconditional, like every other signal pando sends: a dead
+            // leader is not a dead group. The caveat is pid wraparound — a
+            // sticky Failed record keeps its pgid indefinitely, and after
+            // enough pid churn that number can belong to an unrelated
+            // session leader. Fixing that needs the group's start time
+            // recorded and compared, which is a per-platform lookup; until
+            // then the leak this prevents is by far the likelier harm.
+            if let Err(e) = proc::stop(p.pgid, STOP_GRACE) {
+                failures.push(format!("{name}/{process} (group {}): {e:#}", p.pgid));
+            }
+        }
+    }
+    if failures.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "could not signal {} process group(s) before dropping their records: {}",
+        failures.len(),
+        failures.join("; ")
+    )
 }
 
 /// Stop, then start. The ports come back from the record `stop` left behind,
@@ -1966,6 +2065,146 @@ mod tests {
             1,
             "and its record goes with it"
         );
+    }
+
+    // ---- orphans in *another* worktree ------------------------------------
+
+    /// A worktree whose dev process has already lost its leader: the shell
+    /// exits at once and the child it backgrounded keeps the group — and its
+    /// port — alive. This is the record every `reconcile` is about to drop,
+    /// and dropping it unsignalled is how the child becomes unfindable.
+    ///
+    /// The fixture's config is left holding a plain `sleep`, so a command
+    /// run against *another* worktree afterwards starts something ordinary.
+    fn orphaned_sibling(fx: &mut Fx) -> (String, Detached) {
+        with_dev(fx, dev("sleep 300 & exit 0"));
+        let name = worktree_named(fx, "feat/orphan");
+        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let orphan = guard(&outcome);
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                !crate::process::is_alive(orphan.pid)
+            }),
+            "the shell that backgrounded the child should have exited"
+        );
+        assert!(
+            crate::process::group_alive(orphan.pgid),
+            "the child holds the group open"
+        );
+        with_dev(fx, dev("sleep 30"));
+        (name, orphan)
+    }
+
+    #[test]
+    fn stopping_one_worktree_signals_another_ones_orphan() {
+        let mut fx = fixture();
+        let (orphan_name, orphan) = orphaned_sibling(&mut fx);
+        let other = worktree_named(&fx, "feat/other");
+
+        assert_eq!(stop(&fx.paths, &other).unwrap(), StopOutcome::NotRunning);
+        assert!(
+            !crate::process::group_alive(orphan.pgid),
+            "a record dropped by reconcile must have been signalled first"
+        );
+        assert!(
+            fx.state().worktrees[&orphan_name].processes.is_empty(),
+            "and only then is it dropped"
+        );
+    }
+
+    #[test]
+    fn starting_one_worktree_signals_another_ones_orphan() {
+        let mut fx = fixture();
+        let (_orphan_name, orphan) = orphaned_sibling(&mut fx);
+        let other = worktree_named(&fx, "feat/other");
+
+        let outcome = start(&fx.paths, &fx.config, &other, &noop).unwrap();
+        let _guard = guard(&outcome);
+        assert!(
+            !crate::process::group_alive(orphan.pgid),
+            "starting one worktree must not orphan another one's child"
+        );
+    }
+
+    #[test]
+    fn removing_one_worktree_signals_another_ones_orphan() {
+        let mut fx = fixture();
+        let (_orphan_name, orphan) = orphaned_sibling(&mut fx);
+        let other = worktree_named(&fx, "feat/other");
+
+        rm(&fx.paths, &other, false, false).unwrap();
+        assert!(
+            !crate::process::group_alive(orphan.pgid),
+            "removing one worktree must not orphan another one's child"
+        );
+    }
+
+    #[test]
+    fn creating_a_worktree_signals_another_ones_orphan() {
+        let mut fx = fixture();
+        let (_orphan_name, orphan) = orphaned_sibling(&mut fx);
+
+        worktree_named(&fx, "feat/other");
+        assert!(
+            !crate::process::group_alive(orphan.pgid),
+            "creating a worktree must not orphan another one's child"
+        );
+    }
+
+    // A group that would not die must not have its record cleared: the pgid
+    // is the only way back to it.
+    #[test]
+    fn stop_all_keeps_a_record_whose_group_it_could_not_signal() {
+        let mut fx = fixture();
+        with_dev(&mut fx, dev("sleep 30"));
+        let stubborn = worktree_named(&fx, "feat/stubborn");
+        let willing = worktree_named(&fx, "feat/willing");
+        let mut store = fx.state();
+        for (name, pgid) in [(&stubborn, 4242), (&willing, 4243)] {
+            store
+                .worktrees
+                .entry(name.clone())
+                .or_insert_with(|| WorktreeRecord::new(fx.worktrees_dir().join(name), true))
+                .processes
+                .insert("dev".to_string(), fake_record(pgid));
+        }
+        state::save(&fx.paths.state_file(), &store).unwrap();
+
+        let err = stop_all_with(&fx.paths, |pgid| {
+            if pgid == 4242 {
+                anyhow::bail!("killpg refused");
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains(&stubborn),
+            "the failure names the worktree: {err:#}"
+        );
+
+        let saved = fx.state();
+        assert!(
+            saved.worktrees[&stubborn].processes.contains_key("dev"),
+            "a group that was not signalled keeps its record"
+        );
+        assert!(
+            saved.worktrees[&willing].processes.is_empty(),
+            "the ones that were signalled are cleared, and saved"
+        );
+    }
+
+    /// A process record for a group that does not exist, for tests about
+    /// bookkeeping rather than about signals.
+    fn fake_record(pgid: i32) -> ProcessRecord {
+        ProcessRecord {
+            pid: pgid as u32,
+            pgid,
+            started_at: Utc::now(),
+            log_path: PathBuf::from("/does/not/exist/dev.log"),
+            ready_port: None,
+            ready_timeout_s: None,
+            phase: Phase::Running { since: Utc::now() },
+        }
     }
 
     // ---- restart ---------------------------------------------------------
