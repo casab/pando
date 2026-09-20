@@ -158,6 +158,30 @@ pub fn new(
     Ok(dir_name)
 }
 
+/// The first thing `git worktree remove` would refuse over, when there is
+/// one: a tracked file that differs, or an untracked file the project does
+/// not ignore. `None` means git has no objection.
+///
+/// A prunable worktree has no directory left to look in, and clearing its
+/// entry removes nothing, so there is nothing to refuse.
+fn dirty_entry(worktree: &Worktree) -> Option<String> {
+    if worktree.prunable {
+        return None;
+    }
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(&worktree.path)
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let entry = text.lines().find(|l| !l.trim().is_empty())?;
+    Some(entry.trim().to_string())
+}
+
 /// The name of the built-in install hook, and of its log file.
 pub const INSTALL_HOOK: &str = "install";
 
@@ -341,12 +365,22 @@ pub fn rm(paths: &PandoPaths, name: &str, yes: bool, force: bool) -> Result<()> 
         );
     }
 
-    // Whatever is running goes first. A dev server whose working directory
+    // git's own refusal is the last one, so it is asked first: stopping the
+    // dev server and *then* being told the worktree stays leaves a process
+    // that is gone, a worktree that is not, and a record blaming the
+    // process for pando's kill. The question is the one git asks without
+    // `--force`; ignored files never block a removal and do not show here.
+    if !force && let Some(entry) = dirty_entry(target) {
+        bail!(
+            "{name} contains modified or untracked files ({entry}) — commit or remove them, \
+             or pass --force to let git discard them"
+        );
+    }
+
+    // Whatever is running goes next. A dev server whose working directory
     // has just been deleted is not a process anyone can do anything with,
     // and `rm` removes the record that is the only way to find it again.
-    // Every refusal above has already happened, so a removal pando declines
-    // has not touched it.
-    stop_recorded(&mut store, name)?;
+    let stopped = stop_recorded(&mut store, name)?;
 
     // Nothing is unlinked first. Verified against git 2.51: an ignored file
     // does not block `git worktree remove`, and `--force` does not follow a
@@ -365,7 +399,19 @@ pub fn rm(paths: &PandoPaths, name: &str, yes: bool, force: bool) -> Result<()> 
     cmd.arg(target.path.to_str().context("worktree path is not utf-8")?);
     let out = cmd.output().context("spawn git worktree remove")?;
     if !out.status.success() {
-        bail!("git worktree remove failed: {}", git_failure_reason(&out));
+        // Anything that was running has already been stopped by now and
+        // that cannot be taken back, so the cleared record is saved rather
+        // than left behind to resurface as a phantom failure — and the
+        // message says what actually happened.
+        state::save(&paths.state_file(), &store)?;
+        let reason = git_failure_reason(&out);
+        if stopped == StopOutcome::Stopped {
+            bail!(
+                "git worktree remove failed: {reason} — the dev server was stopped; the \
+                 worktree was kept"
+            );
+        }
+        bail!("git worktree remove failed: {reason}");
     }
 
     let _ = std::fs::remove_dir_all(paths.logs_dir(name));
@@ -634,7 +680,14 @@ pub fn start(
     // lockfiles changed under it — a rebase, a branch switch — gets its
     // dependencies brought up to date, and a long install does not hold the
     // lock the rest of pando needs.
-    install_if_needed(paths, config, name, &canonical, progress)?;
+    // A start that will only report what is already up must not install
+    // first: `npm ci` inside a worktree whose dev server is live is a
+    // surprise nobody asked for. Read without the lock, like the hook's own
+    // fingerprint — the decision it guards is "can this step be skipped",
+    // and the authoritative one is made under the lock below.
+    if !already_running(paths, name, &process_name) {
+        install_if_needed(paths, config, name, &canonical, progress)?;
+    }
 
     let _lock = state::lock(&paths.lock_file())?;
     let mut store = state::load(&paths.state_file())?;
@@ -758,6 +811,22 @@ pub fn start(
         record,
         reassigned: assignment.reassigned,
     })))
+}
+
+/// Whether state already records a live process under this name. Best
+/// effort and lock-free: every caller re-decides under the lock.
+fn already_running(paths: &PandoPaths, name: &str, process: &str) -> bool {
+    let Ok(store) = state::load(&paths.state_file()) else {
+        return false;
+    };
+    store
+        .worktrees
+        .get(name)
+        .and_then(|record| record.processes.get(process))
+        .is_some_and(|p| {
+            matches!(p.phase, Phase::Starting { .. } | Phase::Running { .. })
+                && proc::is_alive(p.pid)
+        })
 }
 
 /// Stops everything running for a worktree. The worktree, its ports, and its
@@ -2920,6 +2989,75 @@ time.sleep(300)
         assert!(fx.names().is_empty());
     }
 
+    // git's refusal is the last one, and it used to come *after* the kill:
+    // the dev server was stopped, git then kept the worktree, and the next
+    // read blamed the process for pando's own kill.
+    #[test]
+    fn rm_refuses_a_dirty_worktree_before_it_stops_anything() {
+        let mut fx = fixture();
+        with_dev(&mut fx, dev("sleep 300"));
+        let name = worktree_named(&fx, "feat/one");
+        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let _guard = guard(&outcome);
+        let pgid = outcome.process().record.pgid;
+        std::fs::write(
+            fx.worktrees_dir().join(&name).join("README.md"),
+            "edited in the worktree\n",
+        )
+        .unwrap();
+
+        let err = rm(&fx.paths, &name, false, false).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("modified or untracked"),
+            "{err:#}"
+        );
+        assert!(
+            crate::process::group_alive(pgid),
+            "a removal pando declined has not touched what is running"
+        );
+        let record = &fx.state().worktrees[&name].processes["dev"];
+        assert!(
+            matches!(record.phase, Phase::Starting { .. } | Phase::Running { .. }),
+            "and the process is not written off for a kill that never happened: {:?}",
+            record.phase
+        );
+    }
+
+    // A start that will only report what is already up must not run an
+    // install first: `npm ci` inside a worktree whose dev server is live is
+    // a surprise nobody asked for.
+    #[test]
+    fn a_start_that_reports_a_running_process_runs_no_install() {
+        let mut fx = fixture();
+        // No lockfile here, so the hook has no fingerprint and runs on
+        // every start — which is what makes this visible at all.
+        let marker = fx.paths.project_dir().join("install-ran");
+        fx.config.project.install = Some(format!("echo ran >> {}", marker.display()));
+        with_dev(&mut fx, dev("sleep 300"));
+        let name = worktree_named(&fx, "feat/one");
+        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let _guard = guard(&outcome);
+        let runs = || {
+            std::fs::read_to_string(&marker)
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        let before = runs();
+        assert!(
+            before > 0,
+            "the hook has to have run at all for this to mean anything"
+        );
+
+        let second = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        assert!(matches!(second, StartOutcome::AlreadyRunning(_)));
+        assert_eq!(
+            runs(),
+            before,
+            "nothing was started, so nothing was installed"
+        );
+    }
+
     // A refusal must still leave the worktree usable: it is only stopped
     // once every reason to refuse has been checked.
     #[test]
@@ -3602,10 +3740,11 @@ time.sleep(300)
 
         let err = rm(&fx.paths, &name, false, false).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("git worktree remove failed"), "{msg}");
+        assert!(msg.contains("modified or untracked"), "{msg}");
+        assert!(msg.contains("--force"), "{msg}");
         assert!(
-            msg.contains("--force") || msg.contains("modified or untracked"),
-            "{msg}"
+            msg.contains("scratch.txt"),
+            "it names what is in the way: {msg}"
         );
         assert_eq!(fx.names(), vec![name.clone()]);
 
@@ -3837,7 +3976,7 @@ time.sleep(300)
 
         let err = rm(&fx.paths, &name, false, false).unwrap_err();
         assert!(
-            format!("{err:#}").contains("git worktree remove failed"),
+            format!("{err:#}").contains("modified or untracked"),
             "{err:#}"
         );
         assert_eq!(fx.names(), vec![name], "the worktree is still there");
