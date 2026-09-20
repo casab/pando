@@ -1,0 +1,235 @@
+//! Deterministic port allocation.
+//!
+//! Each worktree gets a base port derived from a hash of the project id plus
+//! the worktree name, then one consecutive port per role. Bases step by
+//! [`BASE_STEP`] so a worktree that grows from one role to four rarely walks
+//! into a neighbour's base, and the project id is in the hash so two repos
+//! with the same branch name do not collide by default.
+
+pub const PORT_MIN: u16 = 17_000;
+pub const PORT_MAX: u16 = 56_998;
+
+/// Gap between consecutive bases: enough room for a web port plus an api,
+/// database, and cache port without reaching the next worktree's base.
+pub const BASE_STEP: u16 = 8;
+
+/// How many bases fit in the range with a full [`BASE_STEP`] window each, so
+/// every port a base can hand out stays inside `PORT_MIN..=PORT_MAX`.
+const BASE_COUNT: u32 = (PORT_MAX as u32 - PORT_MIN as u32 + 1) / BASE_STEP as u32;
+
+/// Bases tried before giving up. A caller that exhausts this has ~400 ports
+/// bound in its neighbourhood and wants a real error, not a longer walk.
+const MAX_PROBE_ATTEMPTS: u32 = 50;
+
+/// Separator between the hash inputs, so `("ab", "c")` and `("a", "bc")`
+/// cannot hash to the same base.
+const HASH_SEPARATOR: u8 = 0x1f;
+
+pub fn is_port_free(port: u16) -> bool {
+    std::net::TcpListener::bind(("0.0.0.0", port)).is_ok()
+}
+
+/// The base port for a worktree, before any occupancy probing.
+pub fn derive_base(project_id: &str, name: &str) -> u16 {
+    let mut input = Vec::with_capacity(project_id.len() + name.len() + 1);
+    input.extend_from_slice(project_id.as_bytes());
+    input.push(HASH_SEPARATOR);
+    input.extend_from_slice(name.as_bytes());
+    let digest = md5::compute(&input);
+    let num = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]);
+    let base = (num % BASE_COUNT) * BASE_STEP as u32 + PORT_MIN as u32;
+    base as u16
+}
+
+/// `n` consecutive free ports at or after `base`, walking the base grid.
+///
+/// `is_free` must combine the OS probe with the ports already recorded in
+/// state for other worktrees of the project: a stopped worktree still owns
+/// its ports, and the OS probe alone would hand them to someone else.
+pub fn reserve(base: u16, n: usize, is_free: impl Fn(u16) -> bool) -> Option<Vec<u16>> {
+    if n == 0 {
+        return Some(Vec::new());
+    }
+    let mut candidate = align_to_grid(base);
+    for _ in 0..MAX_PROBE_ATTEMPTS {
+        if let Some(window) = window_at(candidate, n)
+            && window.iter().all(|&p| is_free(p))
+        {
+            return Some(window);
+        }
+        candidate = next_base(candidate, n);
+    }
+    None
+}
+
+/// The `n` ports starting at `base`, or `None` when they would run past
+/// `PORT_MAX`.
+fn window_at(base: u16, n: usize) -> Option<Vec<u16>> {
+    let last = base as u32 + n as u32 - 1;
+    if last > PORT_MAX as u32 {
+        return None;
+    }
+    Some((0..n as u16).map(|i| base + i).collect())
+}
+
+fn align_to_grid(port: u16) -> u16 {
+    let clamped = port.clamp(PORT_MIN, PORT_MAX);
+    let offset = (clamped - PORT_MIN) % BASE_STEP;
+    clamped - offset
+}
+
+/// The next base to try, wrapping to `PORT_MIN` once a window of `n` no
+/// longer fits below `PORT_MAX`.
+fn next_base(base: u16, n: usize) -> u16 {
+    let next = base as u32 + BASE_STEP as u32;
+    if next + n as u32 - 1 > PORT_MAX as u32 {
+        PORT_MIN
+    } else {
+        next as u16
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    const PROJECT: &str = "acme-shop-3f9a2c1d";
+
+    #[test]
+    fn derive_base_is_deterministic() {
+        assert_eq!(
+            derive_base(PROJECT, "feat+checkout"),
+            derive_base(PROJECT, "feat+checkout")
+        );
+        assert_ne!(
+            derive_base(PROJECT, "feat+checkout"),
+            derive_base(PROJECT, "feat+cart")
+        );
+    }
+
+    #[test]
+    fn bases_sit_on_the_grid_and_inside_the_range() {
+        for name in [
+            "a",
+            "b",
+            "feat+foo",
+            "v4.1",
+            "",
+            "a-very-long-worktree-name",
+        ] {
+            let base = derive_base(PROJECT, name);
+            assert_eq!(
+                (base - PORT_MIN) % BASE_STEP,
+                0,
+                "{name}: base {base} is off the {BASE_STEP}-port grid"
+            );
+            assert!(
+                (PORT_MIN..=PORT_MAX).contains(&base),
+                "{name}: base {base} out of range"
+            );
+            let last = base + BASE_STEP - 1;
+            assert!(
+                last <= PORT_MAX,
+                "{name}: the base's full window ends at {last}, past PORT_MAX"
+            );
+        }
+    }
+
+    // Without the project id in the hash, two repositories with a branch of
+    // the same name would fight over one port.
+    #[test]
+    fn the_same_name_in_two_projects_gets_different_bases() {
+        assert_ne!(
+            derive_base("acme-shop-3f9a2c1d", "feat+checkout"),
+            derive_base("acme-shop-11111111", "feat+checkout")
+        );
+    }
+
+    #[test]
+    fn the_hash_separator_keeps_split_points_distinct() {
+        assert_ne!(derive_base("ab", "c"), derive_base("a", "bc"));
+    }
+
+    #[test]
+    fn reserve_returns_the_base_window_when_free() {
+        assert_eq!(reserve(17_000, 2, |_| true), Some(vec![17_000, 17_001]));
+        assert_eq!(reserve(17_000, 1, |_| true), Some(vec![17_000]));
+        assert_eq!(reserve(17_000, 0, |_| true), Some(vec![]));
+    }
+
+    #[test]
+    fn reserve_steps_a_whole_base_past_an_occupied_port() {
+        let busy: HashSet<u16> = [17_001].into_iter().collect();
+        assert_eq!(
+            reserve(17_000, 2, |p| !busy.contains(&p)),
+            Some(vec![17_008, 17_009]),
+            "a collision moves to the next base, not the next port"
+        );
+    }
+
+    #[test]
+    fn reserve_walks_past_several_occupied_bases() {
+        let busy: HashSet<u16> = [17_000, 17_008, 17_016].into_iter().collect();
+        assert_eq!(
+            reserve(17_000, 4, |p| !busy.contains(&p)),
+            Some(vec![17_024, 17_025, 17_026, 17_027])
+        );
+    }
+
+    #[test]
+    fn reserve_aligns_an_off_grid_start_down_to_the_grid() {
+        assert_eq!(reserve(17_005, 2, |_| true), Some(vec![17_000, 17_001]));
+    }
+
+    #[test]
+    fn reserve_wraps_at_the_upper_bound() {
+        let last_base = PORT_MIN + (BASE_COUNT as u16 - 1) * BASE_STEP;
+        let busy: HashSet<u16> = (last_base..=PORT_MAX).collect();
+        assert_eq!(
+            reserve(last_base, 2, |p| !busy.contains(&p)),
+            Some(vec![PORT_MIN, PORT_MIN + 1])
+        );
+    }
+
+    #[test]
+    fn reserve_gives_up_after_the_attempt_cap() {
+        assert_eq!(reserve(17_000, 2, |_| false), None);
+    }
+
+    #[test]
+    fn reserved_ports_never_leave_the_range() {
+        // Sweep every base a name can hash to, including the last one, and
+        // ask for more ports than a base's own window holds.
+        for k in [0u32, 1, BASE_COUNT / 2, BASE_COUNT - 2, BASE_COUNT - 1] {
+            let base = PORT_MIN + (k as u16) * BASE_STEP;
+            for n in [1usize, 2, 4, 8, 12] {
+                let ports = reserve(base, n, |_| true)
+                    .unwrap_or_else(|| panic!("base {base} n {n} found nothing"));
+                assert_eq!(ports.len(), n);
+                for p in ports {
+                    assert!(
+                        (PORT_MIN..=PORT_MAX).contains(&p),
+                        "base {base} n {n} produced {p}, outside the range"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reserved_ports_are_consecutive() {
+        let ports = reserve(derive_base(PROJECT, "feat+x"), 4, |_| true).unwrap();
+        for pair in ports.windows(2) {
+            assert_eq!(pair[1], pair[0] + 1);
+        }
+    }
+
+    #[test]
+    fn is_port_free_reports_a_bound_port_as_taken() {
+        let listener = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(!is_port_free(port), "a bound port must not read as free");
+        drop(listener);
+    }
+}
