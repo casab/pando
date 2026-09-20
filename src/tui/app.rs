@@ -1236,6 +1236,26 @@ impl App {
                 self.open_inspect();
                 return;
             }
+            KeyCode::Char('y') => {
+                if let Some(line) = self.current_log_line() {
+                    self.copy_to_clipboard(&line);
+                    // The viewer paints full screen, so the header that
+                    // normally carries a confirmation is not there: the
+                    // footer says it instead, and expires like any status.
+                    self.set_status("✓ copied line");
+                }
+                return;
+            }
+            KeyCode::Char('Y') => {
+                match self.current_log_line().as_deref().and_then(first_url) {
+                    Some(url) => {
+                        self.copy_to_clipboard(&url);
+                        self.set_status(format!("✓ copied {url}"));
+                    }
+                    None => self.set_status("no URL on this line"),
+                }
+                return;
+            }
             _ => {}
         }
 
@@ -1381,8 +1401,10 @@ impl App {
         let Some(inspect) = &mut self.inspect else {
             return;
         };
+        let mut close = false;
+        let mut yank = None;
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('J') => self.inspect = None,
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('J') => close = true,
             KeyCode::Char('j') | KeyCode::Down => {
                 inspect.scroll = inspect.scroll.saturating_add(1);
             }
@@ -1398,7 +1420,19 @@ impl App {
             KeyCode::Char('g') => inspect.scroll = 0,
             // The paint clamps it, so this lands on the real last page.
             KeyCode::Char('G') => inspect.scroll = usize::MAX,
+            // The whole block, pretty-printed — which is the form worth
+            // pasting into an issue.
+            KeyCode::Char('y') => yank = Some(inspect.text.clone()),
             _ => {}
+        }
+        if close {
+            self.inspect = None;
+        }
+        if let Some(text) = yank {
+            let count = text.lines().count();
+            self.copy_to_clipboard(&text);
+            let unit = if count == 1 { "line" } else { "lines" };
+            self.set_status(format!("✓ copied {count} {unit}"));
         }
     }
 
@@ -1448,6 +1482,15 @@ impl App {
             text,
             scroll: 0,
         });
+    }
+
+    /// The plain text of the line the viewer calls "current": the one under
+    /// the cursor, or the last visible line while following. Exactly one
+    /// line, even when it is part of a block — `J` is for the block.
+    fn current_log_line(&self) -> Option<String> {
+        let at = self.current_log_index()?;
+        let view = self.log_view()?;
+        view.tail.lines().get(at).map(|parsed| parsed.plain.clone())
     }
 
     /// The buffer index of the line the viewer calls "current": the one
@@ -2181,6 +2224,23 @@ impl App {
         app.refilter();
         app
     }
+}
+
+/// The first http(s) URL in a line, ending at whitespace or a closing
+/// delimiter. What `Y` yanks: a dev server's address is the one thing in a
+/// log that is worth copying on its own.
+fn first_url(line: &str) -> Option<String> {
+    // Earliest in the line, not first scheme tried: a line that mentions a
+    // plain-http address before an https one means the http one.
+    let (at, scheme_len) = ["https://", "http://"]
+        .iter()
+        .filter_map(|scheme| line.find(scheme).map(|at| (at, scheme.len())))
+        .min_by_key(|(at, _)| *at)?;
+    let rest = &line[at + scheme_len..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '>' | ')'))
+        .unwrap_or(rest.len());
+    Some(line[at..at + scheme_len + end].to_string())
 }
 
 /// Where the errors are, as positions in the visible list: one target per
@@ -4208,6 +4268,141 @@ pub mod tests {
             viewer(&app).cursor,
             1,
             "the error is the second of the two visible lines"
+        );
+    }
+
+    // ---- yank ------------------------------------------------------------
+
+    #[test]
+    fn y_copies_exactly_the_cursor_line_and_says_so() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["first", "second", "third"]);
+        open_viewer(&mut app, 80, 12);
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.clipboard.as_deref(), Some("second"));
+        let (message, is_error) = app.active_status().expect("a confirmation");
+        assert!(message.contains("copied line"), "{message}");
+        assert!(!is_error);
+    }
+
+    #[test]
+    fn y_inside_a_block_copies_the_one_line_not_the_block() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &json_block_log());
+        open_viewer(&mut app, 80, 20);
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(
+            app.clipboard.as_deref(),
+            Some("  \"level\": \"error\","),
+            "y is one line; J is the block"
+        );
+    }
+
+    #[test]
+    fn y_while_following_copies_the_newest_line() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["older", "newest"]);
+        open_viewer(&mut app, 80, 12);
+        assert!(viewer(&app).follow);
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.clipboard.as_deref(), Some("newest"));
+    }
+
+    #[test]
+    fn y_on_an_empty_log_copies_nothing_and_says_nothing() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log::<&str>(&app, "feat+one", "dev", &[]);
+        open_viewer(&mut app, 80, 12);
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.clipboard.is_none());
+        assert!(app.active_status().is_none());
+    }
+
+    #[test]
+    fn capital_y_copies_the_url_on_the_line_or_says_there_is_none() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(
+            &app,
+            "feat+one",
+            "dev",
+            &["no url here", "ready on http://localhost:17342/ in 1.2s"],
+        );
+        open_viewer(&mut app, 80, 12);
+        press(&mut app, KeyCode::Char('Y'));
+        assert_eq!(app.clipboard.as_deref(), Some("http://localhost:17342/"));
+        assert!(app.active_status().unwrap().0.contains("copied http"));
+
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('Y'));
+        assert_eq!(
+            app.clipboard.as_deref(),
+            Some("http://localhost:17342/"),
+            "the clipboard is left as it was"
+        );
+        assert!(app.active_status().unwrap().0.contains("no URL"));
+    }
+
+    #[test]
+    fn first_url_stops_at_whitespace_and_closing_delimiters() {
+        assert_eq!(
+            first_url("ready on http://localhost:17342 now"),
+            Some("http://localhost:17342".to_string())
+        );
+        assert_eq!(
+            first_url("see <https://example.com/a>"),
+            Some("https://example.com/a".to_string())
+        );
+        assert_eq!(
+            first_url("both http://a.test and https://b.test"),
+            Some("http://a.test".to_string()),
+            "the first one"
+        );
+        assert_eq!(first_url("nothing here"), None);
+    }
+
+    #[test]
+    fn y_in_the_overlay_copies_the_whole_block_and_counts_its_lines() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &json_block_log());
+        open_viewer(&mut app, 80, 20);
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('J'));
+        press(&mut app, KeyCode::Char('y'));
+        let copied = app.clipboard.as_deref().expect("the block was copied");
+        assert!(copied.contains("\"msg\": \"boom\""), "{copied}");
+        assert!(copied.lines().count() > 1);
+        let (message, _) = app.active_status().expect("a confirmation");
+        assert!(message.contains("lines"), "{message}");
+    }
+
+    #[test]
+    fn a_single_line_confirmation_is_not_plural() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["a plain line"]);
+        open_viewer(&mut app, 80, 20);
+        press(&mut app, KeyCode::Char('J'));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.active_status().unwrap().0, "✓ copied 1 line");
+    }
+
+    #[test]
+    fn the_yank_confirmation_expires() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["a line"]);
+        open_viewer(&mut app, 80, 12);
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.active_status().is_some());
+        // Rather than sleeping for the whole window, age the status.
+        app.status.as_mut().unwrap().at = Instant::now() - STATUS_TTL;
+        assert!(
+            app.active_status().is_none(),
+            "a confirmation is a confirmation, not a fixture"
         );
     }
 

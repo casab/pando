@@ -2510,6 +2510,49 @@ mod tests {
         );
     }
 
+    // ---- yank ------------------------------------------------------------
+
+    #[test]
+    fn a_yank_confirmation_is_visible_in_the_viewers_footer() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["a line worth copying"]);
+        app.open_log_viewer();
+        draw(&mut app, 80, 12);
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        let painted = text_of(&draw(&mut app, 80, 12));
+        assert!(
+            painted.contains("copied line"),
+            "the viewer paints full screen, so the footer has to say it:\n{painted}"
+        );
+    }
+
+    #[test]
+    fn the_footer_returns_to_its_hints_once_the_confirmation_expires() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["a line"]);
+        app.open_log_viewer();
+        draw(&mut app, 80, 12);
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(text_of(&draw(&mut app, 80, 12)).contains("copied"));
+        app.status.as_mut().unwrap().at =
+            std::time::Instant::now() - std::time::Duration::from_secs(60);
+        let painted = text_of(&draw(&mut app, 80, 12));
+        assert!(!painted.contains("copied"), "{painted}");
+        assert!(painted.contains("j/k move"), "{painted}");
+    }
+
+    #[test]
+    fn a_yank_from_the_overlay_is_confirmed_on_the_overlay() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["{\"a\":1}"]);
+        app.open_log_viewer();
+        draw(&mut app, 80, 20);
+        app.handle_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        let painted = text_of(&draw(&mut app, 80, 20));
+        assert!(painted.contains("copied"), "{painted}");
+    }
+
     // ---- gutters, durations and URL wrapping -----------------------------
 
     #[test]
