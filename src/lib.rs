@@ -12,3 +12,5 @@
 
 pub mod paths;
 pub mod project;
+#[cfg(test)]
+pub(crate) mod testutil;

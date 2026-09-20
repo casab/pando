@@ -1,13 +1,14 @@
 //! The repository pando is looking at, and the identity it derives from it.
 //!
-//! `discover` lands with the next work item; the reference type itself is
-//! here first because `PandoPaths` is built from one.
+//! Discovery is from `git worktree list --porcelain`, whose first entry is
+//! always the main checkout — from any cwd, including inside a linked
+//! worktree. `git rev-parse --git-common-dir` is deliberately not used: from
+//! a subdirectory it prints a relative path such as `../.git`.
 
-use std::path::PathBuf;
+use anyhow::{Context, Result, bail};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
-/// A repository pando manages, identified by the canonical path of its main
-/// checkout. Path-based so the id is stable across sessions and needs no
-/// remote; a moved repository is a new project (known limitation).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectRef {
     /// `<display_name>-<8 hex chars of a hash of the canonical root path>`.
@@ -16,4 +17,208 @@ pub struct ProjectRef {
     pub root: PathBuf,
     /// The main checkout's directory name.
     pub display_name: String,
+}
+
+impl ProjectRef {
+    /// Builds a reference from a main-checkout path. Public so tests and
+    /// later phases (doctor adopting a moved project) can construct one
+    /// without shelling out.
+    pub fn from_root(root: impl AsRef<Path>) -> Result<Self> {
+        let root = canonicalize(root.as_ref());
+        let display_name = root
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "repo".to_string());
+        let id = format!("{display_name}-{}", path_hash8(&root));
+        Ok(Self {
+            id,
+            root,
+            display_name,
+        })
+    }
+}
+
+/// The repository containing `cwd`, or an error naming why not.
+pub fn discover(cwd: &Path) -> Result<ProjectRef> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["worktree", "list", "--porcelain"])
+        .output();
+    let out = match out {
+        Ok(o) if o.status.success() => o,
+        Ok(_) => bail!("not inside a git repository: {}", cwd.display()),
+        Err(e) => bail!("could not run git ({e}) — is git installed?"),
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (root, bare) = first_entry(&text)
+        .with_context(|| format!("git listed no worktrees for {}", cwd.display()))?;
+    if bare {
+        bail!(
+            "bare repositories are not supported: {} has no working tree to manage",
+            root.display()
+        );
+    }
+    ProjectRef::from_root(&root)
+}
+
+/// Path and bare-ness of the porcelain output's first entry — the main
+/// checkout. Entries are separated by a blank line; unknown lines are
+/// ignored, as new git versions add them.
+fn first_entry(porcelain: &str) -> Option<(PathBuf, bool)> {
+    let mut path: Option<PathBuf> = None;
+    let mut bare = false;
+    for line in porcelain.lines() {
+        if line.is_empty() {
+            break;
+        }
+        if let Some(rest) = line.strip_prefix("worktree ") {
+            if path.is_some() {
+                break;
+            }
+            path = Some(PathBuf::from(rest));
+        } else if line == "bare" {
+            bare = true;
+        }
+    }
+    path.map(|p| (p, bare))
+}
+
+/// macOS prints `/var/...` from the shell and `/private/var/...` from git, so
+/// every path is canonicalised before it is hashed or compared. Falls back to
+/// the input when the path does not exist, so error messages still name it.
+fn canonicalize(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// First eight hex characters of md5 over the canonical root path. Not
+/// security — just a short, stable discriminator so two checkouts of the same
+/// repository name do not share a project directory.
+fn path_hash8(root: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let digest = md5::compute(root.as_os_str().as_bytes());
+    format!("{digest:x}")[..8].to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::{git, init_repo};
+    use tempfile::tempdir;
+
+    #[test]
+    fn discovers_the_root_from_the_repository_root() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("acme-shop");
+        init_repo(&repo);
+
+        let project = discover(&repo).unwrap();
+        assert_eq!(project.root, std::fs::canonicalize(&repo).unwrap());
+        assert_eq!(project.display_name, "acme-shop");
+        assert!(project.id.starts_with("acme-shop-"));
+        assert_eq!(project.id.len(), "acme-shop-".len() + 8);
+    }
+
+    #[test]
+    fn subdirectory_and_linked_worktree_resolve_to_the_same_project() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("acme-shop");
+        init_repo(&repo);
+        let nested = repo.join("apps").join("web");
+        std::fs::create_dir_all(&nested).unwrap();
+        let linked = dir.path().join("elsewhere").join("feat+x");
+        std::fs::create_dir_all(linked.parent().unwrap()).unwrap();
+        git(
+            &repo,
+            &["worktree", "add", "-b", "feat/x", linked.to_str().unwrap()],
+        );
+
+        let from_root = discover(&repo).unwrap();
+        let from_sub = discover(&nested).unwrap();
+        let from_linked = discover(&linked).unwrap();
+
+        assert_eq!(from_root, from_sub);
+        assert_eq!(
+            from_root, from_linked,
+            "a linked worktree must resolve to the main checkout's project"
+        );
+    }
+
+    #[test]
+    fn the_id_is_stable_and_path_dependent() {
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("one").join("shop");
+        let b = dir.path().join("two").join("shop");
+        init_repo(&a);
+        init_repo(&b);
+
+        let first = discover(&a).unwrap();
+        assert_eq!(first, discover(&a).unwrap(), "id must be deterministic");
+        let second = discover(&b).unwrap();
+        assert_eq!(first.display_name, second.display_name);
+        assert_ne!(
+            first.id, second.id,
+            "same directory name at different paths must not share a project id"
+        );
+    }
+
+    #[test]
+    fn outside_a_repository_is_an_error() {
+        let dir = tempdir().unwrap();
+        let err = discover(dir.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("not inside a git repository"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn a_bare_repository_is_refused() {
+        let dir = tempdir().unwrap();
+        let bare = dir.path().join("bare.git");
+        git(
+            dir.path(),
+            &[
+                "init",
+                "--bare",
+                "--quiet",
+                "--initial-branch=main",
+                bare.to_str().unwrap(),
+            ],
+        );
+
+        let err = discover(&bare).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("bare repositories are not supported"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn first_entry_reads_the_main_checkout_only() {
+        let text = "worktree /repo\nHEAD abc\nbranch refs/heads/main\n\n\
+                    worktree /elsewhere/feat+x\nHEAD def\nbranch refs/heads/feat/x\n\n";
+        assert_eq!(
+            first_entry(text),
+            Some((PathBuf::from("/repo"), false)),
+            "only the first entry describes the main checkout"
+        );
+    }
+
+    #[test]
+    fn first_entry_reports_a_bare_main_checkout() {
+        assert_eq!(
+            first_entry("worktree /repo.git\nbare\n\n"),
+            Some((PathBuf::from("/repo.git"), true))
+        );
+    }
+
+    #[test]
+    fn first_entry_ignores_unknown_lines_and_empty_output() {
+        assert_eq!(
+            first_entry("worktree /repo\nsomething-new-in-git 1\nHEAD abc\n\n"),
+            Some((PathBuf::from("/repo"), false))
+        );
+        assert_eq!(first_entry(""), None);
+    }
 }
