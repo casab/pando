@@ -12,10 +12,12 @@
 //!    the repository must never be able to redirect where pando writes.
 
 use anyhow::{Context, Result, bail};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use toml::{Table, Value};
+use toml_edit::{DocumentMut, Item, Table as EditTable};
 
 use crate::paths::PandoPaths;
 use crate::project::ProjectRef;
@@ -359,13 +361,159 @@ fn build(table: Table, project: &ProjectRef) -> Result<Config> {
 
 /// Only ever writes the pando-home copy. A committed `pando.toml` is never
 /// touched, which is why this takes `PandoPaths` rather than a path.
+///
+/// Kept for tests and for writing a config from scratch. No user-facing path
+/// calls it: detection answers go through [`patch`], which preserves whatever
+/// the developer wrote around them.
 pub fn write(paths: &PandoPaths, config: &Config) -> Result<()> {
     paths.ensure_home()?;
-    let path = paths.config_file();
     let text = toml::to_string_pretty(config).context("serialize pando.toml")?;
+    write_private_atomic(&paths.config_file(), &text)
+}
+
+/// Header for a `pando.toml` pando is creating from nothing. Written once, so
+/// the first thing a developer opening the file sees is that the comments
+/// below are pando's and deleting them costs nothing.
+const NEW_FILE_HEADER: &str = "\
+# pando.toml — pando's own config for this project.
+# Lines marked \"# detected:\" or \"# answered:\" were written by pando.
+# Everything here is yours to edit; pando only ever adds keys it is missing.
+
+";
+
+/// The mode pando's config is written with. It can carry a command line, and
+/// later phases put service credentials next to it.
+const CONFIG_MODE: u32 = 0o600;
+
+/// Why pando wrote a key, rendered as the trailing comment on its line.
+///
+/// Every value pando puts in the file explains itself, which is what makes a
+/// wrong guess one visible edit away rather than hidden state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Note {
+    /// A rule decided it, and this is the signal that decided: `# detected:
+    /// package.json scripts.dev`.
+    Detected(String),
+    /// A human answered the question: `# answered: 2026-09-20`.
+    Answered,
+}
+
+impl Note {
+    /// Two spaces so the comment does not crowd the value, matching what
+    /// `toml_edit` leaves between a value and a hand-written comment.
+    fn comment(&self) -> String {
+        match self {
+            Note::Detected(why) => format!("  # detected: {why}"),
+            Note::Answered => format!("  # answered: {}", Utc::now().format("%Y-%m-%d")),
+        }
+    }
+}
+
+/// Edits the pando-home `pando.toml` in place, preserving comments, key
+/// order, and formatting.
+///
+/// Re-serialising the struct would be simpler and would throw away everything
+/// the developer wrote: their comments, their ordering, and any key a newer
+/// pando understands and this one does not. So the document is parsed as a
+/// document, edited, and written back.
+pub fn patch<F>(paths: &PandoPaths, edit: F) -> Result<()>
+where
+    F: FnOnce(&mut DocumentMut) -> Result<()>,
+{
+    paths.ensure_home()?;
+    let path = paths.config_file();
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(anyhow::Error::from(e).context(format!("read {}", path.display())));
+        }
+    };
+    let mut doc: DocumentMut = match &existing {
+        // A file pando cannot parse is a file someone is editing. Overwriting
+        // it with a document built from the half of it that parsed would lose
+        // their work; refusing costs them one fix.
+        Some(text) => text.parse().with_context(|| {
+            format!(
+                "{} is not valid TOML — fix it, or move it aside, and run again",
+                path.display()
+            )
+        })?,
+        None => DocumentMut::new(),
+    };
+    edit(&mut doc)?;
+    let body = doc.to_string();
+    // A header parsed into an empty document becomes its *trailing* trivia,
+    // so the first table pando adds would land above it. Prepending the text
+    // is the one way it stays at the top; every later patch then carries it
+    // as the first table's leading comment and preserves it untouched.
+    let rendered = match &existing {
+        Some(_) => body,
+        // Nothing to say and nothing to write: a patch that added no keys to
+        // a project with no config leaves it without one.
+        None if body.trim().is_empty() => return Ok(()),
+        None => format!("{NEW_FILE_HEADER}{body}"),
+    };
+    // A patch that changes nothing does not touch the file, so mtime-driven
+    // watchers stay quiet and a read-only run stays read-only.
+    if existing.as_deref() == Some(rendered.as_str()) {
+        return Ok(());
+    }
+    write_private_atomic(&path, &rendered)
+}
+
+/// Writes one key with the note explaining where it came from. The
+/// convenience every detection answer uses.
+///
+/// `table_path` is the table the key belongs to, for example `["dev"]` or
+/// `["project"]`; missing tables are created.
+pub fn set_detected(
+    paths: &PandoPaths,
+    table_path: &[&str],
+    key: &str,
+    value: impl Into<toml_edit::Value>,
+    note: Note,
+) -> Result<()> {
+    let value = value.into();
+    let comment = note.comment();
+    patch(paths, move |doc| {
+        let table = ensure_table(doc, table_path)?;
+        table.insert(key, Item::Value(value));
+        if let Some(v) = table.get_mut(key).and_then(Item::as_value_mut) {
+            v.decor_mut().set_suffix(comment);
+        }
+        Ok(())
+    })
+}
+
+/// The table at `path`, creating any level that is missing. A path that runs
+/// into a non-table (`dev = 3`) is an error naming it rather than a silent
+/// overwrite of whatever was there.
+fn ensure_table<'a>(doc: &'a mut DocumentMut, path: &[&str]) -> Result<&'a mut EditTable> {
+    let mut table = doc.as_table_mut();
+    for (depth, part) in path.iter().enumerate() {
+        let entry = table
+            .entry(part)
+            .or_insert_with(|| Item::Table(EditTable::new()));
+        table = entry.as_table_mut().with_context(|| {
+            format!(
+                "[{}] in pando.toml is not a table — pando will not overwrite it",
+                path[..=depth].join(".")
+            )
+        })?;
+    }
+    Ok(table)
+}
+
+/// Atomic, and 0600: the temp file is locked down before the rename, so there
+/// is never a moment where a world-readable config exists at the final path.
+fn write_private_atomic(path: &Path, text: &str) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).with_context(|| format!("rename tmp → {}", path.display()))?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(CONFIG_MODE))
+        .with_context(|| format!("chmod 0600 {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("rename tmp → {}", path.display()))?;
     Ok(())
 }
 
@@ -524,6 +672,236 @@ mod tests {
     fn write_home(f: &Fixture, text: &str) {
         std::fs::create_dir_all(f.paths.project_dir()).unwrap();
         std::fs::write(f.paths.config_file(), text).unwrap();
+    }
+
+    fn home_text(f: &Fixture) -> String {
+        std::fs::read_to_string(f.paths.config_file()).unwrap()
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// A file a developer wrote by hand: comments above and beside keys,
+    /// tables out of alphabetical order, and a key pando is about to change.
+    const HANDWRITTEN: &str = r#"# my project
+# two comment lines
+
+[share]
+provider = "cloudflared"
+
+[project]
+# the base everything forks from
+base = "trunk"
+install = "npm ci"   # frozen on purpose
+provision = [".env"]
+
+[runtime]
+prelude = "nvm use"
+"#;
+
+    #[test]
+    fn a_patch_leaves_every_line_it_did_not_touch_byte_for_byte() {
+        let f = fixture();
+        write_home(&f, HANDWRITTEN);
+        set_detected(
+            &f.paths,
+            &["project"],
+            "install",
+            "pnpm install --frozen-lockfile",
+            Note::Detected("pnpm-lock.yaml".into()),
+        )
+        .unwrap();
+
+        let after = home_text(&f);
+        let before_lines: Vec<&str> = HANDWRITTEN.lines().collect();
+        let after_lines: Vec<&str> = after.lines().collect();
+        assert_eq!(
+            before_lines.len(),
+            after_lines.len(),
+            "a patch must not add or remove lines:\n{after}"
+        );
+        for (before, after) in before_lines.iter().zip(&after_lines) {
+            if before.starts_with("install") {
+                assert_eq!(
+                    *after,
+                    "install = \"pnpm install --frozen-lockfile\"  # detected: pnpm-lock.yaml",
+                    "the patched line carries the new value and its note"
+                );
+            } else {
+                assert_eq!(before, after, "an untouched line changed");
+            }
+        }
+        // And it is still the config pando reads back.
+        let loaded = load(&f.paths).unwrap();
+        assert_eq!(
+            loaded.config.project.install.as_deref(),
+            Some("pnpm install --frozen-lockfile")
+        );
+        assert_eq!(loaded.config.project.base.as_deref(), Some("trunk"));
+        assert_eq!(loaded.config.runtime.prelude.as_deref(), Some("nvm use"));
+    }
+
+    #[test]
+    fn a_new_key_lands_in_its_table_without_disturbing_the_others() {
+        let f = fixture();
+        write_home(&f, HANDWRITTEN);
+        set_detected(
+            &f.paths,
+            &["runtime"],
+            "version_files",
+            toml_edit::Array::from_iter([".nvmrc"]),
+            Note::Detected(".nvmrc".into()),
+        )
+        .unwrap();
+
+        let after = home_text(&f);
+        assert!(
+            after.contains("version_files = [\".nvmrc\"]  # detected: .nvmrc"),
+            "{after}"
+        );
+        assert!(after.contains("prelude = \"nvm use\""), "{after}");
+        assert!(
+            after.contains("# the base everything forks from"),
+            "{after}"
+        );
+        assert!(after.starts_with("# my project\n"), "{after}");
+        let loaded = load(&f.paths).unwrap();
+        assert_eq!(loaded.config.runtime.version_files, vec![".nvmrc"]);
+    }
+
+    #[test]
+    fn a_missing_table_is_created_and_the_file_gets_a_header() {
+        let f = fixture();
+        set_detected(
+            &f.paths,
+            &["dev"],
+            "cmd",
+            "pnpm dev",
+            Note::Detected("package.json scripts.dev".into()),
+        )
+        .unwrap();
+
+        let after = home_text(&f);
+        assert!(after.starts_with("# pando.toml"), "{after}");
+        assert!(
+            after.contains("[dev]\n"),
+            "the table is not inline: {after}"
+        );
+        assert!(
+            after.contains("cmd = \"pnpm dev\"  # detected: package.json scripts.dev"),
+            "{after}"
+        );
+        let loaded = load(&f.paths).unwrap();
+        assert_eq!(
+            loaded.config.processes["dev"].cmd, "pnpm dev",
+            "[dev] normalises into processes.dev"
+        );
+    }
+
+    #[test]
+    fn an_answered_note_records_the_date() {
+        let f = fixture();
+        set_detected(&f.paths, &["dev"], "cmd", "pnpm dev:web", Note::Answered).unwrap();
+        let after = home_text(&f);
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        assert!(after.contains(&format!("# answered: {today}")), "{after}");
+    }
+
+    #[test]
+    fn patching_the_same_value_twice_replaces_the_note_and_not_the_file() {
+        let f = fixture();
+        set_detected(&f.paths, &["dev"], "cmd", "a", Note::Detected("one".into())).unwrap();
+        let first = home_text(&f);
+        set_detected(&f.paths, &["dev"], "cmd", "b", Note::Answered).unwrap();
+        let second = home_text(&f);
+        assert!(first.contains("cmd = \"a\"  # detected: one"));
+        assert!(second.contains("cmd = \"b\"  # answered:"), "{second}");
+        assert!(
+            !second.contains("detected: one"),
+            "the stale note must go with the stale value: {second}"
+        );
+    }
+
+    #[test]
+    fn the_config_pando_writes_is_private() {
+        let f = fixture();
+        set_detected(&f.paths, &["dev"], "cmd", "pnpm dev", Note::Answered).unwrap();
+        assert_eq!(mode_of(&f.paths.config_file()), 0o600);
+        // Writing again over an existing file keeps it that way.
+        set_detected(&f.paths, &["dev"], "cwd", "apps/web", Note::Answered).unwrap();
+        assert_eq!(mode_of(&f.paths.config_file()), 0o600);
+        assert!(
+            !f.paths.config_file().with_extension("toml.tmp").exists(),
+            "the temp file must be renamed away"
+        );
+    }
+
+    #[test]
+    fn patching_never_touches_a_committed_pando_toml() {
+        let f = fixture();
+        let committed = "[project]\nbase = \"main\"\n";
+        write_committed(&f, committed);
+        set_detected(
+            &f.paths,
+            &["project"],
+            "install",
+            "pnpm install --frozen-lockfile",
+            Note::Detected("pnpm-lock.yaml".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(f.root.join("pando.toml")).unwrap(),
+            committed,
+            "the repository's own file is read-only to pando"
+        );
+        assert!(f.paths.config_file().starts_with(&f.paths.home));
+    }
+
+    #[test]
+    fn a_home_file_that_is_not_valid_toml_is_never_overwritten() {
+        let f = fixture();
+        let broken = "[project\nbase = \"main\"\n";
+        write_home(&f, broken);
+        let err = set_detected(&f.paths, &["dev"], "cmd", "x", Note::Answered).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not valid TOML"), "{msg}");
+        assert_eq!(
+            home_text(&f),
+            broken,
+            "a file pando cannot parse is a file someone is editing"
+        );
+    }
+
+    #[test]
+    fn a_key_whose_table_is_a_scalar_is_refused_by_name() {
+        let f = fixture();
+        write_home(&f, "dev = 3\n");
+        let err = set_detected(&f.paths, &["dev"], "cmd", "x", Note::Answered).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("[dev]"), "{msg}");
+        assert_eq!(home_text(&f), "dev = 3\n");
+    }
+
+    #[test]
+    fn a_patch_that_changes_nothing_leaves_the_file_alone() {
+        let f = fixture();
+        write_home(&f, HANDWRITTEN);
+        let before = std::fs::metadata(f.paths.config_file())
+            .unwrap()
+            .modified()
+            .unwrap();
+        patch(&f.paths, |_doc| Ok(())).unwrap();
+        assert_eq!(home_text(&f), HANDWRITTEN);
+        assert_eq!(
+            std::fs::metadata(f.paths.config_file())
+                .unwrap()
+                .modified()
+                .unwrap(),
+            before,
+            "an empty patch must not rewrite the file"
+        );
     }
 
     #[test]
