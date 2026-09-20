@@ -246,6 +246,32 @@ pub fn rm(paths: &PandoPaths, config: &Config, name: &str, yes: bool, force: boo
     Ok(())
 }
 
+/// Refuses, once per run and before anything is written, a pando home or a
+/// `worktrees_dir` that lies inside the repository or any worktree git knows
+/// about.
+///
+/// `config::validate` already checks `worktrees_dir` against the repository
+/// root, which is all it can do without git. This is the version that has
+/// the porcelain list, so it also covers linked worktrees, and it covers the
+/// home — which nothing validates, and which is where state, caches, logs
+/// and every worktree pando creates would land.
+pub fn guard_write_locations(paths: &PandoPaths, config: &Config) -> Result<()> {
+    let discovery = worktree::discover_all(&paths.project)?;
+    let worktrees: Vec<PathBuf> = discovery
+        .worktrees
+        .iter()
+        .map(|w| w.path.clone())
+        .chain(std::iter::once(discovery.main.path.clone()))
+        .collect();
+    crate::paths::ensure_outside_repository("pando home", &paths.home, paths.root(), &worktrees)?;
+    crate::paths::ensure_outside_repository(
+        "worktrees_dir",
+        &config.worktrees_dir(paths),
+        paths.root(),
+        &worktrees,
+    )
+}
+
 /// Every managed worktree, enriched with git metadata.
 pub fn ls(paths: &PandoPaths) -> Result<Vec<Worktree>> {
     let mut worktrees = worktree::discover(&paths.project)?;
@@ -1138,6 +1164,46 @@ mod tests {
 
         rm(&fx.paths, &fx.config, &name, false, false).unwrap();
         assert!(!elsewhere.join(&name).exists());
+    }
+
+    // Invariant 1 covers the whole repository, and a linked worktree is part
+    // of it. Neither pando's home nor the directory it creates worktrees in
+    // may sit inside any of them.
+    #[test]
+    fn write_locations_inside_the_repository_or_a_worktree_are_refused() {
+        let mut fx = fixture();
+        let linked = fx.root.parent().unwrap().join("linked");
+        git(
+            &fx.root,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "linked",
+                linked.to_str().unwrap(),
+            ],
+        );
+        guard_write_locations(&fx.paths, &fx.config)
+            .expect("a home beside the repository is what every test uses");
+
+        fx.config.project.worktrees_dir = Some(linked.join("nested"));
+        let err = guard_write_locations(&fx.paths, &fx.config).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("inside the worktree"),
+            "{err:#}"
+        );
+
+        fx.config.project.worktrees_dir = None;
+        for (home, expected) in [
+            (linked.join(".pando"), "inside the worktree"),
+            (fx.root.join(".pando"), "inside the repository"),
+        ] {
+            let paths = PandoPaths::new(&home, fx.paths.project.clone());
+            let err = guard_write_locations(&paths, &fx.config).unwrap_err();
+            assert!(format!("{err:#}").contains(expected), "{err:#}");
+            assert!(!home.exists(), "nothing may be created for a refused home");
+        }
     }
 
     /// Commits an ignore rule on `main` and a branch whose own committed

@@ -113,10 +113,70 @@ impl PandoPaths {
     /// Creates the home directory 0700 and the project directory under it.
     /// Idempotent; called before the first write of any run.
     pub fn ensure_home(&self) -> Result<()> {
+        // The last gate: whatever computed this home, nothing is created
+        // until it is proven to sit outside the repository.
+        ensure_outside_repository("pando home", &self.home, self.root(), &[])?;
         ensure_dir_private(&self.home)?;
         std::fs::create_dir_all(self.project_dir())
             .with_context(|| format!("create {}", self.project_dir().display()))?;
         Ok(())
+    }
+}
+
+/// Refuses a location pando would write to that lies inside the repository,
+/// or inside any of the worktrees it was given. `label` names what the user
+/// set, so the message points at the knob they can turn.
+///
+/// Invariant 1 has no exceptions for a path the user configured: a home or a
+/// `worktrees_dir` in the working tree would fill it with state, caches, and
+/// whole worktrees.
+pub fn ensure_outside_repository(
+    label: &str,
+    path: &Path,
+    root: &Path,
+    worktrees: &[PathBuf],
+) -> Result<()> {
+    let resolved = resolve_for_compare(path);
+    if resolved.starts_with(resolve_for_compare(root)) {
+        anyhow::bail!(
+            "{label} {} is inside the repository {} — pando never writes into your repository",
+            path.display(),
+            root.display()
+        );
+    }
+    for worktree in worktrees {
+        if resolved.starts_with(resolve_for_compare(worktree)) {
+            anyhow::bail!(
+                "{label} {} is inside the worktree {} — pando never writes into your repository",
+                path.display(),
+                worktree.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Canonicalises the deepest existing ancestor and re-appends the rest, so a
+/// not-yet-created path still compares correctly against a canonical root —
+/// on macOS `/var/...` and `/private/var/...` are the same directory.
+pub fn resolve_for_compare(path: &Path) -> PathBuf {
+    let mut suffix = Vec::new();
+    let mut cursor = path.to_path_buf();
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(&cursor) {
+            let mut out = canonical;
+            for part in suffix.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        let Some(name) = cursor.file_name().map(|n| n.to_os_string()) else {
+            return path.to_path_buf();
+        };
+        suffix.push(name);
+        if !cursor.pop() {
+            return path.to_path_buf();
+        }
     }
 }
 
@@ -250,6 +310,29 @@ mod tests {
             mode, HOME_MODE,
             "pando home must be 0700 — later phases copy env files into it"
         );
+    }
+
+    // `ensure_home` is the last gate before pando's home is created, so it
+    // refuses a home inside the repository even when nothing checked earlier.
+    #[test]
+    fn ensure_home_refuses_a_home_inside_the_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap().join("acme-shop");
+        std::fs::create_dir_all(&root).unwrap();
+        let project = ProjectRef {
+            id: "acme-shop-3f9a2c1d".into(),
+            root: root.clone(),
+            display_name: "acme-shop".into(),
+        };
+        let home = root.join(".pando");
+        let p = PandoPaths::new(&home, project);
+
+        let err = p.ensure_home().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("inside the repository"),
+            "unexpected error: {err:#}"
+        );
+        assert!(!home.exists(), "a refused home must not be created");
     }
 
     // The only test that touches the environment. `default_home` is the one

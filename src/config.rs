@@ -346,14 +346,14 @@ fn normalize(mut config: Config) -> Result<Config> {
 
 pub fn validate(config: &Config, project: &ProjectRef) -> Result<()> {
     if let Some(dir) = &config.project.worktrees_dir {
-        let resolved = resolve_for_compare(&expand_tilde(dir));
-        if resolved.starts_with(&project.root) {
-            bail!(
-                "worktrees_dir {} is inside the repository {} — pando never writes into your repository",
-                dir.display(),
-                project.root.display()
-            );
-        }
+        // Against the repository root only: the fuller check, which also
+        // knows about linked worktrees, needs git and runs once at startup.
+        crate::paths::ensure_outside_repository(
+            "worktrees_dir",
+            &expand_tilde(dir),
+            &project.root,
+            &[],
+        )?;
     }
     for entry in &config.project.provision {
         let path = Path::new(entry);
@@ -423,30 +423,6 @@ fn expand_tilde(path: &Path) -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/"));
     home.join(rest)
-}
-
-/// Canonicalises the deepest existing ancestor and re-appends the rest, so a
-/// not-yet-created path still compares correctly against a canonical root —
-/// on macOS `/var/...` and `/private/var/...` are the same directory.
-fn resolve_for_compare(path: &Path) -> PathBuf {
-    let mut suffix = Vec::new();
-    let mut cursor = path.to_path_buf();
-    loop {
-        if let Ok(canonical) = std::fs::canonicalize(&cursor) {
-            let mut out = canonical;
-            for part in suffix.iter().rev() {
-                out.push(part);
-            }
-            return out;
-        }
-        let Some(name) = cursor.file_name().map(|n| n.to_os_string()) else {
-            return path.to_path_buf();
-        };
-        suffix.push(name);
-        if !cursor.pop() {
-            return path.to_path_buf();
-        }
-    }
 }
 
 /// Minimal glob for `[branches].rules`: `*` matches any run of characters,

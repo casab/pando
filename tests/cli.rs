@@ -274,3 +274,37 @@ fn every_fixture_kind_builds_a_clean_repository() {
         );
     }
 }
+
+// `PANDO_HOME` decides where state, caches, logs, and every worktree pando
+// creates live. A home inside the repository puts all of it in the working
+// tree, which Invariant 1 forbids — so it is refused before anything is
+// written, in the absolute and the relative form alike.
+#[test]
+fn a_pando_home_inside_the_repository_is_refused() {
+    let e = env();
+    let absolute = e.root.join(".pando-home");
+    for home in [absolute.to_str().unwrap(), ".pando"] {
+        for args in [["new", "feat/inside"], ["ls", "--json"]] {
+            let out = Command::new(env!("CARGO_BIN_EXE_pando"))
+                .env("PANDO_HOME", home)
+                .current_dir(&e.root)
+                .args(args)
+                .output()
+                .expect("run pando");
+            assert_eq!(
+                code(&out),
+                EXIT_ERROR,
+                "PANDO_HOME={home} {args:?} should be refused; stdout: {}",
+                stdout(&out)
+            );
+            assert!(
+                stderr(&out).contains("inside the repository"),
+                "PANDO_HOME={home}: {}",
+                stderr(&out)
+            );
+        }
+    }
+    assert!(!absolute.exists(), "the refused home must not be created");
+    assert!(!e.root.join(".pando").exists());
+    assert_eq!(status_porcelain(&e.root), "", "the fixture must stay clean");
+}

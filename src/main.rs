@@ -4,7 +4,7 @@ use std::process::ExitCode;
 
 use pando::cli::{Cli, dispatch};
 use pando::paths::{PandoPaths, default_home};
-use pando::{config, project, tui};
+use pando::{actions, config, project, tui};
 
 /// 0 ok, 1 error, 2 usage (clap's own), 3 reserved for needs-answer.
 const EXIT_ERROR: u8 = 1;
@@ -27,11 +27,17 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let project = project::discover(&cwd)?;
-    let paths = PandoPaths::new(default_home(), project);
+    // A relative `PANDO_HOME` is resolved here rather than compared as-is:
+    // `.pando` looks like it is outside the repository until the moment it
+    // is created inside it.
+    let paths = PandoPaths::new(cwd.join(default_home()), project);
     let loaded = config::load(&paths)?;
     for warning in &loaded.warnings {
         eprintln!("pando: {warning}");
     }
+    // Once, before dispatch: every command shares the same home, so a home
+    // in the working tree is worth refusing even on a read-only command.
+    actions::guard_write_locations(&paths, &loaded.config)?;
     match cli.command {
         Some(command) => dispatch(command, &paths, &loaded.config),
         None => tui::run(paths, loaded.config),
