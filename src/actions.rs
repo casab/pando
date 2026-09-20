@@ -6,12 +6,18 @@
 //! with `git check-ignore` before anything is created.
 
 use anyhow::{Context, Result, bail};
+use chrono::Utc;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
-use crate::config::{Config, ProvisionMode};
+use crate::config::{Config, ProcessConfig, ProvisionMode};
 use crate::paths::PandoPaths;
-use crate::state::{self, WorktreeRecord};
+use crate::ports;
+use crate::process::{self as proc, SpawnOptions};
+use crate::state::{self, Phase, ProcessRecord, WorktreeRecord};
+use crate::template;
 use crate::worktree::{self, Worktree};
 
 /// Directory name for a branch: `feat/checkout` becomes `feat+checkout`.
@@ -248,6 +254,397 @@ pub fn rm(paths: &PandoPaths, name: &str, yes: bool, force: bool) -> Result<()> 
     store.worktrees.remove(name);
     state::save(&paths.state_file(), &store)?;
     Ok(())
+}
+
+// ---- start, stop, restart -------------------------------------------------
+
+/// How long a process group gets to exit on its own before SIGKILL.
+const STOP_GRACE: Duration = Duration::from_secs(5);
+
+/// The role `share` and the browser-open key default to, and the role a
+/// readiness rule watches when none is named.
+const DEFAULT_READY_ROLE: &str = "web";
+
+/// What `start` produced, and everything a caller needs to report it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartedProcess {
+    pub worktree: String,
+    /// The process's name in config — `dev` for the `[dev]` shorthand.
+    pub process: String,
+    pub ports: BTreeMap<String, u16>,
+    /// The URL of the readiness role, when this process has one.
+    pub url: Option<String>,
+    pub record: ProcessRecord,
+    /// Ports this worktree owned had been taken, so it moved. Worth saying
+    /// out loud: a URL the developer had bookmarked just changed.
+    pub reassigned: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartOutcome {
+    Started(Box<StartedProcess>),
+    AlreadyRunning(Box<StartedProcess>),
+}
+
+impl StartOutcome {
+    pub fn process(&self) -> &StartedProcess {
+        match self {
+            StartOutcome::Started(p) | StartOutcome::AlreadyRunning(p) => p,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopOutcome {
+    Stopped,
+    /// Nothing was running. Not an error: `stop` is how you make sure.
+    NotRunning,
+}
+
+/// Starts a worktree's dev process.
+///
+/// The shape is `new`'s: take the lock, decide, act, record, save. A process
+/// that is already running is reported rather than started twice; a record
+/// left over from one that died is signalled and cleared first, because a
+/// dead leader does not mean a dead process group.
+pub fn start(
+    paths: &PandoPaths,
+    config: &Config,
+    name: &str,
+    progress: &dyn Fn(&str),
+) -> Result<StartOutcome> {
+    let worktree = find_worktree(paths, name)?;
+    let (process_name, process) = single_process(config)?;
+
+    paths.ensure_home()?;
+    let _lock = state::lock(&paths.lock_file())?;
+    let mut store = state::load(&paths.state_file())?;
+
+    // Before `reconcile` can drop it: a record whose leader is gone may
+    // still have a live child holding the port. Dropping the record first
+    // would leak that child and hand its port to someone else.
+    if let Some(existing) = store
+        .worktrees
+        .get(name)
+        .and_then(|r| r.processes.get(&process_name))
+    {
+        let running = matches!(
+            existing.phase,
+            Phase::Starting { .. } | Phase::Running { .. }
+        ) && proc::is_alive(existing.pid);
+        if running {
+            let ports = store.worktrees[name].ports.clone();
+            return Ok(StartOutcome::AlreadyRunning(Box::new(StartedProcess {
+                worktree: name.to_string(),
+                process: process_name,
+                url: url_for(&ports, existing.ready_port),
+                ports,
+                record: existing.clone(),
+                reassigned: false,
+            })));
+        }
+        progress("clearing what is left of the last run");
+        proc::stop(existing.pgid, STOP_GRACE)?;
+    }
+    state::reconcile(&mut store, proc::is_alive);
+
+    // A record only vouches for the worktree it was written for; a stale one
+    // at another path is replaced rather than inherited.
+    let canonical = std::fs::canonicalize(&worktree.path).unwrap_or_else(|_| worktree.path.clone());
+    let record = store
+        .worktrees
+        .entry(name.to_string())
+        .or_insert_with(|| WorktreeRecord::new(canonical.clone(), false));
+    if crate::paths::resolve_for_compare(&record.path)
+        != crate::paths::resolve_for_compare(&canonical)
+    {
+        *record = WorktreeRecord::new(canonical.clone(), false);
+    }
+    // A sticky failure is for display; starting is the user acting on it.
+    record.processes.remove(&process_name);
+    record.observed_ports.clear();
+
+    let roles = process.ports.roles();
+    let assignment = ports::assign(paths, &mut store, name, &roles)?;
+    let ready_role = ready_role(process, &roles)?;
+    let ready_port = ready_role
+        .as_deref()
+        .and_then(|r| assignment.ports.get(r))
+        .copied();
+
+    let log_file = paths.log_file(name, &process_name);
+    let ctx = template::Context {
+        name,
+        branch: worktree.branch.as_deref(),
+        worktree: &canonical,
+        root: paths.root(),
+        project: paths.project_id(),
+        ports: &assignment.ports,
+        default_role: ready_role.as_deref(),
+        log: Some(&log_file),
+    };
+
+    let cmd = template::render(&process.cmd, &ctx)
+        .with_context(|| format!("in the command for process {process_name}"))?;
+    let cwd = process_cwd(&canonical, process, &ctx)?;
+    let env = process_env(paths, name, &worktree, process, &ctx)?;
+    let shell_cmd = with_prelude(config, &cmd);
+
+    // Truncated, not appended: the classifier reads the tail of this file to
+    // explain a failure, and the closing lines of the *previous* run would
+    // be a confident wrong answer.
+    reset_log(&log_file)?;
+    progress(&format!("starting {process_name}"));
+    let spawn = proc::spawn_detached(SpawnOptions {
+        shell_cmd: &shell_cmd,
+        cwd: &cwd,
+        log_file: &log_file,
+        env: &env,
+    })?;
+
+    let now = Utc::now();
+    let record = ProcessRecord {
+        pid: spawn.pid,
+        pgid: spawn.pgid,
+        started_at: now,
+        log_path: log_file,
+        ready_port,
+        ready_timeout_s: process.ready.as_ref().and_then(|r| r.timeout_s),
+        phase: Phase::Starting { since: now },
+    };
+    store
+        .worktrees
+        .get_mut(name)
+        .expect("the record was just inserted")
+        .processes
+        .insert(process_name.clone(), record.clone());
+    state::save(&paths.state_file(), &store)?;
+
+    Ok(StartOutcome::Started(Box::new(StartedProcess {
+        worktree: name.to_string(),
+        process: process_name,
+        url: url_for(&assignment.ports, ready_port),
+        ports: assignment.ports,
+        record,
+        reassigned: assignment.reassigned,
+    })))
+}
+
+/// Stops everything running for a worktree. The worktree, its ports, and its
+/// logs survive: only the processes go.
+pub fn stop(paths: &PandoPaths, name: &str) -> Result<StopOutcome> {
+    paths.ensure_home()?;
+    let _lock = state::lock(&paths.lock_file())?;
+    let mut store = state::load(&paths.state_file())?;
+    let outcome = stop_recorded(&mut store, name)?;
+    state::reconcile(&mut store, proc::is_alive);
+    state::save(&paths.state_file(), &store)?;
+    Ok(outcome)
+}
+
+/// Stops every worktree pando has a process for, returning their names.
+pub fn stop_all(paths: &PandoPaths) -> Result<Vec<String>> {
+    paths.ensure_home()?;
+    let _lock = state::lock(&paths.lock_file())?;
+    let mut store = state::load(&paths.state_file())?;
+    let names: Vec<String> = store
+        .worktrees
+        .iter()
+        .filter(|(_, r)| !r.processes.is_empty())
+        .map(|(name, _)| name.clone())
+        .collect();
+    let mut stopped = Vec::new();
+    for name in names {
+        // One worktree that will not die must not leave the rest running.
+        match stop_recorded(&mut store, &name) {
+            Ok(StopOutcome::Stopped) => stopped.push(name),
+            Ok(StopOutcome::NotRunning) => {}
+            Err(e) => {
+                state::save(&paths.state_file(), &store)?;
+                return Err(e.context(format!("stopping {name}")));
+            }
+        }
+    }
+    state::reconcile(&mut store, proc::is_alive);
+    state::save(&paths.state_file(), &store)?;
+    Ok(stopped)
+}
+
+/// Signals every process group recorded for `name` and drops the records.
+/// The caller holds the lock and saves.
+///
+/// The signal is unconditional, Failed records included. pando is not the
+/// process's parent by then, so "failed" only ever meant "its leader is
+/// gone" — the group can still be serving.
+fn stop_recorded(store: &mut state::State, name: &str) -> Result<StopOutcome> {
+    let Some(record) = store.worktrees.get_mut(name) else {
+        return Ok(StopOutcome::NotRunning);
+    };
+    if record.processes.is_empty() {
+        return Ok(StopOutcome::NotRunning);
+    }
+    let groups: Vec<i32> = record.processes.values().map(|p| p.pgid).collect();
+    record.processes.clear();
+    record.observed_ports.clear();
+    for pgid in groups {
+        proc::stop(pgid, STOP_GRACE)?;
+    }
+    Ok(StopOutcome::Stopped)
+}
+
+/// Stop, then start. The ports come back from the record `stop` left behind,
+/// so a restart keeps the URL.
+pub fn restart(
+    paths: &PandoPaths,
+    config: &Config,
+    name: &str,
+    progress: &dyn Fn(&str),
+) -> Result<StartOutcome> {
+    stop(paths, name)?;
+    start(paths, config, name, progress)
+}
+
+/// The one process this phase starts.
+///
+/// The config already models several — state records one entry per process
+/// from the start — but running more than one needs a log tab and a
+/// readiness rule each, which is the next phase.
+fn single_process(config: &Config) -> Result<(String, &ProcessConfig)> {
+    let mut processes = config.processes.iter();
+    let Some((name, process)) = processes.next() else {
+        bail!("no processes configured; add [dev] to pando.toml");
+    };
+    if processes.next().is_some() {
+        let names: Vec<&str> = config.processes.keys().map(String::as_str).collect();
+        bail!(
+            "this version starts one process per worktree, and pando.toml configures {}: {}",
+            names.len(),
+            names.join(", ")
+        );
+    }
+    Ok((name.clone(), process))
+}
+
+/// The role whose port has to bind before the process counts as running.
+///
+/// `web` when it owns one, because that is the role everything else defaults
+/// to; otherwise its first role. A process with no ports has none, and is
+/// running as soon as it is alive.
+fn ready_role(process: &ProcessConfig, roles: &[String]) -> Result<Option<String>> {
+    if let Some(named) = process.ready.as_ref().and_then(|r| r.role.as_deref()) {
+        if !roles.iter().any(|r| r == named) {
+            bail!(
+                "ready.role = {named:?} names a role this process does not own — it owns {}",
+                if roles.is_empty() {
+                    "none".to_string()
+                } else {
+                    roles.join(", ")
+                }
+            );
+        }
+        return Ok(Some(named.to_string()));
+    }
+    Ok(roles
+        .iter()
+        .find(|r| r.as_str() == DEFAULT_READY_ROLE)
+        .or_else(|| roles.first())
+        .cloned())
+}
+
+fn url_for(ports: &BTreeMap<String, u16>, ready_port: Option<u16>) -> Option<String> {
+    let port = ready_port.or_else(|| ports.get(DEFAULT_READY_ROLE).copied())?;
+    Some(format!("http://localhost:{port}"))
+}
+
+/// The directory the process runs in: the worktree, or the subdirectory
+/// config names. A monorepo app sets `cwd = "apps/web"`.
+fn process_cwd(
+    worktree: &Path,
+    process: &ProcessConfig,
+    ctx: &template::Context<'_>,
+) -> Result<PathBuf> {
+    let Some(relative) = process.cwd.as_deref() else {
+        return Ok(worktree.to_path_buf());
+    };
+    let rendered = template::render(relative, ctx).context("in cwd")?;
+    let dir = worktree.join(&rendered);
+    if !dir.is_dir() {
+        bail!(
+            "cwd {rendered:?} does not exist in this worktree ({}) — check [dev].cwd",
+            dir.display()
+        );
+    }
+    Ok(dir)
+}
+
+/// The environment the process is started with: the ports the map form of
+/// `ports` is sugar for, then whatever `env` sets, then pando's own
+/// variables.
+///
+/// `PANDO_*` last and unconditional: a hook or a script needs to be able to
+/// find out which worktree it is in, and config cannot be allowed to lie
+/// about that.
+fn process_env(
+    paths: &PandoPaths,
+    name: &str,
+    worktree: &Worktree,
+    process: &ProcessConfig,
+    ctx: &template::Context<'_>,
+) -> Result<Vec<(String, String)>> {
+    let mut env: BTreeMap<String, String> = BTreeMap::new();
+    for (var, tmpl) in process.ports.env_templates() {
+        env.insert(
+            var.clone(),
+            template::render(&tmpl, ctx).with_context(|| format!("in ports.{var}"))?,
+        );
+    }
+    for (var, tmpl) in &process.env {
+        env.insert(
+            var.clone(),
+            template::render(tmpl, ctx).with_context(|| format!("in env.{var}"))?,
+        );
+    }
+    env.insert("PANDO_NAME".into(), name.to_string());
+    env.insert(
+        "PANDO_BRANCH".into(),
+        worktree.branch.clone().unwrap_or_else(|| name.to_string()),
+    );
+    env.insert("PANDO_WORKTREE".into(), ctx.worktree.display().to_string());
+    env.insert("PANDO_ROOT".into(), paths.root().display().to_string());
+    env.insert("PANDO_PROJECT".into(), paths.project_id().to_string());
+    Ok(env.into_iter().collect())
+}
+
+/// `[runtime].prelude`, when set, runs before every command pando starts, so
+/// a version manager sourced from a login profile is in effect. The shell is
+/// `bash -lc`, so `.bash_profile` is read and `.zshrc` is not.
+pub fn with_prelude(config: &Config, cmd: &str) -> String {
+    match config.runtime.prelude.as_deref().map(str::trim) {
+        Some(prelude) if !prelude.is_empty() => format!("{prelude} && {cmd}"),
+        _ => cmd.to_string(),
+    }
+}
+
+/// Empties a log file before a run, creating its directory.
+fn reset_log(log_file: &Path) -> Result<()> {
+    if let Some(parent) = log_file.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create log dir {}", parent.display()))?;
+    }
+    std::fs::write(log_file, b"").with_context(|| format!("truncate {}", log_file.display()))
+}
+
+/// The managed worktree called `name`, or an error naming what is there.
+fn find_worktree(paths: &PandoPaths, name: &str) -> Result<Worktree> {
+    let discovery = worktree::discover_all(&paths.project)?;
+    if discovery.main.name == name {
+        bail!("{name:?} is the main checkout — pando starts worktrees, not the repository itself");
+    }
+    discovery
+        .worktrees
+        .into_iter()
+        .find(|w| w.name == name)
+        .with_context(|| format!("no worktree named {name:?}"))
 }
 
 /// Refuses, once per run and before anything is written, a pando home or a
@@ -584,6 +981,529 @@ mod tests {
     }
 
     fn noop(_: &str) {}
+
+    // ---- start, stop, restart helpers ------------------------------------
+
+    use crate::config::{PortsSpec, ReadySpec};
+    use crate::testutil::{Detached, python_listener, python3_available, wait_until};
+    use std::time::Duration;
+
+    /// A dev process with one `web` role exposed as `PORT`, the shape almost
+    /// every JavaScript project has.
+    fn dev(cmd: &str) -> ProcessConfig {
+        ProcessConfig {
+            cmd: cmd.to_string(),
+            ports: PortsSpec::Map(BTreeMap::from([("PORT".to_string(), "web".to_string())])),
+            ..Default::default()
+        }
+    }
+
+    fn with_dev(fx: &mut Fx, process: ProcessConfig) {
+        fx.config.processes.insert("dev".to_string(), process);
+    }
+
+    /// Stops whatever a test started even when an assertion panics first. No
+    /// test in this crate may leave a process behind.
+    fn guard(outcome: &StartOutcome) -> Detached {
+        let p = outcome.process();
+        Detached {
+            pid: p.record.pid,
+            pgid: p.record.pgid,
+        }
+    }
+
+    fn log_of(fx: &Fx, name: &str) -> String {
+        std::fs::read_to_string(fx.paths.log_file(name, "dev")).unwrap_or_default()
+    }
+
+    /// Creates a worktree and returns its directory name.
+    fn worktree_named(fx: &Fx, branch: &str) -> String {
+        new(&fx.paths, &fx.config, branch, None, &noop).unwrap()
+    }
+
+    // ---- start -----------------------------------------------------------
+
+    #[test]
+    fn start_spawns_the_dev_process_and_records_it() {
+        let mut fx = fixture();
+        with_dev(&mut fx, dev("sleep 30"));
+        let name = worktree_named(&fx, "feat/one");
+
+        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let _guard = guard(&outcome);
+        let started = outcome.process();
+        assert!(matches!(outcome, StartOutcome::Started(_)));
+        assert_eq!(started.worktree, name);
+        assert_eq!(started.process, "dev");
+        assert_eq!(started.ports.len(), 1, "one role, one port");
+        let port = started.ports["web"];
+        assert_eq!(
+            started.url.as_deref(),
+            Some(&*format!("http://localhost:{port}"))
+        );
+        assert!(!started.reassigned);
+
+        let record = &fx.state().worktrees[&name].processes["dev"];
+        assert_eq!(record.ready_port, Some(port));
+        assert!(matches!(record.phase, Phase::Starting { .. }));
+        assert!(crate::process::is_alive(record.pid));
+        assert_eq!(
+            record.log_path,
+            fx.paths.log_file(&name, "dev"),
+            "the log lives under pando's home, one file per source"
+        );
+        assert_eq!(
+            fx.state().worktrees[&name].ports["web"],
+            port,
+            "the port is recorded, so a stopped worktree keeps it"
+        );
+    }
+
+    #[test]
+    fn start_runs_in_the_worktree_with_the_ports_and_pando_variables_in_the_environment() {
+        let mut fx = fixture();
+        with_dev(&mut fx, dev("pwd && env | sort && sleep 30"));
+        fx.config.runtime.prelude = Some("echo prelude-ran".to_string());
+        let name = worktree_named(&fx, "feat/one");
+
+        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let _guard = guard(&outcome);
+        let port = outcome.process().ports["web"];
+        let worktree = fx.worktrees_dir().join(&name).canonicalize().unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(10), || log_of(&fx, &name)
+                .contains("PANDO_PROJECT")),
+            "the environment never reached the log: {:?}",
+            log_of(&fx, &name)
+        );
+        let log = log_of(&fx, &name);
+        assert!(
+            log.contains("prelude-ran"),
+            "the prelude did not run: {log}"
+        );
+        assert!(
+            log.contains(&worktree.display().to_string()),
+            "the process must run in its worktree: {log}"
+        );
+        for expected in [
+            format!("PORT={port}"),
+            format!("PANDO_NAME={name}"),
+            "PANDO_BRANCH=feat/one".to_string(),
+            format!("PANDO_WORKTREE={}", worktree.display()),
+            format!("PANDO_ROOT={}", fx.root.display()),
+            format!("PANDO_PROJECT={}", fx.paths.project_id()),
+        ] {
+            assert!(log.contains(&expected), "missing {expected} in:\n{log}");
+        }
+    }
+
+    #[test]
+    fn start_renders_the_port_into_the_command_for_a_positional_framework() {
+        let mut fx = fixture();
+        with_dev(
+            &mut fx,
+            ProcessConfig {
+                cmd: "echo serving on 127.0.0.1:{port:web} && sleep 30".to_string(),
+                ports: PortsSpec::List(vec!["web".to_string()]),
+                ..Default::default()
+            },
+        );
+        let name = worktree_named(&fx, "feat/one");
+        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let _guard = guard(&outcome);
+        let port = outcome.process().ports["web"];
+        assert!(
+            wait_until(Duration::from_secs(10), || log_of(&fx, &name)
+                .contains(&format!("127.0.0.1:{port}"))),
+            "{:?}",
+            log_of(&fx, &name)
+        );
+    }
+
+    #[test]
+    fn start_runs_in_the_configured_subdirectory() {
+        let mut fx = fixture();
+        with_dev(
+            &mut fx,
+            ProcessConfig {
+                cmd: "pwd && sleep 30".to_string(),
+                cwd: Some("apps/web".to_string()),
+                ..Default::default()
+            },
+        );
+        let name = worktree_named(&fx, "feat/one");
+        let worktree = fx.worktrees_dir().join(&name);
+        std::fs::create_dir_all(worktree.join("apps/web")).unwrap();
+
+        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let _guard = guard(&outcome);
+        assert!(
+            wait_until(Duration::from_secs(10), || log_of(&fx, &name)
+                .contains("apps/web")),
+            "{:?}",
+            log_of(&fx, &name)
+        );
+    }
+
+    #[test]
+    fn a_cwd_that_does_not_exist_is_refused_by_name() {
+        let mut fx = fixture();
+        with_dev(
+            &mut fx,
+            ProcessConfig {
+                cmd: "sleep 30".to_string(),
+                cwd: Some("apps/nope".to_string()),
+                ..Default::default()
+            },
+        );
+        let name = worktree_named(&fx, "feat/one");
+        let err = start(&fx.paths, &fx.config, &name, &noop).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("apps/nope"), "{msg}");
+        assert!(
+            fx.state().worktrees[&name].processes.is_empty(),
+            "a refused start records nothing"
+        );
+    }
+
+    #[test]
+    fn a_project_with_no_processes_says_what_to_add() {
+        let fx = fixture();
+        let name = worktree_named(&fx, "feat/one");
+        let err = start(&fx.paths, &fx.config, &name, &noop).unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            "no processes configured; add [dev] to pando.toml"
+        );
+    }
+
+    #[test]
+    fn starting_a_worktree_that_does_not_exist_says_so() {
+        let mut fx = fixture();
+        with_dev(&mut fx, dev("sleep 30"));
+        let err = start(&fx.paths, &fx.config, "nope", &noop).unwrap_err();
+        assert!(format!("{err:#}").contains("no worktree named"));
+        let err = start(&fx.paths, &fx.config, "acme-shop", &noop).unwrap_err();
+        assert!(format!("{err:#}").contains("main checkout"));
+    }
+
+    #[test]
+    fn a_second_start_while_running_reports_the_process_that_is_already_up() {
+        let mut fx = fixture();
+        with_dev(&mut fx, dev("sleep 30"));
+        let name = worktree_named(&fx, "feat/one");
+
+        let first = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let _guard = guard(&first);
+        let second = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        assert!(
+            matches!(second, StartOutcome::AlreadyRunning(_)),
+            "a running process is reported, not started twice"
+        );
+        assert_eq!(second.process().record.pid, first.process().record.pid);
+        assert_eq!(second.process().ports, first.process().ports);
+    }
+
+    // A failure is sticky for display; starting is the user acting on it.
+    #[test]
+    fn start_clears_a_failed_record_and_starts_fresh() {
+        let mut fx = fixture();
+        with_dev(&mut fx, dev("sleep 30"));
+        let name = worktree_named(&fx, "feat/one");
+        let first = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let first_pid = first.process().record.pid;
+        let first_ports = first.process().ports.clone();
+        drop(guard(&first));
+
+        assert!(wait_until(Duration::from_secs(5), || {
+            !crate::process::is_alive(first_pid)
+        }));
+        // Mark it Failed the way a read path would.
+        let mut store = fx.state();
+        store
+            .worktrees
+            .get_mut(&name)
+            .unwrap()
+            .processes
+            .get_mut("dev")
+            .unwrap()
+            .phase = Phase::Failed {
+            at: Utc::now(),
+            reason: "process exited".into(),
+        };
+        state::save(&fx.paths.state_file(), &store).unwrap();
+
+        let second = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let _guard = guard(&second);
+        assert!(matches!(second, StartOutcome::Started(_)));
+        assert_ne!(second.process().record.pid, first_pid);
+        assert_eq!(
+            second.process().ports,
+            first_ports,
+            "ports are stable across a failure"
+        );
+        assert!(matches!(
+            fx.state().worktrees[&name].processes["dev"].phase,
+            Phase::Starting { .. }
+        ));
+    }
+
+    #[test]
+    fn a_process_with_no_ports_gets_no_ready_port() {
+        let mut fx = fixture();
+        with_dev(
+            &mut fx,
+            ProcessConfig {
+                cmd: "sleep 30".to_string(),
+                ..Default::default()
+            },
+        );
+        let name = worktree_named(&fx, "feat/one");
+        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let _guard = guard(&outcome);
+        assert!(outcome.process().ports.is_empty());
+        assert_eq!(outcome.process().record.ready_port, None);
+        assert_eq!(outcome.process().url, None);
+
+        // Which is what makes it Running as soon as it is alive.
+        let mut store = fx.state();
+        assert!(state::advance_phases(
+            &mut store,
+            crate::process::is_alive,
+            crate::ports::is_port_free
+        ));
+        assert!(matches!(
+            store.worktrees[&name].processes["dev"].phase,
+            Phase::Running { .. }
+        ));
+    }
+
+    #[test]
+    fn a_ready_role_the_process_does_not_own_is_refused() {
+        let mut fx = fixture();
+        with_dev(
+            &mut fx,
+            ProcessConfig {
+                cmd: "sleep 30".to_string(),
+                ports: PortsSpec::List(vec!["web".to_string()]),
+                ready: Some(ReadySpec {
+                    role: Some("api".to_string()),
+                    timeout_s: None,
+                }),
+                ..Default::default()
+            },
+        );
+        let name = worktree_named(&fx, "feat/one");
+        let err = start(&fx.paths, &fx.config, &name, &noop).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("api") && msg.contains("web"), "{msg}");
+    }
+
+    #[test]
+    fn the_readiness_port_is_the_one_a_listener_binds() {
+        if !python3_available() {
+            eprintln!("skipping: python3 is not installed");
+            return;
+        }
+        let mut fx = fixture();
+        with_dev(
+            &mut fx,
+            ProcessConfig {
+                cmd: python_listener_template(),
+                ports: PortsSpec::List(vec!["web".to_string()]),
+                ..Default::default()
+            },
+        );
+        let name = worktree_named(&fx, "feat/one");
+        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let _guard = guard(&outcome);
+        let port = outcome.process().ports["web"];
+
+        assert!(
+            wait_until(Duration::from_secs(20), || !crate::ports::is_port_free(
+                port
+            )),
+            "the listener never bound {port}: {:?}",
+            log_of(&fx, &name)
+        );
+        let mut store = fx.state();
+        assert!(state::advance_phases(
+            &mut store,
+            crate::process::is_alive,
+            crate::ports::is_port_free
+        ));
+        assert!(
+            matches!(
+                store.worktrees[&name].processes["dev"].phase,
+                Phase::Running { .. }
+            ),
+            "a bound ready port is what running means"
+        );
+    }
+
+    /// The listener, with its port coming from a template rather than the
+    /// environment — the positional shape Django and friends use.
+    fn python_listener_template() -> String {
+        python_listener(0).replace("',0)", "',{port:web})")
+    }
+
+    // ---- stop ------------------------------------------------------------
+
+    #[test]
+    fn stop_ends_the_process_and_keeps_the_ports() {
+        let mut fx = fixture();
+        with_dev(&mut fx, dev("sleep 30"));
+        let name = worktree_named(&fx, "feat/one");
+        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let _guard = guard(&outcome);
+        let pgid = outcome.process().record.pgid;
+        let ports = outcome.process().ports.clone();
+
+        assert_eq!(stop(&fx.paths, &name).unwrap(), StopOutcome::Stopped);
+        assert!(
+            !crate::process::group_alive(pgid),
+            "the group must be empty"
+        );
+        let record = &fx.state().worktrees[&name];
+        assert!(
+            record.processes.is_empty(),
+            "the record goes with the process"
+        );
+        assert_eq!(
+            record.ports, ports,
+            "a stopped worktree still owns its ports"
+        );
+        assert!(record.created_by_pando, "and is still ours");
+    }
+
+    // The origin tool skipped the signal for a record it had written off,
+    // and leaked every child whose shell had already exited.
+    #[test]
+    fn stop_signals_the_group_even_when_the_leader_is_already_gone() {
+        let mut fx = fixture();
+        with_dev(&mut fx, dev("sleep 30 & exit 0"));
+        let name = worktree_named(&fx, "feat/one");
+        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let _guard = guard(&outcome);
+        let (pid, pgid) = (outcome.process().record.pid, outcome.process().record.pgid);
+
+        assert!(wait_until(Duration::from_secs(5), || {
+            !crate::process::is_alive(pid)
+        }));
+        assert!(
+            crate::process::group_alive(pgid),
+            "the backgrounded child is still there"
+        );
+        // Written off as failed, which is exactly when the signal used to be
+        // skipped.
+        let mut store = fx.state();
+        store
+            .worktrees
+            .get_mut(&name)
+            .unwrap()
+            .processes
+            .get_mut("dev")
+            .unwrap()
+            .phase = Phase::Failed {
+            at: Utc::now(),
+            reason: "process exited".into(),
+        };
+        state::save(&fx.paths.state_file(), &store).unwrap();
+
+        assert_eq!(stop(&fx.paths, &name).unwrap(), StopOutcome::Stopped);
+        assert!(
+            !crate::process::group_alive(pgid),
+            "a failed record's group must still be killed"
+        );
+    }
+
+    #[test]
+    fn stopping_something_that_is_not_running_is_not_an_error() {
+        let mut fx = fixture();
+        with_dev(&mut fx, dev("sleep 30"));
+        assert_eq!(stop(&fx.paths, "nope").unwrap(), StopOutcome::NotRunning);
+        let name = worktree_named(&fx, "feat/one");
+        assert_eq!(stop(&fx.paths, &name).unwrap(), StopOutcome::NotRunning);
+    }
+
+    #[test]
+    fn stop_all_stops_every_worktree_that_is_running() {
+        let mut fx = fixture();
+        with_dev(&mut fx, dev("sleep 30"));
+        let one = worktree_named(&fx, "feat/one");
+        let two = worktree_named(&fx, "feat/two");
+        let a = start(&fx.paths, &fx.config, &one, &noop).unwrap();
+        let _ga = guard(&a);
+        let b = start(&fx.paths, &fx.config, &two, &noop).unwrap();
+        let _gb = guard(&b);
+        assert_ne!(
+            a.process().ports["web"],
+            b.process().ports["web"],
+            "two worktrees never share a port"
+        );
+
+        let mut stopped = stop_all(&fx.paths).unwrap();
+        stopped.sort();
+        assert_eq!(stopped, vec![one.clone(), two.clone()]);
+        assert!(!crate::process::group_alive(a.process().record.pgid));
+        assert!(!crate::process::group_alive(b.process().record.pgid));
+        assert!(fx.state().worktrees[&one].processes.is_empty());
+        assert!(fx.state().worktrees[&two].processes.is_empty());
+        assert!(
+            stop_all(&fx.paths).unwrap().is_empty(),
+            "and it is idempotent"
+        );
+    }
+
+    // ---- restart ---------------------------------------------------------
+
+    #[test]
+    fn restart_stops_the_old_process_and_keeps_the_ports() {
+        let mut fx = fixture();
+        with_dev(&mut fx, dev("sleep 30"));
+        let name = worktree_named(&fx, "feat/one");
+        let first = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let first_pgid = first.process().record.pgid;
+        let ports = first.process().ports.clone();
+        drop(guard(&first));
+
+        let second = restart(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let _guard = guard(&second);
+        assert!(matches!(second, StartOutcome::Started(_)));
+        assert_ne!(second.process().record.pid, first.process().record.pid);
+        assert!(!crate::process::group_alive(first_pgid));
+        assert_eq!(
+            second.process().ports,
+            ports,
+            "a restart keeps the URL the developer had open"
+        );
+        assert!(!second.process().reassigned);
+    }
+
+    #[test]
+    fn restarting_something_that_was_never_started_just_starts_it() {
+        let mut fx = fixture();
+        with_dev(&mut fx, dev("sleep 30"));
+        let name = worktree_named(&fx, "feat/one");
+        let outcome = restart(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let _guard = guard(&outcome);
+        assert!(matches!(outcome, StartOutcome::Started(_)));
+    }
+
+    #[test]
+    fn the_prelude_is_prefixed_to_the_command() {
+        let mut config = Config::default();
+        assert_eq!(with_prelude(&config, "pnpm dev"), "pnpm dev");
+        config.runtime.prelude = Some("  ".to_string());
+        assert_eq!(
+            with_prelude(&config, "pnpm dev"),
+            "pnpm dev",
+            "a blank prelude adds nothing"
+        );
+        config.runtime.prelude = Some("nvm use 22".to_string());
+        assert_eq!(with_prelude(&config, "pnpm dev"), "nvm use 22 && pnpm dev");
+    }
 
     /// A repo with one commit, a gitignore listing `.env`, and an untracked
     /// ignored `.env` present so provisioning has something to link.

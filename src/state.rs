@@ -72,6 +72,10 @@ pub struct ProcessRecord {
     /// transition. `None` means "running once alive".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ready_port: Option<u16>,
+    /// How long this process may sit in `Starting`. `None` is
+    /// [`START_TIMEOUT_SECS`]; a slow first build sets its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_timeout_s: Option<u64>,
     pub phase: Phase,
 }
 
@@ -242,6 +246,10 @@ pub fn advance_phases(
         for proc in rec.processes.values_mut() {
             match &proc.phase {
                 Phase::Starting { since } => {
+                    let timeout = proc
+                        .ready_timeout_s
+                        .map(|s| s as i64)
+                        .unwrap_or(START_TIMEOUT_SECS);
                     if !is_alive(proc.pid) {
                         proc.phase = Phase::Failed {
                             at: now,
@@ -251,10 +259,17 @@ pub fn advance_phases(
                     } else if proc.ready_port.map(|p| !is_port_free(p)).unwrap_or(true) {
                         proc.phase = Phase::Running { since: now };
                         changed = true;
-                    } else if now.signed_duration_since(*since).num_seconds() > START_TIMEOUT_SECS {
+                    } else if now.signed_duration_since(*since).num_seconds() > timeout {
+                        // The watched port is the whole content of this
+                        // failure: "timeout" alone tells nobody what pando
+                        // was waiting for.
+                        let port = proc
+                            .ready_port
+                            .map(|p| p.to_string())
+                            .unwrap_or_else(|| "?".to_string());
                         proc.phase = Phase::Failed {
                             at: now,
-                            reason: "timeout".into(),
+                            reason: format!("timeout: nothing bound port {port} in {timeout}s"),
                         };
                         changed = true;
                     }
@@ -341,6 +356,7 @@ mod tests {
             started_at: at(9),
             log_path: PathBuf::from("logs/feat+x/dev.log"),
             ready_port: Some(17_000),
+            ready_timeout_s: None,
             phase,
         }
     }
@@ -643,9 +659,49 @@ mod tests {
 
         assert!(advance_phases(&mut state, |_| true, |_| true));
         let phase = &state.worktrees["w"].processes["dev"].phase;
+        // The watched port is the content of this failure: "timeout" alone
+        // does not say what pando was waiting for.
         assert!(
-            matches!(phase, Phase::Failed { reason, .. } if reason == "timeout"),
+            matches!(phase, Phase::Failed { reason, .. }
+                if reason.contains("timeout") && reason.contains("17000")),
             "got {phase:?}"
+        );
+    }
+
+    // A first build can take minutes; a project that says so must not be
+    // called failed after the default thirty seconds.
+    #[test]
+    fn a_process_with_its_own_timeout_is_given_it() {
+        let mut state = State::new();
+        let mut rec = WorktreeRecord::new("/abs/w", true);
+        let elapsed = Utc::now() - chrono::Duration::seconds(START_TIMEOUT_SECS + 5);
+        let mut proc = starting(100, elapsed);
+        proc.ready_timeout_s = Some(300);
+        rec.processes.insert("dev".into(), proc);
+        state.worktrees.insert("w".into(), rec);
+
+        assert!(
+            !advance_phases(&mut state, |_| true, |_| true),
+            "still inside its own window, so nothing changes"
+        );
+        assert!(matches!(
+            state.worktrees["w"].processes["dev"].phase,
+            Phase::Starting { .. }
+        ));
+
+        state
+            .worktrees
+            .get_mut("w")
+            .unwrap()
+            .processes
+            .get_mut("dev")
+            .unwrap()
+            .ready_timeout_s = Some(1);
+        assert!(advance_phases(&mut state, |_| true, |_| true));
+        let phase = &state.worktrees["w"].processes["dev"].phase;
+        assert!(
+            matches!(phase, Phase::Failed { reason, .. } if reason.contains("1s")),
+            "the reason names the window it ran out of: {phase:?}"
         );
     }
 

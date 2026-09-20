@@ -25,8 +25,22 @@ const MAX_PROBE_ATTEMPTS: u32 = 50;
 /// cannot hash to the same base.
 const HASH_SEPARATOR: u8 = 0x1f;
 
+/// Whether nothing is listening on `port`.
+///
+/// Both addresses, because one bind answers only half the question. A
+/// listener on `127.0.0.1` leaves `0.0.0.0` bindable, and a listener on
+/// `0.0.0.0` leaves `127.0.0.1` bindable — verified on macOS, and the reason
+/// a dev server that binds loopback only (Django's `runserver` default)
+/// would otherwise never be seen as ready.
+///
+/// A server bound to one non-loopback interface is still missed; the
+/// observed-port scan is what catches those.
 pub fn is_port_free(port: u16) -> bool {
-    std::net::TcpListener::bind(("0.0.0.0", port)).is_ok()
+    can_bind("0.0.0.0", port) && can_bind("127.0.0.1", port)
+}
+
+fn can_bind(host: &str, port: u16) -> bool {
+    std::net::TcpListener::bind((host, port)).is_ok()
 }
 
 /// The base port for a worktree, before any occupancy probing.
@@ -456,6 +470,21 @@ mod tests {
         let listener = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         assert!(!is_port_free(port), "a bound port must not read as free");
+        drop(listener);
+    }
+
+    // A dev server that binds loopback only leaves `0.0.0.0:<port>`
+    // bindable, so probing one address would report it free and readiness
+    // would never arrive.
+    #[test]
+    fn a_loopback_only_listener_is_not_free_either() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(
+            std::net::TcpListener::bind(("0.0.0.0", port)).is_ok(),
+            "the premise: the wildcard address is still bindable"
+        );
+        assert!(!is_port_free(port), "but the port is in use");
         drop(listener);
     }
 }

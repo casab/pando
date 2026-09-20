@@ -83,21 +83,62 @@ pub fn is_alive(pid: u32) -> bool {
     }
 }
 
+/// Whether any process is still in the group — the leader, a child it
+/// forked, or a grandchild.
+///
+/// `kill(-pgid, 0)` and not `kill(leader, 0)`: a dev server's group leader is
+/// a `bash -lc` that very often exits while the server it backgrounded keeps
+/// running and keeps the port. Asking after the leader alone is how a stop
+/// reports success over a process that is still serving.
+pub fn group_alive(pgid: i32) -> bool {
+    // 0 is "our own group" and 1 is "every process we may signal". Neither
+    // is ever a worktree's process group, and both would be catastrophic to
+    // pass to kill(2).
+    if pgid <= 1 {
+        return false;
+    }
+    match nix::sys::signal::kill(Pid::from_raw(-pgid), None) {
+        Ok(()) => true,
+        Err(Errno::ESRCH) => false,
+        // The group exists but holds something we may not signal.
+        Err(Errno::EPERM) => true,
+        Err(_) => false,
+    }
+}
+
+/// SIGTERM to the whole group, then SIGKILL to whatever is left after
+/// `grace`. Returns once the group is empty, or once it has been SIGKILLed.
+///
+/// Signalling is unconditional, including for a process pando has already
+/// written off as failed: a leader that exited is not a group that exited,
+/// and skipping the signal is exactly how a backgrounded child outlives the
+/// tool that started it.
 pub fn stop(pgid: i32, grace: Duration) -> Result<()> {
+    if pgid <= 1 {
+        return Ok(());
+    }
     let group = Pid::from_raw(pgid);
     let any_in_group = Pid::from_raw(-pgid);
-    let leader_pid = pgid as u32;
 
     match killpg(group, Signal::SIGTERM) {
         Ok(()) => {}
-        Err(Errno::ESRCH) => return Ok(()),
+        // Nothing left in the group; there is nothing to wait for.
+        Err(Errno::ESRCH) => {
+            reap_group(any_in_group);
+            return Ok(());
+        }
+        // macOS returns EPERM for a group whose only member is a zombie
+        // leader. Falling through reaps it.
+        Err(Errno::EPERM) => {}
         Err(e) => return Err(anyhow::Error::from(e).context("killpg SIGTERM")),
     }
 
     let deadline = Instant::now() + grace;
     loop {
+        // Reap first: a zombie child of ours still counts as a group member
+        // to kill(2), so an unreaped leader would look alive forever.
         reap_group(any_in_group);
-        if !is_alive(leader_pid) {
+        if !group_alive(pgid) {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -106,15 +147,25 @@ pub fn stop(pgid: i32, grace: Duration) -> Result<()> {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    // Tolerate EPERM on macOS: signaling a zombie group leader can return
-    // EPERM even though the group has no live processes left.
     match killpg(group, Signal::SIGKILL) {
         Ok(()) | Err(Errno::ESRCH) | Err(Errno::EPERM) => {}
         Err(e) => return Err(anyhow::Error::from(e).context("killpg SIGKILL")),
     }
-    reap_group(any_in_group);
-    Ok(())
+    // SIGKILL is not instantaneous; the caller is about to reuse this
+    // worktree's ports, so it is worth the few milliseconds to see it land.
+    let hard_deadline = Instant::now() + KILL_SETTLE;
+    loop {
+        reap_group(any_in_group);
+        if !group_alive(pgid) || Instant::now() >= hard_deadline {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
+
+/// How long to wait for SIGKILL to be delivered before giving up and
+/// returning anyway.
+const KILL_SETTLE: Duration = Duration::from_millis(500);
 
 fn reap_group(any_in_group: Pid) {
     loop {
@@ -138,6 +189,54 @@ mod tests {
     #[test]
     fn stop_is_idempotent_when_group_already_gone() {
         stop(999_999, Duration::from_millis(100)).unwrap();
+        assert!(!group_alive(999_999));
+    }
+
+    // `kill(-0, …)` signals our own process group and `kill(-1, …)` signals
+    // every process we are allowed to signal. Neither is ever a worktree.
+    #[test]
+    fn stop_refuses_the_process_group_ids_that_would_signal_ourselves() {
+        assert!(!group_alive(0));
+        assert!(!group_alive(1));
+        assert!(!group_alive(-5));
+        stop(0, Duration::from_millis(10)).unwrap();
+        stop(1, Duration::from_millis(10)).unwrap();
+        stop(-1, Duration::from_millis(10)).unwrap();
+        // Still here, and still runnable: we did not signal ourselves.
+        assert!(is_alive(std::process::id()));
+    }
+
+    // The failure the origin tool had: a leader that exits leaves its
+    // backgrounded child holding the port, and a stop that watches only the
+    // leader reports success over a process that is still serving.
+    #[test]
+    fn stop_kills_a_child_whose_leader_already_exited() {
+        let dir = tempdir().unwrap();
+        let log = dir.path().join("log.txt");
+        let r = spawn_detached(SpawnOptions {
+            // bash backgrounds the sleep and exits immediately.
+            shell_cmd: "sleep 30 & exit 0",
+            cwd: dir.path(),
+            log_file: &log,
+            env: &[],
+        })
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while is_alive(r.pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!is_alive(r.pid), "the leader should have exited on its own");
+        assert!(
+            group_alive(r.pgid),
+            "the backgrounded child keeps the group alive"
+        );
+
+        stop(r.pgid, Duration::from_secs(5)).unwrap();
+        assert!(
+            !group_alive(r.pgid),
+            "stop must empty the group, not just outlive its leader"
+        );
     }
 
     #[test]
