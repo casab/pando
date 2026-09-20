@@ -211,13 +211,23 @@ pub fn save(path: &Path, state: &State) -> Result<()> {
 /// proxy has exited. The worktree record itself survives — `created_by_pando`
 /// and the port assignment outlive any process.
 ///
+/// One exception: a `Failed` record stays. It is the one phase whose whole
+/// purpose is to outlive its process — `refresh` advances phases rather
+/// than reconciling precisely so a crashed dev server stays visible until
+/// the developer acts on it — and dropping it here erased that from
+/// `status` the moment anything else in the project was started or stopped.
+/// The mutations that *are* about those processes clear them explicitly:
+/// `start` for the ones it starts, `stop` for the ones it stops, `rm` for
+/// all of a worktree's.
+///
 /// Every read path calls this before trusting the map. Returns whether
 /// anything changed, so a caller holding the lock knows to save.
 pub fn reconcile(state: &mut State, is_alive: impl Fn(u32) -> bool) -> bool {
     let mut changed = false;
     for rec in state.worktrees.values_mut() {
         let before = rec.processes.len();
-        rec.processes.retain(|_, p| is_alive(p.pid));
+        rec.processes
+            .retain(|_, p| is_alive(p.pid) || matches!(p.phase, Phase::Failed { .. }));
         changed |= rec.processes.len() != before;
 
         let before = rec.services.len();
@@ -225,7 +235,13 @@ pub fn reconcile(state: &mut State, is_alive: impl Fn(u32) -> bool) -> bool {
             .retain(|s| s.pid.map(&is_alive).unwrap_or(true));
         changed |= rec.services.len() != before;
 
-        if !rec.processes.is_empty() {
+        // Nothing is up, whatever records are left, so the worktree is not
+        // listening on anything.
+        if rec
+            .processes
+            .values()
+            .any(|p| matches!(p.phase, Phase::Starting { .. } | Phase::Running { .. }))
+        {
             continue;
         }
         if !rec.observed_ports.is_empty() {
@@ -804,6 +820,33 @@ mod tests {
             !rec.processes.contains_key("api"),
             "a dead process record must be dropped"
         );
+    }
+
+    // Phase 2b review, finding 7. `Failed` is the one phase whose whole
+    // purpose is to outlive its process — `refresh` deliberately advances
+    // phases rather than reconciling so a crash stays visible — and
+    // `reconcile` threw it away on the next mutation of *any* worktree.
+    #[test]
+    fn reconcile_keeps_a_failed_record_and_drops_the_merely_dead() {
+        let mut state = State::new();
+        let mut rec = WorktreeRecord::new("/abs/w", true);
+        rec.processes.insert("web".into(), running(100));
+        rec.processes
+            .insert("api".into(), process(200, failed(12, "process exited")));
+        state.worktrees.insert("w".into(), rec);
+
+        assert!(reconcile(&mut state, |_| false));
+        let rec = state.worktrees.get("w").unwrap();
+        assert!(
+            !rec.processes.contains_key("web"),
+            "a dead record nobody was told about is bookkeeping"
+        );
+        assert!(
+            rec.processes.contains_key("api"),
+            "a crash has to stay visible until the developer acts on it"
+        );
+        // And the worktree stops claiming to be listening on anything.
+        assert!(rec.observed_ports.is_empty());
     }
 
     #[test]

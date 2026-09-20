@@ -1167,3 +1167,47 @@ fn restart_asks_the_question_start_would_have_asked() {
     );
     assert_eq!(status_porcelain(&e.root), "");
 }
+
+// Phase 2b review, finding 7. Stopping one process reconciled the whole
+// state file, and a sibling's `Failed` record — the one phase whose entire
+// purpose is to outlive its process — went with it, so `status` stopped
+// mentioning that anything had crashed.
+#[test]
+fn stopping_one_process_leaves_the_others_crash_visible() {
+    let e = env();
+    e.write_config(
+        "[project]\ninstall = \"true\"\n\n\
+         [processes.web]\ncmd = \"sleep 300\"\nports = []\n\n\
+         [processes.api]\ncmd = \"sleep 1\"\nports = []\n",
+    );
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+    let out = e.pando(&["start", "feat+one"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+
+    // The api exits on its own; a read is what notices.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let out = e.pando(&["status", "feat+one"]);
+    assert!(
+        stdout(&out).contains("failed"),
+        "the api should have failed by now: {}",
+        stdout(&out)
+    );
+
+    let out = e.pando(&["stop", "feat+one", "--only", "web"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+
+    let text = e.pando(&["status", "feat+one"]);
+    assert!(
+        stdout(&text).contains("api") && stdout(&text).contains("failed"),
+        "stopping web must not erase the api's crash: {}",
+        stdout(&text)
+    );
+    let json = e.pando(&["status", "feat+one", "--json"]);
+    assert!(
+        stdout(&json).contains("\"api\""),
+        "and --json says so too: {}",
+        stdout(&json)
+    );
+    assert_eq!(code(&e.pando(&["stop"])), EXIT_OK);
+    assert_eq!(status_porcelain(&e.root), "");
+}

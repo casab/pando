@@ -895,6 +895,10 @@ pub fn start(
                 // the developer renamed — whose live child would otherwise
                 // be left holding a port nothing could find again.
                 //
+                // This is also where a `Failed` record goes: it survives
+                // `reconcile` on purpose, so the mutation that acts on that
+                // process is the one that has to clear it.
+                //
                 // A `--only` start leaves every other record alone. One
                 // whose leader is dead is still signalled, by the sweep
                 // below, before `reconcile` drops it.
@@ -1192,7 +1196,10 @@ pub fn stop_all_with(paths: &PandoPaths, stop: impl Fn(i32) -> Result<()>) -> Re
 ///
 /// The signal is unconditional, Failed records included. pando is not the
 /// process's parent by then, so "failed" only ever meant "its leader is
-/// gone" — the group can still be serving.
+/// gone" — the group can still be serving. Clearing them is this path's job
+/// too: a `Failed` record survives `reconcile` on purpose, and a stop of
+/// the process it belongs to is one of the three things that ends it (the
+/// others being a start of it and an `rm` of its worktree).
 fn stop_recorded(
     store: &mut state::State,
     name: &str,
@@ -3400,6 +3407,97 @@ time.sleep(300)
         );
         with_dev(fx, dev("sleep 30"));
         (name, orphan)
+    }
+
+    // Phase 2b review, finding 7. A `Failed` record now outlives
+    // `reconcile`, and it is exactly the record most likely to still have a
+    // live child behind its pgid — so the sweep has to keep signalling it,
+    // and only its own worktree's stop may clear it.
+    #[test]
+    fn a_failed_records_group_is_signalled_and_the_record_kept_until_its_own_stop() {
+        let mut fx = fixture();
+        let (orphan_name, orphan) = orphaned_sibling(&mut fx);
+        // A refresh is what turns a dead leader into a Failed record; the
+        // child it backgrounded is still holding the group open.
+        let state = refresh(&fx.paths).state;
+        assert!(
+            matches!(
+                state.worktrees[&orphan_name].processes["dev"].phase,
+                Phase::Failed { .. }
+            ),
+            "{:?}",
+            state.worktrees[&orphan_name].processes["dev"].phase
+        );
+
+        let other = worktree_named(&fx, "feat/other");
+        stop(&fx.paths, &other, None).unwrap();
+        assert!(
+            !crate::process::group_alive(orphan.pgid),
+            "a Failed record's group is signalled like every other"
+        );
+        assert!(
+            matches!(
+                fx.state().worktrees[&orphan_name].processes["dev"].phase,
+                Phase::Failed { .. }
+            ),
+            "but stopping another worktree must not erase the crash"
+        );
+
+        // Its own stop is what clears it.
+        stop(&fx.paths, &orphan_name, None).unwrap();
+        assert!(fx.state().worktrees[&orphan_name].processes.is_empty());
+    }
+
+    // Finding 7 on the path `--only` promises to leave alone: `stop` ran
+    // `reconcile` over the whole state file, so stopping the web process
+    // threw away the record that said the api had crashed.
+    #[test]
+    fn stopping_one_process_leaves_a_siblings_failed_record_where_status_can_see_it() {
+        let mut fx = fixture();
+        with_web_and_api(&mut fx);
+        let name = workspace_worktree(&fx, "feat/one");
+        let report = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+        let _guard = guard(&report);
+
+        // The api dies, and a read is what notices.
+        let api = fx.state().worktrees[&name].processes["api"].clone();
+        crate::process::stop(api.pgid, Duration::from_secs(5)).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(10), || matches!(
+                refresh(&fx.paths).state.worktrees[&name]
+                    .processes
+                    .get("api")
+                    .map(|p| &p.phase),
+                Some(Phase::Failed { .. })
+            )),
+            "the api never reached failed"
+        );
+
+        stop(&fx.paths, &name, Some("web")).unwrap();
+
+        let state = refresh(&fx.paths).state;
+        let record = &state.worktrees[&name];
+        assert!(
+            !record.processes.contains_key("web"),
+            "the process that was stopped is gone"
+        );
+        assert!(
+            matches!(
+                record.processes.get("api").map(|p| &p.phase),
+                Some(Phase::Failed { .. })
+            ),
+            "and the one that crashed is still saying so: {:?}",
+            record.processes
+        );
+        assert_eq!(
+            state::aggregate_phase(record).map(|a| a.word()),
+            Some("failed"),
+            "which is what the worktree reads as"
+        );
+
+        // A whole stop of its own worktree is what clears it.
+        stop(&fx.paths, &name, None).unwrap();
+        assert!(fx.state().worktrees[&name].processes.is_empty());
     }
 
     #[test]
