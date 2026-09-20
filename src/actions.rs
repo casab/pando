@@ -923,6 +923,7 @@ pub fn start(
     // And every *other* worktree's dead-leader group, because `reconcile`
     // drops those records too.
     sweep_orphaned_groups(&store)?;
+    advance_before_reconcile(&mut store);
     state::reconcile(&mut store, proc::is_alive);
 
     let record = store
@@ -1134,6 +1135,7 @@ fn stop_missing(
     // `reconcile` drops dead-leader records for every worktree in the
     // project, not only this one, so every one of them is signalled first.
     sweep_orphaned_groups(&store)?;
+    advance_before_reconcile(&mut store);
     state::reconcile(&mut store, proc::is_alive);
     state::save(&paths.state_file(), &store)?;
     Ok(outcome)
@@ -1174,6 +1176,7 @@ pub fn stop_all_with(paths: &PandoPaths, stop: impl Fn(i32) -> Result<()>) -> Re
     if failures.is_empty() {
         match sweep_orphaned_groups(&store) {
             Ok(()) => {
+                advance_before_reconcile(&mut store);
                 state::reconcile(&mut store, proc::is_alive);
             }
             Err(e) => sweep_failed = Some(e),
@@ -1703,16 +1706,12 @@ pub fn refresh(paths: &PandoPaths) -> Refreshed {
         }
     };
 
-    let failed_before = failed_processes(&store);
     // One scan of every live group, used for both questions this pass
     // answers: whether a starting process has opened its port yet, and what
     // every group is really listening on.
     let scans = scan_groups(&store);
-    let mut changed = state::advance_phases(&mut store, proc::is_alive, |pgid, port| {
-        port_is_bound(&scans, pgid, port)
-    });
+    let mut changed = advance_with(&mut store, &scans);
     changed |= capture_observed_ports(&mut store, &scans);
-    changed |= explain_new_failures(&mut store, &failed_before);
     if changed {
         // A read path that cannot write is still a read path: the phases are
         // right in memory either way, so a save that fails is not worth
@@ -1728,6 +1727,36 @@ pub fn refresh(paths: &PandoPaths) -> Refreshed {
         state: store,
         warning: None,
     }
+}
+
+/// Moves every process to the phase it is really in, and writes the reason
+/// for each failure that is new. The one implementation of "advance", used
+/// by the read path and by every mutation that is about to `reconcile`.
+fn advance_with(store: &mut state::State, scans: &BTreeMap<i32, Option<Vec<u16>>>) -> bool {
+    let failed_before = failed_processes(store);
+    let mut changed = state::advance_phases(store, proc::is_alive, |pgid, port| {
+        port_is_bound(scans, pgid, port)
+    });
+    changed |= explain_new_failures(store, &failed_before);
+    changed
+}
+
+/// Advances phases before `reconcile` drops anything.
+///
+/// `reconcile` keeps a record that is already `Failed`, because a crash has
+/// to stay visible until the developer acts on it. That only works if
+/// something marked it failed first — and between a process dying and the
+/// next read path, nothing has. Without this, a `start`, a `stop`, or a
+/// `stop --only` of a *sibling* silently drops the crash it was about to
+/// make visible. So every mutation advances with the same inputs the read
+/// path uses, and only then reconciles.
+///
+/// The observed ports the same scan could capture are deliberately not
+/// recorded here: `start` clears them for the processes it replaces, and
+/// the next refresh says what is really listening.
+fn advance_before_reconcile(store: &mut state::State) {
+    let scans = scan_groups(store);
+    advance_with(store, &scans);
 }
 
 /// `(worktree, process)` pairs already in `Failed`, so a reason is explained
@@ -3500,6 +3529,68 @@ time.sleep(300)
         assert!(fx.state().worktrees[&name].processes.is_empty());
     }
 
+    // The half finding 7 left open. `reconcile` keeps a record that is
+    // *already* `Failed`, but a process that died since the last read path
+    // is still recorded as `Running` — and `reconcile` drops it before
+    // anything has had the chance to mark it failed. So a mutation path has
+    // to advance phases first, exactly as the read path does.
+    #[test]
+    fn a_crash_no_read_path_has_seen_yet_survives_a_stop_of_its_sibling() {
+        let mut fx = fixture();
+        with_web_and_api(&mut fx);
+        let name = workspace_worktree(&fx, "feat/one");
+        let report = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+        let _guard = guard(&report);
+
+        // kill -9, and then *nothing reads state*: no `status`, no `ls`, no
+        // TUI tick. What is on disk still says the api is running.
+        let api = fx.state().worktrees[&name].processes["api"].clone();
+        nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(api.pgid),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .unwrap();
+        assert!(
+            wait_until(Duration::from_secs(10), || !crate::process::is_alive(
+                api.pid
+            )),
+            "the api should be gone after a SIGKILL"
+        );
+        assert!(
+            matches!(
+                fx.state().worktrees[&name].processes["api"].phase,
+                Phase::Running { .. } | Phase::Starting { .. }
+            ),
+            "the premise: nothing has marked it failed yet"
+        );
+
+        stop(&fx.paths, &name, Some("web")).unwrap();
+
+        // On disk, without a read path having run since.
+        let record = &fx.state().worktrees[&name];
+        let Some(api_record) = record.processes.get("api") else {
+            panic!("the crash was reconciled away: {:?}", record.processes);
+        };
+        match &api_record.phase {
+            Phase::Failed { reason, .. } => assert!(
+                reason.contains("process exited"),
+                "the reason should say what happened: {reason}"
+            ),
+            other => panic!("a crash has to be recorded as failed, not {other:?}"),
+        }
+        // And the first read path after it agrees, which is what `status`
+        // and the TUI row show.
+        let state = refresh(&fx.paths).state;
+        assert_eq!(
+            state::aggregate_phase(&state.worktrees[&name]).map(|a| a.word()),
+            Some("failed"),
+            "status has to be able to see it"
+        );
+
+        stop(&fx.paths, &name, None).unwrap();
+        assert!(fx.state().worktrees[&name].processes.is_empty());
+    }
+
     #[test]
     fn stopping_one_worktree_signals_another_ones_orphan() {
         let mut fx = fixture();
@@ -3512,11 +3603,24 @@ time.sleep(300)
         );
         assert!(
             !crate::process::group_alive(orphan.pgid),
-            "a record dropped by reconcile must have been signalled first"
+            "a record reconcile could drop must have been signalled first"
         );
+        // Signalled, and *kept*: the mutation advances phases before it
+        // reconciles, so a leader that died without a read path noticing is
+        // a crash the developer still gets to see. Its own worktree's stop
+        // is what clears it.
+        assert!(
+            matches!(
+                fx.state().worktrees[&orphan_name].processes["dev"].phase,
+                Phase::Failed { .. }
+            ),
+            "the crash stays visible: {:?}",
+            fx.state().worktrees[&orphan_name].processes["dev"].phase
+        );
+        stop(&fx.paths, &orphan_name, None).unwrap();
         assert!(
             fx.state().worktrees[&orphan_name].processes.is_empty(),
-            "and only then is it dropped"
+            "and only its own stop drops it"
         );
     }
 
