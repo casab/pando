@@ -162,18 +162,30 @@ fn parse_targets(root: &Path) -> BTreeMap<String, String> {
             {
                 continue;
             }
-            // just writes the recipe on the following lines; make may also
-            // put a one-liner after the colon.
-            let recipe = if !rest.trim().is_empty() && !rest.trim_start().starts_with('=') {
-                rest.trim().to_string()
-            } else {
-                lines
+            // `x := 1` is an assignment, not a target.
+            if rest.trim_start().starts_with('=') {
+                continue;
+            }
+            // What follows the colon is the prerequisite list — the targets
+            // that run *first* — in both make and just, never the recipe.
+            // Only make's one-liner form, a semicolon after the
+            // prerequisites, puts a command on the target line. Otherwise
+            // the recipe is the indented line below, and a target whose
+            // next line is not indented has no recipe at all.
+            let inline = rest.split_once(';').map(|(_, cmd)| cmd.trim());
+            let recipe = match inline {
+                Some(cmd) if !cmd.is_empty() => cmd.to_string(),
+                _ => lines
                     .get(i + 1)
+                    .filter(|l| l.starts_with([' ', '\t']))
                     .map(|l| l.trim())
                     .filter(|l| !l.is_empty())
                     .unwrap_or_default()
-                    .to_string()
+                    .to_string(),
             };
+            // make's "do not echo this line" prefix is not part of the
+            // command.
+            let recipe = recipe.trim_start_matches('@').trim().to_string();
             if !recipe.is_empty() {
                 out.entry(name.to_string()).or_insert(recipe);
             }
@@ -749,7 +761,12 @@ fn port_proposal(signals: &Signals, rule: Option<&'static FrameworkRule>) -> Opt
     let keys = signals.env_example_keys.iter();
     let mut others: Vec<&String> = Vec::new();
     for key in keys {
-        if !key.contains("PORT") || is_service_port(key) {
+        // Exactly `PORT`, or a `<SOMETHING>_PORT`. A substring test also
+        // matches `SUPPORT_EMAIL`, `REPORT_URL`, `IMPORT_PATH` and
+        // `PASSPORT_SECRET`, which is not only nonsense to offer: it turns
+        // a slot that resolved silently into a question, and a
+        // non-interactive `start` that exited 0 into an exit 3.
+        if !(key == "PORT" || key.ends_with("_PORT")) || is_service_port(key) {
             continue;
         }
         if key == "PORT" {
@@ -810,10 +827,11 @@ pub const DEV: &str = "dev";
 /// environment variable to choose.
 pub fn still_needed(slot: Slot, config: &Config) -> bool {
     match slot {
-        Slot::PortEnv => config
-            .processes
-            .get(DEV)
-            .is_none_or(|p| p.ports.roles().is_empty()),
+        // Unset, not empty. A process configured with no ports at all — a
+        // worker, a watcher, a queue consumer — has answered this question
+        // with `ports = []`, and asking again would hand it a port it will
+        // never bind and then call it failed for not binding it.
+        Slot::PortEnv => config.processes.get(DEV).is_none_or(|p| p.ports.is_none()),
         _ => true,
     }
 }
@@ -842,15 +860,15 @@ pub fn apply(slot: Slot, candidate: &Candidate, config: &mut Config) {
             let process = config.processes.entry(DEV.to_string()).or_default();
             process.cmd = candidate.value.clone();
             if let Some(ports) = &candidate.ports {
-                process.ports = ports.clone();
+                process.ports = Some(ports.clone());
             }
         }
         Slot::PortEnv => {
             let process = config.processes.entry(DEV.to_string()).or_default();
-            process.ports = PortsSpec::Map(BTreeMap::from([(
+            process.ports = Some(PortsSpec::Map(BTreeMap::from([(
                 candidate.value.clone(),
                 crate::config::WEB_ROLE.to_string(),
-            )]));
+            )])));
         }
     }
 }
@@ -993,6 +1011,34 @@ mod tests {
         );
     }
 
+    // Text after the colon is the prerequisite list in make and in just,
+    // never the recipe. `run: build fmt` used to yield `build fmt` as the
+    // command that starts the dev server — accepted silently, and written
+    // to config with a comment claiming the run target said so.
+    #[test]
+    fn what_follows_a_target_name_is_prerequisites_not_the_recipe() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Makefile"),
+            "run: build fmt\n\tgo run .\n\nbuild:\n\tgo build ./...\n\n\
+             serve: ; python3 -m http.server\n\nall: build run\nnext:\n\techo hi\n",
+        )
+        .unwrap();
+        let targets = parse_targets(dir.path());
+        assert_eq!(
+            targets["run"], "go run .",
+            "the indented line below the target is the recipe: {targets:?}"
+        );
+        assert_eq!(
+            targets["serve"], "python3 -m http.server",
+            "make's one-liner form puts the recipe after a semicolon: {targets:?}"
+        );
+        assert!(
+            !targets.contains_key("all"),
+            "a target whose next line is another target has no recipe: {targets:?}"
+        );
+    }
+
     #[test]
     fn env_example_keys_are_read_in_file_order() {
         let dir = tempdir().unwrap();
@@ -1101,6 +1147,34 @@ mod tests {
         let proposal = port_proposal(&signals, None).unwrap();
         assert_eq!(values(&proposal), vec!["PORT", "API_PORT"]);
         assert!(!proposal.decided, "two candidates is a question");
+    }
+
+    // A substring match made `SUPPORT_EMAIL` and `REPORT_URL` port
+    // candidates, which turned a slot that resolved silently into a
+    // question — and a non-interactive `start` that exited 0 into an exit 3.
+    #[test]
+    fn only_a_key_that_is_or_ends_with_port_is_a_port() {
+        let signals = Signals {
+            env_example_keys: [
+                "PORT",
+                "SUPPORT_EMAIL",
+                "REPORT_URL",
+                "IMPORT_PATH",
+                "EXPORT_DIR",
+                "PASSPORT_SECRET",
+                "API_PORT",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+            ..Default::default()
+        };
+        let proposal = port_proposal(&signals, None).unwrap();
+        assert_eq!(
+            values(&proposal),
+            vec!["PORT", "API_PORT"],
+            "support, report, import, export and passport are not ports"
+        );
     }
 
     #[test]
@@ -1241,11 +1315,8 @@ mod tests {
         };
         let mut config = Config::default();
         apply(Slot::PortEnv, &candidate, &mut config);
-        assert_eq!(config.processes["dev"].ports.roles(), vec!["web"]);
-        assert_eq!(
-            config.processes["dev"].ports.env_templates()["PORT"],
-            "{port:web}"
-        );
+        assert_eq!(config.processes["dev"].roles(), vec!["web"]);
+        assert_eq!(config.processes["dev"].port_env()["PORT"], "{port:web}");
 
         let edits = edits(Slot::PortEnv, &candidate);
         assert_eq!(edits.len(), 1);

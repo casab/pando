@@ -121,8 +121,12 @@ pub struct ProcessConfig {
     /// refuses, by name.
     #[serde(default)]
     pub cmd: String,
-    #[serde(default, skip_serializing_if = "PortsSpec::is_empty")]
-    pub ports: PortsSpec,
+    /// Roles this process owns, when it says. `None` is "nobody has said
+    /// yet", which detection may answer; `Some([])` is "this process has no
+    /// ports", which it may not. A worker with a port it never binds is
+    /// reported as failed for the whole of its healthy life.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ports: Option<PortsSpec>,
     /// Relative to the worktree. `None` means the worktree root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
@@ -147,14 +151,25 @@ impl Default for PortsSpec {
     }
 }
 
-impl PortsSpec {
-    fn is_empty(&self) -> bool {
-        match self {
-            PortsSpec::List(v) => v.is_empty(),
-            PortsSpec::Map(m) => m.is_empty(),
-        }
+impl ProcessConfig {
+    /// The roles this process owns; none when nothing has said.
+    pub fn roles(&self) -> Vec<String> {
+        self.ports
+            .as_ref()
+            .map(PortsSpec::roles)
+            .unwrap_or_default()
     }
 
+    /// The environment the map form of `ports` is sugar for.
+    pub fn port_env(&self) -> BTreeMap<String, String> {
+        self.ports
+            .as_ref()
+            .map(PortsSpec::env_templates)
+            .unwrap_or_default()
+    }
+}
+
+impl PortsSpec {
     /// Role names in declaration order, whichever form was written.
     ///
     /// Deduplicated: two environment variables may point at the same role
@@ -1226,7 +1241,7 @@ prelude = "nvm use"
         assert!(loaded.config.dev.is_none(), "[dev] is normalised away");
         let dev = loaded.config.processes.get("dev").expect("processes.dev");
         assert_eq!(dev.cmd, "pnpm dev");
-        assert_eq!(dev.ports.roles(), vec!["web".to_string()]);
+        assert_eq!(dev.roles(), vec!["web".to_string()]);
     }
 
     #[test]
@@ -1267,7 +1282,7 @@ prelude = "nvm use"
         );
         let loaded = load(&f.paths).unwrap();
         let web = loaded.config.processes.get("web").unwrap();
-        assert_eq!(web.ports, PortsSpec::List(vec!["web".into()]));
+        assert_eq!(web.ports, Some(PortsSpec::List(vec!["web".into()])));
     }
 
     #[test]

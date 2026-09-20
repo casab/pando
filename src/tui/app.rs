@@ -1575,6 +1575,7 @@ pub mod tests {
             ],
             preselect: Some(0),
             allow_custom: true,
+            allow_none: false,
         }
     }
 

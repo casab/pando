@@ -132,7 +132,7 @@ impl Kind {
                     "dev".to_string(),
                     ProcessConfig {
                         cmd: "pnpm dev".to_string(),
-                        ports: port_env("PORT"),
+                        ports: Some(port_env("PORT")),
                         ..Default::default()
                     },
                 );
@@ -147,7 +147,7 @@ impl Kind {
                         // Positional: Django takes the port on the command
                         // line, so there is no environment variable to pick.
                         cmd: "uv run python manage.py runserver 127.0.0.1:{port:web}".to_string(),
-                        ports: PortsSpec::List(strings(&["web"])),
+                        ports: Some(PortsSpec::List(strings(&["web"]))),
                         ..Default::default()
                     },
                 );
@@ -158,7 +158,7 @@ impl Kind {
                     "dev".to_string(),
                     ProcessConfig {
                         cmd: "go run .".to_string(),
-                        ports: port_env("PORT"),
+                        ports: Some(port_env("PORT")),
                         ..Default::default()
                     },
                 );
@@ -175,7 +175,7 @@ impl Kind {
                     "dev".to_string(),
                     ProcessConfig {
                         cmd: "pnpm dev".to_string(),
-                        ports: port_env("WEB_PORT"),
+                        ports: Some(port_env("WEB_PORT")),
                         ..Default::default()
                     },
                 );

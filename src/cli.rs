@@ -294,6 +294,9 @@ fn prompt_with(
     if question.allow_custom {
         writeln!(out, "   c) something else — type the command")?;
     }
+    if question.allow_none {
+        writeln!(out, "   n) none — this process has no port")?;
+    }
     let default = question.preselect.map(|i| i + 1);
     loop {
         match default {
@@ -309,6 +312,9 @@ fn prompt_with(
             && let Some(index) = question.preselect
         {
             return Ok(actions::Answer::Choice(index));
+        }
+        if question.allow_none && (line == "n" || line == "N") {
+            return Ok(actions::Answer::None);
         }
         if question.allow_custom && (line == "c" || line == "C") {
             write!(out, "  command > ")?;
@@ -781,7 +787,10 @@ fn worktree_url(record: &WorktreeRecord) -> Option<String> {
         .or_else(|| record.ports.values().next());
     let port = match assigned {
         Some(port) if record.observed_ports.contains(port) => *port,
-        Some(port) => *port,
+        // It was given a port and is listening somewhere else: a framework
+        // that ignores `PORT`, or one that picked the next free number. The
+        // URL follows what is really serving, not what pando asked for.
+        Some(port) => record.observed_ports.first().copied().unwrap_or(*port),
         None => *record.observed_ports.first()?,
     };
     Some(format!("http://localhost:{port}"))
@@ -1248,6 +1257,37 @@ mod tests {
         assert!(text.contains(" -"), "{text}");
     }
 
+    // The documented behaviour — "what it is really listening on when that
+    // is known" — was two identical match arms, so a framework that ignored
+    // `PORT` and bound something else still had the assigned port printed
+    // as its URL.
+    #[test]
+    fn the_url_prefers_a_port_the_process_is_really_listening_on() {
+        let mut record = WorktreeRecord::new("/trees/feat+one", true);
+        record.ports.insert("web".to_string(), 17_342);
+
+        record.observed_ports = vec![17_342, 17_399];
+        assert_eq!(
+            worktree_url(&record).as_deref(),
+            Some("http://localhost:17342"),
+            "the assigned port is among them, so it is the one"
+        );
+
+        record.observed_ports = vec![3_000];
+        assert_eq!(
+            worktree_url(&record).as_deref(),
+            Some("http://localhost:3000"),
+            "it ignored the port pando gave it; the URL follows the process"
+        );
+
+        record.observed_ports = vec![];
+        assert_eq!(
+            worktree_url(&record).as_deref(),
+            Some("http://localhost:17342"),
+            "nothing observed at all falls back to what was assigned"
+        );
+    }
+
     // ---- questions -------------------------------------------------------
 
     fn dev_question(options: &[&str]) -> actions::Question {
@@ -1260,6 +1300,7 @@ mod tests {
                 .collect(),
             preselect: (!options.is_empty()).then_some(0),
             allow_custom: true,
+            allow_none: false,
         }
     }
 

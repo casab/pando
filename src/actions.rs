@@ -153,7 +153,7 @@ pub fn new(
     // files are provisioned, and the next `start` tries the install again —
     // so the error is worth an exit code, but not an unwind.
     progress("installing");
-    install_if_needed(paths, config, &dir_name, &target, progress)
+    install_if_needed(paths, config, &dir_name, Some(branch), &target, progress)
         .with_context(|| format!("{dir_name} was created, but its install step failed"))?;
     Ok(dir_name)
 }
@@ -199,6 +199,7 @@ pub fn install_if_needed(
     paths: &PandoPaths,
     config: &Config,
     name: &str,
+    branch: Option<&str>,
     worktree: &Path,
     progress: &dyn Fn(&str),
 ) -> Result<()> {
@@ -225,7 +226,7 @@ pub fn install_if_needed(
 
     let log_file = paths.log_file(name, INSTALL_HOOK);
     progress(&format!("{INSTALL_HOOK}: {install}"));
-    let env = pando_env(paths, name, worktree);
+    let env = pando_env(paths, name, branch, worktree);
     hooks::run(&log_file, &with_prelude(config, install), worktree, &env)
         .with_context(|| format!("the {INSTALL_HOOK} hook failed"))?;
 
@@ -268,10 +269,22 @@ pub fn install_if_needed(
 
 /// The variables every command pando runs gets, whether or not it has ports
 /// yet. A hook has to be able to find out which worktree it is in.
-fn pando_env(paths: &PandoPaths, name: &str, worktree: &Path) -> Vec<(String, String)> {
+fn pando_env(
+    paths: &PandoPaths,
+    name: &str,
+    branch: Option<&str>,
+    worktree: &Path,
+) -> Vec<(String, String)> {
     vec![
         ("PANDO_NAME".to_string(), name.to_string()),
-        ("PANDO_BRANCH".to_string(), name.to_string()),
+        // The git branch, the same string the dev process is given. A hook
+        // doing `git checkout "$PANDO_BRANCH"` with the *directory* name
+        // checks out the wrong thing, or nothing at all. A detached HEAD
+        // has no branch, and then the directory name is all there is.
+        (
+            "PANDO_BRANCH".to_string(),
+            branch.unwrap_or(name).to_string(),
+        ),
         ("PANDO_WORKTREE".to_string(), worktree.display().to_string()),
         ("PANDO_ROOT".to_string(), paths.root().display().to_string()),
         ("PANDO_PROJECT".to_string(), paths.project_id().to_string()),
@@ -439,6 +452,10 @@ pub struct Question {
     /// Whether a command typed by hand is acceptable. Always true in this
     /// phase: every slot accepts a shell command, so there is no dead end.
     pub allow_custom: bool,
+    /// Whether "this process has none" is an answer. True for the port
+    /// question: a worker or a watcher really has no port, and that has to
+    /// be sayable, or the question comes back on every start.
+    pub allow_none: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -450,6 +467,9 @@ pub enum Answer {
     /// can review.
     Auto(usize),
     Custom(String),
+    /// "This process has none of those." Only offered where a question has
+    /// an empty answer that means something, which this phase is the port.
+    None,
 }
 
 /// How a front end asks. The CLI prompts on a terminal and refuses
@@ -565,6 +585,27 @@ pub fn resolve(
                 Answer::Custom(value) => {
                     (detect::custom(*slot, value.trim()), config::Note::Answered)
                 }
+                // Written down as an empty list rather than left out: "this
+                // process has no ports" and "nobody has said yet" have to
+                // be different states, or the question returns on every
+                // start and the answer is a port nothing will ever bind.
+                Answer::None if *slot == Slot::PortEnv => {
+                    let (table, key) = Slot::PortEnv.key();
+                    config::set_detected(
+                        paths,
+                        table,
+                        key,
+                        toml_edit::Value::Array(toml_edit::Array::new()),
+                        config::Note::Answered,
+                    )?;
+                    config
+                        .processes
+                        .entry(detect::DEV.to_string())
+                        .or_default()
+                        .ports = Some(config::PortsSpec::List(Vec::new()));
+                    continue;
+                }
+                Answer::None => bail!("{} has no \"none\" answer", slot_label(*slot)),
             }
         };
         let (candidate, note) = candidate;
@@ -599,6 +640,7 @@ fn question_for(proposal: &detect::Proposal) -> Question {
             .collect(),
         preselect: (!proposal.candidates.is_empty()).then_some(0),
         allow_custom: true,
+        allow_none: proposal.slot == Slot::PortEnv,
     }
 }
 
@@ -698,7 +740,14 @@ pub fn start(
     // fingerprint — the decision it guards is "can this step be skipped",
     // and the authoritative one is made under the lock below.
     if !already_running(paths, name, &process_name) {
-        install_if_needed(paths, config, name, &canonical, progress)?;
+        install_if_needed(
+            paths,
+            config,
+            name,
+            worktree.branch.as_deref(),
+            &canonical,
+            progress,
+        )?;
     }
 
     let _lock = state::lock(&paths.lock_file())?;
@@ -759,7 +808,7 @@ pub fn start(
     record.processes.clear();
     record.observed_ports.clear();
 
-    let roles = process.ports.roles();
+    let roles = process.roles();
     let assignment = ports::assign(paths, &mut store, name, &roles)?;
     let ready_role = ready_role(process, &roles)?;
     let ready_port = ready_role
@@ -1106,7 +1155,7 @@ fn process_env(
     ctx: &template::Context<'_>,
 ) -> Result<Vec<(String, String)>> {
     let mut env: BTreeMap<String, String> = BTreeMap::new();
-    for (var, tmpl) in process.ports.env_templates() {
+    for (var, tmpl) in process.port_env() {
         env.insert(
             var.clone(),
             template::render(&tmpl, ctx).with_context(|| format!("in ports.{var}"))?,
@@ -1706,7 +1755,10 @@ mod tests {
     fn dev(cmd: &str) -> ProcessConfig {
         ProcessConfig {
             cmd: cmd.to_string(),
-            ports: PortsSpec::Map(BTreeMap::from([("PORT".to_string(), "web".to_string())])),
+            ports: Some(PortsSpec::Map(BTreeMap::from([(
+                "PORT".to_string(),
+                "web".to_string(),
+            )]))),
             ..Default::default()
         }
     }
@@ -1818,7 +1870,7 @@ mod tests {
             &mut fx,
             ProcessConfig {
                 cmd: "echo serving on 127.0.0.1:{port:web} && sleep 30".to_string(),
-                ports: PortsSpec::List(vec!["web".to_string()]),
+                ports: Some(PortsSpec::List(vec!["web".to_string()])),
                 ..Default::default()
             },
         );
@@ -2000,7 +2052,7 @@ mod tests {
             &mut fx,
             ProcessConfig {
                 cmd: "sleep 30".to_string(),
-                ports: PortsSpec::List(vec!["web".to_string()]),
+                ports: Some(PortsSpec::List(vec!["web".to_string()])),
                 ready: Some(ReadySpec {
                     role: Some("api".to_string()),
                     timeout_s: None,
@@ -2025,7 +2077,7 @@ mod tests {
             &mut fx,
             ProcessConfig {
                 cmd: python_listener_template(),
-                ports: PortsSpec::List(vec!["web".to_string()]),
+                ports: Some(PortsSpec::List(vec!["web".to_string()])),
                 ..Default::default()
             },
         );
@@ -2088,7 +2140,7 @@ mod tests {
             &mut fx,
             ProcessConfig {
                 cmd: python_listener_v6_template(),
-                ports: PortsSpec::List(vec!["web".to_string()]),
+                ports: Some(PortsSpec::List(vec!["web".to_string()])),
                 ready: Some(ReadySpec {
                     role: None,
                     timeout_s: Some(20),
@@ -2183,7 +2235,10 @@ time.sleep(300)
             &mut fx,
             ProcessConfig {
                 cmd: wildcard_bind_loop(),
-                ports: PortsSpec::Map(BTreeMap::from([("PORT".to_string(), "web".to_string())])),
+                ports: Some(PortsSpec::Map(BTreeMap::from([(
+                    "PORT".to_string(),
+                    "web".to_string(),
+                )]))),
                 ready: Some(ReadySpec {
                     role: None,
                     timeout_s: Some(120),
@@ -2721,6 +2776,41 @@ time.sleep(300)
         );
     }
 
+    // The hook's `PANDO_BRANCH` was the directory name and the dev
+    // process's was the git branch, so `git checkout "$PANDO_BRANCH"` in a
+    // hook checked out the wrong thing — or nothing at all.
+    #[test]
+    fn pando_branch_is_the_git_branch_for_hooks_as_well_as_processes() {
+        let mut fx = fixture();
+        fx.config.project.install = Some("echo INSTALL PANDO_BRANCH=$PANDO_BRANCH".to_string());
+        with_dev(
+            &mut fx,
+            dev("echo DEV PANDO_BRANCH=$PANDO_BRANCH && sleep 30"),
+        );
+        let name = worktree_named(&fx, "feat/one");
+        assert_eq!(name, "feat+one", "the directory name is the sanitised one");
+
+        assert!(
+            install_log(&fx, &name).contains("PANDO_BRANCH=feat/one"),
+            "the hook gets the branch, not the directory: {:?}",
+            install_log(&fx, &name)
+        );
+
+        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let _guard = guard(&outcome);
+        assert!(
+            wait_until(Duration::from_secs(10), || log_of(&fx, &name)
+                .contains("PANDO_BRANCH=")),
+            "the process never logged its environment: {:?}",
+            log_of(&fx, &name)
+        );
+        assert!(
+            log_of(&fx, &name).contains("PANDO_BRANCH=feat/one"),
+            "and both agree: {:?}",
+            log_of(&fx, &name)
+        );
+    }
+
     #[test]
     fn a_project_with_no_install_step_runs_no_hook() {
         let fx = fixture();
@@ -2797,7 +2887,7 @@ time.sleep(300)
         .unwrap();
         let notices = notices.into_inner();
         assert_eq!(config.processes["dev"].cmd, "pnpm dev");
-        assert_eq!(config.processes["dev"].ports.roles(), vec!["web"]);
+        assert_eq!(config.processes["dev"].roles(), vec!["web"]);
         assert!(
             notices.iter().any(|n| n.contains("pnpm dev")),
             "every guess is visible: {notices:?}"
@@ -2833,10 +2923,7 @@ time.sleep(300)
         let (ask, asked) = scripted(vec![Answer::Choice(1), Answer::Choice(0)]);
         let config = resolve_process(&fx.paths, &fx.config, &ask, &noop).unwrap();
         assert_eq!(config.processes["dev"].cmd, "pnpm dev:web");
-        assert_eq!(
-            config.processes["dev"].ports.env_templates()["PORT"],
-            "{port:web}"
-        );
+        assert_eq!(config.processes["dev"].port_env()["PORT"], "{port:web}");
         let questions = asked.borrow();
         assert_eq!(questions.len(), 2);
         assert_eq!(questions[0].slot, Slot::DevCmd);
@@ -2866,13 +2953,49 @@ time.sleep(300)
             "./scripts/serve.sh --port {port:web}"
         );
         assert_eq!(
-            config.processes["dev"].ports.roles(),
+            config.processes["dev"].roles(),
             vec!["web"],
             "a command carrying {{port:web}} has answered the port question"
         );
         let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
         assert!(written.contains("# answered:"), "{written}");
         assert!(written.contains("ports = [\"web\"]"), "{written}");
+    }
+
+    // "no ports" and "not answered yet" used to be the same state, so a
+    // process that really has none — a worker, a watcher, a queue consumer
+    // — was asked again on every start, and given a port it would never
+    // bind if anything answered for it.
+    #[test]
+    fn answering_none_to_the_port_question_is_written_down_as_no_ports() {
+        let fx = detectable_fixture(
+            r#"{ "dev": "concurrently \"npm:dev:*\"", "dev:web": "next dev" }"#,
+            "PORT=3000\nAPI_PORT=3001\n",
+        );
+        let (ask, asked) = scripted(vec![
+            Answer::Custom("./worker.sh".to_string()),
+            Answer::None,
+        ]);
+        let config = resolve_process(&fx.paths, &fx.config, &ask, &noop).unwrap();
+        assert_eq!(asked.borrow().len(), 2, "the command, then the port");
+        assert!(
+            asked.borrow()[1].allow_none,
+            "the port question has to offer \"none\" for this to be answerable"
+        );
+        assert!(
+            config.processes["dev"].roles().is_empty(),
+            "a process with no ports has no roles"
+        );
+
+        let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+        assert!(
+            written.contains("ports = []"),
+            "an empty list, so it reads as answered rather than missing: {written}"
+        );
+
+        // And asked once: a second resolve has nothing left to ask about.
+        let again = resolve_process(&fx.paths, &config, &refuse, &noop).unwrap();
+        assert!(again.processes["dev"].roles().is_empty());
     }
 
     #[test]
@@ -3130,7 +3253,7 @@ time.sleep(300)
             &mut fx,
             ProcessConfig {
                 cmd: python_listener_template(),
-                ports: PortsSpec::List(vec!["web".to_string()]),
+                ports: Some(PortsSpec::List(vec!["web".to_string()])),
                 ..Default::default()
             },
         );

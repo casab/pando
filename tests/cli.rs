@@ -959,3 +959,34 @@ fn yes_records_that_it_took_the_first_option_rather_than_detecting_one() {
     );
     assert_eq!(code(&e.pando(&["stop"])), EXIT_OK);
 }
+
+// A process the developer deliberately gave no ports — a worker, a watcher,
+// a queue consumer — used to have one injected into its own `[dev]` table,
+// and was then reported failed for never binding a port it was never told
+// about.
+#[test]
+fn a_process_with_no_ports_of_its_own_is_running_once_it_is_alive() {
+    // A project full of port signals, so there is every temptation.
+    let e = env_of(Kind::NextPnpmCompose);
+    e.write_config("[dev]\ncmd = \"sleep 300\"\n\n[dev.ready]\ntimeout_s = 2\n");
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+    let out = e.pando(&["start", "feat+one"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+
+    let text = std::fs::read_to_string(e.config_file()).unwrap();
+    assert!(
+        !text.contains("ports ="),
+        "nothing may give a portless process a port: {text}"
+    );
+
+    // Well past its readiness window, which it has no port to satisfy.
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    let out = e.pando(&["status", "feat+one"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("running"),
+        "a process with no ports is running once alive: {}",
+        stdout(&out)
+    );
+    assert_eq!(code(&e.pando(&["stop"])), EXIT_OK);
+}

@@ -1020,6 +1020,7 @@ mod tests {
                         .collect(),
                     preselect: Some(11),
                     allow_custom: true,
+                    allow_none: false,
                 },
                 selected: 11,
                 custom: Some("a rather long command typed by hand".into()),
