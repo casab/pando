@@ -830,7 +830,7 @@ pub fn start(
 
     let cmd = template::render(&process.cmd, &ctx)
         .with_context(|| format!("in the command for process {process_name}"))?;
-    let cwd = process_cwd(&canonical, process, &ctx)?;
+    let cwd = process_cwd(&canonical, &process_name, process, &ctx)?;
     let env = process_env(paths, name, &worktree, process, &ctx)?;
     let shell_cmd = with_prelude(config, &cmd);
 
@@ -1123,6 +1123,7 @@ fn url_for(ports: &BTreeMap<String, u16>, ready_port: Option<u16>) -> Option<Str
 /// config names. A monorepo app sets `cwd = "apps/web"`.
 fn process_cwd(
     worktree: &Path,
+    name: &str,
     process: &ProcessConfig,
     ctx: &template::Context<'_>,
 ) -> Result<PathBuf> {
@@ -1133,8 +1134,25 @@ fn process_cwd(
     let dir = worktree.join(&rendered);
     if !dir.is_dir() {
         bail!(
-            "cwd {rendered:?} does not exist in this worktree ({}) — check [dev].cwd",
+            "cwd {rendered:?} does not exist in this worktree ({}) — check the cwd of process \
+             {name:?}",
             dir.display()
+        );
+    }
+    // `config::validate` refuses the literal ways out — an absolute path, a
+    // `..` — but a template renders at start time and a symlink resolves
+    // later still, so the directory that will really be entered is compared
+    // against the worktree that owns it. A process that ran outside its own
+    // worktree would be writing into a repository, which Invariant 1
+    // forbids.
+    let resolved = crate::paths::resolve_for_compare(&dir);
+    let owner = crate::paths::resolve_for_compare(worktree);
+    if !resolved.starts_with(&owner) {
+        bail!(
+            "cwd {rendered:?} for process {name:?} resolves to {}, which is outside the worktree \
+             ({})",
+            resolved.display(),
+            owner.display()
         );
     }
     Ok(dir)
@@ -1926,6 +1944,36 @@ mod tests {
         let err = start(&fx.paths, &fx.config, &name, &noop).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("apps/nope"), "{msg}");
+        assert!(
+            fx.state().worktrees[&name].processes.is_empty(),
+            "a refused start records nothing"
+        );
+    }
+
+    // `config::validate` refuses a literal `..` or an absolute path, but a
+    // symlink resolves only when the process is about to be started, and a
+    // process running outside its worktree writes into a repository.
+    #[test]
+    fn a_cwd_that_is_a_symlink_out_of_the_worktree_is_refused() {
+        let mut fx = fixture();
+        with_dev(
+            &mut fx,
+            ProcessConfig {
+                cmd: "sleep 30".to_string(),
+                cwd: Some("escape".to_string()),
+                ..Default::default()
+            },
+        );
+        let name = worktree_named(&fx, "feat/one");
+        let worktree = fx.worktrees_dir().join(&name);
+        let outside = fx.root.parent().expect("a parent").join("elsewhere");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, worktree.join("escape")).unwrap();
+
+        let err = start(&fx.paths, &fx.config, &name, &noop).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("outside the worktree"), "{msg}");
+        assert!(msg.contains("\"dev\""), "the process is named: {msg}");
         assert!(
             fx.state().worktrees[&name].processes.is_empty(),
             "a refused start records nothing"

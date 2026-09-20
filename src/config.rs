@@ -111,7 +111,7 @@ impl RuntimeSection {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessConfig {
     /// The command that starts the process. Defaulted rather than required
@@ -205,7 +205,7 @@ impl PortsSpec {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReadySpec {
     /// Role whose port must bind. A process with no ports is ready once alive.
@@ -646,6 +646,7 @@ pub fn validate(config: &Config, project: &ProjectRef) -> Result<()> {
             &[],
         )?;
     }
+    validate_processes(config)?;
     for entry in &config.project.provision {
         let path = Path::new(entry);
         if path.is_absolute() {
@@ -660,6 +661,69 @@ pub fn validate(config: &Config, project: &ProjectRef) -> Result<()> {
         if entry.trim().is_empty() {
             bail!("provision paths must not be empty");
         }
+    }
+    Ok(())
+}
+
+/// Rules that only make sense across every process of a worktree.
+///
+/// A role names a port, and a port belongs to exactly one process: two
+/// processes claiming `web` would both be handed the same number, and the
+/// second one to start would die with `EADDRINUSE` for a reason nothing in
+/// pando could explain. `{port:<role>}` may still *reference* any role of
+/// the worktree — that is how a web process is told the api's port — so
+/// only ownership is exclusive, never use.
+fn validate_processes(config: &Config) -> Result<()> {
+    let mut owner: BTreeMap<String, String> = BTreeMap::new();
+    for (name, process) in &config.processes {
+        let roles = process.roles();
+        for role in &roles {
+            if let Some(first) = owner.get(role) {
+                bail!(
+                    "processes {first:?} and {name:?} both claim the role {role:?} — a role \
+                     belongs to one process, and every process may still reference it with \
+                     {{port:{role}}}"
+                );
+            }
+            owner.insert(role.clone(), name.clone());
+        }
+        if let Some(named) = process.ready.as_ref().and_then(|r| r.role.as_deref())
+            && !roles.iter().any(|r| r == named)
+        {
+            bail!(
+                "ready.role = {named:?} in process {name:?} names a role it does not own — it \
+                 owns {}",
+                if roles.is_empty() {
+                    "none".to_string()
+                } else {
+                    roles.join(", ")
+                }
+            );
+        }
+        if let Some(cwd) = process.cwd.as_deref() {
+            validate_cwd(name, cwd)?;
+        }
+    }
+    Ok(())
+}
+
+/// A process runs inside its own worktree. An absolute path or one that
+/// climbs out with `..` would put it somewhere pando does not own — the
+/// main checkout, a sibling worktree — and everything it wrote there would
+/// be written into a repository, which Invariant 1 forbids.
+fn validate_cwd(process: &str, cwd: &str) -> Result<()> {
+    if cwd.trim().is_empty() {
+        bail!("cwd for process {process:?} must not be empty — leave it out for the worktree root");
+    }
+    let path = Path::new(cwd);
+    if path.is_absolute() {
+        bail!("cwd {cwd:?} for process {process:?} must be relative to the worktree");
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
+    {
+        bail!("cwd {cwd:?} for process {process:?} must not escape the worktree");
     }
     Ok(())
 }
@@ -1494,6 +1558,127 @@ auth_cmd = "./scripts/dev-cookie.sh"
             msg.contains(&f.paths.config_file().display().to_string()),
             "{msg}"
         );
+    }
+
+    // ---- several processes ------------------------------------------------
+
+    /// Loads a home config and returns the error message it refused with.
+    fn refusal(text: &str) -> String {
+        let f = fixture();
+        write_home(&f, text);
+        format!("{:#}", load(&f.paths).unwrap_err())
+    }
+
+    fn accepts(text: &str) -> Config {
+        let f = fixture();
+        write_home(&f, text);
+        load(&f.paths).expect("this config is valid").config
+    }
+
+    #[test]
+    fn two_processes_claiming_one_role_are_refused_by_name() {
+        let msg = refusal(
+            "[processes.web]\ncmd = \"a\"\nports = [\"web\"]\n\n\
+             [processes.api]\ncmd = \"b\"\nports = { PORT = \"web\" }\n",
+        );
+        assert!(
+            msg.contains("\"api\""),
+            "the message names both processes: {msg}"
+        );
+        assert!(msg.contains("\"web\""), "{msg}");
+        // Both forms of `ports` own roles the same way, so the map form is
+        // caught as well as the list.
+        assert!(msg.contains("role"), "{msg}");
+    }
+
+    #[test]
+    fn one_process_may_reference_another_processs_role() {
+        // The whole reason `{port:<role>}` exists: the web process is told
+        // the port the api was given. Referencing is not owning.
+        let config = accepts(
+            "[processes.web]\ncmd = \"a\"\nports = [\"web\"]\n\
+             env = { VITE_API_URL = \"http://localhost:{port:api}\" }\n\n\
+             [processes.api]\ncmd = \"b\"\nports = [\"api\"]\n",
+        );
+        assert_eq!(config.processes["web"].roles(), vec!["web"]);
+        assert_eq!(config.processes["api"].roles(), vec!["api"]);
+    }
+
+    #[test]
+    fn a_role_repeated_inside_one_process_is_still_one_port() {
+        // `PORT` and `NEXT_PUBLIC_PORT` both meaning `web` is one port, not
+        // a process colliding with itself.
+        let config = accepts(
+            "[processes.web]\ncmd = \"a\"\nports = { PORT = \"web\", NEXT_PUBLIC_PORT = \"web\" }\n",
+        );
+        assert_eq!(config.processes["web"].roles(), vec!["web"]);
+    }
+
+    #[test]
+    fn a_ready_role_a_process_does_not_own_is_refused() {
+        let msg = refusal(
+            "[processes.web]\ncmd = \"a\"\nports = [\"web\"]\n\n\
+             [processes.api]\ncmd = \"b\"\nports = [\"api\"]\nready = { role = \"web\" }\n",
+        );
+        assert!(msg.contains("ready.role"), "{msg}");
+        assert!(msg.contains("\"api\""), "the process is named: {msg}");
+        assert!(
+            msg.contains("owns api"),
+            "and so is what it does own: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_ready_role_a_process_does_own_is_fine() {
+        let config = accepts(
+            "[processes.web]\ncmd = \"a\"\nports = [\"web\"]\nready = { role = \"web\", timeout_s = 90 }\n",
+        );
+        let ready = config.processes["web"].ready.clone().expect("a ready rule");
+        assert_eq!(ready.role.as_deref(), Some("web"));
+        assert_eq!(ready.timeout_s, Some(90));
+    }
+
+    #[test]
+    fn a_cwd_that_escapes_the_worktree_is_refused() {
+        for cwd in ["/etc", "../sibling", "apps/../../elsewhere"] {
+            let msg = refusal(&format!("[processes.web]\ncmd = \"a\"\ncwd = \"{cwd}\"\n"));
+            assert!(
+                msg.contains("web"),
+                "the process is named for cwd {cwd:?}: {msg}"
+            );
+            assert!(
+                msg.contains("relative") || msg.contains("escape"),
+                "cwd {cwd:?} was refused for the wrong reason: {msg}"
+            );
+        }
+        let msg = refusal("[processes.web]\ncmd = \"a\"\ncwd = \"  \"\n");
+        assert!(msg.contains("empty"), "{msg}");
+    }
+
+    #[test]
+    fn a_cwd_inside_the_worktree_is_kept_as_written() {
+        let config = accepts("[processes.web]\ncmd = \"a\"\ncwd = \"apps/web\"\n");
+        assert_eq!(config.processes["web"].cwd.as_deref(), Some("apps/web"));
+        // The worktree root itself, spelled out, is not an escape.
+        let config = accepts("[dev]\ncmd = \"a\"\ncwd = \".\"\n");
+        assert_eq!(config.processes["dev"].cwd.as_deref(), Some("."));
+    }
+
+    #[test]
+    fn a_committed_config_that_fails_the_new_rules_is_dropped_rather_than_fatal() {
+        // The Phase 1 rule, still holding for rules Phase 2b added: a file
+        // the team committed may be newer, or wrong, and must not brick
+        // every command.
+        let f = fixture();
+        write_committed(
+            &f,
+            "[processes.web]\ncmd = \"a\"\nports = [\"web\"]\n\n\
+             [processes.api]\ncmd = \"b\"\nports = [\"web\"]\n",
+        );
+        let loaded = load(&f.paths).expect("a committed file is dropped, not fatal");
+        assert!(loaded.config.processes.is_empty());
+        assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
+        assert!(loaded.warnings[0].contains("role"), "{:?}", loaded.warnings);
     }
 
     #[test]
