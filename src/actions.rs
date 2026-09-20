@@ -181,7 +181,7 @@ fn git_succeeds(root: &Path, args: &[&str]) -> bool {
 
 /// Removes a worktree, its logs, and its data directory. The branch is kept;
 /// deleting it is a separate decision.
-pub fn rm(paths: &PandoPaths, config: &Config, name: &str, yes: bool, force: bool) -> Result<()> {
+pub fn rm(paths: &PandoPaths, name: &str, yes: bool, force: bool) -> Result<()> {
     let discovery = worktree::discover_all(&paths.project)?;
     if discovery.main.name == name {
         bail!("{name:?} is the main checkout — pando never removes it");
@@ -219,12 +219,12 @@ pub fn rm(paths: &PandoPaths, config: &Config, name: &str, yes: bool, force: boo
         );
     }
 
-    // Unlink provisioned symlinks before git touches the worktree, so the
-    // main checkout's files are never followed during teardown.
-    for rel in &config.project.provision {
-        remove_symlink_if_link(&target.path.join(rel));
-    }
-
+    // Nothing is unlinked first. Verified against git 2.51: an ignored file
+    // does not block `git worktree remove`, and `--force` does not follow a
+    // symlink out of the worktree — so unlinking bought nothing, and a
+    // removal git then refused (a dirty tree without `--force`) left the
+    // worktree alive without the `.env` pando had provisioned for it.
+    //
     // Always run, even when the directory is already gone: the same command
     // clears a prunable entry, and only that one. `git worktree prune` is
     // global and would sweep entries pando has no business touching.
@@ -442,15 +442,6 @@ fn provision_worktree_files(paths: &PandoPaths, config: &Config, worktree: &Path
         }
     }
     Ok(())
-}
-
-fn remove_symlink_if_link(path: &Path) {
-    if std::fs::symlink_metadata(path)
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false)
-    {
-        std::fs::remove_file(path).ok();
-    }
 }
 
 fn ref_exists(root: &Path, refname: &str) -> bool {
@@ -930,7 +921,7 @@ mod tests {
         std::fs::write(fx.paths.log_file(&name, "dev"), "log line\n").unwrap();
         std::fs::create_dir_all(fx.paths.data_dir(&name)).unwrap();
 
-        rm(&fx.paths, &fx.config, &name, false, false).unwrap();
+        rm(&fx.paths, &name, false, false).unwrap();
 
         assert!(fx.names().is_empty());
         assert!(!fx.worktrees_dir().join(&name).exists());
@@ -960,7 +951,7 @@ mod tests {
         );
         assert!(!fx.paths.home.exists(), "nothing has written the home yet");
 
-        rm(&fx.paths, &fx.config, "adopted", true, false).unwrap();
+        rm(&fx.paths, "adopted", true, false).unwrap();
 
         let mode = std::fs::metadata(&fx.paths.home)
             .unwrap()
@@ -977,7 +968,7 @@ mod tests {
     fn rm_keeps_the_branch() {
         let fx = fixture();
         let name = new(&fx.paths, &fx.config, "feat/one", None, &noop).unwrap();
-        rm(&fx.paths, &fx.config, &name, false, false).unwrap();
+        rm(&fx.paths, &name, false, false).unwrap();
         assert!(
             ref_exists(&fx.root, "refs/heads/feat/one"),
             "rm removes the worktree, not the work"
@@ -1000,14 +991,14 @@ mod tests {
             ],
         );
 
-        let err = rm(&fx.paths, &fx.config, "adopted", false, false).unwrap_err();
+        let err = rm(&fx.paths, "adopted", false, false).unwrap_err();
         assert!(
             format!("{err:#}").contains("--yes"),
             "unexpected error: {err:#}"
         );
         assert_eq!(fx.names(), vec!["adopted"]);
 
-        rm(&fx.paths, &fx.config, "adopted", true, false).unwrap();
+        rm(&fx.paths, "adopted", true, false).unwrap();
         assert!(fx.names().is_empty());
     }
 
@@ -1017,7 +1008,7 @@ mod tests {
         let name = new(&fx.paths, &fx.config, "feat/one", None, &noop).unwrap();
         std::fs::write(fx.worktrees_dir().join(&name).join("scratch.txt"), "wip").unwrap();
 
-        let err = rm(&fx.paths, &fx.config, &name, false, false).unwrap_err();
+        let err = rm(&fx.paths, &name, false, false).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("git worktree remove failed"), "{msg}");
         assert!(
@@ -1026,7 +1017,7 @@ mod tests {
         );
         assert_eq!(fx.names(), vec![name.clone()]);
 
-        rm(&fx.paths, &fx.config, &name, false, true).unwrap();
+        rm(&fx.paths, &name, false, true).unwrap();
         assert!(fx.names().is_empty());
     }
 
@@ -1037,7 +1028,7 @@ mod tests {
         let mut fx = fixture();
         fx.config.project.provision = vec![".env".into()];
         let name = new(&fx.paths, &fx.config, "feat/one", None, &noop).unwrap();
-        rm(&fx.paths, &fx.config, &name, false, false).unwrap();
+        rm(&fx.paths, &name, false, false).unwrap();
         assert!(fx.names().is_empty());
         assert_eq!(
             std::fs::read_to_string(fx.root.join(".env")).unwrap(),
@@ -1062,7 +1053,7 @@ mod tests {
         );
 
         for (yes, force) in [(false, false), (true, false), (true, true)] {
-            let err = rm(&fx.paths, &fx.config, &name, yes, force).unwrap_err();
+            let err = rm(&fx.paths, &name, yes, force).unwrap_err();
             let msg = format!("{err:#}");
             assert!(msg.contains("locked"), "{msg}");
             assert!(msg.contains("benchmark running"), "{msg}");
@@ -1078,7 +1069,7 @@ mod tests {
         std::fs::remove_dir_all(fx.worktrees_dir().join(&gone)).unwrap();
         std::fs::remove_dir_all(fx.worktrees_dir().join(&other)).unwrap();
 
-        rm(&fx.paths, &fx.config, &gone, false, false).unwrap();
+        rm(&fx.paths, &gone, false, false).unwrap();
 
         let left = fx.names();
         assert_eq!(
@@ -1092,10 +1083,10 @@ mod tests {
     fn rm_refuses_the_main_checkout_and_an_unknown_name() {
         let fx = fixture();
         let main_name = worktree::discover_all(&fx.paths.project).unwrap().main.name;
-        let err = rm(&fx.paths, &fx.config, &main_name, true, true).unwrap_err();
+        let err = rm(&fx.paths, &main_name, true, true).unwrap_err();
         assert!(format!("{err:#}").contains("main checkout"), "{err:#}");
 
-        let err = rm(&fx.paths, &fx.config, "nope", true, true).unwrap_err();
+        let err = rm(&fx.paths, "nope", true, true).unwrap_err();
         assert!(format!("{err:#}").contains("no worktree named"), "{err:#}");
     }
 
@@ -1162,8 +1153,35 @@ mod tests {
             elsewhere.join(&name).canonicalize().unwrap()
         );
 
-        rm(&fx.paths, &fx.config, &name, false, false).unwrap();
+        rm(&fx.paths, &name, false, false).unwrap();
         assert!(!elsewhere.join(&name).exists());
+    }
+
+    // A refused `rm` must change nothing at all. Unlinking the provisioned
+    // files before asking git left the worktree alive and stripped of its
+    // `.env`, with nothing to re-provision it.
+    #[test]
+    fn a_refused_rm_leaves_the_provisioned_files_alone() {
+        let mut fx = fixture();
+        fx.config.project.provision = vec![".env".into()];
+        let name = new(&fx.paths, &fx.config, "feat/p", None, &noop).unwrap();
+        let worktree = fx.worktrees_dir().join(&name);
+        let env = worktree.join(".env");
+        std::fs::write(worktree.join("DIRTY.txt"), "wip").unwrap();
+
+        let err = rm(&fx.paths, &name, false, false).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("git worktree remove failed"),
+            "{err:#}"
+        );
+        assert_eq!(fx.names(), vec![name], "the worktree is still there");
+        assert!(
+            std::fs::symlink_metadata(&env)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false),
+            "a refused rm must leave the provisioned symlink where it was"
+        );
+        assert_eq!(std::fs::read_to_string(&env).unwrap(), "SECRET=1\n");
     }
 
     // Invariant 1 covers the whole repository, and a linked worktree is part

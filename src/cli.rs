@@ -75,7 +75,7 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             }
         }
         Command::Rm { name, yes, force } => {
-            actions::rm(paths, config, &name, yes, force)?;
+            actions::rm(paths, &name, yes, force)?;
             writeln!(out, "removed {name}")?;
             Ok(())
         }

@@ -202,7 +202,7 @@ fn every_command_leaves_the_repository_untouched() {
     actions::created_by_pando(&h.paths);
     h.assert_untouched("created_by_pando", Some(&worktree));
 
-    actions::rm(&h.paths, &h.config, &name, false, false).unwrap();
+    actions::rm(&h.paths, &name, false, false).unwrap();
     h.assert_untouched("rm", None);
     assert!(!worktree.exists());
 }
@@ -219,7 +219,7 @@ fn a_refused_command_leaves_the_repository_untouched() {
     );
     h.assert_untouched("a refused new", None);
 
-    assert!(actions::rm(&h.paths, &h.config, "nope", true, true).is_err());
+    assert!(actions::rm(&h.paths, "nope", true, true).is_err());
     h.assert_untouched("a refused rm", None);
 
     assert!(actions::path(&h.paths, "nope").is_err());
@@ -279,10 +279,10 @@ fn adopting_and_removing_a_worktree_elsewhere_leaves_the_repository_untouched() 
     assert_eq!(tree(&h.root), h.baseline, "ls must not write anything");
 
     assert!(
-        actions::rm(&h.paths, &h.config, "adopted-elsewhere", false, false).is_err(),
+        actions::rm(&h.paths, "adopted-elsewhere", false, false).is_err(),
         "an adopted worktree needs --yes"
     );
-    actions::rm(&h.paths, &h.config, "adopted-elsewhere", true, false).unwrap();
+    actions::rm(&h.paths, "adopted-elsewhere", true, false).unwrap();
     assert_eq!(status_porcelain(&h.root), "");
     assert_eq!(tree(&h.root), h.baseline);
 }

@@ -747,10 +747,9 @@ impl App {
 
     fn spawn_remove(&mut self, name: String, yes: bool, force: bool) -> bool {
         let paths = self.paths.clone();
-        let config = self.config.clone();
         let worker_name = name.clone();
         self.spawn_pending(name, PendingKind::Remove, move || {
-            actions::rm(&paths, &config, &worker_name, yes, force)
+            actions::rm(&paths, &worker_name, yes, force)
                 .map(|()| PendingOutcome::Removed(worker_name))
                 .map_err(|e| format!("{e:#}"))
         })
