@@ -807,7 +807,18 @@ fn worktree_url(record: &WorktreeRecord) -> Option<String> {
         // It was given a port and is listening somewhere else: a framework
         // that ignores `PORT`, or one that picked the next free number. The
         // URL follows what is really serving, not what pando asked for.
-        Some(port) => record.observed_ports.first().copied().unwrap_or(*port),
+        //
+        // But only a port no other role claims. With several processes,
+        // an observed port that is not this role's is usually just the
+        // *other* process's — and a worktree whose web server is stopped
+        // while its api keeps serving would otherwise hand out the api's
+        // URL as the worktree's.
+        Some(port) => record
+            .observed_ports
+            .iter()
+            .find(|observed| !record.ports.values().any(|role| role == *observed))
+            .copied()
+            .unwrap_or(*port),
         None => *record.observed_ports.first()?,
     };
     Some(format!("http://localhost:{port}"))
@@ -1577,6 +1588,37 @@ mod tests {
             },
         );
         crate::state::save(&fx.paths.state_file(), &store).unwrap();
+    }
+
+    #[test]
+    fn the_url_follows_a_listener_only_when_no_other_role_owns_that_port() {
+        let mut record = WorktreeRecord::new("/trees/feat+one", true);
+        record.ports.insert("web".to_string(), 17_342);
+        record.ports.insert("api".to_string(), 17_343);
+
+        // Both up: the web role's, as always.
+        record.observed_ports = vec![17_342, 17_343];
+        assert_eq!(
+            worktree_url(&record).as_deref(),
+            Some("http://localhost:17342")
+        );
+
+        // The web process stopped and the api kept serving. The api's port
+        // is not the worktree's URL.
+        record.observed_ports = vec![17_343];
+        assert_eq!(
+            worktree_url(&record).as_deref(),
+            Some("http://localhost:17342"),
+            "another process's port is not the web role's"
+        );
+
+        // A framework that ignored its port and bound something nobody
+        // claimed is still followed, which is what this rule is for.
+        record.observed_ports = vec![17_343, 3000];
+        assert_eq!(
+            worktree_url(&record).as_deref(),
+            Some("http://localhost:3000")
+        );
     }
 
     #[test]
