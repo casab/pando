@@ -35,8 +35,11 @@ enum CreateSource {
 
 /// Creates a worktree for `branch`, returning its directory name.
 ///
-/// Every refusal happens before git is asked to do anything, so a rejected
-/// `new` leaves no directory, no branch, and no state behind.
+/// A rejected `new` leaves no directory, no branch, and no state behind.
+/// Most refusals happen before git is asked to do anything; the ones that
+/// cannot — the worktree's own gitignore has the last word on provisioning,
+/// and it can only be read once the worktree exists — unwind what was
+/// created and say so in the error.
 pub fn new(
     paths: &PandoPaths,
     config: &Config,
@@ -59,8 +62,10 @@ pub fn new(
         );
     }
 
-    // Checked before anything is created: a project that needs an untracked,
-    // non-ignored file is refused with the path named, not fixed up.
+    // The cheap early refusal: a project that needs an untracked,
+    // non-ignored file is refused with the path named, not fixed up. The
+    // worktree gets asked again once it exists, because it may have a
+    // different `.gitignore` checked out.
     for rel in &config.project.provision {
         ensure_gitignored(&root, rel)?;
     }
@@ -74,6 +79,11 @@ pub fn new(
     let source = resolve_create_source(&root, branch, base, config, progress)?;
 
     paths.ensure_home()?;
+    // State is locked and read *before* git creates anything: a state file
+    // pando cannot use has to refuse while there is still nothing to undo.
+    let _lock = state::lock(&paths.lock_file())?;
+    let mut store = state::load(&paths.state_file())?;
+
     std::fs::create_dir_all(&worktrees_dir)
         .with_context(|| format!("create {}", worktrees_dir.display()))?;
 
@@ -107,18 +117,66 @@ pub fn new(
         bail!("git worktree add failed: {}", git_failure_reason(&out));
     }
 
-    progress("provisioning");
-    provision_worktree_files(paths, config, &target)?;
+    // Past this point the worktree exists, so every failure has something to
+    // undo before it is reported.
+    let finish = (|| -> Result<()> {
+        progress("provisioning");
+        provision_worktree_files(paths, config, &target)?;
+        let canonical = std::fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
+        store
+            .worktrees
+            .insert(dir_name.clone(), WorktreeRecord::new(canonical, true));
+        state::save(&paths.state_file(), &store)
+    })();
+    match finish {
+        Ok(()) => Ok(dir_name),
+        Err(e) => Err(unwind_new(&root, &target, branch, &source, e)),
+    }
+}
 
-    let _lock = state::lock(&paths.lock_file())?;
-    let mut store = state::load(&paths.state_file())?;
-    let canonical = std::fs::canonicalize(&target).unwrap_or(target);
-    store
-        .worktrees
-        .insert(dir_name.clone(), WorktreeRecord::new(canonical, true));
-    state::save(&paths.state_file(), &store)?;
+/// Undoes a `new` that failed after `git worktree add`. The worktree goes;
+/// so does the branch, but only when pando created it in this same call —
+/// a branch that existed before is the user's work, not pando's to delete.
+///
+/// The returned error is the original one plus what was actually undone, so
+/// a partial unwind never reads as a clean one.
+fn unwind_new(
+    root: &Path,
+    target: &Path,
+    branch: &str,
+    source: &CreateSource,
+    err: anyhow::Error,
+) -> anyhow::Error {
+    let Some(target_str) = target.to_str() else {
+        return err;
+    };
+    if !git_succeeds(root, &["worktree", "remove", "--force", target_str]) {
+        return anyhow::anyhow!(
+            "{err:#} — the partial worktree at {} could not be removed; remove it with \
+             `git worktree remove --force` and delete the branch if it is new",
+            target.display()
+        );
+    }
+    if matches!(source, CreateSource::Local) {
+        return anyhow::anyhow!("{err:#} — the partial worktree was removed");
+    }
+    if !git_succeeds(root, &["branch", "-D", branch]) {
+        return anyhow::anyhow!(
+            "{err:#} — the partial worktree was removed, but the new branch {branch} is still \
+             there; delete it with `git branch -D {branch}`"
+        );
+    }
+    anyhow::anyhow!("{err:#} — the partial worktree and the new branch {branch} were removed")
+}
 
-    Ok(dir_name)
+fn git_succeeds(root: &Path, args: &[&str]) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// Removes a worktree, its logs, and its data directory. The branch is kept;
@@ -303,20 +361,22 @@ fn validate_branch_name(root: &Path, branch: &str) -> Result<()> {
 }
 
 /// Exit 0 means ignored, 1 means not ignored (including a tracked file),
-/// 128 is a git error worth surfacing.
-fn ensure_gitignored(root: &Path, rel: &str) -> Result<()> {
+/// 128 is a git error worth surfacing. `dir` is whichever checkout has the
+/// last word: the main one for the pre-flight, the new worktree for the
+/// check that actually authorises a write.
+fn ensure_gitignored(dir: &Path, rel: &str) -> Result<()> {
     let out = Command::new("git")
         .arg("-C")
-        .arg(root)
+        .arg(dir)
         .args(["check-ignore", "-q", "--", rel])
         .output()
         .context("spawn git check-ignore")?;
     match out.status.code() {
         Some(0) => Ok(()),
         Some(1) => bail!(
-            "provision path {rel:?} is not ignored by {}'s gitignore — pando only creates files \
-             your project already ignores. Add it to .gitignore, or drop it from provision.",
-            root.display()
+            "provision path {rel:?} is not ignored in {} — pando only creates files your project \
+             already ignores. Add it to .gitignore, or drop it from provision.",
+            dir.display()
         ),
         Some(128) => bail!(
             "git check-ignore failed for {rel:?}: {}",
@@ -326,8 +386,14 @@ fn ensure_gitignored(root: &Path, rel: &str) -> Result<()> {
     }
 }
 
-/// Links (or copies) the configured files into a new worktree. Every path
-/// was already proven gitignored by the caller.
+/// Links (or copies) the configured files into a new worktree.
+///
+/// The caller proved every path gitignored in the main checkout, but this
+/// worktree has a different commit checked out and can have a different
+/// `.gitignore` — an older branch, or an uncommitted edit the pre-flight
+/// read. Invariant 1 is about the worktree the file lands in, so the
+/// authorising `check-ignore` is re-run there, immediately before each
+/// write.
 fn provision_worktree_files(paths: &PandoPaths, config: &Config, worktree: &Path) -> Result<()> {
     for rel in &config.project.provision {
         let src = paths.root().join(rel);
@@ -335,6 +401,7 @@ fn provision_worktree_files(paths: &PandoPaths, config: &Config, worktree: &Path
         if !src.exists() || dst.exists() {
             continue;
         }
+        ensure_gitignored(worktree, rel)?;
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create dir {}", parent.display()))?;
@@ -1071,5 +1138,78 @@ mod tests {
 
         rm(&fx.paths, &fx.config, &name, false, false).unwrap();
         assert!(!elsewhere.join(&name).exists());
+    }
+
+    /// Commits an ignore rule on `main` and a branch whose own committed
+    /// `.gitignore` predates it, so the main checkout authorises a write the
+    /// worktree would not.
+    fn with_a_branch_that_does_not_ignore(fx: &Fx, rel: &str, branch: &str) {
+        std::fs::write(
+            fx.root.join(".gitignore"),
+            format!(".env\nnode_modules/\n{rel}\n"),
+        )
+        .unwrap();
+        git(&fx.root, &["add", ".gitignore"]);
+        git(&fx.root, &["commit", "--quiet", "-m", "ignore it"]);
+        std::fs::write(fx.root.join(rel), "TOKEN=1\n").unwrap();
+
+        git(&fx.root, &["checkout", "--quiet", "-b", branch]);
+        std::fs::write(fx.root.join(".gitignore"), ".env\nnode_modules/\n").unwrap();
+        git(&fx.root, &["commit", "--quiet", "-am", "older gitignore"]);
+        git(&fx.root, &["checkout", "--quiet", "main"]);
+    }
+
+    // State is read before git is asked to create anything, so a state file
+    // pando cannot parse refuses while there is still nothing to undo.
+    #[test]
+    fn a_broken_state_file_refuses_new_before_anything_is_created() {
+        let fx = fixture();
+        fx.paths.ensure_home().unwrap();
+        std::fs::write(fx.paths.state_file(), "not json").unwrap();
+
+        let err = new(&fx.paths, &fx.config, "feat/b", None, &noop).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("parse state file"), "{msg}");
+        assert!(fx.names().is_empty(), "no worktree may have been created");
+        assert!(
+            !ref_exists(&fx.root, "refs/heads/feat/b"),
+            "no branch may have been created"
+        );
+        assert!(!fx.worktrees_dir().join("feat+b").exists());
+    }
+
+    // The worktree's own gitignore is the last word, so a refusal can happen
+    // after `git worktree add` — which makes the unwind what keeps `new`
+    // all-or-nothing.
+    #[test]
+    fn a_refusal_after_the_worktree_exists_unwinds_it() {
+        let mut fx = fixture();
+        with_a_branch_that_does_not_ignore(&fx, "local.pando", "legacy");
+        fx.config.project.provision = vec!["local.pando".into()];
+
+        // A forked branch is pando's own doing, so it goes too.
+        let err = new(&fx.paths, &fx.config, "feat/new", Some("legacy"), &noop).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not ignored"), "{msg}");
+        assert!(
+            msg.contains("removed"),
+            "the error must say what it undid: {msg}"
+        );
+        assert!(fx.names().is_empty(), "the worktree must be gone");
+        assert!(!fx.worktrees_dir().join("feat+new").exists());
+        assert!(
+            !ref_exists(&fx.root, "refs/heads/feat/new"),
+            "a branch pando created must be deleted by the unwind"
+        );
+        assert!(!fx.state().worktrees.contains_key("feat+new"));
+
+        // An existing branch was only checked out, so it survives.
+        let err = new(&fx.paths, &fx.config, "legacy", None, &noop).unwrap_err();
+        assert!(format!("{err:#}").contains("not ignored"), "{err:#}");
+        assert!(fx.names().is_empty());
+        assert!(
+            ref_exists(&fx.root, "refs/heads/legacy"),
+            "a branch pando did not create must survive the unwind"
+        );
     }
 }

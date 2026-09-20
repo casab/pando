@@ -14,7 +14,7 @@ mod common;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use common::{Kind, build, git, paths_for, status_porcelain};
+use common::{Kind, build, git, git_raw, paths_for, status_porcelain};
 use pando::config::{self, Config};
 use pando::{actions, state};
 use tempfile::TempDir;
@@ -318,4 +318,102 @@ fn config_is_read_from_the_repository_but_never_written_to_it() {
         "config::write must not touch the repository"
     );
     assert!(h.paths.config_file().starts_with(&h.home));
+}
+
+fn branch_exists(root: &Path, branch: &str) -> bool {
+    git_raw(
+        root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .status
+    .success()
+}
+
+// The pre-flight `check-ignore` runs in the main checkout, but the file is
+// written into a worktree that has a different commit checked out — and a
+// different `.gitignore`. The worktree is where the invariant has to hold,
+// so that is where the last word is.
+//
+// The provisioned path is deliberately not `.env`: a name a developer's own
+// global gitignore might list would make this pass for the wrong reason.
+#[test]
+fn a_branch_whose_gitignore_lacks_the_provision_path_is_refused() {
+    let mut h = harness();
+    std::fs::write(
+        h.root.join(".gitignore"),
+        ".env\n.env.local\nnode_modules/\nlocal.pando\n",
+    )
+    .unwrap();
+    git(&h.root, &["add", ".gitignore"]);
+    git(&h.root, &["commit", "--quiet", "-m", "ignore local.pando"]);
+    std::fs::write(h.root.join("local.pando"), "TOKEN=1\n").unwrap();
+
+    // A branch committed before the ignore rule existed.
+    git(&h.root, &["checkout", "--quiet", "-b", "legacy"]);
+    std::fs::write(h.root.join(".gitignore"), ".env\nnode_modules/\n").unwrap();
+    git(&h.root, &["commit", "--quiet", "-am", "legacy gitignore"]);
+    git(&h.root, &["checkout", "--quiet", "main"]);
+
+    h.config.project.provision = vec!["local.pando".into()];
+    h.baseline = tree(&h.root);
+
+    let err = actions::new(&h.paths, &h.config, "legacy", None, &|_| {}).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("not ignored"), "{msg}");
+    assert!(msg.contains("local.pando"), "{msg}");
+
+    h.assert_untouched("a new refused inside the worktree", None);
+    assert!(
+        actions::ls(&h.paths).unwrap().is_empty(),
+        "the half-created worktree must have been unwound"
+    );
+    assert!(
+        !h.config.worktrees_dir(&h.paths).join("legacy").exists(),
+        "the worktree directory must be gone"
+    );
+    assert!(
+        branch_exists(&h.root, "legacy"),
+        "a branch pando did not create must survive the unwind"
+    );
+    let store = state::load(&h.paths.state_file()).unwrap_or_else(|_| state::State::new());
+    assert!(!store.worktrees.contains_key("legacy"));
+}
+
+// The same hole from the other side: an *uncommitted* `.gitignore` edit in
+// the main checkout authorises the pre-flight, and the worktree checks out
+// the committed file that never had the rule.
+#[test]
+fn an_uncommitted_gitignore_edit_does_not_authorise_a_write_into_a_worktree() {
+    let mut h = harness();
+    std::fs::write(
+        h.root.join(".gitignore"),
+        ".env\n.env.local\nnode_modules/\nsecrets.local\n",
+    )
+    .unwrap();
+    std::fs::write(h.root.join("secrets.local"), "TOKEN=1\n").unwrap();
+    h.config.project.provision = vec!["secrets.local".into()];
+
+    // The edit itself is the user's, so the comparison is against the tree
+    // as they left it rather than against an empty `git status`.
+    let before_status = status_porcelain(&h.root);
+    assert!(before_status.contains(".gitignore"), "{before_status}");
+    let before_tree = tree(&h.root);
+
+    let err = actions::new(&h.paths, &h.config, "feat/u", None, &|_| {}).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("not ignored"), "{msg}");
+    assert!(msg.contains("secrets.local"), "{msg}");
+
+    assert_eq!(status_porcelain(&h.root), before_status);
+    assert_eq!(tree(&h.root), before_tree);
+    assert!(actions::ls(&h.paths).unwrap().is_empty());
+    assert!(
+        !branch_exists(&h.root, "feat/u"),
+        "a branch pando created in this call must be deleted by the unwind"
+    );
 }
