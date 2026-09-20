@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use crate::config::{Config, ProcessConfig, ProvisionMode};
+use crate::config::{self, Config, ProcessConfig, ProvisionMode};
+use crate::detect::{self, Slot};
 use crate::paths::PandoPaths;
 use crate::ports;
 use crate::process::{self as proc, SpawnOptions};
@@ -254,6 +255,189 @@ pub fn rm(paths: &PandoPaths, name: &str, yes: bool, force: bool) -> Result<()> 
     store.worktrees.remove(name);
     state::save(&paths.state_file(), &store)?;
     Ok(())
+}
+
+// ---- questions ------------------------------------------------------------
+
+/// Something pando needs to know and cannot work out on its own.
+///
+/// Asked at the moment the answer is needed, answered once, and written to
+/// `pando.toml` so it is never asked again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Question {
+    pub slot: Slot,
+    pub prompt: String,
+    /// Each option as its value and the signal that found it, in rule order.
+    pub options: Vec<(String, String)>,
+    /// The option the rules put first. `None` when they found nothing, in
+    /// which case only a typed answer will do.
+    pub preselect: Option<usize>,
+    /// Whether a command typed by hand is acceptable. Always true in this
+    /// phase: every slot accepts a shell command, so there is no dead end.
+    pub allow_custom: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Answer {
+    Choice(usize),
+    Custom(String),
+}
+
+/// How a front end asks. The CLI prompts on a terminal and refuses
+/// elsewhere; the TUI opens a modal; a test hands back a scripted answer.
+pub type Ask<'a> = &'a dyn Fn(&Question) -> Result<Answer>;
+
+/// The error every front end turns into exit code 3.
+///
+/// A question is not a failure, and an agent has to be able to tell them
+/// apart without reading English.
+#[derive(Debug, Clone)]
+pub struct NeedsAnswer {
+    pub question: Question,
+}
+
+impl std::fmt::Display for NeedsAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.question.prompt)
+    }
+}
+
+impl std::error::Error for NeedsAnswer {}
+
+/// The slots `new` fills: what to install, what pins the runtime, and which
+/// local files a worktree needs a copy of.
+pub const NEW_SLOTS: [Slot; 3] = [Slot::Install, Slot::VersionFiles, Slot::Provision];
+
+/// The slots `start` fills: the dev process and how it takes its port.
+pub const START_SLOTS: [Slot; 2] = [Slot::DevCmd, Slot::PortEnv];
+
+/// Fills the dev process from detection when config has none.
+pub fn resolve_process(
+    paths: &PandoPaths,
+    config: &Config,
+    ask: Ask<'_>,
+    progress: &dyn Fn(&str),
+) -> Result<Config> {
+    resolve(paths, config, &START_SLOTS, ask, progress)
+}
+
+/// Fills what `new` needs before it creates anything.
+pub fn resolve_for_new(
+    paths: &PandoPaths,
+    config: &Config,
+    ask: Ask<'_>,
+    progress: &dyn Fn(&str),
+) -> Result<Config> {
+    resolve(paths, config, &NEW_SLOTS, ask, progress)
+}
+
+/// Detects, asks where it has to, and writes every answer to `pando.toml`.
+///
+/// Returns the config with the answers applied, so the caller does not have
+/// to re-read the file it just wrote.
+pub fn resolve(
+    paths: &PandoPaths,
+    config: &Config,
+    slots: &[Slot],
+    ask: Ask<'_>,
+    progress: &dyn Fn(&str),
+) -> Result<Config> {
+    let mut config = config.clone();
+    if slots.iter().all(|slot| already_answered(*slot, &config)) {
+        return Ok(config);
+    }
+    let signals = detect::signals(paths.root());
+    let proposals = detect::propose(paths.root(), &signals);
+
+    for slot in slots {
+        // Just in time, and once: a slot the developer has already filled
+        // in, by hand or by answering before, is never asked about again.
+        if already_answered(*slot, &config) || !detect::still_needed(*slot, &config) {
+            continue;
+        }
+        let Some(proposal) = proposals.iter().find(|p| p.slot == *slot) else {
+            continue;
+        };
+        let candidate = if proposal.decided {
+            let candidate = proposal
+                .preferred()
+                .expect("a decided proposal has a candidate")
+                .clone();
+            // Every guess is visible: a one-line notice now, and a comment
+            // in the file afterwards.
+            progress(&format!(
+                "using {:?} for {} (detected: {})",
+                candidate.value,
+                slot_label(*slot),
+                candidate.why
+            ));
+            let why = candidate.why.clone();
+            (candidate, config::Note::Detected(why))
+        } else {
+            let question = question_for(proposal);
+            match ask(&question)? {
+                Answer::Choice(index) => {
+                    let candidate = proposal
+                        .candidates
+                        .get(index)
+                        .with_context(|| format!("option {index} is not on offer"))?
+                        .clone();
+                    let why = candidate.why.clone();
+                    (candidate, config::Note::Detected(why))
+                }
+                Answer::Custom(value) => {
+                    (detect::custom(*slot, value.trim()), config::Note::Answered)
+                }
+            }
+        };
+        let (candidate, note) = candidate;
+        if candidate.value.trim().is_empty() {
+            bail!("an empty answer is not a {}", slot_label(*slot));
+        }
+        for (table, key, value) in detect::edits(*slot, &candidate) {
+            config::set_detected(paths, table, key, value, note.clone())?;
+        }
+        detect::apply(*slot, &candidate, &mut config);
+    }
+    Ok(config)
+}
+
+fn question_for(proposal: &detect::Proposal) -> Question {
+    Question {
+        slot: proposal.slot,
+        prompt: proposal.slot.prompt().to_string(),
+        options: proposal
+            .candidates
+            .iter()
+            .map(|c| (c.value.clone(), c.why.clone()))
+            .collect(),
+        preselect: (!proposal.candidates.is_empty()).then_some(0),
+        allow_custom: true,
+    }
+}
+
+fn slot_label(slot: Slot) -> &'static str {
+    match slot {
+        Slot::Install => "install command",
+        Slot::VersionFiles => "runtime version file",
+        Slot::DevCmd => "dev command",
+        Slot::PortEnv => "port variable",
+        Slot::Provision => "provision list",
+    }
+}
+
+/// Whether config already says what this slot needs, from any layer.
+fn already_answered(slot: Slot, config: &Config) -> bool {
+    match slot {
+        Slot::Install => config.project.install.is_some(),
+        Slot::VersionFiles => !config.runtime.version_files.is_empty(),
+        Slot::Provision => !config.project.provision.is_empty(),
+        Slot::DevCmd => config
+            .processes
+            .get(detect::DEV)
+            .is_some_and(|p| !p.cmd.trim().is_empty()),
+        Slot::PortEnv => !detect::still_needed(Slot::PortEnv, config),
+    }
 }
 
 // ---- start, stop, restart -------------------------------------------------
@@ -1640,6 +1824,221 @@ mod tests {
         let outcome = restart(&fx.paths, &fx.config, &name, &noop).unwrap();
         let _guard = guard(&outcome);
         assert!(matches!(outcome, StartOutcome::Started(_)));
+    }
+
+    // ---- questions -------------------------------------------------------
+
+    use crate::detect::Slot;
+
+    /// Questions a scripted `ask` was asked, shared with the test.
+    type AskedQuestions = std::rc::Rc<std::cell::RefCell<Vec<Question>>>;
+
+    /// An `ask` that answers from a script and records what it was asked.
+    fn scripted(answers: Vec<Answer>) -> (impl Fn(&Question) -> Result<Answer>, AskedQuestions) {
+        let asked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = asked.clone();
+        let answers = std::cell::RefCell::new(answers.into_iter());
+        let ask = move |q: &Question| -> Result<Answer> {
+            seen.borrow_mut().push(q.clone());
+            answers
+                .borrow_mut()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("asked more questions than the test scripted"))
+        };
+        (ask, asked)
+    }
+
+    fn refuse(_: &Question) -> Result<Answer> {
+        panic!("nothing should have been asked")
+    }
+
+    /// A fixture with a package.json, a lockfile, and an env example — the
+    /// shape detection is built for.
+    fn detectable_fixture(scripts: &str, env_example: &str) -> Fx {
+        let fx = fixture();
+        std::fs::write(
+            fx.root.join("package.json"),
+            format!("{{\n  \"name\": \"x\",\n  \"scripts\": {scripts}\n}}\n"),
+        )
+        .unwrap();
+        std::fs::write(fx.root.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+        std::fs::write(fx.root.join(".env.example"), env_example).unwrap();
+        git(&fx.root, &["add", "."]);
+        git(&fx.root, &["commit", "--quiet", "-m", "app"]);
+        fx
+    }
+
+    #[test]
+    fn an_unambiguous_project_is_resolved_without_asking_anything() {
+        let fx = detectable_fixture(
+            r#"{ "dev": "next dev", "build": "next build" }"#,
+            "PORT=3000\n",
+        );
+        let notices = std::cell::RefCell::new(Vec::<String>::new());
+        let config = resolve_process(&fx.paths, &fx.config, &refuse, &|m| {
+            notices.borrow_mut().push(m.to_string())
+        })
+        .unwrap();
+        let notices = notices.into_inner();
+        assert_eq!(config.processes["dev"].cmd, "pnpm dev");
+        assert_eq!(config.processes["dev"].ports.roles(), vec!["web"]);
+        assert!(
+            notices.iter().any(|n| n.contains("pnpm dev")),
+            "every guess is visible: {notices:?}"
+        );
+    }
+
+    #[test]
+    fn an_answer_is_written_to_the_config_with_a_comment() {
+        let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");
+        resolve_process(&fx.paths, &fx.config, &refuse, &noop).unwrap();
+        let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+        assert!(
+            written.contains("cmd = \"pnpm dev\"  # detected: package.json scripts.dev"),
+            "{written}"
+        );
+        assert!(written.contains("[dev]"), "{written}");
+        assert!(
+            written.contains("ports = { PORT = \"web\" }"),
+            "the map form is what a developer would have written: {written}"
+        );
+        // And the file pando wrote is one pando reads back.
+        let loaded = crate::config::load(&fx.paths).unwrap();
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        assert_eq!(loaded.config.processes["dev"].cmd, "pnpm dev");
+    }
+
+    #[test]
+    fn an_ambiguous_project_asks_once_and_never_again() {
+        let fx = detectable_fixture(
+            r#"{ "dev": "concurrently \"npm:dev:*\"", "dev:web": "next dev" }"#,
+            "PORT=3000\nAPI_PORT=3001\n",
+        );
+        let (ask, asked) = scripted(vec![Answer::Choice(1), Answer::Choice(0)]);
+        let config = resolve_process(&fx.paths, &fx.config, &ask, &noop).unwrap();
+        assert_eq!(config.processes["dev"].cmd, "pnpm dev:web");
+        assert_eq!(
+            config.processes["dev"].ports.env_templates()["PORT"],
+            "{port:web}"
+        );
+        let questions = asked.borrow();
+        assert_eq!(questions.len(), 2);
+        assert_eq!(questions[0].slot, Slot::DevCmd);
+        assert_eq!(questions[0].preselect, Some(0));
+        assert!(questions[0].allow_custom);
+        assert_eq!(questions[1].slot, Slot::PortEnv);
+
+        // Second run, reading the config that was just written: nothing left
+        // to ask.
+        let loaded = crate::config::load(&fx.paths).unwrap().config;
+        let again = resolve_process(&fx.paths, &loaded, &refuse, &noop).unwrap();
+        assert_eq!(again.processes["dev"].cmd, "pnpm dev:web");
+    }
+
+    #[test]
+    fn a_typed_answer_is_taken_as_written_and_dated() {
+        let fx = detectable_fixture(
+            r#"{ "dev": "concurrently \"npm:dev:*\"", "dev:web": "next dev" }"#,
+            "PORT=3000\nAPI_PORT=3001\n",
+        );
+        let (ask, _) = scripted(vec![Answer::Custom(
+            "./scripts/serve.sh --port {port:web}".to_string(),
+        )]);
+        let config = resolve_process(&fx.paths, &fx.config, &ask, &noop).unwrap();
+        assert_eq!(
+            config.processes["dev"].cmd,
+            "./scripts/serve.sh --port {port:web}"
+        );
+        assert_eq!(
+            config.processes["dev"].ports.roles(),
+            vec!["web"],
+            "a command carrying {{port:web}} has answered the port question"
+        );
+        let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+        assert!(written.contains("# answered:"), "{written}");
+        assert!(written.contains("ports = [\"web\"]"), "{written}");
+    }
+
+    #[test]
+    fn a_config_the_developer_already_wrote_is_never_questioned() {
+        let mut fx = detectable_fixture(
+            r#"{ "dev": "concurrently \"npm:dev:*\"", "dev:web": "next dev" }"#,
+            "PORT=3000\nAPI_PORT=3001\n",
+        );
+        with_dev(&mut fx, dev("./my-own-server"));
+        let config = resolve_process(&fx.paths, &fx.config, &refuse, &noop).unwrap();
+        assert_eq!(config.processes["dev"].cmd, "./my-own-server");
+        assert!(
+            !fx.paths.config_file().exists(),
+            "resolving nothing writes nothing"
+        );
+    }
+
+    #[test]
+    fn a_library_is_resolved_to_nothing_at_all() {
+        let fx = fixture();
+        let config = resolve_process(&fx.paths, &fx.config, &refuse, &noop).unwrap();
+        assert!(
+            config.processes.is_empty(),
+            "a repository with no server gets no process and no question"
+        );
+        assert!(!fx.paths.config_file().exists());
+    }
+
+    #[test]
+    fn new_resolves_install_version_files_and_provision() {
+        let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");
+        std::fs::write(fx.root.join(".nvmrc"), "22\n").unwrap();
+        git(&fx.root, &["add", ".nvmrc"]);
+        git(&fx.root, &["commit", "--quiet", "-m", "nvmrc"]);
+
+        let config = resolve_for_new(&fx.paths, &fx.config, &refuse, &noop).unwrap();
+        assert_eq!(
+            config.project.install.as_deref(),
+            Some("pnpm install --frozen-lockfile")
+        );
+        assert_eq!(config.runtime.version_files, vec![".nvmrc"]);
+        assert_eq!(config.project.provision, vec![".env"]);
+        assert!(
+            config.processes.is_empty(),
+            "new does not need the dev command yet"
+        );
+        let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+        assert!(written.contains("# detected: pnpm-lock.yaml"), "{written}");
+    }
+
+    // The case `--yes` cannot rescue: pando knows there is a server here and
+    // has no candidate to offer.
+    #[test]
+    fn a_framework_with_no_command_shape_asks_with_no_options() {
+        let fx = fixture();
+        std::fs::write(
+            fx.root.join("package.json"),
+            "{\n  \"scripts\": { \"build\": \"node build.js\" }\n}\n",
+        )
+        .unwrap();
+        let (ask, asked) = scripted(vec![Answer::Custom("node server.js".to_string())]);
+        let config = resolve_process(&fx.paths, &fx.config, &ask, &noop).unwrap();
+        assert_eq!(config.processes["dev"].cmd, "node server.js");
+        let questions = asked.borrow();
+        assert_eq!(questions[0].slot, Slot::DevCmd);
+        assert!(questions[0].options.is_empty());
+        assert_eq!(
+            questions[0].preselect, None,
+            "there is nothing to recommend, so --yes has nothing to take"
+        );
+        assert!(questions[0].allow_custom);
+    }
+
+    #[test]
+    fn an_empty_answer_is_refused() {
+        let fx = detectable_fixture(
+            r#"{ "dev": "concurrently \"npm:dev:*\"", "dev:web": "next dev" }"#,
+            "PORT=3000\n",
+        );
+        let (ask, _) = scripted(vec![Answer::Custom("   ".to_string())]);
+        let err = resolve_process(&fx.paths, &fx.config, &ask, &noop).unwrap_err();
+        assert!(format!("{err:#}").contains("empty answer"), "{err:#}");
     }
 
     // ---- refresh ---------------------------------------------------------

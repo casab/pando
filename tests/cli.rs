@@ -21,8 +21,12 @@ struct Env {
 }
 
 fn env() -> Env {
+    env_of(Kind::Plain)
+}
+
+fn env_of(kind: Kind) -> Env {
     let dir = TempDir::new().unwrap();
-    let root = build(Kind::Plain, dir.path()).root;
+    let root = build(kind, dir.path()).root;
     Env {
         home: dir.path().join("pando-home"),
         root,
@@ -633,4 +637,92 @@ fn a_crashed_process_stays_visible_as_failed() {
     let v: serde_json::Value =
         serde_json::from_str(&stdout(&e.pando(&["status", "--json"]))).unwrap();
     assert_eq!(v["worktrees"][0]["processes"]["dev"]["phase"], "failed");
+}
+
+// ---- questions ------------------------------------------------------------
+
+// An agent never hangs: a question it cannot answer is exit code 3 with the
+// question printed, not a process blocked on a prompt nobody will read.
+#[test]
+fn a_question_with_no_terminal_to_ask_on_exits_three() {
+    let e = env_of(Kind::NextMessy);
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+
+    let out = e.pando(&["start", "feat+one"]);
+    assert_eq!(code(&out), 3, "stdout: {}", stdout(&out));
+    let printed = stderr(&out);
+    assert!(
+        printed.contains("Which command starts the local development server?"),
+        "{printed}"
+    );
+    assert!(
+        printed.contains("pnpm dev"),
+        "the options are printed: {printed}"
+    );
+    assert!(printed.contains("--yes"), "and the way out: {printed}");
+    assert!(
+        stdout(&out).is_empty(),
+        "stdout stays clean: {}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn yes_accepts_the_recommendation_and_never_asks_again() {
+    let e = env_of(Kind::NextMessy);
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+
+    let out = e.pando(&["start", "feat+one", "--yes"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+
+    // Written down, with the reason, in pando's own config.
+    let project = pando::project::ProjectRef::from_root(&e.root).unwrap();
+    let config = e.home.join("projects").join(&project.id).join("pando.toml");
+    let text = std::fs::read_to_string(&config).unwrap();
+    assert!(text.contains("cmd = \"pnpm dev\""), "{text}");
+    assert!(text.contains("ports = { PORT = \"web\" }"), "{text}");
+    assert!(text.contains("# detected:"), "{text}");
+    assert!(
+        text.contains("install = \"pnpm install --frozen-lockfile\""),
+        "new answered the install slot on its own: {text}"
+    );
+
+    assert_eq!(code(&e.pando(&["stop", "feat+one"])), EXIT_OK);
+    // Without --yes and without a terminal: nothing left to ask, so it runs.
+    let out = e.pando(&["start", "feat+one"]);
+    assert_eq!(
+        code(&out),
+        EXIT_OK,
+        "an answered question is never asked again: {}",
+        stderr(&out)
+    );
+    assert_eq!(code(&e.pando(&["stop"])), EXIT_OK);
+    assert_eq!(status_porcelain(&e.root), "");
+}
+
+// Level zero: a library has no dev server, so there is nothing to ask about
+// and the failure is the honest one.
+#[test]
+fn a_library_is_never_asked_about_a_dev_server() {
+    let e = env_of(Kind::RustLib);
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+    let out = e.pando(&["start", "feat+one"]);
+    assert_eq!(code(&out), EXIT_ERROR, "stderr: {}", stderr(&out));
+    assert_eq!(
+        stderr(&out).trim(),
+        "pando: no processes configured; add [dev] to pando.toml"
+    );
+}
+
+// The common case: detection resolves every slot, so the first start needs
+// no answers at all.
+#[test]
+fn a_common_project_starts_with_no_questions() {
+    let e = env_of(Kind::NextPnpmCompose);
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+    let out = e.pando(&["start", "feat+one"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("pnpm dev"), "{}", stderr(&out));
+    assert_eq!(code(&e.pando(&["stop"])), EXIT_OK);
+    assert_eq!(status_porcelain(&e.root), "");
 }

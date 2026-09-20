@@ -50,6 +50,9 @@ pub enum Command {
     New {
         /// Branch name. Slashes become plus signs in the directory name.
         branch: String,
+        /// Accept pando's own recommendation for anything it would ask.
+        #[arg(long)]
+        yes: bool,
         /// Base to fork a new branch from. A bare name prefers the
         /// remote-tracking ref, so a stale local branch is never the fork
         /// point.
@@ -115,10 +118,9 @@ const DEFAULT_TAIL: usize = 50;
 pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result<()> {
     let mut out = std::io::stdout();
     match command {
-        Command::New { branch, base } => {
-            let name = actions::new(paths, config, &branch, base.as_deref(), &|msg| {
-                eprintln!("pando: {msg}");
-            })?;
+        Command::New { branch, base, yes } => {
+            let config = &actions::resolve_for_new(paths, config, &asker(yes), &notice)?;
+            let name = actions::new(paths, config, &branch, base.as_deref(), &notice)?;
             // The canonical path, the one the state record and `pando path`
             // carry: the raw one differs on macOS (/var against /private/var)
             // and reads as a second, different location.
@@ -143,8 +145,9 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             writeln!(out, "{}", actions::path(paths, &name)?.display())?;
             Ok(())
         }
-        Command::Start { name, yes: _ } => {
-            let outcome = actions::start(paths, config, &name, &|msg| eprintln!("pando: {msg}"))?;
+        Command::Start { name, yes } => {
+            let config = &actions::resolve_process(paths, config, &asker(yes), &notice)?;
+            let outcome = actions::start(paths, config, &name, &notice)?;
             let started = outcome.process();
             if started.reassigned {
                 eprintln!("pando: the ports {name} had were taken; it moved to new ones");
@@ -178,7 +181,7 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             }
         },
         Command::Restart { name } => {
-            let outcome = actions::restart(paths, config, &name, &|msg| eprintln!("pando: {msg}"))?;
+            let outcome = actions::restart(paths, config, &name, &notice)?;
             writeln!(out, "restarted {name}{}", url_suffix(outcome.process()))?;
             Ok(())
         }
@@ -197,6 +200,139 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             json,
         } => logs(paths, &name, &source, tail, follow, json, &mut out),
     }
+}
+
+/// Everything pando narrates goes to stderr, so a command's stdout stays
+/// exactly what a script asked for.
+fn notice(message: &str) {
+    eprintln!("pando: {message}");
+}
+
+/// The CLI's way of asking.
+///
+/// With `--yes`, the rules' own recommendation is taken and said out loud.
+/// On a terminal, a numbered prompt. Anywhere else — a script, an agent, a
+/// pipe — the question becomes exit code 3 rather than a process that
+/// blocks on a `read` nobody will ever answer.
+fn asker(yes: bool) -> impl Fn(&actions::Question) -> Result<actions::Answer> {
+    move |question: &actions::Question| {
+        if yes {
+            return match question.preselect {
+                Some(index) => {
+                    notice(&format!("--yes: taking {:?}", question.options[index].0));
+                    Ok(actions::Answer::Choice(index))
+                }
+                None => Err(needs_answer(question)),
+            };
+        }
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            return Err(needs_answer(question));
+        }
+        prompt(question)
+    }
+}
+
+fn needs_answer(question: &actions::Question) -> anyhow::Error {
+    anyhow::Error::new(actions::NeedsAnswer {
+        question: question.clone(),
+    })
+}
+
+/// A numbered prompt on stderr, so a piped stdout is still only the
+/// command's own output.
+fn prompt(question: &actions::Question) -> Result<actions::Answer> {
+    let width = question
+        .options
+        .iter()
+        .map(|(value, _)| value.chars().count())
+        .max()
+        .unwrap_or(0);
+    eprintln!("pando: {}", question.prompt);
+    for (i, (value, why)) in question.options.iter().enumerate() {
+        let marker = if question.preselect == Some(i) {
+            "*"
+        } else {
+            " "
+        };
+        eprintln!("  {marker}{}) {value:<width$}  {why}", i + 1);
+    }
+    if question.allow_custom {
+        eprintln!("   c) something else — type the command");
+    }
+    let default = question.preselect.map(|i| i + 1);
+    loop {
+        match default {
+            Some(n) => eprint!("  [{n}] > "),
+            None => eprint!("  > "),
+        }
+        use std::io::Write as _;
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line)? == 0 {
+            // The terminal went away mid-question.
+            return Err(needs_answer(question));
+        }
+        let line = line.trim();
+        if line.is_empty()
+            && let Some(index) = question.preselect
+        {
+            return Ok(actions::Answer::Choice(index));
+        }
+        if question.allow_custom && (line == "c" || line == "C") {
+            eprint!("  command > ");
+            let _ = std::io::stderr().flush();
+            let mut custom = String::new();
+            std::io::stdin().read_line(&mut custom)?;
+            let custom = custom.trim().to_string();
+            if !custom.is_empty() {
+                return Ok(actions::Answer::Custom(custom));
+            }
+            eprintln!("pando: an empty command is not an answer");
+            continue;
+        }
+        match line.parse::<usize>() {
+            Ok(n) if n >= 1 && n <= question.options.len() => {
+                return Ok(actions::Answer::Choice(n - 1));
+            }
+            // A line that is not a number is taken as the command itself,
+            // so nobody has to discover that `c` exists first.
+            _ if question.allow_custom && !line.is_empty() => {
+                return Ok(actions::Answer::Custom(line.to_string()));
+            }
+            _ => eprintln!(
+                "pando: pick a number between 1 and {}",
+                question.options.len()
+            ),
+        }
+    }
+}
+
+/// What exit code 3 prints: the question, its options, and the two ways out.
+pub fn render_needs_answer(needs: &actions::NeedsAnswer) -> String {
+    let mut out = format!(
+        "pando: {}
+",
+        needs.question.prompt
+    );
+    for (i, (value, why)) in needs.question.options.iter().enumerate() {
+        out.push_str(&format!(
+            "  {}) {value}  ({why})
+",
+            i + 1
+        ));
+    }
+    if needs.question.options.is_empty() {
+        out.push_str(
+            "  (pando found no candidates for this)
+",
+        );
+    }
+    out.push_str(
+        "pando: answer it in pando.toml, or rerun with --yes to take the first option
+",
+    );
+    out
 }
 
 fn url_suffix(started: &actions::StartedProcess) -> String {

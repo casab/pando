@@ -18,6 +18,15 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
+        // A question is not a failure. It gets its own exit code and its own
+        // shape, so an agent can answer it instead of guessing what broke.
+        Err(e) if e.downcast_ref::<actions::NeedsAnswer>().is_some() => {
+            let needs = e
+                .downcast_ref::<actions::NeedsAnswer>()
+                .expect("just checked");
+            eprint!("{}", pando::cli::render_needs_answer(needs));
+            ExitCode::from(EXIT_NEEDS_ANSWER)
+        }
         Err(e) => {
             // `{:#}` flattens the context chain onto one line: a CLI failure
             // is one sentence, not a stack.

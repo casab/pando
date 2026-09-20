@@ -664,10 +664,18 @@ fn dev_cmd_proposal(signals: &Signals, rule: Option<&'static FrameworkRule>) -> 
 
     dedup_by_value(&mut candidates);
     if candidates.is_empty() {
-        // A library, or a repository with nothing to serve. Proposing a
-        // process here would be inventing one, and asking would be asking
-        // about a server that does not exist.
-        return None;
+        // A framework pando recognises but has no command shape for: it
+        // knows there is a server here and not how to start it, which is a
+        // question, and the only slot in this phase that has one with no
+        // options to offer.
+        return rule.map(|_| Proposal {
+            slot: Slot::DevCmd,
+            candidates: Vec::new(),
+            decided: false,
+        });
+        // With no rule at all — a library, or a repository with nothing to
+        // serve — there is no proposal. Asking about a dev server that does
+        // not exist is worse than saying nothing.
     }
     // One candidate is certain. So is a script named exactly `dev` that is
     // really one dev server: a body that runs several at once is the
@@ -808,6 +816,19 @@ pub fn still_needed(slot: Slot, config: &Config) -> bool {
     }
 }
 
+/// A value the developer typed rather than chose.
+///
+/// A command carrying `{port:web}` brings its roles with it, so the port
+/// question that would have followed is already answered.
+pub fn custom(slot: Slot, value: &str) -> Candidate {
+    let roles = roles_in(value);
+    Candidate {
+        value: value.to_string(),
+        why: String::new(),
+        ports: (slot == Slot::DevCmd && !roles.is_empty()).then_some(PortsSpec::List(roles)),
+    }
+}
+
 /// Writes a chosen candidate into a config. The one place that knows what
 /// each slot means, shared by the resolver and the tests.
 pub fn apply(slot: Slot, candidate: &Candidate, config: &mut Config) {
@@ -866,6 +887,23 @@ pub fn edits(
             vec![(table, key, toml_edit::Value::InlineTable(inline))]
         }
     }
+}
+
+/// The roles a command asks for by carrying `{port:<role>}`.
+///
+/// A developer who types their own command with a placeholder in it has
+/// declared the role by using it; there is no second question to ask.
+pub fn roles_in(cmd: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for piece in cmd.split("{port:").skip(1) {
+        let Some((role, _)) = piece.split_once('}') else {
+            continue;
+        };
+        if !role.is_empty() && !out.contains(&role.to_string()) {
+            out.push(role.to_string());
+        }
+    }
+    out
 }
 
 /// Multi-valued slots carry their list as one comma-separated string, so a
