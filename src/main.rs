@@ -6,8 +6,11 @@ use pando::cli::{Cli, dispatch};
 use pando::paths::{PandoPaths, default_home};
 use pando::{actions, config, project, tui};
 
-/// 0 ok, 1 error, 2 usage (clap's own), 3 reserved for needs-answer.
+/// 0 ok, 1 error, 2 usage (clap's own), 3 needs-answer.
 const EXIT_ERROR: u8 = 1;
+/// pando has a question it cannot answer on its own. Its own code, so an
+/// agent can tell "ask the human" from "it broke" without parsing text.
+pub const EXIT_NEEDS_ANSWER: u8 = 3;
 
 fn main() -> ExitCode {
     // Parsed before anything else so `--help` and `--version` work outside a

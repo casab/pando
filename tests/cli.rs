@@ -30,9 +30,29 @@ fn env() -> Env {
     }
 }
 
+/// Every process a test starts is stopped when its environment goes, even
+/// when an assertion panicked first. `Drop` on the struct runs before its
+/// fields, so the fixture is still on disk when this runs.
+impl Drop for Env {
+    fn drop(&mut self) {
+        if self.home.exists() {
+            let _ = self.pando(&["stop"]);
+        }
+    }
+}
+
 impl Env {
     fn pando(&self, args: &[&str]) -> Output {
         self.pando_in(&self.root, args)
+    }
+
+    /// Writes pando's own config for this project — the layer detection
+    /// would write, and the only one pando ever writes to.
+    fn write_config(&self, toml: &str) {
+        let project = pando::project::ProjectRef::from_root(&self.root).unwrap();
+        let dir = self.home.join("projects").join(&project.id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pando.toml"), toml).unwrap();
     }
 
     fn pando_in(&self, cwd: &Path, args: &[&str]) -> Output {
@@ -414,4 +434,203 @@ fn running_from_a_deleted_directory_says_which_directory() {
     let err = stderr(&out);
     assert!(err.contains("current directory"), "{err}");
     assert_eq!(err.trim().lines().count(), 1, "expected one line: {err}");
+}
+
+// ---- start, stop, status, logs -------------------------------------------
+
+/// A dev "server": prints a line and stays up. No real server is needed to
+/// prove the lifecycle, and `sleep` is available everywhere.
+const SLEEPER: &str = "[dev]\ncmd = \"echo started-ok && sleep 30\"\nports = { PORT = \"web\" }\n";
+
+#[test]
+fn start_status_logs_and_stop_work_from_the_cli() {
+    let e = env();
+    e.write_config(SLEEPER);
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+
+    let out = e.pando(&["start", "feat+one"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("started feat+one"),
+        "{}",
+        stdout(&out)
+    );
+    assert!(
+        stdout(&out).contains("http://localhost:"),
+        "start prints the URL: {}",
+        stdout(&out)
+    );
+
+    // Status, as a machine sees it.
+    let out = e.pando(&["status", "--json"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("status --json parses");
+    assert_eq!(v["version"], 1);
+    let wt = &v["worktrees"][0];
+    assert_eq!(wt["name"], "feat+one");
+    let port = wt["ports"]["web"].as_u64().expect("a web port");
+    assert!(
+        (17_000..=56_998).contains(&port),
+        "port {port} out of range"
+    );
+    let phase = wt["processes"]["dev"]["phase"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(phase == "running" || phase == "starting", "{phase}");
+
+    // The listing carries them too.
+    let out = e.pando(&["ls"]);
+    assert!(stdout(&out).contains(&port.to_string()), "{}", stdout(&out));
+
+    // Logs.
+    let mut found = false;
+    for _ in 0..40 {
+        let out = e.pando(&["logs", "feat+one", "--tail", "5"]);
+        assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+        if stdout(&out).contains("started-ok") {
+            found = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(found, "the dev process's output never reached its log");
+
+    let out = e.pando(&["logs", "feat+one", "--json"]);
+    let line: serde_json::Value = serde_json::from_str(stdout(&out).lines().next().unwrap())
+        .expect("logs --json emits one object per line");
+    assert!(line["line"].is_string());
+    assert!(line["level"].is_string());
+
+    // Starting twice says so rather than starting twice.
+    let out = e.pando(&["start", "feat+one"]);
+    assert_eq!(code(&out), EXIT_OK);
+    assert!(stdout(&out).contains("already running"), "{}", stdout(&out));
+
+    let out = e.pando(&["stop", "feat+one"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("stopped feat+one"),
+        "{}",
+        stdout(&out)
+    );
+
+    let out = e.pando(&["status", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert!(
+        v["worktrees"][0]["processes"]
+            .as_object()
+            .unwrap()
+            .is_empty(),
+        "a stopped worktree has no processes"
+    );
+    assert_eq!(
+        v["worktrees"][0]["ports"]["web"].as_u64(),
+        Some(port),
+        "but it still owns its ports"
+    );
+    assert_eq!(status_porcelain(&e.root), "");
+}
+
+#[test]
+fn restart_keeps_the_port_and_replaces_the_process() {
+    let e = env();
+    e.write_config(SLEEPER);
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+    assert_eq!(code(&e.pando(&["start", "feat+one"])), EXIT_OK);
+
+    let first: serde_json::Value =
+        serde_json::from_str(&stdout(&e.pando(&["status", "--json"]))).unwrap();
+    let port = first["worktrees"][0]["ports"]["web"].as_u64().unwrap();
+    let pid = first["worktrees"][0]["processes"]["dev"]["pid"]
+        .as_u64()
+        .unwrap();
+
+    let out = e.pando(&["restart", "feat+one"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    let second: serde_json::Value =
+        serde_json::from_str(&stdout(&e.pando(&["status", "--json"]))).unwrap();
+    assert_eq!(
+        second["worktrees"][0]["ports"]["web"].as_u64(),
+        Some(port),
+        "a restart keeps the URL"
+    );
+    assert_ne!(
+        second["worktrees"][0]["processes"]["dev"]["pid"].as_u64(),
+        Some(pid)
+    );
+    assert_eq!(code(&e.pando(&["stop"])), EXIT_OK);
+}
+
+#[test]
+fn a_project_with_no_dev_process_fails_with_exit_one_and_a_hint() {
+    let e = env();
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+    let out = e.pando(&["start", "feat+one"]);
+    assert_eq!(code(&out), EXIT_ERROR);
+    assert_eq!(
+        stderr(&out).trim(),
+        "pando: no processes configured; add [dev] to pando.toml"
+    );
+}
+
+#[test]
+fn stopping_nothing_is_not_an_error() {
+    let e = env();
+    let out = e.pando(&["stop"]);
+    assert_eq!(code(&out), EXIT_OK);
+    assert!(
+        stdout(&out).contains("nothing was running"),
+        "{}",
+        stdout(&out)
+    );
+
+    let out = e.pando(&["stop", "nope"]);
+    assert_eq!(code(&out), EXIT_OK);
+    assert!(stdout(&out).contains("was not running"), "{}", stdout(&out));
+}
+
+#[test]
+fn logs_for_a_worktree_that_has_never_run_says_where_they_would_be() {
+    let e = env();
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+    let out = e.pando(&["logs", "feat+one"]);
+    assert_eq!(code(&out), EXIT_ERROR);
+    assert!(
+        stderr(&out).contains("no logs for feat+one"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn a_crashed_process_stays_visible_as_failed() {
+    let e = env();
+    e.write_config("[dev]\ncmd = \"echo 'Error: Cannot find module next' && exit 1\"\n");
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+    assert_eq!(code(&e.pando(&["start", "feat+one"])), EXIT_OK);
+
+    let mut reason = String::new();
+    for _ in 0..40 {
+        let v: serde_json::Value =
+            serde_json::from_str(&stdout(&e.pando(&["status", "--json"]))).unwrap();
+        let process = &v["worktrees"][0]["processes"]["dev"];
+        if process["phase"] == "failed" {
+            reason = process["reason"].as_str().unwrap_or_default().to_string();
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        reason.starts_with("process exited"),
+        "reason was {reason:?}"
+    );
+    assert!(
+        reason.contains("dependencies are missing"),
+        "the log's own words become a hint: {reason}"
+    );
+    // Still there on the next read: a failure is sticky until acted on.
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout(&e.pando(&["status", "--json"]))).unwrap();
+    assert_eq!(v["worktrees"][0]["processes"]["dev"]["phase"], "failed");
 }
