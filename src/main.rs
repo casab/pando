@@ -45,7 +45,25 @@ fn run(cli: Cli) -> Result<()> {
     // `.pando` looks like it is outside the repository until the moment it
     // is created inside it.
     let paths = PandoPaths::new(cwd.join(default_home()), project);
-    let loaded = config::load(&paths)?;
+    // `new`, `start`, `restart` and the TUI act on `pando.toml`; nothing
+    // else needs it. A home layer pando cannot use stops those and only
+    // those — you need `stop` most when that file is broken, and `ls` to
+    // see what is there at all.
+    let needs_config = cli
+        .command
+        .as_ref()
+        .map(pando::cli::Command::needs_config)
+        .unwrap_or(true);
+    let loaded = match config::load(&paths) {
+        Ok(loaded) => loaded,
+        Err(e) if needs_config => return Err(e),
+        Err(e) => {
+            eprintln!(
+                "pando: {e:#} — carrying on without it; `new`, `start` and `restart` need it fixed"
+            );
+            config::load_without_home(&paths)
+        }
+    };
     for warning in &loaded.warnings {
         eprintln!("pando: {warning}");
     }

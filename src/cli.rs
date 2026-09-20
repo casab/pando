@@ -112,6 +112,20 @@ pub enum Command {
     },
 }
 
+impl Command {
+    /// Whether this command acts on `pando.toml`.
+    ///
+    /// The ones that do not run on whatever layers are left when pando's
+    /// own is unusable: a broken config is exactly when `stop`, `ls` and
+    /// `logs` are worth having.
+    pub fn needs_config(&self) -> bool {
+        matches!(
+            self,
+            Command::New { .. } | Command::Start { .. } | Command::Restart { .. }
+        )
+    }
+}
+
 /// Lines `logs` prints when nothing else is asked for.
 const DEFAULT_TAIL: usize = 50;
 

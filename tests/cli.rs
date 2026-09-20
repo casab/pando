@@ -53,10 +53,17 @@ impl Env {
     /// Writes pando's own config for this project — the layer detection
     /// would write, and the only one pando ever writes to.
     fn write_config(&self, toml: &str) {
+        let path = self.config_file();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, toml).unwrap();
+    }
+
+    fn config_file(&self) -> std::path::PathBuf {
         let project = pando::project::ProjectRef::from_root(&self.root).unwrap();
-        let dir = self.home.join("projects").join(&project.id);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("pando.toml"), toml).unwrap();
+        self.home
+            .join("projects")
+            .join(&project.id)
+            .join("pando.toml")
     }
 
     fn pando_in(&self, cwd: &Path, args: &[&str]) -> Output {
@@ -395,22 +402,136 @@ fn a_committed_pando_toml_pando_cannot_use_does_not_stop_ls() {
         assert!(stdout(&out).contains("no worktrees"), "{}", stdout(&out));
     }
 
-    // pando's own file is a different matter: it fails hard, and says which.
+    // pando's own file is a different matter: a command that would act on
+    // it fails hard, and says which key.
     std::fs::remove_file(e.root.join("pando.toml")).unwrap();
-    let home_config = e.home.join("projects");
-    std::fs::create_dir_all(&home_config).unwrap();
-    let out = e.pando(&["ls", "--json"]);
-    let listed: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("valid json");
-    let id = listed["project"]["id"].as_str().unwrap();
-    std::fs::create_dir_all(home_config.join(id)).unwrap();
-    std::fs::write(
-        home_config.join(id).join("pando.toml"),
-        "[project]\nnope = 1\n",
-    )
-    .unwrap();
-    let out = e.pando(&["ls"]);
+    e.write_config("[project]\nnope = 1\n");
+    let out = e.pando(&["start", "feat+one"]);
     assert_eq!(code(&out), EXIT_ERROR, "stdout: {}", stdout(&out));
     assert!(stderr(&out).contains("nope"), "{}", stderr(&out));
+}
+
+// You need `stop` most when the config is broken, and `ls` to see what is
+// there at all. Only the commands that would act on the config refuse.
+#[test]
+fn a_home_pando_toml_pando_cannot_use_still_lets_you_look_and_stop() {
+    for (what, bad) in [
+        ("a syntax error", "[dev\ncmd = \"x\"\n"),
+        ("a type error", "[dev]\ncmd = 3\n"),
+        (
+            "a validation error",
+            "[project]\nprovision = [\"../escape\"]\n",
+        ),
+    ] {
+        let e = env_of(Kind::NextPnpmCompose);
+        e.write_config(bad);
+
+        let main_name = Kind::NextPnpmCompose.dir_name();
+        for args in [
+            vec!["ls"],
+            vec!["status"],
+            vec!["stop"],
+            vec!["path", main_name],
+        ] {
+            let out = e.pando(&args);
+            assert_eq!(
+                code(&out),
+                EXIT_OK,
+                "{what}: {args:?} should still run: {}",
+                stderr(&out)
+            );
+            assert!(
+                stderr(&out).contains("pando.toml"),
+                "{what}: {args:?} should say what it ignored: {}",
+                stderr(&out)
+            );
+        }
+        // `rm` gets as far as its own refusal rather than the config's.
+        let out = e.pando(&["rm", "feat+nope"]);
+        assert_eq!(code(&out), EXIT_ERROR);
+        assert!(
+            stderr(&out).contains("no worktree named"),
+            "{what}: {}",
+            stderr(&out)
+        );
+
+        for args in [
+            vec!["start", "feat+one"],
+            vec!["restart", "feat+one"],
+            vec!["new", "feat/one"],
+        ] {
+            let out = e.pando(&args);
+            assert_eq!(
+                code(&out),
+                EXIT_ERROR,
+                "{what}: {args:?} must refuse: {}",
+                stdout(&out)
+            );
+            assert!(
+                stderr(&out).contains("pando.toml"),
+                "{what}: {args:?} must say the config is why: {}",
+                stderr(&out)
+            );
+        }
+    }
+}
+
+// The review's repro: detection used to append `[dev]` beside a configured
+// process, writing a file pando's own loader refuses — after which every
+// command failed, `stop` included.
+#[test]
+fn a_configured_process_is_never_given_a_dev_table_beside_it() {
+    let e = env_of(Kind::NextPnpmCompose);
+    e.write_config("[project]\ninstall = \"true\"\n\n[processes.web]\ncmd = \"sleep 300\"\n");
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+    let before = std::fs::read_to_string(e.config_file()).unwrap();
+
+    let out = e.pando(&["start", "feat+one", "--yes"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    let after = std::fs::read_to_string(e.config_file()).unwrap();
+    assert_eq!(
+        after, before,
+        "a project that declares its processes is not detected at"
+    );
+    assert!(!after.contains("[dev]"), "{after}");
+
+    for args in [vec!["ls"], vec!["status"], vec!["stop"]] {
+        let out = e.pando(&args);
+        assert_eq!(
+            code(&out),
+            EXIT_OK,
+            "{args:?} after the start: {}",
+            stderr(&out)
+        );
+    }
+}
+
+// The shape a developer writes when they want pando to fill the command in:
+// every other command still works, and only `start` has something to say.
+#[test]
+fn a_dev_table_with_no_command_is_refused_only_by_start() {
+    let e = env_of(Kind::NextPnpmCompose);
+    e.write_config("[dev]\ncwd = \".\"\n");
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+
+    for args in [
+        vec!["ls"],
+        vec!["status"],
+        vec!["stop"],
+        vec!["path", "feat+one"],
+        vec!["logs", "feat+one", "--source", "install"],
+    ] {
+        let out = e.pando(&args);
+        assert_eq!(code(&out), EXIT_OK, "{args:?}: {}", stderr(&out));
+    }
+
+    let out = e.pando(&["start", "feat+one"]);
+    assert_eq!(code(&out), EXIT_ERROR, "stdout: {}", stdout(&out));
+    assert!(
+        stderr(&out).contains("cmd"),
+        "it says what is missing: {}",
+        stderr(&out)
+    );
 }
 
 // A command run from a directory that no longer exists fails before git is

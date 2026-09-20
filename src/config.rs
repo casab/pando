@@ -114,6 +114,12 @@ impl RuntimeSection {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessConfig {
+    /// The command that starts the process. Defaulted rather than required
+    /// so that a `[dev]` table holding only `cwd` or `env` — the shape a
+    /// developer writes when they want pando to fill the command in — is a
+    /// file every other command can still read. `start` is the one that
+    /// refuses, by name.
+    #[serde(default)]
     pub cmd: String,
     #[serde(default, skip_serializing_if = "PortsSpec::is_empty")]
     pub ports: PortsSpec,
@@ -330,6 +336,21 @@ pub struct Loaded {
 }
 
 pub fn load(paths: &PandoPaths) -> Result<Loaded> {
+    load_layers(paths, true)
+}
+
+/// Everything except pando's own layer.
+///
+/// A home `pando.toml` that cannot be parsed, deserialised or validated is
+/// fatal for the commands that act on it — `new`, `start`, `restart` and
+/// the TUI, which can do both. Every other command needs none of it, and
+/// `stop` is the one you need most when that file is broken, so those run
+/// on what is left.
+pub fn load_without_home(paths: &PandoPaths) -> Loaded {
+    load_layers(paths, false).unwrap_or_default()
+}
+
+fn load_layers(paths: &PandoPaths, use_home: bool) -> Result<Loaded> {
     let mut warnings = Vec::new();
     let committed_path = paths.root().join("pando.toml");
     let home_path = paths.config_file();
@@ -338,7 +359,14 @@ pub fn load(paths: &PandoPaths) -> Result<Loaded> {
     if let Some(table) = committed.as_mut() {
         strip_forbidden_committed_keys(table, &committed_path, &mut warnings);
     }
-    let home = read_table(&home_path, &mut warnings);
+    // Strictly, and only when it is wanted: a file pando wrote and cannot
+    // parse is not one to carry on past the way a committed one is. The
+    // caller decides whether this command can do without it.
+    let home = if use_home {
+        read_home_table(&home_path)?
+    } else {
+        None
+    };
 
     // A committed file belongs to the team, and to whichever pando wrote
     // it — a key this build has never heard of is what a *newer* pando's
@@ -516,13 +544,28 @@ pub fn set_detected(
     let value = value.into();
     let comment = note.comment();
     patch(paths, move |doc| {
-        let table = ensure_table(doc, table_path)?;
+        let target = write_target(doc, table_path);
+        let table = ensure_table(doc, &target)?;
         table.insert(key, Item::Value(value));
         if let Some(v) = table.get_mut(key).and_then(Item::as_value_mut) {
             v.decor_mut().set_suffix(comment);
         }
         Ok(())
     })
+}
+
+/// Where a key really goes in *this* document.
+///
+/// `[dev]` is shorthand for `[processes.dev]`, and the two forms may not
+/// both appear in one file. A document that already has a `[processes]`
+/// table therefore gets the long form: writing the shorthand beside it
+/// would produce a file pando's own loader refuses, taking every later
+/// command down with it.
+fn write_target<'a>(doc: &DocumentMut, path: &'a [&'a str]) -> Vec<&'a str> {
+    if path == ["dev"] && doc.as_table().contains_key("processes") {
+        return vec!["processes", "dev"];
+    }
+    path.to_vec()
 }
 
 /// The table at `path`, creating any level that is missing. A path that runs
@@ -597,6 +640,17 @@ pub fn validate(config: &Config, project: &ProjectRef) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// pando's own layer. A file that is not there is not an error; one that is
+/// there and does not parse is.
+fn read_home_table(path: &Path) -> Result<Option<Table>> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Ok(None);
+    };
+    let table =
+        toml::from_str::<Table>(&text).with_context(|| format!("parse {}", path.display()))?;
+    Ok(Some(table))
 }
 
 fn read_table(path: &Path, warnings: &mut Vec<String>) -> Option<Table> {
@@ -933,6 +987,39 @@ prelude = "nvm use"
             home_text(&f),
             broken,
             "a file pando cannot parse is a file someone is editing"
+        );
+    }
+
+    // `[dev]` is shorthand for `[processes.dev]` and the two forms may not
+    // both be in one file, so a document that already has a `[processes]`
+    // table gets the long form — otherwise pando writes a file it then
+    // refuses to read.
+    #[test]
+    fn a_dev_key_takes_the_long_form_when_the_file_already_has_processes() {
+        let f = fixture();
+        write_home(&f, "[processes.dev]\ncwd = \"apps/web\"\n");
+        set_detected(
+            &f.paths,
+            &["dev"],
+            "cmd",
+            "pnpm dev",
+            Note::Detected("package.json scripts.dev".into()),
+        )
+        .unwrap();
+
+        let text = home_text(&f);
+        assert!(
+            !text.contains("[dev]"),
+            "the shorthand beside [processes] is a file pando cannot load: {text}"
+        );
+        assert!(text.contains("[processes.dev]"), "{text}");
+        assert!(text.contains("cmd = \"pnpm dev\""), "{text}");
+        let loaded = load(&f.paths).expect("the file pando wrote must load");
+        assert_eq!(loaded.config.processes["dev"].cmd, "pnpm dev");
+        assert_eq!(
+            loaded.config.processes["dev"].cwd.as_deref(),
+            Some("apps/web"),
+            "and what was already there is untouched"
         );
     }
 

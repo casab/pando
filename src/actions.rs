@@ -464,10 +464,20 @@ pub fn resolve(
     if slots.iter().all(|slot| already_answered(*slot, &config)) {
         return Ok(config);
     }
+    // A project whose config already declares its processes has answered
+    // both process slots by declaring them — including a `[dev]` whose
+    // ports the developer deliberately left out. Detection can only write
+    // the `[dev]` shorthand, and `[dev]` beside `[processes]` is a file
+    // pando's own loader refuses, so the slots are not resolved at all
+    // rather than resolved into a file nothing can read afterwards.
+    let declared_processes = !config.processes.is_empty();
     let signals = detect::signals(paths.root());
     let proposals = detect::propose(paths.root(), &signals);
 
     for slot in slots {
+        if declared_processes && matches!(slot, Slot::DevCmd | Slot::PortEnv) {
+            continue;
+        }
         // Just in time, and once: a slot the developer has already filled
         // in, by hand or by answering before, is never asked about again.
         if already_answered(*slot, &config) || !detect::still_needed(*slot, &config) {
@@ -934,6 +944,16 @@ fn single_process(config: &Config) -> Result<(String, &ProcessConfig)> {
             names.len(),
             names.join(", ")
         );
+    }
+    // `cmd` is optional so that a half-written process table does not take
+    // every other command down with it; this is where it has to be there.
+    if process.cmd.trim().is_empty() {
+        let table = if name == detect::DEV {
+            "[dev]".to_string()
+        } else {
+            format!("[processes.{name}]")
+        };
+        bail!("{table} in pando.toml has no cmd — add the command that starts this process");
     }
     Ok((name.clone(), process))
 }
@@ -2590,6 +2610,28 @@ mod tests {
         assert!(
             !fx.paths.config_file().exists(),
             "resolving nothing writes nothing"
+        );
+    }
+
+    // Detection may only ever write `[dev]`, and a file holding both `[dev]`
+    // and `[processes]` is one pando's own loader refuses — which used to
+    // brick every later command, `stop` included.
+    #[test]
+    fn detection_never_writes_a_dev_table_next_to_a_configured_process() {
+        let mut fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");
+        fx.config
+            .processes
+            .insert("web".to_string(), dev("sleep 30"));
+
+        let config = resolve_process(&fx.paths, &fx.config, &refuse, &noop).unwrap();
+        assert!(
+            !config.processes.contains_key("dev"),
+            "a project that declares its processes has answered both slots"
+        );
+        assert!(
+            !fx.paths.config_file().exists(),
+            "and nothing at all was written: {:?}",
+            std::fs::read_to_string(fx.paths.config_file()).ok()
         );
     }
 
