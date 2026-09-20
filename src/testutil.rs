@@ -45,3 +45,74 @@ pub fn init_repo(path: &Path) {
     git(path, &["init", "--quiet", "--initial-branch=main"]);
     git(path, &["commit", "--quiet", "--allow-empty", "-m", "root"]);
 }
+
+/// A detached child that is always stopped, even when a test fails partway
+/// through. Every test in this crate that forks a real process holds one of
+/// these: an assertion that panics mid-test must not leave a `sleep` or a
+/// listener behind.
+pub struct Detached {
+    pub pid: u32,
+    pub pgid: i32,
+}
+
+impl Drop for Detached {
+    fn drop(&mut self) {
+        let _ = crate::process::stop(self.pgid, std::time::Duration::from_secs(5));
+    }
+}
+
+/// Spawns a detached shell command under a guard, as `actions::start` does.
+pub fn spawn_guarded(shell_cmd: &str, cwd: &Path, log_file: &Path) -> Detached {
+    let r = crate::process::spawn_detached(crate::process::SpawnOptions {
+        shell_cmd,
+        cwd,
+        log_file,
+        env: &[],
+    })
+    .expect("spawn detached");
+    Detached {
+        pid: r.pid,
+        pgid: r.pgid,
+    }
+}
+
+/// Whether `python3` is on PATH. Tests that need a process which binds a
+/// port skip with a message rather than failing on a machine without it.
+pub fn python3_available() -> bool {
+    Command::new("python3")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// A process that binds `port` and then does nothing, for readiness and
+/// observed-port tests.
+///
+/// Deliberately brace-free: `{` is pando's template syntax, and a command
+/// carrying one would have to be escaped everywhere this string is used.
+pub fn python_listener(port: u16) -> String {
+    format!(
+        "python3 -u -c \"import socket,time;s=socket.socket();\
+         s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);\
+         s.bind(('127.0.0.1',{port}));s.listen(5);print('listening on {port}');time.sleep(300)\""
+    )
+}
+
+/// Polls `ready` until it is true or the deadline passes. Returns whether it
+/// became true. Fixed sleeps make process tests flaky on a loaded machine;
+/// this makes them fast when the machine is idle and patient when it is not.
+pub fn wait_until(timeout: std::time::Duration, ready: impl Fn() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if ready() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
