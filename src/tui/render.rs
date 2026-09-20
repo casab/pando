@@ -1949,6 +1949,170 @@ mod tests {
         }
     }
 
+    /// A log with one of everything the viewer has to paint: ANSI colour, a
+    /// multi-line JSON block, errors and warnings, a duration, a URL that
+    /// has to wrap, wide glyphs, and a line longer than any terminal.
+    fn a_log_of_everything() -> Vec<String> {
+        vec![
+            "\x1b[32mready\x1b[0m in 85ms".to_string(),
+            "listening on https://a-rather-long-hostname.example.com/a/b/c".to_string(),
+            "WARN slow query took 450 ms".to_string(),
+            "{".to_string(),
+            "  \"level\": \"error\",".to_string(),
+            "  \"msg\": \"boom\",".to_string(),
+            "  \"detail\": \"…\"".to_string(),
+            "}".to_string(),
+            "日本語のログ行 with 🎉 emoji and e\u{0301} combining".to_string(),
+            "x".repeat(4000),
+            "ERROR the last one".to_string(),
+        ]
+    }
+
+    #[test]
+    fn renders_the_viewer_at_any_terminal_size_without_panicking() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &a_log_of_everything());
+        write_log(&app, "feat+one", "install", &["installed"]);
+        app.open_log_viewer();
+
+        // One pass per state the viewer can be painted in. The keys are
+        // pressed between passes, so each sweep starts from the one before.
+        let states: [&[KeyEvent]; 8] = [
+            // Following the live tail, which is how it opens.
+            &[],
+            // A cursor part way up, with wrap off.
+            &[
+                KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE),
+            ],
+            // A query being typed.
+            &[
+                KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+            ],
+            // And confirmed.
+            &[KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)],
+            // Collapsed to the matches.
+            &[KeyEvent::new(KeyCode::Char('&'), KeyModifiers::NONE)],
+            // Errors only, with a count prefix half typed.
+            &[
+                KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE),
+            ],
+            // The inspect overlay over all of it.
+            &[KeyEvent::new(KeyCode::Char('J'), KeyModifiers::NONE)],
+            // And the help overlay over that.
+            &[
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+            ],
+        ];
+        for keys in states {
+            for key in keys {
+                app.handle_key(*key);
+            }
+            for width in 1..=120u16 {
+                for height in [1u16, 2, 3, 5, 12, 40] {
+                    draw(&mut app, width, height);
+                }
+            }
+            // Past the width where a percentage of it stops fitting in a
+            // u16 (1093 * 60 overflows), and as tall again.
+            for width in [1092u16, 1093, 1500, 2000, 3000] {
+                for height in [1u16, 3, 40] {
+                    draw(&mut app, width, height);
+                }
+            }
+            for height in [1092u16, 1093, 3000] {
+                draw(&mut app, 80, height);
+            }
+        }
+    }
+
+    #[test]
+    fn renders_a_viewer_with_no_log_and_one_with_nothing_in_it_at_any_size() {
+        for lines in [Vec::<String>::new(), vec![String::new()]] {
+            let (_dir, mut app) = app_with_logs(&["feat+one"]);
+            if !lines.is_empty() {
+                write_log(&app, "feat+one", "dev", &lines);
+            }
+            app.open_log_viewer();
+            for width in [1u16, 2, 5, 40, 120, 1093, 3000] {
+                for height in [1u16, 2, 3, 40] {
+                    draw(&mut app, width, height);
+                }
+            }
+        }
+    }
+
+    // Wide and zero-width glyphs are counted as one cell by every budget in
+    // here; what must never happen is a panic or a lost line.
+    #[test]
+    fn a_line_of_wide_glyphs_paints_at_every_width() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(
+            &app,
+            "feat+one",
+            "dev",
+            &[
+                "日本語".repeat(40),
+                "🎉🎉🎉".repeat(20),
+                "e\u{0301}".repeat(60),
+            ],
+        );
+        app.open_log_viewer();
+        for width in 1..=60u16 {
+            draw(&mut app, width, 10);
+            app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+            app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        }
+    }
+
+    #[test]
+    fn an_escape_the_terminal_cannot_read_is_painted_as_text_not_as_an_escape() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(
+            &app,
+            "feat+one",
+            "dev",
+            &[
+                "\x1b[38;5;mbroken \x1b[999Xthing",
+                "a bare \x1b in the middle",
+                "trailing escape \x1b[",
+                "\x1b[mzero length",
+            ],
+        );
+        app.open_log_viewer();
+        let buffer = draw(&mut app, 60, 12);
+        let painted: String = text_of(&buffer);
+        assert!(
+            !painted.contains('\x1b'),
+            "an escape must never reach the screen as text: {painted:?}"
+        );
+        assert!(painted.contains("thing"), "{painted}");
+        assert!(painted.contains("zero length"), "{painted}");
+    }
+
+    #[test]
+    fn a_real_ansi_colour_reaches_the_screen_as_colour() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["\x1b[32mready\x1b[0m now"]);
+        app.open_log_viewer();
+        let buffer = draw(&mut app, 60, 8);
+        let painted = text_of(&buffer);
+        assert!(painted.contains("ready now"), "{painted}");
+        assert!(!painted.contains("[32m"), "never as text: {painted}");
+        let colours: Vec<_> = (0..60)
+            .map(|x| buffer.cell((x, 1)).unwrap().style().fg)
+            .collect();
+        assert!(
+            colours.contains(&Some(ratatui::style::Color::Green)),
+            "the escape painted the colour it asked for: {colours:?}"
+        );
+    }
+
     #[test]
     fn renders_an_empty_list_and_a_filter_with_no_matches() {
         // Wide enough that the list pane, now sharing the body with the

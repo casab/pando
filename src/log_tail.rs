@@ -606,6 +606,11 @@ impl LogTail {
         self.capacity
     }
 
+    /// The file this tail is following.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Levels of lines evicted by the most recent `poll`, oldest first.
     pub fn evicted_levels(&self) -> &[LogLevel] {
         &self.evicted_levels

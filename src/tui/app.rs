@@ -4406,6 +4406,198 @@ pub mod tests {
         );
     }
 
+    // ---- eviction --------------------------------------------------------
+
+    /// Replaces the open viewer's tail with one that holds `capacity`
+    /// lines, so a test can make the ring buffer evict without writing ten
+    /// thousand lines.
+    fn shrink_viewer_tail(app: &mut App, capacity: usize) {
+        let view = app.log_view_mut().expect("the viewer is open");
+        let path = view.tail.path().to_path_buf();
+        view.tail = LogTail::new(path, capacity);
+        view.tail.poll().ok();
+    }
+
+    #[test]
+    fn scrolling_tracks_only_the_evictions_the_filter_was_showing() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(
+            &app,
+            "feat+one",
+            "dev",
+            &["ERROR one", "info a", "info b", "ERROR two"],
+        );
+        open_viewer(&mut app, 80, 12);
+        shrink_viewer_tail(&mut app, 4);
+        press(&mut app, KeyCode::Char('f'));
+        press(&mut app, KeyCode::Char('f')); // errors only: two lines visible
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(viewer(&app).cursor, 1, "on the second of the two errors");
+
+        // Three more lines, of which only one is an error, push the first
+        // three out of a four-line buffer.
+        write_log(
+            &app,
+            "feat+one",
+            "dev",
+            &[
+                "ERROR one",
+                "info a",
+                "info b",
+                "ERROR two",
+                "info c",
+                "info d",
+                "ERROR three",
+            ],
+        );
+        app.handle_event(AppEvent::Tick);
+        assert_eq!(viewer(&app).tail.lines().len(), 4);
+        assert_eq!(
+            viewer(&app).cursor,
+            0,
+            "one visible line was evicted, so the cursor moved by one — \
+             not by the three lines that actually fell out"
+        );
+        assert_eq!(viewer(&app).visible_len(), 2);
+    }
+
+    #[test]
+    fn motions_on_a_log_that_evicts_while_it_is_open_stay_in_range() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        let first: Vec<String> = (0..10).map(|i| format!("line {i}")).collect();
+        write_log(&app, "feat+one", "dev", &first);
+        open_viewer(&mut app, 80, 12);
+        shrink_viewer_tail(&mut app, 4);
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+
+        for round in 0..5 {
+            let lines: Vec<String> = (0..10 + round * 3).map(|i| format!("line {i}")).collect();
+            write_log(&app, "feat+one", "dev", &lines);
+            app.handle_event(AppEvent::Tick);
+            paint(&mut app, 80, 12);
+            let view = viewer(&app);
+            assert!(
+                view.cursor < view.visible_len().max(1),
+                "round {round}: cursor {} of {}",
+                view.cursor,
+                view.visible_len()
+            );
+            press(&mut app, KeyCode::Char('j'));
+            press(&mut app, KeyCode::Char('k'));
+        }
+        // And a truncation, which resets the tail to the start of the file.
+        write_log(&app, "feat+one", "dev", &["one short line"]);
+        app.handle_event(AppEvent::Tick);
+        paint(&mut app, 80, 12);
+        assert!(viewer(&app).cursor < viewer(&app).visible_len().max(1));
+    }
+
+    // ---- the subprocess and state rules ----------------------------------
+
+    /// Every key the viewer binds, in one list, so the guards below can
+    /// drive the lot.
+    fn every_viewer_key() -> Vec<KeyEvent> {
+        let mut keys = Vec::new();
+        for c in [
+            'j', 'k', 'g', 'G', 'w', 'f', 'E', 'e', 'y', 'Y', 'J', 'n', 'N', '&', '/', '3', '0',
+            'z',
+        ] {
+            keys.push(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        for c in ['d', 'u', 'n', 'p'] {
+            keys.push(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+        }
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Backspace,
+            KeyCode::Esc,
+        ] {
+            keys.push(KeyEvent::new(code, KeyModifiers::NONE));
+        }
+        keys
+    }
+
+    // The origin tool's hard-won rule: a key handler that reads state takes
+    // the flock and forks a socket scan, and the frame freezes until it is
+    // done. The viewer reads its own log file on the tick and nothing else.
+    #[test]
+    fn no_key_the_viewer_binds_reads_or_writes_state() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &a_busy_log());
+        open_viewer(&mut app, 80, 20);
+        let before = app.state.clone();
+        for key in every_viewer_key() {
+            app.handle_key(key);
+            paint(&mut app, 80, 20);
+        }
+        assert_eq!(app.state, before, "the viewer never touches state");
+        assert!(
+            !app.paths.state_file().exists(),
+            "and never writes one either"
+        );
+        assert!(
+            !app.paths.lock_file().exists(),
+            "so it never takes the lock a mutation holds"
+        );
+    }
+
+    /// A log with something for every key to act on.
+    fn a_busy_log() -> Vec<String> {
+        let mut lines = json_block_log();
+        lines.push("ERROR later on".to_string());
+        lines.push("ready on http://localhost:17342/".to_string());
+        lines
+    }
+
+    // The other half of the rule: a child that inherits the terminal paints
+    // over the alternate screen. The two commands the TUI is allowed to run
+    // are the browser opener and `pbcopy`, both on a worker thread with
+    // every stream redirected.
+    #[test]
+    fn the_tui_spawns_nothing_that_could_paint_over_the_screen() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let expected: [(&str, usize); 4] = [
+            ("src/tui/app.rs", 2),
+            ("src/tui/render.rs", 0),
+            ("src/tui/modal.rs", 0),
+            ("src/tui/mod.rs", 0),
+        ];
+        // Built rather than written, so this test does not match itself.
+        let blocking = format!(".{}()", "status");
+        let spawn = format!("Command::{}", "new");
+        for (file, allowed) in expected {
+            let whole = std::fs::read_to_string(root.join(file)).unwrap();
+            // Comments explain the rule; code has to keep it.
+            let source: String = whole
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !source.contains(&blocking),
+                "{file}: a blocking wait on a child freezes the frame it is \
+                 called from"
+            );
+            assert_eq!(
+                source.matches(&spawn).count(),
+                allowed,
+                "{file}: every subprocess the TUI runs has to be one of the \
+                 documented ones, off the UI thread with its streams redirected"
+            );
+        }
+    }
+
     #[test]
     fn the_viewer_keeps_ten_thousand_lines() {
         assert_eq!(LOG_VIEWER_CAPACITY, 10_000);
