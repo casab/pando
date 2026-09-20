@@ -565,8 +565,9 @@ pub fn set_detected(
 ) -> Result<()> {
     let value = value.into();
     let comment = note.comment();
+    let elsewhere = other_layer_declares_processes(paths);
     patch(paths, move |doc| {
-        let target = write_target(doc, table_path);
+        let target = write_target(doc, elsewhere, table_path);
         let table = ensure_table(doc, &target)?;
         table.insert(key, Item::Value(value));
         if let Some(v) = table.get_mut(key).and_then(Item::as_value_mut) {
@@ -576,15 +577,66 @@ pub fn set_detected(
     })
 }
 
+/// Writes every key of one table at once, with the note on the table's own
+/// header rather than repeated on each key.
+///
+/// A whole `[processes.<app>]` table is one answer to one question. Ten
+/// identical `# answered: --yes took the first of 2 options` lines for a
+/// two-app workspace say that ten times; one on the header says it once,
+/// and says it about the table rather than about a key.
+pub fn set_detected_table(
+    paths: &PandoPaths,
+    table_path: &[&str],
+    entries: Vec<(String, toml_edit::Value)>,
+    note: Note,
+) -> Result<()> {
+    let comment = note.comment();
+    let elsewhere = other_layer_declares_processes(paths);
+    patch(paths, move |doc| {
+        let target = write_target(doc, elsewhere, table_path);
+        let table = ensure_table(doc, &target)?;
+        for (key, value) in entries {
+            table.insert(&key, Item::Value(value));
+        }
+        table.decor_mut().set_suffix(comment);
+        Ok(())
+    })
+}
+
+/// Whether a layer other than the one being patched already declares a
+/// process, which for now means the `pando.toml` a team committed.
+///
+/// The conflict [`normalize`] refuses is between the *merged* layers, so
+/// looking only at the document being edited misses a `[processes]` table
+/// in the committed file — and that is precisely the shape 2b invites, a
+/// long-form `[processes.dev]` with a `cwd` and no `cmd` for detection to
+/// fill in. Read as a bare table rather than through `load`: this is a
+/// question about which *tables* exist, and it has to be answerable even
+/// when the merged config would not validate.
+fn other_layer_declares_processes(paths: &PandoPaths) -> bool {
+    let path = paths.root().join("pando.toml");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    toml::from_str::<Table>(&text)
+        .map(|table| table.contains_key("processes"))
+        .unwrap_or(false)
+}
+
 /// Where a key really goes in *this* document.
 ///
 /// `[dev]` is shorthand for `[processes.dev]`, and the two forms may not
-/// both appear in one file. A document that already has a `[processes]`
-/// table therefore gets the long form: writing the shorthand beside it
-/// would produce a file pando's own loader refuses, taking every later
-/// command down with it.
-fn write_target<'a>(doc: &DocumentMut, path: &'a [&'a str]) -> Vec<&'a str> {
-    if path == ["dev"] && doc.as_table().contains_key("processes") {
+/// both appear in one file — or in two layers of one config. Whenever
+/// anything already declares a process, the long form is what gets
+/// written: the shorthand beside it produces a config pando's own loader
+/// refuses, taking `start`, `new`, `restart` and the TUI down with it until
+/// a human edits the file pando wrote.
+fn write_target<'a>(
+    doc: &DocumentMut,
+    other_layer_has_processes: bool,
+    path: &'a [&'a str],
+) -> Vec<&'a str> {
+    if path == ["dev"] && (other_layer_has_processes || doc.as_table().contains_key("processes")) {
         return vec!["processes", "dev"];
     }
     path.to_vec()
@@ -593,9 +645,16 @@ fn write_target<'a>(doc: &DocumentMut, path: &'a [&'a str]) -> Vec<&'a str> {
 /// The table at `path`, creating any level that is missing. A path that runs
 /// into a non-table (`dev = 3`) is an error naming it rather than a silent
 /// overwrite of whatever was there.
+///
+/// A level pando creates only to hold the next one is implicit, so the file
+/// gets `[processes.web]` and not a bare `[processes]` line above it — a
+/// line that is valid TOML and that no human would have written. A level
+/// that was already there keeps whatever the developer made it.
 fn ensure_table<'a>(doc: &'a mut DocumentMut, path: &[&str]) -> Result<&'a mut EditTable> {
     let mut table = doc.as_table_mut();
+    let leaf = path.len().saturating_sub(1);
     for (depth, part) in path.iter().enumerate() {
+        let existed = table.contains_key(part);
         let entry = table
             .entry(part)
             .or_insert_with(|| Item::Table(EditTable::new()));
@@ -605,6 +664,9 @@ fn ensure_table<'a>(doc: &'a mut DocumentMut, path: &[&str]) -> Result<&'a mut E
                 path[..=depth].join(".")
             )
         })?;
+        if !existed && depth < leaf {
+            table.set_implicit(true);
+        }
     }
     Ok(table)
 }
@@ -1116,6 +1178,80 @@ prelude = "nvm use"
             Some("apps/web"),
             "and what was already there is untouched"
         );
+    }
+
+    // Phase 2b review, finding 3. The conflict `normalize` refuses is
+    // between the *merged* layers, so a `[processes]` table in the file the
+    // team committed was invisible to the redirect above — and a `[dev]`
+    // written beside it left `start`, `new`, `restart` and the TUI refusing
+    // to run until a human edited pando's own file.
+    #[test]
+    fn a_dev_key_takes_the_long_form_when_the_committed_layer_has_processes() {
+        let f = fixture();
+        write_committed(&f, "[processes.dev]\ncwd = \"apps/web\"\n");
+        write_home(&f, "[project]\ninstall = \"true\"\n");
+        set_detected(
+            &f.paths,
+            &["dev"],
+            "cmd",
+            "pnpm dev",
+            Note::Detected("package.json scripts.dev".into()),
+        )
+        .unwrap();
+
+        let text = home_text(&f);
+        assert!(
+            !text.contains("[dev]"),
+            "[dev] here and [processes.dev] there cannot both apply: {text}"
+        );
+        assert!(text.contains("[processes.dev]"), "{text}");
+        let loaded = load(&f.paths).expect("the file pando wrote must load");
+        assert_eq!(loaded.config.processes["dev"].cmd, "pnpm dev");
+        assert_eq!(
+            loaded.config.processes["dev"].cwd.as_deref(),
+            Some("apps/web"),
+            "the committed layer's own key still applies"
+        );
+    }
+
+    // One question, one note. Ten identical `# answered:` lines for a
+    // two-app workspace say the same thing ten times, and the bare
+    // `[processes]` header above them is a line no human would write.
+    #[test]
+    fn a_whole_table_carries_one_note_on_its_header_and_no_bare_parent() {
+        let f = fixture();
+        set_detected_table(
+            &f.paths,
+            &["processes", "web"],
+            vec![
+                ("cmd".to_string(), "pnpm dev".into()),
+                ("cwd".to_string(), "apps/web".into()),
+            ],
+            Note::TookFirst(2),
+        )
+        .unwrap();
+
+        let text = home_text(&f);
+        assert!(
+            !text.lines().any(|l| l.trim() == "[processes]"),
+            "the intermediate table is implicit: {text}"
+        );
+        // The file's own header mentions the marker, so only lines that
+        // are not themselves comments count.
+        assert_eq!(
+            text.lines()
+                .filter(|line| !line.starts_with('#') && line.contains("# answered:"))
+                .count(),
+            1,
+            "one note for the whole table: {text}"
+        );
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("[processes.web]") && l.contains("# answered:")),
+            "and it is on the header: {text}"
+        );
+        let loaded = load(&f.paths).expect("the file pando wrote must load");
+        assert_eq!(loaded.config.processes["web"].cmd, "pnpm dev");
     }
 
     #[test]

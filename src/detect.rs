@@ -1084,13 +1084,26 @@ fn app_port_env(signals: &Signals, app: &WorkspaceApp) -> Option<String> {
 /// its own pair of ports and the two halves still find each other. It is
 /// given to every process *except* the one it points at, which is the only
 /// one that does not need to be told.
-fn cross_references(signals: &Signals, apps: &[WorkspaceApp]) -> Vec<(String, String, String)> {
+///
+/// Only an app that owns a role can be pointed at: `{port:<role>}` for a
+/// role nobody owns does not render, and an environment that cannot be
+/// rendered is a start that refuses.
+fn cross_references(
+    signals: &Signals,
+    apps: &[WorkspaceApp],
+    owns_role: &[bool],
+) -> Vec<(String, String, String)> {
     let mut out = Vec::new();
     for (key, value) in &signals.env_example {
         let Some(port) = localhost_url_port(value) else {
             continue;
         };
-        let Some(target) = apps.iter().find(|a| a.default_port == Some(port)) else {
+        let Some(target) = apps
+            .iter()
+            .zip(owns_role)
+            .find(|(app, owns)| **owns && app.default_port == Some(port))
+            .map(|(app, _)| app)
+        else {
             continue;
         };
         let template = value.replacen(
@@ -1127,12 +1140,29 @@ fn processes_proposal(root: &Path, signals: &Signals) -> Option<Proposal> {
     if apps.len() < MIN_WORKSPACE_APPS {
         return None;
     }
-    let references = cross_references(signals, &apps);
+    // A role is a port, and a port is only worth giving an app that has
+    // some way of being told which one it got: its framework reads one
+    // from the environment, or takes it on the command line (the flag is
+    // already in `cmd` by now), or the env example has an `<APP>_PORT` key
+    // for it. An app with none of those — a watcher, a codegen step, a
+    // queue consumer, the `dev: "tsc -w"` of a `packages/*` library — gets
+    // `ports = []` and no readiness rule. Given a role anyway it would be
+    // handed a reserved port it never hears about, and `advance_phases`
+    // would wait thirty seconds for it to bind before calling a perfectly
+    // healthy process failed — and the whole worktree with it.
+    let port_envs: Vec<Option<String>> =
+        apps.iter().map(|app| app_port_env(signals, app)).collect();
+    let owns_role: Vec<bool> = apps
+        .iter()
+        .zip(&port_envs)
+        .map(|(app, port_env)| app.port == PortMechanism::InCommand || port_env.is_some())
+        .collect();
+    let references = cross_references(signals, &apps, &owns_role);
     let mut processes: BTreeMap<String, ProcessConfig> = BTreeMap::new();
-    for app in &apps {
+    for ((app, port_env), owns_role) in apps.iter().zip(&port_envs).zip(&owns_role) {
         let mut env: BTreeMap<String, String> = BTreeMap::new();
-        if let Some(var) = app_port_env(signals, app) {
-            env.insert(var, format!("{{port:{}}}", app.name));
+        if let Some(var) = port_env {
+            env.insert(var.clone(), format!("{{port:{}}}", app.name));
         }
         for (target, key, template) in &references {
             // The app a reference points at is the one that does not need
@@ -1142,14 +1172,19 @@ fn processes_proposal(root: &Path, signals: &Signals) -> Option<Proposal> {
             }
             env.insert(key.clone(), template.clone());
         }
+        let roles = if *owns_role {
+            vec![app.name.clone()]
+        } else {
+            Vec::new()
+        };
         processes.insert(
             app.name.clone(),
             ProcessConfig {
                 cmd: app.cmd.clone(),
                 cwd: Some(app.dir.clone()),
-                ports: Some(PortsSpec::List(vec![app.name.clone()])),
+                ports: Some(PortsSpec::List(roles)),
                 env,
-                ready: Some(ReadySpec {
+                ready: owns_role.then(|| ReadySpec {
                     role: Some(app.name.clone()),
                     timeout_s: None,
                 }),

@@ -624,9 +624,20 @@ pub fn resolve(
         if candidate.value.trim().is_empty() {
             bail!("an empty answer is not a {}", slot_label(*slot));
         }
-        for edit in detect::edits(*slot, &candidate) {
-            let table: Vec<&str> = edit.table.iter().map(String::as_str).collect();
-            config::set_detected(paths, &table, &edit.key, edit.value, note.clone())?;
+        let edits = detect::edits(*slot, &candidate);
+        if *slot == Slot::Processes {
+            // A whole process table is one answer to one question, so the
+            // note goes on the table's header rather than on each of its
+            // five keys.
+            for (table, entries) in group_by_table(edits) {
+                let table: Vec<&str> = table.iter().map(String::as_str).collect();
+                config::set_detected_table(paths, &table, entries, note.clone())?;
+            }
+        } else {
+            for edit in edits {
+                let table: Vec<&str> = edit.table.iter().map(String::as_str).collect();
+                config::set_detected(paths, &table, &edit.key, edit.value, note.clone())?;
+            }
         }
         detect::apply(*slot, &candidate, &mut config);
         if *slot == Slot::Processes {
@@ -637,6 +648,23 @@ pub fn resolve(
         }
     }
     Ok(config)
+}
+
+/// Edits gathered per table, keeping the order they were produced in.
+///
+/// The keys of one table are written together so the note explaining them
+/// can sit on the table rather than on every key.
+type TableEdits = Vec<(Vec<String>, Vec<(String, toml_edit::Value)>)>;
+
+fn group_by_table(edits: Vec<detect::Edit>) -> TableEdits {
+    let mut out: TableEdits = Vec::new();
+    for edit in edits {
+        match out.iter_mut().find(|(table, _)| *table == edit.table) {
+            Some((_, entries)) => entries.push((edit.key, edit.value)),
+            None => out.push((edit.table, vec![(edit.key, edit.value)])),
+        }
+    }
+    out
 }
 
 /// The candidate an answer chose, by index.
@@ -3649,6 +3677,136 @@ time.sleep(300)
         // Second run: nothing left to ask.
         let again = resolve_process(&fx.paths, &loaded.config, &refuse, &noop).unwrap();
         assert_eq!(again.processes.len(), 2);
+    }
+
+    /// The workspace above plus a third app whose `dev` script is not a
+    /// server. A `packages/*` library with `dev: "tsc -w"`, a codegen
+    /// watcher, a queue consumer: it has a dev script, it has no framework
+    /// rule, and the env example has no `WORKER_PORT` for it.
+    fn workspace_with_worker_fixture() -> Fx {
+        let fx = workspace_fixture();
+        std::fs::create_dir_all(fx.root.join("apps/worker")).unwrap();
+        std::fs::write(
+            fx.root.join("apps/worker/package.json"),
+            "{ \"name\": \"worker\", \"scripts\": { \"dev\": \"tsc -w\" } }\n",
+        )
+        .unwrap();
+        git(&fx.root, &["add", "."]);
+        git(&fx.root, &["commit", "--quiet", "-m", "worker"]);
+        fx
+    }
+
+    // Phase 2b review, finding 2. Detection wrote a role and a readiness
+    // rule for every app, including one with no way to be told which port
+    // the role stands for. The process was then handed a reserved port it
+    // never heard of, `advance_phases` waited thirty seconds for it, and a
+    // worktree whose every process was healthy read `failed`.
+    #[test]
+    fn a_workspace_app_with_no_way_to_be_told_a_port_gets_neither_a_role_nor_readiness() {
+        let fx = workspace_with_worker_fixture();
+        let (ask, _asked) = scripted(vec![Answer::Auto(0)]);
+        let mut config = resolve_process(&fx.paths, &fx.config, &ask, &noop).unwrap();
+
+        assert_eq!(
+            config.processes.keys().cloned().collect::<Vec<_>>(),
+            vec!["api", "web", "worker"]
+        );
+        let worker = &config.processes["worker"];
+        assert_eq!(
+            worker.ports,
+            Some(PortsSpec::List(Vec::new())),
+            "no framework rule, no flag and no WORKER_PORT key: it cannot be told a port"
+        );
+        assert!(
+            worker.ready.is_none(),
+            "and there is nothing for readiness to wait for: {:?}",
+            worker.ready
+        );
+        assert!(
+            !worker.env.keys().any(|key| key.ends_with("PORT")),
+            "{:?}",
+            worker.env
+        );
+        // The apps that *can* be told one still are.
+        assert_eq!(config.processes["web"].roles(), vec!["web"]);
+        assert_eq!(config.processes["api"].roles(), vec!["api"]);
+        assert_eq!(
+            config.processes["api"]
+                .ready
+                .as_ref()
+                .and_then(|r| r.role.as_deref()),
+            Some("api")
+        );
+        let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+        assert!(
+            written.contains("ports = []"),
+            "`no ports` is an answer written down, not a gap: {written}"
+        );
+
+        // And a process with no port to wait for is Running as soon as it
+        // is alive, rather than failed thirty seconds later for not binding
+        // one it was never told about.
+        for process in config.processes.values_mut() {
+            process.cmd = "sleep 30".to_string();
+        }
+        let name = worktree_named(&fx, "feat/one");
+        let report = start(&fx.paths, &config, &name, None, &noop).unwrap();
+        let _g = guard(&report);
+        assert_eq!(
+            fx.state().worktrees[&name].processes["worker"].ready_port,
+            None,
+            "a process that owns no role has no port to wait for"
+        );
+        assert!(
+            wait_until(Duration::from_secs(10), || matches!(
+                refresh(&fx.paths).state.worktrees[&name]
+                    .processes
+                    .get("worker")
+                    .map(|p| &p.phase),
+                Some(Phase::Running { .. })
+            )),
+            "the worker never reached running: {:?}",
+            fx.state().worktrees[&name].processes["worker"].phase
+        );
+        stop(&fx.paths, &name, None).unwrap();
+    }
+
+    // The two cosmetic gaps the notes list, and the shape of the file as a
+    // whole: what detection writes has to read like something a human would
+    // have written, because the whole point is that a wrong guess is one
+    // visible edit away.
+    #[test]
+    fn the_config_a_workspace_answer_writes_reads_as_a_human_would_write_it() {
+        let fx = workspace_fixture();
+        let (ask, _asked) = scripted(vec![Answer::Auto(0)]);
+        resolve_process(&fx.paths, &fx.config, &ask, &noop).unwrap();
+
+        let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+        assert!(
+            !written.lines().any(|line| line.trim() == "[processes]"),
+            "a bare [processes] header is a line nobody would write: {written}"
+        );
+        // The file's own header mentions the marker, so only lines that
+        // are not themselves comments count.
+        assert_eq!(
+            written
+                .lines()
+                .filter(|line| !line.starts_with('#') && line.contains("# answered:"))
+                .count(),
+            2,
+            "one note per table answered, not one per key: {written}"
+        );
+        for header in ["[processes.api]", "[processes.web]"] {
+            assert!(
+                written
+                    .lines()
+                    .any(|line| line.starts_with(header) && line.contains("# answered:")),
+                "{header} carries the note for its own keys: {written}"
+            );
+        }
+        let loaded = crate::config::load(&fx.paths).expect("the file pando wrote must load");
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        assert_eq!(loaded.config.processes.len(), 2);
     }
 
     #[test]
