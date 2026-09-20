@@ -7,12 +7,14 @@ one, a running dev environment: dev server, optional private services, logs,
 and a shareable URL. It is the generalization of `dwt`, a private tool that was
 built for a single project.
 
-## Current phase: design only
+## Current phase: implementation, phase by phase
 
-There is no code in this folder yet, on purpose. `docs/` is the spec. Do not
-scaffold a Cargo project, write source files, or add tooling unless the user
-explicitly says the implementation phase has started. The repo is local-only
-until the user says to publish it; never push or add a remote unasked.
+Implementation started on 2026-09-20. Work follows `plans/00-master.md`: one
+phase at a time, from that phase's plan file, one conventional commit per
+work item, with `cargo test`, `cargo clippy -- -D warnings`, and
+`cargo fmt --check` clean before every commit. Do not start a phase that has
+no plan file yet. The repo is local-only: never push, never add a remote,
+never open a PR. No attribution lines in commit messages.
 
 ## Docs and plans are never committed
 
@@ -36,6 +38,17 @@ here: no internal hostnames, routes, cookie or env variable names, schema
 details, organisation or account names, PR links. Describe the origin only in
 generic terms, for example "a monorepo with three processes, a native
 database, a prod schema dump, and cookie auth."
+
+## Testing policy
+
+- Mutating commands (`new`, `start`, `stop`, `rm`, `share`, `init`) run only
+  against generated fixture repositories in temporary directories. Tests
+  create them; a fixtures script creates them for manual runs.
+- Real repositories on this machine may be used only with read-only commands:
+  `ls`, `doctor`, `signals`, `status`, `path`. Never `new` or `start` on them
+  during development.
+- dwt's origin project is never used, not even read-only. Its path is in
+  `CLAUDE.local.md` only so it can be recognised and avoided.
 
 ## Conventions
 
