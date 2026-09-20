@@ -569,6 +569,11 @@ pub struct LogTail {
     /// Lets the viewer realign absolute indices (search matches, scroll) after
     /// the ring buffer drops old lines. Cleared at the top of every `poll`.
     evicted_levels: Vec<LogLevel>,
+    /// Every line ever pushed, counted. Monotonic: it survives both
+    /// eviction and truncation, which is what a follower needs in order to
+    /// know how many lines are new since it last looked. `lines().len()`
+    /// cannot say — it stops at `capacity` and never moves again.
+    lines_seen: u64,
     block_id_counter: u64,
     open_block: Option<OpenBlock>,
 }
@@ -584,6 +589,7 @@ impl LogTail {
             leftover: String::new(),
             line_start_offset: 0,
             evicted_levels: Vec::new(),
+            lines_seen: 0,
             block_id_counter: 0,
             open_block: None,
         }
@@ -596,6 +602,13 @@ impl LogTail {
     /// Levels of lines evicted by the most recent `poll`, oldest first.
     pub fn evicted_levels(&self) -> &[LogLevel] {
         &self.evicted_levels
+    }
+
+    /// How many lines this tail has ever read, across evictions and
+    /// truncations. A follower prints `lines_seen() - printed_so_far` from
+    /// the back of the buffer and is never silently left behind.
+    pub fn lines_seen(&self) -> u64 {
+        self.lines_seen
     }
 
     pub fn poll(&mut self) -> Result<bool> {
@@ -687,6 +700,7 @@ impl LogTail {
         let mut parsed = parse_line(raw, file_offset);
         self.track_block(&mut parsed);
         self.buffer.push_back(parsed);
+        self.lines_seen += 1;
     }
 
     /// Multi-line JSON block bookkeeping: tag member lines with the block id,

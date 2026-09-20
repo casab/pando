@@ -905,6 +905,11 @@ fn human_duration(d: chrono::TimeDelta) -> String {
 /// enough not to spin a core.
 const FOLLOW_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Lines a follower keeps room for between two polls. Big enough that a
+/// dev server's startup burst is printed in full rather than clipped to
+/// whatever `--tail` happened to be.
+const FOLLOW_CAPACITY: usize = 4096;
+
 #[derive(Serialize)]
 struct LogLineOut<'a> {
     /// The line's own timestamp when it has one pando can read, else null.
@@ -946,31 +951,47 @@ pub fn logs<W: Write>(
             available.join(", ")
         );
     }
-    // Capacity is the tail size: a one-shot read keeps only what it prints.
-    let mut tailer = log_tail::LogTail::new(path.clone(), tail.max(1));
+    // A one-shot read keeps only what it prints. A follower needs room for
+    // whatever arrives between two polls, which has nothing to do with how
+    // many lines the reader asked to see first.
+    let capacity = if follow {
+        tail.max(FOLLOW_CAPACITY)
+    } else {
+        tail.max(1)
+    };
+    let mut tailer = log_tail::LogTail::new(path.clone(), capacity);
     tailer
         .poll()
         .with_context(|| format!("read {}", path.display()))?;
-    for line in tailer.lines() {
+    let first = tailer.lines().len().saturating_sub(tail);
+    for line in tailer.lines().iter().skip(first) {
         write_log_line(out, &line.plain, line.level, json)?;
     }
     if !follow {
         return Ok(());
     }
+    // How many lines have gone past, not how many are in the buffer: the
+    // buffer stops growing at `capacity`, and comparing against its length
+    // is how a follower goes silent forever a few seconds into a run.
+    let mut printed = tailer.lines_seen();
     // Ends on Ctrl-C, which is what `-f` means everywhere else.
     loop {
         std::thread::sleep(FOLLOW_INTERVAL);
-        let before = tailer.lines().len();
         let grew = tailer
             .poll()
             .with_context(|| format!("read {}", path.display()))?;
         if !grew {
             continue;
         }
+        let seen = tailer.lines_seen();
+        // Truncation resets the file's offsets but not this count, so a
+        // restarted process picks up where the follower left off.
+        let fresh = seen.saturating_sub(printed) as usize;
+        printed = seen;
         let lines: Vec<(String, LogLevel)> = tailer
             .lines()
             .iter()
-            .skip(before.min(tailer.lines().len()))
+            .skip(tailer.lines().len().saturating_sub(fresh))
             .map(|l| (l.plain.clone(), l.level))
             .collect();
         for (plain, level) in lines {

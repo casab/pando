@@ -59,11 +59,19 @@ impl Env {
     }
 
     fn config_file(&self) -> std::path::PathBuf {
+        self.project_dir().join("pando.toml")
+    }
+
+    fn log_file(&self, name: &str, source: &str) -> std::path::PathBuf {
+        self.project_dir()
+            .join("logs")
+            .join(name)
+            .join(format!("{source}.log"))
+    }
+
+    fn project_dir(&self) -> std::path::PathBuf {
         let project = pando::project::ProjectRef::from_root(&self.root).unwrap();
-        self.home
-            .join("projects")
-            .join(&project.id)
-            .join("pando.toml")
+        self.home.join("projects").join(&project.id)
     }
 
     fn pando_in(&self, cwd: &Path, args: &[&str]) -> Output {
@@ -846,4 +854,74 @@ fn a_common_project_starts_with_no_questions() {
     assert!(stderr(&out).contains("pnpm dev"), "{}", stderr(&out));
     assert_eq!(code(&e.pando(&["stop"])), EXIT_OK);
     assert_eq!(status_porcelain(&e.root), "");
+}
+
+// `logs -f` went permanently silent once the log reached `--tail` lines:
+// the follow loop compared against the length of a bounded ring buffer,
+// which stops growing, so every later line was skipped as already printed.
+#[test]
+fn follow_keeps_printing_once_the_log_is_longer_than_the_tail() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let e = env();
+    let log = e.log_file("feat+one", "dev");
+    std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+    std::fs::write(&log, "l1\nl2\nl3\nl4\nl5\n").unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pando"))
+        .env("PANDO_HOME", &e.home)
+        .current_dir(&e.root)
+        .args(["logs", "feat+one", "--tail", "3", "-f"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("run pando logs -f");
+
+    let (tx, rx) = mpsc::channel::<String>();
+    let out = child.stdout.take().expect("piped stdout");
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(out).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    // Whatever happens, the follower does not outlive this test.
+    let printed = |what: &str| -> String {
+        rx.recv_timeout(Duration::from_secs(20))
+            .unwrap_or_else(|_| panic!("nothing was printed for {what}"))
+    };
+
+    for expected in ["l3", "l4", "l5"] {
+        assert_eq!(printed("the initial tail"), expected);
+    }
+
+    let append = |text: &str| {
+        let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        f.write_all(text.as_bytes()).unwrap();
+    };
+    // Well past the ring's capacity, in batches, the way a dev server logs.
+    for i in 6..=20 {
+        append(&format!("l{i}\n"));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    for i in 6..=20 {
+        let line = printed("a line after the window filled");
+        assert_eq!(line, format!("l{i}"), "a line went missing after l{i}");
+    }
+
+    // And across the truncation a restart does: the file shrinks, and the
+    // lines written after it are still new.
+    std::fs::write(&log, "").unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    append("fresh-1\nfresh-2\n");
+    assert_eq!(printed("the first line after a truncation"), "fresh-1");
+    assert_eq!(printed("the second line after a truncation"), "fresh-2");
+
+    let _ = child.kill();
+    let _ = child.wait();
+    drop(rx);
+    let _ = reader.join();
 }
