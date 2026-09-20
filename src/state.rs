@@ -232,13 +232,18 @@ fn sweep_dead_shares(state: &mut State, is_alive: &impl Fn(u32) -> bool) -> bool
     changed
 }
 
-/// Moves each process through Starting → Running → Failed. `is_port_free` is
-/// consulted for a process that declared a `ready_port`; one that did not is
-/// Running as soon as it is alive.
+/// Moves each process through Starting → Running → Failed.
+///
+/// `port_bound(pgid, port)` answers "has this process group opened that
+/// port yet?" and is injected: the honest answer comes from scanning the
+/// group's own sockets, and the one thing it must never do is *bind* the
+/// port to find out, which would hand the server being waited for an
+/// `EADDRINUSE`. A process that declared no `ready_port` is Running as soon
+/// as it is alive.
 pub fn advance_phases(
     state: &mut State,
     is_alive: impl Fn(u32) -> bool,
-    is_port_free: impl Fn(u16) -> bool,
+    port_bound: impl Fn(i32, u16) -> bool,
 ) -> bool {
     let now = Utc::now();
     let mut changed = false;
@@ -256,7 +261,11 @@ pub fn advance_phases(
                             reason: "process exited".into(),
                         };
                         changed = true;
-                    } else if proc.ready_port.map(|p| !is_port_free(p)).unwrap_or(true) {
+                    } else if proc
+                        .ready_port
+                        .map(|p| port_bound(proc.pgid, p))
+                        .unwrap_or(true)
+                    {
                         proc.phase = Phase::Running { since: now };
                         changed = true;
                     } else if now.signed_duration_since(*since).num_seconds() > timeout {
@@ -614,7 +623,7 @@ mod tests {
             .insert("dev".into(), starting(100, Utc::now()));
         state.worktrees.insert("w".into(), rec);
 
-        assert!(advance_phases(&mut state, |_| true, |_| false));
+        assert!(advance_phases(&mut state, |_| true, |_, _| true));
         let phase = &state.worktrees["w"].processes["dev"].phase;
         assert!(matches!(phase, Phase::Running { .. }), "got {phase:?}");
     }
@@ -628,7 +637,7 @@ mod tests {
         rec.processes.insert("worker".into(), proc);
         state.worktrees.insert("w".into(), rec);
 
-        assert!(advance_phases(&mut state, |_| true, |_| true));
+        assert!(advance_phases(&mut state, |_| true, |_, _| false));
         let phase = &state.worktrees["w"].processes["worker"].phase;
         assert!(matches!(phase, Phase::Running { .. }), "got {phase:?}");
     }
@@ -641,7 +650,7 @@ mod tests {
             .insert("dev".into(), starting(100, Utc::now()));
         state.worktrees.insert("w".into(), rec);
 
-        assert!(advance_phases(&mut state, |_| false, |_| true));
+        assert!(advance_phases(&mut state, |_| false, |_, _| false));
         let phase = &state.worktrees["w"].processes["dev"].phase;
         assert!(
             matches!(phase, Phase::Failed { reason, .. } if reason == "process exited"),
@@ -657,7 +666,7 @@ mod tests {
         rec.processes.insert("dev".into(), starting(100, long_ago));
         state.worktrees.insert("w".into(), rec);
 
-        assert!(advance_phases(&mut state, |_| true, |_| true));
+        assert!(advance_phases(&mut state, |_| true, |_, _| false));
         let phase = &state.worktrees["w"].processes["dev"].phase;
         // The watched port is the content of this failure: "timeout" alone
         // does not say what pando was waiting for.
@@ -681,7 +690,7 @@ mod tests {
         state.worktrees.insert("w".into(), rec);
 
         assert!(
-            !advance_phases(&mut state, |_| true, |_| true),
+            !advance_phases(&mut state, |_| true, |_, _| false),
             "still inside its own window, so nothing changes"
         );
         assert!(matches!(
@@ -697,7 +706,7 @@ mod tests {
             .get_mut("dev")
             .unwrap()
             .ready_timeout_s = Some(1);
-        assert!(advance_phases(&mut state, |_| true, |_| true));
+        assert!(advance_phases(&mut state, |_| true, |_, _| false));
         let phase = &state.worktrees["w"].processes["dev"].phase;
         assert!(
             matches!(phase, Phase::Failed { reason, .. } if reason.contains("1s")),
@@ -709,7 +718,7 @@ mod tests {
     fn advance_phases_moves_running_to_failed_when_the_process_dies() {
         let mut state = State::new();
         state.worktrees.insert("w".into(), record_with(100));
-        assert!(advance_phases(&mut state, |_| false, |_| true));
+        assert!(advance_phases(&mut state, |_| false, |_, _| false));
         let phase = &state.worktrees["w"].processes["dev"].phase;
         assert!(
             matches!(phase, Phase::Failed { reason, .. } if reason == "process exited"),
@@ -735,7 +744,7 @@ mod tests {
         state.worktrees.insert("failed".into(), failed);
 
         let before = state.clone();
-        assert!(!advance_phases(&mut state, |_| true, |_| false));
+        assert!(!advance_phases(&mut state, |_| true, |_, _| true));
         assert_eq!(state, before);
     }
 
@@ -747,7 +756,7 @@ mod tests {
         rec.processes.insert("api".into(), running(200));
         state.worktrees.insert("w".into(), rec);
 
-        advance_phases(&mut state, |pid| pid == 100, |_| false);
+        advance_phases(&mut state, |pid| pid == 100, |_, _| true);
         let procs = &state.worktrees["w"].processes;
         assert!(matches!(procs["dev"].phase, Phase::Running { .. }));
         assert!(matches!(procs["api"].phase, Phase::Failed { .. }));

@@ -1223,8 +1223,9 @@ mod tests {
         record.ports.insert("web".to_string(), 17_342);
         record.observed_ports = vec![17_342, 17_399];
         // Alive, so the read path leaves it Running, with a process group
-        // that no longer exists — which is how a scan that finds nothing
-        // keeps the last ports pando actually saw.
+        // that no longer exists — so a scan that runs and finds nothing is
+        // an answer, and the ports it is really listening on are none. The
+        // last good answer survives only a scan that could not run at all.
         record.processes.insert(
             "dev".to_string(),
             crate::state::ProcessRecord {
@@ -1269,7 +1270,7 @@ mod tests {
         assert_eq!(wt["name"], "feat+one");
         assert_eq!(wt["branch"], "feat/one");
         assert_eq!(wt["ports"]["web"], 17_342);
-        assert_eq!(wt["observed_ports"][1], 17_399);
+        assert_eq!(wt["observed_ports"], serde_json::json!([]));
         assert_eq!(wt["url"], "http://localhost:17342");
         let dev = &wt["processes"]["dev"];
         assert_eq!(dev["pid"], std::process::id());

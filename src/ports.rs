@@ -27,20 +27,62 @@ const HASH_SEPARATOR: u8 = 0x1f;
 
 /// Whether nothing is listening on `port`.
 ///
-/// Both addresses, because one bind answers only half the question. A
-/// listener on `127.0.0.1` leaves `0.0.0.0` bindable, and a listener on
-/// `0.0.0.0` leaves `127.0.0.1` bindable — verified on macOS, and the reason
-/// a dev server that binds loopback only (Django's `runserver` default)
-/// would otherwise never be seen as ready.
+/// Three addresses, because one bind answers only part of the question. A
+/// listener on `127.0.0.1` leaves `0.0.0.0` bindable and the other way
+/// round — verified on macOS — and a listener on `[::1]` leaves both IPv4
+/// addresses bindable, which is where `listen(port, "localhost")` on Node
+/// and `runserver [::1]:8000` land.
 ///
 /// A server bound to one non-loopback interface is still missed; the
 /// observed-port scan is what catches those.
+///
+/// This binds the port for an instant, so it is only ever used where taking
+/// the port is the point: reserving one. Readiness is answered by
+/// [`something_is_listening`] and by scanning the process group, because a
+/// probe that takes the port can hand the server it is waiting for an
+/// `EADDRINUSE`.
 pub fn is_port_free(port: u16) -> bool {
-    can_bind("0.0.0.0", port) && can_bind("127.0.0.1", port)
+    can_bind("0.0.0.0", port) && can_bind("127.0.0.1", port) && v6_loopback_free(port)
 }
 
 fn can_bind(host: &str, port: u16) -> bool {
     std::net::TcpListener::bind((host, port)).is_ok()
+}
+
+/// Whether `[::1]:port` is free, on a machine that has an IPv6 loopback.
+///
+/// Only `AddrInUse` counts as taken: a host without IPv6 answers every bind
+/// with `AddrNotAvailable` or `AfNoSupport`, and reading that as "occupied"
+/// would leave pando with no ports at all.
+fn v6_loopback_free(port: u16) -> bool {
+    match std::net::TcpListener::bind(("::1", port)) {
+        Ok(_) => true,
+        Err(e) => e.kind() != std::io::ErrorKind::AddrInUse,
+    }
+}
+
+/// How long a readiness connection waits before calling the port closed.
+/// Local, so anything slower than this is not a listener that is up.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Whether something accepts a connection on `port`, over either loopback.
+///
+/// The readiness question asked without taking anything: a refused
+/// connection means not ready, and a successful one is released at once.
+/// Used only where the process-group scan could not run — there is no
+/// `lsof`, or it was denied — since a connection says nothing about *whose*
+/// listener answered.
+pub fn something_is_listening(port: u16) -> bool {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
+    for host in [
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+    ] {
+        if TcpStream::connect_timeout(&SocketAddr::new(host, port), CONNECT_TIMEOUT).is_ok() {
+            return true;
+        }
+    }
+    false
 }
 
 /// The base port for a worktree, before any occupancy probing.
@@ -272,6 +314,32 @@ mod tests {
     #[test]
     fn the_hash_separator_keeps_split_points_distinct() {
         assert_ne!(derive_base("ab", "c"), derive_base("a", "bc"));
+    }
+
+    // A listener on `[::1]` leaves both IPv4 addresses bindable, so a probe
+    // that only tries those hands out a port that is already taken.
+    #[test]
+    fn a_port_held_by_an_ipv6_only_listener_is_not_free() {
+        let Ok(listener) = std::net::TcpListener::bind(("::1", 0)) else {
+            eprintln!("skipping: no IPv6 loopback on this machine");
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        assert!(
+            !is_port_free(port),
+            "{port} is held by an IPv6 listener and must not be handed out"
+        );
+        drop(listener);
+        assert!(is_port_free(port), "and it is free again once that goes");
+    }
+
+    // A machine with no IPv6 at all must not have every port read as taken.
+    #[test]
+    fn a_free_port_is_free_whatever_this_machine_thinks_of_ipv6() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        assert!(is_port_free(port));
     }
 
     #[test]

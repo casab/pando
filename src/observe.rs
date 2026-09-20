@@ -28,27 +28,37 @@ const SCAN_TIMEOUT: Duration = Duration::from_secs(3);
 /// The leader is a `bash -lc` that usually `exec`s away or exits early, so
 /// the interesting pids are almost never the one pando recorded.
 pub fn group_pids(pgid: i32) -> Vec<u32> {
+    group_pids_checked(pgid).unwrap_or_default()
+}
+
+/// [`group_pids`], distinguishing "no processes" from "the scan could not
+/// run". `None` is the second: no `ps`, denied, or timed out.
+pub fn group_pids_checked(pgid: i32) -> Option<Vec<u32>> {
     if pgid <= 0 {
-        return Vec::new();
+        return Some(Vec::new());
     }
     #[cfg(target_os = "linux")]
     if let Some(pids) = proc_group_pids(pgid) {
-        return pids;
+        return Some(pids);
     }
     let mut cmd = Command::new("ps");
     // `-axo pid=,pgid=` over `-g <pgid>`: one spelling that works on BSD and
     // GNU `ps` alike, and the filtering is ours rather than the tool's.
     cmd.args(["-axo", "pid=,pgid="]);
-    match run_capturing(cmd, SCAN_TIMEOUT) {
-        Some(text) => parse_ps_pgid(&text, pgid),
-        None => Vec::new(),
-    }
+    let text = run_capturing(cmd, SCAN_TIMEOUT)?;
+    Some(parse_ps_pgid(&text, pgid))
 }
 
 /// The TCP ports `pids` are listening on, paired with the pid that owns each.
 pub fn listening_ports(pids: &[u32]) -> Vec<(u32, u16)> {
+    listening_ports_checked(pids).unwrap_or_default()
+}
+
+/// [`listening_ports`], distinguishing "nothing is listening" from "the
+/// scan could not run".
+pub fn listening_ports_checked(pids: &[u32]) -> Option<Vec<(u32, u16)>> {
     if pids.is_empty() {
-        return Vec::new();
+        return Some(Vec::new());
     }
     #[cfg(target_os = "linux")]
     {
@@ -56,12 +66,10 @@ pub fn listening_ports(pids: &[u32]) -> Vec<(u32, u16)> {
         // -H drops the header, -p adds the owning process, -n keeps ports
         // numeric so nothing has to be resolved.
         cmd.args(["-ltnpH"]);
-        let Some(text) = run_capturing(cmd, SCAN_TIMEOUT) else {
-            return Vec::new();
-        };
+        let text = run_capturing(cmd, SCAN_TIMEOUT)?;
         let mut found = parse_ss(&text);
         found.retain(|(pid, _)| pids.contains(pid));
-        return found;
+        return Some(found);
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -85,19 +93,30 @@ pub fn listening_ports(pids: &[u32]) -> Vec<(u32, u16)> {
             "-F",
             "pn",
         ]);
-        match run_capturing(cmd, SCAN_TIMEOUT) {
-            Some(text) => parse_lsof(&text),
-            None => Vec::new(),
-        }
+        let text = run_capturing(cmd, SCAN_TIMEOUT)?;
+        Some(parse_lsof(&text))
     }
 }
 
 /// Every port the group listens on, sorted and deduplicated. The one call
 /// the rest of pando makes.
 pub fn observed_ports(pgid: i32) -> Vec<u16> {
-    let pids = group_pids(pgid);
-    let ports: BTreeSet<u16> = listening_ports(&pids).into_iter().map(|(_, p)| p).collect();
-    ports.into_iter().collect()
+    observed_ports_checked(pgid).unwrap_or_default()
+}
+
+/// [`observed_ports`], distinguishing a group that is listening on nothing
+/// from a scan that could not run at all.
+///
+/// The difference decides readiness: an empty answer from a working scan
+/// means "not up yet", while `None` means pando has to fall back to asking
+/// the port itself.
+pub fn observed_ports_checked(pgid: i32) -> Option<Vec<u16>> {
+    let pids = group_pids_checked(pgid)?;
+    let ports: BTreeSet<u16> = listening_ports_checked(&pids)?
+        .into_iter()
+        .map(|(_, p)| p)
+        .collect();
+    Some(ports.into_iter().collect())
 }
 
 /// `ps -axo pid=,pgid=` filtered to one group. Rows that do not parse are

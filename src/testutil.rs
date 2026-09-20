@@ -101,6 +101,26 @@ pub fn python_listener(port: u16) -> String {
     )
 }
 
+/// A process that binds `port` on the IPv6 loopback and nowhere else.
+///
+/// Not exotic: `listen(port, "localhost")` in Node on macOS resolves to
+/// `::1` first, and `runserver [::1]:8000` does the same. Both IPv4
+/// addresses stay bindable, so a probe that only tries those never sees it.
+pub fn python_listener_v6(port: u16) -> String {
+    format!(
+        "python3 -u -c \"import socket,time;s=socket.socket(socket.AF_INET6,socket.SOCK_STREAM);\
+         s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);\
+         s.bind(('::1',{port}));s.listen(5);print('listening');time.sleep(300)\""
+    )
+}
+
+/// Whether this machine has an IPv6 loopback to bind at all. A test about
+/// IPv6 behaviour skips with a message rather than failing where there is
+/// none.
+pub fn ipv6_loopback_available() -> bool {
+    std::net::TcpListener::bind(("::1", 0)).is_ok()
+}
+
 /// Polls `ready` until it is true or the deadline passes. Returns whether it
 /// became true. Fixed sleeps make process tests flaky on a loaded machine;
 /// this makes them fast when the machine is idle and patient when it is not.

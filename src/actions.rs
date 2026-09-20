@@ -1178,8 +1178,14 @@ pub fn refresh(paths: &PandoPaths) -> Refreshed {
     };
 
     let failed_before = failed_processes(&store);
-    let mut changed = state::advance_phases(&mut store, proc::is_alive, ports::is_port_free);
-    changed |= capture_observed_ports(&mut store);
+    // One scan of every live group, used for both questions this pass
+    // answers: whether a starting process has opened its port yet, and what
+    // every group is really listening on.
+    let scans = scan_groups(&store);
+    let mut changed = state::advance_phases(&mut store, proc::is_alive, |pgid, port| {
+        port_is_bound(&scans, pgid, port)
+    });
+    changed |= capture_observed_ports(&mut store, &scans);
     changed |= explain_new_failures(&mut store, &failed_before);
     if changed {
         // A read path that cannot write is still a read path: the phases are
@@ -1212,30 +1218,72 @@ fn failed_processes(store: &state::State) -> Vec<(String, String)> {
     out
 }
 
-/// Records the ports each running group is really listening on.
+/// The ports every live process group is listening on, scanned once.
+///
+/// `Starting` groups are scanned too, not only `Running` ones: the scan is
+/// how a process *becomes* Running, and scanning only what is already
+/// running is a deadlock. `None` against a pgid means the scan itself could
+/// not run — no `lsof`, denied, or timed out — which is a different answer
+/// from "listening on nothing".
+fn scan_groups(store: &state::State) -> BTreeMap<i32, Option<Vec<u16>>> {
+    let mut scans: BTreeMap<i32, Option<Vec<u16>>> = BTreeMap::new();
+    for record in store.worktrees.values() {
+        for p in record.processes.values() {
+            if !matches!(p.phase, Phase::Starting { .. } | Phase::Running { .. }) {
+                continue;
+            }
+            scans
+                .entry(p.pgid)
+                .or_insert_with(|| crate::observe::observed_ports_checked(p.pgid));
+        }
+    }
+    scans
+}
+
+/// Whether the process group has opened `port` yet.
+///
+/// Never by binding it: a probe that takes the port to find out whether it
+/// is taken is one an `EADDRINUSE` away from killing the very server it is
+/// waiting for, and it answers about the port rather than about *this*
+/// process. The scan of the group's own sockets answers both properly; a
+/// connection is the fallback for a machine where the scan cannot run.
+fn port_is_bound(scans: &BTreeMap<i32, Option<Vec<u16>>>, pgid: i32, port: u16) -> bool {
+    match scans.get(&pgid) {
+        Some(Some(ports)) => ports.contains(&port),
+        _ => ports::something_is_listening(port),
+    }
+}
+
+/// Records the ports each live group is really listening on.
 ///
 /// Configured ports are what pando asked for; these are what happened. A
 /// framework that ignores `PORT`, or one that opens a second socket for hot
 /// reload, shows up here and nowhere else.
-fn capture_observed_ports(store: &mut state::State) -> bool {
+fn capture_observed_ports(
+    store: &mut state::State,
+    scans: &BTreeMap<i32, Option<Vec<u16>>>,
+) -> bool {
     let mut changed = false;
     for record in store.worktrees.values_mut() {
-        let running: Vec<i32> = record
+        let groups: Vec<i32> = record
             .processes
             .values()
-            .filter(|p| matches!(p.phase, Phase::Running { .. }))
+            .filter(|p| matches!(p.phase, Phase::Starting { .. } | Phase::Running { .. }))
             .map(|p| p.pgid)
             .collect();
-        let mut observed: Vec<u16> = running
-            .iter()
-            .flat_map(|pgid| crate::observe::observed_ports(*pgid))
-            .collect();
+        let mut observed = Vec::new();
+        let mut scanned = false;
+        for pgid in &groups {
+            if let Some(Some(ports)) = scans.get(pgid) {
+                scanned = true;
+                observed.extend(ports.iter().copied());
+            }
+        }
         observed.sort_unstable();
         observed.dedup();
-        // A scan that came back empty for a process that *is* running is
-        // more likely a denied or missing `lsof` than a server with no
-        // socket, so the last good answer is kept rather than cleared.
-        if observed.is_empty() && !running.is_empty() {
+        // A scan that could not run says nothing at all, so the last good
+        // answer stands rather than being cleared by a missing `lsof`.
+        if !groups.is_empty() && !scanned {
             continue;
         }
         if record.observed_ports != observed {
@@ -1850,12 +1898,13 @@ mod tests {
         assert_eq!(outcome.process().record.ready_port, None);
         assert_eq!(outcome.process().url, None);
 
-        // Which is what makes it Running as soon as it is alive.
+        // Which is what makes it Running as soon as it is alive: nothing
+        // is watching a port, so no probe can have an opinion.
         let mut store = fx.state();
         assert!(state::advance_phases(
             &mut store,
             crate::process::is_alive,
-            crate::ports::is_port_free
+            |_, _| false
         ));
         assert!(matches!(
             store.worktrees[&name].processes["dev"].phase,
@@ -1912,10 +1961,13 @@ mod tests {
             log_of(&fx, &name)
         );
         let mut store = fx.state();
+        // Through the readiness probe the read path really uses: the
+        // group's own listening sockets, never a bind of the port.
+        let scans = scan_groups(&store);
         assert!(state::advance_phases(
             &mut store,
             crate::process::is_alive,
-            crate::ports::is_port_free
+            |pgid, port| port_is_bound(&scans, pgid, port)
         ));
         assert!(
             matches!(
@@ -1930,6 +1982,150 @@ mod tests {
     /// environment — the positional shape Django and friends use.
     fn python_listener_template() -> String {
         python_listener(0).replace("',0)", "',{port:web})")
+    }
+
+    fn python_listener_v6_template() -> String {
+        crate::testutil::python_listener_v6(0).replace("',0)", "',{port:web})")
+    }
+
+    // A server on `[::1]` leaves both IPv4 addresses bindable, so a probe
+    // that decides readiness by binding says "not up" forever — and the
+    // observed-port scan never ran for a process that had not reached
+    // Running, so the two mechanisms deadlocked each other.
+    #[test]
+    fn a_dev_server_on_ipv6_loopback_alone_still_becomes_running() {
+        if !python3_available() {
+            eprintln!("skipping: python3 is not installed");
+            return;
+        }
+        if !crate::testutil::ipv6_loopback_available() {
+            eprintln!("skipping: no IPv6 loopback on this machine");
+            return;
+        }
+        let mut fx = fixture();
+        with_dev(
+            &mut fx,
+            ProcessConfig {
+                cmd: python_listener_v6_template(),
+                ports: PortsSpec::List(vec!["web".to_string()]),
+                ready: Some(ReadySpec {
+                    role: None,
+                    timeout_s: Some(20),
+                }),
+                ..Default::default()
+            },
+        );
+        let name = worktree_named(&fx, "feat/one");
+        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let _guard = guard(&outcome);
+        let port = outcome.process().ports["web"];
+
+        assert!(
+            wait_until(Duration::from_secs(20), || matches!(
+                refresh(&fx.paths).state.worktrees[&name].processes["dev"].phase,
+                Phase::Running { .. }
+            )),
+            "a server that is serving must not read as failed: {:?}",
+            log_of(&fx, &name)
+        );
+        assert!(
+            refresh(&fx.paths).state.worktrees[&name]
+                .observed_ports
+                .contains(&port),
+            "and the port it really bound is recorded"
+        );
+    }
+
+    // Readiness used to be answered by binding the port: "free" meant not
+    // up yet. That says nothing about *which* process is listening, so an
+    // unrelated squatter on the port made a dev server that had not even
+    // opened a socket read as running.
+    #[test]
+    fn a_port_something_else_holds_does_not_make_this_process_ready() {
+        let mut fx = fixture();
+        with_dev(&mut fx, dev("sleep 300"));
+        let name = worktree_named(&fx, "feat/one");
+        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let _guard = guard(&outcome);
+        let port = outcome.process().ports["web"];
+
+        let squatter = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let refreshed = refresh(&fx.paths);
+        assert!(
+            matches!(
+                refreshed.state.worktrees[&name].processes["dev"].phase,
+                Phase::Starting { .. }
+            ),
+            "readiness is about this group's own sockets, not about the port"
+        );
+        drop(squatter);
+    }
+
+    /// A "dev server" that tries to bind the IPv4 wildcard over and over and
+    /// counts how often it was refused — the class Django's
+    /// `runserver 0.0.0.0:P`, `vite --host 0.0.0.0` and Rails' `-b 0.0.0.0`
+    /// all belong to. A probe holding `0.0.0.0:P` locks every one of them
+    /// out, `SO_REUSEADDR` or not.
+    fn wildcard_bind_loop() -> String {
+        "python3 -u -c \"
+import os,socket,time
+p=int(os.environ['PORT'])
+f=0
+for i in range(1500):
+    s=socket.socket()
+    s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+    try:
+        s.bind(('0.0.0.0',p))
+        s.listen(5)
+    except OSError:
+        f+=1
+    s.close()
+    time.sleep(0.001)
+print('bind failures',f)
+time.sleep(300)
+\""
+        .to_string()
+    }
+
+    // Deciding "is it up yet?" by *taking* the port meant nothing else
+    // could take it for the length of every probe — including the server
+    // pando was waiting for, which then died with EADDRINUSE and a
+    // classifier pointing at the wrong culprit.
+    #[test]
+    fn polling_readiness_never_refuses_the_server_its_own_port() {
+        if !python3_available() {
+            eprintln!("skipping: python3 is not installed");
+            return;
+        }
+        let mut fx = fixture();
+        with_dev(
+            &mut fx,
+            ProcessConfig {
+                cmd: wildcard_bind_loop(),
+                ports: PortsSpec::Map(BTreeMap::from([("PORT".to_string(), "web".to_string())])),
+                ready: Some(ReadySpec {
+                    role: None,
+                    timeout_s: Some(120),
+                }),
+                ..Default::default()
+            },
+        );
+        let name = worktree_named(&fx, "feat/one");
+        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let _guard = guard(&outcome);
+
+        // Polled the whole time the server is coming up, which is what
+        // `ls`, `status` and the TUI's tick each do.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while std::time::Instant::now() < deadline && !log_of(&fx, &name).contains("bind failures")
+        {
+            refresh(&fx.paths);
+        }
+        let log = log_of(&fx, &name);
+        assert!(
+            log.contains("bind failures 0"),
+            "the server was refused its own port while pando was checking on it: {log:?}"
+        );
     }
 
     // ---- stop ------------------------------------------------------------
