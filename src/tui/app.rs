@@ -1304,6 +1304,35 @@ impl App {
                 view.follow = true;
                 view.new_below = 0;
             }
+            // Jump to the next (E) or previous (e) error, relative to the
+            // cursor, so repeated presses walk the list rather than
+            // re-finding the same line.
+            KeyCode::Char('E') | KeyCode::Char('e') => {
+                let forward = matches!(key.code, KeyCode::Char('E'));
+                let targets = error_ranks(view);
+                if !targets.is_empty() {
+                    let from = if view.follow { last_rank } else { view.cursor };
+                    let target = if forward {
+                        targets
+                            .iter()
+                            .copied()
+                            .find(|rank| *rank > from)
+                            .or_else(|| targets.first().copied())
+                    } else {
+                        targets
+                            .iter()
+                            .copied()
+                            .rev()
+                            .find(|rank| *rank < from)
+                            .or_else(|| targets.last().copied())
+                    };
+                    if let Some(rank) = target {
+                        view.cursor = rank;
+                        view.scroll = rank.saturating_sub(viewer_height / 2).min(max_scroll);
+                        view.follow = false;
+                    }
+                }
+            }
             KeyCode::Char('w') => view.wrap = !view.wrap,
             KeyCode::Char('/') => {
                 view.search_mode = SearchMode::Typing;
@@ -2152,6 +2181,37 @@ impl App {
         app.refilter();
         app
     }
+}
+
+/// Where the errors are, as positions in the visible list: one target per
+/// error *block*, and one per run of consecutive standalone error lines.
+///
+/// Stepping through all forty lines of one stack trace is not jumping to
+/// the next error — but two blocks that happen to be adjacent are two
+/// errors, so a run only merges while the block id stays the same.
+fn error_ranks(view: &LogView) -> Vec<usize> {
+    let query = view.search.query.to_lowercase();
+    let collapse = view.collapsed();
+    let mut ranks = Vec::new();
+    let mut rank = 0usize;
+    let mut previous: Option<(bool, Option<u64>)> = None;
+    for parsed in view.tail.lines() {
+        let visible = view.log_filter.passes(parsed.level)
+            && (!collapse || parsed.plain_lower.contains(&query));
+        if !visible {
+            continue;
+        }
+        let is_error = parsed.level >= LogLevel::Error;
+        if is_error {
+            let same_run = matches!(previous, Some((true, block)) if block == parsed.block_id);
+            if !same_run {
+                ranks.push(rank);
+            }
+        }
+        previous = Some((is_error, parsed.block_id));
+        rank += 1;
+    }
+    ranks
 }
 
 /// The contiguous range of the block containing `at`.
@@ -4021,6 +4081,134 @@ pub mod tests {
         assert!(app.inspect.is_some());
         app.close_log_viewer();
         assert!(app.inspect.is_none());
+    }
+
+    // ---- error jumps -----------------------------------------------------
+
+    #[test]
+    fn capital_e_lands_on_the_first_line_of_each_error_block() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(
+            &app,
+            "feat+one",
+            "dev",
+            &[
+                "starting up", // 0
+                "{",           // 1  block A, error
+                "  \"level\": \"error\",",
+                "  \"msg\": \"a\"",
+                "}",          // 4
+                "still fine", // 5
+                "{",          // 6  block B, error
+                "  \"level\": \"error\",",
+                "  \"msg\": \"b\"",
+                "}",    // 9
+                "done", // 10
+            ],
+        );
+        open_viewer(&mut app, 80, 24);
+        press(&mut app, KeyCode::Char('g'));
+
+        press(&mut app, KeyCode::Char('E'));
+        assert_eq!(viewer(&app).cursor, 1, "the first line of the first block");
+        press(&mut app, KeyCode::Char('E'));
+        assert_eq!(
+            viewer(&app).cursor,
+            6,
+            "not every line of it — the next block"
+        );
+        press(&mut app, KeyCode::Char('E'));
+        assert_eq!(viewer(&app).cursor, 1, "and it wraps");
+        press(&mut app, KeyCode::Char('e'));
+        assert_eq!(viewer(&app).cursor, 6, "backwards too");
+    }
+
+    #[test]
+    fn two_adjacent_error_blocks_are_two_jump_targets() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(
+            &app,
+            "feat+one",
+            "dev",
+            &[
+                "{",
+                "  \"level\": \"error\",",
+                "}",
+                "{",
+                "  \"level\": \"error\",",
+                "}",
+            ],
+        );
+        open_viewer(&mut app, 80, 24);
+        assert_eq!(
+            error_ranks(viewer(&app)),
+            vec![0, 3],
+            "back-to-back blocks must not merge into one run"
+        );
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('E'));
+        assert_eq!(
+            viewer(&app).cursor,
+            3,
+            "the cursor was already on the first"
+        );
+        press(&mut app, KeyCode::Char('E'));
+        assert_eq!(viewer(&app).cursor, 0, "and it wraps back to it");
+    }
+
+    #[test]
+    fn a_run_of_standalone_error_lines_is_one_target() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(
+            &app,
+            "feat+one",
+            "dev",
+            &[
+                "ok",
+                "ERROR one",
+                "ERROR two",
+                "ERROR three",
+                "ok again",
+                "ERROR four",
+            ],
+        );
+        open_viewer(&mut app, 80, 24);
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('E'));
+        assert_eq!(viewer(&app).cursor, 1);
+        press(&mut app, KeyCode::Char('E'));
+        assert_eq!(viewer(&app).cursor, 5, "the run counts once");
+    }
+
+    #[test]
+    fn an_error_jump_with_no_errors_moves_nothing() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["all", "quite", "fine"]);
+        open_viewer(&mut app, 80, 12);
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('E'));
+        assert_eq!(viewer(&app).cursor, 0);
+        assert!(!viewer(&app).follow);
+    }
+
+    #[test]
+    fn an_error_jump_respects_the_level_filter() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(
+            &app,
+            "feat+one",
+            "dev",
+            &["info", "WARN slow", "info", "ERROR boom"],
+        );
+        open_viewer(&mut app, 80, 12);
+        press(&mut app, KeyCode::Char('f')); // warn+, so two lines are shown
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('E'));
+        assert_eq!(
+            viewer(&app).cursor,
+            1,
+            "the error is the second of the two visible lines"
+        );
     }
 
     #[test]

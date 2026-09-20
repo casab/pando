@@ -14,7 +14,7 @@ use ratatui::widgets::{
 };
 
 use super::app::{App, LogFilter, LogView, Mode, SearchMode};
-use crate::log_tail::LogLevel;
+use crate::log_tail::{LogLevel, ParsedLine};
 use crate::state::{Aggregate, Phase, ProcessRecord};
 use crate::theme::{
     blue, border, cyan, green, highlight_bg, magenta, orange, red, search_cursor_bg,
@@ -536,7 +536,13 @@ fn viewer_rows(
         let at_cursor = rank == cursor;
         // The cursor line always renders in full: with wrap off it is the
         // one line that expands, so the line being read stays readable.
-        let rows = line_rows(styled, width, view.wrap || at_cursor);
+        let rows = gutter_rows(
+            styled,
+            parsed.level,
+            width,
+            view.wrap || at_cursor,
+            block_glyph(lines, at),
+        );
         if at_cursor {
             cursor_highlight_rows(rows, width)
         } else {
@@ -700,13 +706,54 @@ fn render_inspect(f: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
-/// One log line as visual rows: wrapped to the width, or truncated to a
-/// single row when wrap is off.
-fn line_rows(line: Line<'static>, width: usize, wrap: bool) -> Vec<Line<'static>> {
-    if wrap {
-        wrap_line_to_rows(line, width)
+/// One log line as visual rows: wrapped (or truncated, when wrap is off) to
+/// the width minus the one-column gutter, then every row prefixed with the
+/// severity bar — so a tall wrapped error reads as one continuous red edge.
+fn gutter_rows(
+    line: Line<'static>,
+    level: LogLevel,
+    width: usize,
+    wrap: bool,
+    glyph: &'static str,
+) -> Vec<Line<'static>> {
+    let content_width = width.saturating_sub(1).max(1);
+    let mut rows = if wrap {
+        wrap_line_to_rows(line, content_width)
     } else {
-        vec![truncate_line(line, width)]
+        vec![truncate_line(line, content_width)]
+    };
+    for row in &mut rows {
+        row.spans.insert(0, level_gutter(level, glyph));
+    }
+    rows
+}
+
+/// The coloured bar at a line's left edge: red for an error, yellow for a
+/// warning, muted otherwise — so problems are visible while scanning,
+/// without reading a word.
+fn level_gutter(level: LogLevel, glyph: &'static str) -> Span<'static> {
+    let colour = match level {
+        LogLevel::Error => red(),
+        LogLevel::Warn => yellow(),
+        _ => text_muted(),
+    };
+    Span::styled(glyph, Style::new().fg(colour))
+}
+
+/// The gutter glyph for one buffer line: a multi-line JSON block draws as a
+/// bracket (╭ │ ╰) so the whole entry reads as one unit; a standalone line
+/// keeps the plain bar.
+fn block_glyph(buffer: &std::collections::VecDeque<ParsedLine>, at: usize) -> &'static str {
+    let Some(id) = buffer.get(at).and_then(|parsed| parsed.block_id) else {
+        return "▎";
+    };
+    let starts = at == 0 || buffer[at - 1].block_id != Some(id);
+    let ends = at + 1 >= buffer.len() || buffer[at + 1].block_id != Some(id);
+    match (starts, ends) {
+        (true, true) => "▎",
+        (true, false) => "╭",
+        (false, true) => "╰",
+        (false, false) => "│",
     }
 }
 
@@ -791,34 +838,97 @@ fn highlight_search_in_line(
     Line::from(spans)
 }
 
-/// Hard char-wrap a styled line into rows of at most `width` chars, keeping
-/// each span's style across the split. Always at least one row, so a blank
-/// line still occupies one.
+/// Char-wrap a styled line into rows of at most `width` chars, keeping each
+/// span's style across the split. Always at least one row, so a blank line
+/// still occupies one.
+///
+/// A break that would fall inside a URL's `scheme://host` is moved to just
+/// before the URL instead, so `http://` never ends up on one row with the
+/// host on the next — a URL cut in half is one nobody can click, copy, or
+/// read aloud. The path is fair game; only the part that has to stay
+/// together is protected, and a host wider than the whole viewport is cut
+/// like anything else.
 fn wrap_line_to_rows(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
-    let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
-    let mut current: Vec<Span<'static>> = Vec::new();
-    let mut col = 0usize;
-    for span in line.spans {
-        let style = span.style;
-        let mut buf = String::new();
-        for ch in span.content.chars() {
-            if col == width {
-                if !buf.is_empty() {
-                    current.push(Span::styled(std::mem::take(&mut buf), style));
-                }
-                rows.push(std::mem::take(&mut current));
-                col = 0;
-            }
-            buf.push(ch);
-            col += 1;
-        }
-        if !buf.is_empty() {
-            current.push(Span::styled(buf, style));
-        }
+    let cells: Vec<(char, Style)> = line
+        .spans
+        .iter()
+        .flat_map(|span| {
+            let style = span.style;
+            span.content
+                .chars()
+                .map(move |c| (c, style))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    if cells.is_empty() {
+        return vec![Line::from(Vec::<Span<'static>>::new())];
     }
-    rows.push(current);
-    rows.into_iter().map(Line::from).collect()
+    let text: String = cells.iter().map(|(c, _)| *c).collect();
+    let protected = protected_ranges(&text);
+
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut start = 0usize;
+    while start < cells.len() {
+        let mut end = (start + width).min(cells.len());
+        if end < cells.len()
+            && let Some(&(from, to)) = protected.iter().find(|&&(from, to)| from < end && end < to)
+            && from > start
+            && to - from <= width
+        {
+            end = from;
+        }
+        rows.push(row_of(&cells[start..end]));
+        start = end;
+    }
+    rows
+}
+
+/// Regroups consecutive cells that share a style back into spans.
+fn row_of(cells: &[(char, Style)]) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut current: Option<Style> = None;
+    for (c, style) in cells {
+        if current != Some(*style) {
+            if let Some(style) = current {
+                spans.push(Span::styled(std::mem::take(&mut buf), style));
+            }
+            current = Some(*style);
+        }
+        buf.push(*c);
+    }
+    if let Some(style) = current {
+        spans.push(Span::styled(buf, style));
+    }
+    Line::from(spans)
+}
+
+/// Char ranges a wrap should not split: each URL's `scheme://authority`,
+/// ending at the first `/`, `?`, `#`, closing delimiter, or space.
+fn protected_ranges(text: &str) -> Vec<(usize, usize)> {
+    const SCHEMES: [&str; 2] = ["https://", "http://"];
+    let chars: Vec<char> = text.chars().collect();
+    let mut ranges = Vec::new();
+    let mut at = 0usize;
+    while at < chars.len() {
+        let ahead: String = chars[at..].iter().take(8).collect();
+        let Some(scheme) = SCHEMES.iter().find(|s| ahead.starts_with(**s)) else {
+            at += 1;
+            continue;
+        };
+        let mut end = at + scheme.chars().count();
+        while end < chars.len() {
+            let c = chars[end];
+            if c.is_whitespace() || matches!(c, '/' | '?' | '#' | '"' | '\'' | ')' | '>' | ',') {
+                break;
+            }
+            end += 1;
+        }
+        ranges.push((at, end));
+        at = end.max(at + 1);
+    }
+    ranges
 }
 
 /// Paints the cursor line: every span without a background of its own gets
@@ -2398,6 +2508,145 @@ mod tests {
             1,
             "to exactly one row:\n{truncated}"
         );
+    }
+
+    // ---- gutters, durations and URL wrapping -----------------------------
+
+    #[test]
+    fn every_row_of_a_line_carries_a_gutter_coloured_by_severity() {
+        for (line, want) in [
+            ("ERROR boom", red()),
+            ("WARN slow", yellow()),
+            ("just info", text_muted()),
+        ] {
+            let (_dir, mut app) = app_with_logs(&["feat+one"]);
+            write_log(&app, "feat+one", "dev", &[line]);
+            app.open_log_viewer();
+            let buffer = draw(&mut app, 40, 10);
+            let gutter = buffer.cell((1, 1)).unwrap();
+            assert_eq!(gutter.symbol(), "▎", "{line}");
+            assert_eq!(gutter.style().fg, Some(want), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_wrapped_line_keeps_one_continuous_gutter() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(
+            &app,
+            "feat+one",
+            "dev",
+            &[format!("ERROR {}", "x".repeat(90))],
+        );
+        app.open_log_viewer();
+        let buffer = draw(&mut app, 40, 10);
+        // Three body rows of one long error line, each with the same bar.
+        for row in 1..4 {
+            let gutter = buffer.cell((1, row)).unwrap();
+            assert_eq!(gutter.symbol(), "▎", "row {row}");
+            assert_eq!(gutter.style().fg, Some(red()), "row {row}");
+        }
+    }
+
+    #[test]
+    fn a_json_block_is_bracketed_in_the_gutter() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(
+            &app,
+            "feat+one",
+            "dev",
+            &["{", "  \"msg\": \"hi\",", "  \"n\": 1", "}"],
+        );
+        app.open_log_viewer();
+        let buffer = draw(&mut app, 40, 10);
+        let glyphs: Vec<&str> = (1..5)
+            .map(|row| buffer.cell((1, row)).unwrap().symbol())
+            .collect();
+        assert_eq!(
+            glyphs,
+            vec!["╭", "│", "│", "╰"],
+            "one entry reads as one unit"
+        );
+    }
+
+    #[test]
+    fn a_line_that_is_not_in_a_block_keeps_the_plain_bar() {
+        let buffer: std::collections::VecDeque<ParsedLine> = std::collections::VecDeque::new();
+        assert_eq!(block_glyph(&buffer, 0), "▎", "an index that is not there");
+    }
+
+    // The colouring itself is `log_tail`'s, ported verbatim; this is that
+    // it survives the trip through the viewer's spans.
+    #[test]
+    fn a_duration_reaches_the_viewer_still_coloured_by_speed() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["GET /api/a 200 in 85ms"]);
+        app.open_log_viewer();
+        let buffer = draw(&mut app, 60, 10);
+        let painted = text_of(&buffer);
+        assert!(painted.contains("85ms"), "{painted}");
+        let colours: Vec<_> = (0..60)
+            .map(|x| buffer.cell((x, 1)).unwrap().style().fg)
+            .collect();
+        assert!(
+            colours.contains(&Some(green())),
+            "a fast duration is green: {colours:?}"
+        );
+    }
+
+    #[test]
+    fn a_url_wraps_before_itself_rather_than_through_its_host() {
+        let line = Line::raw("see https://example.com/a/b for more".to_string());
+        // A width that would otherwise split "https://example.com" in two.
+        let rows = wrap_line_to_rows(line, 20);
+        let texts: Vec<String> = rows
+            .iter()
+            .map(|r| r.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        assert!(
+            texts.iter().any(|t| t.starts_with("https://example.com")),
+            "the scheme and the host stay together: {texts:?}"
+        );
+        assert_eq!(
+            texts.concat(),
+            "see https://example.com/a/b for more",
+            "and nothing is lost: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn a_host_wider_than_the_viewport_is_cut_like_anything_else() {
+        let host = "a".repeat(40);
+        let line = Line::raw(format!("x https://{host}/p"));
+        let rows = wrap_line_to_rows(line, 10);
+        let texts: Vec<String> = rows
+            .iter()
+            .map(|r| r.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        assert!(
+            rows.iter().all(|r| r
+                .spans
+                .iter()
+                .map(|s| s.content.chars().count())
+                .sum::<usize>()
+                <= 10),
+            "no row may exceed the width: {texts:?}"
+        );
+        assert_eq!(texts.concat(), format!("x https://{host}/p"));
+    }
+
+    #[test]
+    fn protected_ranges_cover_the_scheme_and_host_only() {
+        let text = "get https://example.com/a?b=1 done";
+        let ranges = protected_ranges(text);
+        assert_eq!(ranges.len(), 1);
+        let (from, to) = ranges[0];
+        let chars: Vec<char> = text.chars().collect();
+        assert_eq!(
+            chars[from..to].iter().collect::<String>(),
+            "https://example.com"
+        );
+        assert!(protected_ranges("no urls here").is_empty());
     }
 
     // ---- the inspect overlay ---------------------------------------------
