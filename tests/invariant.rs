@@ -620,7 +620,8 @@ fn two_processes_never_write_into_the_repository() {
             .map(|p| p.process.as_str())
             .collect::<Vec<_>>(),
         vec!["api", "web"],
-        "both processes, in config order"
+        "alphabetically by process name, which is the order they are spawned in — \
+         the file lists web first, and nothing in the loader preserves that"
     );
     let web_port = report.ports["web"];
     let api_port = report.ports["api"];

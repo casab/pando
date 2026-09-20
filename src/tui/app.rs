@@ -749,15 +749,13 @@ impl App {
         self.set_status(format!("log: {}", processes[self.tail_index].0));
     }
 
-    /// The URL a worktree serves on, from the role `share` and this key
-    /// default to.
+    /// The URL a worktree serves on.
+    ///
+    /// The one shared rule, so the row, the detail pane and `o` open the
+    /// address `pando status` prints — including when a framework ignored
+    /// the port it was given.
     pub fn url_of(&self, name: &str) -> Option<String> {
-        let record = self.record_for(name)?;
-        let port = record
-            .ports
-            .get("web")
-            .or_else(|| record.ports.values().next())?;
-        Some(format!("http://localhost:{port}"))
+        actions::worktree_url(self.record_for(name)?)
     }
 
     fn selected_name(&mut self) -> Option<String> {
@@ -2211,6 +2209,52 @@ pub mod tests {
         with_process(&mut app, "feat+one", running_phase());
         press(&mut app, KeyCode::Char('o'));
         assert_eq!(app.opened.as_deref(), Some("http://localhost:17342"));
+    }
+
+    // Phase 2b review, finding 6. `url_of` was a third implementation of
+    // the URL rule: the alphabetically first *role* rather than the first
+    // role of the first process, and it never looked at what the process
+    // was really listening on. `o` opened a different address from the one
+    // `pando status` had just printed.
+    #[test]
+    fn open_uses_the_same_url_rule_as_status() {
+        let mut app = test_app(&["feat+url2"]);
+        let mut state = State::new();
+        let mut record = WorktreeRecord::new("/trees/feat+url2", true);
+        record.ports.insert("srv".to_string(), 19_056);
+        record.ports.insert("admin".to_string(), 19_057);
+        record
+            .roles
+            .insert("alpha".to_string(), vec!["srv".to_string()]);
+        record
+            .roles
+            .insert("beta".to_string(), vec!["admin".to_string()]);
+        // And `alpha` ignored the port it was given, which the TUI never
+        // noticed at all.
+        record.processes.insert(
+            "alpha".to_string(),
+            ProcessRecord {
+                pid: 4242,
+                pgid: 4242,
+                started_at: Utc::now(),
+                log_path: PathBuf::from("/does/not/exist/alpha.log"),
+                ready_port: Some(19_056),
+                ready_timeout_s: None,
+                observed_ports: vec![3000],
+                phase: running_phase(),
+            },
+        );
+        record.observed_ports = vec![3000];
+        state.worktrees.insert("feat+url2".to_string(), record);
+        app.handle_event(AppEvent::Refreshed(Box::new(Ok(state.clone()))));
+
+        assert_eq!(
+            app.url_of("feat+url2"),
+            crate::actions::worktree_url(&state.worktrees["feat+url2"]),
+            "one rule, wherever it is asked"
+        );
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.opened.as_deref(), Some("http://localhost:3000"));
     }
 
     #[test]

@@ -397,7 +397,7 @@ pub fn rm(paths: &PandoPaths, name: &str, yes: bool, force: bool) -> Result<()> 
     // Whatever is running goes next. A dev server whose working directory
     // has just been deleted is not a process anyone can do anything with,
     // and `rm` removes the record that is the only way to find it again.
-    let stopped = stop_recorded(&mut store, name, None)?;
+    let stopped = stop_recorded(&mut store, name, None, MissingOnly::IsAnError)?;
 
     // Nothing is unlinked first. Verified against git 2.51: an ignored file
     // does not block `git worktree remove`, and `--force` does not follow a
@@ -748,8 +748,10 @@ pub struct StartReport {
     /// reserved for the whole worktree at once, so starting one process
     /// never moves another one's port.
     pub ports: BTreeMap<String, u16>,
-    /// The `web` role's URL when any process owns that role, else the first
-    /// role of the first process in config order.
+    /// The `web` role's URL when any process owns that role, else the
+    /// first role of the alphabetically first process that owns one — the
+    /// same rule, through the same function, that `status`, `ls` and the
+    /// TUI use. See [`worktree_url`].
     pub url: Option<String>,
     /// Ports this worktree owned had been taken, so it moved. Worth saying
     /// out loud: a URL the developer had bookmarked just changed.
@@ -1060,11 +1062,15 @@ pub fn start(
             })
         })
         .collect();
+    // From the record, through the one function every read path uses, so
+    // that `pando start` and a `pando status` a second later cannot
+    // disagree about the URL of the same worktree.
+    let url = store.worktrees.get(name).and_then(worktree_url);
     Ok(StartReport {
         worktree: name.to_string(),
         started,
         already_running,
-        url: url_for(&assignment.ports, &roles),
+        url,
         ports: assignment.ports,
         reassigned: assignment.reassigned,
     })
@@ -1091,13 +1097,36 @@ fn every_process_running(
     })
 }
 
+/// What an `--only` that names nothing the worktree is running means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissingOnly {
+    /// An error naming what the worktree *is* running. `stop` cannot see
+    /// config — it has to work when `pando.toml` is broken — so the record
+    /// is the only thing it can check a name against, and "not running"
+    /// would read as "nothing to do" for a typo.
+    IsAnError,
+    /// Nothing to do. `restart` has already checked the name against
+    /// config, and bringing a process that is down back up is exactly what
+    /// `restart --only` is for.
+    IsNothingToDo,
+}
+
 /// Stops a worktree's processes — every one it is running, or the one
 /// `only` names. The worktree, its ports, and its logs survive.
 pub fn stop(paths: &PandoPaths, name: &str, only: Option<&str>) -> Result<StopOutcome> {
+    stop_missing(paths, name, only, MissingOnly::IsAnError)
+}
+
+fn stop_missing(
+    paths: &PandoPaths,
+    name: &str,
+    only: Option<&str>,
+    missing: MissingOnly,
+) -> Result<StopOutcome> {
     paths.ensure_home()?;
     let _lock = state::lock(&paths.lock_file())?;
     let mut store = state::load(&paths.state_file())?;
-    let outcome = stop_recorded(&mut store, name, only)?;
+    let outcome = stop_recorded(&mut store, name, only, missing)?;
     // `reconcile` drops dead-leader records for every worktree in the
     // project, not only this one, so every one of them is signalled first.
     sweep_orphaned_groups(&store)?;
@@ -1129,7 +1158,7 @@ pub fn stop_all_with(paths: &PandoPaths, stop: impl Fn(i32) -> Result<()>) -> Re
         // One worktree that will not die must not leave the rest running —
         // and must not lose its record either. The failures are collected
         // and reported once every other group has been signalled.
-        match stop_recorded_with(&mut store, &name, None, &stop) {
+        match stop_recorded_with(&mut store, &name, None, MissingOnly::IsAnError, &stop) {
             Ok(StopOutcome::Stopped(_)) => stopped.push(name),
             Ok(StopOutcome::NotRunning) => {}
             Err(e) => failures.push(format!("stopping {name}: {e:#}")),
@@ -1164,14 +1193,22 @@ pub fn stop_all_with(paths: &PandoPaths, stop: impl Fn(i32) -> Result<()>) -> Re
 /// The signal is unconditional, Failed records included. pando is not the
 /// process's parent by then, so "failed" only ever meant "its leader is
 /// gone" — the group can still be serving.
-fn stop_recorded(store: &mut state::State, name: &str, only: Option<&str>) -> Result<StopOutcome> {
-    stop_recorded_with(store, name, only, |pgid| proc::stop(pgid, STOP_GRACE))
+fn stop_recorded(
+    store: &mut state::State,
+    name: &str,
+    only: Option<&str>,
+    missing: MissingOnly,
+) -> Result<StopOutcome> {
+    stop_recorded_with(store, name, only, missing, |pgid| {
+        proc::stop(pgid, STOP_GRACE)
+    })
 }
 
 fn stop_recorded_with(
     store: &mut state::State,
     name: &str,
     only: Option<&str>,
+    missing: MissingOnly,
     stop: impl Fn(i32) -> Result<()>,
 ) -> Result<StopOutcome> {
     let Some(record) = store.worktrees.get_mut(name) else {
@@ -1187,6 +1224,9 @@ fn stop_recorded_with(
         .map(|(process, p)| (process.clone(), p.pgid))
         .collect();
     if groups.is_empty() {
+        if missing == MissingOnly::IsNothingToDo {
+            return Ok(StopOutcome::NotRunning);
+        }
         // Only reachable with `--only`: the worktree is running something,
         // just not that. Naming what it *is* running beats "not running",
         // which would read as "nothing to do" for a typo.
@@ -1271,14 +1311,26 @@ pub fn restart(
     only: Option<&str>,
     progress: &dyn Fn(&str),
 ) -> Result<StartReport> {
-    stop(paths, name, only)?;
+    // Against config, and before anything is signalled: `stop` can only
+    // check a name against what is running, so a typo at `--only` used to
+    // get an error about the record — a different message depending on
+    // unrelated state, and never the one that lists the names config
+    // declares.
+    selected_processes(config, only)?;
+    // And a name config does know, whose process is simply not up, is a
+    // no-op to stop rather than a refusal. Bringing a stopped process back
+    // is the one thing `restart --only` exists for, and it used to be the
+    // one thing it could not do — but only while a sibling was still
+    // running, which made the failure look random.
+    stop_missing(paths, name, only, MissingOnly::IsNothingToDo)?;
     start(paths, config, name, only, progress)
 }
 
 /// The processes a start, stop or restart acts on: every one config
 /// declares, or the one `only` names.
 ///
-/// Config order, which is the order they are spawned in.
+/// Alphabetically by process name, which is the order they are spawned in:
+/// nothing in the loader preserves the file's own order.
 fn selected_processes<'a>(
     config: &'a Config,
     only: Option<&str>,
@@ -1319,7 +1371,9 @@ fn selected_processes<'a>(
     Ok(chosen)
 }
 
-/// Every role every process of the worktree owns, in config order.
+/// Every role every process of the worktree owns, alphabetically by
+/// process name — which is the order `Config.processes` keeps them in, and
+/// the order they are spawned in.
 ///
 /// Ports are reserved for all of them at once, whatever `--only` asked
 /// for: a role belongs to the worktree, and starting one process must
@@ -1363,14 +1417,77 @@ fn ready_role(process: &ProcessConfig, roles: &[String]) -> Result<Option<String
         .cloned())
 }
 
-/// The URL a worktree serves on: the `web` role's port when any of its
-/// processes owns that role, else the first role of the first process in
-/// config order. One worktree, one URL, however many processes it runs.
-fn url_for(ports: &BTreeMap<String, u16>, roles: &[String]) -> Option<String> {
-    let port = ports
-        .get(DEFAULT_READY_ROLE)
-        .or_else(|| roles.iter().find_map(|role| ports.get(role)))?;
-    Some(format!("http://localhost:{port}"))
+/// The URL a worktree serves on. One worktree, one URL, however many
+/// processes it runs — and one function, because `start`, `status`, `ls`,
+/// the TUI's row and the TUI's `o` key all have to hand out the same one.
+///
+/// The role is `web` whenever any process owns it, because that is the role
+/// everything else defaults to; otherwise the first role of the
+/// alphabetically first process that owns one. The port is what that
+/// process is really listening on when that is known, and the port pando
+/// assigned it otherwise.
+///
+/// From the record alone: `status` and the TUI never see config, and the
+/// answer has to survive a stop unchanged.
+pub fn worktree_url(record: &WorktreeRecord) -> Option<String> {
+    let role = url_role(record)?;
+    let assigned = *record.ports.get(&role)?;
+    Some(format!(
+        "http://localhost:{}",
+        observed_port_for_role(record, &role).unwrap_or(assigned)
+    ))
+}
+
+/// The role a worktree's URL points at: `web` wherever anything owns it,
+/// else the first role of the alphabetically first process that owns one.
+fn url_role(record: &WorktreeRecord) -> Option<String> {
+    if record.ports.contains_key(DEFAULT_READY_ROLE) {
+        return Some(DEFAULT_READY_ROLE.to_string());
+    }
+    record
+        .roles
+        .values()
+        .find_map(|roles| roles.first())
+        .filter(|role| record.ports.contains_key(*role))
+        .cloned()
+        // A record written before pando kept track of who owns what: the
+        // ports are all there is to go on.
+        .or_else(|| record.ports.keys().next().cloned())
+}
+
+/// The port the process that owns `role` is really listening on.
+///
+/// A framework that ignores `PORT`, or one that picked the next free
+/// number, is followed: the URL is what is really serving, not what pando
+/// asked for. But only within the owning process's own group. An observed
+/// port belongs to whichever group opened it, and with several processes a
+/// port nobody claimed is far more often the *other* process's HMR socket
+/// or debugger than this role's server — which is how a worktree whose web
+/// server was stopped handed out the api's second port as its URL.
+fn observed_port_for_role(record: &WorktreeRecord, role: &str) -> Option<u16> {
+    let assigned = *record.ports.get(role)?;
+    let owner = record
+        .roles
+        .iter()
+        .find(|(_, roles)| roles.iter().any(|owned| owned == role))
+        .map(|(process, _)| process)?;
+    let process = record.processes.get(owner)?;
+    // A process that is not up is not listening on anything, and what it
+    // was last seen holding says nothing about now.
+    if !matches!(
+        process.phase,
+        Phase::Starting { .. } | Phase::Running { .. }
+    ) {
+        return None;
+    }
+    if process.observed_ports.contains(&assigned) {
+        return Some(assigned);
+    }
+    process
+        .observed_ports
+        .iter()
+        .copied()
+        .find(|observed| !record.ports.values().any(|port| port == observed))
 }
 
 /// The directory the process runs in: the worktree, or the subdirectory
@@ -2991,6 +3108,80 @@ time.sleep(300)
         assert!(crate::process::is_alive(web_pid));
     }
 
+    // Phase 2b review, finding 5. `restart` was `stop` then `start`, and a
+    // `--only` stop of something that is not running is an error — so the
+    // one command a developer reaches for to bring a stopped process back
+    // refused to do it, but only when a *sibling* was still up.
+    #[test]
+    fn restart_only_brings_back_a_process_that_is_not_running() {
+        let mut fx = fixture();
+        with_web_and_api(&mut fx);
+        let name = workspace_worktree(&fx, "feat/one");
+        let first = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+        let _guard = guard(&first);
+        stop(&fx.paths, &name, Some("api")).unwrap();
+        let web_pid = fx.state().worktrees[&name].processes["web"].pid;
+        assert!(
+            !fx.state().worktrees[&name].processes.contains_key("api"),
+            "the api is down and the web process is still serving"
+        );
+
+        let report = restart(&fx.paths, &fx.config, &name, Some("api"), &noop).unwrap();
+        let _g2 = guard(&report);
+        assert_eq!(names_of(&report.started), vec!["api"]);
+        assert_eq!(
+            report.ports, first.ports,
+            "and on the ports the worktree already had"
+        );
+        assert_eq!(
+            fx.state().worktrees[&name].processes["web"].pid,
+            web_pid,
+            "the process it did not name was never touched"
+        );
+    }
+
+    // The name is checked against config, not against what happens to be
+    // running: the same typo used to produce two different messages
+    // depending on unrelated state, and only one of them listed the names
+    // config declares.
+    #[test]
+    fn restart_only_answers_a_name_config_never_heard_of_with_the_names_it_did() {
+        let mut fx = fixture();
+        with_web_and_api(&mut fx);
+        let name = workspace_worktree(&fx, "feat/one");
+        let first = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+        let _guard = guard(&first);
+
+        let err = format!(
+            "{:#}",
+            restart(&fx.paths, &fx.config, &name, Some("typo"), &noop).unwrap_err()
+        );
+        assert!(err.contains("no process named \"typo\""), "{err}");
+        assert!(err.contains("api, web"), "{err}");
+        assert_eq!(
+            live_processes(&fx, &name),
+            vec!["api", "web"],
+            "and a refused restart stops nothing"
+        );
+    }
+
+    // `stop` itself keeps the stricter message: it cannot see config — it
+    // has to work when `pando.toml` is broken — so the record is the only
+    // thing it can check a name against.
+    #[test]
+    fn stop_only_still_refuses_a_name_the_worktree_is_not_running() {
+        let mut fx = fixture();
+        with_web_and_api(&mut fx);
+        let name = workspace_worktree(&fx, "feat/one");
+        let first = start(&fx.paths, &fx.config, &name, Some("web"), &noop).unwrap();
+        let _guard = guard(&first);
+        let err = format!("{:#}", stop(&fx.paths, &name, Some("api")).unwrap_err());
+        assert!(
+            err.contains("is not running a process named \"api\""),
+            "{err}"
+        );
+    }
+
     #[test]
     fn restart_replaces_every_process_and_keeps_every_port() {
         let mut fx = fixture();
@@ -3382,6 +3573,46 @@ time.sleep(300)
         let record = &store.worktrees["feat+one"];
         assert!(record.processes["web"].observed_ports.is_empty());
         assert_eq!(record.observed_ports, vec![9876, 17_343]);
+    }
+
+    // Phase 2b review, finding 6. `start` and every read path have to hand
+    // out the same URL for the same worktree, in every state it can be in.
+    #[test]
+    fn start_and_the_read_paths_agree_on_the_url_when_nothing_owns_web() {
+        let mut fx = fixture();
+        // `alpha` owns `srv` and `beta` owns `admin`: the alphabetically
+        // first *process* and the alphabetically first *role* are different
+        // answers, which is what made two commands disagree.
+        for (process, role) in [("alpha", "srv"), ("beta", "admin")] {
+            fx.config.processes.insert(
+                process.to_string(),
+                ProcessConfig {
+                    cmd: "sleep 30".to_string(),
+                    ports: Some(PortsSpec::List(vec![role.to_string()])),
+                    ..Default::default()
+                },
+            );
+        }
+        let name = worktree_named(&fx, "feat/url2");
+
+        let report = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+        let _g = guard(&report);
+        let expected = format!("http://localhost:{}", report.ports["srv"]);
+        assert_eq!(
+            report.url.as_deref(),
+            Some(expected.as_str()),
+            "alpha comes first, so its first role is the worktree's URL"
+        );
+        assert_eq!(
+            worktree_url(&fx.state().worktrees[&name]),
+            report.url,
+            "and the record every read path works from says the same"
+        );
+
+        // The ports survive a stop, so the URL does too — and it is still
+        // the same one.
+        stop(&fx.paths, &name, None).unwrap();
+        assert_eq!(worktree_url(&fx.state().worktrees[&name]), report.url);
     }
 
     // ---- restart ---------------------------------------------------------

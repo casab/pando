@@ -13,6 +13,7 @@ use tempfile::TempDir;
 const EXIT_OK: i32 = 0;
 const EXIT_ERROR: i32 = 1;
 const EXIT_USAGE: i32 = 2;
+const EXIT_NEEDS_ANSWER: i32 = 3;
 
 struct Env {
     _dir: TempDir,
@@ -1132,4 +1133,37 @@ fn a_process_with_no_ports_of_its_own_is_running_once_it_is_alive() {
         stdout(&out)
     );
     assert_eq!(code(&e.pando(&["stop"])), EXIT_OK);
+}
+
+// Phase 2b review, finding 5, second half. `Command::Restart` passed the
+// raw config while `Command::Start` resolved it, so `restart` on a project
+// whose process question has never been answered refused instead of asking
+// — the same input, two different answers, depending on which verb was
+// typed.
+#[test]
+fn restart_asks_the_question_start_would_have_asked() {
+    let e = env_of(Kind::MonoWebApi);
+    assert_eq!(code(&e.pando(&["new", "feat/one", "--yes"])), EXIT_OK);
+
+    let restart = e.pando(&["restart", "feat+one"]);
+    let start = e.pando(&["start", "feat+one"]);
+    assert_eq!(
+        code(&restart),
+        EXIT_NEEDS_ANSWER,
+        "stdout: {} stderr: {}",
+        stdout(&restart),
+        stderr(&restart)
+    );
+    assert_eq!(
+        code(&start),
+        EXIT_NEEDS_ANSWER,
+        "and this is the answer it should match: {}",
+        stderr(&start)
+    );
+    assert_eq!(
+        stderr(&restart),
+        stderr(&start),
+        "the same question, asked the same way"
+    );
+    assert_eq!(status_porcelain(&e.root), "");
 }

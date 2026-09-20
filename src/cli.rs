@@ -9,6 +9,7 @@ use std::io::Write;
 use std::time::Duration;
 
 use crate::actions;
+use crate::actions::worktree_url;
 use crate::cache;
 use crate::config::Config;
 use crate::log_tail::{self, LogLevel};
@@ -98,6 +99,10 @@ pub enum Command {
     /// Stop and start again, keeping the ports.
     Restart {
         name: String,
+        /// Accept pando's own recommendation for anything it would ask.
+        /// Without it, an unanswerable question exits 3.
+        #[arg(long)]
+        yes: bool,
         /// One process by name. The others are not restarted.
         #[arg(long)]
         only: Option<String>,
@@ -208,7 +213,11 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
                 Ok(())
             }
         },
-        Command::Restart { name, only } => {
+        Command::Restart { name, yes, only } => {
+            // Resolved exactly as `start` resolves it: a project whose
+            // process question has never been answered gets the question,
+            // not a refusal.
+            let config = &actions::resolve_process(paths, config, &asker(yes), &notice)?;
             let report = actions::restart(paths, config, &name, only.as_deref(), &notice)?;
             writeln!(out, "restarted {name}{}", url_suffix(report.url.as_deref()))?;
             Ok(())
@@ -795,57 +804,6 @@ fn phase_reason(phase: &Phase) -> Option<String> {
     }
 }
 
-/// The URL a worktree serves on: what the process that owns the role is
-/// really listening on when that is known, falling back to the port pando
-/// assigned it.
-fn worktree_url(record: &WorktreeRecord) -> Option<String> {
-    let role = if record.ports.contains_key(crate::config::WEB_ROLE) {
-        crate::config::WEB_ROLE.to_string()
-    } else {
-        record.ports.keys().next()?.clone()
-    };
-    let assigned = *record.ports.get(&role)?;
-    Some(format!(
-        "http://localhost:{}",
-        observed_port_for_role(record, &role).unwrap_or(assigned)
-    ))
-}
-
-/// The port the process that owns `role` is really listening on.
-///
-/// A framework that ignores `PORT`, or one that picked the next free
-/// number, is followed: the URL is what is really serving, not what pando
-/// asked for. But only within the owning process's own group. An observed
-/// port belongs to whichever group opened it, and with several processes a
-/// port nobody claimed is far more often the *other* process's HMR socket
-/// or debugger than this role's server — which is how a worktree whose web
-/// server was stopped handed out the api's second port as its URL.
-fn observed_port_for_role(record: &WorktreeRecord, role: &str) -> Option<u16> {
-    let assigned = *record.ports.get(role)?;
-    let owner = record
-        .roles
-        .iter()
-        .find(|(_, roles)| roles.iter().any(|owned| owned == role))
-        .map(|(process, _)| process)?;
-    let process = record.processes.get(owner)?;
-    // A process that is not up is not listening on anything, and what it
-    // was last seen holding says nothing about now.
-    if !matches!(
-        process.phase,
-        Phase::Starting { .. } | Phase::Running { .. }
-    ) {
-        return None;
-    }
-    if process.observed_ports.contains(&assigned) {
-        return Some(assigned);
-    }
-    process
-        .observed_ports
-        .iter()
-        .copied()
-        .find(|observed| !record.ports.values().any(|port| port == observed))
-}
-
 pub fn status_json<W: Write>(paths: &PandoPaths, only: Option<&str>, out: &mut W) -> Result<()> {
     let refreshed = actions::refresh(paths);
     if let Some(warning) = &refreshed.warning {
@@ -1430,6 +1388,42 @@ mod tests {
         assert_eq!(
             worktree_url(&record).as_deref(),
             Some("http://localhost:17342")
+        );
+    }
+
+    // Phase 2b review, finding 6. One rule with three implementations:
+    // `start` took the first role of the first process, `status` and `ls`
+    // took the alphabetically first *role*, and the TUI took that and never
+    // looked at what was really listening. Two processes whose role names
+    // sort the other way round from their own names were all it took for
+    // `pando start` and `pando status`, seconds apart, to hand out two
+    // different URLs.
+    #[test]
+    fn the_url_is_the_first_role_of_the_first_process_when_nothing_owns_web() {
+        let mut record = WorktreeRecord::new("/trees/feat+url2", true);
+        record.ports.insert("srv".to_string(), 19_056);
+        record.ports.insert("admin".to_string(), 19_057);
+        record
+            .roles
+            .insert("alpha".to_string(), vec!["srv".to_string()]);
+        record
+            .roles
+            .insert("beta".to_string(), vec!["admin".to_string()]);
+        assert_eq!(
+            worktree_url(&record).as_deref(),
+            Some("http://localhost:19056"),
+            "alpha comes first, so alpha's first role is the worktree's URL"
+        );
+
+        // `web` still wins wherever anything owns it, whatever it sorts
+        // against.
+        record.ports.insert("web".to_string(), 19_058);
+        record
+            .roles
+            .insert("zeta".to_string(), vec!["web".to_string()]);
+        assert_eq!(
+            worktree_url(&record).as_deref(),
+            Some("http://localhost:19058")
         );
     }
 
