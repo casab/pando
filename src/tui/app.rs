@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use crate::actions;
 use crate::cache;
 use crate::config::Config;
-use crate::log_tail::LogTail;
+use crate::log_tail::{LogLevel, LogTail};
 use crate::paths::PandoPaths;
 use crate::state::{self, Aggregate, ProcessRecord, State, WorktreeRecord};
 use crate::worktree::{self, BranchEntry, EnrichUpdate, PrInfo, Worktree};
@@ -41,6 +41,10 @@ pub const REFRESH_EVERY: u32 = 4;
 const MAX_LOG_TAILS: usize = 8;
 /// Lines of the dev log the detail pane keeps.
 const TAIL_CAPACITY: usize = 256;
+/// Lines the full-screen viewer keeps for the log it has open. Two orders
+/// of magnitude more than the detail pane's glance, because the viewer is
+/// what a stack trace from ten minutes ago is read in.
+pub const LOG_VIEWER_CAPACITY: usize = 10_000;
 const SPINNER_FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
 /// Everything the event loop can deliver. One enum so the loop blocks on a
@@ -86,6 +90,167 @@ pub struct Snapshot {
 pub enum Mode {
     Normal,
     Filter,
+}
+
+/// What the whole screen is showing: the list with its detail pane, or one
+/// worktree's log full screen.
+pub enum View {
+    List,
+    Log(Box<LogView>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchMode {
+    Inactive,
+    Typing,
+    Active,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SearchState {
+    pub query: String,
+    /// Buffer indices of the lines that match, in order.
+    pub matches: Vec<usize>,
+    /// Which of those the viewer is sitting on.
+    pub cursor: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LogFilter {
+    #[default]
+    All,
+    WarnPlus,
+    ErrorOnly,
+}
+
+impl LogFilter {
+    pub fn cycle(self) -> Self {
+        match self {
+            LogFilter::All => LogFilter::WarnPlus,
+            LogFilter::WarnPlus => LogFilter::ErrorOnly,
+            LogFilter::ErrorOnly => LogFilter::All,
+        }
+    }
+
+    pub fn passes(self, level: LogLevel) -> bool {
+        match self {
+            LogFilter::All => true,
+            LogFilter::WarnPlus => level >= LogLevel::Warn,
+            LogFilter::ErrorOnly => level >= LogLevel::Error,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LogFilter::All => "all",
+            LogFilter::WarnPlus => "warn+",
+            LogFilter::ErrorOnly => "errors",
+        }
+    }
+}
+
+/// Pretty-print overlay for one log line (`J`). `lines` are pre-styled;
+/// `text` is the plain version `y` yanks.
+pub struct LineInspect {
+    pub lines: Vec<ratatui::text::Line<'static>>,
+    pub text: String,
+    pub scroll: usize,
+}
+
+/// One worktree's log, open full screen.
+pub struct LogView {
+    pub name: String,
+    /// Which log is on screen. A plain string, not an enum: a source is a
+    /// process, a hook, or later a tunnel, and pando learns the set from
+    /// the files that are there.
+    pub source: String,
+    /// Every source this worktree has a file for, in tab order. Rebuilt
+    /// from disk each time the tab bar is drawn, so a hook that ran once
+    /// appears and a source that never existed does not.
+    pub available: Vec<String>,
+    pub tail: LogTail,
+    /// Viewport top, as a position in the *filtered* list.
+    pub scroll: usize,
+    /// The highlighted line, also a filtered position. The viewport follows
+    /// it; while `follow` is on it rides the tail.
+    pub cursor: usize,
+    pub follow: bool,
+    /// Lines the filter shows that arrived below the viewport while it was
+    /// scrolled up. Cleared by any jump back to the live tail.
+    pub new_below: usize,
+    pub count_prefix: Option<usize>,
+    pub search_mode: SearchMode,
+    pub search: SearchState,
+    /// The file was not there when the viewer opened.
+    pub missing: bool,
+    pub log_filter: LogFilter,
+    /// Collapse to the lines matching the search, grep-style (`&`).
+    pub filter_to_matches: bool,
+    /// When false (`w`), long lines truncate to one row instead of
+    /// wrapping, so one noisy dump cannot fill the screen.
+    pub wrap: bool,
+}
+
+impl LogView {
+    fn new(name: String, source: String, available: Vec<String>, path: std::path::PathBuf) -> Self {
+        let missing = !path.exists();
+        let mut tail = LogTail::new(path, LOG_VIEWER_CAPACITY);
+        if !missing {
+            tail.poll().ok();
+        }
+        Self {
+            name,
+            source,
+            available,
+            tail,
+            // usize::MAX is "the bottom", clamped by the first paint: the
+            // viewer opens on the newest line, following.
+            scroll: usize::MAX,
+            cursor: usize::MAX,
+            follow: !missing,
+            new_below: 0,
+            count_prefix: None,
+            search_mode: SearchMode::Inactive,
+            search: SearchState::default(),
+            missing,
+            log_filter: LogFilter::All,
+            filter_to_matches: false,
+            wrap: true,
+        }
+    }
+
+    /// Whether `filter_to_matches` is actually collapsing anything: an
+    /// empty query would otherwise hide every line.
+    pub fn collapsed(&self) -> bool {
+        self.filter_to_matches && !self.search.query.is_empty()
+    }
+
+    /// Buffer indices of the lines the viewer is currently showing.
+    pub fn visible(&self) -> Vec<usize> {
+        let query = self.search.query.to_lowercase();
+        let collapse = self.collapsed();
+        self.tail
+            .lines()
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| {
+                self.log_filter.passes(p.level) && (!collapse || p.plain_lower.contains(&query))
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// How many lines the viewer is showing.
+    pub fn visible_len(&self) -> usize {
+        if self.collapsed() {
+            return self.visible().len();
+        }
+        self.tail
+            .lines()
+            .iter()
+            .filter(|p| self.log_filter.passes(p.level))
+            .count()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -315,10 +480,18 @@ pub struct App {
     /// index into its process list. Clamped on every read, because the
     /// list changes under it as processes start and stop.
     pub tail_index: usize,
-    /// Whether the detail pane's tail has the arrow keys.
-    pub tail_focus: bool,
     /// Lines scrolled back from the end of the tail.
     pub tail_scroll: usize,
+    /// How many rows the detail pane last gave the tail, so PgUp/PgDn move
+    /// by a screenful of whatever is actually on screen.
+    pub tail_rows: usize,
+    /// The list, or one worktree's log full screen.
+    pub view: View,
+    /// The pretty-print overlay for one line of the open log (`J`).
+    pub inspect: Option<LineInspect>,
+    /// Rows the viewer's body last had. Set by the paint, read by the key
+    /// handler, so a half-page is half of what is really on screen.
+    pub viewer_height: usize,
     /// The last ownership warning shown, so a standing one is reported when
     /// it appears or changes rather than on every refresh.
     pub state_warning: Option<String>,
@@ -359,8 +532,11 @@ impl App {
             refreshing: false,
             log_tails: LogTails::default(),
             tail_index: 0,
-            tail_focus: false,
             tail_scroll: 0,
+            tail_rows: 0,
+            view: View::List,
+            inspect: None,
+            viewer_height: 0,
             state_warning: None,
             prs: HashMap::new(),
             list_state: ListState::default(),
@@ -404,7 +580,7 @@ impl App {
                 self.tick = self.tick.wrapping_add(1);
                 let spinning = self.pending.is_some();
                 self.poll_pending();
-                let grew = self.poll_log_tail();
+                let grew = self.poll_logs();
                 if self.tick.is_multiple_of(SLOW_TICK_EVERY) {
                     self.spawn_discovery();
                 } else if self.tick.is_multiple_of(REFRESH_EVERY) {
@@ -545,6 +721,13 @@ impl App {
             }
             None => {}
         }
+        // The viewer owns the whole screen and the whole keyboard, so it
+        // comes before the list's keys — but after the modals, because a
+        // worker can still raise a question while it is open.
+        if matches!(self.view, View::Log(_)) {
+            self.handle_log_key(key);
+            return;
+        }
         if self.mode == Mode::Filter {
             self.handle_filter_key(key);
             return;
@@ -565,7 +748,10 @@ impl App {
             KeyCode::Char('x') => self.stop_selected(),
             KeyCode::Char('r') => self.restart_selected(),
             KeyCode::Char('o') => self.open_selected_url(),
-            KeyCode::Char('l') => self.toggle_tail_focus(),
+            KeyCode::Char('l') | KeyCode::Char('L') => self.open_log_viewer(),
+            // PgUp is older, PgDn is newer — j/k stay on the list.
+            KeyCode::PageUp => self.scroll_tail(-(self.tail_rows.max(1) as isize)),
+            KeyCode::PageDown => self.scroll_tail(self.tail_rows.max(1) as isize),
             KeyCode::Tab => self.cycle_tail(),
             KeyCode::Char('R') => {
                 self.spawn_discovery();
@@ -876,15 +1062,229 @@ impl App {
         self.opened = Some(url.to_string());
     }
 
-    fn toggle_tail_focus(&mut self) {
-        if self.selected_worktree().is_none() {
-            self.set_error("nothing selected");
+    // ---- the log viewer --------------------------------------------------
+
+    /// Every log source a worktree has, in tab order: its processes first,
+    /// then its hooks, then whatever else is in the directory.
+    ///
+    /// The set comes from the files that are there, not from an enum —
+    /// pando cannot know in advance what a project calls its processes. The
+    /// order comes from config, so the tabs read the way `pando status`
+    /// lists them rather than the way the filesystem happens to.
+    pub fn log_sources(&self, name: &str) -> Vec<String> {
+        let mut present: Vec<String> = match std::fs::read_dir(self.paths.logs_dir(name)) {
+            Ok(entries) => entries
+                .filter_map(|entry| entry.ok())
+                .filter_map(|entry| {
+                    let file = entry.file_name().to_string_lossy().into_owned();
+                    file.strip_suffix(".log").map(str::to_string)
+                })
+                .filter(|source| !source.is_empty() && !source.starts_with('.'))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        present.sort();
+        present.dedup();
+        let mut ordered = Vec::new();
+        for known in self.known_sources() {
+            if let Some(at) = present.iter().position(|p| *p == known) {
+                ordered.push(present.remove(at));
+            }
+        }
+        // Anything else the directory holds — `tunnel`, `proxy`, a process
+        // that has since been renamed — alphabetically, after the rest.
+        ordered.extend(present);
+        ordered
+    }
+
+    /// The sources config accounts for, in the order they belong in:
+    /// processes, then hooks (pando's own install hook first).
+    fn known_sources(&self) -> Vec<String> {
+        let mut known: Vec<String> = self.config.processes.keys().cloned().collect();
+        known.push(actions::INSTALL_HOOK.to_string());
+        known.extend(self.config.hooks.iter().map(|hook| hook.name.clone()));
+        known
+    }
+
+    pub fn log_view(&self) -> Option<&LogView> {
+        match &self.view {
+            View::Log(view) => Some(view),
+            View::List => None,
+        }
+    }
+
+    pub fn log_view_mut(&mut self) -> Option<&mut LogView> {
+        match &mut self.view {
+            View::Log(view) => Some(view),
+            View::List => None,
+        }
+    }
+
+    /// Opens the viewer on the selected worktree. It starts on the source
+    /// the detail pane's tail was already showing, when that one has a log
+    /// — pressing `l` while reading the api's tail should not land on the
+    /// web server's.
+    pub fn open_log_viewer(&mut self) {
+        let Some(name) = self.selected_name() else {
+            return;
+        };
+        let available = self.log_sources(&name);
+        let tailed = self.tail_target().map(|(_, process, _)| process);
+        let source = tailed
+            .clone()
+            .filter(|process| available.contains(process))
+            .or_else(|| available.first().cloned())
+            .or(tailed)
+            .unwrap_or_else(|| crate::detect::DEV.to_string());
+        self.open_log_source(name, source, available);
+    }
+
+    fn open_log_source(&mut self, name: String, source: String, available: Vec<String>) {
+        let path = self.paths.log_file(&name, &source);
+        self.inspect = None;
+        self.view = View::Log(Box::new(LogView::new(name, source, available, path)));
+    }
+
+    pub fn close_log_viewer(&mut self) {
+        self.inspect = None;
+        self.view = View::List;
+    }
+
+    /// Next (or previous) tab. The list is the one the last paint read off
+    /// disk, so no key handler goes to the filesystem.
+    fn switch_log_source(&mut self, delta: isize) {
+        let Some(view) = self.log_view() else { return };
+        if view.available.len() < 2 {
             return;
         }
-        self.tail_focus = !self.tail_focus;
-        self.tail_scroll = 0;
-        if self.tail_focus {
-            self.set_status("log: j/k scroll, l or esc to leave");
+        let at = view
+            .available
+            .iter()
+            .position(|source| *source == view.source)
+            .unwrap_or(0);
+        let next = (at as isize + delta).rem_euclid(view.available.len() as isize) as usize;
+        let source = view.available[next].clone();
+        let name = view.name.clone();
+        let available = view.available.clone();
+        self.open_log_source(name, source, available);
+    }
+
+    /// Every key the viewer answers to. Pure state: nothing here forks, and
+    /// nothing here reads the filesystem — the tab list was read by the
+    /// last paint and the tail is polled on the tick.
+    fn handle_log_key(&mut self, key: KeyEvent) {
+        let page = self.viewer_height.max(1) / 2;
+        let viewer_height = self.viewer_height;
+
+        // A digit builds a count prefix and does nothing else. A leading
+        // zero is not a count, so `0` stays free.
+        if let KeyCode::Char(c @ '0'..='9') = key.code {
+            if let Some(view) = self.log_view_mut() {
+                let digit = c as usize - '0' as usize;
+                if digit > 0 || view.count_prefix.is_some() {
+                    let current = view.count_prefix.unwrap_or(0);
+                    view.count_prefix = Some((current * 10 + digit).min(99_999));
+                }
+            }
+            return;
+        }
+        let (has_count, count) = match self.log_view_mut() {
+            Some(view) => {
+                let taken = view.count_prefix.take();
+                (taken.is_some(), taken.unwrap_or(1))
+            }
+            None => return,
+        };
+
+        // Keys that act on the app rather than on the viewport.
+        match key.code {
+            KeyCode::Char('?') => {
+                self.help_scroll = 0;
+                self.modal = Some(Modal::Help);
+                return;
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.close_log_viewer();
+                return;
+            }
+            KeyCode::Tab => {
+                self.switch_log_source(1);
+                return;
+            }
+            KeyCode::BackTab => {
+                self.switch_log_source(-1);
+                return;
+            }
+            _ => {}
+        }
+
+        let Some(view) = self.log_view_mut() else {
+            return;
+        };
+        // The visible list may have shrunk under the cursor since the last
+        // paint — a filter change, a truncation, an eviction — so clamp
+        // before moving rather than after.
+        let visible_len = view.visible_len();
+        let last_rank = visible_len.saturating_sub(1);
+        let max_scroll = visible_len.saturating_sub(viewer_height.max(1));
+        view.scroll = view.scroll.min(max_scroll);
+        if !view.follow {
+            view.cursor = view.cursor.min(last_rank);
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !view.follow {
+                    view.cursor = view.cursor.saturating_add(count).min(last_rank);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if view.follow {
+                    // Breaking follow puts the cursor where it visibly was:
+                    // on the last line, moving up from there.
+                    view.follow = false;
+                    view.cursor = last_rank.saturating_sub(count);
+                } else {
+                    view.cursor = view.cursor.saturating_sub(count);
+                }
+            }
+            KeyCode::Char('d') if ctrl => {
+                if !view.follow {
+                    view.cursor = view.cursor.saturating_add(count * page).min(last_rank);
+                }
+            }
+            KeyCode::Char('u') if ctrl => {
+                if view.follow {
+                    view.follow = false;
+                    view.cursor = last_rank.saturating_sub(count * page);
+                } else {
+                    view.cursor = view.cursor.saturating_sub(count * page);
+                }
+            }
+            KeyCode::Char('g') | KeyCode::Home => {
+                view.cursor = 0;
+                view.scroll = 0;
+                view.follow = false;
+            }
+            KeyCode::Char('G') => {
+                if has_count {
+                    // `<n>G` is vim's "go to line n", one-based.
+                    view.cursor = count.saturating_sub(1).min(last_rank);
+                    view.scroll = view.cursor;
+                    view.follow = false;
+                } else {
+                    view.follow = true;
+                    view.new_below = 0;
+                }
+            }
+            // An alias of bare G, because the list binds End to "last".
+            KeyCode::End => {
+                view.follow = true;
+                view.new_below = 0;
+            }
+            KeyCode::Char('w') => view.wrap = !view.wrap,
+            _ => {}
         }
     }
 
@@ -899,13 +1299,73 @@ impl App {
         self.tail_scroll = next.clamp(0, max as isize) as usize;
     }
 
-    /// Reads whatever the selected worktree's log has grown by. Cheap: an
-    /// offset-based read of one file, nothing forked.
-    fn poll_log_tail(&mut self) -> bool {
+    /// Reads whatever the log on screen has grown by — the viewer's when it
+    /// is open, the detail pane's otherwise. Cheap: an offset-based read of
+    /// one file, nothing forked.
+    fn poll_logs(&mut self) -> bool {
+        if self.log_view().is_some() {
+            return self.poll_viewer();
+        }
         let Some((key, _, path)) = self.tail_target() else {
             return false;
         };
         self.log_tails.touch(&key, path).poll().unwrap_or(false)
+    }
+
+    /// Polls the open viewer's tail and keeps the viewport honest about
+    /// what the ring buffer did: eviction shifts every absolute index down,
+    /// and lines arriving below a scrolled-back viewport are what the
+    /// `↓ N new` badge counts.
+    fn poll_viewer(&mut self) -> bool {
+        let Some(view) = self.log_view_mut() else {
+            return false;
+        };
+        if view.missing {
+            return false;
+        }
+        let before = view.tail.lines().len();
+        let grew = view.tail.poll().unwrap_or(false);
+        let evicted: Vec<LogLevel> = view.tail.evicted_levels().to_vec();
+        if !evicted.is_empty() {
+            let count = evicted.len();
+            // Absolute buffer indices all shift down by `count`.
+            view.search.matches.retain_mut(|at| {
+                if *at < count {
+                    false
+                } else {
+                    *at -= count;
+                    true
+                }
+            });
+            if view.search.cursor >= view.search.matches.len() {
+                view.search.cursor = view.search.matches.len().saturating_sub(1);
+            }
+            // `scroll` and `cursor` are positions in the *filtered* list,
+            // so only the evicted lines the filter was showing move them.
+            // While following, the paint re-pins them anyway.
+            if !view.follow {
+                let visible_evicted = evicted
+                    .iter()
+                    .filter(|level| view.log_filter.passes(**level))
+                    .count();
+                view.scroll = view.scroll.saturating_sub(visible_evicted);
+                view.cursor = view.cursor.saturating_sub(visible_evicted);
+            }
+        }
+        if view.follow {
+            view.scroll = usize::MAX;
+        } else if grew {
+            let added = view.tail.lines().len() + evicted.len() - before;
+            view.new_below += view
+                .tail
+                .lines()
+                .iter()
+                .rev()
+                .take(added)
+                .filter(|parsed| view.log_filter.passes(parsed.level))
+                .count();
+        }
+        grew
     }
 
     // ---- background work -------------------------------------------------
@@ -1021,10 +1481,6 @@ impl App {
         // the next one's log rather than wherever the last one was
         // scrolled — and at that worktree's first process, not at whatever
         // index the last one happened to be showing.
-        if self.tail_focus {
-            self.scroll_tail(delta);
-            return;
-        }
         self.tail_scroll = 0;
         self.tail_index = 0;
         if self.filtered_indices.is_empty() {
@@ -1468,8 +1924,11 @@ impl App {
             refreshing: false,
             log_tails: LogTails::default(),
             tail_index: 0,
-            tail_focus: false,
             tail_scroll: 0,
+            tail_rows: 0,
+            view: View::List,
+            inspect: None,
+            viewer_height: 0,
             state_warning: None,
             prs: HashMap::new(),
             list_state: ListState::default(),
@@ -2461,18 +2920,24 @@ pub mod tests {
         assert!(tails.get("keep").is_some());
     }
 
+    // `l` used to focus the inline tail so j/k scrolled it; it opens the
+    // full viewer now, and the page keys scroll the tail in place — which
+    // is the origin tool's own binding, and leaves j/k on the list.
     #[test]
-    fn focusing_the_log_moves_the_arrow_keys_onto_it() {
-        let mut app = test_app(&["feat+one", "feat+two"]);
-        press(&mut app, KeyCode::Char('l'));
-        assert!(app.tail_focus);
-        let before = app.list_state.selected();
-        press(&mut app, KeyCode::Char('j'));
-        assert_eq!(app.list_state.selected(), before, "the cursor stays put");
-        press(&mut app, KeyCode::Char('l'));
-        assert!(!app.tail_focus);
-        press(&mut app, KeyCode::Char('j'));
-        assert_ne!(app.list_state.selected(), before);
+    fn the_page_keys_scroll_the_inline_tail_without_moving_the_list() {
+        let (_dir, mut app) = app_with_logs(&["feat+one", "feat+two"]);
+        let lines: Vec<String> = (0..40).map(|i| format!("line {i}")).collect();
+        write_log(&app, "feat+one", "dev", &lines);
+        tail_the_log(&mut app, "feat+one", "dev");
+        app.tail_rows = 10;
+        app.handle_event(AppEvent::Tick);
+
+        let row = app.list_state.selected();
+        press(&mut app, KeyCode::PageUp);
+        assert_eq!(app.tail_scroll, 10, "a page back through the tail");
+        assert_eq!(app.list_state.selected(), row, "the list cursor stays put");
+        press(&mut app, KeyCode::PageDown);
+        assert_eq!(app.tail_scroll, 0, "and a page forward returns to the end");
     }
 
     #[test]
@@ -2481,5 +2946,315 @@ pub mod tests {
         app.tail_scroll = 12;
         press(&mut app, KeyCode::Char('j'));
         assert_eq!(app.tail_scroll, 0);
+    }
+
+    // ---- the log viewer --------------------------------------------------
+
+    /// An app whose home is a real (temporary) directory, so the log files
+    /// the viewer reads are real files.
+    pub fn app_with_logs(names: &[&str]) -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = PandoPaths::new(
+            dir.path().join("home"),
+            ProjectRef {
+                id: "acme-shop-3f9a2c1d".into(),
+                root: dir.path().join("acme-shop"),
+                display_name: "acme-shop".into(),
+            },
+        );
+        let worktrees: Vec<Worktree> = names.iter().map(|n| wt(n)).collect();
+        // Every project that has a dev log has a dev process configured;
+        // tab order is read off config, so the fixture carries one.
+        let mut config = Config::default();
+        config
+            .processes
+            .insert("dev".to_string(), crate::config::ProcessConfig::default());
+        let mut app = App::new_for_test(paths, config, worktrees);
+        app.created_by_pando = names.iter().map(|n| (n.to_string(), true)).collect();
+        (dir, app)
+    }
+
+    pub fn write_log<S: AsRef<str>>(app: &App, worktree: &str, source: &str, lines: &[S]) {
+        let path = app.paths.log_file(worktree, source);
+        std::fs::create_dir_all(path.parent().expect("a log has a directory")).unwrap();
+        let body: String = lines
+            .iter()
+            .map(|line| format!("{}\n", line.as_ref()))
+            .collect();
+        std::fs::write(path, body).unwrap();
+    }
+
+    /// Points the detail pane's tail at a log that really exists.
+    fn tail_the_log(app: &mut App, worktree: &str, source: &str) {
+        let path = app.paths.log_file(worktree, source);
+        if !app.state.worktrees.contains_key(worktree) {
+            with_process(app, worktree, running_phase());
+        }
+        let record = app
+            .state
+            .worktrees
+            .get_mut(worktree)
+            .expect("the worktree has a record");
+        let process = record
+            .processes
+            .remove("dev")
+            .expect("with_process left a dev record");
+        record.processes.insert(
+            source.to_string(),
+            ProcessRecord {
+                log_path: path,
+                ..process
+            },
+        );
+    }
+
+    /// Opens the viewer the way a key press would, then paints once so the
+    /// tab list and the viewport are what the first frame decided.
+    fn open_viewer(app: &mut App, width: u16, height: u16) {
+        press(app, KeyCode::Char('l'));
+        paint(app, width, height);
+    }
+
+    fn paint(app: &mut App, width: u16, height: u16) {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|f| crate::tui::render::render(f, app))
+            .unwrap();
+    }
+
+    fn viewer(app: &App) -> &LogView {
+        app.log_view().expect("the viewer is open")
+    }
+
+    #[test]
+    fn l_opens_the_viewer_on_the_selected_worktree_and_q_returns_to_the_list() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["listening on 17342"]);
+        open_viewer(&mut app, 80, 20);
+        assert_eq!(viewer(&app).name, "feat+one");
+        assert_eq!(viewer(&app).source, "dev");
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.log_view().is_none(), "q goes back to the list");
+        assert!(!app.should_quit, "and does not quit pando");
+    }
+
+    #[test]
+    fn a_worktree_with_two_logs_gets_two_tabs_and_one_with_one_gets_one() {
+        let (_dir, mut app) = app_with_logs(&["feat+one", "feat+two"]);
+        write_log(&app, "feat+one", "dev", &["up"]);
+        write_log(&app, "feat+one", "install", &["installed"]);
+        write_log(&app, "feat+two", "dev", &["up"]);
+
+        open_viewer(&mut app, 80, 20);
+        assert_eq!(viewer(&app).available, vec!["dev", "install"]);
+
+        press(&mut app, KeyCode::Char('q'));
+        press(&mut app, KeyCode::Char('j'));
+        open_viewer(&mut app, 80, 20);
+        assert_eq!(viewer(&app).available, vec!["dev"]);
+    }
+
+    #[test]
+    fn a_source_that_appears_later_gets_a_tab_on_the_next_draw() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["up"]);
+        open_viewer(&mut app, 80, 20);
+        assert_eq!(viewer(&app).available, vec!["dev"]);
+
+        write_log(&app, "feat+one", "migrate", &["done"]);
+        paint(&mut app, 80, 20);
+        assert_eq!(
+            viewer(&app).available,
+            vec!["dev", "migrate"],
+            "the tab bar is rebuilt from the files that are there"
+        );
+    }
+
+    #[test]
+    fn tabs_run_processes_first_then_hooks_then_whatever_is_left() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        app.config
+            .processes
+            .insert("web".to_string(), crate::config::ProcessConfig::default());
+        app.config
+            .processes
+            .insert("api".to_string(), crate::config::ProcessConfig::default());
+        app.config.hooks.push(crate::config::HookConfig {
+            name: "migrate".to_string(),
+            after: crate::config::HookPoint::Services,
+            fingerprint: Vec::new(),
+            cmd: "true".to_string(),
+            cwd: None,
+            fallback: None,
+        });
+        for source in ["tunnel", "migrate", "install", "web", "api"] {
+            write_log(&app, "feat+one", source, &["x"]);
+        }
+        open_viewer(&mut app, 80, 20);
+        assert_eq!(
+            viewer(&app).available,
+            vec!["api", "web", "install", "migrate", "tunnel"],
+            "processes, then hooks, then the rest"
+        );
+    }
+
+    #[test]
+    fn the_viewer_opens_on_the_source_the_detail_tail_was_showing() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "api", &["api up"]);
+        write_log(&app, "feat+one", "dev", &["dev up"]);
+        tail_the_log(&mut app, "feat+one", "api");
+        open_viewer(&mut app, 80, 20);
+        assert_eq!(
+            viewer(&app).source,
+            "api",
+            "pressing l while reading the api's tail must not land on dev"
+        );
+    }
+
+    #[test]
+    fn tab_cycles_the_source_and_shift_tab_goes_back() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["dev up"]);
+        write_log(&app, "feat+one", "install", &["installed"]);
+        open_viewer(&mut app, 80, 20);
+        assert_eq!(viewer(&app).source, "dev");
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(viewer(&app).source, "install");
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(viewer(&app).source, "dev", "and it wraps");
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(viewer(&app).source, "install");
+    }
+
+    #[test]
+    fn tab_does_nothing_when_there_is_only_one_source() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["dev up"]);
+        open_viewer(&mut app, 80, 20);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(viewer(&app).source, "dev");
+    }
+
+    #[test]
+    fn a_worktree_with_no_log_yet_opens_a_viewer_that_says_so() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        open_viewer(&mut app, 80, 20);
+        let view = viewer(&app);
+        assert!(view.missing);
+        assert!(view.available.is_empty());
+        assert!(!view.follow, "nothing to follow");
+    }
+
+    #[test]
+    fn the_cursor_moves_by_a_count_and_never_leaves_the_log() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        let lines: Vec<String> = (0..20).map(|i| format!("line {i}")).collect();
+        write_log(&app, "feat+one", "dev", &lines);
+        open_viewer(&mut app, 80, 12);
+        assert!(viewer(&app).follow, "the viewer opens on the live tail");
+
+        press(&mut app, KeyCode::Char('k'));
+        assert!(!viewer(&app).follow, "k breaks follow");
+        assert_eq!(viewer(&app).cursor, 18);
+
+        type_str(&mut app, "5");
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(viewer(&app).cursor, 13, "a count repeats the motion");
+        assert_eq!(viewer(&app).count_prefix, None, "and is consumed");
+
+        type_str(&mut app, "99");
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(viewer(&app).cursor, 19, "clamped at the last line");
+        type_str(&mut app, "99");
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(viewer(&app).cursor, 0, "and at the first");
+    }
+
+    #[test]
+    fn g_goes_to_the_top_capital_g_follows_and_a_count_jumps_to_a_line() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        let lines: Vec<String> = (0..20).map(|i| format!("line {i}")).collect();
+        write_log(&app, "feat+one", "dev", &lines);
+        open_viewer(&mut app, 80, 12);
+
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(viewer(&app).cursor, 0);
+        assert!(!viewer(&app).follow);
+
+        type_str(&mut app, "7");
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(viewer(&app).cursor, 6, "<n>G is one-based");
+
+        press(&mut app, KeyCode::Char('G'));
+        assert!(viewer(&app).follow, "bare G returns to the live tail");
+    }
+
+    #[test]
+    fn the_half_page_keys_move_by_half_the_viewer() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        let lines: Vec<String> = (0..60).map(|i| format!("line {i}")).collect();
+        write_log(&app, "feat+one", "dev", &lines);
+        // 20 rows minus the border and the footer leaves 17 body rows.
+        open_viewer(&mut app, 80, 20);
+        let half = app.viewer_height / 2;
+        assert!(half > 1, "the body has room for a half page: {half}");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(viewer(&app).cursor, 59 - half);
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(viewer(&app).cursor, 59);
+    }
+
+    #[test]
+    fn motions_on_an_empty_and_a_one_line_log_stay_in_range() {
+        for lines in [vec![], vec!["only".to_string()]] {
+            let (_dir, mut app) = app_with_logs(&["feat+one"]);
+            write_log(&app, "feat+one", "dev", &lines);
+            open_viewer(&mut app, 80, 8);
+            for key in ['j', 'k', 'g', 'G', 'w'] {
+                type_str(&mut app, "9");
+                press(&mut app, KeyCode::Char(key));
+                paint(&mut app, 80, 8);
+            }
+            app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+            app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+            paint(&mut app, 80, 8);
+            assert!(viewer(&app).cursor <= lines.len().saturating_sub(1).max(0));
+        }
+    }
+
+    #[test]
+    fn w_toggles_wrap() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["x".repeat(400)]);
+        open_viewer(&mut app, 80, 12);
+        assert!(viewer(&app).wrap, "lines wrap by default");
+        press(&mut app, KeyCode::Char('w'));
+        assert!(!viewer(&app).wrap);
+        press(&mut app, KeyCode::Char('w'));
+        assert!(viewer(&app).wrap);
+    }
+
+    #[test]
+    fn the_viewer_polls_its_own_log_on_the_tick() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["one"]);
+        open_viewer(&mut app, 80, 12);
+        assert_eq!(viewer(&app).tail.lines().len(), 1);
+        write_log(&app, "feat+one", "dev", &["one", "two", "three"]);
+        app.handle_event(AppEvent::Tick);
+        assert_eq!(viewer(&app).tail.lines().len(), 3);
+    }
+
+    #[test]
+    fn the_viewer_keeps_ten_thousand_lines() {
+        assert_eq!(LOG_VIEWER_CAPACITY, 10_000);
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["one"]);
+        open_viewer(&mut app, 80, 12);
+        assert_eq!(viewer(&app).tail.capacity(), LOG_VIEWER_CAPACITY);
     }
 }

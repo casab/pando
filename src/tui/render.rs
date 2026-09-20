@@ -5,13 +5,15 @@
 //! width, and text truncates rather than clipping at a pane edge.
 
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, List, ListItem, Paragraph};
+use ratatui::widgets::{
+    Block, BorderType, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 
-use super::app::{App, Mode};
-use crate::log_tail::LogLevel;
+use super::app::{App, LogFilter, LogView, Mode};
+use crate::log_tail::{LogLevel, ParsedLine};
 use crate::state::{Aggregate, Phase, ProcessRecord};
 use crate::theme::{
     blue, border, cyan, green, highlight_bg, magenta, orange, red, surface, text, text_dim,
@@ -118,6 +120,16 @@ pub fn body_layout(body: Rect) -> [Rect; 2] {
 }
 
 pub fn render(f: &mut Frame, app: &mut App) {
+    // The viewer takes the whole screen: the header and footer it would
+    // share with the list are the two rows a long stack trace needs most.
+    if app.log_view().is_some() {
+        render_log_viewer(f, f.area(), app);
+        if let Some(modal) = &app.modal {
+            super::modal::render_modal(f, f.area(), modal, app);
+        }
+        return;
+    }
+
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Fill(1),
@@ -194,7 +206,11 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
             Style::new().fg(text_dim()),
         ))
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(if app.tail_focus { orange() } else { border() }));
+        .border_style(Style::new().fg(if app.tail_scroll > 0 {
+            orange()
+        } else {
+            border()
+        }));
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -322,7 +338,464 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
         lines.push(tail_header(app, &name, width));
         lines.extend(tail_lines(app, &name, tail_rows, width));
     }
+    // What the paint decided, so PgUp/PgDn move by a screenful of what is
+    // really there rather than a guess.
+    app.tail_rows = if show_tail { tail_rows } else { 0 };
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+// ---- the log viewer ------------------------------------------------------
+
+/// Key hints for the viewer's footer. The counters and the position badge
+/// claim their width first; these collapse into whatever is left.
+const LOG_HINTS: [(&str, &str, bool); 7] = [
+    ("j/k", "move", true),
+    ("g/G", "top/live", false),
+    ("/", "search", true),
+    ("f", "filter", false),
+    ("w", "wrap", false),
+    ("tab", "source", false),
+    ("q", "back", true),
+];
+
+/// One worktree's log, full screen: a tab per source, the lines the filter
+/// shows, and a footer that says where the cursor is.
+fn render_log_viewer(f: &mut Frame, area: Rect, app: &mut App) {
+    let status = app.active_status().map(|(m, e)| (m.to_string(), e));
+    let Some(view) = app.log_view() else { return };
+
+    let suffix = match app.phase_of(&view.name).map(|p| p.word()) {
+        _ if view.missing => " (no log yet)",
+        Some("running") => "",
+        Some(_) => " (not running)",
+        None => " (not running)",
+    };
+    let title = format!(" {} · {}{suffix} ", view.name, view.source);
+    let block = Block::bordered()
+        .title(Span::styled(
+            truncate(&title, area.width.saturating_sub(2) as usize),
+            Style::new().fg(text()).add_modifier(Modifier::BOLD),
+        ))
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(border()));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        app.viewer_height = 0;
+        return;
+    }
+
+    // The tab list is read here, every frame, so a hook that has just run
+    // gets a tab and one that never ran never does. It is a `read_dir` of
+    // pando's own log directory: no git, no network, nothing forked.
+    let sources = app.log_sources(&view.name);
+    let has_tabs = sources.len() > 1;
+    let (tab_area, content) = if has_tabs {
+        let [tabs, rest] =
+            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
+        (Some(tabs), rest)
+    } else {
+        (None, inner)
+    };
+    if let Some(tabs) = tab_area {
+        let strip = source_tabs(&sources, &view.source, tabs.width as usize);
+        f.render_widget(Paragraph::new(strip), tabs);
+    }
+
+    let [body_area, footer_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(content);
+    let body_height = body_area.height as usize;
+    let width = inner.width as usize;
+
+    let view = app.log_view().expect("still the viewer");
+    let visible = view.visible();
+    let visible_count = visible.len();
+    let (errors, warnings) = view
+        .tail
+        .lines()
+        .iter()
+        .fold((0usize, 0usize), |(e, w), parsed| match parsed.level {
+            LogLevel::Error => (e + 1, w),
+            LogLevel::Warn => (e, w + 1),
+            _ => (e, w),
+        });
+    let last_rank = visible_count.saturating_sub(1);
+    let cursor = if view.follow {
+        last_rank
+    } else {
+        view.cursor.min(last_rank)
+    };
+    let scroll = view
+        .scroll
+        .min(visible_count.saturating_sub(body_height.max(1)));
+
+    let (rendered, scroll_out) = viewer_rows(view, &visible, cursor, scroll, body_height, width);
+    f.render_widget(Paragraph::new(rendered), body_area);
+
+    if !view.missing && visible_count > body_height && body_height > 0 {
+        let mut state = ScrollbarState::new(visible_count)
+            .viewport_content_length(body_height)
+            .position(scroll_out);
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_symbol(None)
+                .thumb_style(Style::new().fg(border()).add_modifier(Modifier::BOLD)),
+            area.inner(Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut state,
+        );
+    }
+
+    let footer = viewer_footer(
+        view,
+        ViewerCounts {
+            visible: visible_count,
+            total: view.tail.lines().len(),
+            errors,
+            warnings,
+        },
+        cursor,
+        status,
+        has_tabs,
+        footer_area.width as usize,
+    );
+    f.render_widget(Paragraph::new(footer), footer_area);
+
+    // What the paint decided, so the next key press moves by what is on
+    // screen and `G`'s usize::MAX lands on a real line.
+    app.viewer_height = body_height;
+    if let Some(view) = app.log_view_mut() {
+        view.available = sources;
+        view.scroll = scroll_out;
+        view.cursor = cursor;
+        if !view.follow && visible_count > 0 && cursor == last_rank {
+            view.new_below = 0;
+        }
+    }
+}
+
+/// Counters the footer shows about the whole buffer, not the viewport.
+struct ViewerCounts {
+    visible: usize,
+    total: usize,
+    errors: usize,
+    warnings: usize,
+}
+
+/// The rows to paint and the viewport top they imply.
+///
+/// Two passes, because a wrapped line is several rows: walk forward from
+/// the scroll position while the cursor still fits, and fall back to
+/// anchoring the bottom of the window on the cursor (or on the tail, while
+/// following) when it does not.
+fn viewer_rows(
+    view: &LogView,
+    visible: &[usize],
+    cursor: usize,
+    scroll: usize,
+    body_height: usize,
+    width: usize,
+) -> (Vec<Line<'static>>, usize) {
+    if view.missing {
+        return (
+            vec![Line::styled(
+                truncate("  no log file for this source yet", width),
+                Style::new().fg(text_muted()),
+            )],
+            scroll,
+        );
+    }
+    let lines = view.tail.lines();
+    let body_height = body_height.max(1);
+    let last_rank = visible.len().saturating_sub(1);
+    let build = |rank: usize, at: usize| -> Vec<Line<'static>> {
+        let Some(parsed) = lines.get(at) else {
+            return Vec::new();
+        };
+        let at_cursor = rank == cursor;
+        // The cursor line always renders in full: with wrap off it is the
+        // one line that expands, so the line being read stays readable.
+        let rows = line_rows(parsed, width, view.wrap || at_cursor);
+        if at_cursor {
+            cursor_highlight_rows(rows, width)
+        } else {
+            rows
+        }
+    };
+
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut scroll_out = scroll;
+    let mut cursor_fits = false;
+    if !view.follow {
+        let start = scroll.min(cursor);
+        scroll_out = start;
+        for (rank, at) in visible.iter().copied().enumerate().skip(start) {
+            let built = build(rank, at);
+            if rank == cursor && rows.len() + built.len() <= body_height {
+                cursor_fits = true;
+            }
+            rows.extend(built);
+            if rows.len() >= body_height {
+                break;
+            }
+        }
+    }
+
+    if view.follow || !cursor_fits || rows.len() < body_height {
+        // Anchor the bottom of the window: on the tail while following, on
+        // the cursor when it fell below the forward window.
+        let anchor = if !view.follow && !cursor_fits {
+            cursor
+        } else {
+            last_rank
+        };
+        rows.clear();
+        let mut top = anchor;
+        for (rank, at) in visible.iter().copied().enumerate().take(anchor + 1).rev() {
+            let mut built = build(rank, at);
+            built.append(&mut rows);
+            rows = built;
+            top = rank;
+            if rows.len() >= body_height {
+                break;
+            }
+        }
+        scroll_out = top;
+        let start = rows.len().saturating_sub(body_height);
+        rows = rows.split_off(start);
+    } else {
+        rows.truncate(body_height);
+    }
+
+    // An empty body looks the same whether there is no output, the filter
+    // hid everything, or the paint is broken. Say which.
+    if rows.is_empty() {
+        let placeholder = if view.tail.lines().is_empty() {
+            "  waiting for output…".to_string()
+        } else {
+            format!(
+                "  nothing at level {} — press f to change the filter",
+                view.log_filter.label()
+            )
+        };
+        rows.push(Line::styled(
+            truncate(&placeholder, width),
+            Style::new().fg(text_muted()),
+        ));
+    }
+    (rows, scroll_out)
+}
+
+/// One log line as visual rows: wrapped to the width, or truncated to a
+/// single row when wrap is off.
+fn line_rows(parsed: &ParsedLine, width: usize, wrap: bool) -> Vec<Line<'static>> {
+    let line = parsed.styled.clone();
+    if wrap {
+        wrap_line_to_rows(line, width)
+    } else {
+        vec![truncate_line(line, width)]
+    }
+}
+
+/// Hard char-wrap a styled line into rows of at most `width` chars, keeping
+/// each span's style across the split. Always at least one row, so a blank
+/// line still occupies one.
+fn wrap_line_to_rows(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut col = 0usize;
+    for span in line.spans {
+        let style = span.style;
+        let mut buf = String::new();
+        for ch in span.content.chars() {
+            if col == width {
+                if !buf.is_empty() {
+                    current.push(Span::styled(std::mem::take(&mut buf), style));
+                }
+                rows.push(std::mem::take(&mut current));
+                col = 0;
+            }
+            buf.push(ch);
+            col += 1;
+        }
+        if !buf.is_empty() {
+            current.push(Span::styled(buf, style));
+        }
+    }
+    rows.push(current);
+    rows.into_iter().map(Line::from).collect()
+}
+
+/// Paints the cursor line: every span without a background of its own gets
+/// the highlight, and each row is padded to the full width so the bar spans
+/// the viewport the way the list's highlight does.
+fn cursor_highlight_rows(rows: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
+    rows.into_iter()
+        .map(|row| {
+            let mut used = 0usize;
+            let mut spans: Vec<Span<'static>> = row
+                .spans
+                .into_iter()
+                .map(|span| {
+                    used += span.content.chars().count();
+                    if span.style.bg.is_none() {
+                        let style = span.style.bg(highlight_bg());
+                        Span::styled(span.content, style)
+                    } else {
+                        span
+                    }
+                })
+                .collect();
+            if used < width {
+                spans.push(Span::styled(
+                    " ".repeat(width - used),
+                    Style::new().bg(highlight_bg()),
+                ));
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// The tab strip. When the labelled tabs do not fit, only the active one
+/// keeps its label so the rest do not slide off the edge.
+fn source_tabs(sources: &[String], active: &str, width: usize) -> Line<'static> {
+    let tabs = |labelled: bool| -> Vec<Span<'static>> {
+        sources
+            .iter()
+            .enumerate()
+            .flat_map(|(i, source)| {
+                let label = if labelled || source == active {
+                    format!(" {}:{source} ", i + 1)
+                } else {
+                    format!(" {} ", i + 1)
+                };
+                let style = if source == active {
+                    Style::new()
+                        .fg(blue())
+                        .add_modifier(Modifier::BOLD)
+                        .bg(highlight_bg())
+                } else {
+                    Style::new().fg(text_dim())
+                };
+                [Span::styled(label, style), Span::raw(" ")]
+            })
+            .collect()
+    };
+    let labelled = tabs(true);
+    let labelled_width: usize = labelled
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum();
+    if labelled_width <= width {
+        return Line::from(labelled);
+    }
+    truncate_line(Line::from(tabs(false)), width)
+}
+
+/// The viewer's one-row footer: hints or a confirmation on the left, the
+/// counters and the position badge pinned right.
+fn viewer_footer(
+    view: &LogView,
+    counts: ViewerCounts,
+    cursor: usize,
+    status: Option<(String, bool)>,
+    has_tabs: bool,
+    width: usize,
+) -> Line<'static> {
+    let (badge, badge_style) = if let Some(count) = view.count_prefix {
+        (
+            count.to_string(),
+            Style::new().fg(yellow()).add_modifier(Modifier::BOLD),
+        )
+    } else if view.follow {
+        (
+            "FOLLOW ●".to_string(),
+            Style::new().fg(green()).add_modifier(Modifier::BOLD),
+        )
+    } else if view.new_below > 0 {
+        (
+            format!("↓ {} new (G)", view.new_below),
+            Style::new().fg(orange()).add_modifier(Modifier::BOLD),
+        )
+    } else if counts.visible == 0 {
+        ("0/0".to_string(), Style::new().fg(text_dim()))
+    } else {
+        (
+            format!("{}/{}", cursor + 1, counts.visible),
+            Style::new().fg(text_dim()),
+        )
+    };
+
+    // Counters are state, not reminders: they claim their width before the
+    // hints do.
+    let mut tail: Vec<Span<'static>> = Vec::new();
+    if view.log_filter != LogFilter::All {
+        tail.push(Span::styled(
+            format!(
+                "  [{} · {}/{}]",
+                view.log_filter.label(),
+                counts.visible,
+                counts.total
+            ),
+            Style::new().fg(yellow()),
+        ));
+    }
+    if counts.errors > 0 {
+        tail.push(Span::styled(
+            format!("  {}E", counts.errors),
+            Style::new().fg(red()).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if counts.warnings > 0 {
+        tail.push(Span::styled(
+            format!(" {}W", counts.warnings),
+            Style::new().fg(yellow()),
+        ));
+    }
+
+    let badge_width = badge.chars().count();
+    let tail_width: usize = tail
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum::<usize>();
+    let hint_budget = width.saturating_sub(tail_width + badge_width + 1);
+    let mut spans = match &status {
+        Some((message, is_error)) => vec![Span::styled(
+            format!(" {}", truncate(message, hint_budget.saturating_sub(1))),
+            if *is_error {
+                Style::new().fg(red()).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(green()).add_modifier(Modifier::BOLD)
+            },
+        )],
+        None => log_hint_spans(has_tabs, hint_budget),
+    };
+    spans.extend(tail);
+
+    let used: usize = spans
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum::<usize>();
+    spans.push(Span::raw(
+        " ".repeat(width.saturating_sub(used + badge_width)),
+    ));
+    spans.push(Span::styled(badge, badge_style));
+    truncate_line(Line::from(spans), width)
+}
+
+fn log_hint_spans(has_tabs: bool, width: usize) -> Vec<Span<'static>> {
+    let shown: Vec<(&str, &str, bool)> = LOG_HINTS
+        .iter()
+        .filter(|(key, _, _)| has_tabs || *key != "tab")
+        .copied()
+        .collect();
+    truncate_line(hint_line(&shown, width), width).spans
 }
 
 fn status_row<'a>(app: &App, name: &str, width: usize) -> Line<'a> {
@@ -496,12 +969,12 @@ fn tail_header<'a>(app: &App, name: &str, width: usize) -> Line<'a> {
         Some((_, process, _)) if processes > 1 => format!(" log {process}"),
         _ => " log".to_string(),
     };
-    let hint = if app.tail_focus {
-        "  j/k scroll, l to leave"
+    let hint = if app.tail_scroll > 0 {
+        "  PgDn for newer, l to open"
     } else if processes > 1 {
-        "  l to scroll, tab to switch"
+        "  l to open, tab to switch"
     } else {
-        "  l to scroll"
+        "  l to open"
     };
     Line::from(vec![
         Span::styled(label.clone(), Style::new().fg(text_muted())),
@@ -841,11 +1314,12 @@ fn pr_color(pr: &PrInfo) -> ratatui::style::Color {
 }
 
 /// Key hints, most valuable first. The essential ones are never dropped.
-const HINTS: [(&str, &str, bool); 11] = [
+const HINTS: [(&str, &str, bool); 12] = [
     ("j/k", "move", true),
     ("s", "start", true),
     ("x", "stop", true),
     ("r", "restart", false),
+    ("l", "logs", true),
     ("tab", "log", false),
     ("o", "open", false),
     ("n", "new", false),
@@ -858,15 +1332,6 @@ const HINTS: [(&str, &str, bool); 11] = [
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     let width = area.width as usize;
     let line = match app.mode {
-        _ if app.tail_focus => hint_line(
-            &[
-                ("j/k", "scroll", true),
-                ("tab", "next process", false),
-                ("l", "leave the log", true),
-                ("q", "quit", true),
-            ],
-            width,
-        ),
         Mode::Filter => hint_line(
             &[
                 ("↑↓", "move", true),
@@ -1010,7 +1475,9 @@ pub fn truncate_line(line: Line<'static>, width: usize) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::app::tests::{running_phase, test_app, with_process, with_second_process, wt};
+    use crate::tui::app::tests::{
+        app_with_logs, running_phase, test_app, with_process, with_second_process, write_log, wt,
+    };
     use crate::tui::app::{BranchLoadState, Modal, RemoveBlocker};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -1072,7 +1539,6 @@ mod tests {
                 reason: "process exited".into(),
             },
         );
-        app.tail_focus = true;
 
         for width in 1..=120u16 {
             for height in [1u16, 2, 3, 5, 12, 40] {
@@ -1565,8 +2031,174 @@ mod tests {
         let rendered = text_of(&draw(&mut app, 120, 20));
         assert!(rendered.contains("s start"), "{rendered}");
         assert!(rendered.contains("x stop"), "{rendered}");
-        app.tail_focus = true;
-        let rendered = text_of(&draw(&mut app, 120, 20));
-        assert!(rendered.contains("scroll"), "{rendered}");
+        assert!(rendered.contains("l logs"), "{rendered}");
+    }
+
+    // ---- the log viewer --------------------------------------------------
+
+    /// Opens the viewer on the first worktree and paints one frame.
+    fn viewer_frame(app: &mut App, width: u16, height: u16) -> String {
+        app.open_log_viewer();
+        text_of(&draw(app, width, height))
+    }
+
+    #[test]
+    fn the_viewer_names_the_worktree_and_the_source_it_is_showing() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["listening on 17342"]);
+        let painted = viewer_frame(&mut app, 80, 14);
+        assert!(painted.contains("feat+one · dev"), "{painted}");
+        assert!(painted.contains("listening on 17342"), "{painted}");
+    }
+
+    #[test]
+    fn the_viewer_paints_a_tab_per_source_and_marks_the_active_one() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["up"]);
+        write_log(&app, "feat+one", "install", &["installed"]);
+        let painted = viewer_frame(&mut app, 80, 14);
+        assert!(painted.contains("1:dev"), "{painted}");
+        assert!(painted.contains("2:install"), "{painted}");
+    }
+
+    #[test]
+    fn a_single_source_gets_no_tab_bar_at_all() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["up"]);
+        let painted = viewer_frame(&mut app, 80, 14);
+        assert!(
+            !painted.contains("1:dev"),
+            "one source needs no tabs:\n{painted}"
+        );
+    }
+
+    #[test]
+    fn narrow_tabs_keep_the_active_label_and_shrink_the_rest_to_digits() {
+        let sources = vec![
+            "dev".to_string(),
+            "api".to_string(),
+            "install".to_string(),
+            "migrate".to_string(),
+        ];
+        let wide = source_tabs(&sources, "api", 80);
+        let wide_text: String = wide.spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(wide_text.contains("1:dev"), "{wide_text}");
+        assert!(wide_text.contains("4:migrate"), "{wide_text}");
+
+        let narrow = source_tabs(&sources, "api", 20);
+        let narrow_text: String = narrow.spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(
+            narrow_text.contains("2:api"),
+            "the active one keeps its label"
+        );
+        assert!(!narrow_text.contains("1:dev"), "{narrow_text}");
+        assert!(narrow_text.chars().count() <= 20, "{narrow_text}");
+    }
+
+    #[test]
+    fn the_footer_says_where_the_cursor_is() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        let lines: Vec<String> = (0..30).map(|i| format!("line {i}")).collect();
+        write_log(&app, "feat+one", "dev", &lines);
+        let painted = viewer_frame(&mut app, 80, 14);
+        assert!(
+            painted.contains("FOLLOW"),
+            "it opens on the live tail:\n{painted}"
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        let painted = text_of(&draw(&mut app, 80, 14));
+        assert!(
+            painted.contains("1/30"),
+            "one-based, out of what is shown:\n{painted}"
+        );
+    }
+
+    #[test]
+    fn a_missing_log_says_so_rather_than_painting_an_empty_pane() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        let painted = viewer_frame(&mut app, 80, 14);
+        assert!(painted.contains("no log file"), "{painted}");
+    }
+
+    #[test]
+    fn the_cursor_line_is_painted_across_the_whole_width() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["short", "also short"]);
+        app.open_log_viewer();
+        draw(&mut app, 40, 10);
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        let buffer = draw(&mut app, 40, 10);
+        // The first body row is the cursor line; every cell of it, padding
+        // included, carries the highlight.
+        let row = 1;
+        let painted: Vec<_> = (1..39)
+            .map(|x| buffer.cell((x, row)).unwrap().style().bg)
+            .collect();
+        assert!(
+            painted.iter().all(|bg| *bg == Some(highlight_bg())),
+            "the cursor bar spans the viewport: {painted:?}"
+        );
+    }
+
+    #[test]
+    fn a_line_longer_than_the_viewer_wraps_and_truncates_with_w() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(
+            &app,
+            "feat+one",
+            "dev",
+            &["a line".to_string(), "ab".repeat(60)],
+        );
+        app.open_log_viewer();
+        let wrapped = text_of(&draw(&mut app, 40, 14));
+        assert!(
+            wrapped.lines().filter(|row| row.contains("abab")).count() > 3,
+            "the long line wraps over several rows:\n{wrapped}"
+        );
+        // Wrap off, and the cursor on the *other* line: the cursor line
+        // always renders in full, so the long one is the one that cuts.
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        let truncated = text_of(&draw(&mut app, 40, 14));
+        assert!(truncated.contains('…'), "wrap off truncates:\n{truncated}");
+        assert_eq!(
+            truncated.lines().filter(|row| row.contains("abab")).count(),
+            1,
+            "to exactly one row:\n{truncated}"
+        );
+    }
+
+    #[test]
+    fn wrap_line_to_rows_never_returns_nothing() {
+        assert_eq!(wrap_line_to_rows(Line::raw(""), 10).len(), 1);
+        assert_eq!(wrap_line_to_rows(Line::raw("abcdef"), 2).len(), 3);
+        // A zero width would divide by nothing; it is clamped to one.
+        assert_eq!(wrap_line_to_rows(Line::raw("ab"), 0).len(), 2);
+    }
+
+    #[test]
+    fn wrap_keeps_every_span_style_across_the_split() {
+        let line = Line::from(vec![
+            Span::styled("aaaa", Style::new().fg(red())),
+            Span::styled("bbbb", Style::new().fg(green())),
+        ]);
+        let rows = wrap_line_to_rows(line, 3);
+        let flat: Vec<(String, Style)> = rows
+            .iter()
+            .flat_map(|r| r.spans.iter().map(|s| (s.content.to_string(), s.style)))
+            .collect();
+        assert_eq!(
+            flat.iter().map(|(c, _)| c.as_str()).collect::<String>(),
+            "aaaabbbb"
+        );
+        for (content, style) in &flat {
+            let want = if content.starts_with('a') {
+                red()
+            } else {
+                green()
+            };
+            assert_eq!(style.fg, Some(want), "{content}");
+        }
     }
 }

@@ -599,6 +599,13 @@ impl LogTail {
         &self.buffer
     }
 
+    /// How many lines this tail keeps before it starts evicting. The
+    /// detail pane's glance and the full viewer are two orders of
+    /// magnitude apart, so which one a tail is matters.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     /// Levels of lines evicted by the most recent `poll`, oldest first.
     pub fn evicted_levels(&self) -> &[LogLevel] {
         &self.evicted_levels

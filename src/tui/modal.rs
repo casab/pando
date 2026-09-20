@@ -35,7 +35,14 @@ pub fn render_modal(f: &mut Frame, area: Rect, modal: &Modal, app: &App) {
             custom,
             ..
         } => render_question(f, area, question, *selected, custom.as_deref()),
-        Modal::Help => render_help(f, area, app.help_scroll),
+        Modal::Help => {
+            let keys: &[(&str, &str)] = if app.log_view().is_some() {
+                &HELP_LOG
+            } else {
+                &HELP
+            };
+            render_help(f, area, app.help_scroll, keys)
+        }
     }
 }
 
@@ -332,7 +339,7 @@ fn render_remove(
 
 /// Every key the list view answers to. Scrollable, because a tmux split is
 /// often shorter than the keymap.
-const HELP: [(&str, &str); 17] = [
+const HELP: [(&str, &str); 18] = [
     ("j / ↓", "move down"),
     ("k / ↑", "move up"),
     ("g / G", "first / last"),
@@ -341,7 +348,8 @@ const HELP: [(&str, &str); 17] = [
     ("x", "stop it"),
     ("r", "restart it"),
     ("o", "open its URL"),
-    ("l", "scroll the log tail"),
+    ("l", "open the log viewer"),
+    ("PgUp/PgDn", "scroll the log tail"),
     ("tab", "switch the log to the next process"),
     ("n", "new worktree"),
     ("d", "remove the selected worktree"),
@@ -352,15 +360,30 @@ const HELP: [(&str, &str); 17] = [
     ("ctrl-c", "quit from anywhere"),
 ];
 
-fn render_help(f: &mut Frame, area: Rect, scroll: usize) {
-    let Some(inner) = popup(f, area, "keys", HELP.len() as u16 + 2, 50) else {
+/// And every key the log viewer answers to, shown instead of the list's
+/// while it is open.
+const HELP_LOG: [(&str, &str); 10] = [
+    ("j / k", "move the cursor down / up"),
+    ("ctrl-d/u", "half a page down / up"),
+    ("<n>j/k/G", "repeat n times, or jump to line n"),
+    ("g / G", "top / follow the live tail"),
+    ("w", "wrap long lines, or truncate them"),
+    ("tab", "next log source"),
+    ("S-tab", "previous log source"),
+    ("?", "this help"),
+    ("q / esc", "back to the list"),
+    ("ctrl-c", "quit from anywhere"),
+];
+
+fn render_help(f: &mut Frame, area: Rect, scroll: usize, keys: &[(&str, &str)]) {
+    let Some(inner) = popup(f, area, "keys", keys.len() as u16 + 2, 50) else {
         return;
     };
     let width = inner.width as usize;
     let visible = inner.height as usize;
-    let max_scroll = HELP.len().saturating_sub(visible);
+    let max_scroll = keys.len().saturating_sub(visible);
     let start = scroll.min(max_scroll);
-    let lines: Vec<Line> = HELP
+    let lines: Vec<Line> = keys
         .iter()
         .skip(start)
         .take(visible)
