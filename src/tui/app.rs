@@ -1614,6 +1614,9 @@ pub mod tests {
     pub fn with_process(app: &mut App, name: &str, phase: Phase) {
         let mut record = WorktreeRecord::new(format!("/trees/{name}"), true);
         record.ports.insert("web".to_string(), 17_342);
+        record
+            .roles
+            .insert("dev".to_string(), vec!["web".to_string()]);
         record.processes.insert(
             "dev".to_string(),
             ProcessRecord {
@@ -1623,6 +1626,7 @@ pub mod tests {
                 log_path: PathBuf::from("/does/not/exist/dev.log"),
                 ready_port: Some(17_342),
                 ready_timeout_s: None,
+                observed_ports: Vec::new(),
                 phase,
             },
         );
@@ -1638,6 +1642,9 @@ pub mod tests {
             .expect("the worktree has a record");
         let port = 17_343 + record.processes.len() as u16;
         record.ports.insert(process.to_string(), port);
+        record
+            .roles
+            .insert(process.to_string(), vec![process.to_string()]);
         record.processes.insert(
             process.to_string(),
             ProcessRecord {
@@ -1647,6 +1654,7 @@ pub mod tests {
                 log_path: PathBuf::from(format!("/does/not/exist/{process}.log")),
                 ready_port: Some(port),
                 ready_timeout_s: None,
+                observed_ports: Vec::new(),
                 phase,
             },
         );

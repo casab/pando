@@ -795,33 +795,55 @@ fn phase_reason(phase: &Phase) -> Option<String> {
     }
 }
 
-/// The URL a worktree serves on: what it is really listening on when that is
-/// known, falling back to the port pando assigned.
+/// The URL a worktree serves on: what the process that owns the role is
+/// really listening on when that is known, falling back to the port pando
+/// assigned it.
 fn worktree_url(record: &WorktreeRecord) -> Option<String> {
-    let assigned = record
-        .ports
-        .get("web")
-        .or_else(|| record.ports.values().next());
-    let port = match assigned {
-        Some(port) if record.observed_ports.contains(port) => *port,
-        // It was given a port and is listening somewhere else: a framework
-        // that ignores `PORT`, or one that picked the next free number. The
-        // URL follows what is really serving, not what pando asked for.
-        //
-        // But only a port no other role claims. With several processes,
-        // an observed port that is not this role's is usually just the
-        // *other* process's — and a worktree whose web server is stopped
-        // while its api keeps serving would otherwise hand out the api's
-        // URL as the worktree's.
-        Some(port) => record
-            .observed_ports
-            .iter()
-            .find(|observed| !record.ports.values().any(|role| role == *observed))
-            .copied()
-            .unwrap_or(*port),
-        None => *record.observed_ports.first()?,
+    let role = if record.ports.contains_key(crate::config::WEB_ROLE) {
+        crate::config::WEB_ROLE.to_string()
+    } else {
+        record.ports.keys().next()?.clone()
     };
-    Some(format!("http://localhost:{port}"))
+    let assigned = *record.ports.get(&role)?;
+    Some(format!(
+        "http://localhost:{}",
+        observed_port_for_role(record, &role).unwrap_or(assigned)
+    ))
+}
+
+/// The port the process that owns `role` is really listening on.
+///
+/// A framework that ignores `PORT`, or one that picked the next free
+/// number, is followed: the URL is what is really serving, not what pando
+/// asked for. But only within the owning process's own group. An observed
+/// port belongs to whichever group opened it, and with several processes a
+/// port nobody claimed is far more often the *other* process's HMR socket
+/// or debugger than this role's server — which is how a worktree whose web
+/// server was stopped handed out the api's second port as its URL.
+fn observed_port_for_role(record: &WorktreeRecord, role: &str) -> Option<u16> {
+    let assigned = *record.ports.get(role)?;
+    let owner = record
+        .roles
+        .iter()
+        .find(|(_, roles)| roles.iter().any(|owned| owned == role))
+        .map(|(process, _)| process)?;
+    let process = record.processes.get(owner)?;
+    // A process that is not up is not listening on anything, and what it
+    // was last seen holding says nothing about now.
+    if !matches!(
+        process.phase,
+        Phase::Starting { .. } | Phase::Running { .. }
+    ) {
+        return None;
+    }
+    if process.observed_ports.contains(&assigned) {
+        return Some(assigned);
+    }
+    process
+        .observed_ports
+        .iter()
+        .copied()
+        .find(|observed| !record.ports.values().any(|port| port == observed))
 }
 
 pub fn status_json<W: Write>(paths: &PandoPaths, only: Option<&str>, out: &mut W) -> Result<()> {
@@ -1297,6 +1319,7 @@ mod tests {
                 log_path: fx.paths.log_file(&name, "dev"),
                 ready_port: Some(17_342),
                 ready_timeout_s: None,
+                observed_ports: Vec::new(),
                 phase: Phase::Running { since: Utc::now() },
             },
         );
@@ -1324,34 +1347,134 @@ mod tests {
         assert!(text.contains(" -"), "{text}");
     }
 
+    /// A process record for a live group with the sockets it was seen
+    /// holding.
+    fn listening(pgid: i32, observed: &[u16]) -> crate::state::ProcessRecord {
+        crate::state::ProcessRecord {
+            pid: std::process::id(),
+            pgid,
+            started_at: Utc::now(),
+            log_path: PathBuf::from("/does/not/exist/dev.log"),
+            ready_port: None,
+            ready_timeout_s: None,
+            observed_ports: observed.to_vec(),
+            phase: Phase::Running { since: Utc::now() },
+        }
+    }
+
+    /// A worktree shaped like a one-process start: `dev` owning `web`.
+    fn one_process_record(observed: &[u16]) -> WorktreeRecord {
+        let mut record = WorktreeRecord::new("/trees/feat+one", true);
+        record.ports.insert("web".to_string(), 17_342);
+        record
+            .roles
+            .insert("dev".to_string(), vec!["web".to_string()]);
+        record
+            .processes
+            .insert("dev".to_string(), listening(101, observed));
+        record.observed_ports = observed.to_vec();
+        record
+    }
+
+    /// A worktree shaped like a two-process start: `web` and `api`, each
+    /// owning its own role and running in its own group.
+    fn two_process_record(web: &[u16], api: &[u16]) -> WorktreeRecord {
+        let mut record = WorktreeRecord::new("/trees/feat+one", true);
+        record.ports.insert("web".to_string(), 17_342);
+        record.ports.insert("api".to_string(), 17_343);
+        record
+            .roles
+            .insert("web".to_string(), vec!["web".to_string()]);
+        record
+            .roles
+            .insert("api".to_string(), vec!["api".to_string()]);
+        record
+            .processes
+            .insert("web".to_string(), listening(101, web));
+        record
+            .processes
+            .insert("api".to_string(), listening(102, api));
+        let mut union: Vec<u16> = web.iter().chain(api).copied().collect();
+        union.sort_unstable();
+        union.dedup();
+        record.observed_ports = union;
+        record
+    }
+
     // The documented behaviour — "what it is really listening on when that
     // is known" — was two identical match arms, so a framework that ignored
     // `PORT` and bound something else still had the assigned port printed
     // as its URL.
     #[test]
     fn the_url_prefers_a_port_the_process_is_really_listening_on() {
-        let mut record = WorktreeRecord::new("/trees/feat+one", true);
-        record.ports.insert("web".to_string(), 17_342);
-
-        record.observed_ports = vec![17_342, 17_399];
         assert_eq!(
-            worktree_url(&record).as_deref(),
+            worktree_url(&one_process_record(&[17_342, 17_399])).as_deref(),
             Some("http://localhost:17342"),
             "the assigned port is among them, so it is the one"
         );
-
-        record.observed_ports = vec![3_000];
         assert_eq!(
-            worktree_url(&record).as_deref(),
+            worktree_url(&one_process_record(&[3_000])).as_deref(),
             Some("http://localhost:3000"),
             "it ignored the port pando gave it; the URL follows the process"
         );
+        assert_eq!(
+            worktree_url(&one_process_record(&[])).as_deref(),
+            Some("http://localhost:17342"),
+            "nothing observed at all falls back to what was assigned"
+        );
+        // And nothing running at all: the port survives the stop, so the
+        // URL the developer bookmarked is still the one they get.
+        let mut record = one_process_record(&[3_000]);
+        record.processes.clear();
+        record.observed_ports.clear();
+        assert_eq!(
+            worktree_url(&record).as_deref(),
+            Some("http://localhost:17342")
+        );
+    }
 
-        record.observed_ports = vec![];
+    // Phase 2b review, finding 4. `f6093df` narrowed "prefer an observed
+    // port" to "prefer one no role claims", but the observed list was one
+    // flat set per worktree, so a socket the *api* opened — an HMR socket,
+    // `node --inspect`, a metrics port — was indistinguishable from one the
+    // web process opened, and became the worktree's URL while the web
+    // server was not serving at all.
+    #[test]
+    fn the_url_follows_a_listener_only_in_the_group_that_owns_the_role() {
+        assert_eq!(
+            worktree_url(&two_process_record(&[17_342], &[17_343])).as_deref(),
+            Some("http://localhost:17342"),
+            "both up, each on its own port"
+        );
+
+        assert_eq!(
+            worktree_url(&two_process_record(&[17_342], &[9876, 17_343])).as_deref(),
+            Some("http://localhost:17342"),
+            "the api's second socket is the api's, whatever claims it"
+        );
+
+        // The review's reproduction: the web process stopped, the api kept
+        // serving, and it holds a port no role claims.
+        let mut record = two_process_record(&[], &[9876, 17_343]);
+        record.processes.remove("web");
         assert_eq!(
             worktree_url(&record).as_deref(),
             Some("http://localhost:17342"),
-            "nothing observed at all falls back to what was assigned"
+            "the web role's own port, not whatever the api happens to hold"
+        );
+
+        // And a framework that ignored `PORT` is still followed, because
+        // there it is the process that owns the role doing the ignoring.
+        assert_eq!(
+            worktree_url(&two_process_record(&[3000], &[17_343])).as_deref(),
+            Some("http://localhost:3000"),
+            "the web process itself bound 3000"
+        );
+
+        // A port another role already has is never a candidate either.
+        assert_eq!(
+            worktree_url(&two_process_record(&[17_343], &[17_343])).as_deref(),
+            Some("http://localhost:17342")
         );
     }
 
@@ -1474,6 +1597,7 @@ mod tests {
                 log_path: fx.paths.log_file(&name, "dev"),
                 ready_port: Some(17_342),
                 ready_timeout_s: None,
+                observed_ports: Vec::new(),
                 phase: Phase::Running { since: Utc::now() },
             },
         );
@@ -1486,6 +1610,7 @@ mod tests {
                 log_path: fx.paths.log_file(&name, "worker"),
                 ready_port: None,
                 ready_timeout_s: None,
+                observed_ports: Vec::new(),
                 phase: Phase::Failed {
                     at: Utc::now(),
                     reason: "process exited".to_string(),
@@ -1576,6 +1701,7 @@ mod tests {
                 log_path: fx.paths.log_file(name, "web"),
                 ready_port: Some(17_342),
                 ready_timeout_s: None,
+                observed_ports: Vec::new(),
                 phase: Phase::Running { since: Utc::now() },
             },
         );
@@ -1588,42 +1714,19 @@ mod tests {
                 log_path: fx.paths.log_file(name, "api"),
                 ready_port: Some(17_343),
                 ready_timeout_s: None,
+                observed_ports: Vec::new(),
                 phase: api_phase,
             },
         );
         crate::state::save(&fx.paths.state_file(), &store).unwrap();
     }
 
-    #[test]
-    fn the_url_follows_a_listener_only_when_no_other_role_owns_that_port() {
-        let mut record = WorktreeRecord::new("/trees/feat+one", true);
-        record.ports.insert("web".to_string(), 17_342);
-        record.ports.insert("api".to_string(), 17_343);
-
-        // Both up: the web role's, as always.
-        record.observed_ports = vec![17_342, 17_343];
-        assert_eq!(
-            worktree_url(&record).as_deref(),
-            Some("http://localhost:17342")
-        );
-
-        // The web process stopped and the api kept serving. The api's port
-        // is not the worktree's URL.
-        record.observed_ports = vec![17_343];
-        assert_eq!(
-            worktree_url(&record).as_deref(),
-            Some("http://localhost:17342"),
-            "another process's port is not the web role's"
-        );
-
-        // A framework that ignored its port and bound something nobody
-        // claimed is still followed, which is what this rule is for.
-        record.observed_ports = vec![17_343, 3000];
-        assert_eq!(
-            worktree_url(&record).as_deref(),
-            Some("http://localhost:3000")
-        );
-    }
+    // `the_url_follows_a_listener_only_when_no_other_role_owns_that_port`
+    // lived here. It asserted that a port no role claims becomes the
+    // worktree's URL, which is the bug finding 4 reproduces: that port
+    // belongs to whichever group opened it.
+    // `the_url_follows_a_listener_only_in_the_group_that_owns_the_role`
+    // above is the rule it should have pinned.
 
     #[test]
     fn status_text_lists_every_process_under_its_worktree() {

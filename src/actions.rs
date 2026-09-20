@@ -941,6 +941,22 @@ pub fn start(
 
     let assignment = ports::assign_keeping(paths, &mut store, name, &roles, &keep)?;
 
+    // Which process owns which role, for the whole worktree and whatever
+    // `--only` asked for, recorded beside the ports themselves. The URL
+    // rule has to be answerable from the record alone — `status` and the
+    // TUI never see config — and it has to give the same answer after a
+    // stop as `start` gave, so this outlives the processes exactly as the
+    // ports do.
+    let owners: BTreeMap<String, Vec<String>> = config
+        .processes
+        .iter()
+        .map(|(process, config)| (process.clone(), config.roles()))
+        .filter(|(_, roles)| !roles.is_empty())
+        .collect();
+    if let Some(record) = store.worktrees.get_mut(name) {
+        record.roles = owners;
+    }
+
     let mut planned: Vec<Planned> = Vec::new();
     for (process_name, process) in &selection {
         if already.contains(process_name) {
@@ -1015,6 +1031,7 @@ pub fn start(
             log_path: plan.log_file,
             ready_port: plan.ready_port,
             ready_timeout_s: plan.ready_timeout_s,
+            observed_ports: Vec::new(),
             phase: Phase::Starting { since: now },
         };
         store
@@ -1639,40 +1656,61 @@ fn port_is_bound(scans: &BTreeMap<i32, Option<Vec<u16>>>, pgid: i32, port: u16) 
     }
 }
 
-/// Records the ports each live group is really listening on.
+/// Records the ports each live group is really listening on, per process.
 ///
 /// Configured ports are what pando asked for; these are what happened. A
 /// framework that ignores `PORT`, or one that opens a second socket for hot
 /// reload, shows up here and nowhere else.
+///
+/// Per process, because a worktree-wide list cannot say which group opened
+/// which socket: an `--inspect` port the api opened reads exactly like a
+/// port the web server opened, and the worktree's URL then follows it.
+/// The worktree's own list stays as the union of them, which is the shape
+/// `status --json` publishes.
 fn capture_observed_ports(
     store: &mut state::State,
     scans: &BTreeMap<i32, Option<Vec<u16>>>,
 ) -> bool {
     let mut changed = false;
     for record in store.worktrees.values_mut() {
-        let groups: Vec<i32> = record
-            .processes
-            .values()
-            .filter(|p| matches!(p.phase, Phase::Starting { .. } | Phase::Running { .. }))
-            .map(|p| p.pgid)
-            .collect();
-        let mut observed = Vec::new();
+        let mut union: Vec<u16> = Vec::new();
+        let mut groups = 0usize;
         let mut scanned = false;
-        for pgid in &groups {
-            if let Some(Some(ports)) = scans.get(pgid) {
-                scanned = true;
-                observed.extend(ports.iter().copied());
+        for proc in record.processes.values_mut() {
+            if !matches!(proc.phase, Phase::Starting { .. } | Phase::Running { .. }) {
+                // Not up, so listening on nothing: its last sighting went
+                // stale the moment it stopped.
+                if !proc.observed_ports.is_empty() {
+                    proc.observed_ports.clear();
+                    changed = true;
+                }
+                continue;
             }
+            groups += 1;
+            let Some(Some(ports)) = scans.get(&proc.pgid) else {
+                // This group could not be scanned: its last good answer
+                // stands rather than being cleared by a missing `lsof`.
+                union.extend(proc.observed_ports.iter().copied());
+                continue;
+            };
+            scanned = true;
+            let mut observed = ports.clone();
+            observed.sort_unstable();
+            observed.dedup();
+            if proc.observed_ports != observed {
+                proc.observed_ports = observed.clone();
+                changed = true;
+            }
+            union.extend(observed);
         }
-        observed.sort_unstable();
-        observed.dedup();
-        // A scan that could not run says nothing at all, so the last good
-        // answer stands rather than being cleared by a missing `lsof`.
-        if !groups.is_empty() && !scanned {
+        union.sort_unstable();
+        union.dedup();
+        // Nothing could be scanned at all, so there is nothing to say.
+        if groups > 0 && !scanned {
             continue;
         }
-        if record.observed_ports != observed {
-            record.observed_ports = observed;
+        if record.observed_ports != union {
+            record.observed_ports = union;
             changed = true;
         }
     }
@@ -3124,6 +3162,7 @@ time.sleep(300)
                 log_path: log,
                 ready_port: None,
                 ready_timeout_s: None,
+                observed_ports: Vec::new(),
                 phase: Phase::Running { since: Utc::now() },
             },
         );
@@ -3283,8 +3322,66 @@ time.sleep(300)
             log_path: PathBuf::from("/does/not/exist/dev.log"),
             ready_port: None,
             ready_timeout_s: None,
+            observed_ports: Vec::new(),
             phase: Phase::Running { since: Utc::now() },
         }
+    }
+
+    // Phase 2b review, finding 4. One flat list per worktree cannot say
+    // which group opened which socket, and the URL rule needs exactly that.
+    #[test]
+    fn observed_ports_are_recorded_per_process_and_the_worktrees_list_is_their_union() {
+        let mut store = state::State::new();
+        let mut record = WorktreeRecord::new("/trees/feat+one", true);
+        record.processes.insert("web".to_string(), fake_record(101));
+        record.processes.insert("api".to_string(), fake_record(102));
+        store.worktrees.insert("feat+one".to_string(), record);
+
+        let scans = BTreeMap::from([
+            (101, Some(vec![17_342])),
+            (102, Some(vec![17_343, 9876, 17_343])),
+        ]);
+        assert!(capture_observed_ports(&mut store, &scans));
+
+        let record = &store.worktrees["feat+one"];
+        assert_eq!(record.processes["web"].observed_ports, vec![17_342]);
+        assert_eq!(
+            record.processes["api"].observed_ports,
+            vec![9876, 17_343],
+            "sorted, and each port once"
+        );
+        assert_eq!(
+            record.observed_ports,
+            vec![9876, 17_342, 17_343],
+            "the worktree's own list is the union, which is what the JSON shape publishes"
+        );
+
+        // A scan that could not run says nothing at all: the last good
+        // answer stands rather than being cleared by a missing `lsof`.
+        let unscannable = BTreeMap::from([(101, None), (102, None)]);
+        assert!(!capture_observed_ports(&mut store, &unscannable));
+        assert_eq!(
+            store.worktrees["feat+one"].observed_ports,
+            vec![9876, 17_342, 17_343]
+        );
+
+        // A process that is no longer up is listening on nothing, and its
+        // last sighting is stale the moment it stops.
+        store
+            .worktrees
+            .get_mut("feat+one")
+            .unwrap()
+            .processes
+            .get_mut("web")
+            .unwrap()
+            .phase = Phase::Failed {
+            at: Utc::now(),
+            reason: "process exited".to_string(),
+        };
+        assert!(capture_observed_ports(&mut store, &scans));
+        let record = &store.worktrees["feat+one"];
+        assert!(record.processes["web"].observed_ports.is_empty());
+        assert_eq!(record.observed_ports, vec![9876, 17_343]);
     }
 
     // ---- restart ---------------------------------------------------------

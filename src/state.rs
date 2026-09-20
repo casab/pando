@@ -35,7 +35,19 @@ pub struct WorktreeRecord {
     /// still owns its ports.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub ports: BTreeMap<String, u16>,
-    /// Listening sockets actually seen in the process group.
+    /// Which process owns which roles, as config declared them at the last
+    /// start. Process name to its roles, in the order it declared them.
+    ///
+    /// Written for every process of the worktree, whatever `--only` asked
+    /// for, and it survives a stop exactly as `ports` does. Without it the
+    /// URL rule — the `web` role, else the first role of the alphabetically
+    /// first process — is only answerable while something is running, and
+    /// `start` and a later `status` would disagree about a worktree that
+    /// has since been stopped.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub roles: BTreeMap<String, Vec<String>>,
+    /// Every listening socket seen across this worktree's process groups:
+    /// the union of the per-process lists below.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub observed_ports: Vec<u16>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -54,6 +66,7 @@ impl WorktreeRecord {
             created_by_pando,
             processes: BTreeMap::new(),
             ports: BTreeMap::new(),
+            roles: BTreeMap::new(),
             observed_ports: Vec::new(),
             services: Vec::new(),
             hooks: BTreeMap::new(),
@@ -76,6 +89,14 @@ pub struct ProcessRecord {
     /// [`START_TIMEOUT_SECS`]; a slow first build sets its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ready_timeout_s: Option<u64>,
+    /// The listening sockets seen in *this* process's own group, sorted.
+    ///
+    /// Per process, not per worktree: a port an api opened for its
+    /// debugger is indistinguishable from one the web server opened once
+    /// the two are merged into one list, and the URL a worktree hands out
+    /// then follows whichever of them nothing claimed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed_ports: Vec<u16>,
     pub phase: Phase,
 }
 
@@ -465,6 +486,7 @@ mod tests {
             log_path: PathBuf::from("logs/feat+x/dev.log"),
             ready_port: Some(17_000),
             ready_timeout_s: None,
+            observed_ports: Vec::new(),
             phase,
         }
     }
@@ -638,7 +660,11 @@ mod tests {
 
     fn full_state() -> State {
         let mut rec = record_with(4242);
+        rec.roles.insert("dev".to_string(), vec!["web".to_string()]);
         rec.observed_ports = vec![17_000, 17_001];
+        if let Some(dev) = rec.processes.get_mut("dev") {
+            dev.observed_ports = vec![17_000, 17_001];
+        }
         rec.services = vec![
             ServiceRecord {
                 name: "postgres".into(),
