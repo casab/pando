@@ -1,0 +1,238 @@
+//! End-to-end behaviour of the `pando` binary: exit codes, and what it
+//! prints. Everything runs against a generated fixture repository with an
+//! injected `PANDO_HOME`, so no test can reach a real repo or the real home.
+
+mod common;
+
+use std::path::Path;
+use std::process::{Command, Output};
+
+use common::{Kind, build, git, status_porcelain};
+use tempfile::TempDir;
+
+const EXIT_OK: i32 = 0;
+const EXIT_ERROR: i32 = 1;
+const EXIT_USAGE: i32 = 2;
+
+struct Env {
+    _dir: TempDir,
+    home: std::path::PathBuf,
+    root: std::path::PathBuf,
+}
+
+fn env() -> Env {
+    let dir = TempDir::new().unwrap();
+    let root = build(Kind::Plain, dir.path()).root;
+    Env {
+        home: dir.path().join("pando-home"),
+        root,
+        _dir: dir,
+    }
+}
+
+impl Env {
+    fn pando(&self, args: &[&str]) -> Output {
+        self.pando_in(&self.root, args)
+    }
+
+    fn pando_in(&self, cwd: &Path, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_pando"))
+            .env("PANDO_HOME", &self.home)
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .expect("run pando")
+    }
+}
+
+fn code(out: &Output) -> i32 {
+    out.status.code().expect("pando exited via a signal")
+}
+
+fn stdout(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn stderr(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+#[test]
+fn ls_on_a_fresh_fixture_succeeds_with_exit_zero() {
+    let e = env();
+    let out = e.pando(&["ls"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("no worktrees"), "{}", stdout(&out));
+}
+
+#[test]
+fn the_full_new_path_rm_cycle_works_from_the_cli() {
+    let e = env();
+
+    let out = e.pando(&["new", "feat/one"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("feat+one"), "{}", stdout(&out));
+
+    let out = e.pando(&["ls"]);
+    assert_eq!(code(&out), EXIT_OK);
+    assert!(stdout(&out).contains("feat+one"));
+
+    let out = e.pando(&["path", "feat+one"]);
+    assert_eq!(code(&out), EXIT_OK);
+    let printed = stdout(&out).trim().to_string();
+    assert!(Path::new(&printed).is_dir(), "path printed {printed:?}");
+    // Canonical on both sides: git prints /private/var where the shell and
+    // TempDir say /var.
+    let canonical_home = std::fs::canonicalize(&e.home).unwrap();
+    assert!(
+        Path::new(&printed).starts_with(&canonical_home),
+        "{printed} is not under {}",
+        canonical_home.display()
+    );
+
+    let out = e.pando(&["rm", "feat+one"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    assert!(!Path::new(&printed).exists());
+    assert_eq!(status_porcelain(&e.root), "", "the fixture must stay clean");
+}
+
+#[test]
+fn ls_json_parses_and_carries_the_documented_keys() {
+    let e = env();
+    e.pando(&["new", "feat/one"]);
+    let out = e.pando(&["ls", "--json"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("valid json");
+    assert_eq!(v["version"], 1);
+    assert!(v["project"]["id"].as_str().is_some());
+    let w = &v["worktrees"][0];
+    for key in [
+        "name",
+        "path",
+        "branch",
+        "head",
+        "detached",
+        "dirty",
+        "ahead",
+        "behind",
+        "created_by_pando",
+        "prunable",
+        "locked",
+        "pr",
+    ] {
+        assert!(w.get(key).is_some(), "missing key {key:?} in {w}");
+    }
+}
+
+// Discovery is from porcelain, whose first entry is the main checkout from
+// any cwd — so a subdirectory sees exactly what the root sees.
+#[test]
+fn commands_work_from_a_subdirectory_of_the_repository() {
+    let e = env();
+    e.pando(&["new", "feat/one"]);
+    let nested = e.root.join("apps").join("web");
+    std::fs::create_dir_all(&nested).unwrap();
+
+    let from_root = stdout(&e.pando(&["ls", "--json"]));
+    let from_sub = stdout(&e.pando_in(&nested, &["ls", "--json"]));
+    assert_eq!(from_root, from_sub);
+}
+
+#[test]
+fn running_outside_a_git_repository_fails_with_exit_one_and_one_line() {
+    let e = env();
+    let outside = e.root.parent().unwrap().join("not-a-repo");
+    std::fs::create_dir_all(&outside).unwrap();
+
+    let out = e.pando_in(&outside, &["ls"]);
+    assert_eq!(code(&out), EXIT_ERROR);
+    let err = stderr(&out);
+    assert_eq!(err.trim().lines().count(), 1, "expected one line: {err}");
+    assert!(err.contains("not inside a git repository"), "{err}");
+}
+
+#[test]
+fn a_bare_repository_fails_the_same_way() {
+    let e = env();
+    let bare = e.root.parent().unwrap().join("bare.git");
+    git(
+        e.root.parent().unwrap(),
+        &[
+            "init",
+            "--bare",
+            "--quiet",
+            "--initial-branch=main",
+            bare.to_str().unwrap(),
+        ],
+    );
+
+    let out = e.pando_in(&bare, &["ls"]);
+    assert_eq!(code(&out), EXIT_ERROR);
+    assert!(
+        stderr(&out).contains("bare repositories are not supported"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn an_unknown_subcommand_is_a_usage_error() {
+    let e = env();
+    assert_eq!(code(&e.pando(&["definitely-not-a-command"])), EXIT_USAGE);
+    assert_eq!(code(&e.pando(&["rm"])), EXIT_USAGE, "missing argument");
+}
+
+#[test]
+fn help_and_version_work_outside_a_repository() {
+    let e = env();
+    let outside = e.root.parent().unwrap().join("nowhere");
+    std::fs::create_dir_all(&outside).unwrap();
+    assert_eq!(code(&e.pando_in(&outside, &["--help"])), EXIT_OK);
+    assert_eq!(code(&e.pando_in(&outside, &["--version"])), EXIT_OK);
+}
+
+#[test]
+fn removing_a_worktree_pando_did_not_create_needs_yes() {
+    let e = env();
+    let adopted = e.root.parent().unwrap().join("adopted");
+    git(
+        &e.root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "adopted",
+            adopted.to_str().unwrap(),
+        ],
+    );
+
+    let out = e.pando(&["rm", "adopted"]);
+    assert_eq!(code(&out), EXIT_ERROR);
+    assert!(stderr(&out).contains("--yes"), "{}", stderr(&out));
+    assert!(adopted.exists());
+
+    let out = e.pando(&["rm", "adopted", "--yes"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    assert!(!adopted.exists());
+}
+
+#[test]
+fn every_fixture_kind_builds_a_clean_repository() {
+    let dir = TempDir::new().unwrap();
+    for kind in Kind::ALL {
+        let fixture = build(kind, &dir.path().join(kind.dir_name()));
+        assert!(
+            fixture.root.join(".gitignore").is_file(),
+            "{:?} has no .gitignore",
+            kind
+        );
+        assert_eq!(
+            status_porcelain(&fixture.root),
+            "",
+            "{:?} must be clean after building — its ignored files are ignored",
+            kind
+        );
+    }
+}

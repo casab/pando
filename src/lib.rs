@@ -12,6 +12,7 @@
 
 pub mod actions;
 pub mod cache;
+pub mod cli;
 pub mod config;
 pub mod log_tail;
 pub mod paths;
