@@ -72,6 +72,11 @@ fn the_full_new_path_rm_cycle_works_from_the_cli() {
     let out = e.pando(&["new", "feat/one"]);
     assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
     assert!(stdout(&out).contains("feat+one"), "{}", stdout(&out));
+    let created = stdout(&out)
+        .trim()
+        .rsplit_once(" at ")
+        .map(|(_, path)| path.to_string())
+        .expect("new prints where it created the worktree");
 
     let out = e.pando(&["ls"]);
     assert_eq!(code(&out), EXIT_OK);
@@ -80,6 +85,10 @@ fn the_full_new_path_rm_cycle_works_from_the_cli() {
     let out = e.pando(&["path", "feat+one"]);
     assert_eq!(code(&out), EXIT_OK);
     let printed = stdout(&out).trim().to_string();
+    assert_eq!(
+        created, printed,
+        "new must print the canonical path it recorded, the one `path` gives"
+    );
     assert!(Path::new(&printed).is_dir(), "path printed {printed:?}");
     // Canonical on both sides: git prints /private/var where the shell and
     // TempDir say /var.
@@ -378,4 +387,31 @@ fn a_committed_pando_toml_pando_cannot_use_does_not_stop_ls() {
     let out = e.pando(&["ls"]);
     assert_eq!(code(&out), EXIT_ERROR, "stdout: {}", stdout(&out));
     assert!(stderr(&out).contains("nope"), "{}", stderr(&out));
+}
+
+// A command run from a directory that no longer exists fails before git is
+// ever consulted, and a bare errno names nothing at all.
+#[test]
+fn running_from_a_deleted_directory_says_which_directory() {
+    let e = env();
+    let gone = e.root.parent().unwrap().join("gone");
+    std::fs::create_dir_all(&gone).unwrap();
+    // Only a child can delete its own cwd out from under itself, so the
+    // shell sets that up and then becomes pando.
+    let script = format!(
+        "cd '{dir}' && rmdir '{dir}' && exec '{bin}' ls",
+        dir = gone.display(),
+        bin = env!("CARGO_BIN_EXE_pando"),
+    );
+    let out = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(script)
+        .env("PANDO_HOME", &e.home)
+        .output()
+        .expect("run sh");
+
+    assert_eq!(code(&out), EXIT_ERROR, "stdout: {}", stdout(&out));
+    let err = stderr(&out);
+    assert!(err.contains("current directory"), "{err}");
+    assert_eq!(err.trim().lines().count(), 1, "expected one line: {err}");
 }

@@ -219,11 +219,62 @@ fn strip_attribute(line: &str, name: &str) -> Option<Option<String>> {
         Some(if reason.is_empty() {
             None
         } else {
-            Some(reason.to_string())
+            Some(unquote_c_style(reason))
         })
     } else {
         None
     }
+}
+
+/// Decodes the C-quoting git uses for a reason containing non-ASCII, a
+/// quote, or a control character. A value that does not start with a quote
+/// is already literal and is returned untouched.
+///
+/// The escapes are bytes, not characters — `\303\251` is one `é` — so this
+/// decodes into a byte buffer and reads UTF-8 out of it at the end.
+fn unquote_c_style(value: &str) -> String {
+    let Some(inner) = value
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    else {
+        return value.to_string();
+    };
+    let mut out: Vec<u8> = Vec::with_capacity(inner.len());
+    let mut chars = inner.chars().peekable();
+    let mut buf = [0u8; 4];
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push(b'\n'),
+            Some('t') => out.push(b'\t'),
+            Some('r') => out.push(b'\r'),
+            Some('"') => out.push(b'"'),
+            Some('\\') => out.push(b'\\'),
+            // `\NNN`: up to three octal digits, one byte.
+            Some(digit) if digit.is_digit(8) => {
+                let mut byte = digit.to_digit(8).unwrap_or(0);
+                for _ in 0..2 {
+                    let Some(next) = chars.peek().and_then(|c| c.to_digit(8)) else {
+                        break;
+                    };
+                    byte = byte * 8 + next;
+                    chars.next();
+                }
+                out.push(byte.min(u8::MAX as u32) as u8);
+            }
+            // Not an escape git produces: keep both characters rather than
+            // silently eating one.
+            Some(other) => {
+                out.push(b'\\');
+                out.extend_from_slice(other.encode_utf8(&mut buf).as_bytes());
+            }
+            None => out.push(b'\\'),
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1224,5 +1275,38 @@ bare
     fn parse_pr_list_rejects_malformed_json_with_context() {
         let err = parse_pr_list("not json").unwrap_err();
         assert!(format!("{err:#}").contains("parse gh pr list JSON"));
+    }
+
+    // git C-quotes a reason with non-ASCII, a quote, or a control character
+    // in it. Stored raw, the escapes reach the CLI error, the TUI modal and
+    // `ls --json` verbatim.
+    #[test]
+    fn a_c_quoted_lock_reason_is_decoded() {
+        let text = concat!(
+            "worktree /a\n",
+            "HEAD 0123456789012345678901234567890123456789\n",
+            "branch refs/heads/x\n",
+            r#"locked "h\303\251llo \"x\" tab\tend""#,
+            "\n\n"
+        );
+        let entries = parse_porcelain(text);
+        assert_eq!(
+            entries[0].lock_reason.as_deref(),
+            Some("h\u{e9}llo \"x\" tab\tend")
+        );
+    }
+
+    #[test]
+    fn an_unquoted_reason_is_left_exactly_as_git_printed_it() {
+        let text = concat!(
+            "worktree /a\n",
+            "HEAD 0123456789012345678901234567890123456789\n",
+            "prunable gitdir file points to non-existent location\n\n"
+        );
+        let entries = parse_porcelain(text);
+        assert_eq!(
+            entries[0].prunable_reason.as_deref(),
+            Some("gitdir file points to non-existent location")
+        );
     }
 }

@@ -15,6 +15,9 @@ use crate::worktree::{PrState, Worktree};
 /// crate version so agents can pin what they parse.
 pub const JSON_VERSION: u32 = 1;
 
+/// What `git log --format=%h` abbreviates to, and what the JSON documents.
+const SHORT_SHA_LEN: usize = 7;
+
 #[derive(Parser, Debug)]
 #[command(name = "pando", version, about = "One repo. Every branch alive.")]
 pub struct Cli {
@@ -60,11 +63,12 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             let name = actions::new(paths, config, &branch, base.as_deref(), &|msg| {
                 eprintln!("pando: {msg}");
             })?;
-            writeln!(
-                out,
-                "created {name} at {}",
-                config.worktrees_dir(paths).join(&name).display()
-            )?;
+            // The canonical path, the one the state record and `pando path`
+            // carry: the raw one differs on macOS (/var against /private/var)
+            // and reads as a second, different location.
+            let created = config.worktrees_dir(paths).join(&name);
+            let created = std::fs::canonicalize(&created).unwrap_or(created);
+            writeln!(out, "created {name} at {}", created.display())?;
             Ok(())
         }
         Command::Ls { json } => {
@@ -194,6 +198,7 @@ pub fn ls_json<W: Write>(paths: &PandoPaths, out: &mut W) -> Result<()> {
         worktrees: worktrees
             .into_iter()
             .map(|w| {
+                let head = short_head(&w);
                 let pr = w
                     .branch
                     .as_deref()
@@ -208,7 +213,7 @@ pub fn ls_json<W: Write>(paths: &PandoPaths, out: &mut W) -> Result<()> {
                     name: w.name,
                     path: w.path.display().to_string(),
                     branch: w.branch,
-                    head: w.head_sha.or(w.head),
+                    head,
                     detached: w.detached,
                     dirty: w.dirty,
                     ahead: w.ahead_behind.map(|(a, _)| a),
@@ -226,6 +231,18 @@ pub fn ls_json<W: Write>(paths: &PandoPaths, out: &mut W) -> Result<()> {
     };
     writeln!(out, "{}", serde_json::to_string_pretty(&output)?)?;
     Ok(())
+}
+
+/// The sha `ls --json` publishes: seven characters, always. `head_sha` is
+/// enrichment's abbreviation and porcelain's `head` is the full forty, so a
+/// worktree whose enrichment failed would otherwise put a different shape
+/// into a field documented as `"abc1234"`.
+fn short_head(w: &Worktree) -> Option<String> {
+    w.head_sha.clone().or_else(|| {
+        w.head
+            .as_ref()
+            .map(|sha| sha.chars().take(SHORT_SHA_LEN).collect())
+    })
 }
 
 /// Truncate to at most `max` chars with a trailing ellipsis, so a long name
@@ -431,5 +448,23 @@ mod tests {
     fn ellipsize_keeps_short_strings_and_truncates_long_ones() {
         assert_eq!(ellipsize("short", 10), "short");
         assert_eq!(ellipsize("abcdefghij", 5), "abcd…");
+    }
+
+    // `head` is documented as "abc1234". Enrichment supplies the seven
+    // characters, but porcelain's sha is all forty, so a worktree whose
+    // enrichment failed used to publish a different shape in the same field.
+    #[test]
+    fn the_json_head_is_always_the_short_sha() {
+        let mut w = crate::tui::app::tests::wt("feat+one");
+        w.head = Some("0123456789012345678901234567890123456789".into());
+        w.head_sha = None;
+        assert_eq!(short_head(&w).as_deref(), Some("0123456"));
+
+        w.head_sha = Some("abc1234".into());
+        assert_eq!(short_head(&w).as_deref(), Some("abc1234"));
+
+        w.head = None;
+        w.head_sha = None;
+        assert_eq!(short_head(&w), None);
     }
 }

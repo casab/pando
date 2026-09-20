@@ -563,8 +563,17 @@ impl App {
     }
 
     fn refilter(&mut self) {
+        let keep = self.selected_worktree().map(|w| w.name.clone());
+        self.refilter_keeping(keep);
+    }
+
+    /// `keep` is the worktree the cursor was on, passed in rather than read
+    /// here: `apply_snapshot` has already replaced the list by the time it
+    /// refilters, and resolving the old row against the new list would pick
+    /// whichever worktree now happens to sit at that index.
+    fn refilter_keeping(&mut self, keep: Option<String>) {
         let needle = self.filter.to_lowercase();
-        let keep_name = self.selected_worktree().map(|w| w.name.clone());
+        let keep_name = keep;
         self.filtered_indices = self
             .worktrees
             .iter()
@@ -594,6 +603,9 @@ impl App {
     /// that are still there. Returns the names that are new, so only those
     /// get enriched.
     fn apply_snapshot(&mut self, snapshot: Snapshot) -> Vec<String> {
+        // Captured before the list is replaced: after that, the old row
+        // index points at whatever worktree the refresh moved into it.
+        let keep = self.selected_worktree().map(|w| w.name.clone());
         let known: HashMap<String, Worktree> = self
             .worktrees
             .drain(..)
@@ -626,7 +638,7 @@ impl App {
             }
             self.state_warning = snapshot.warning;
         }
-        self.refilter();
+        self.refilter_keeping(keep);
         fresh
     }
 
@@ -1401,6 +1413,30 @@ pub mod tests {
 
         app.apply_snapshot(snapshot(None));
         assert_eq!(app.state_warning, None);
+    }
+
+    // The cursor follows the worktree, not the row it happened to be on:
+    // a refresh that reorders the list (a new worktree is newest-first)
+    // must not move the selection to a different one.
+    #[test]
+    fn a_refresh_keeps_the_cursor_on_the_same_worktree_when_the_order_changes() {
+        let mut app = test_app(&["feat+one", "feat+two", "fix+three"]);
+        app.select_index(2);
+        assert_eq!(app.selected_worktree().unwrap().name, "fix+three");
+
+        app.apply_snapshot(Snapshot {
+            main: wt("acme-shop"),
+            worktrees: vec![wt("fix+three"), wt("feat+one"), wt("feat+two")],
+            created_by_pando: BTreeMap::new(),
+            warning: None,
+            default_base: None,
+        });
+        assert_eq!(
+            app.selected_worktree().unwrap().name,
+            "fix+three",
+            "the cursor must stay on the worktree it was on"
+        );
+        assert_eq!(app.list_state.selected(), Some(0));
     }
 
     #[test]

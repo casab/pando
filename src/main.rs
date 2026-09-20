@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use std::process::ExitCode;
 
@@ -25,7 +25,9 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    let cwd = std::env::current_dir()?;
+    let cwd = std::env::current_dir().context(
+        "cannot read the current directory — it may have been deleted; cd somewhere that exists",
+    )?;
     let project = project::discover(&cwd)?;
     // A relative `PANDO_HOME` is resolved here rather than compared as-is:
     // `.pando` looks like it is outside the repository until the moment it
