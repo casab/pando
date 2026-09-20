@@ -85,9 +85,13 @@ impl PandoPaths {
         self.project_dir().join("logs").join(name)
     }
 
-    /// `source` is a free string: `dev`, a service name, a hook name,
+    /// `source` names one log of one worktree: `dev`, a process, a hook,
     /// `tunnel`, `proxy`. The TUI builds its log tabs from the files that
     /// exist, so nothing here enumerates the set.
+    ///
+    /// It is a path component, so every name that reaches this has to have
+    /// been through [`validate_log_source`] first — at config load time for
+    /// a process or a hook, at the argument for `logs --source`.
     pub fn log_file(&self, name: &str, source: &str) -> PathBuf {
         self.logs_dir(name).join(format!("{source}.log"))
     }
@@ -121,6 +125,72 @@ impl PandoPaths {
             .with_context(|| format!("create {}", self.project_dir().display()))?;
         Ok(())
     }
+}
+
+/// Log names pando keeps for its own use: the install hook's log, and the
+/// `tunnel` and `proxy` logs `share` writes.
+///
+/// One list, in one place, because a process, a hook and `share` all write
+/// into the same `logs/<worktree>/` directory and whichever of them starts
+/// last truncates the other's log. Phase 3's `[[hooks]]` and Phase 4's
+/// `share` extend this rather than keeping a second list somewhere else.
+pub const RESERVED_LOG_SOURCES: [&str; 3] = ["install", "tunnel", "proxy"];
+
+/// Refuses a name that would not be exactly one component of
+/// `logs/<worktree>/<name>.log`.
+///
+/// A TOML key may be any quoted string, so `[processes."../../x"]` parses
+/// happily; used as a path component it escapes the log directory, and
+/// starting it creates and truncates whatever `.log` file it lands on.
+/// Aimed back at the checkout that is Invariant 1 broken — pando writing
+/// into the repository — and aimed anywhere else it is still a file pando
+/// had no business touching.
+///
+/// `kind` names what is being checked, so the message reads as a sentence:
+/// `process name`, `hook name`, `log source`.
+pub fn validate_log_source(kind: &str, name: &str) -> Result<()> {
+    const WHERE: &str = "a log lives at logs/<worktree>/<name>.log";
+    if name.trim().is_empty() {
+        anyhow::bail!("a {kind} must not be empty — {WHERE}");
+    }
+    if name == "." || name == ".." {
+        anyhow::bail!("{kind} {name:?} is a directory, not a name — {WHERE}");
+    }
+    if name.contains('/') || name.contains('\\') {
+        let mut message = format!("{kind} {name:?} must be a single name, not a path — {WHERE}");
+        if let Some(suggestion) = suggest_log_source(name) {
+            message.push_str(&format!("; try {suggestion:?}"));
+        }
+        anyhow::bail!("{message}");
+    }
+    Ok(())
+}
+
+/// The same check plus [`RESERVED_LOG_SOURCES`].
+///
+/// Process and hook names go through this one. `logs --source` does not:
+/// `--source install` is how the install hook's log is read, and refusing
+/// to read a log pando itself wrote would be absurd.
+pub fn validate_owned_log_source(kind: &str, name: &str) -> Result<()> {
+    validate_log_source(kind, name)?;
+    if RESERVED_LOG_SOURCES.contains(&name) {
+        anyhow::bail!(
+            "{kind} {name:?} is reserved for pando's own logs ({}) — pando would truncate that \
+             log on every start; pick another name",
+            RESERVED_LOG_SOURCES.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// The last component of a path-shaped name, when that is itself usable.
+/// `apps/web` is a name a developer plausibly writes, and `web` is what
+/// they meant.
+fn suggest_log_source(name: &str) -> Option<&str> {
+    let last = name
+        .rsplit(['/', '\\'])
+        .find(|part| !part.trim().is_empty())?;
+    (last != "." && last != ".." && !RESERVED_LOG_SOURCES.contains(&last)).then_some(last)
 }
 
 /// Refuses a location pando would write to that lies inside the repository,
@@ -282,6 +352,71 @@ mod tests {
                 loc.display()
             );
         }
+    }
+
+    // A process name is a path component of its log file, so anything that
+    // is not one component is a write outside the logs directory waiting to
+    // happen. Both separators, because a name with a backslash in it is one
+    // component here and not on every filesystem pando's logs might be read
+    // from.
+    #[test]
+    fn a_log_source_that_is_not_one_path_component_is_refused() {
+        for bad in [
+            "../../../../../escaped-log",
+            "apps/web",
+            "a\\b",
+            "/absolute",
+            ".",
+            "..",
+            "",
+            "   ",
+        ] {
+            let err = validate_log_source("process name", bad)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("logs/<worktree>"),
+                "{bad:?} was refused without saying why: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plain_name_is_a_log_source_whatever_alphabet_it_is_in() {
+        for good in ["dev", "web", "api", "wörker", "install", ".hidden", "a b"] {
+            validate_log_source("process name", good)
+                .unwrap_or_else(|e| panic!("{good:?} should be a usable log source: {e:#}"));
+        }
+    }
+
+    #[test]
+    fn the_names_pando_writes_its_own_logs_under_are_refused_to_processes() {
+        for reserved in RESERVED_LOG_SOURCES {
+            let err = validate_owned_log_source("process name", reserved)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("reserved"), "{err}");
+            assert!(err.contains(reserved), "{err}");
+        }
+        // Only the exact names; `installer` is a perfectly good process.
+        validate_owned_log_source("process name", "installer").unwrap();
+        // And `logs --source install` still reads the hook's own log.
+        validate_log_source("log source", "install").unwrap();
+    }
+
+    // `[processes."apps/web"]` is a name a developer plausibly writes, so
+    // the refusal says what they meant rather than only that they are wrong.
+    #[test]
+    fn a_path_shaped_name_suggests_its_last_component() {
+        let err = validate_log_source("process name", "apps/web")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("try \"web\""), "{err}");
+        // Nothing usable to suggest, so nothing is suggested.
+        let err = validate_log_source("process name", "../..")
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("try "), "{err}");
     }
 
     #[test]

@@ -531,6 +531,69 @@ fn starting_and_stopping_never_writes_into_the_repository() {
     );
 }
 
+/// Phase 2b review, finding 1: a process's name is a path component of its
+/// log file, so a hand-written `[processes."../../x"]` created — and
+/// truncated — a `.log` file outside pando's home, and, aimed back at the
+/// checkout, inside the repository.
+///
+/// The invariant test's own blind spot: nothing else here gives a process
+/// an adversarial name.
+#[test]
+fn an_adversarial_process_name_writes_nothing_outside_pandos_home() {
+    let h = harness();
+    let name = actions::new(&h.paths, &h.config, "feat/esc", None, &|_| {}).unwrap();
+    let worktree = h.config.worktrees_dir(&h.paths).join(&name);
+    h.assert_untouched("new", Some(&worktree));
+
+    // Five levels above `logs/<worktree>/` is the fixture's own parent
+    // directory, which is where the repository sits. One name lands beside
+    // it; the other lands inside it, which is Invariant 1 itself.
+    let repo = h
+        .root
+        .file_name()
+        .expect("the fixture root has a name")
+        .to_string_lossy()
+        .to_string();
+    for escape in [
+        "../../../../../escaped-log".to_string(),
+        format!("../../../../../{repo}/inside-repo"),
+    ] {
+        std::fs::write(
+            h.paths.config_file(),
+            format!(
+                "[project]\nprovision = [\".env\"]\n\n[processes.\"{escape}\"]\n\
+                 cmd = \"true\"\nports = []\n"
+            ),
+        )
+        .unwrap();
+        match config::load(&h.paths) {
+            Err(e) => {
+                let msg = format!("{e:#}");
+                assert!(
+                    msg.contains(&format!("{escape:?}")),
+                    "the refusal quotes the name: {msg}"
+                );
+            }
+            Ok(loaded) => {
+                // Unfixed: the name loads, and starting it is what writes
+                // the file. The assertions below are the ones that fail.
+                let _ = actions::start(&h.paths, &loaded.config, &name, None, &|_| {});
+                h.assert_untouched(&format!("start of {escape:?}"), Some(&worktree));
+                panic!("a process name that escapes the log directory must be refused at load");
+            }
+        }
+        h.assert_untouched(&format!("load of {escape:?}"), Some(&worktree));
+        assert!(
+            !h.parent.join("escaped-log.log").exists(),
+            "a log was written above pando's home"
+        );
+        assert!(
+            !h.root.join("inside-repo.log").exists(),
+            "a log was written into the repository"
+        );
+    }
+}
+
 /// Phase 2b: the same guarantee with two processes in two directories.
 ///
 /// The workspace fixture, its listener config, and the whole lifecycle —

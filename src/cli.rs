@@ -1045,6 +1045,10 @@ pub fn logs<W: Write>(
     json: bool,
     out: &mut W,
 ) -> Result<()> {
+    // `source` is a path component of the file about to be read, so a
+    // traversal here reads outside the worktree's log directory entirely —
+    // a file `available_sources` would never list.
+    crate::paths::validate_log_source("log source", source)?;
     let path = paths.log_file(name, source);
     if !path.exists() {
         let available = available_sources(paths, name);
@@ -1747,6 +1751,45 @@ mod tests {
         let path = fx.paths.log_file(name, source);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, text).unwrap();
+    }
+
+    // The read side of finding 1: `--source` is the other half of the same
+    // path component, so a traversal there reads a file outside the
+    // worktree's log directory — one `available_sources` never lists, so
+    // nothing even suggests it is reachable.
+    #[test]
+    fn a_log_source_that_escapes_the_log_directory_is_refused() {
+        let fx = fixture();
+        write_log(&fx, "feat+one", "web", "web line\n");
+        // A real file the traversal would reach, so the refusal is about
+        // the name rather than about the file not being there.
+        std::fs::create_dir_all(fx.paths.project_dir()).unwrap();
+        std::fs::write(fx.paths.project_dir().join("outside.log"), "secret\n").unwrap();
+
+        let mut out = Vec::new();
+        let err = logs(
+            &fx.paths,
+            "feat+one",
+            "../../outside",
+            5,
+            false,
+            false,
+            &mut out,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("\"../../outside\""), "{msg}");
+        assert!(msg.contains("logs/<worktree>"), "{msg}");
+        assert!(
+            out.is_empty(),
+            "nothing outside the log directory may be printed: {}",
+            String::from_utf8_lossy(&out)
+        );
+
+        // And the hook logs pando writes itself are still readable by name.
+        write_log(&fx, "feat+one", "install", "install line\n");
+        let text = capture(|b| logs(&fx.paths, "feat+one", "install", 5, false, false, b));
+        assert_eq!(text, "install line\n");
     }
 
     #[test]

@@ -647,6 +647,11 @@ pub fn validate(config: &Config, project: &ProjectRef) -> Result<()> {
         )?;
     }
     validate_processes(config)?;
+    // A hook writes `logs/<worktree>/<name>.log` under exactly the same
+    // rules as a process, and shares the namespace with it.
+    for hook in &config.hooks {
+        crate::paths::validate_owned_log_source("hook name", &hook.name)?;
+    }
     for entry in &config.project.provision {
         let path = Path::new(entry);
         if path.is_absolute() {
@@ -673,9 +678,13 @@ pub fn validate(config: &Config, project: &ProjectRef) -> Result<()> {
 /// pando could explain. `{port:<role>}` may still *reference* any role of
 /// the worktree — that is how a web process is told the api's port — so
 /// only ownership is exclusive, never use.
+///
+/// The name itself is checked here too: it becomes a path component of the
+/// process's log file, and a TOML key may be any quoted string.
 fn validate_processes(config: &Config) -> Result<()> {
     let mut owner: BTreeMap<String, String> = BTreeMap::new();
     for (name, process) in &config.processes {
+        crate::paths::validate_owned_log_source("process name", name)?;
         let roles = process.roles();
         for role in &roles {
             if let Some(first) = owner.get(role) {
@@ -1662,6 +1671,82 @@ auth_cmd = "./scripts/dev-cookie.sh"
         // The worktree root itself, spelled out, is not an escape.
         let config = accepts("[dev]\ncmd = \"a\"\ncwd = \".\"\n");
         assert_eq!(config.processes["dev"].cwd.as_deref(), Some("."));
+    }
+
+    // Phase 2b review, finding 1. A TOML key may be any quoted string, and
+    // a process's name is a path component of its log file: `start` then
+    // creates and truncates a `.log` file wherever the name points, up to
+    // and including inside the repository.
+    #[test]
+    fn a_process_name_that_escapes_the_log_directory_is_refused() {
+        for bad in [
+            "../../../../../escaped-log",
+            "../../../../../acme-shop/inside-repo",
+            "apps/web",
+            "/absolute",
+            "..",
+            ".",
+            "",
+            "   ",
+        ] {
+            let msg = refusal(&format!("[processes.\"{bad}\"]\ncmd = \"true\"\n"));
+            assert!(
+                msg.contains("logs/<worktree>"),
+                "{bad:?} must be refused as a log path: {msg}"
+            );
+            if !bad.trim().is_empty() {
+                assert!(
+                    msg.contains(&format!("{bad:?}")),
+                    "the refusal quotes the name: {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_process_name_with_a_directory_in_it_suggests_the_name_it_meant() {
+        let msg = refusal("[processes.\"apps/web\"]\ncmd = \"true\"\n");
+        assert!(msg.contains("\"apps/web\""), "{msg}");
+        assert!(msg.contains("try \"web\""), "{msg}");
+    }
+
+    // A process named `install` shares the install hook's log file, and
+    // `reset_log` truncates it on every start; `tunnel` and `proxy` are
+    // `share`'s, reserved the same way.
+    #[test]
+    fn a_process_named_after_one_of_pandos_own_logs_is_refused() {
+        for reserved in crate::paths::RESERVED_LOG_SOURCES {
+            let msg = refusal(&format!("[processes.{reserved}]\ncmd = \"true\"\n"));
+            assert!(msg.contains("reserved"), "{msg}");
+            assert!(msg.contains(reserved), "{msg}");
+        }
+        let config = accepts("[processes.installer]\ncmd = \"true\"\n");
+        assert!(config.processes.contains_key("installer"));
+    }
+
+    #[test]
+    fn a_process_name_in_any_alphabet_is_still_fine() {
+        let config = accepts("[processes.\"wörker\"]\ncmd = \"true\"\nports = []\n");
+        assert!(config.processes.contains_key("wörker"));
+    }
+
+    // Hooks write into the same directory under the same rules, so the same
+    // name check applies to them — before Phase 3 gives anyone a way to
+    // write one.
+    #[test]
+    fn a_hook_name_that_escapes_the_log_directory_or_is_reserved_is_refused() {
+        let msg = refusal(
+            "[[hooks]]\nname = \"../../../../../escaped-hook\"\nafter = \"install\"\ncmd = \"true\"\n",
+        );
+        assert!(msg.contains("\"../../../../../escaped-hook\""), "{msg}");
+        assert!(msg.contains("logs/<worktree>"), "{msg}");
+
+        let msg = refusal("[[hooks]]\nname = \"install\"\nafter = \"install\"\ncmd = \"true\"\n");
+        assert!(msg.contains("reserved"), "{msg}");
+
+        let config =
+            accepts("[[hooks]]\nname = \"migrate\"\nafter = \"services\"\ncmd = \"true\"\n");
+        assert_eq!(config.hooks[0].name, "migrate");
     }
 
     #[test]

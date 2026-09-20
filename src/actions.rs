@@ -183,6 +183,10 @@ fn dirty_entry(worktree: &Worktree) -> Option<String> {
 }
 
 /// The name of the built-in install hook, and of its log file.
+///
+/// It shares `logs/<worktree>/` with every process, so it is one of
+/// [`crate::paths::RESERVED_LOG_SOURCES`]; a process allowed to take the
+/// name would have its log truncated on every start.
 pub const INSTALL_HOOK: &str = "install";
 
 /// Runs `[project].install` when the lockfiles have changed since it last
@@ -1939,6 +1943,17 @@ mod tests {
     use crate::project::ProjectRef;
     use crate::testutil::git;
     use tempfile::{TempDir, tempdir};
+
+    // The two lists have to stay in step: a process named `install` writes
+    // the install hook's log file, and `reset_log` truncates it on every
+    // start.
+    #[test]
+    fn the_install_hooks_log_name_is_one_no_process_may_take() {
+        assert!(
+            crate::paths::RESERVED_LOG_SOURCES.contains(&INSTALL_HOOK),
+            "{INSTALL_HOOK} must be reserved, or a process can take its log"
+        );
+    }
 
     struct Fx {
         _dir: TempDir,
