@@ -21,7 +21,9 @@ use std::time::{Duration, Instant};
 use crate::actions;
 use crate::cache;
 use crate::config::Config;
+use crate::log_tail::LogTail;
 use crate::paths::PandoPaths;
+use crate::state::{Phase, State, WorktreeRecord};
 use crate::worktree::{self, BranchEntry, EnrichUpdate, PrInfo, Worktree};
 
 /// How long a status message stays on the header before the counts return.
@@ -29,6 +31,16 @@ const STATUS_TTL: Duration = Duration::from_secs(6);
 /// Ticks between porcelain re-discoveries. The fs watcher only sees pando's
 /// own worktrees directory, so adopted worktrees elsewhere arrive here.
 pub const SLOW_TICK_EVERY: u32 = 20;
+/// Ticks between process-state refreshes. Much faster than discovery,
+/// because a dev server that just died should turn red while the developer
+/// is still looking at it — and far cheaper, because it reads one state file
+/// rather than forking git.
+pub const REFRESH_EVERY: u32 = 4;
+/// How many worktrees' log tails are kept open at once. Each holds a file
+/// handle and a ring buffer; the selected row is always one of them.
+const MAX_LOG_TAILS: usize = 8;
+/// Lines of the dev log the detail pane keeps.
+const TAIL_CAPACITY: usize = 256;
 const SPINNER_FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
 /// Everything the event loop can deliver. One enum so the loop blocks on a
@@ -42,6 +54,12 @@ pub enum AppEvent {
     EnrichDone,
     BranchesReady(Vec<BranchEntry>),
     PrsReady(Result<Vec<PrInfo>, String>),
+    /// Process state, advanced and saved off the UI thread.
+    Refreshed(Box<Result<State, String>>),
+    /// A worker needs an answer before it can go on. It is blocked on the
+    /// other end of this channel until one arrives — or until the channel
+    /// is dropped, which is how quitting aborts it.
+    AskQuestion(Box<(actions::Question, Sender<Result<actions::Answer, String>>)>),
 }
 
 /// One consistent read of the repository, taken off the UI thread.
@@ -49,6 +67,9 @@ pub struct Snapshot {
     pub main: Worktree,
     pub worktrees: Vec<Worktree>,
     pub created_by_pando: BTreeMap<String, bool>,
+    /// Process state as of the same read, so the list and the detail pane
+    /// never disagree about what is running.
+    pub state: State,
     /// Why the ownership map may be wrong — the same one line `ls` prints
     /// and `rm` refuses with, so the TUI never shows "adopted" about a
     /// state file it could not read without saying so.
@@ -75,6 +96,16 @@ pub enum Modal {
         blocker: Option<RemoveBlocker>,
         /// Whether pando created it; drives the extra warning line.
         created_by_pando: bool,
+    },
+    /// Something pando needs to know before it can start. A worker thread is
+    /// waiting on `reply`; closing this modal without answering has to send
+    /// something, or that thread waits forever.
+    Question {
+        question: actions::Question,
+        selected: usize,
+        /// `Some` while a command is being typed instead of chosen.
+        custom: Option<String>,
+        reply: Sender<Result<actions::Answer, String>>,
     },
     Help,
 }
@@ -161,6 +192,9 @@ pub fn create_rows(input: &str, branches: &[BranchEntry]) -> Vec<CreateRow> {
 pub enum PendingKind {
     Create,
     Remove,
+    Start,
+    Stop,
+    Restart,
 }
 
 impl PendingKind {
@@ -168,6 +202,9 @@ impl PendingKind {
         match self {
             PendingKind::Create => "creating",
             PendingKind::Remove => "removing",
+            PendingKind::Start => "starting",
+            PendingKind::Stop => "stopping",
+            PendingKind::Restart => "restarting",
         }
     }
 }
@@ -175,6 +212,60 @@ impl PendingKind {
 pub enum PendingOutcome {
     Created(String),
     Removed(String),
+    Started(String, Option<String>),
+    Stopped(String),
+}
+
+/// A bounded set of open log tails, evicted by least-recent use.
+///
+/// A tail holds a file handle and a ring buffer, and a project with fifty
+/// worktrees would otherwise keep fifty of each. The selected row is touched
+/// on every poll, so it never evicts itself.
+#[derive(Default)]
+pub struct LogTails {
+    open: HashMap<String, (LogTail, u64)>,
+    clock: u64,
+}
+
+impl LogTails {
+    pub fn get(&self, name: &str) -> Option<&LogTail> {
+        self.open.get(name).map(|(tail, _)| tail)
+    }
+
+    pub fn len(&self) -> usize {
+        self.open.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.open.is_empty()
+    }
+
+    pub fn forget(&mut self, name: &str) {
+        self.open.remove(name);
+    }
+
+    /// The tail for `name`, opening it if it is not already, and marking it
+    /// as the most recently used.
+    pub fn touch(&mut self, name: &str, path: std::path::PathBuf) -> &mut LogTail {
+        self.clock += 1;
+        if !self.open.contains_key(name)
+            && self.open.len() >= MAX_LOG_TAILS
+            && let Some(coldest) = self
+                .open
+                .iter()
+                .min_by_key(|(_, (_, seen))| *seen)
+                .map(|(name, _)| name.clone())
+        {
+            self.open.remove(&coldest);
+        }
+        let clock = self.clock;
+        let entry = self
+            .open
+            .entry(name.to_string())
+            .or_insert_with(|| (LogTail::new(path, TAIL_CAPACITY), clock));
+        entry.1 = clock;
+        &mut entry.0
+    }
 }
 
 pub struct PendingAction {
@@ -200,6 +291,18 @@ pub struct App {
     pub default_base: Option<String>,
     pub worktrees: Vec<Worktree>,
     pub created_by_pando: BTreeMap<String, bool>,
+    /// Process state: what is running, on which ports, and why anything
+    /// failed. Replaced wholesale by each refresh.
+    pub state: State,
+    /// One refresh at a time. A scan of listening sockets can take a moment,
+    /// and stacking them up behind a slow one helps nobody.
+    pub refreshing: bool,
+    /// Open log tails, keyed by worktree, for the detail pane.
+    pub log_tails: LogTails,
+    /// Whether the detail pane's tail has the arrow keys.
+    pub tail_focus: bool,
+    /// Lines scrolled back from the end of the tail.
+    pub tail_scroll: usize,
     /// The last ownership warning shown, so a standing one is reported when
     /// it appears or changes rather than on every refresh.
     pub state_warning: Option<String>,
@@ -221,6 +324,9 @@ pub struct App {
     /// Set instead of touching the terminal when tests drive the app.
     #[cfg(test)]
     pub clipboard: Option<String>,
+    /// The URL a test asked to open, instead of handing it to the desktop.
+    #[cfg(test)]
+    pub opened: Option<String>,
 }
 
 impl App {
@@ -233,6 +339,11 @@ impl App {
             default_base: None,
             worktrees: Vec::new(),
             created_by_pando: BTreeMap::new(),
+            state: State::new(),
+            refreshing: false,
+            log_tails: LogTails::default(),
+            tail_focus: false,
+            tail_scroll: 0,
             state_warning: None,
             prs: HashMap::new(),
             list_state: ListState::default(),
@@ -251,6 +362,8 @@ impl App {
             event_rx: Some(event_rx),
             #[cfg(test)]
             clipboard: None,
+            #[cfg(test)]
+            opened: None,
         };
         // One synchronous read so the first frame has rows, hydrated from the
         // disk cache so those rows already carry sha, age, and dirty state.
@@ -274,10 +387,13 @@ impl App {
                 self.tick = self.tick.wrapping_add(1);
                 let spinning = self.pending.is_some();
                 self.poll_pending();
+                let grew = self.poll_log_tail();
                 if self.tick.is_multiple_of(SLOW_TICK_EVERY) {
                     self.spawn_discovery();
+                } else if self.tick.is_multiple_of(REFRESH_EVERY) {
+                    self.spawn_refresh();
                 }
-                spinning || self.expire_status()
+                spinning || grew || self.expire_status()
             }
             AppEvent::FsChange => {
                 self.spawn_discovery();
@@ -325,6 +441,34 @@ impl App {
             }
             // A missing or unauthenticated `gh` just means no chips.
             AppEvent::PrsReady(Err(_)) => false,
+            AppEvent::Refreshed(result) => {
+                self.refreshing = false;
+                match *result {
+                    Ok(state) => {
+                        let changed = state != self.state;
+                        self.state = state;
+                        changed
+                    }
+                    Err(e) => {
+                        self.set_error(format!("refresh failed: {e}"));
+                        true
+                    }
+                }
+            }
+            AppEvent::AskQuestion(boxed) => {
+                let (question, reply) = *boxed;
+                let selected = question.preselect.unwrap_or(0);
+                // No candidates to choose between means the answer can only
+                // be typed, so the input line opens straight away.
+                let custom = question.options.is_empty().then(String::new);
+                self.modal = Some(Modal::Question {
+                    question,
+                    selected,
+                    custom,
+                    reply,
+                });
+                true
+            }
         }
     }
 
@@ -365,6 +509,15 @@ impl App {
                 self.handle_create_key(key, input, branches, selected);
                 return;
             }
+            Some(Modal::Question {
+                question,
+                selected,
+                custom,
+                reply,
+            }) => {
+                self.handle_question_key(key, question, selected, custom, reply);
+                return;
+            }
             None => {}
         }
         if self.mode == Mode::Filter {
@@ -383,7 +536,12 @@ impl App {
             KeyCode::Char('n') => self.open_create(),
             KeyCode::Char('d') => self.open_remove(),
             KeyCode::Char('y') => self.copy_selected_path(),
-            KeyCode::Char('r') => {
+            KeyCode::Char('s') | KeyCode::Enter => self.start_selected(),
+            KeyCode::Char('x') => self.stop_selected(),
+            KeyCode::Char('r') => self.restart_selected(),
+            KeyCode::Char('o') => self.open_selected_url(),
+            KeyCode::Char('l') => self.toggle_tail_focus(),
+            KeyCode::Char('R') => {
                 self.spawn_discovery();
                 self.set_status("refreshing…");
             }
@@ -391,7 +549,6 @@ impl App {
                 self.help_scroll = 0;
                 self.modal = Some(Modal::Help);
             }
-            KeyCode::Enter => self.set_status("detail and logs arrive with start/stop"),
             _ => {}
         }
     }
@@ -503,6 +660,254 @@ impl App {
         }
     }
 
+    // ---- processes -------------------------------------------------------
+
+    /// The state record for a worktree, when there is one.
+    pub fn record_for(&self, name: &str) -> Option<&WorktreeRecord> {
+        self.state.worktrees.get(name)
+    }
+
+    /// The process this phase shows: the first one recorded.
+    pub fn phase_of(&self, name: &str) -> Option<&Phase> {
+        Some(&self.record_for(name)?.processes.values().next()?.phase)
+    }
+
+    /// The URL a worktree serves on, from the role `share` and this key
+    /// default to.
+    pub fn url_of(&self, name: &str) -> Option<String> {
+        let record = self.record_for(name)?;
+        let port = record
+            .ports
+            .get("web")
+            .or_else(|| record.ports.values().next())?;
+        Some(format!("http://localhost:{port}"))
+    }
+
+    fn selected_name(&mut self) -> Option<String> {
+        match self.selected_worktree() {
+            Some(wt) => Some(wt.name.clone()),
+            None => {
+                self.set_error("nothing selected");
+                None
+            }
+        }
+    }
+
+    fn start_selected(&mut self) {
+        let Some(name) = self.selected_name() else {
+            return;
+        };
+        let paths = self.paths.clone();
+        let config = self.config.clone();
+        let worker_name = name.clone();
+        let tx = self.event_tx.clone();
+        let (ptx, prx) = mpsc::channel::<String>();
+        let started = self.spawn_pending(name, PendingKind::Start, move || {
+            let progress = |msg: &str| {
+                let _ = ptx.send(msg.to_string());
+            };
+            // Detection may have a question; it goes back to the UI thread
+            // and this worker waits for the answer.
+            let ask = |question: &actions::Question| ask_through_ui(&tx, question);
+            let config = actions::resolve_process(&paths, &config, &ask, &progress)
+                .map_err(|e| format!("{e:#}"))?;
+            actions::start(&paths, &config, &worker_name, &progress)
+                .map(|outcome| {
+                    let started = outcome.process();
+                    PendingOutcome::Started(worker_name.clone(), started.url.clone())
+                })
+                .map_err(|e| format!("{e:#}"))
+        });
+        if started && let Some(p) = self.pending.as_mut() {
+            p.progress_rx = Some(prx);
+        }
+    }
+
+    fn stop_selected(&mut self) {
+        let Some(name) = self.selected_name() else {
+            return;
+        };
+        let paths = self.paths.clone();
+        let worker_name = name.clone();
+        self.spawn_pending(name, PendingKind::Stop, move || {
+            actions::stop(&paths, &worker_name)
+                .map(|_| PendingOutcome::Stopped(worker_name))
+                .map_err(|e| format!("{e:#}"))
+        });
+    }
+
+    fn restart_selected(&mut self) {
+        let Some(name) = self.selected_name() else {
+            return;
+        };
+        let paths = self.paths.clone();
+        let config = self.config.clone();
+        let worker_name = name.clone();
+        let tx = self.event_tx.clone();
+        let (ptx, prx) = mpsc::channel::<String>();
+        let started = self.spawn_pending(name, PendingKind::Restart, move || {
+            let progress = |msg: &str| {
+                let _ = ptx.send(msg.to_string());
+            };
+            let ask = |question: &actions::Question| ask_through_ui(&tx, question);
+            let config = actions::resolve_process(&paths, &config, &ask, &progress)
+                .map_err(|e| format!("{e:#}"))?;
+            actions::restart(&paths, &config, &worker_name, &progress)
+                .map(|outcome| {
+                    PendingOutcome::Started(worker_name.clone(), outcome.process().url.clone())
+                })
+                .map_err(|e| format!("{e:#}"))
+        });
+        if started && let Some(p) = self.pending.as_mut() {
+            p.progress_rx = Some(prx);
+        }
+    }
+
+    fn open_selected_url(&mut self) {
+        let Some(name) = self.selected_name() else {
+            return;
+        };
+        let Some(url) = self.url_of(&name) else {
+            self.set_error(format!("{name} has no port yet — start it first"));
+            return;
+        };
+        self.open_url(&url);
+        self.set_status(format!("opened {url}"));
+    }
+
+    /// Hands a URL to the desktop, on a worker thread with every stream
+    /// captured: a browser launcher that writes to the terminal would paint
+    /// over the alternate screen.
+    #[cfg(not(test))]
+    fn open_url(&mut self, url: &str) {
+        let url = url.to_string();
+        thread::spawn(move || {
+            let opener = if cfg!(target_os = "macos") {
+                "open"
+            } else {
+                "xdg-open"
+            };
+            let _ = std::process::Command::new(opener)
+                .arg(&url)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output();
+        });
+    }
+
+    #[cfg(test)]
+    fn open_url(&mut self, url: &str) {
+        self.opened = Some(url.to_string());
+    }
+
+    fn toggle_tail_focus(&mut self) {
+        if self.selected_worktree().is_none() {
+            self.set_error("nothing selected");
+            return;
+        }
+        self.tail_focus = !self.tail_focus;
+        self.tail_scroll = 0;
+        if self.tail_focus {
+            self.set_status("log: j/k scroll, l or esc to leave");
+        }
+    }
+
+    fn scroll_tail(&mut self, delta: isize) {
+        let lines = self
+            .selected_worktree()
+            .map(|w| w.name.clone())
+            .and_then(|name| self.log_tails.get(&name).map(|t| t.lines().len()))
+            .unwrap_or(0);
+        let max = lines.saturating_sub(1);
+        // Negative is "up", which in a tail means further back.
+        let next = self.tail_scroll as isize - delta;
+        self.tail_scroll = next.clamp(0, max as isize) as usize;
+    }
+
+    /// Reads whatever the selected worktree's log has grown by. Cheap: an
+    /// offset-based read of one file, nothing forked.
+    fn poll_log_tail(&mut self) -> bool {
+        let Some(name) = self.selected_worktree().map(|w| w.name.clone()) else {
+            return false;
+        };
+        let Some(record) = self.state.worktrees.get(&name) else {
+            return false;
+        };
+        let Some(process) = record.processes.values().next() else {
+            return false;
+        };
+        let path = process.log_path.clone();
+        self.log_tails.touch(&name, path).poll().unwrap_or(false)
+    }
+
+    // ---- background work -------------------------------------------------
+    fn handle_question_key(
+        &mut self,
+        key: KeyEvent,
+        question: actions::Question,
+        mut selected: usize,
+        mut custom: Option<String>,
+        reply: Sender<Result<actions::Answer, String>>,
+    ) {
+        // Whatever happens, the worker gets an answer: it is blocked on this
+        // channel, and a modal that closes without sending would leave it
+        // there forever.
+        if let Some(text) = custom.as_mut() {
+            match key.code {
+                KeyCode::Esc => {
+                    // Back to the list of options, unless there were none.
+                    if question.options.is_empty() {
+                        let _ = reply.send(Err("cancelled".to_string()));
+                        return;
+                    }
+                    custom = None;
+                }
+                KeyCode::Enter => {
+                    let answer = text.trim().to_string();
+                    if answer.is_empty() {
+                        self.set_error("type a command, or esc to go back");
+                    } else {
+                        let _ = reply.send(Ok(actions::Answer::Custom(answer)));
+                        return;
+                    }
+                }
+                KeyCode::Backspace => {
+                    text.pop();
+                }
+                KeyCode::Char(c) => text.push(c),
+                _ => {}
+            }
+        } else {
+            match key.code {
+                KeyCode::Esc => {
+                    let _ = reply.send(Err("cancelled".to_string()));
+                    return;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    selected = (selected + 1).min(question.options.len().saturating_sub(1));
+                }
+                KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+                KeyCode::Char('c') => custom = Some(String::new()),
+                KeyCode::Enter => {
+                    if question.options.is_empty() {
+                        custom = Some(String::new());
+                    } else {
+                        let _ = reply.send(Ok(actions::Answer::Choice(selected)));
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.modal = Some(Modal::Question {
+            question,
+            selected,
+            custom,
+            reply,
+        });
+    }
+
     fn open_create(&mut self) {
         self.modal = Some(Modal::Create {
             input: String::new(),
@@ -545,6 +950,13 @@ impl App {
     }
 
     fn move_cursor(&mut self, delta: isize) {
+        // The tail belongs to a row, so moving off it starts at the end of
+        // the next one's log rather than wherever the last one was scrolled.
+        if self.tail_focus {
+            self.scroll_tail(delta);
+            return;
+        }
+        self.tail_scroll = 0;
         if self.filtered_indices.is_empty() {
             return;
         }
@@ -632,6 +1044,7 @@ impl App {
         self.main = Some(snapshot.main);
         self.default_base = snapshot.default_base;
         self.created_by_pando = snapshot.created_by_pando;
+        self.state = snapshot.state;
         if snapshot.warning != self.state_warning {
             if let Some(message) = snapshot.warning.clone() {
                 self.set_error(message);
@@ -691,6 +1104,25 @@ impl App {
     //
     // Everything below leaves the UI thread immediately. A key handler that
     // shells out to git freezes the frame for as long as git takes.
+
+    /// Advances phases, captures observed ports, and saves — off the UI
+    /// thread, because it takes the state lock and scans listening sockets.
+    pub fn spawn_refresh(&mut self) {
+        if self.refreshing {
+            return;
+        }
+        self.refreshing = true;
+        let paths = self.paths.clone();
+        let tx = self.event_tx.clone();
+        thread::spawn(move || {
+            let refreshed = actions::refresh(&paths);
+            let result = match refreshed.warning {
+                Some(warning) => Err(warning),
+                None => Ok(refreshed.state),
+            };
+            let _ = tx.send(AppEvent::Refreshed(Box::new(result)));
+        });
+    }
 
     pub fn spawn_discovery(&self) {
         let paths = self.paths.clone();
@@ -834,6 +1266,21 @@ impl App {
                         self.set_status(format!("removed {name}"));
                         self.spawn_discovery();
                     }
+                    PendingOutcome::Started(name, url) => {
+                        match url {
+                            Some(url) => self.set_status(format!("started {name} — {url}")),
+                            None => self.set_status(format!("started {name}")),
+                        }
+                        // The log is new, so whatever was tailed for this
+                        // worktree is about the run that just ended.
+                        self.log_tails.forget(&name);
+                        self.tail_scroll = 0;
+                        self.spawn_refresh();
+                    }
+                    PendingOutcome::Stopped(name) => {
+                        self.set_status(format!("stopped {name}"));
+                        self.spawn_refresh();
+                    }
                 }
             }
             Ok(Err(e)) => {
@@ -947,6 +1394,11 @@ impl App {
             default_base: Some("main".into()),
             worktrees,
             created_by_pando: BTreeMap::new(),
+            state: State::new(),
+            refreshing: false,
+            log_tails: LogTails::default(),
+            tail_focus: false,
+            tail_scroll: 0,
             state_warning: None,
             prs: HashMap::new(),
             list_state: ListState::default(),
@@ -964,9 +1416,29 @@ impl App {
             event_tx,
             event_rx: Some(event_rx),
             clipboard: None,
+            opened: None,
         };
         app.refilter();
         app
+    }
+}
+
+/// Sends a question to the UI thread and waits for the answer.
+///
+/// Called from a worker, never from the UI thread. A dropped receiver — the
+/// app quitting while the modal is open — comes back as an error, so the
+/// worker unwinds instead of waiting for an answer nobody will give.
+fn ask_through_ui(tx: &Sender<AppEvent>, question: &actions::Question) -> Result<actions::Answer> {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    tx.send(AppEvent::AskQuestion(Box::new((
+        question.clone(),
+        reply_tx,
+    ))))
+    .map_err(|_| anyhow::anyhow!("pando is shutting down"))?;
+    match reply_rx.recv() {
+        Ok(Ok(answer)) => Ok(answer),
+        Ok(Err(reason)) => Err(anyhow::anyhow!(reason)),
+        Err(_) => Err(anyhow::anyhow!("cancelled")),
     }
 }
 
@@ -974,12 +1446,15 @@ impl App {
 /// the base a new branch would fork from. Runs off the UI thread.
 pub fn snapshot(paths: &PandoPaths) -> Result<Snapshot> {
     let discovery = worktree::discover_all(&paths.project)?;
-    let owned = actions::created_by_pando(paths, &discovery.worktrees);
+    // One read of state for both answers, so the list's ownership dots and
+    // its status column cannot come from two different moments.
+    let refreshed = actions::refresh(paths);
     Ok(Snapshot {
+        created_by_pando: actions::ownership(&refreshed.state, &discovery.worktrees),
         main: discovery.main,
         worktrees: discovery.worktrees,
-        created_by_pando: owned.by_name,
-        warning: owned.warning,
+        state: refreshed.state,
+        warning: refreshed.warning,
         default_base: worktree::resolve_base_branch(paths.root()),
     })
 }
@@ -1041,11 +1516,14 @@ pub mod tests {
     }
 
     pub fn test_app(names: &[&str]) -> App {
+        // A path that cannot exist: these tests drive the app's own logic,
+        // and a worker thread that wandered into a real repository would be
+        // exactly the thing the testing policy forbids.
         let paths = PandoPaths::new(
-            "/tmp/pando-test-home",
+            "/pando-test-does-not-exist/home",
             ProjectRef {
                 id: "acme-shop-3f9a2c1d".into(),
-                root: PathBuf::from("/tmp/acme-shop"),
+                root: PathBuf::from("/pando-test-does-not-exist/acme-shop"),
                 display_name: "acme-shop".into(),
             },
         );
@@ -1053,6 +1531,62 @@ pub mod tests {
         let mut app = App::new_for_test(paths, Config::default(), worktrees);
         app.created_by_pando = names.iter().map(|n| (n.to_string(), true)).collect();
         app
+    }
+
+    use crate::state::{ProcessRecord, WorktreeRecord};
+    use chrono::Utc;
+
+    /// Gives a worktree a process in `phase`, as a refresh would have.
+    pub fn with_process(app: &mut App, name: &str, phase: Phase) {
+        let mut record = WorktreeRecord::new(format!("/trees/{name}"), true);
+        record.ports.insert("web".to_string(), 17_342);
+        record.processes.insert(
+            "dev".to_string(),
+            ProcessRecord {
+                pid: 4242,
+                pgid: 4242,
+                started_at: Utc::now(),
+                log_path: PathBuf::from("/does/not/exist/dev.log"),
+                ready_port: Some(17_342),
+                ready_timeout_s: None,
+                phase,
+            },
+        );
+        app.state.worktrees.insert(name.to_string(), record);
+    }
+
+    pub fn running_phase() -> Phase {
+        Phase::Running { since: Utc::now() }
+    }
+
+    fn a_question() -> actions::Question {
+        actions::Question {
+            slot: crate::detect::Slot::DevCmd,
+            prompt: "Which command starts the local development server?".to_string(),
+            options: vec![
+                (
+                    "pnpm dev".to_string(),
+                    "package.json scripts.dev".to_string(),
+                ),
+                (
+                    "pnpm dev:web".to_string(),
+                    "package.json scripts.dev:web".to_string(),
+                ),
+            ],
+            preselect: Some(0),
+            allow_custom: true,
+        }
+    }
+
+    /// Opens the question modal the way a worker would, and hands back the
+    /// end of the channel that worker would be blocked on.
+    fn open_question(
+        app: &mut App,
+        question: actions::Question,
+    ) -> Receiver<Result<actions::Answer, String>> {
+        let (tx, rx) = mpsc::channel();
+        app.handle_event(AppEvent::AskQuestion(Box::new((question, tx))));
+        rx
     }
 
     fn press(app: &mut App, code: KeyCode) {
@@ -1359,6 +1893,7 @@ pub mod tests {
             main: wt("acme-shop"),
             worktrees: vec![refreshed, wt("feat+two")],
             created_by_pando: BTreeMap::new(),
+            state: State::new(),
             warning: None,
             default_base: Some("main".into()),
         });
@@ -1381,6 +1916,7 @@ pub mod tests {
             main: wt("acme-shop"),
             worktrees: vec![moved],
             created_by_pando: BTreeMap::new(),
+            state: State::new(),
             warning: None,
             default_base: None,
         });
@@ -1397,6 +1933,7 @@ pub mod tests {
             main: wt("acme-shop"),
             worktrees: vec![wt("feat+one")],
             created_by_pando: BTreeMap::new(),
+            state: State::new(),
             warning: warning.map(str::to_string),
             default_base: None,
         };
@@ -1428,6 +1965,7 @@ pub mod tests {
             main: wt("acme-shop"),
             worktrees: vec![wt("fix+three"), wt("feat+one"), wt("feat+two")],
             created_by_pando: BTreeMap::new(),
+            state: State::new(),
             warning: None,
             default_base: None,
         });
@@ -1460,5 +1998,235 @@ pub mod tests {
         assert_eq!(base64(b"fooba"), "Zm9vYmE=");
         assert_eq!(base64(b"foobar"), "Zm9vYmFy");
         assert_eq!(base64("/trees/feat+one".as_bytes()), "L3RyZWVzL2ZlYXQrb25l");
+    }
+    // ---- processes -------------------------------------------------------
+
+    #[test]
+    fn the_process_keys_each_start_their_own_work() {
+        for (key, kind) in [
+            (KeyCode::Char('s'), PendingKind::Start),
+            (KeyCode::Char('x'), PendingKind::Stop),
+            (KeyCode::Char('r'), PendingKind::Restart),
+        ] {
+            let mut app = test_app(&["feat+one"]);
+            press(&mut app, key);
+            let pending = app.pending.as_ref().expect("the key started something");
+            assert_eq!(pending.kind, kind, "{key:?}");
+            assert_eq!(pending.name, "feat+one");
+            // And the work is on a worker thread, not this one: the frame
+            // is still answering keys.
+            assert!(!app.should_quit);
+        }
+    }
+
+    #[test]
+    fn enter_starts_the_selected_worktree() {
+        let mut app = test_app(&["feat+one"]);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.pending.as_ref().map(|p| p.kind),
+            Some(PendingKind::Start)
+        );
+    }
+
+    #[test]
+    fn a_process_key_with_nothing_selected_says_so() {
+        let mut app = test_app(&[]);
+        press(&mut app, KeyCode::Char('s'));
+        assert!(app.pending.is_none());
+        assert_eq!(
+            app.active_status().map(|(m, _)| m),
+            Some("nothing selected")
+        );
+    }
+
+    #[test]
+    fn open_needs_a_port_before_it_has_a_url() {
+        let mut app = test_app(&["feat+one"]);
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.opened, None);
+        let (message, is_error) = app.active_status().unwrap();
+        assert!(message.contains("no port yet"), "{message}");
+        assert!(is_error);
+
+        with_process(&mut app, "feat+one", running_phase());
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.opened.as_deref(), Some("http://localhost:17342"));
+    }
+
+    #[test]
+    fn a_refresh_replaces_the_process_state() {
+        let mut app = test_app(&["feat+one"]);
+        let mut state = State::new();
+        let mut record = WorktreeRecord::new("/trees/feat+one", true);
+        record.ports.insert("web".to_string(), 17_342);
+        state.worktrees.insert("feat+one".to_string(), record);
+        assert!(app.handle_event(AppEvent::Refreshed(Box::new(Ok(state)))));
+        assert_eq!(
+            app.url_of("feat+one").as_deref(),
+            Some("http://localhost:17342")
+        );
+        assert!(!app.refreshing, "the single-flight slot is free again");
+    }
+
+    #[test]
+    fn a_refresh_that_failed_reaches_the_status_line() {
+        let mut app = test_app(&["feat+one"]);
+        app.handle_event(AppEvent::Refreshed(Box::new(Err("state is v3".into()))));
+        let (message, is_error) = app.active_status().unwrap();
+        assert!(message.contains("state is v3"), "{message}");
+        assert!(is_error);
+    }
+
+    // ---- the question modal ----------------------------------------------
+
+    #[test]
+    fn a_question_opens_a_modal_with_the_recommendation_preselected() {
+        let mut app = test_app(&["feat+one"]);
+        let _rx = open_question(&mut app, a_question());
+        match app.modal.as_ref() {
+            Some(Modal::Question {
+                question,
+                selected,
+                custom,
+                ..
+            }) => {
+                assert_eq!(*selected, 0, "the rules' own pick is preselected");
+                assert!(custom.is_none());
+                assert_eq!(question.options.len(), 2);
+            }
+            other => panic!("expected a question modal, got {:?}", other.is_some()),
+        }
+    }
+
+    #[test]
+    fn choosing_an_option_answers_the_worker_and_closes_the_modal() {
+        let mut app = test_app(&["feat+one"]);
+        let rx = open_question(&mut app, a_question());
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(rx.try_recv().unwrap(), Ok(actions::Answer::Choice(1)));
+        assert!(app.modal.is_none(), "the modal closes once it is answered");
+    }
+
+    // Every slot accepts a shell command, so there is never a dead end.
+    #[test]
+    fn a_typed_command_is_sent_as_written() {
+        let mut app = test_app(&["feat+one"]);
+        let rx = open_question(&mut app, a_question());
+        press(&mut app, KeyCode::Char('c'));
+        type_str(&mut app, "./serve.sh");
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Ok(actions::Answer::Custom("./serve.s".to_string()))
+        );
+        assert!(app.modal.is_none());
+    }
+
+    // The worker is blocked on the reply channel. A modal that closed
+    // without sending would leave it there for the life of the process.
+    #[test]
+    fn cancelling_a_question_always_tells_the_worker() {
+        let mut app = test_app(&["feat+one"]);
+        let rx = open_question(&mut app, a_question());
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(rx.try_recv().unwrap(), Err("cancelled".to_string()));
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn escape_from_the_typing_line_goes_back_to_the_options() {
+        let mut app = test_app(&["feat+one"]);
+        let rx = open_question(&mut app, a_question());
+        press(&mut app, KeyCode::Char('c'));
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(
+            app.modal.as_ref(),
+            Some(Modal::Question { custom: None, .. })
+        ));
+        assert!(rx.try_recv().is_err(), "nothing was answered yet");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(rx.try_recv().unwrap(), Err("cancelled".to_string()));
+    }
+
+    #[test]
+    fn a_question_with_no_options_opens_straight_into_typing() {
+        let mut app = test_app(&["feat+one"]);
+        let mut question = a_question();
+        question.options.clear();
+        question.preselect = None;
+        let rx = open_question(&mut app, question);
+        assert!(matches!(
+            app.modal.as_ref(),
+            Some(Modal::Question {
+                custom: Some(_),
+                ..
+            })
+        ));
+        type_str(&mut app, "node server.js");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Ok(actions::Answer::Custom("node server.js".to_string()))
+        );
+    }
+
+    #[test]
+    fn an_empty_typed_answer_is_refused_rather_than_sent() {
+        let mut app = test_app(&["feat+one"]);
+        let rx = open_question(&mut app, a_question());
+        press(&mut app, KeyCode::Char('c'));
+        press(&mut app, KeyCode::Enter);
+        assert!(rx.try_recv().is_err());
+        assert!(app.modal.is_some());
+        assert!(app.active_status().unwrap().0.contains("type a command"));
+    }
+
+    // ---- the log tail ----------------------------------------------------
+
+    #[test]
+    fn the_tail_lru_keeps_the_newest_and_drops_the_coldest() {
+        let mut tails = LogTails::default();
+        for i in 0..MAX_LOG_TAILS + 2 {
+            tails.touch(&format!("w{i}"), PathBuf::from("/does/not/exist.log"));
+        }
+        assert_eq!(tails.len(), MAX_LOG_TAILS);
+        assert!(tails.get("w0").is_none(), "the coldest went");
+        assert!(tails.get(&format!("w{}", MAX_LOG_TAILS + 1)).is_some());
+    }
+
+    #[test]
+    fn the_selected_tail_never_evicts_itself() {
+        let mut tails = LogTails::default();
+        tails.touch("keep", PathBuf::from("/does/not/exist.log"));
+        for i in 0..MAX_LOG_TAILS + 4 {
+            tails.touch("keep", PathBuf::from("/does/not/exist.log"));
+            tails.touch(&format!("w{i}"), PathBuf::from("/does/not/exist.log"));
+        }
+        assert!(tails.get("keep").is_some());
+    }
+
+    #[test]
+    fn focusing_the_log_moves_the_arrow_keys_onto_it() {
+        let mut app = test_app(&["feat+one", "feat+two"]);
+        press(&mut app, KeyCode::Char('l'));
+        assert!(app.tail_focus);
+        let before = app.list_state.selected();
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.list_state.selected(), before, "the cursor stays put");
+        press(&mut app, KeyCode::Char('l'));
+        assert!(!app.tail_focus);
+        press(&mut app, KeyCode::Char('j'));
+        assert_ne!(app.list_state.selected(), before);
+    }
+
+    #[test]
+    fn moving_the_cursor_returns_the_tail_to_the_end() {
+        let mut app = test_app(&["feat+one", "feat+two"]);
+        app.tail_scroll = 12;
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.tail_scroll, 0);
     }
 }

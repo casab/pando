@@ -29,8 +29,126 @@ pub fn render_modal(f: &mut Frame, area: Rect, modal: &Modal, app: &App) {
             blocker,
             created_by_pando,
         } => render_remove(f, area, name, blocker.as_ref(), *created_by_pando),
+        Modal::Question {
+            question,
+            selected,
+            custom,
+            ..
+        } => render_question(f, area, question, *selected, custom.as_deref()),
         Modal::Help => render_help(f, area, app.help_scroll),
     }
+}
+
+/// A question, its options with the signal that found each one, and a line
+/// for a command typed by hand. Every slot accepts one, so there is never a
+/// dead end.
+fn render_question(
+    f: &mut Frame,
+    area: Rect,
+    question: &crate::actions::Question,
+    selected: usize,
+    custom: Option<&str>,
+) {
+    let height = (question.options.len() as u16).min(8) + 7;
+    let Some(inner) = popup(f, area, "pando needs an answer", height, 64) else {
+        return;
+    };
+    let width = inner.width as usize;
+    let [prompt_area, list_area, footer_area] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Fill(1),
+        Constraint::Length(2),
+    ])
+    .areas(inner);
+
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                truncate(&question.prompt, width),
+                Style::new().fg(text()).add_modifier(Modifier::BOLD),
+            ),
+            Line::raw(""),
+        ]),
+        prompt_area,
+    );
+
+    let visible = list_area.height as usize;
+    let start = selected.saturating_sub(visible.saturating_sub(1));
+    let items: Vec<ListItem> = question
+        .options
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+        .map(|(i, (value, why))| {
+            let marker = if i == selected && custom.is_none() {
+                "▸ "
+            } else {
+                "  "
+            };
+            let why = if why.is_empty() {
+                String::new()
+            } else {
+                format!("  {why}")
+            };
+            let value_width = width.saturating_sub(marker.len() + why.chars().count());
+            let mut spans = vec![
+                Span::styled(marker, Style::new().fg(orange())),
+                Span::styled(truncate(value, value_width), Style::new().fg(text())),
+                Span::styled(truncate(&why, width), Style::new().fg(text_muted())),
+            ];
+            if i == selected && custom.is_none() {
+                spans = spans
+                    .into_iter()
+                    .map(|s| Span::styled(s.content, s.style.bg(highlight_bg())))
+                    .collect();
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    if items.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::styled(
+                truncate("pando found nothing to suggest here", width),
+                Style::new().fg(text_muted()),
+            )),
+            list_area,
+        );
+    } else {
+        f.render_widget(List::new(items), list_area);
+    }
+
+    let footer = match custom {
+        Some(typed) => vec![
+            Line::from(vec![
+                Span::styled("> ", Style::new().fg(orange())),
+                Span::styled(
+                    truncate(typed, width.saturating_sub(3)),
+                    Style::new().fg(text()),
+                ),
+                Span::styled("▏", Style::new().fg(orange())),
+            ]),
+            Line::styled(
+                truncate("⏎ accept   esc back", width),
+                Style::new().fg(text_muted()),
+            ),
+        ],
+        None => vec![
+            Line::raw(""),
+            Line::from(vec![
+                Span::styled("⏎", Style::new().fg(orange()).add_modifier(Modifier::BOLD)),
+                Span::styled(" choose   ", Style::new().fg(text_muted())),
+                Span::styled("c", Style::new().fg(orange()).add_modifier(Modifier::BOLD)),
+                Span::styled(" type a command   ", Style::new().fg(text_muted())),
+                Span::styled(
+                    "esc",
+                    Style::new().fg(orange()).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" cancel", Style::new().fg(text_muted())),
+            ]),
+        ],
+    };
+    f.render_widget(Paragraph::new(footer), footer_area);
 }
 
 fn popup(f: &mut Frame, area: Rect, title: &str, height: u16, percent: u16) -> Option<Rect> {
@@ -214,15 +332,20 @@ fn render_remove(
 
 /// Every key the list view answers to. Scrollable, because a tmux split is
 /// often shorter than the keymap.
-const HELP: [(&str, &str); 11] = [
+const HELP: [(&str, &str); 16] = [
     ("j / ↓", "move down"),
     ("k / ↑", "move up"),
     ("g / G", "first / last"),
     ("/", "filter by name or branch"),
+    ("s / ⏎", "start the dev process"),
+    ("x", "stop it"),
+    ("r", "restart it"),
+    ("o", "open its URL"),
+    ("l", "scroll the log tail"),
     ("n", "new worktree"),
     ("d", "remove the selected worktree"),
     ("y", "copy the worktree path"),
-    ("r", "refresh now"),
+    ("R", "refresh now"),
     ("?", "this help"),
     ("q / esc", "quit"),
     ("ctrl-c", "quit from anywhere"),
