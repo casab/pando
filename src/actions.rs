@@ -221,16 +221,23 @@ pub fn install_if_needed(
 
     let _lock = state::lock(&paths.lock_file())?;
     let mut store = state::load(&paths.state_file())?;
-    if let Some(record) = store.worktrees.get_mut(name) {
-        record.hooks.insert(
+    // `or_insert_with`, not `get_mut`: on `start` for an adopted worktree
+    // there is no record yet — `start` creates it after this returns — and
+    // dropping the result on the floor would re-install on every start
+    // forever. A record pando did not create is not claimed as its own.
+    store
+        .worktrees
+        .entry(name.to_string())
+        .or_insert_with(|| WorktreeRecord::new(worktree, false))
+        .hooks
+        .insert(
             INSTALL_HOOK.to_string(),
             state::HookRecord {
                 fingerprint: after,
                 ran_at: Utc::now(),
             },
         );
-        state::save(&paths.state_file(), &store)?;
-    }
+    state::save(&paths.state_file(), &store)?;
     Ok(())
 }
 
@@ -330,6 +337,13 @@ pub fn rm(paths: &PandoPaths, name: &str, yes: bool, force: bool) -> Result<()> 
             target.path.display()
         );
     }
+
+    // Whatever is running goes first. A dev server whose working directory
+    // has just been deleted is not a process anyone can do anything with,
+    // and `rm` removes the record that is the only way to find it again.
+    // Every refusal above has already happened, so a removal pando declines
+    // has not touched it.
+    stop_recorded(&mut store, name)?;
 
     // Nothing is unlinked first. Verified against git 2.51: an ignored file
     // does not block `git worktree remove`, and `--force` does not follow a
@@ -612,31 +626,39 @@ pub fn start(
     let _lock = state::lock(&paths.lock_file())?;
     let mut store = state::load(&paths.state_file())?;
 
-    // Before `reconcile` can drop it: a record whose leader is gone may
+    // Before `reconcile` can drop them: a record whose leader is gone may
     // still have a live child holding the port. Dropping the record first
     // would leak that child and hand its port to someone else.
-    if let Some(existing) = store
-        .worktrees
-        .get(name)
-        .and_then(|r| r.processes.get(&process_name))
-    {
-        let running = matches!(
-            existing.phase,
-            Phase::Starting { .. } | Phase::Running { .. }
-        ) && proc::is_alive(existing.pid);
-        if running {
-            let ports = store.worktrees[name].ports.clone();
-            return Ok(StartOutcome::AlreadyRunning(Box::new(StartedProcess {
-                worktree: name.to_string(),
-                process: process_name,
-                url: url_for(&ports, existing.ready_port),
-                ports,
-                record: existing.clone(),
-                reassigned: false,
-            })));
+    if let Some(record) = store.worktrees.get(name) {
+        if let Some(existing) = record.processes.get(&process_name) {
+            let running = matches!(
+                existing.phase,
+                Phase::Starting { .. } | Phase::Running { .. }
+            ) && proc::is_alive(existing.pid);
+            if running {
+                let ports = record.ports.clone();
+                return Ok(StartOutcome::AlreadyRunning(Box::new(StartedProcess {
+                    worktree: name.to_string(),
+                    process: process_name,
+                    url: url_for(&ports, existing.ready_port),
+                    ports,
+                    record: existing.clone(),
+                    reassigned: false,
+                })));
+            }
         }
-        progress("clearing what is left of the last run");
-        proc::stop(existing.pgid, STOP_GRACE)?;
+        // *Every* group recorded for this worktree, not only the one being
+        // started: a record under another name — state a newer pando wrote,
+        // or a process the developer has since renamed in config — is about
+        // to be dropped by `reconcile`, and a live child of it would be left
+        // holding a port nothing could find again.
+        let groups: Vec<i32> = record.processes.values().map(|p| p.pgid).collect();
+        if !groups.is_empty() {
+            progress("clearing what is left of the last run");
+        }
+        for pgid in groups {
+            proc::stop(pgid, STOP_GRACE)?;
+        }
     }
     state::reconcile(&mut store, proc::is_alive);
 
@@ -652,7 +674,8 @@ pub fn start(
         *record = WorktreeRecord::new(canonical.clone(), false);
     }
     // A sticky failure is for display; starting is the user acting on it.
-    record.processes.remove(&process_name);
+    // Everything goes, because everything was just signalled.
+    record.processes.clear();
     record.observed_ports.clear();
 
     let roles = process.ports.roles();
@@ -1898,6 +1921,53 @@ mod tests {
         );
     }
 
+    // A record under a name this pando does not start — state a newer one
+    // wrote, or a process since renamed in config — is still a process
+    // group, and `reconcile` is about to drop it.
+    #[test]
+    fn start_signals_every_group_recorded_for_the_worktree() {
+        let mut fx = fixture();
+        with_dev(&mut fx, dev("sleep 30"));
+        let name = worktree_named(&fx, "feat/one");
+
+        // A leader that exits and leaves its child behind, recorded under
+        // another process name.
+        let log = fx.paths.log_file(&name, "worker");
+        let stray = crate::testutil::spawn_guarded("sleep 30 & exit 0", &fx.root, &log);
+        let (stray_pid, stray_pgid) = (stray.pid, stray.pgid);
+        assert!(wait_until(Duration::from_secs(5), || {
+            !crate::process::is_alive(stray_pid)
+        }));
+        assert!(crate::process::group_alive(stray_pgid));
+
+        let mut store = fx.state();
+        store.worktrees.get_mut(&name).unwrap().processes.insert(
+            "worker".to_string(),
+            ProcessRecord {
+                pid: stray_pid,
+                pgid: stray_pgid,
+                started_at: Utc::now(),
+                log_path: log,
+                ready_port: None,
+                ready_timeout_s: None,
+                phase: Phase::Running { since: Utc::now() },
+            },
+        );
+        state::save(&fx.paths.state_file(), &store).unwrap();
+
+        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let _guard = guard(&outcome);
+        assert!(
+            !crate::process::group_alive(stray_pgid),
+            "a group nothing would record again must not be left running"
+        );
+        assert_eq!(
+            fx.state().worktrees[&name].processes.len(),
+            1,
+            "and its record goes with it"
+        );
+    }
+
     // ---- restart ---------------------------------------------------------
 
     #[test]
@@ -2067,6 +2137,51 @@ mod tests {
             install_log(&fx, &name).matches("rewriting").count(),
             1,
             "the fingerprint recorded is the one the install left behind, so it settles"
+        );
+    }
+
+    // On `start` for a worktree pando did not create there is no record yet,
+    // so a hook result written through `get_mut` would be dropped and the
+    // install would run again on every single start.
+    #[test]
+    fn the_install_hook_settles_on_an_adopted_worktree_too() {
+        let mut fx = installable_fixture("echo run");
+        with_dev(&mut fx, dev("sleep 30"));
+        // Created by git, not by pando: no state record exists.
+        let adopted = fx.worktrees_dir().join("adopted");
+        std::fs::create_dir_all(fx.worktrees_dir()).unwrap();
+        git(
+            &fx.root,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "adopted",
+                adopted.to_str().unwrap(),
+            ],
+        );
+        assert!(!fx.state().worktrees.contains_key("adopted"));
+
+        let first = start(&fx.paths, &fx.config, "adopted", &noop).unwrap();
+        drop(guard(&first));
+        assert_eq!(install_log(&fx, "adopted").matches("run").count(), 1);
+        assert!(
+            install_fingerprint(&fx, "adopted").is_some(),
+            "the fingerprint is recorded even with no record to hang it on yet"
+        );
+        assert!(
+            !fx.state().worktrees["adopted"].created_by_pando,
+            "and pando does not claim a worktree it found"
+        );
+
+        stop(&fx.paths, "adopted").unwrap();
+        let second = start(&fx.paths, &fx.config, "adopted", &noop).unwrap();
+        let _guard = guard(&second);
+        assert_eq!(
+            install_log(&fx, "adopted").matches("run").count(),
+            1,
+            "nothing changed, so the install does not run again"
         );
     }
 
@@ -2304,6 +2419,63 @@ mod tests {
         let (ask, _) = scripted(vec![Answer::Custom("   ".to_string())]);
         let err = resolve_process(&fx.paths, &fx.config, &ask, &noop).unwrap_err();
         assert!(format!("{err:#}").contains("empty answer"), "{err:#}");
+    }
+
+    // A dev server whose working directory has just been deleted is not a
+    // process anyone can do anything with — and `rm` removes the record
+    // that is the only way to find it again.
+    #[test]
+    fn rm_stops_what_is_running_before_it_removes_the_worktree() {
+        let mut fx = fixture();
+        with_dev(&mut fx, dev("sleep 30"));
+        let name = worktree_named(&fx, "feat/one");
+        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let _guard = guard(&outcome);
+        let pgid = outcome.process().record.pgid;
+        assert!(crate::process::group_alive(pgid));
+
+        rm(&fx.paths, &name, false, false).unwrap();
+        assert!(
+            !crate::process::group_alive(pgid),
+            "rm must not leave a process behind with no record of it"
+        );
+        assert!(!fx.state().worktrees.contains_key(&name));
+        assert!(fx.names().is_empty());
+    }
+
+    // A refusal must still leave the worktree usable: it is only stopped
+    // once every reason to refuse has been checked.
+    #[test]
+    fn a_refused_rm_leaves_the_process_running() {
+        let mut fx = fixture();
+        with_dev(&mut fx, dev("sleep 30"));
+        let name = worktree_named(&fx, "feat/one");
+        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let _guard = guard(&outcome);
+        let pgid = outcome.process().record.pgid;
+
+        // Locked worktrees are always refused, before anything is touched.
+        git(
+            &fx.root,
+            &[
+                "worktree",
+                "lock",
+                fx.worktrees_dir().join(&name).to_str().unwrap(),
+            ],
+        );
+        assert!(rm(&fx.paths, &name, true, true).is_err());
+        assert!(
+            crate::process::group_alive(pgid),
+            "a removal pando declined has not touched what is running"
+        );
+        git(
+            &fx.root,
+            &[
+                "worktree",
+                "unlock",
+                fx.worktrees_dir().join(&name).to_str().unwrap(),
+            ],
+        );
     }
 
     // ---- refresh ---------------------------------------------------------
