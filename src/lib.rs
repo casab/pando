@@ -10,6 +10,7 @@
 //!       → cli · tui
 //! ```
 
+pub mod cache;
 pub mod config;
 pub mod log_tail;
 pub mod paths;
@@ -20,3 +21,4 @@ pub mod state;
 #[cfg(test)]
 pub(crate) mod testutil;
 pub mod theme;
+pub mod worktree;
