@@ -22,6 +22,10 @@ use toml_edit::{DocumentMut, Item, Table as EditTable};
 use crate::paths::PandoPaths;
 use crate::project::ProjectRef;
 
+/// The role `share`, the browser-open key, and a readiness rule all default
+/// to. Roles are otherwise free strings.
+pub const WEB_ROLE: &str = "web";
+
 /// Keys the committed layer may not set, because they decide where pando
 /// writes and are machine-specific.
 const COMMITTED_FORBIDDEN: [&str; 2] = ["root", "worktrees_dir"];
@@ -124,7 +128,7 @@ pub struct ProcessConfig {
 
 /// Roles a process owns. The map form `{ ENV = "role" }` is sugar for the
 /// list plus an env template, expanded when a process is started.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum PortsSpec {
     List(Vec<String>),

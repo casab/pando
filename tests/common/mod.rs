@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use pando::config::{Config, PortsSpec, ProcessConfig};
 use pando::paths::PandoPaths;
 use pando::project::ProjectRef;
 
@@ -107,6 +108,80 @@ impl Kind {
             Kind::MonoWebApi => "mono-web-api",
             Kind::NextMessy => "next-messy",
         }
+    }
+
+    /// The config detection should arrive at for this fixture, for the
+    /// slots this phase fills: install, runtime version files, the dev
+    /// command, its port role, and provision.
+    ///
+    /// Written by hand from `fixtures.md` before detection existed, and
+    /// compared structurally — never as TOML text, because key order and
+    /// comments would make that fragile. Services, hooks and probes are
+    /// later phases and are left empty here.
+    pub fn expected_config(self) -> Config {
+        let mut config = Config::default();
+        match self {
+            Kind::Plain => {
+                config.project.provision = strings(&[".env", ".env.local"]);
+            }
+            Kind::NextPnpmCompose | Kind::NextMessy => {
+                config.project.install = Some("pnpm install --frozen-lockfile".to_string());
+                config.project.provision = strings(&[".env", ".env.local"]);
+                config.runtime.version_files = strings(&[".nvmrc"]);
+                config.processes.insert(
+                    "dev".to_string(),
+                    ProcessConfig {
+                        cmd: "pnpm dev".to_string(),
+                        ports: port_env("PORT"),
+                        ..Default::default()
+                    },
+                );
+            }
+            Kind::DjangoUvPostgres => {
+                config.project.install = Some("uv sync --frozen".to_string());
+                config.project.provision = strings(&[".env"]);
+                config.runtime.version_files = strings(&[".python-version"]);
+                config.processes.insert(
+                    "dev".to_string(),
+                    ProcessConfig {
+                        // Positional: Django takes the port on the command
+                        // line, so there is no environment variable to pick.
+                        cmd: "uv run python manage.py runserver 127.0.0.1:{port:web}".to_string(),
+                        ports: PortsSpec::List(strings(&["web"])),
+                        ..Default::default()
+                    },
+                );
+            }
+            Kind::GoService => {
+                // No install step: `go run` resolves its own modules.
+                config.processes.insert(
+                    "dev".to_string(),
+                    ProcessConfig {
+                        cmd: "go run .".to_string(),
+                        ports: port_env("PORT"),
+                        ..Default::default()
+                    },
+                );
+            }
+            // Level zero: a library has nothing to serve, so detection
+            // proposes nothing and asks nothing.
+            Kind::RustLib => {}
+            Kind::MonoWebApi => {
+                config.project.install = Some("pnpm install --frozen-lockfile".to_string());
+                config.project.provision = strings(&[".env"]);
+                // This phase proposes the root script as one process; the
+                // two-process form is Phase 2b.
+                config.processes.insert(
+                    "dev".to_string(),
+                    ProcessConfig {
+                        cmd: "pnpm dev".to_string(),
+                        ports: port_env("WEB_PORT"),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        config
     }
 
     pub const ALL: [Kind; 7] = [
@@ -424,4 +499,17 @@ fn ignored_files_for(kind: Kind) -> Vec<(&'static str, &'static str)> {
         )],
         Kind::GoService | Kind::RustLib => vec![],
     }
+}
+
+fn strings(values: &[&str]) -> Vec<String> {
+    values.iter().map(|v| v.to_string()).collect()
+}
+
+/// `ports = { <VAR> = "web" }`: the sugar for one role reached through an
+/// environment variable.
+fn port_env(var: &str) -> PortsSpec {
+    PortsSpec::Map(std::collections::BTreeMap::from([(
+        var.to_string(),
+        "web".to_string(),
+    )]))
 }
