@@ -60,6 +60,11 @@ pub enum AppEvent {
     /// other end of this channel until one arrives — or until the channel
     /// is dropped, which is how quitting aborts it.
     AskQuestion(Box<(actions::Question, Sender<Result<actions::Answer, String>>)>),
+    /// Detection settled something, and this is the config with it applied.
+    /// Sent as soon as it is resolved rather than with the outcome: the
+    /// answer is on disk by then, so the UI thread's copy has to match
+    /// whether or not the start that followed worked.
+    ConfigResolved(Box<Config>),
 }
 
 /// One consistent read of the repository, taken off the UI thread.
@@ -455,6 +460,14 @@ impl App {
                     }
                 }
             }
+            AppEvent::ConfigResolved(config) => {
+                // The one place the session's config changes while it runs.
+                // Without it the modal reopens on the next `s`, with the
+                // rule's first candidate preselected rather than the answer
+                // just given.
+                self.config = *config;
+                false
+            }
             AppEvent::AskQuestion(boxed) => {
                 let (question, reply) = *boxed;
                 let selected = question.preselect.unwrap_or(0);
@@ -711,6 +724,10 @@ impl App {
             let ask = |question: &actions::Question| ask_through_ui(&tx, question);
             let config = actions::resolve_process(&paths, &config, &ask, &progress)
                 .map_err(|e| format!("{e:#}"))?;
+            // Back to the UI thread at once: an answer written to
+            // `pando.toml` that this session's own copy does not have is
+            // one the next keypress asks all over again.
+            let _ = tx.send(AppEvent::ConfigResolved(Box::new(config.clone())));
             actions::start(&paths, &config, &worker_name, &progress)
                 .map(|outcome| {
                     let started = outcome.process();
@@ -752,6 +769,7 @@ impl App {
             let ask = |question: &actions::Question| ask_through_ui(&tx, question);
             let config = actions::resolve_process(&paths, &config, &ask, &progress)
                 .map_err(|e| format!("{e:#}"))?;
+            let _ = tx.send(AppEvent::ConfigResolved(Box::new(config.clone())));
             actions::restart(&paths, &config, &worker_name, &progress)
                 .map(|outcome| {
                     PendingOutcome::Started(worker_name.clone(), outcome.process().url.clone())
@@ -2018,6 +2036,59 @@ pub mod tests {
             // is still answering keys.
             assert!(!app.should_quit);
         }
+    }
+
+    // The answers a session writes have to be in that session's own copy of
+    // the config. They were written to `pando.toml` and nowhere else, so
+    // the next `s` re-ran detection against a config that still had
+    // nothing and asked the same question again — with the rule's first
+    // candidate preselected rather than the answer just given.
+    #[test]
+    fn what_a_start_resolves_is_applied_to_this_session_in_memory() {
+        // A real repository, because detection reads one. Nothing is
+        // started: the worktree in the list does not exist, so the worker
+        // resolves, sends the config, and then fails to find it — which is
+        // exactly the case the config must survive.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("acme-shop");
+        crate::testutil::init_repo(&root);
+        std::fs::write(
+            root.join("package.json"),
+            "{\n  \"name\": \"x\",\n  \"scripts\": { \"dev\": \"next dev\" }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+        std::fs::write(root.join(".env.example"), "PORT=3000\n").unwrap();
+        let paths = PandoPaths::new(
+            dir.path().join("pando-home"),
+            crate::project::ProjectRef::from_root(&root).unwrap(),
+        );
+        let mut app = App::new_for_test(paths, Config::default(), vec![wt("feat+one")]);
+        assert!(app.config.processes.is_empty(), "nothing is known yet");
+
+        press(&mut app, KeyCode::Char('s'));
+        let rx = app.event_rx.take().expect("the app owns its receiver");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut applied = false;
+        while Instant::now() < deadline && !applied {
+            match rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(event) => {
+                    let is_config = matches!(event, AppEvent::ConfigResolved(_));
+                    app.handle_event(event);
+                    applied = is_config;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        app.event_rx = Some(rx);
+
+        assert!(applied, "the worker never sent what it resolved");
+        assert_eq!(
+            app.config.processes["dev"].cmd, "pnpm dev",
+            "the session knows what it just answered, so the next `s` asks nothing"
+        );
+        assert_eq!(app.config.processes["dev"].roles(), vec!["web"]);
     }
 
     #[test]
