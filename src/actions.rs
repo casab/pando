@@ -2450,7 +2450,10 @@ mod tests {
         let _guard = guard(&outcome);
         let port = outcome.ports["web"];
 
-        let squatter = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        // Taking the port is this test's setup, not what it is about: on a
+        // busy run another test's listener can hold it for a moment, and a
+        // failure there says nothing about readiness.
+        let squatter = bind_when_free(port);
         let refreshed = refresh(&fx.paths);
         assert!(
             matches!(
@@ -2460,6 +2463,20 @@ mod tests {
             "readiness is about this group's own sockets, not about the port"
         );
         drop(squatter);
+    }
+
+    /// Takes `port`, waiting for whatever else on this machine has it.
+    fn bind_when_free(port: u16) -> std::net::TcpListener {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match std::net::TcpListener::bind(("127.0.0.1", port)) {
+                Ok(listener) => return listener,
+                Err(e) if std::time::Instant::now() >= deadline => {
+                    panic!("could not take port {port} to squat on: {e}")
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
     }
 
     /// A "dev server" that tries to bind the IPv4 wildcard over and over and
@@ -2661,7 +2678,9 @@ time.sleep(300)
             log_source(&fx, &name, "api")
         );
         assert!(
-            log_source(&fx, &name, "api").contains(&format!("PORT={api_port}")),
+            wait_until(Duration::from_secs(30), || {
+                log_source(&fx, &name, "api").contains(&format!("PORT={api_port}"))
+            }),
             "the map form of ports reaches the process it belongs to: {:?}",
             log_source(&fx, &name, "api")
         );

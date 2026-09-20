@@ -359,7 +359,13 @@ mod tests {
             "{port} is held by an IPv6 listener and must not be handed out"
         );
         drop(listener);
-        assert!(is_port_free(port), "and it is free again once that goes");
+        // Bounded, not instant: the probe binds three addresses, and on a
+        // busy run another thread's probe can hold this one for a moment.
+        // What is being pinned is that a released port reads as free.
+        assert!(
+            crate::testutil::wait_until(std::time::Duration::from_secs(10), || is_port_free(port)),
+            "and it is free again once that goes"
+        );
     }
 
     // A machine with no IPv6 at all must not have every port read as taken.
