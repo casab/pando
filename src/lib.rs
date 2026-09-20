@@ -10,6 +10,7 @@
 //!       → cli · tui
 //! ```
 
+pub mod actions;
 pub mod cache;
 pub mod config;
 pub mod log_tail;
