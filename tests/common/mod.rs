@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use pando::config::{Config, PortsSpec, ProcessConfig};
+use pando::config::{Config, PortsSpec, ProcessConfig, ReadySpec};
 use pando::paths::PandoPaths;
 use pando::project::ProjectRef;
 
@@ -169,14 +169,45 @@ impl Kind {
             Kind::MonoWebApi => {
                 config.project.install = Some("pnpm install --frozen-lockfile".to_string());
                 config.project.provision = strings(&[".env"]);
-                // This phase proposes the root script as one process; the
-                // two-process form is Phase 2b.
+                // Two processes, each in its own directory, with the web
+                // one told the api's port. The root `dev` script is a
+                // `pnpm -r` wrapper, which works but gives one log and one
+                // readiness rule for two servers.
                 config.processes.insert(
-                    "dev".to_string(),
+                    "web".to_string(),
+                    ProcessConfig {
+                        // Vite takes its port on the command line, so the
+                        // flag is appended to the app's own dev script.
+                        cmd: "pnpm dev -- --port {port:web}".to_string(),
+                        cwd: Some("apps/web".to_string()),
+                        ports: Some(PortsSpec::List(strings(&["web"]))),
+                        // The reason `{port:<role>}` exists: the web app
+                        // has to be told the port the api was given in
+                        // this worktree.
+                        env: std::collections::BTreeMap::from([(
+                            "VITE_API_URL".to_string(),
+                            "http://localhost:{port:api}".to_string(),
+                        )]),
+                        ready: Some(ReadySpec {
+                            role: Some("web".to_string()),
+                            timeout_s: None,
+                        }),
+                    },
+                );
+                config.processes.insert(
+                    "api".to_string(),
                     ProcessConfig {
                         cmd: "pnpm dev".to_string(),
-                        ports: Some(port_env("WEB_PORT")),
-                        ..Default::default()
+                        cwd: Some("apps/api".to_string()),
+                        ports: Some(PortsSpec::List(strings(&["api"]))),
+                        env: std::collections::BTreeMap::from([(
+                            "PORT".to_string(),
+                            "{port:api}".to_string(),
+                        )]),
+                        ready: Some(ReadySpec {
+                            role: Some("api".to_string()),
+                            timeout_s: None,
+                        }),
                     },
                 );
             }

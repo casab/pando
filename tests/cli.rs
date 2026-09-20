@@ -518,8 +518,11 @@ fn a_configured_process_is_never_given_a_dev_table_beside_it() {
 // every other command still works, and only `start` has something to say.
 #[test]
 fn a_dev_table_with_no_command_is_refused_only_by_start() {
-    let e = env_of(Kind::NextPnpmCompose);
-    e.write_config("[dev]\ncwd = \".\"\n");
+    // A repository with nothing to serve, so detection has no command to
+    // fill in and `cmd` really is missing when `start` asks for it.
+    let e = env_of(Kind::RustLib);
+    // The install step is only here so there is a log to read below.
+    e.write_config("[project]\ninstall = \"true\"\n\n[dev]\ncwd = \".\"\n");
     assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
 
     for args in [
@@ -540,6 +543,38 @@ fn a_dev_table_with_no_command_is_refused_only_by_start() {
         "it says what is missing: {}",
         stderr(&out)
     );
+}
+
+// The other half of the same shape: a `[dev]` a developer left half
+// written is an invitation, not an error. Detection fills the command and
+// the ports, and keeps every key they did write.
+#[test]
+fn a_dev_table_with_no_command_is_filled_in_by_detection() {
+    let e = env_of(Kind::NextPnpmCompose);
+    e.write_config("[dev]\ncwd = \".\"\nenv = { GREETING = \"hello\" }\n");
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+
+    let out = e.pando(&["start", "feat+one"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+
+    let text = std::fs::read_to_string(e.config_file()).unwrap();
+    assert!(
+        text.contains("cmd = \"pnpm dev\""),
+        "the command is filled in: {text}"
+    );
+    assert!(
+        text.contains("# detected:"),
+        "and says where it came from: {text}"
+    );
+    assert!(
+        text.contains("ports = { PORT = \"web\" }"),
+        "and so is the port, which was unset: {text}"
+    );
+    assert!(
+        text.contains("cwd = \".\"") && text.contains("GREETING"),
+        "what the developer wrote is untouched: {text}"
+    );
+    assert_eq!(code(&e.pando(&["stop"])), EXIT_OK);
 }
 
 // A command run from a directory that no longer exists fails before git is

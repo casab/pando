@@ -20,7 +20,14 @@ fn detected(root: &Path) -> (Config, Vec<Proposal>) {
     let proposals = detect::propose(root, &signals);
     let mut config = Config::default();
     let mut asked = Vec::new();
+    // The same two gates `actions::resolve` applies, in the same order:
+    // this helper is what the resolver does with the answers taken at
+    // their preferred candidate, so it has to make the same decisions.
+    let mut may_fill_dev = detect::may_fill_dev(&config);
     for proposal in &proposals {
+        if matches!(proposal.slot, Slot::DevCmd | Slot::PortEnv) && !may_fill_dev {
+            continue;
+        }
         if !detect::still_needed(proposal.slot, &config) {
             continue;
         }
@@ -31,6 +38,9 @@ fn detected(root: &Path) -> (Config, Vec<Proposal>) {
             asked.push(proposal.clone());
         }
         detect::apply(proposal.slot, candidate, &mut config);
+        if proposal.slot == Slot::Processes {
+            may_fill_dev = detect::fills_one_dev_process(&config);
+        }
     }
     (config, asked)
 }
@@ -147,6 +157,60 @@ fn a_dev_script_that_runs_one_server_is_taken_without_asking() {
         .expect("a dev command");
     assert!(dev.decided);
     assert_eq!(dev.preferred().unwrap().value, "pnpm dev");
+}
+
+// Phase 2b: the workspace fixture proposes the two-process form, with one
+// confirmation, and everything `fixtures.md` says it should hold.
+#[test]
+fn a_workspace_proposes_a_process_per_app_after_one_question() {
+    let (_dir, root) = fixture(Kind::MonoWebApi);
+    let (config, asked) = detected(&root);
+    assert_eq!(config, Kind::MonoWebApi.expected_config());
+
+    let slots: Vec<Slot> = asked.iter().map(|p| p.slot).collect();
+    assert_eq!(
+        slots,
+        vec![Slot::Processes],
+        "one confirmation, not one question per app"
+    );
+    let offered: Vec<&str> = asked[0]
+        .candidates
+        .iter()
+        .map(|c| c.value.as_str())
+        .collect();
+    assert_eq!(offered.len(), 2, "the per-app form, or the root script");
+    assert_eq!(
+        offered[1], "pnpm dev",
+        "declining falls back to the root script"
+    );
+    assert_eq!(asked[0].preferred().unwrap().value, offered[0]);
+
+    // The whole point of the shape: one process is told the other's port.
+    assert_eq!(
+        config.processes["web"].env["VITE_API_URL"],
+        "http://localhost:{port:api}"
+    );
+    assert_eq!(config.processes["api"].env["PORT"], "{port:api}");
+    assert_eq!(config.processes["web"].cwd.as_deref(), Some("apps/web"));
+    assert_eq!(config.processes["api"].cwd.as_deref(), Some("apps/api"));
+}
+
+// Fixture 6 has a `concurrently` wrapper and no workspace behind it: the
+// per-app form is only offered when there are per-app manifests to offer.
+#[test]
+fn a_wrapper_script_with_no_workspace_is_still_one_process() {
+    for kind in [Kind::NextMessy, Kind::NextPnpmCompose] {
+        let (_dir, root) = fixture(kind);
+        let signals = detect::signals(&root);
+        assert!(
+            detect::propose(&root, &signals)
+                .iter()
+                .all(|p| p.slot != Slot::Processes),
+            "{} is not a workspace",
+            kind.dir_name()
+        );
+        assert!(detect::workspace_apps(&root, &signals).is_empty());
+    }
 }
 
 #[test]

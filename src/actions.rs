@@ -497,8 +497,10 @@ impl std::error::Error for NeedsAnswer {}
 /// local files a worktree needs a copy of.
 pub const NEW_SLOTS: [Slot; 3] = [Slot::Install, Slot::VersionFiles, Slot::Provision];
 
-/// The slots `start` fills: the dev process and how it takes its port.
-pub const START_SLOTS: [Slot; 2] = [Slot::DevCmd, Slot::PortEnv];
+/// The slots `start` fills: how many processes there are, then the dev
+/// process and how it takes its port. `Processes` first, because the
+/// answer to it decides whether the other two have anything left to ask.
+pub const START_SLOTS: [Slot; 3] = [Slot::Processes, Slot::DevCmd, Slot::PortEnv];
 
 /// Fills the dev process from detection when config has none.
 pub fn resolve_process(
@@ -535,22 +537,28 @@ pub fn resolve(
     if slots.iter().all(|slot| already_answered(*slot, &config)) {
         return Ok(config);
     }
-    // A project whose config already declares its processes has answered
-    // both process slots by declaring them — including a `[dev]` whose
-    // ports the developer deliberately left out. Detection can only write
-    // the `[dev]` shorthand, and `[dev]` beside `[processes]` is a file
-    // pando's own loader refuses, so the slots are not resolved at all
-    // rather than resolved into a file nothing can read afterwards.
-    let declared_processes = !config.processes.is_empty();
     let signals = detect::signals(paths.root());
     let proposals = detect::propose(paths.root(), &signals);
+    // Asked of the config as it was loaded: once detection has written
+    // `[dev].cmd`, the file is indistinguishable from one a developer
+    // wrote by hand, and a `[dev]` they wrote is an answer about its ports
+    // too. The only thing that changes it mid-run is an answer to the
+    // shape question itself.
+    let mut may_fill_dev = detect::may_fill_dev(&config);
 
     for slot in slots {
-        if declared_processes && matches!(slot, Slot::DevCmd | Slot::PortEnv) {
+        if matches!(slot, Slot::DevCmd | Slot::PortEnv) && !may_fill_dev {
             continue;
         }
         // Just in time, and once: a slot the developer has already filled
-        // in, by hand or by answering before, is never asked about again.
+        // in, by hand or by answering before, is never asked about again —
+        // and a config that declares its processes has answered every
+        // question about them, including the ones detection could only
+        // write into `[dev]`.
+        //
+        // Re-read from `config` on every pass, because an earlier slot in
+        // this same run may have answered a later one: taking the
+        // per-app form settles the dev command and its ports with it.
         if already_answered(*slot, &config) || !detect::still_needed(*slot, &config) {
             continue;
         }
@@ -590,7 +598,7 @@ pub fn resolve(
                 // be different states, or the question returns on every
                 // start and the answer is a port nothing will ever bind.
                 Answer::None if *slot == Slot::PortEnv => {
-                    let (table, key) = Slot::PortEnv.key();
+                    let (table, key) = Slot::PortEnv.key().expect("the port slot writes one key");
                     config::set_detected(
                         paths,
                         table,
@@ -612,10 +620,17 @@ pub fn resolve(
         if candidate.value.trim().is_empty() {
             bail!("an empty answer is not a {}", slot_label(*slot));
         }
-        for (table, key, value) in detect::edits(*slot, &candidate) {
-            config::set_detected(paths, table, key, value, note.clone())?;
+        for edit in detect::edits(*slot, &candidate) {
+            let table: Vec<&str> = edit.table.iter().map(String::as_str).collect();
+            config::set_detected(paths, &table, &edit.key, edit.value, note.clone())?;
         }
         detect::apply(*slot, &candidate, &mut config);
+        if *slot == Slot::Processes {
+            // The answer decided the shape. The per-app form leaves the
+            // single-process slots nothing to fill; the root-script form
+            // leaves them the port.
+            may_fill_dev = detect::fills_one_dev_process(&config);
+        }
     }
     Ok(config)
 }
@@ -648,6 +663,7 @@ fn slot_label(slot: Slot) -> &'static str {
     match slot {
         Slot::Install => "install command",
         Slot::VersionFiles => "runtime version file",
+        Slot::Processes => "process list",
         Slot::DevCmd => "dev command",
         Slot::PortEnv => "port variable",
         Slot::Provision => "provision list",
@@ -660,11 +676,10 @@ fn already_answered(slot: Slot, config: &Config) -> bool {
         Slot::Install => config.project.install.is_some(),
         Slot::VersionFiles => !config.runtime.version_files.is_empty(),
         Slot::Provision => !config.project.provision.is_empty(),
-        Slot::DevCmd => config
-            .processes
-            .get(detect::DEV)
-            .is_some_and(|p| !p.cmd.trim().is_empty()),
-        Slot::PortEnv => !detect::still_needed(Slot::PortEnv, config),
+        // Both of these now live in one place, because they are the same
+        // question asked twice: has anything already said what this
+        // project's processes are?
+        Slot::Processes | Slot::DevCmd | Slot::PortEnv => !detect::still_needed(slot, config),
     }
 }
 
@@ -3522,6 +3537,166 @@ time.sleep(300)
         git(&fx.root, &["add", "."]);
         git(&fx.root, &["commit", "--quiet", "-m", "app"]);
         fx
+    }
+
+    /// A workspace fixture: two apps, each with its own dev script, and an
+    /// env example in which one points at the other.
+    fn workspace_fixture() -> Fx {
+        let fx = detectable_fixture(
+            r#"{ "dev": "pnpm -r --parallel dev" }"#,
+            "WEB_PORT=5173\nAPI_PORT=4000\nVITE_API_URL=http://localhost:4000\n",
+        );
+        std::fs::write(
+            fx.root.join("package.json"),
+            "{\n  \"workspaces\": [\"apps/*\"],\n  \"scripts\": { \"dev\": \"pnpm -r --parallel dev\" }\n}\n",
+        )
+        .unwrap();
+        for (dir, manifest) in [
+            ("apps/web", r#"{ "scripts": { "dev": "vite" } }"#),
+            ("apps/api", r#"{ "scripts": { "dev": "node server.js" } }"#),
+        ] {
+            std::fs::create_dir_all(fx.root.join(dir)).unwrap();
+            std::fs::write(fx.root.join(dir).join("package.json"), manifest).unwrap();
+        }
+        std::fs::write(
+            fx.root.join("apps/web/vite.config.ts"),
+            "export default {}\n",
+        )
+        .unwrap();
+        git(&fx.root, &["add", "."]);
+        git(&fx.root, &["commit", "--quiet", "-m", "workspace"]);
+        fx
+    }
+
+    #[test]
+    fn a_workspace_is_asked_about_once_and_yes_takes_the_per_app_form() {
+        let fx = workspace_fixture();
+        // What `--yes` does: the first option, recorded as a flag's choice
+        // rather than a rule's.
+        let (ask, asked) = scripted(vec![Answer::Auto(0)]);
+        let config = resolve_process(&fx.paths, &fx.config, &ask, &noop).unwrap();
+
+        let questions = asked.borrow();
+        assert_eq!(questions.len(), 1, "one question, not one per app");
+        assert_eq!(questions[0].slot, Slot::Processes);
+        assert_eq!(questions[0].preselect, Some(0));
+        assert_eq!(
+            questions[0].options.len(),
+            2,
+            "the per-app form and the root script"
+        );
+
+        assert_eq!(
+            config.processes.keys().cloned().collect::<Vec<_>>(),
+            vec!["api", "web"]
+        );
+        assert_eq!(config.processes["web"].cwd.as_deref(), Some("apps/web"));
+        assert_eq!(
+            config.processes["web"].env["VITE_API_URL"],
+            "http://localhost:{port:api}"
+        );
+
+        let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+        assert!(written.contains("[processes.web]"), "{written}");
+        assert!(written.contains("[processes.api]"), "{written}");
+        assert!(
+            !written.contains("\n[dev]"),
+            "nothing may write [dev] beside [processes]: {written}"
+        );
+        assert!(
+            written.contains("--yes took the first of 2 options"),
+            "a flag's choice says so: {written}"
+        );
+        // And the file pando wrote is one pando reads back.
+        let loaded = crate::config::load(&fx.paths).unwrap();
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        assert_eq!(loaded.config.processes.len(), 2);
+
+        // Second run: nothing left to ask.
+        let again = resolve_process(&fx.paths, &loaded.config, &refuse, &noop).unwrap();
+        assert_eq!(again.processes.len(), 2);
+    }
+
+    #[test]
+    fn declining_the_workspace_question_keeps_the_root_script() {
+        let fx = workspace_fixture();
+        // The second option is the root script; the port question follows
+        // it, because one process still needs a port.
+        let (ask, asked) = scripted(vec![Answer::Choice(1), Answer::Choice(0)]);
+        let config = resolve_process(&fx.paths, &fx.config, &ask, &noop).unwrap();
+
+        let questions = asked.borrow();
+        assert_eq!(
+            questions.iter().map(|q| q.slot).collect::<Vec<_>>(),
+            vec![Slot::Processes, Slot::PortEnv]
+        );
+        assert_eq!(
+            config.processes.keys().cloned().collect::<Vec<_>>(),
+            vec!["dev"]
+        );
+        assert_eq!(config.processes["dev"].cmd, "pnpm dev");
+        assert_eq!(config.processes["dev"].port_env()["WEB_PORT"], "{port:web}");
+
+        let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+        assert!(written.contains("[dev]"), "one process is [dev]: {written}");
+        assert!(!written.contains("[processes."), "{written}");
+    }
+
+    #[test]
+    fn a_lone_dev_with_no_command_is_filled_in_and_its_own_keys_are_kept() {
+        let mut fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");
+        fx.config.processes.insert(
+            "dev".to_string(),
+            ProcessConfig {
+                cwd: Some(".".to_string()),
+                env: BTreeMap::from([("GREETING".to_string(), "hello".to_string())]),
+                ..Default::default()
+            },
+        );
+        let config = resolve_process(&fx.paths, &fx.config, &refuse, &noop).unwrap();
+        assert_eq!(config.processes["dev"].cmd, "pnpm dev");
+        assert_eq!(config.processes["dev"].roles(), vec!["web"]);
+        assert_eq!(config.processes["dev"].cwd.as_deref(), Some("."));
+        assert_eq!(config.processes["dev"].env["GREETING"], "hello");
+    }
+
+    // A `ports` the developer wrote is an answer, including the empty one.
+    #[test]
+    fn a_lone_dev_that_says_it_has_no_ports_keeps_none() {
+        let mut fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");
+        fx.config.processes.insert(
+            "dev".to_string(),
+            ProcessConfig {
+                ports: Some(PortsSpec::List(Vec::new())),
+                ..Default::default()
+            },
+        );
+        let config = resolve_process(&fx.paths, &fx.config, &refuse, &noop).unwrap();
+        assert_eq!(
+            config.processes["dev"].cmd, "pnpm dev",
+            "the command is filled"
+        );
+        assert!(
+            config.processes["dev"].roles().is_empty(),
+            "and the ports are left exactly as they were"
+        );
+    }
+
+    // The workspace question is only for a workspace. Anywhere else the
+    // dev-command question is the one asked, as it was before.
+    #[test]
+    fn a_project_that_is_not_a_workspace_is_never_asked_about_processes() {
+        let fx = detectable_fixture(
+            r#"{ "dev": "concurrently \"npm:dev:*\"", "dev:web": "next dev" }"#,
+            "PORT=3000\n",
+        );
+        let (ask, asked) = scripted(vec![Answer::Choice(1)]);
+        resolve_process(&fx.paths, &fx.config, &ask, &noop).unwrap();
+        assert_eq!(
+            asked.borrow().iter().map(|q| q.slot).collect::<Vec<_>>(),
+            vec![Slot::DevCmd],
+            "a wrapper script with no workspace behind it is still one process"
+        );
     }
 
     #[test]

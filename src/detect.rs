@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
-use crate::config::{Config, PortsSpec};
+use crate::config::{Config, PortsSpec, ProcessConfig, ReadySpec};
 
 // ---- signals --------------------------------------------------------------
 
@@ -32,8 +32,10 @@ pub struct Signals {
     pub lockfiles: Vec<String>,
     pub workspace_markers: Vec<String>,
     pub version_files: Vec<String>,
-    /// Keys from `.env.example` and friends, in file order.
-    pub env_example_keys: Vec<String>,
+    /// `.env.example` entries, in file order. The values matter as well as
+    /// the keys: a value that is a localhost URL is how one app says where
+    /// another one listens.
+    pub env_example: Vec<(String, String)>,
     /// Framework marker files that exist.
     pub markers: Vec<String>,
     pub compose_files: Vec<String>,
@@ -106,7 +108,7 @@ pub fn signals(root: &Path) -> Signals {
         lockfiles: present(root, &LOCKFILES),
         workspace_markers: present(root, &WORKSPACE_MARKERS),
         version_files: present(root, &VERSION_FILES),
-        env_example_keys: env_example_keys(root),
+        env_example: env_example(root),
         markers: present(root, &MARKER_FILES),
         compose_files: present(root, &COMPOSE_FILES),
         ignored_present: ignored_present(root),
@@ -194,8 +196,15 @@ fn parse_targets(root: &Path) -> BTreeMap<String, String> {
     out
 }
 
-/// Keys of the first env example file that exists, in file order.
-fn env_example_keys(root: &Path) -> Vec<String> {
+impl Signals {
+    /// The env example's keys, for the rules that only care about names.
+    pub fn env_keys(&self) -> impl Iterator<Item = &str> {
+        self.env_example.iter().map(|(key, _)| key.as_str())
+    }
+}
+
+/// Entries of the first env example file that exists, in file order.
+fn env_example(root: &Path) -> Vec<(String, String)> {
     for name in ENV_EXAMPLES {
         let Ok(text) = std::fs::read_to_string(root.join(name)) else {
             continue;
@@ -204,8 +213,9 @@ fn env_example_keys(root: &Path) -> Vec<String> {
             .lines()
             .map(str::trim)
             .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .filter_map(|l| l.split_once('=').map(|(k, _)| k.trim().to_string()))
-            .filter(|k| !k.is_empty())
+            .filter_map(|l| l.split_once('='))
+            .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
+            .filter(|(key, _)| !key.is_empty())
             .collect();
     }
     Vec::new()
@@ -283,6 +293,12 @@ pub struct FrameworkRule {
     /// The command to propose when the project has no script to run.
     /// `{runner}` is replaced with the project's package or venv runner.
     pub command: Option<&'static str>,
+    /// The flag that tells this framework its port, for an app whose own
+    /// script pando runs rather than the command above: `pnpm dev --
+    /// --port 1234`. `{port}` is replaced with the role template. `None`
+    /// for a framework that takes its port some other way — Django's
+    /// positional `host:port` cannot be appended to somebody's script.
+    pub port_flag: Option<&'static str>,
 }
 
 /// The ten rules v1 ships with. Order matters: the first match wins, so the
@@ -295,6 +311,7 @@ pub const RULES: [FrameworkRule; 10] = [
         port: PortMechanism::Env("PORT"),
         default_port: 3000,
         command: Some("npx next dev"),
+        port_flag: Some("--port {port}"),
     },
     FrameworkRule {
         name: "Nuxt",
@@ -303,6 +320,7 @@ pub const RULES: [FrameworkRule; 10] = [
         port: PortMechanism::Env("PORT"),
         default_port: 3000,
         command: Some("npx nuxt dev"),
+        port_flag: Some("--port {port}"),
     },
     FrameworkRule {
         name: "Vite",
@@ -313,6 +331,7 @@ pub const RULES: [FrameworkRule; 10] = [
         port: PortMechanism::InCommand,
         default_port: 5173,
         command: Some("npx vite --port {port:web}"),
+        port_flag: Some("--port {port}"),
     },
     FrameworkRule {
         name: "Django",
@@ -321,6 +340,7 @@ pub const RULES: [FrameworkRule; 10] = [
         port: PortMechanism::InCommand,
         default_port: 8000,
         command: Some("{runner}python manage.py runserver 127.0.0.1:{port:web}"),
+        port_flag: None,
     },
     FrameworkRule {
         name: "Rails",
@@ -329,6 +349,7 @@ pub const RULES: [FrameworkRule; 10] = [
         port: PortMechanism::InCommand,
         default_port: 3000,
         command: Some("bin/rails server -p {port:web}"),
+        port_flag: Some("-p {port}"),
     },
     FrameworkRule {
         name: "Phoenix",
@@ -337,6 +358,7 @@ pub const RULES: [FrameworkRule; 10] = [
         port: PortMechanism::Env("PORT"),
         default_port: 4000,
         command: Some("mix phx.server"),
+        port_flag: None,
     },
     FrameworkRule {
         name: "Laravel",
@@ -345,6 +367,7 @@ pub const RULES: [FrameworkRule; 10] = [
         port: PortMechanism::InCommand,
         default_port: 8000,
         command: Some("php artisan serve --port {port:web}"),
+        port_flag: Some("--port {port}"),
     },
     FrameworkRule {
         name: "Go",
@@ -353,6 +376,7 @@ pub const RULES: [FrameworkRule; 10] = [
         port: PortMechanism::Env("PORT"),
         default_port: 8080,
         command: Some("go run ."),
+        port_flag: None,
     },
     FrameworkRule {
         name: "Rust",
@@ -363,6 +387,7 @@ pub const RULES: [FrameworkRule; 10] = [
         // Only for a crate that builds a binary; a library has nothing to
         // run, which `binary_crate` decides.
         command: Some("cargo run"),
+        port_flag: None,
     },
     FrameworkRule {
         name: "Node",
@@ -371,6 +396,7 @@ pub const RULES: [FrameworkRule; 10] = [
         port: PortMechanism::Env("PORT"),
         default_port: 3000,
         command: None,
+        port_flag: None,
     },
 ];
 
@@ -413,21 +439,28 @@ fn binary_crate(root: &Path) -> bool {
 pub enum Slot {
     Install,
     VersionFiles,
+    /// The shape of the whole `[processes]` table: one process, or one per
+    /// app of a workspace. Asked before the slots that fill a single
+    /// process, because it decides whether there is one.
+    Processes,
     DevCmd,
     PortEnv,
     Provision,
 }
 
 impl Slot {
-    /// Where the answer is written, as a table path plus a key.
-    pub fn key(self) -> (&'static [&'static str], &'static str) {
-        match self {
+    /// Where the answer is written, as a table path plus a key. `None` for
+    /// [`Slot::Processes`], whose answer is whole tables rather than one
+    /// key; [`edits`] is what knows how to write that.
+    pub fn key(self) -> Option<(&'static [&'static str], &'static str)> {
+        Some(match self {
             Slot::Install => (&["project"], "install"),
             Slot::VersionFiles => (&["runtime"], "version_files"),
             Slot::DevCmd => (&["dev"], "cmd"),
             Slot::PortEnv => (&["dev"], "ports"),
             Slot::Provision => (&["project"], "provision"),
-        }
+            Slot::Processes => return None,
+        })
     }
 
     /// The question asked when the rules cannot decide.
@@ -435,6 +468,7 @@ impl Slot {
         match self {
             Slot::Install => "Which command installs this project's dependencies?",
             Slot::VersionFiles => "Which file pins this project's runtime version?",
+            Slot::Processes => "Run these as separate processes?",
             Slot::DevCmd => "Which command starts the local development server?",
             Slot::PortEnv => "Which environment variable sets the web server's port?",
             Slot::Provision => "Which local files should each worktree get a copy of?",
@@ -443,8 +477,11 @@ impl Slot {
 }
 
 /// One thing a rule found, and why.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Candidate {
+    /// What the developer sees at a question, and the value written for
+    /// every slot that holds one. For [`Slot::Processes`] it is a summary
+    /// of `processes` below, because that answer is several tables.
     pub value: String,
     /// The signal that made this a candidate, written into the config as
     /// `# detected: <why>`.
@@ -452,6 +489,9 @@ pub struct Candidate {
     /// Roles this candidate brings with it, for a command that already
     /// carries `{port:<role>}`. When set, the port slot is already answered.
     pub ports: Option<PortsSpec>,
+    /// Whole processes, for the one slot whose answer is not a single
+    /// value: the workspace form proposes a table per app.
+    pub processes: Option<BTreeMap<String, ProcessConfig>>,
 }
 
 /// What the rules found for one slot.
@@ -478,6 +518,9 @@ pub fn propose(root: &Path, signals: &Signals) -> Vec<Proposal> {
     [
         install_proposal(signals),
         version_files_proposal(signals),
+        // Before the single-process slots: it decides whether there is one
+        // process or several, and the slots below only fill a single one.
+        processes_proposal(root, signals),
         dev_cmd_proposal(signals, rule),
         port_proposal(signals, rule),
         provision_proposal(signals),
@@ -523,7 +566,7 @@ fn install_proposal(signals: &Signals) -> Option<Proposal> {
         .map(|(cmd, why)| Candidate {
             value: cmd.to_string(),
             why: why.to_string(),
-            ports: None,
+            ..Candidate::default()
         })
         .collect();
     if candidates.is_empty() {
@@ -548,7 +591,7 @@ fn version_files_proposal(signals: &Signals) -> Option<Proposal> {
         candidates: vec![Candidate {
             value: signals.version_files.join(","),
             why: signals.version_files.join(", "),
-            ports: None,
+            ..Candidate::default()
         }],
         decided: true,
     })
@@ -655,7 +698,7 @@ fn dev_cmd_proposal(signals: &Signals, rule: Option<&'static FrameworkRule>) -> 
         .map(|(name, _body)| Candidate {
             value: format!("{runner}{name}"),
             why: format!("package.json scripts.{name}"),
-            ports: None,
+            ..Candidate::default()
         })
         .chain(target_candidates(signals))
         .collect();
@@ -673,6 +716,7 @@ fn dev_cmd_proposal(signals: &Signals, rule: Option<&'static FrameworkRule>) -> 
             value,
             why: format!("the {} rule", rule.name),
             ports,
+            ..Candidate::default()
         });
     }
 
@@ -719,7 +763,7 @@ fn target_candidates(signals: &Signals) -> Vec<Candidate> {
             out.push(Candidate {
                 value: recipe.clone(),
                 why: format!("the {name} target"),
-                ports: None,
+                ..Candidate::default()
             });
         }
     }
@@ -754,12 +798,12 @@ fn port_proposal(signals: &Signals, rule: Option<&'static FrameworkRule>) -> Opt
         candidates.push(Candidate {
             value: name.to_string(),
             why: format!("the {framework} convention"),
-            ports: None,
+            ..Candidate::default()
         });
     }
     // Then `PORT`, then anything else port-shaped that is not a service's.
-    let keys = signals.env_example_keys.iter();
-    let mut others: Vec<&String> = Vec::new();
+    let keys = signals.env_keys();
+    let mut others: Vec<&str> = Vec::new();
     for key in keys {
         // Exactly `PORT`, or a `<SOMETHING>_PORT`. A substring test also
         // matches `SUPPORT_EMAIL`, `REPORT_URL`, `IMPORT_PATH` and
@@ -773,9 +817,9 @@ fn port_proposal(signals: &Signals, rule: Option<&'static FrameworkRule>) -> Opt
             candidates.insert(
                 framework_env.is_some().into(),
                 Candidate {
-                    value: key.clone(),
+                    value: key.to_string(),
                     why: "PORT in the env example".to_string(),
-                    ports: None,
+                    ..Candidate::default()
                 },
             );
         } else {
@@ -783,9 +827,9 @@ fn port_proposal(signals: &Signals, rule: Option<&'static FrameworkRule>) -> Opt
         }
     }
     candidates.extend(others.into_iter().map(|key| Candidate {
-        value: key.clone(),
+        value: key.to_string(),
         why: format!("{key} in the env example"),
-        ports: None,
+        ..Candidate::default()
     }));
     dedup_by_value(&mut candidates);
     if candidates.is_empty() {
@@ -799,6 +843,357 @@ fn port_proposal(signals: &Signals, rule: Option<&'static FrameworkRule>) -> Opt
     })
 }
 
+// ---- workspaces -----------------------------------------------------------
+
+/// One app of a workspace: a directory with its own manifest and its own
+/// dev script.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceApp {
+    /// The directory's own name, which is the process's name and its role.
+    pub name: String,
+    /// Relative to the repository root, for example `apps/web`.
+    pub dir: String,
+    /// The script pando would run, already prefixed with the runner.
+    pub cmd: String,
+    /// The port this app listens on when nobody tells it otherwise. What
+    /// makes a localhost URL in the env example resolvable to *this* app.
+    pub default_port: Option<u16>,
+    /// How this app takes a port, from its own framework rule.
+    pub port: PortMechanism,
+}
+
+/// Fewer than this is not a workspace worth splitting up: one app with a
+/// dev script is the single-process case pando already handles.
+const MIN_WORKSPACE_APPS: usize = 2;
+
+/// Where a workspace says its packages live.
+///
+/// pnpm keeps them in `pnpm-workspace.yaml`, npm, yarn and bun in the root
+/// manifest. turbo and nx describe pipelines rather than membership, so
+/// when one of those is the only marker the two conventional directories
+/// are tried. Hand-parsed on purpose: one list of globs is not worth a YAML
+/// dependency, and anything this cannot read simply is not a signal.
+fn workspace_globs(root: &Path) -> Vec<String> {
+    let mut globs = Vec::new();
+    if let Ok(text) = std::fs::read_to_string(root.join("pnpm-workspace.yaml")) {
+        globs.extend(yaml_string_list(&text, "packages"));
+    }
+    let manifest = std::fs::read_to_string(root.join("package.json")).unwrap_or_default();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&manifest) {
+        let workspaces = value.get("workspaces");
+        let list = match workspaces {
+            // Both shapes yarn and npm accept.
+            Some(serde_json::Value::Array(list)) => Some(list.clone()),
+            Some(serde_json::Value::Object(map)) => match map.get("packages") {
+                Some(serde_json::Value::Array(list)) => Some(list.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(list) = list {
+            globs.extend(list.iter().filter_map(|v| v.as_str()).map(str::to_string));
+        }
+    }
+    if globs.is_empty()
+        && ["turbo.json", "nx.json"]
+            .iter()
+            .any(|f| root.join(f).exists())
+    {
+        globs.push("apps/*".to_string());
+        globs.push("packages/*".to_string());
+    }
+    globs.sort();
+    globs.dedup();
+    globs
+}
+
+/// The string items of a top-level YAML list, for one key. Enough for
+/// `packages:` followed by `  - 'apps/*'` lines, and nothing more.
+fn yaml_string_list(text: &str, key: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut inside = false;
+    for line in text.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.trim_start().starts_with('#') || trimmed.trim().is_empty() {
+            continue;
+        }
+        if !line.starts_with([' ', '\t']) {
+            inside = trimmed.trim_end_matches(':') == key && trimmed.ends_with(':');
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        let Some(item) = trimmed.trim_start().strip_prefix('-') else {
+            continue;
+        };
+        let item = item.trim().trim_matches(['"', '\'']).to_string();
+        if !item.is_empty() {
+            out.push(item);
+        }
+    }
+    out
+}
+
+/// The directories a workspace glob names.
+///
+/// Only a trailing `*` is expanded, which is the shape every workspace
+/// glob in the wild has (`apps/*`, `packages/*`); anything else is treated
+/// as a literal directory. A glob pando cannot read finds nothing, which
+/// means one fewer proposal rather than a wrong one.
+fn expand_glob(root: &Path, glob: &str) -> Vec<String> {
+    let glob = glob.trim_end_matches('/');
+    let Some(prefix) = glob.strip_suffix("/*") else {
+        if glob.contains('*') || !root.join(glob).is_dir() {
+            return Vec::new();
+        }
+        return vec![glob.to_string()];
+    };
+    if prefix.contains('*') {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(root.join(prefix)) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| Some(format!("{prefix}/{}", e.file_name().to_str()?)))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Signals of one app directory: enough for its framework rule, and no
+/// more. A full read would shell out to git once per app for files nothing
+/// here looks at.
+fn app_signals(dir: &Path) -> Signals {
+    let manifest = std::fs::read_to_string(dir.join("package.json")).unwrap_or_default();
+    Signals {
+        scripts: parse_scripts(&manifest),
+        markers: present(dir, &MARKER_FILES),
+        ..Default::default()
+    }
+}
+
+/// Every app of the workspace that has a dev script of its own.
+///
+/// The name is the directory's, which is also the role its port is
+/// reserved under — so two apps with the same directory name would claim
+/// one role, and `config::validate` would refuse the file pando had just
+/// written. That is a workspace pando says nothing about.
+pub fn workspace_apps(root: &Path, signals: &Signals) -> Vec<WorkspaceApp> {
+    let runner = script_runner(signals);
+    let mut apps: Vec<WorkspaceApp> = Vec::new();
+    for glob in workspace_globs(root) {
+        for dir in expand_glob(root, &glob) {
+            let path = root.join(&dir);
+            let app = app_signals(&path);
+            let Some(script) = app.scripts.get("dev") else {
+                continue;
+            };
+            if is_production(script) || is_multiplexer(script) {
+                continue;
+            }
+            let Some(name) = Path::new(&dir).file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let rule = framework(&path, &app);
+            let mut cmd = format!("{runner}dev");
+            // A framework that takes its port on the command line gets the
+            // flag appended to its own script: `pnpm dev -- --port 1234`
+            // runs what the app already runs, on the port pando chose.
+            if let Some(rule) = rule
+                && rule.port == PortMechanism::InCommand
+                && let Some(flag) = rule.port_flag
+            {
+                cmd = format!(
+                    "{cmd} -- {}",
+                    flag.replace("{port}", &format!("{{port:{name}}}"))
+                );
+            }
+            apps.push(WorkspaceApp {
+                default_port: app_default_port(signals, name, rule),
+                port: match rule {
+                    Some(rule)
+                        if rule.port == PortMechanism::InCommand && rule.port_flag.is_none() =>
+                    {
+                        PortMechanism::Ask
+                    }
+                    Some(rule) => rule.port,
+                    None => PortMechanism::Ask,
+                },
+                name: name.to_string(),
+                dir,
+                cmd,
+            });
+        }
+    }
+    apps.sort_by(|a, b| a.dir.cmp(&b.dir));
+    apps.dedup_by(|a, b| a.dir == b.dir);
+    let mut names: Vec<&str> = apps.iter().map(|a| a.name.as_str()).collect();
+    names.sort_unstable();
+    let unique = names.len();
+    names.dedup();
+    if names.len() != unique {
+        // Two apps with the same directory name would claim the same role.
+        return Vec::new();
+    }
+    apps
+}
+
+/// The port an app listens on by default: what the root env example says
+/// for it, else what its framework does.
+fn app_default_port(
+    signals: &Signals,
+    name: &str,
+    rule: Option<&'static FrameworkRule>,
+) -> Option<u16> {
+    let wanted = format!("{}_PORT", name.to_uppercase().replace('-', "_"));
+    let from_example = signals
+        .env_example
+        .iter()
+        .find(|(key, _)| *key == wanted)
+        .and_then(|(_, value)| value.parse::<u16>().ok());
+    from_example.or_else(|| rule.map(|r| r.default_port))
+}
+
+/// The env variable an app reads its port from, when its framework uses
+/// one: the rule's own name, else a `<APP>_PORT` key in the env example.
+fn app_port_env(signals: &Signals, app: &WorkspaceApp) -> Option<String> {
+    match app.port {
+        PortMechanism::Env(name) => Some(name.to_string()),
+        // The command already carries the port. A second way of saying it
+        // is a second thing that can disagree.
+        PortMechanism::InCommand => None,
+        PortMechanism::Ask => {
+            let wanted = format!("{}_PORT", app.name.to_uppercase().replace('-', "_"));
+            signals
+                .env_keys()
+                .any(|key| key == wanted)
+                .then_some(wanted)
+        }
+    }
+}
+
+/// Cross-references between apps, read out of the root env example.
+///
+/// A value like `http://localhost:4000` is one app being told where
+/// another one listens. When that port is another app's default, the value
+/// becomes a template pointing at that app's role — so every worktree gets
+/// its own pair of ports and the two halves still find each other. It is
+/// given to every process *except* the one it points at, which is the only
+/// one that does not need to be told.
+fn cross_references(signals: &Signals, apps: &[WorkspaceApp]) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for (key, value) in &signals.env_example {
+        let Some(port) = localhost_url_port(value) else {
+            continue;
+        };
+        let Some(target) = apps.iter().find(|a| a.default_port == Some(port)) else {
+            continue;
+        };
+        let template = value.replacen(
+            &format!(":{port}"),
+            &format!(":{{port:{}}}", target.name),
+            1,
+        );
+        out.push((target.name.clone(), key.clone(), template));
+    }
+    out
+}
+
+/// The port of a URL that points at this machine, if that is what this is.
+fn localhost_url_port(value: &str) -> Option<u16> {
+    let (_, after) = value.split_once("://")?;
+    let host_port = after.split(['/', '?', '#']).next()?;
+    // Credentials, as in `postgres://user:pass@localhost:5432/db`.
+    let host_port = host_port.rsplit('@').next()?;
+    let (host, port) = host_port.rsplit_once(':')?;
+    if !matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0" | "[::1]") {
+        return None;
+    }
+    port.parse().ok()
+}
+
+/// The multi-process form, for a workspace whose apps each have a dev
+/// script — and the root script as the one-process fallback beside it.
+///
+/// Always a question: running two servers instead of one changes what
+/// `start`, `stop` and the log tabs do, and that is the developer's call.
+/// `--yes` takes the first option, which is the per-app form.
+fn processes_proposal(root: &Path, signals: &Signals) -> Option<Proposal> {
+    let apps = workspace_apps(root, signals);
+    if apps.len() < MIN_WORKSPACE_APPS {
+        return None;
+    }
+    let references = cross_references(signals, &apps);
+    let mut processes: BTreeMap<String, ProcessConfig> = BTreeMap::new();
+    for app in &apps {
+        let mut env: BTreeMap<String, String> = BTreeMap::new();
+        if let Some(var) = app_port_env(signals, app) {
+            env.insert(var, format!("{{port:{}}}", app.name));
+        }
+        for (target, key, template) in &references {
+            // The app a reference points at is the one that does not need
+            // to be told where it is.
+            if *target == app.name {
+                continue;
+            }
+            env.insert(key.clone(), template.clone());
+        }
+        processes.insert(
+            app.name.clone(),
+            ProcessConfig {
+                cmd: app.cmd.clone(),
+                cwd: Some(app.dir.clone()),
+                ports: Some(PortsSpec::List(vec![app.name.clone()])),
+                env,
+                ready: Some(ReadySpec {
+                    role: Some(app.name.clone()),
+                    timeout_s: None,
+                }),
+            },
+        );
+    }
+    let summary = apps
+        .iter()
+        .map(|app| format!("{}: {} in {}", app.name, app.cmd, app.dir))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut candidates = vec![Candidate {
+        value: summary,
+        why: format!("a dev script in each of {} workspace apps", apps.len()),
+        processes: Some(processes),
+        ..Candidate::default()
+    }];
+    // The fallback: whatever the root script is, as it was before. Written
+    // as `[dev]`, because one process is what that shorthand is for.
+    if let Some(script) = signals.scripts.get("dev") {
+        let _ = script;
+        let value = format!("{}dev", script_runner(signals));
+        candidates.push(Candidate {
+            value: value.clone(),
+            why: "package.json scripts.dev".to_string(),
+            processes: Some(BTreeMap::from([(
+                DEV.to_string(),
+                ProcessConfig {
+                    cmd: value,
+                    ..Default::default()
+                },
+            )])),
+            ..Candidate::default()
+        });
+    }
+    Some(Proposal {
+        slot: Slot::Processes,
+        candidates,
+        // Never: two processes instead of one is a change of shape, and
+        // "ask just in time, once" is exactly what this is for.
+        decided: false,
+    })
+}
+
 fn provision_proposal(signals: &Signals) -> Option<Proposal> {
     if signals.ignored_present.is_empty() {
         return None;
@@ -808,7 +1203,7 @@ fn provision_proposal(signals: &Signals) -> Option<Proposal> {
         candidates: vec![Candidate {
             value: signals.ignored_present.join(","),
             why: "gitignored and present in the main checkout".to_string(),
-            ports: None,
+            ..Candidate::default()
         }],
         decided: true,
     })
@@ -827,6 +1222,13 @@ pub const DEV: &str = "dev";
 /// environment variable to choose.
 pub fn still_needed(slot: Slot, config: &Config) -> bool {
     match slot {
+        // A config that already declares any process has answered the
+        // question of how many there are.
+        Slot::Processes => config.processes.is_empty(),
+        Slot::DevCmd => config
+            .processes
+            .get(DEV)
+            .is_none_or(|dev| dev.cmd.trim().is_empty()),
         // Unset, not empty. A process configured with no ports at all — a
         // worker, a watcher, a queue consumer — has answered this question
         // with `ports = []`, and asking again would hand it a port it will
@@ -836,16 +1238,64 @@ pub fn still_needed(slot: Slot, config: &Config) -> bool {
     }
 }
 
+/// Whether detection may write into the single `dev` process at all, given
+/// the config **as it was loaded**.
+///
+/// Two shapes qualify: a project with no processes configured, and the one
+/// a developer writes when they want pando to fill something in — a lone
+/// `[dev]` holding a `cwd` or an `env` and no command. Any other process
+/// present, or a `[dev]` whose command they wrote themselves, means
+/// detection stays out: a `[dev]` a developer wrote is an answer about its
+/// ports too, and `[dev]` written beside `[processes]` is a file pando's
+/// own loader refuses.
+///
+/// Asked once, of the config as loaded, and carried through the run:
+/// the moment detection writes `[dev].cmd`, the config is indistinguishable
+/// from one written by hand, and re-reading it would give the opposite
+/// answer.
+pub fn may_fill_dev(config: &Config) -> bool {
+    match config.processes.len() {
+        0 => true,
+        1 => config
+            .processes
+            .get(DEV)
+            .is_some_and(|dev| dev.cmd.trim().is_empty()),
+        _ => false,
+    }
+}
+
+/// The same permission, after an answer to [`Slot::Processes`] has been
+/// applied: the single-process slots still have work to do when the answer
+/// was the single-process form, and nothing to do when it was not.
+pub fn fills_one_dev_process(config: &Config) -> bool {
+    config.processes.len() == 1 && config.processes.contains_key(DEV)
+}
+
 /// A value the developer typed rather than chose.
 ///
 /// A command carrying `{port:web}` brings its roles with it, so the port
 /// question that would have followed is already answered.
 pub fn custom(slot: Slot, value: &str) -> Candidate {
     let roles = roles_in(value);
+    let ports = (matches!(slot, Slot::DevCmd | Slot::Processes) && !roles.is_empty())
+        .then_some(PortsSpec::List(roles));
     Candidate {
         value: value.to_string(),
         why: String::new(),
-        ports: (slot == Slot::DevCmd && !roles.is_empty()).then_some(PortsSpec::List(roles)),
+        // A command typed at the processes question is one process, named
+        // `dev`: every question has a custom answer, and the custom answer
+        // to "several processes?" is "no, this one".
+        processes: (slot == Slot::Processes).then(|| {
+            BTreeMap::from([(
+                DEV.to_string(),
+                ProcessConfig {
+                    cmd: value.to_string(),
+                    ports: ports.clone(),
+                    ..Default::default()
+                },
+            )])
+        }),
+        ports,
     }
 }
 
@@ -856,10 +1306,20 @@ pub fn apply(slot: Slot, candidate: &Candidate, config: &mut Config) {
         Slot::Install => config.project.install = Some(candidate.value.clone()),
         Slot::VersionFiles => config.runtime.version_files = split_list(&candidate.value),
         Slot::Provision => config.project.provision = split_list(&candidate.value),
+        Slot::Processes => {
+            for (name, process) in candidate.processes.iter().flatten() {
+                config.processes.insert(name.clone(), process.clone());
+            }
+        }
         Slot::DevCmd => {
             let process = config.processes.entry(DEV.to_string()).or_default();
             process.cmd = candidate.value.clone();
-            if let Some(ports) = &candidate.ports {
+            // Only when nobody has said: a `ports` the developer wrote is
+            // an answer, and a command that carries `{port:web}` must not
+            // overwrite it.
+            if let Some(ports) = &candidate.ports
+                && process.ports.is_none()
+            {
                 process.ports = Some(ports.clone());
             }
         }
@@ -878,17 +1338,21 @@ pub fn apply(slot: Slot, candidate: &Candidate, config: &mut Config) {
 /// Separate from [`apply`] because the file is edited in place rather than
 /// re-serialised from the struct: the developer's comments and ordering
 /// survive, and only the keys pando decided are touched.
-pub fn edits(
-    slot: Slot,
-    candidate: &Candidate,
-) -> Vec<(&'static [&'static str], &'static str, toml_edit::Value)> {
-    let (table, key) = slot.key();
+pub fn edits(slot: Slot, candidate: &Candidate) -> Vec<Edit> {
+    // Owned, not `&'static`: `[processes.<app>]` is a table whose name
+    // detection only learns by reading the repository.
+    let single = |table: &[&str], key: &str, value: toml_edit::Value| Edit {
+        table: table.iter().map(|t| t.to_string()).collect(),
+        key: key.to_string(),
+        value,
+    };
+    let keyed = slot.key();
     match slot {
         Slot::Install | Slot::DevCmd => {
-            let mut out: Vec<(&'static [&'static str], &'static str, toml_edit::Value)> =
-                vec![(table, key, candidate.value.clone().into())];
+            let (table, key) = keyed.expect("this slot writes one key");
+            let mut out = vec![single(table, key, candidate.value.clone().into())];
             if let Some(PortsSpec::List(roles)) = &candidate.ports {
-                out.push((
+                out.push(single(
                     &["dev"],
                     "ports",
                     toml_edit::Value::Array(toml_edit::Array::from_iter(roles.iter().cloned())),
@@ -896,17 +1360,91 @@ pub fn edits(
             }
             out
         }
-        Slot::VersionFiles | Slot::Provision => vec![(
-            table,
-            key,
-            toml_edit::Value::Array(toml_edit::Array::from_iter(split_list(&candidate.value))),
-        )],
+        Slot::VersionFiles | Slot::Provision => {
+            let (table, key) = keyed.expect("this slot writes one key");
+            vec![single(
+                table,
+                key,
+                toml_edit::Value::Array(toml_edit::Array::from_iter(split_list(&candidate.value))),
+            )]
+        }
         Slot::PortEnv => {
+            let (table, key) = keyed.expect("this slot writes one key");
             let mut inline = toml_edit::InlineTable::new();
             inline.insert(&candidate.value, crate::config::WEB_ROLE.into());
-            vec![(table, key, toml_edit::Value::InlineTable(inline))]
+            vec![single(table, key, toml_edit::Value::InlineTable(inline))]
+        }
+        Slot::Processes => process_edits(candidate),
+    }
+}
+
+/// One key pando is about to write, and the table it belongs in.
+#[derive(Debug, Clone)]
+pub struct Edit {
+    pub table: Vec<String>,
+    pub key: String,
+    pub value: toml_edit::Value,
+}
+
+/// A whole `[processes]` table, written out.
+///
+/// One process named `dev` takes the `[dev]` shorthand instead: that is
+/// what the shorthand is for, and it keeps the single-process file the
+/// shape every example in the docs has.
+fn process_edits(candidate: &Candidate) -> Vec<Edit> {
+    let mut out = Vec::new();
+    let processes = candidate.processes.clone().unwrap_or_default();
+    let shorthand = processes.len() == 1 && processes.contains_key(DEV);
+    for (name, process) in &processes {
+        let table: Vec<String> = if shorthand {
+            vec![DEV.to_string()]
+        } else {
+            vec!["processes".to_string(), name.clone()]
+        };
+        let mut push = |key: &str, value: toml_edit::Value| {
+            out.push(Edit {
+                table: table.clone(),
+                key: key.to_string(),
+                value,
+            })
+        };
+        push("cmd", process.cmd.clone().into());
+        if let Some(cwd) = &process.cwd {
+            push("cwd", cwd.clone().into());
+        }
+        match &process.ports {
+            Some(PortsSpec::List(roles)) => push(
+                "ports",
+                toml_edit::Value::Array(toml_edit::Array::from_iter(roles.iter().cloned())),
+            ),
+            Some(PortsSpec::Map(map)) => {
+                let mut inline = toml_edit::InlineTable::new();
+                for (var, role) in map {
+                    inline.insert(var, role.as_str().into());
+                }
+                push("ports", toml_edit::Value::InlineTable(inline));
+            }
+            None => {}
+        }
+        if !process.env.is_empty() {
+            let mut inline = toml_edit::InlineTable::new();
+            for (var, value) in &process.env {
+                inline.insert(var, value.as_str().into());
+            }
+            push("env", toml_edit::Value::InlineTable(inline));
+        }
+        if let Some(ready) = &process.ready {
+            let mut inline = toml_edit::InlineTable::new();
+            if let Some(role) = &ready.role {
+                inline.insert("role", role.as_str().into());
+            }
+            if let Some(timeout) = ready.timeout_s {
+                inline.insert("timeout_s", (timeout as i64).into());
+            }
+            push("ready", toml_edit::Value::InlineTable(inline));
         }
     }
+    out
 }
 
 /// The roles a command asks for by carrying `{port:<role>}`.
@@ -963,6 +1501,13 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    /// Env example keys with values nothing reads, for the port rules.
+    fn env_pairs(keys: &[&str]) -> Vec<(String, String)> {
+        keys.iter()
+            .map(|k| (k.to_string(), "1".to_string()))
+            .collect()
     }
 
     fn with_lock(mut signals: Signals, lock: &str) -> Signals {
@@ -1047,7 +1592,13 @@ mod tests {
             "# a comment\nPORT=3000\n\nDB_PORT=5432\nEMPTY\n",
         )
         .unwrap();
-        assert_eq!(env_example_keys(dir.path()), vec!["PORT", "DB_PORT"]);
+        assert_eq!(
+            env_example(dir.path()),
+            vec![
+                ("PORT".to_string(), "3000".to_string()),
+                ("DB_PORT".to_string(), "5432".to_string())
+            ]
+        );
     }
 
     // ---- the dev command -------------------------------------------------
@@ -1138,10 +1689,7 @@ mod tests {
     #[test]
     fn a_service_port_is_never_offered_as_the_web_port() {
         let signals = Signals {
-            env_example_keys: ["PORT", "API_PORT", "DB_PORT", "SMTP_PORT", "REDIS_PORT"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            env_example: env_pairs(&["PORT", "API_PORT", "DB_PORT", "SMTP_PORT", "REDIS_PORT"]),
             ..Default::default()
         };
         let proposal = port_proposal(&signals, None).unwrap();
@@ -1155,7 +1703,7 @@ mod tests {
     #[test]
     fn only_a_key_that_is_or_ends_with_port_is_a_port() {
         let signals = Signals {
-            env_example_keys: [
+            env_example: env_pairs(&[
                 "PORT",
                 "SUPPORT_EMAIL",
                 "REPORT_URL",
@@ -1163,10 +1711,7 @@ mod tests {
                 "EXPORT_DIR",
                 "PASSPORT_SECRET",
                 "API_PORT",
-            ]
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
+            ]),
             ..Default::default()
         };
         let proposal = port_proposal(&signals, None).unwrap();
@@ -1197,6 +1742,7 @@ mod tests {
                 value: "python manage.py runserver 127.0.0.1:{port:web}".into(),
                 why: "the Django rule".into(),
                 ports: Some(PortsSpec::List(vec!["web".into()])),
+                ..Candidate::default()
             },
             &mut config,
         );
@@ -1304,6 +1850,374 @@ mod tests {
         assert!(!proposal.decided, "pando does not guess which one is live");
     }
 
+    // ---- workspaces ------------------------------------------------------
+
+    /// A workspace with a web app and an api app, the shape the fixture
+    /// catalogue's `mono-web-api` has.
+    fn workspace(dir: &Path) {
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{ "workspaces": ["apps/*"], "scripts": { "dev": "pnpm -r --parallel dev" } }"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+        std::fs::create_dir_all(dir.join("apps/web")).unwrap();
+        std::fs::write(
+            dir.join("apps/web/package.json"),
+            r#"{ "scripts": { "dev": "vite" } }"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("apps/web/vite.config.ts"), "export default {}\n").unwrap();
+        std::fs::create_dir_all(dir.join("apps/api")).unwrap();
+        std::fs::write(
+            dir.join("apps/api/package.json"),
+            r#"{ "scripts": { "dev": "node --watch src/index.js" } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(".env.example"),
+            "WEB_PORT=5173\nAPI_PORT=4000\nVITE_API_URL=http://localhost:4000\n\
+             DATABASE_URL=postgres://app:app@localhost:5432/app\n",
+        )
+        .unwrap();
+    }
+
+    fn proposed_processes(root: &Path) -> Proposal {
+        let signals = signals(root);
+        propose(root, &signals)
+            .into_iter()
+            .find(|p| p.slot == Slot::Processes)
+            .expect("a processes proposal")
+    }
+
+    #[test]
+    fn a_workspace_proposes_one_process_per_app() {
+        let dir = tempdir().unwrap();
+        workspace(dir.path());
+        let proposal = proposed_processes(dir.path());
+        assert!(
+            !proposal.decided,
+            "two processes instead of one is the developer's call"
+        );
+        let processes = proposal.candidates[0]
+            .processes
+            .clone()
+            .expect("the per-app form carries processes");
+        assert_eq!(
+            processes.keys().cloned().collect::<Vec<_>>(),
+            vec!["api", "web"]
+        );
+
+        let web = &processes["web"];
+        assert_eq!(web.cwd.as_deref(), Some("apps/web"));
+        assert_eq!(
+            web.cmd, "pnpm dev -- --port {port:web}",
+            "Vite takes its port on the command line, so the flag goes on its own script"
+        );
+        assert_eq!(web.roles(), vec!["web"]);
+        assert_eq!(
+            web.env["VITE_API_URL"], "http://localhost:{port:api}",
+            "a localhost URL pointing at another app becomes that app's role"
+        );
+        assert!(
+            !web.env.contains_key("WEB_PORT"),
+            "and nothing says the port twice: {:?}",
+            web.env
+        );
+        assert_eq!(web.ready.clone().unwrap().role.as_deref(), Some("web"));
+
+        let api = &processes["api"];
+        assert_eq!(api.cwd.as_deref(), Some("apps/api"));
+        assert_eq!(api.cmd, "pnpm dev");
+        assert_eq!(
+            api.env["PORT"], "{port:api}",
+            "Node reads its port from the environment"
+        );
+        assert!(
+            !api.env.contains_key("VITE_API_URL"),
+            "the app a reference points at is the one that need not be told"
+        );
+        assert_eq!(api.ready.clone().unwrap().role.as_deref(), Some("api"));
+
+        // The question shows each process with its directory and command.
+        let summary = &proposal.candidates[0].value;
+        for needle in ["api", "web", "apps/api", "apps/web", "pnpm dev"] {
+            assert!(summary.contains(needle), "{summary}");
+        }
+    }
+
+    #[test]
+    fn the_root_script_is_offered_beside_the_per_app_form() {
+        let dir = tempdir().unwrap();
+        workspace(dir.path());
+        let proposal = proposed_processes(dir.path());
+        assert_eq!(proposal.candidates.len(), 2);
+        let fallback = &proposal.candidates[1];
+        assert_eq!(fallback.value, "pnpm dev");
+        let processes = fallback.processes.clone().expect("one process");
+        assert_eq!(processes.keys().cloned().collect::<Vec<_>>(), vec!["dev"]);
+        assert_eq!(processes["dev"].cmd, "pnpm dev");
+        assert!(
+            processes["dev"].ports.is_none(),
+            "declining leaves the port question to be asked"
+        );
+    }
+
+    #[test]
+    fn one_app_is_not_a_workspace_worth_splitting_up() {
+        let dir = tempdir().unwrap();
+        workspace(dir.path());
+        std::fs::remove_dir_all(dir.path().join("apps/api")).unwrap();
+        let signals = signals(dir.path());
+        assert!(
+            propose(dir.path(), &signals)
+                .iter()
+                .all(|p| p.slot != Slot::Processes),
+            "one app with a dev script is the single-process case"
+        );
+    }
+
+    #[test]
+    fn an_app_with_no_dev_script_is_not_a_process() {
+        let dir = tempdir().unwrap();
+        workspace(dir.path());
+        std::fs::create_dir_all(dir.path().join("apps/tools")).unwrap();
+        std::fs::write(
+            dir.path().join("apps/tools/package.json"),
+            r#"{ "scripts": { "build": "tsc" } }"#,
+        )
+        .unwrap();
+        let apps = workspace_apps(dir.path(), &signals(dir.path()));
+        assert_eq!(
+            apps.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+            vec!["api", "web"]
+        );
+    }
+
+    // Two apps with one directory name would claim one role, and
+    // `config::validate` would refuse the file pando had just written.
+    #[test]
+    fn two_apps_with_the_same_name_are_not_proposed_at_all() {
+        let dir = tempdir().unwrap();
+        workspace(dir.path());
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{ "workspaces": ["apps/*", "packages/*"] }"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("packages/web")).unwrap();
+        std::fs::write(
+            dir.path().join("packages/web/package.json"),
+            r#"{ "scripts": { "dev": "vite" } }"#,
+        )
+        .unwrap();
+        assert!(workspace_apps(dir.path(), &signals(dir.path())).is_empty());
+    }
+
+    #[test]
+    fn a_repository_that_is_not_a_workspace_proposes_nothing() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{ "scripts": { "dev": "next dev" } }"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("apps/web")).unwrap();
+        std::fs::write(
+            dir.path().join("apps/web/package.json"),
+            r#"{ "scripts": { "dev": "vite" } }"#,
+        )
+        .unwrap();
+        assert!(
+            workspace_apps(dir.path(), &signals(dir.path())).is_empty(),
+            "an apps/ directory is not a workspace; the manifest has to say so"
+        );
+    }
+
+    #[test]
+    fn workspace_globs_are_read_from_every_convention() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - 'apps/*'\n",
+        )
+        .unwrap();
+        assert_eq!(workspace_globs(dir.path()), vec!["apps/*"]);
+
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{ "workspaces": { "packages": ["services/*"] } }"#,
+        )
+        .unwrap();
+        assert_eq!(workspace_globs(dir.path()), vec!["services/*"]);
+
+        // turbo and nx describe pipelines, not membership.
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("turbo.json"), "{}").unwrap();
+        assert_eq!(workspace_globs(dir.path()), vec!["apps/*", "packages/*"]);
+    }
+
+    #[test]
+    fn only_a_localhost_url_names_another_apps_port() {
+        assert_eq!(localhost_url_port("http://localhost:4000"), Some(4000));
+        assert_eq!(
+            localhost_url_port("http://127.0.0.1:4000/api/v1"),
+            Some(4000)
+        );
+        assert_eq!(
+            localhost_url_port("postgres://app:app@localhost:5432/app"),
+            Some(5432)
+        );
+        assert_eq!(localhost_url_port("https://api.example.com:443"), None);
+        assert_eq!(localhost_url_port("http://localhost"), None);
+        assert_eq!(localhost_url_port("4000"), None);
+    }
+
+    #[test]
+    fn a_url_that_matches_no_app_is_left_alone() {
+        let dir = tempdir().unwrap();
+        workspace(dir.path());
+        let processes = proposed_processes(dir.path()).candidates[0]
+            .processes
+            .clone()
+            .unwrap();
+        for (name, process) in &processes {
+            assert!(
+                !process.env.contains_key("DATABASE_URL"),
+                "{name} was told about a database that is not one of the apps: {:?}",
+                process.env
+            );
+        }
+    }
+
+    #[test]
+    fn the_processes_slot_writes_a_table_per_app() {
+        let dir = tempdir().unwrap();
+        workspace(dir.path());
+        let candidate = proposed_processes(dir.path()).candidates[0].clone();
+        let edits = edits(Slot::Processes, &candidate);
+        let web: Vec<(&str, String)> = edits
+            .iter()
+            .filter(|e| e.table == vec!["processes", "web"])
+            .map(|e| (e.key.as_str(), e.value.to_string().trim().to_string()))
+            .collect();
+        assert_eq!(
+            web,
+            vec![
+                ("cmd", "\"pnpm dev -- --port {port:web}\"".to_string()),
+                ("cwd", "\"apps/web\"".to_string()),
+                ("ports", "[\"web\"]".to_string()),
+                (
+                    "env",
+                    "{ VITE_API_URL = \"http://localhost:{port:api}\" }".to_string()
+                ),
+                ("ready", "{ role = \"web\" }".to_string()),
+            ]
+        );
+        assert!(
+            edits.iter().any(|e| e.table == vec!["processes", "api"]),
+            "and one for the api"
+        );
+    }
+
+    // The single-process fallback keeps the `[dev]` shorthand: that is
+    // what it is for, and it is the shape every example is written in.
+    #[test]
+    fn the_single_process_answer_is_written_as_the_dev_shorthand() {
+        let dir = tempdir().unwrap();
+        workspace(dir.path());
+        let candidate = proposed_processes(dir.path()).candidates[1].clone();
+        let edits = edits(Slot::Processes, &candidate);
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].table, vec!["dev"]);
+        assert_eq!(edits[0].key, "cmd");
+    }
+
+    #[test]
+    fn a_command_typed_at_the_process_question_is_one_process() {
+        let candidate = custom(Slot::Processes, "./scripts/dev.sh --port {port:web}");
+        let processes = candidate.processes.clone().expect("one process");
+        assert_eq!(processes.keys().cloned().collect::<Vec<_>>(), vec!["dev"]);
+        assert_eq!(processes["dev"].roles(), vec!["web"]);
+        let mut config = Config::default();
+        apply(Slot::Processes, &candidate, &mut config);
+        assert_eq!(
+            config.processes["dev"].cmd,
+            "./scripts/dev.sh --port {port:web}"
+        );
+    }
+
+    // ---- what detection may fill in --------------------------------------
+
+    #[test]
+    fn a_lone_dev_with_no_command_may_be_filled_and_anything_else_may_not() {
+        let mut empty = Config::default();
+        assert!(
+            may_fill_dev(&empty),
+            "nothing configured is pando's to fill"
+        );
+
+        empty.processes.insert(
+            DEV.to_string(),
+            ProcessConfig {
+                cwd: Some("apps/web".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            may_fill_dev(&empty),
+            "a [dev] with no command is an invitation"
+        );
+        assert!(still_needed(Slot::DevCmd, &empty));
+        assert!(still_needed(Slot::PortEnv, &empty));
+        assert!(
+            !still_needed(Slot::Processes, &empty),
+            "but the shape question has been answered by writing [dev] at all"
+        );
+
+        let mut written = Config::default();
+        written.processes.insert(
+            DEV.to_string(),
+            ProcessConfig {
+                cmd: "sleep 300".to_string(),
+                ..Default::default()
+            },
+        );
+        assert!(
+            !may_fill_dev(&written),
+            "a command the developer wrote is an answer about its ports too"
+        );
+
+        let mut named = Config::default();
+        named.processes.insert(
+            "web".to_string(),
+            ProcessConfig {
+                cmd: "vite".to_string(),
+                ..Default::default()
+            },
+        );
+        assert!(
+            !may_fill_dev(&named),
+            "a process under another name means [dev] would land beside [processes]"
+        );
+
+        // And after an answer to the shape question.
+        let mut per_app = Config::default();
+        per_app
+            .processes
+            .insert("web".to_string(), ProcessConfig::default());
+        per_app
+            .processes
+            .insert("api".to_string(), ProcessConfig::default());
+        assert!(!fills_one_dev_process(&per_app));
+        let mut single = Config::default();
+        single
+            .processes
+            .insert(DEV.to_string(), ProcessConfig::default());
+        assert!(fills_one_dev_process(&single));
+    }
+
     // ---- writing the answer ----------------------------------------------
 
     #[test]
@@ -1311,7 +2225,7 @@ mod tests {
         let candidate = Candidate {
             value: "PORT".to_string(),
             why: "the Next.js convention".to_string(),
-            ports: None,
+            ..Candidate::default()
         };
         let mut config = Config::default();
         apply(Slot::PortEnv, &candidate, &mut config);
@@ -1320,9 +2234,9 @@ mod tests {
 
         let edits = edits(Slot::PortEnv, &candidate);
         assert_eq!(edits.len(), 1);
-        assert_eq!(edits[0].0, &["dev"]);
-        assert_eq!(edits[0].1, "ports");
-        assert_eq!(edits[0].2.to_string().trim(), "{ PORT = \"web\" }");
+        assert_eq!(edits[0].table, vec!["dev"]);
+        assert_eq!(edits[0].key, "ports");
+        assert_eq!(edits[0].value.to_string().trim(), "{ PORT = \"web\" }");
     }
 
     #[test]
@@ -1330,13 +2244,16 @@ mod tests {
         let candidate = Candidate {
             value: ".env,.env.local".to_string(),
             why: "gitignored and present".to_string(),
-            ports: None,
+            ..Candidate::default()
         };
         let mut config = Config::default();
         apply(Slot::Provision, &candidate, &mut config);
         assert_eq!(config.project.provision, vec![".env", ".env.local"]);
         let edits = edits(Slot::Provision, &candidate);
-        assert_eq!(edits[0].2.to_string().trim(), "[\".env\", \".env.local\"]");
+        assert_eq!(
+            edits[0].value.to_string().trim(),
+            "[\".env\", \".env.local\"]"
+        );
     }
 
     #[test]
@@ -1345,10 +2262,11 @@ mod tests {
             value: "python manage.py runserver 127.0.0.1:{port:web}".to_string(),
             why: "the Django rule".to_string(),
             ports: Some(PortsSpec::List(vec!["web".to_string()])),
+            ..Candidate::default()
         };
         let edits = edits(Slot::DevCmd, &candidate);
         assert_eq!(edits.len(), 2, "the command and the role it needs");
-        assert_eq!(edits[1].1, "ports");
-        assert_eq!(edits[1].2.to_string().trim(), "[\"web\"]");
+        assert_eq!(edits[1].key, "ports");
+        assert_eq!(edits[1].value.to_string().trim(), "[\"web\"]");
     }
 }
