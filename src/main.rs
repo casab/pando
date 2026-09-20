@@ -4,7 +4,7 @@ use std::process::ExitCode;
 
 use pando::cli::{Cli, dispatch};
 use pando::paths::{PandoPaths, default_home};
-use pando::{config, project};
+use pando::{config, project, tui};
 
 /// 0 ok, 1 error, 2 usage (clap's own), 3 reserved for needs-answer.
 const EXIT_ERROR: u8 = 1;
@@ -34,6 +34,6 @@ fn run(cli: Cli) -> Result<()> {
     }
     match cli.command {
         Some(command) => dispatch(command, &paths, &loaded.config),
-        None => anyhow::bail!("run `pando --help` to see the available commands"),
+        None => tui::run(paths, loaded.config),
     }
 }

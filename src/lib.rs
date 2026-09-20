@@ -23,4 +23,5 @@ pub mod state;
 #[cfg(test)]
 pub(crate) mod testutil;
 pub mod theme;
+pub mod tui;
 pub mod worktree;
