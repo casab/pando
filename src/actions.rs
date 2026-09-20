@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use crate::config::{self, Config, ProcessConfig, ProvisionMode};
 use crate::detect::{self, Slot};
+use crate::hooks;
 use crate::paths::PandoPaths;
 use crate::ports;
 use crate::process::{self as proc, SpawnOptions};
@@ -139,10 +140,95 @@ pub fn new(
             .insert(dir_name.clone(), WorktreeRecord::new(canonical, true));
         state::save(&paths.state_file(), &store)
     })();
-    match finish {
-        Ok(()) => Ok(dir_name),
-        Err(e) => Err(unwind_new(&root, &target, branch, &source, e)),
+    if let Err(e) = finish {
+        return Err(unwind_new(&root, &target, branch, &source, e));
     }
+    // The lock goes before the install runs: `npm ci` takes minutes, and
+    // holding the state lock through it would stall every `ls` and freeze
+    // the TUI's tick.
+    drop(_lock);
+
+    // A failed install keeps the worktree. The branch is checked out, the
+    // files are provisioned, and the next `start` tries the install again —
+    // so the error is worth an exit code, but not an unwind.
+    progress("installing");
+    install_if_needed(paths, config, &dir_name, &target, progress)
+        .with_context(|| format!("{dir_name} was created, but its install step failed"))?;
+    Ok(dir_name)
+}
+
+/// The name of the built-in install hook, and of its log file.
+pub const INSTALL_HOOK: &str = "install";
+
+/// Runs `[project].install` when the lockfiles have changed since it last
+/// ran here.
+///
+/// A built-in hook rather than a special case: the same fingerprint gate
+/// `[[hooks]]` gets in the next phase, keyed on the lockfiles because a
+/// lockfile changing is what "the dependencies changed" means.
+///
+/// Deliberately not under the state lock. It reads the recorded fingerprint
+/// without one — the worst a race can do is run an idempotent install twice
+/// — and takes the lock only to write the result.
+pub fn install_if_needed(
+    paths: &PandoPaths,
+    config: &Config,
+    name: &str,
+    worktree: &Path,
+    progress: &dyn Fn(&str),
+) -> Result<()> {
+    let Some(install) = config.project.install.as_deref() else {
+        return Ok(());
+    };
+    if install.trim().is_empty() {
+        return Ok(());
+    }
+    let globs: Vec<String> = detect::LOCKFILES.iter().map(|l| l.to_string()).collect();
+    let current = hooks::fingerprint(worktree, &globs);
+    let recorded = state::load(&paths.state_file()).ok().and_then(|store| {
+        store
+            .worktrees
+            .get(name)
+            .and_then(|r| r.hooks.get(INSTALL_HOOK))
+            .and_then(|h| h.fingerprint.clone())
+    });
+    // No fingerprint at all means nothing here can say the dependencies are
+    // unchanged, so the hook runs every time.
+    if current.is_some() && current == recorded {
+        return Ok(());
+    }
+
+    let log_file = paths.log_file(name, INSTALL_HOOK);
+    progress(&format!("{INSTALL_HOOK}: {install}"));
+    let env = pando_env(paths, name, worktree);
+    hooks::run(&log_file, &with_prelude(config, install), worktree, &env)
+        .with_context(|| format!("the {INSTALL_HOOK} hook failed"))?;
+
+    let _lock = state::lock(&paths.lock_file())?;
+    let mut store = state::load(&paths.state_file())?;
+    if let Some(record) = store.worktrees.get_mut(name) {
+        record.hooks.insert(
+            INSTALL_HOOK.to_string(),
+            state::HookRecord {
+                fingerprint: current,
+                ran_at: Utc::now(),
+            },
+        );
+        state::save(&paths.state_file(), &store)?;
+    }
+    Ok(())
+}
+
+/// The variables every command pando runs gets, whether or not it has ports
+/// yet. A hook has to be able to find out which worktree it is in.
+fn pando_env(paths: &PandoPaths, name: &str, worktree: &Path) -> Vec<(String, String)> {
+    vec![
+        ("PANDO_NAME".to_string(), name.to_string()),
+        ("PANDO_BRANCH".to_string(), name.to_string()),
+        ("PANDO_WORKTREE".to_string(), worktree.display().to_string()),
+        ("PANDO_ROOT".to_string(), paths.root().display().to_string()),
+        ("PANDO_PROJECT".to_string(), paths.project_id().to_string()),
+    ]
 }
 
 /// Undoes a `new` that failed after `git worktree add`. The worktree goes;
@@ -499,8 +585,15 @@ pub fn start(
 ) -> Result<StartOutcome> {
     let worktree = find_worktree(paths, name)?;
     let (process_name, process) = single_process(config)?;
+    let canonical = std::fs::canonicalize(&worktree.path).unwrap_or_else(|_| worktree.path.clone());
 
     paths.ensure_home()?;
+    // Before the lock, and before anything is spawned: a worktree whose
+    // lockfiles changed under it — a rebase, a branch switch — gets its
+    // dependencies brought up to date, and a long install does not hold the
+    // lock the rest of pando needs.
+    install_if_needed(paths, config, name, &canonical, progress)?;
+
     let _lock = state::lock(&paths.lock_file())?;
     let mut store = state::load(&paths.state_file())?;
 
@@ -534,7 +627,6 @@ pub fn start(
 
     // A record only vouches for the worktree it was written for; a stale one
     // at another path is replaced rather than inherited.
-    let canonical = std::fs::canonicalize(&worktree.path).unwrap_or_else(|_| worktree.path.clone());
     let record = store
         .worktrees
         .entry(name.to_string())
@@ -1824,6 +1916,137 @@ mod tests {
         let outcome = restart(&fx.paths, &fx.config, &name, &noop).unwrap();
         let _guard = guard(&outcome);
         assert!(matches!(outcome, StartOutcome::Started(_)));
+    }
+
+    // ---- the install hook ------------------------------------------------
+
+    /// A fixture with a lockfile, so the install hook has a fingerprint.
+    fn installable_fixture(install: &str) -> Fx {
+        let mut fx = fixture();
+        std::fs::write(fx.root.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+        git(&fx.root, &["add", "."]);
+        git(&fx.root, &["commit", "--quiet", "-m", "lock"]);
+        fx.config.project.install = Some(install.to_string());
+        fx
+    }
+
+    fn install_log(fx: &Fx, name: &str) -> String {
+        std::fs::read_to_string(fx.paths.log_file(name, INSTALL_HOOK)).unwrap_or_default()
+    }
+
+    fn install_fingerprint(fx: &Fx, name: &str) -> Option<String> {
+        fx.state().worktrees[name]
+            .hooks
+            .get(INSTALL_HOOK)?
+            .fingerprint
+            .clone()
+    }
+
+    #[test]
+    fn the_install_hook_runs_after_new_and_records_its_fingerprint() {
+        let fx = installable_fixture("echo installed-once");
+        let name = worktree_named(&fx, "feat/one");
+        assert!(install_log(&fx, &name).contains("installed-once"));
+        let recorded = install_fingerprint(&fx, &name).expect("a fingerprint");
+        assert!(recorded.starts_with("md5:"), "{recorded}");
+    }
+
+    #[test]
+    fn the_install_hook_is_skipped_while_the_lockfile_is_unchanged() {
+        let mut fx = installable_fixture("echo run");
+        let name = worktree_named(&fx, "feat/one");
+        assert_eq!(install_log(&fx, &name).matches("run").count(), 1);
+
+        with_dev(&mut fx, dev("sleep 30"));
+        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let _guard = guard(&outcome);
+        assert_eq!(
+            install_log(&fx, &name).matches("run").count(),
+            1,
+            "nothing changed, so nothing to install"
+        );
+    }
+
+    // The case the fingerprint exists for: a branch with different
+    // dependencies, or a rebase that moved the lockfile under a worktree.
+    #[test]
+    fn the_install_hook_runs_again_when_the_lockfile_changes() {
+        let mut fx = installable_fixture("echo run");
+        with_dev(&mut fx, dev("sleep 30"));
+        let name = worktree_named(&fx, "feat/one");
+        let first = install_fingerprint(&fx, &name).unwrap();
+
+        let worktree = fx.worktrees_dir().join(&name);
+        std::fs::write(worktree.join("pnpm-lock.yaml"), "lockfileVersion: '10.0'\n").unwrap();
+
+        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let _guard = guard(&outcome);
+        assert_eq!(
+            install_log(&fx, &name).matches("run").count(),
+            2,
+            "a changed lockfile is what makes it run again"
+        );
+        assert_ne!(install_fingerprint(&fx, &name).unwrap(), first);
+    }
+
+    // The worktree is the expensive thing; the install is retryable. A
+    // failure reports itself and leaves everything else alone.
+    #[test]
+    fn a_failed_install_keeps_the_worktree_and_names_its_log() {
+        let fx = installable_fixture("echo could-not-resolve >&2 && exit 1");
+        let err = new(&fx.paths, &fx.config, "feat/one", None, &noop).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("install"), "{msg}");
+        assert!(msg.contains("could-not-resolve"), "{msg}");
+        assert!(
+            msg.contains("install.log"),
+            "the log path is in the message: {msg}"
+        );
+
+        assert_eq!(
+            fx.names(),
+            vec!["feat+one".to_string()],
+            "the worktree stays"
+        );
+        assert!(fx.worktrees_dir().join("feat+one").is_dir());
+        assert!(
+            install_fingerprint(&fx, "feat+one").is_none(),
+            "a failed install records no fingerprint, so the next start retries"
+        );
+    }
+
+    #[test]
+    fn a_failed_install_is_retried_by_the_next_start() {
+        let mut fx = installable_fixture("exit 1");
+        assert!(new(&fx.paths, &fx.config, "feat/one", None, &noop).is_err());
+        fx.config.project.install = Some("echo recovered".to_string());
+        with_dev(&mut fx, dev("sleep 30"));
+
+        let outcome = start(&fx.paths, &fx.config, "feat+one", &noop).unwrap();
+        let _guard = guard(&outcome);
+        assert!(install_log(&fx, "feat+one").contains("recovered"));
+        assert!(install_fingerprint(&fx, "feat+one").is_some());
+    }
+
+    #[test]
+    fn a_project_with_no_install_step_runs_no_hook() {
+        let fx = fixture();
+        let name = worktree_named(&fx, "feat/one");
+        assert!(!fx.paths.log_file(&name, INSTALL_HOOK).exists());
+        assert!(fx.state().worktrees[&name].hooks.is_empty());
+    }
+
+    // No lockfile means nothing can say the dependencies are unchanged, so
+    // the hook has to run every time rather than guess.
+    #[test]
+    fn an_install_with_nothing_to_fingerprint_runs_every_time() {
+        let mut fx = fixture();
+        fx.config.project.install = Some("echo run".to_string());
+        with_dev(&mut fx, dev("sleep 30"));
+        let name = worktree_named(&fx, "feat/one");
+        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let _guard = guard(&outcome);
+        assert_eq!(install_log(&fx, &name).matches("run").count(), 2);
     }
 
     // ---- questions -------------------------------------------------------

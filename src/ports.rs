@@ -131,6 +131,23 @@ pub fn assign(
     name: &str,
     roles: &[String],
 ) -> anyhow::Result<Assignment> {
+    assign_with(paths, store, name, roles, is_port_free)
+}
+
+/// [`assign`] with the host probe injected.
+///
+/// Tests drive this one: [`is_port_free`] answers by binding the port for
+/// an instant, so two tests probing at the same moment can each see the
+/// other's probe and conclude the port is taken. That is a real property of
+/// the probe, not a bug — but it makes "the same ports come back" flaky to
+/// assert, so the assertions use a probe that does not move.
+pub fn assign_with(
+    paths: &crate::paths::PandoPaths,
+    store: &mut crate::state::State,
+    name: &str,
+    roles: &[String],
+    is_free: impl Fn(u16) -> bool,
+) -> anyhow::Result<Assignment> {
     use anyhow::Context as _;
     use std::collections::{BTreeMap, HashSet};
 
@@ -166,7 +183,7 @@ pub fn assign(
     if recorded.len() == roles.len() && record.ports.len() == roles.len() {
         let usable = recorded
             .iter()
-            .all(|p| is_port_free(*p) && !taken_by_others.contains(p));
+            .all(|p| is_free(*p) && !taken_by_others.contains(p));
         if usable {
             return Ok(Assignment {
                 ports: record.ports.clone(),
@@ -178,7 +195,7 @@ pub fn assign(
     let had_ports = !record.ports.is_empty();
     let base = derive_base(paths.project_id(), name);
     let window = reserve(base, roles.len(), |port| {
-        is_port_free(port) && !taken_by_others.contains(&port)
+        is_free(port) && !taken_by_others.contains(&port)
     })
     .with_context(|| {
         format!(
@@ -353,13 +370,26 @@ mod tests {
         names.iter().map(|s| s.to_string()).collect()
     }
 
+    /// A host with nothing bound on it, so an assertion about which ports
+    /// come back is about pando's own rules and not about the machine.
+    fn all_free(_: u16) -> bool {
+        true
+    }
+
     #[test]
     fn assign_records_a_port_per_role_and_reuses_it() {
         let (_dir, paths) = assign_fixture();
         let mut store = crate::state::State::new();
         with_record(&mut store, "feat+one");
 
-        let first = assign(&paths, &mut store, "feat+one", &roles(&["web", "api"])).unwrap();
+        let first = assign_with(
+            &paths,
+            &mut store,
+            "feat+one",
+            &roles(&["web", "api"]),
+            all_free,
+        )
+        .unwrap();
         assert_eq!(first.ports.len(), 2);
         assert!(!first.reassigned);
         assert_eq!(first.ports["api"], first.ports["web"] + 1, "consecutive");
@@ -368,7 +398,14 @@ mod tests {
             "the assignment is recorded, so a stopped worktree keeps its ports"
         );
 
-        let second = assign(&paths, &mut store, "feat+one", &roles(&["web", "api"])).unwrap();
+        let second = assign_with(
+            &paths,
+            &mut store,
+            "feat+one",
+            &roles(&["web", "api"]),
+            all_free,
+        )
+        .unwrap();
         assert_eq!(second.ports, first.ports, "ports are stable per worktree");
         assert!(!second.reassigned);
     }
@@ -383,10 +420,9 @@ mod tests {
         with_record(&mut store, "feat+one");
         with_record(&mut store, "feat+two");
 
-        let one = assign(&paths, &mut store, "feat+one", &roles(&["web"])).unwrap();
-        // Force the collision: pretend both hash to the same base.
+        let one = assign_with(&paths, &mut store, "feat+one", &roles(&["web"]), all_free).unwrap();
         store.worktrees.get_mut("feat+two").unwrap().ports.clear();
-        let two = assign(&paths, &mut store, "feat+two", &roles(&["web"])).unwrap();
+        let two = assign_with(&paths, &mut store, "feat+two", &roles(&["web"]), all_free).unwrap();
         assert_ne!(one.ports["web"], two.ports["web"]);
 
         // And explicitly: a worktree asking for a port already recorded
@@ -398,7 +434,8 @@ mod tests {
             .unwrap()
             .ports
             .insert("web".to_string(), stolen);
-        let again = assign(&paths, &mut store, "feat+two", &roles(&["web"])).unwrap();
+        let again =
+            assign_with(&paths, &mut store, "feat+two", &roles(&["web"]), all_free).unwrap();
         assert_ne!(
             again.ports["web"], stolen,
             "a port recorded for another worktree is not free"
@@ -427,6 +464,10 @@ mod tests {
         let moved = assign(&paths, &mut store, "feat+one", &roles(&["web"])).unwrap();
         assert_ne!(moved.ports["web"], held, "a bound port is not reusable");
         assert!(
+            (PORT_MIN..=PORT_MAX).contains(&moved.ports["web"]),
+            "and the real host probe is what `assign` uses"
+        );
+        assert!(
             moved.reassigned,
             "a moved port is worth telling the user about"
         );
@@ -440,8 +481,15 @@ mod tests {
         let (_dir, paths) = assign_fixture();
         let mut store = crate::state::State::new();
         with_record(&mut store, "feat+one");
-        assign(&paths, &mut store, "feat+one", &roles(&["web"])).unwrap();
-        let grown = assign(&paths, &mut store, "feat+one", &roles(&["web", "api"])).unwrap();
+        assign_with(&paths, &mut store, "feat+one", &roles(&["web"]), all_free).unwrap();
+        let grown = assign_with(
+            &paths,
+            &mut store,
+            "feat+one",
+            &roles(&["web", "api"]),
+            all_free,
+        )
+        .unwrap();
         assert_eq!(grown.ports.len(), 2);
         assert_eq!(grown.ports["api"], grown.ports["web"] + 1);
         assert_eq!(store.worktrees["feat+one"].ports.len(), 2);

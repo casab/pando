@@ -42,7 +42,9 @@ pub struct Signals {
     pub ignored_present: Vec<String>,
 }
 
-const LOCKFILES: [&str; 11] = [
+/// Also the install hook's fingerprint: a lockfile changing is what means
+/// the dependencies changed.
+pub const LOCKFILES: [&str; 11] = [
     "pnpm-lock.yaml",
     "package-lock.json",
     "yarn.lock",
