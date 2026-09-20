@@ -11,6 +11,7 @@
 //! ```
 
 pub mod config;
+pub mod log_tail;
 pub mod paths;
 pub mod ports;
 pub mod process;
