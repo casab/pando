@@ -869,6 +869,17 @@ pub fn status_json<W: Write>(paths: &PandoPaths, only: Option<&str>, out: &mut W
 }
 
 pub fn status_text<W: Write>(paths: &PandoPaths, only: Option<&str>, out: &mut W) -> Result<()> {
+    status_text_at(paths, only, out, terminal_width())
+}
+
+/// [`status_text`] at a given terminal width, so the shedding is testable
+/// without a terminal — the shape `ls_text_at` already has.
+pub fn status_text_at<W: Write>(
+    paths: &PandoPaths,
+    only: Option<&str>,
+    out: &mut W,
+    width: usize,
+) -> Result<()> {
     let refreshed = actions::refresh(paths);
     if let Some(warning) = &refreshed.warning {
         eprintln!("pando: {warning}");
@@ -885,14 +896,19 @@ pub fn status_text<W: Write>(paths: &PandoPaths, only: Option<&str>, out: &mut W
         }
         return Ok(());
     }
-    let width = shown
+    let names = shown
         .iter()
         .map(|w| w.name.chars().count())
         .max()
         .unwrap_or(4);
     for w in shown {
         let record = refreshed.state.worktrees.get(&w.name);
-        writeln!(out, "{:<width$}  {}", w.name, worktree_line(record))?;
+        writeln!(
+            out,
+            "{:<names$}  {}",
+            w.name,
+            worktree_line(record, width.saturating_sub(names + COL_GAP))
+        )?;
         // One line per process under it, so a worktree that is `failed`
         // says which of its processes is, and each one's pid is reachable.
         let Some(record) = record else { continue };
@@ -903,21 +919,28 @@ pub fn status_text<W: Write>(paths: &PandoPaths, only: Option<&str>, out: &mut W
             .max()
             .unwrap_or(0);
         for (name, p) in &record.processes {
-            writeln!(
-                out,
+            // The same shape as the worktree line above, and the same
+            // degradation: a reason or an uptime is truncated rather than
+            // allowed to wrap the row under it.
+            let row = format!(
                 "  {:<process_width$}  {}",
                 name,
                 process_line(p),
                 process_width = process_width
-            )?;
+            );
+            writeln!(out, "{}", ellipsize(&row, width))?;
         }
     }
     Ok(())
 }
 
+/// Width the phase word is padded to, so the cell after it lines up
+/// whichever of the four words is printed.
+const PHASE_CELL: usize = 8;
+
 /// The worktree's own line: its aggregate phase, its ports, and the one URL
-/// it serves on.
-fn worktree_line(record: Option<&WorktreeRecord>) -> String {
+/// it serves on, fitted to `room` characters.
+fn worktree_line(record: Option<&WorktreeRecord>, room: usize) -> String {
     let Some(record) = record else {
         return "stopped".to_string();
     };
@@ -928,22 +951,56 @@ fn worktree_line(record: Option<&WorktreeRecord>) -> String {
         }
         // The ports survive a stop, and saying so is how a developer knows
         // the URL they bookmarked will still be theirs.
-        return format!("stopped   {ports}");
+        return fit_line("stopped", &ports, None, None, room);
     };
     let age = human_duration(Utc::now().signed_duration_since(aggregate.since()));
     match aggregate {
-        crate::state::Aggregate::Running { .. } => {
-            let url = worktree_url(record).unwrap_or_default();
-            format!("running   {ports}  {url}  up {age}")
+        crate::state::Aggregate::Running { .. } => fit_line(
+            "running",
+            &ports,
+            worktree_url(record).as_deref(),
+            Some(&format!("up {age}")),
+            room,
+        ),
+        crate::state::Aggregate::Starting { .. } => {
+            fit_line("starting", &ports, None, Some(&format!("for {age}")), room)
         }
-        crate::state::Aggregate::Starting { .. } => format!("starting  {ports}  for {age}"),
         // Named: `failed` on a worktree running three processes is a
         // question until it says which one.
-        crate::state::Aggregate::Failed { .. } => format!(
-            "failed    {ports}  {}",
-            aggregate.reason().unwrap_or_default()
-        ),
+        crate::state::Aggregate::Failed { .. } => {
+            fit_line("failed", &ports, None, aggregate.reason().as_deref(), room)
+        }
     }
+}
+
+/// Assembles a worktree's status line and fits it into `room` characters.
+///
+/// The TUI is used in tmux splits and `pando status` is read in the same
+/// ones, so this degrades rather than wraps. The URL goes first: it is the
+/// longest cell by far and `--json` still carries it. The ports cell is
+/// truncated after that, because a developer who can see three roles and
+/// two numbers knows more than one looking at a line that wrapped.
+fn fit_line(word: &str, ports: &str, url: Option<&str>, tail: Option<&str>, room: usize) -> String {
+    let assemble = |ports: &str, url: Option<&str>| {
+        let mut parts = vec![format!("{word:<PHASE_CELL$}"), ports.to_string()];
+        parts.extend(url.map(str::to_string));
+        parts.extend(tail.map(str::to_string));
+        parts.join(&" ".repeat(COL_GAP))
+    };
+    let full = assemble(ports, url);
+    if full.chars().count() <= room {
+        return full;
+    }
+    let without_url = assemble(ports, None);
+    if without_url.chars().count() <= room {
+        return without_url;
+    }
+    let over = without_url.chars().count() - room;
+    let keep = ports.chars().count().saturating_sub(over);
+    // And if even an empty ports cell will not fit — a split narrow enough
+    // that the phase word and the age are already too much — the line is
+    // truncated rather than left to wrap onto the process rows below it.
+    ellipsize(&assemble(&ellipsize(ports, keep), None), room)
 }
 
 fn process_line(p: &ProcessRecord) -> String {
@@ -1728,7 +1785,7 @@ mod tests {
         let name = actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
         with_two_processes(&fx, &name, Phase::Running { since: Utc::now() });
 
-        let text = capture(|b| status_text(&fx.paths, None, b));
+        let text = capture(|b| status_text_at(&fx.paths, None, b, 200));
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines.len(),
@@ -1757,6 +1814,44 @@ mod tests {
         }
     }
 
+    // Phase 2b review, finding 9. `ls` sheds columns and the TUI detail
+    // pane truncates; `status` had no width parameter at all, and the
+    // per-process rows 2b added grow the block it prints. In the tmux split
+    // the TUI is designed for, it wrapped.
+    #[test]
+    fn status_text_sheds_the_url_and_then_the_ports_as_the_terminal_narrows() {
+        let fx = fixture();
+        let name = actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
+        with_two_processes(&fx, &name, Phase::Running { since: Utc::now() });
+
+        let wide = capture(|b| status_text_at(&fx.paths, None, b, 200));
+        assert!(wide.contains("http://localhost:17342"), "{wide}");
+        assert!(
+            wide.contains("api 17343") && wide.contains("web 17342"),
+            "{wide}"
+        );
+
+        for width in [60, 44, 32, 24, 12] {
+            let text = capture(|b| status_text_at(&fx.paths, None, b, width));
+            for line in text.lines() {
+                assert!(
+                    line.chars().count() <= width,
+                    "{line:?} is wider than {width} columns:\n{text}"
+                );
+            }
+            assert!(
+                text.contains("feat+one"),
+                "the name is the identifier and never goes: {text}"
+            );
+        }
+
+        // The URL is the longest cell and `--json` still carries it, so it
+        // is the first thing to go; the ports cell is truncated after that.
+        let narrow = capture(|b| status_text_at(&fx.paths, None, b, 44));
+        assert!(!narrow.contains("http://"), "{narrow}");
+        assert!(narrow.contains("running"), "{narrow}");
+    }
+
     #[test]
     fn status_text_says_which_process_failed() {
         let fx = fixture();
@@ -1770,7 +1865,7 @@ mod tests {
             },
         );
 
-        let text = capture(|b| status_text(&fx.paths, None, b));
+        let text = capture(|b| status_text_at(&fx.paths, None, b, 200));
         let lines: Vec<&str> = text.lines().collect();
         assert!(
             lines[0].contains("failed") && lines[0].contains("api: process exited"),

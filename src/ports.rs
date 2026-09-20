@@ -263,7 +263,7 @@ pub fn assign_with(
         }
     }
 
-    let had_ports = !record.ports.is_empty();
+    let previous = record.ports.clone();
     let base = derive_base(paths.project_id(), name);
     let window = reserve(base, roles.len(), |port| {
         is_free(port) && !taken_by_others.contains(&port)
@@ -276,11 +276,17 @@ pub fn assign_with(
     })?;
 
     let ports: BTreeMap<String, u16> = roles.iter().cloned().zip(window).collect();
+    // Only a role that still exists and really changed number. The reuse
+    // fast path above needs the recorded set to be exactly the roles being
+    // asked for, so adding or removing a process always re-derives the
+    // window — and the new one usually lands on the same numbers. Calling
+    // that a reassignment tells the developer their ports were taken, which
+    // is a claim about other processes on the machine and is simply untrue.
+    let reassigned = ports
+        .iter()
+        .any(|(role, port)| previous.get(role).is_some_and(|had| had != port));
     record.ports = ports.clone();
-    Ok(Assignment {
-        ports,
-        reassigned: had_ports,
-    })
+    Ok(Assignment { ports, reassigned })
 }
 
 #[cfg(test)]
@@ -630,6 +636,73 @@ mod tests {
         assert_eq!(grown.ports.len(), 2);
         assert_eq!(grown.ports["api"], grown.ports["web"] + 1);
         assert_eq!(store.worktrees["feat+one"].ports.len(), 2);
+    }
+
+    // Phase 2b review, finding 8. Adding a process re-derives the window,
+    // and the new one usually lands on exactly the numbers the old one had.
+    // "the ports it had were taken; it moved to new ones" then states
+    // something false about other processes on the machine — and adding a
+    // process to a workspace config is a normal edit.
+    #[test]
+    fn a_window_that_lands_on_the_same_numbers_is_not_a_reassignment() {
+        let (_dir, paths) = assign_fixture();
+        let mut store = crate::state::State::new();
+        with_record(&mut store, "feat+det");
+        let two = assign_with(
+            &paths,
+            &mut store,
+            "feat+det",
+            &roles(&["api", "web"]),
+            &[],
+            all_free,
+        )
+        .unwrap();
+        assert!(!two.reassigned, "nothing was there to move");
+
+        let three = assign_with(
+            &paths,
+            &mut store,
+            "feat+det",
+            &roles(&["api", "web", "worker"]),
+            &[],
+            all_free,
+        )
+        .unwrap();
+        assert_eq!(three.ports["api"], two.ports["api"]);
+        assert_eq!(three.ports["web"], two.ports["web"]);
+        assert!(
+            !three.reassigned,
+            "a third role is not two ports moving: {:?} → {:?}",
+            two.ports, three.ports
+        );
+
+        // A role that goes away is not a move either: what is left kept
+        // every number it had.
+        let mut shrunk = store.clone();
+        let fewer = assign_with(
+            &paths,
+            &mut shrunk,
+            "feat+det",
+            &roles(&["api", "web"]),
+            &[],
+            all_free,
+        )
+        .unwrap();
+        assert!(!fewer.reassigned, "{:?} → {:?}", three.ports, fewer.ports);
+
+        // And a port that really did move still says so.
+        let web = three.ports["web"];
+        let moved = assign_with(
+            &paths,
+            &mut store,
+            "feat+det",
+            &roles(&["api", "web", "worker"]),
+            &[],
+            move |port| port != web,
+        )
+        .unwrap();
+        assert_ne!(moved.ports["web"], web);
+        assert!(moved.reassigned);
     }
 
     // A `--only` start leaves the worktree's other processes running, and a
