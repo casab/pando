@@ -9,7 +9,8 @@ use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Block, BorderType, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState,
 };
 
 use super::app::{App, LogFilter, LogView, Mode, SearchMode};
@@ -124,6 +125,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // share with the list are the two rows a long stack trace needs most.
     if app.log_view().is_some() {
         render_log_viewer(f, f.area(), app);
+        if app.inspect.is_some() {
+            render_inspect(f, f.area(), app);
+        }
         if let Some(modal) = &app.modal {
             super::modal::render_modal(f, f.area(), modal, app);
         }
@@ -601,6 +605,99 @@ fn viewer_rows(
         ));
     }
     (rows, scroll_out)
+}
+
+/// Pretty-printed JSON needs room to nest before wrapping stops helping.
+const INSPECT_MIN_WIDTH: u16 = 48;
+
+/// The overlay: one log line (or one JSON block) pretty-printed, wrapped to
+/// the popup width, scrollable.
+fn render_inspect(f: &mut Frame, area: Rect, app: &mut App) {
+    let status = app.active_status().map(|(m, e)| (m.to_string(), e));
+    let Some(inspect) = &app.inspect else { return };
+    let height = area
+        .height
+        .saturating_sub(4)
+        .clamp(8.min(area.height), area.height);
+    let popup = centered_rect(80, INSPECT_MIN_WIDTH, height, area);
+    if popup.width < 3 || popup.height < 3 {
+        return;
+    }
+    let block = Block::bordered()
+        .title(Span::styled(
+            " inspect ",
+            Style::new().fg(blue()).add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Line::from(match &status {
+            Some((message, is_error)) => Span::styled(
+                truncate(
+                    &format!(" {message} "),
+                    popup.width.saturating_sub(2) as usize,
+                ),
+                if *is_error {
+                    Style::new().fg(red()).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::new().fg(green()).add_modifier(Modifier::BOLD)
+                },
+            ),
+            None => Span::styled(
+                truncate(
+                    " j/k scroll · y copy · q close ",
+                    popup.width.saturating_sub(2) as usize,
+                ),
+                Style::new().fg(text_muted()),
+            ),
+        }))
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(border()))
+        .style(Style::new().bg(surface()));
+    let inner = block.inner(popup);
+    f.render_widget(Clear, popup);
+    f.render_widget(block, popup);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let width = (inner.width as usize).max(1);
+    let rows: Vec<Line<'static>> = inspect
+        .lines
+        .iter()
+        .cloned()
+        .flat_map(|line| wrap_line_to_rows(line, width))
+        .collect();
+    let body_height = (inner.height as usize).max(1);
+    let scroll = inspect.scroll.min(rows.len().saturating_sub(body_height));
+    let visible: Vec<Line<'static>> = rows
+        .iter()
+        .skip(scroll)
+        .take(body_height)
+        .cloned()
+        .collect();
+    f.render_widget(Paragraph::new(visible), inner);
+
+    if rows.len() > body_height {
+        let mut state = ScrollbarState::new(rows.len())
+            .viewport_content_length(body_height)
+            .position(scroll);
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_symbol(None)
+                .thumb_style(Style::new().fg(border()).add_modifier(Modifier::BOLD)),
+            popup.inner(Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut state,
+        );
+    }
+
+    // Persist the clamp, so a `G` (which asks for usize::MAX) lands on the
+    // real last page rather than off the end.
+    if let Some(inspect) = &mut app.inspect {
+        inspect.scroll = scroll;
+    }
 }
 
 /// One log line as visual rows: wrapped to the width, or truncated to a
@@ -2301,6 +2398,80 @@ mod tests {
             1,
             "to exactly one row:\n{truncated}"
         );
+    }
+
+    // ---- the inspect overlay ---------------------------------------------
+
+    #[test]
+    fn the_overlay_paints_the_pretty_printed_json_over_the_viewer() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(
+            &app,
+            "feat+one",
+            "dev",
+            &["request {\"path\":\"/checkout\",\"ms\":30}"],
+        );
+        app.open_log_viewer();
+        draw(&mut app, 80, 20);
+        app.handle_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::NONE));
+        let painted = text_of(&draw(&mut app, 80, 20));
+        assert!(painted.contains("inspect"), "{painted}");
+        assert!(painted.contains("\"path\": \"/checkout\""), "{painted}");
+        assert!(painted.contains("y copy"), "{painted}");
+    }
+
+    #[test]
+    fn the_overlay_colours_the_json_it_shows() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["{\"path\":\"/x\"}"]);
+        app.open_log_viewer();
+        draw(&mut app, 80, 20);
+        app.handle_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::NONE));
+        let colours: Vec<_> = app
+            .inspect
+            .as_ref()
+            .unwrap()
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter().filter_map(|s| s.style.fg))
+            .collect();
+        assert!(
+            colours.len() > 1,
+            "the overlay is syntax-coloured, not one flat colour: {colours:?}"
+        );
+    }
+
+    #[test]
+    fn capital_g_in_the_overlay_lands_on_the_real_last_page() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        let long: String = (0..60)
+            .map(|i| format!("\"k{i}\":{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        write_log(&app, "feat+one", "dev", &[format!("{{{long}}}")]);
+        app.open_log_viewer();
+        draw(&mut app, 80, 20);
+        app.handle_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE));
+        assert_eq!(app.inspect.as_ref().unwrap().scroll, usize::MAX);
+        draw(&mut app, 80, 20);
+        let scroll = app.inspect.as_ref().unwrap().scroll;
+        assert!(
+            scroll > 0 && scroll < 1000,
+            "the paint clamps it to a real page: {scroll}"
+        );
+    }
+
+    #[test]
+    fn the_overlay_survives_a_terminal_too_small_for_it() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["{\"a\":1}"]);
+        app.open_log_viewer();
+        draw(&mut app, 80, 20);
+        app.handle_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::NONE));
+        for (width, height) in [(1u16, 1u16), (2, 2), (4, 3), (20, 4), (48, 6)] {
+            draw(&mut app, width, height);
+        }
     }
 
     // ---- search ----------------------------------------------------------

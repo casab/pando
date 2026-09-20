@@ -12,8 +12,9 @@
 use anyhow::Result;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::Rect;
+use ratatui::text::Line;
 use ratatui::widgets::ListState;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -21,7 +22,7 @@ use std::time::{Duration, Instant};
 use crate::actions;
 use crate::cache;
 use crate::config::Config;
-use crate::log_tail::{LogLevel, LogTail};
+use crate::log_tail::{LogLevel, LogTail, ParsedLine, colorize_json};
 use crate::paths::PandoPaths;
 use crate::state::{self, Aggregate, ProcessRecord, State, WorktreeRecord};
 use crate::worktree::{self, BranchEntry, EnrichUpdate, PrInfo, Worktree};
@@ -152,7 +153,7 @@ impl LogFilter {
 /// Pretty-print overlay for one log line (`J`). `lines` are pre-styled;
 /// `text` is the plain version `y` yanks.
 pub struct LineInspect {
-    pub lines: Vec<ratatui::text::Line<'static>>,
+    pub lines: Vec<Line<'static>>,
     pub text: String,
     pub scroll: usize,
 }
@@ -1176,6 +1177,12 @@ impl App {
         let page = self.viewer_height.max(1) / 2;
         let viewer_height = self.viewer_height;
 
+        // The overlay sits on top of the viewer, so it answers first.
+        if self.inspect.is_some() {
+            self.handle_inspect_key(key, page);
+            return;
+        }
+
         // While a query is being typed every key belongs to it, esc
         // included — so this comes before anything else.
         if self
@@ -1223,6 +1230,10 @@ impl App {
             }
             KeyCode::BackTab => {
                 self.switch_log_source(-1);
+                return;
+            }
+            KeyCode::Enter | KeyCode::Char('J') => {
+                self.open_inspect();
                 return;
             }
             _ => {}
@@ -1335,6 +1346,95 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn handle_inspect_key(&mut self, key: KeyEvent, page: usize) {
+        let Some(inspect) = &mut self.inspect else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('J') => self.inspect = None,
+            KeyCode::Char('j') | KeyCode::Down => {
+                inspect.scroll = inspect.scroll.saturating_add(1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                inspect.scroll = inspect.scroll.saturating_sub(1);
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                inspect.scroll = inspect.scroll.saturating_add(page);
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                inspect.scroll = inspect.scroll.saturating_sub(page);
+            }
+            KeyCode::Char('g') => inspect.scroll = 0,
+            // The paint clamps it, so this lands on the real last page.
+            KeyCode::Char('G') => inspect.scroll = usize::MAX,
+            _ => {}
+        }
+    }
+
+    /// Opens the pretty-print overlay on the line the cursor is on. A line
+    /// that belongs to a multi-line JSON block expands to the whole block,
+    /// rejoined and re-prettified: one log entry is one thing to read.
+    fn open_inspect(&mut self) {
+        let Some(at) = self.current_log_index() else {
+            return;
+        };
+        let Some(view) = self.log_view() else { return };
+        let buffer = view.tail.lines();
+        let Some(parsed) = buffer.get(at) else {
+            return;
+        };
+        let (text, lines) = match parsed.block_id {
+            Some(id) => {
+                let (start, end) = block_bounds(buffer, at, id);
+                let joined = joined_block(buffer, start, end);
+                match serde_json::from_str::<serde_json::Value>(&joined)
+                    .ok()
+                    .and_then(|value| serde_json::to_string_pretty(&value).ok())
+                {
+                    Some(pretty) => {
+                        let styled = pretty
+                            .lines()
+                            .map(|line| Line::from(colorize_json(line)))
+                            .collect();
+                        (pretty, styled)
+                    }
+                    // A partial block — its head evicted, or raw output
+                    // interleaved into it — is shown verbatim rather than
+                    // not at all.
+                    None => (
+                        joined,
+                        buffer
+                            .range(start..=end)
+                            .map(|p| p.styled.clone())
+                            .collect(),
+                    ),
+                }
+            }
+            None => inspect_content(parsed),
+        };
+        self.inspect = Some(LineInspect {
+            lines,
+            text,
+            scroll: 0,
+        });
+    }
+
+    /// The buffer index of the line the viewer calls "current": the one
+    /// under the cursor, or the last visible line while following.
+    fn current_log_index(&self) -> Option<usize> {
+        let view = self.log_view()?;
+        let visible = view.visible();
+        if visible.is_empty() {
+            return None;
+        }
+        let at = if view.follow {
+            visible.len() - 1
+        } else {
+            view.cursor.min(visible.len() - 1)
+        };
+        Some(visible[at])
     }
 
     fn handle_search_typing_key(&mut self, key: KeyEvent, viewer_height: usize) {
@@ -2052,6 +2152,58 @@ impl App {
         app.refilter();
         app
     }
+}
+
+/// The contiguous range of the block containing `at`.
+fn block_bounds(buffer: &VecDeque<ParsedLine>, at: usize, id: u64) -> (usize, usize) {
+    let mut start = at;
+    while start > 0 && buffer[start - 1].block_id == Some(id) {
+        start -= 1;
+    }
+    let mut end = at;
+    while end + 1 < buffer.len() && buffer[end + 1].block_id == Some(id) {
+        end += 1;
+    }
+    (start, end)
+}
+
+fn joined_block(buffer: &VecDeque<ParsedLine>, start: usize, end: usize) -> String {
+    buffer
+        .range(start..=end)
+        .map(|parsed| parsed.plain.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Overlay content for a single line: the JSON it carries, pretty-printed
+/// and syntax-coloured with any prefix kept above it, or the raw line —
+/// which the overlay wraps, so this is also the long-line reader.
+fn inspect_content(parsed: &ParsedLine) -> (String, Vec<Line<'static>>) {
+    let pretty = parsed.json_start.and_then(|at| {
+        serde_json::from_str::<serde_json::Value>(&parsed.plain[at..])
+            .ok()
+            .and_then(|value| serde_json::to_string_pretty(&value).ok())
+            .map(|pretty| (at, pretty))
+    });
+    let Some((at, pretty)) = pretty else {
+        return (parsed.plain.clone(), vec![parsed.styled.clone()]);
+    };
+    let prefix = parsed.plain[..at].trim_end();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if !prefix.is_empty() {
+        lines.push(Line::styled(
+            prefix.to_string(),
+            ratatui::style::Style::new().fg(crate::theme::text_muted()),
+        ));
+        lines.push(Line::raw(""));
+    }
+    lines.extend(pretty.lines().map(|line| Line::from(colorize_json(line))));
+    let text = if prefix.is_empty() {
+        pretty
+    } else {
+        format!("{prefix}\n\n{pretty}")
+    };
+    (text, lines)
 }
 
 /// Rebuilds the match set for the current query, under the current level
@@ -3678,6 +3830,197 @@ pub mod tests {
             "the reader stays on the match they were on"
         );
         assert_eq!(viewer(&app).cursor, was);
+    }
+
+    // ---- JSON blocks and the inspect overlay -----------------------------
+
+    /// A pretty-printed JSON block, as a framework prints one, with
+    /// ordinary lines on either side.
+    fn json_block_log() -> Vec<String> {
+        [
+            "starting up",
+            "{",
+            "  \"level\": \"error\",",
+            "  \"msg\": \"boom\",",
+            "  \"count\": 3",
+            "}",
+            "carrying on",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    #[test]
+    fn the_lines_of_a_json_block_share_one_id_and_one_severity() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &json_block_log());
+        open_viewer(&mut app, 80, 20);
+        let lines: Vec<_> = viewer(&app).tail.lines().iter().cloned().collect();
+        let ids: Vec<Option<u64>> = lines.iter().map(|l| l.block_id).collect();
+        assert_eq!(ids[0], None, "the line before the block is its own");
+        assert!(ids[1].is_some());
+        assert_eq!(
+            ids[1..6]
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            1,
+            "every line of the block carries the same id: {ids:?}"
+        );
+        assert_eq!(ids[6], None, "and the line after it is its own again");
+        for line in &lines[1..6] {
+            assert_eq!(
+                line.level,
+                LogLevel::Error,
+                "the whole block takes the block's severity: {}",
+                line.plain
+            );
+        }
+    }
+
+    #[test]
+    fn a_level_filter_keeps_or_drops_a_block_as_one_unit() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &json_block_log());
+        open_viewer(&mut app, 80, 20);
+        assert_eq!(viewer(&app).visible_len(), 7);
+        press(&mut app, KeyCode::Char('f'));
+        press(&mut app, KeyCode::Char('f')); // errors only
+        assert_eq!(
+            viewer(&app).visible_len(),
+            5,
+            "all five lines of the block, and neither of the plain ones"
+        );
+    }
+
+    #[test]
+    fn capital_j_inspects_the_whole_block_and_j_scrolls_it() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &json_block_log());
+        open_viewer(&mut app, 80, 20);
+        // Onto a line in the middle of the block.
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('J'));
+
+        let inspect = app.inspect.as_ref().expect("the overlay is open");
+        assert!(
+            inspect.text.contains("\"msg\": \"boom\""),
+            "{}",
+            inspect.text
+        );
+        assert!(inspect.text.contains("\"count\": 3"), "{}", inspect.text);
+        assert!(
+            !inspect.text.contains("starting up"),
+            "the block, and only the block: {}",
+            inspect.text
+        );
+        assert_eq!(inspect.scroll, 0);
+
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.inspect.as_ref().unwrap().scroll, 1);
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.inspect.as_ref().unwrap().scroll, 0);
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.inspect.is_none(), "q closes the overlay");
+        assert!(app.log_view().is_some(), "and leaves the viewer open");
+    }
+
+    #[test]
+    fn enter_inspects_the_cursor_line_and_pretty_prints_its_json() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(
+            &app,
+            "feat+one",
+            "dev",
+            &["12:00:01 request {\"path\":\"/x\",\"ms\":30}"],
+        );
+        open_viewer(&mut app, 80, 20);
+        press(&mut app, KeyCode::Enter);
+        let inspect = app.inspect.as_ref().expect("the overlay is open");
+        assert!(
+            inspect.text.starts_with("12:00:01 request"),
+            "the prefix is kept above the JSON: {}",
+            inspect.text
+        );
+        assert!(
+            inspect.text.contains("\n  \"path\": \"/x\""),
+            "and the JSON is expanded: {}",
+            inspect.text
+        );
+    }
+
+    #[test]
+    fn a_line_with_no_json_inspects_as_itself() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["just a plain line"]);
+        open_viewer(&mut app, 80, 20);
+        press(&mut app, KeyCode::Char('J'));
+        assert_eq!(app.inspect.as_ref().unwrap().text, "just a plain line");
+        assert_eq!(app.inspect.as_ref().unwrap().lines.len(), 1);
+    }
+
+    #[test]
+    fn a_block_with_raw_output_interleaved_inspects_verbatim() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(
+            &app,
+            "feat+one",
+            "dev",
+            &[
+                "{",
+                "  \"level\": \"warn\",",
+                "SELECT * FROM users;",
+                "  \"msg\": \"slow\"",
+                "}",
+            ],
+        );
+        open_viewer(&mut app, 80, 20);
+        press(&mut app, KeyCode::Char('J'));
+        let inspect = app.inspect.as_ref().expect("the overlay is open");
+        assert!(
+            inspect.text.contains("SELECT * FROM users;"),
+            "an unparseable block is shown as it arrived: {}",
+            inspect.text
+        );
+        assert_eq!(inspect.lines.len(), 5, "one styled line per raw line");
+    }
+
+    #[test]
+    fn the_overlay_swallows_the_viewers_keys_while_it_is_open() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        let lines: Vec<String> = (0..20).map(|i| format!("line {i}")).collect();
+        write_log(&app, "feat+one", "dev", &lines);
+        open_viewer(&mut app, 80, 20);
+        press(&mut app, KeyCode::Char('g'));
+        let cursor = viewer(&app).cursor;
+        press(&mut app, KeyCode::Char('J'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(
+            viewer(&app).cursor,
+            cursor,
+            "the line underneath does not move"
+        );
+        press(&mut app, KeyCode::Esc);
+        assert!(app.inspect.is_none());
+        assert!(
+            app.log_view().is_some(),
+            "esc closes the overlay, not the viewer"
+        );
+    }
+
+    #[test]
+    fn leaving_the_viewer_closes_the_overlay_with_it() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["a line"]);
+        open_viewer(&mut app, 80, 20);
+        press(&mut app, KeyCode::Char('J'));
+        assert!(app.inspect.is_some());
+        app.close_log_viewer();
+        assert!(app.inspect.is_none());
     }
 
     #[test]
