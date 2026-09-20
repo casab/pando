@@ -728,11 +728,8 @@ impl App {
             // `pando.toml` that this session's own copy does not have is
             // one the next keypress asks all over again.
             let _ = tx.send(AppEvent::ConfigResolved(Box::new(config.clone())));
-            actions::start(&paths, &config, &worker_name, &progress)
-                .map(|outcome| {
-                    let started = outcome.process();
-                    PendingOutcome::Started(worker_name.clone(), started.url.clone())
-                })
+            actions::start(&paths, &config, &worker_name, None, &progress)
+                .map(|report| PendingOutcome::Started(worker_name.clone(), report.url.clone()))
                 .map_err(|e| format!("{e:#}"))
         });
         if started && let Some(p) = self.pending.as_mut() {
@@ -747,7 +744,7 @@ impl App {
         let paths = self.paths.clone();
         let worker_name = name.clone();
         self.spawn_pending(name, PendingKind::Stop, move || {
-            actions::stop(&paths, &worker_name)
+            actions::stop(&paths, &worker_name, None)
                 .map(|_| PendingOutcome::Stopped(worker_name))
                 .map_err(|e| format!("{e:#}"))
         });
@@ -770,10 +767,8 @@ impl App {
             let config = actions::resolve_process(&paths, &config, &ask, &progress)
                 .map_err(|e| format!("{e:#}"))?;
             let _ = tx.send(AppEvent::ConfigResolved(Box::new(config.clone())));
-            actions::restart(&paths, &config, &worker_name, &progress)
-                .map(|outcome| {
-                    PendingOutcome::Started(worker_name.clone(), outcome.process().url.clone())
-                })
+            actions::restart(&paths, &config, &worker_name, None, &progress)
+                .map(|report| PendingOutcome::Started(worker_name.clone(), report.url.clone()))
                 .map_err(|e| format!("{e:#}"))
         });
         if started && let Some(p) = self.pending.as_mut() {

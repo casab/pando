@@ -181,7 +181,25 @@ pub fn assign(
     name: &str,
     roles: &[String],
 ) -> anyhow::Result<Assignment> {
-    assign_with(paths, store, name, roles, is_port_free)
+    assign_keeping(paths, store, name, roles, &[])
+}
+
+/// [`assign`] told which of this worktree's ports one of its *own*
+/// processes is already holding.
+///
+/// A `--only` start leaves the worktree's other processes running, and
+/// their listeners make their own ports fail the freeness probe. Without
+/// this, starting one process of a pair would decide the pair's ports had
+/// been taken and move every one of them — changing the URL of a server
+/// that never stopped serving.
+pub fn assign_keeping(
+    paths: &crate::paths::PandoPaths,
+    store: &mut crate::state::State,
+    name: &str,
+    roles: &[String],
+    keep: &[u16],
+) -> anyhow::Result<Assignment> {
+    assign_with(paths, store, name, roles, keep, is_port_free)
 }
 
 /// [`assign`] with the host probe injected.
@@ -196,6 +214,7 @@ pub fn assign_with(
     store: &mut crate::state::State,
     name: &str,
     roles: &[String],
+    keep: &[u16],
     is_free: impl Fn(u16) -> bool,
 ) -> anyhow::Result<Assignment> {
     use anyhow::Context as _;
@@ -231,9 +250,11 @@ pub fn assign_with(
         .filter_map(|role| record.ports.get(role).copied())
         .collect();
     if recorded.len() == roles.len() && record.ports.len() == roles.len() {
+        // A port one of this worktree's own live processes is holding is
+        // not a port somebody took: it is this worktree's, still in use.
         let usable = recorded
             .iter()
-            .all(|p| is_free(*p) && !taken_by_others.contains(p));
+            .all(|p| (is_free(*p) || keep.contains(p)) && !taken_by_others.contains(p));
         if usable {
             return Ok(Assignment {
                 ports: record.ports.clone(),
@@ -463,6 +484,7 @@ mod tests {
             &mut store,
             "feat+one",
             &roles(&["web", "api"]),
+            &[],
             all_free,
         )
         .unwrap();
@@ -479,6 +501,7 @@ mod tests {
             &mut store,
             "feat+one",
             &roles(&["web", "api"]),
+            &[],
             all_free,
         )
         .unwrap();
@@ -496,9 +519,25 @@ mod tests {
         with_record(&mut store, "feat+one");
         with_record(&mut store, "feat+two");
 
-        let one = assign_with(&paths, &mut store, "feat+one", &roles(&["web"]), all_free).unwrap();
+        let one = assign_with(
+            &paths,
+            &mut store,
+            "feat+one",
+            &roles(&["web"]),
+            &[],
+            all_free,
+        )
+        .unwrap();
         store.worktrees.get_mut("feat+two").unwrap().ports.clear();
-        let two = assign_with(&paths, &mut store, "feat+two", &roles(&["web"]), all_free).unwrap();
+        let two = assign_with(
+            &paths,
+            &mut store,
+            "feat+two",
+            &roles(&["web"]),
+            &[],
+            all_free,
+        )
+        .unwrap();
         assert_ne!(one.ports["web"], two.ports["web"]);
 
         // And explicitly: a worktree asking for a port already recorded
@@ -510,8 +549,15 @@ mod tests {
             .unwrap()
             .ports
             .insert("web".to_string(), stolen);
-        let again =
-            assign_with(&paths, &mut store, "feat+two", &roles(&["web"]), all_free).unwrap();
+        let again = assign_with(
+            &paths,
+            &mut store,
+            "feat+two",
+            &roles(&["web"]),
+            &[],
+            all_free,
+        )
+        .unwrap();
         assert_ne!(
             again.ports["web"], stolen,
             "a port recorded for another worktree is not free"
@@ -557,18 +603,80 @@ mod tests {
         let (_dir, paths) = assign_fixture();
         let mut store = crate::state::State::new();
         with_record(&mut store, "feat+one");
-        assign_with(&paths, &mut store, "feat+one", &roles(&["web"]), all_free).unwrap();
+        assign_with(
+            &paths,
+            &mut store,
+            "feat+one",
+            &roles(&["web"]),
+            &[],
+            all_free,
+        )
+        .unwrap();
         let grown = assign_with(
             &paths,
             &mut store,
             "feat+one",
             &roles(&["web", "api"]),
+            &[],
             all_free,
         )
         .unwrap();
         assert_eq!(grown.ports.len(), 2);
         assert_eq!(grown.ports["api"], grown.ports["web"] + 1);
         assert_eq!(store.worktrees["feat+one"].ports.len(), 2);
+    }
+
+    // A `--only` start leaves the worktree's other processes running, and a
+    // running listener makes its own port fail the freeness probe. Read as
+    // "somebody took it", that moves every port the worktree owns — while
+    // the server holding one of them is still serving on the old number.
+    #[test]
+    fn a_port_this_worktrees_own_process_holds_is_not_one_somebody_took() {
+        let (_dir, paths) = assign_fixture();
+        let mut store = crate::state::State::new();
+        with_record(&mut store, "feat+one");
+        let first = assign_with(
+            &paths,
+            &mut store,
+            "feat+one",
+            &roles(&["api", "web"]),
+            &[],
+            all_free,
+        )
+        .unwrap();
+        let web = first.ports["web"];
+        // The worktree's own web server is up, so its port no longer binds.
+        let web_is_busy = move |port: u16| port != web;
+
+        let mut untold = store.clone();
+        let moved = assign_with(
+            &paths,
+            &mut untold,
+            "feat+one",
+            &roles(&["api", "web"]),
+            &[],
+            web_is_busy,
+        )
+        .unwrap();
+        assert!(
+            moved.reassigned && moved.ports["web"] != web,
+            "without being told, the probe cannot tell our own listener from a squatter"
+        );
+
+        let told = assign_with(
+            &paths,
+            &mut store,
+            "feat+one",
+            &roles(&["api", "web"]),
+            &[web],
+            web_is_busy,
+        )
+        .unwrap();
+        assert_eq!(
+            told.ports, first.ports,
+            "the ports stay exactly where they were"
+        );
+        assert!(!told.reassigned);
     }
 
     #[test]

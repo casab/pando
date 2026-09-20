@@ -101,6 +101,17 @@ pub fn python_listener(port: u16) -> String {
     )
 }
 
+/// A listener that binds whatever port the `{port:<role>}` template
+/// resolves to, for tests that start a process which really holds a port.
+pub fn python_listener_for_role(role: &str) -> String {
+    format!(
+        "python3 -u -c \"import socket,time;s=socket.socket();\
+         s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);\
+         s.bind(('127.0.0.1',{{port:{role}}}));s.listen(5);\
+         print('listening');time.sleep(300)\""
+    )
+}
+
 /// A process that binds `port` on the IPv6 loopback and nowhere else.
 ///
 /// Not exotic: `listen(port, "localhost")` in Node on macOS resolves to

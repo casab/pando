@@ -161,25 +161,22 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
         }
         Command::Start { name, yes } => {
             let config = &actions::resolve_process(paths, config, &asker(yes), &notice)?;
-            let outcome = actions::start(paths, config, &name, &notice)?;
-            let started = outcome.process();
-            if started.reassigned {
+            let report = actions::start(paths, config, &name, None, &notice)?;
+            if report.reassigned {
                 eprintln!("pando: the ports {name} had were taken; it moved to new ones");
             }
-            match &outcome {
-                actions::StartOutcome::AlreadyRunning(_) => {
-                    writeln!(out, "{name} is already running{}", url_suffix(started))?;
-                }
-                actions::StartOutcome::Started(_) => {
-                    writeln!(out, "started {name}{}", url_suffix(started))?;
-                }
+            let url = url_suffix(report.url.as_deref());
+            if report.started_nothing() {
+                writeln!(out, "{name} is already running{url}")?;
+            } else {
+                writeln!(out, "started {name}{url}")?;
             }
             Ok(())
         }
         Command::Stop { name } => match name {
             Some(name) => {
-                match actions::stop(paths, &name)? {
-                    actions::StopOutcome::Stopped => writeln!(out, "stopped {name}")?,
+                match actions::stop(paths, &name, None)? {
+                    actions::StopOutcome::Stopped(_) => writeln!(out, "stopped {name}")?,
                     actions::StopOutcome::NotRunning => writeln!(out, "{name} was not running")?,
                 }
                 Ok(())
@@ -195,8 +192,8 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             }
         },
         Command::Restart { name } => {
-            let outcome = actions::restart(paths, config, &name, &notice)?;
-            writeln!(out, "restarted {name}{}", url_suffix(outcome.process()))?;
+            let report = actions::restart(paths, config, &name, None, &notice)?;
+            writeln!(out, "restarted {name}{}", url_suffix(report.url.as_deref()))?;
             Ok(())
         }
         Command::Status { name, json } => {
@@ -391,8 +388,8 @@ pando: answer it in pando.toml — nothing pando can accept for you exists here
     out
 }
 
-fn url_suffix(started: &actions::StartedProcess) -> String {
-    match &started.url {
+fn url_suffix(url: Option<&str>) -> String {
+    match url {
         Some(url) => format!(" — {url}"),
         None => String::new(),
     }

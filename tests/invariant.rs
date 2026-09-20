@@ -456,8 +456,8 @@ fn starting_and_stopping_never_writes_into_the_repository() {
         "the install hook logs under pando's home"
     );
 
-    let outcome = actions::start(&h.paths, &h.config, &name, &|_| {}).unwrap();
-    let port = outcome.process().ports["web"];
+    let outcome = actions::start(&h.paths, &h.config, &name, None, &|_| {}).unwrap();
+    let port = outcome.ports["web"];
     h.assert_untouched("start", Some(&worktree));
 
     // Wait for it to really be listening, which is when observed ports and
@@ -503,20 +503,19 @@ fn starting_and_stopping_never_writes_into_the_repository() {
     h.assert_untouched("ls", Some(&worktree));
 
     assert_eq!(
-        actions::stop(&h.paths, &name).unwrap(),
-        actions::StopOutcome::Stopped
+        actions::stop(&h.paths, &name, None).unwrap(),
+        actions::StopOutcome::Stopped(vec!["dev".to_string()])
     );
     h.assert_untouched("stop", Some(&worktree));
 
-    let restarted = actions::restart(&h.paths, &h.config, &name, &|_| {}).unwrap();
+    let restarted = actions::restart(&h.paths, &h.config, &name, None, &|_| {}).unwrap();
     assert_eq!(
-        restarted.process().ports["web"],
-        port,
+        restarted.ports["web"], port,
         "a restart keeps the port, so the URL keeps working"
     );
     h.assert_untouched("restart", Some(&worktree));
 
-    actions::stop(&h.paths, &name).unwrap();
+    actions::stop(&h.paths, &name, None).unwrap();
     h.assert_untouched("stop again", Some(&worktree));
 
     actions::rm(&h.paths, &name, false, false).unwrap();
@@ -534,7 +533,7 @@ fn starting_and_stopping_never_writes_into_the_repository() {
 fn every_file_the_lifecycle_writes_is_under_pandos_home() {
     let h = harness_with("[project]\ninstall = \"true\"\n\n[dev]\ncmd = \"sleep 30\"\n");
     let name = actions::new(&h.paths, &h.config, "feat/one", None, &|_| {}).unwrap();
-    let outcome = actions::start(&h.paths, &h.config, &name, &|_| {}).unwrap();
+    let outcome = actions::start(&h.paths, &h.config, &name, None, &|_| {}).unwrap();
     actions::refresh(&h.paths);
 
     for path in [
@@ -553,9 +552,9 @@ fn every_file_the_lifecycle_writes_is_under_pandos_home() {
     let store = state::load(&h.paths.state_file()).unwrap();
     let record = &store.worktrees[&name];
     assert!(record.hooks.contains_key("install"));
-    assert_eq!(record.processes["dev"].pid, outcome.process().record.pid);
+    assert_eq!(record.processes["dev"].pid, outcome.started[0].record.pid);
 
-    actions::stop(&h.paths, &name).unwrap();
+    actions::stop(&h.paths, &name, None).unwrap();
     h.assert_untouched("the whole lifecycle", None);
 }
 

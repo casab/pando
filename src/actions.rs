@@ -393,7 +393,7 @@ pub fn rm(paths: &PandoPaths, name: &str, yes: bool, force: bool) -> Result<()> 
     // Whatever is running goes next. A dev server whose working directory
     // has just been deleted is not a process anyone can do anything with,
     // and `rm` removes the record that is the only way to find it again.
-    let stopped = stop_recorded(&mut store, name)?;
+    let stopped = stop_recorded(&mut store, name, None)?;
 
     // Nothing is unlinked first. Verified against git 2.51: an ignored file
     // does not block `git worktree remove`, and `--force` does not follow a
@@ -418,7 +418,7 @@ pub fn rm(paths: &PandoPaths, name: &str, yes: bool, force: bool) -> Result<()> 
         // message says what actually happened.
         state::save(&paths.state_file(), &store)?;
         let reason = git_failure_reason(&out);
-        if stopped == StopOutcome::Stopped {
+        if matches!(stopped, StopOutcome::Stopped(_)) {
             bail!(
                 "git worktree remove failed: {reason} — the dev server was stopped; the \
                  worktree was kept"
@@ -677,56 +677,105 @@ const STOP_GRACE: Duration = Duration::from_secs(5);
 /// readiness rule watches when none is named.
 const DEFAULT_READY_ROLE: &str = "web";
 
-/// What `start` produced, and everything a caller needs to report it.
+/// One process a start brought up, or found already up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartedProcess {
-    pub worktree: String,
     /// The process's name in config — `dev` for the `[dev]` shorthand.
     pub process: String,
-    pub ports: BTreeMap<String, u16>,
-    /// The URL of the readiness role, when this process has one.
-    pub url: Option<String>,
     pub record: ProcessRecord,
+}
+
+/// What one `start` did to a worktree.
+///
+/// A worktree has as many processes as its config declares, so a start is
+/// never one thing: some come up, some were already running, and the ports
+/// and the URL belong to the worktree rather than to any one of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartReport {
+    pub worktree: String,
+    /// Spawned by this call, in the order they were spawned.
+    pub started: Vec<StartedProcess>,
+    /// Already up, and left exactly as they were.
+    pub already_running: Vec<StartedProcess>,
+    /// Every role of the worktree, whatever `--only` asked for: ports are
+    /// reserved for the whole worktree at once, so starting one process
+    /// never moves another one's port.
+    pub ports: BTreeMap<String, u16>,
+    /// The `web` role's URL when any process owns that role, else the first
+    /// role of the first process in config order.
+    pub url: Option<String>,
     /// Ports this worktree owned had been taken, so it moved. Worth saying
     /// out loud: a URL the developer had bookmarked just changed.
     pub reassigned: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StartOutcome {
-    Started(Box<StartedProcess>),
-    AlreadyRunning(Box<StartedProcess>),
-}
+impl StartReport {
+    /// Every process this call has something to say about.
+    pub fn processes(&self) -> impl Iterator<Item = &StartedProcess> {
+        self.started.iter().chain(self.already_running.iter())
+    }
 
-impl StartOutcome {
-    pub fn process(&self) -> &StartedProcess {
-        match self {
-            StartOutcome::Started(p) | StartOutcome::AlreadyRunning(p) => p,
-        }
+    /// Nothing was spawned: everything asked for was already up.
+    pub fn started_nothing(&self) -> bool {
+        self.started.is_empty()
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The names of a list of processes, for a message.
+pub fn process_names(list: &[StartedProcess]) -> String {
+    list.iter()
+        .map(|p| p.process.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopOutcome {
-    Stopped,
+    /// The processes whose groups were signalled.
+    Stopped(Vec<String>),
     /// Nothing was running. Not an error: `stop` is how you make sure.
     NotRunning,
 }
 
-/// Starts a worktree's dev process.
+/// Everything a start needs to know about one process before anything is
+/// spawned.
 ///
-/// The shape is `new`'s: take the lock, decide, act, record, save. A process
-/// that is already running is reported rather than started twice; a record
-/// left over from one that died is signalled and cleared first, because a
-/// dead leader does not mean a dead process group.
+/// Planned in full first, and spawned only afterwards: a second process
+/// with an unrenderable command or a missing `cwd` must not leave the first
+/// one running behind a failed start.
+struct Planned {
+    process: String,
+    shell_cmd: String,
+    cwd: PathBuf,
+    env: Vec<(String, String)>,
+    log_file: PathBuf,
+    ready_port: Option<u16>,
+    ready_timeout_s: Option<u64>,
+}
+
+/// Starts a worktree's processes — every one its config declares, or the
+/// one `only` names.
+///
+/// The shape is `new`'s: take the lock, decide, act, record, save. A
+/// process that is already running is reported rather than started twice; a
+/// record left over from one that died is signalled and cleared first,
+/// because a dead leader does not mean a dead process group.
+///
+/// Every process is spawned before any of them is waited on. Dependencies
+/// between them are the app's problem: a web server that needs its api up
+/// first retries, as every dev server does.
 pub fn start(
     paths: &PandoPaths,
     config: &Config,
     name: &str,
+    only: Option<&str>,
     progress: &dyn Fn(&str),
-) -> Result<StartOutcome> {
+) -> Result<StartReport> {
     let worktree = find_worktree(paths, name)?;
-    let (process_name, process) = single_process(config)?;
+    // Before anything is installed, signalled or spawned: a `--only` naming
+    // a process that does not exist must have no side effects at all.
+    let selection = selected_processes(config, only)?;
+    let roles = worktree_roles(config);
     let canonical = std::fs::canonicalize(&worktree.path).unwrap_or_else(|_| worktree.path.clone());
 
     paths.ensure_home()?;
@@ -736,10 +785,11 @@ pub fn start(
     // lock the rest of pando needs.
     // A start that will only report what is already up must not install
     // first: `npm ci` inside a worktree whose dev server is live is a
-    // surprise nobody asked for. Read without the lock, like the hook's own
-    // fingerprint — the decision it guards is "can this step be skipped",
-    // and the authoritative one is made under the lock below.
-    if !already_running(paths, name, &process_name) {
+    // surprise nobody asked for. Starting one process beside a live one is
+    // not that case — it is about to run code. Read without the lock, like
+    // the hook's own fingerprint: the decision it guards is "can this step
+    // be skipped", and the authoritative one is made under the lock below.
+    if !every_process_running(paths, name, &selection) {
         install_if_needed(
             paths,
             config,
@@ -753,38 +803,68 @@ pub fn start(
     let _lock = state::lock(&paths.lock_file())?;
     let mut store = state::load(&paths.state_file())?;
 
-    // Before `reconcile` can drop them: a record whose leader is gone may
-    // still have a live child holding the port. Dropping the record first
-    // would leak that child and hand its port to someone else.
+    // A record only vouches for the worktree it was written for; a stale
+    // one at another path is replaced rather than inherited. Every group it
+    // recorded is signalled first: those processes are running somewhere
+    // else entirely, and dropping the record would leave nothing able to
+    // find them again.
+    let stale = store.worktrees.get(name).is_some_and(|record| {
+        crate::paths::resolve_for_compare(&record.path)
+            != crate::paths::resolve_for_compare(&canonical)
+    });
+    if stale {
+        let groups: Vec<i32> = store.worktrees[name]
+            .processes
+            .values()
+            .map(|p| p.pgid)
+            .collect();
+        for pgid in groups {
+            proc::stop(pgid, STOP_GRACE)?;
+        }
+        store.worktrees.remove(name);
+    }
+
+    // Decided before anything is touched. A process that is alive is
+    // reported and left exactly as it is; one whose leader is gone is
+    // signalled before its record goes, because a dead leader is not a dead
+    // process group and its child may still hold the port.
+    let mut already: Vec<String> = Vec::new();
+    let mut clear: Vec<(String, i32)> = Vec::new();
     if let Some(record) = store.worktrees.get(name) {
-        if let Some(existing) = record.processes.get(&process_name) {
-            let running = matches!(
+        for (process, existing) in &record.processes {
+            let selected = selection.iter().any(|(n, _)| n == process);
+            let live = matches!(
                 existing.phase,
                 Phase::Starting { .. } | Phase::Running { .. }
             ) && proc::is_alive(existing.pid);
-            if running {
-                let ports = record.ports.clone();
-                return Ok(StartOutcome::AlreadyRunning(Box::new(StartedProcess {
-                    worktree: name.to_string(),
-                    process: process_name,
-                    url: url_for(&ports, existing.ready_port),
-                    ports,
-                    record: existing.clone(),
-                    reassigned: false,
-                })));
+            if selected && live {
+                already.push(process.clone());
+            } else if selected || only.is_none() {
+                // Selected and not live: this start replaces it. Not
+                // selected, with nothing asking for a subset: a name config
+                // no longer has — state a newer pando wrote, or a process
+                // the developer renamed — whose live child would otherwise
+                // be left holding a port nothing could find again.
+                //
+                // A `--only` start leaves every other record alone. One
+                // whose leader is dead is still signalled, by the sweep
+                // below, before `reconcile` drops it.
+                clear.push((process.clone(), existing.pgid));
             }
         }
-        // *Every* group recorded for this worktree, not only the one being
-        // started: a record under another name — state a newer pando wrote,
-        // or a process the developer has since renamed in config — is about
-        // to be dropped by `reconcile`, and a live child of it would be left
-        // holding a port nothing could find again.
-        let groups: Vec<i32> = record.processes.values().map(|p| p.pgid).collect();
-        if !groups.is_empty() {
-            progress("clearing what is left of the last run");
-        }
-        for pgid in groups {
-            proc::stop(pgid, STOP_GRACE)?;
+    }
+    for process in &already {
+        progress(&format!("{process} is already running"));
+    }
+    if !clear.is_empty() {
+        progress("clearing what is left of the last run");
+    }
+    for (_, pgid) in &clear {
+        proc::stop(*pgid, STOP_GRACE)?;
+    }
+    if let Some(record) = store.worktrees.get_mut(name) {
+        for (process, _) in &clear {
+            record.processes.remove(process);
         }
     }
     // And every *other* worktree's dead-leader group, because `reconcile`
@@ -792,111 +872,168 @@ pub fn start(
     sweep_orphaned_groups(&store)?;
     state::reconcile(&mut store, proc::is_alive);
 
-    // A record only vouches for the worktree it was written for; a stale one
-    // at another path is replaced rather than inherited.
     let record = store
         .worktrees
         .entry(name.to_string())
         .or_insert_with(|| WorktreeRecord::new(canonical.clone(), false));
-    if crate::paths::resolve_for_compare(&record.path)
-        != crate::paths::resolve_for_compare(&canonical)
-    {
-        *record = WorktreeRecord::new(canonical.clone(), false);
+    // A whole-worktree start replaces everything that was observed; a
+    // `--only` start leaves the sibling's ports alone and lets the next
+    // refresh say what is really listening.
+    if only.is_none() {
+        record.observed_ports.clear();
     }
-    // A sticky failure is for display; starting is the user acting on it.
-    // Everything goes, because everything was just signalled.
-    record.processes.clear();
-    record.observed_ports.clear();
-
-    let roles = process.roles();
-    let assignment = ports::assign(paths, &mut store, name, &roles)?;
-    let ready_role = ready_role(process, &roles)?;
-    let ready_port = ready_role
-        .as_deref()
-        .and_then(|r| assignment.ports.get(r))
-        .copied();
-
-    let log_file = paths.log_file(name, &process_name);
-    let ctx = template::Context {
-        name,
-        branch: worktree.branch.as_deref(),
-        worktree: &canonical,
-        root: paths.root(),
-        project: paths.project_id(),
-        ports: &assignment.ports,
-        default_role: ready_role.as_deref(),
-        log: Some(&log_file),
-    };
-
-    let cmd = template::render(&process.cmd, &ctx)
-        .with_context(|| format!("in the command for process {process_name}"))?;
-    let cwd = process_cwd(&canonical, &process_name, process, &ctx)?;
-    let env = process_env(paths, name, &worktree, process, &ctx)?;
-    let shell_cmd = with_prelude(config, &cmd);
-
-    // Truncated, not appended: the classifier reads the tail of this file to
-    // explain a failure, and the closing lines of the *previous* run would
-    // be a confident wrong answer.
-    reset_log(&log_file)?;
-    progress(&format!("starting {process_name}"));
-    let spawn = proc::spawn_detached(SpawnOptions {
-        shell_cmd: &shell_cmd,
-        cwd: &cwd,
-        log_file: &log_file,
-        env: &env,
-    })?;
-
-    let now = Utc::now();
-    let record = ProcessRecord {
-        pid: spawn.pid,
-        pgid: spawn.pgid,
-        started_at: now,
-        log_path: log_file,
-        ready_port,
-        ready_timeout_s: process.ready.as_ref().and_then(|r| r.timeout_s),
-        phase: Phase::Starting { since: now },
-    };
-    store
-        .worktrees
-        .get_mut(name)
-        .expect("the record was just inserted")
+    // Ports this worktree's own surviving processes are holding. They will
+    // not pass a freeness probe, and they are not somebody else's either.
+    let keep: Vec<u16> = record
         .processes
-        .insert(process_name.clone(), record.clone());
-    state::save(&paths.state_file(), &store)?;
+        .keys()
+        .filter_map(|process| config.processes.get(process))
+        .flat_map(|process| process.roles())
+        .filter_map(|role| record.ports.get(&role).copied())
+        .collect();
 
-    Ok(StartOutcome::Started(Box::new(StartedProcess {
+    let assignment = ports::assign_keeping(paths, &mut store, name, &roles, &keep)?;
+
+    let mut planned: Vec<Planned> = Vec::new();
+    for (process_name, process) in &selection {
+        if already.contains(process_name) {
+            continue;
+        }
+        let process_roles = process.roles();
+        let ready_role = ready_role(process, &process_roles)
+            .with_context(|| format!("in process {process_name}"))?;
+        let ready_port = ready_role
+            .as_deref()
+            .and_then(|r| assignment.ports.get(r))
+            .copied();
+        let log_file = paths.log_file(name, process_name);
+        let ctx = template::Context {
+            name,
+            branch: worktree.branch.as_deref(),
+            worktree: &canonical,
+            root: paths.root(),
+            project: paths.project_id(),
+            // Every role of the worktree, not only this process's own:
+            // `{port:api}` inside the web process's env is how one process
+            // is told where another one is listening.
+            ports: &assignment.ports,
+            default_role: ready_role.as_deref(),
+            log: Some(&log_file),
+        };
+        let cmd = template::render(&process.cmd, &ctx)
+            .with_context(|| format!("in the command for process {process_name}"))?;
+        let cwd = process_cwd(&canonical, process_name, process, &ctx)?;
+        let env = process_env(paths, name, &worktree, process, &ctx)?;
+        planned.push(Planned {
+            process: process_name.clone(),
+            shell_cmd: with_prelude(config, &cmd),
+            cwd,
+            env,
+            log_file,
+            ready_port,
+            ready_timeout_s: process.ready.as_ref().and_then(|r| r.timeout_s),
+        });
+    }
+
+    let mut started: Vec<StartedProcess> = Vec::new();
+    let mut failure: Option<anyhow::Error> = None;
+    for plan in planned {
+        progress(&format!("starting {}", plan.process));
+        // Truncated, not appended: the classifier reads the tail of this
+        // file to explain a failure, and the closing lines of the
+        // *previous* run would be a confident wrong answer.
+        let spawned = reset_log(&plan.log_file).and_then(|()| {
+            proc::spawn_detached(SpawnOptions {
+                shell_cmd: &plan.shell_cmd,
+                cwd: &plan.cwd,
+                log_file: &plan.log_file,
+                env: &plan.env,
+            })
+        });
+        let spawn = match spawned {
+            Ok(spawn) => spawn,
+            // Whatever came up before this one is already running and
+            // already in the map. The state is saved below either way, so
+            // the failure never leaves a process nothing can stop.
+            Err(e) => {
+                failure = Some(e.context(format!("starting process {}", plan.process)));
+                break;
+            }
+        };
+        let now = Utc::now();
+        let record = ProcessRecord {
+            pid: spawn.pid,
+            pgid: spawn.pgid,
+            started_at: now,
+            log_path: plan.log_file,
+            ready_port: plan.ready_port,
+            ready_timeout_s: plan.ready_timeout_s,
+            phase: Phase::Starting { since: now },
+        };
+        store
+            .worktrees
+            .get_mut(name)
+            .expect("the record was just inserted")
+            .processes
+            .insert(plan.process.clone(), record.clone());
+        started.push(StartedProcess {
+            process: plan.process,
+            record,
+        });
+    }
+    state::save(&paths.state_file(), &store)?;
+    if let Some(e) = failure {
+        return Err(e);
+    }
+
+    let already_running: Vec<StartedProcess> = already
+        .iter()
+        .filter_map(|process| {
+            let record = store.worktrees.get(name)?.processes.get(process)?;
+            Some(StartedProcess {
+                process: process.clone(),
+                record: record.clone(),
+            })
+        })
+        .collect();
+    Ok(StartReport {
         worktree: name.to_string(),
-        process: process_name,
-        url: url_for(&assignment.ports, ready_port),
+        started,
+        already_running,
+        url: url_for(&assignment.ports, &roles),
         ports: assignment.ports,
-        record,
         reassigned: assignment.reassigned,
-    })))
+    })
 }
 
-/// Whether state already records a live process under this name. Best
-/// effort and lock-free: every caller re-decides under the lock.
-fn already_running(paths: &PandoPaths, name: &str, process: &str) -> bool {
+/// Whether every process a start was asked for is already up. Best effort
+/// and lock-free: every caller re-decides under the lock.
+fn every_process_running(
+    paths: &PandoPaths,
+    name: &str,
+    selection: &[(String, &ProcessConfig)],
+) -> bool {
     let Ok(store) = state::load(&paths.state_file()) else {
         return false;
     };
-    store
-        .worktrees
-        .get(name)
-        .and_then(|record| record.processes.get(process))
-        .is_some_and(|p| {
+    let Some(record) = store.worktrees.get(name) else {
+        return false;
+    };
+    selection.iter().all(|(process, _)| {
+        record.processes.get(process).is_some_and(|p| {
             matches!(p.phase, Phase::Starting { .. } | Phase::Running { .. })
                 && proc::is_alive(p.pid)
         })
+    })
 }
 
-/// Stops everything running for a worktree. The worktree, its ports, and its
-/// logs survive: only the processes go.
-pub fn stop(paths: &PandoPaths, name: &str) -> Result<StopOutcome> {
+/// Stops a worktree's processes — every one it is running, or the one
+/// `only` names. The worktree, its ports, and its logs survive.
+pub fn stop(paths: &PandoPaths, name: &str, only: Option<&str>) -> Result<StopOutcome> {
     paths.ensure_home()?;
     let _lock = state::lock(&paths.lock_file())?;
     let mut store = state::load(&paths.state_file())?;
-    let outcome = stop_recorded(&mut store, name)?;
+    let outcome = stop_recorded(&mut store, name, only)?;
     // `reconcile` drops dead-leader records for every worktree in the
     // project, not only this one, so every one of them is signalled first.
     sweep_orphaned_groups(&store)?;
@@ -928,8 +1065,8 @@ pub fn stop_all_with(paths: &PandoPaths, stop: impl Fn(i32) -> Result<()>) -> Re
         // One worktree that will not die must not leave the rest running —
         // and must not lose its record either. The failures are collected
         // and reported once every other group has been signalled.
-        match stop_recorded_with(&mut store, &name, &stop) {
-            Ok(StopOutcome::Stopped) => stopped.push(name),
+        match stop_recorded_with(&mut store, &name, None, &stop) {
+            Ok(StopOutcome::Stopped(_)) => stopped.push(name),
             Ok(StopOutcome::NotRunning) => {}
             Err(e) => failures.push(format!("stopping {name}: {e:#}")),
         }
@@ -957,19 +1094,20 @@ pub fn stop_all_with(paths: &PandoPaths, stop: impl Fn(i32) -> Result<()>) -> Re
     Ok(stopped)
 }
 
-/// Signals every process group recorded for `name` and drops the records.
+/// Signals the process groups recorded for `name` and drops their records.
 /// The caller holds the lock and saves.
 ///
 /// The signal is unconditional, Failed records included. pando is not the
 /// process's parent by then, so "failed" only ever meant "its leader is
 /// gone" — the group can still be serving.
-fn stop_recorded(store: &mut state::State, name: &str) -> Result<StopOutcome> {
-    stop_recorded_with(store, name, |pgid| proc::stop(pgid, STOP_GRACE))
+fn stop_recorded(store: &mut state::State, name: &str, only: Option<&str>) -> Result<StopOutcome> {
+    stop_recorded_with(store, name, only, |pgid| proc::stop(pgid, STOP_GRACE))
 }
 
 fn stop_recorded_with(
     store: &mut state::State,
     name: &str,
+    only: Option<&str>,
     stop: impl Fn(i32) -> Result<()>,
 ) -> Result<StopOutcome> {
     let Some(record) = store.worktrees.get_mut(name) else {
@@ -981,8 +1119,21 @@ fn stop_recorded_with(
     let groups: Vec<(String, i32)> = record
         .processes
         .iter()
+        .filter(|(process, _)| only.is_none_or(|wanted| process.as_str() == wanted))
         .map(|(process, p)| (process.clone(), p.pgid))
         .collect();
+    if groups.is_empty() {
+        // Only reachable with `--only`: the worktree is running something,
+        // just not that. Naming what it *is* running beats "not running",
+        // which would read as "nothing to do" for a typo.
+        let running: Vec<&str> = record.processes.keys().map(String::as_str).collect();
+        bail!(
+            "{name} is not running a process named {:?} — it is running: {}",
+            only.unwrap_or_default(),
+            running.join(", ")
+        );
+    }
+    let mut stopped = Vec::new();
     let mut failures = Vec::new();
     for (process, pgid) in groups {
         // Signal first, drop second. A record cleared for a group that was
@@ -990,6 +1141,7 @@ fn stop_recorded_with(
         match stop(pgid) {
             Ok(()) => {
                 record.processes.remove(&process);
+                stopped.push(process);
             }
             Err(e) => failures.push(format!("{process} (group {pgid}): {e:#}")),
         }
@@ -1000,7 +1152,7 @@ fn stop_recorded_with(
     if !failures.is_empty() {
         bail!("{name}: {}", failures.join("; "));
     }
-    Ok(StopOutcome::Stopped)
+    Ok(StopOutcome::Stopped(stopped))
 }
 
 /// Signals every process group in the project whose leader is dead, so that
@@ -1045,47 +1197,80 @@ fn sweep_orphaned_groups(store: &state::State) -> Result<()> {
     )
 }
 
-/// Stop, then start. The ports come back from the record `stop` left behind,
-/// so a restart keeps the URL.
+/// Stop, then start. The ports come back from the record `stop` left
+/// behind, so a restart keeps the URL — and `--only` restarts one process
+/// while the rest keep serving on the ports they already have.
 pub fn restart(
     paths: &PandoPaths,
     config: &Config,
     name: &str,
+    only: Option<&str>,
     progress: &dyn Fn(&str),
-) -> Result<StartOutcome> {
-    stop(paths, name)?;
-    start(paths, config, name, progress)
+) -> Result<StartReport> {
+    stop(paths, name, only)?;
+    start(paths, config, name, only, progress)
 }
 
-/// The one process this phase starts.
+/// The processes a start, stop or restart acts on: every one config
+/// declares, or the one `only` names.
 ///
-/// The config already models several — state records one entry per process
-/// from the start — but running more than one needs a log tab and a
-/// readiness rule each, which is the next phase.
-fn single_process(config: &Config) -> Result<(String, &ProcessConfig)> {
-    let mut processes = config.processes.iter();
-    let Some((name, process)) = processes.next() else {
+/// Config order, which is the order they are spawned in.
+fn selected_processes<'a>(
+    config: &'a Config,
+    only: Option<&str>,
+) -> Result<Vec<(String, &'a ProcessConfig)>> {
+    if config.processes.is_empty() {
         bail!("no processes configured; add [dev] to pando.toml");
-    };
-    if processes.next().is_some() {
-        let names: Vec<&str> = config.processes.keys().map(String::as_str).collect();
-        bail!(
-            "this version starts one process per worktree, and pando.toml configures {}: {}",
-            names.len(),
-            names.join(", ")
-        );
     }
+    let chosen: Vec<(String, &ProcessConfig)> = match only {
+        Some(wanted) => {
+            let process = config.processes.get(wanted).with_context(|| {
+                let known: Vec<&str> = config.processes.keys().map(String::as_str).collect();
+                format!(
+                    "no process named {wanted:?} in pando.toml — it configures: {}",
+                    known.join(", ")
+                )
+            })?;
+            vec![(wanted.to_string(), process)]
+        }
+        None => config
+            .processes
+            .iter()
+            .map(|(name, process)| (name.clone(), process))
+            .collect(),
+    };
     // `cmd` is optional so that a half-written process table does not take
     // every other command down with it; this is where it has to be there.
-    if process.cmd.trim().is_empty() {
-        let table = if name == detect::DEV {
-            "[dev]".to_string()
-        } else {
-            format!("[processes.{name}]")
-        };
-        bail!("{table} in pando.toml has no cmd — add the command that starts this process");
+    // Refused before anything starts: half a worktree is worse than none.
+    for (name, process) in &chosen {
+        if process.cmd.trim().is_empty() {
+            let table = if name == detect::DEV && config.processes.len() == 1 {
+                "[dev]".to_string()
+            } else {
+                format!("[processes.{name}]")
+            };
+            bail!("{table} in pando.toml has no cmd — add the command that starts this process");
+        }
     }
-    Ok((name.clone(), process))
+    Ok(chosen)
+}
+
+/// Every role every process of the worktree owns, in config order.
+///
+/// Ports are reserved for all of them at once, whatever `--only` asked
+/// for: a role belongs to the worktree, and starting one process must
+/// never move another one's port. `config::validate` has already refused
+/// two processes claiming one role, so this only deduplicates defensively.
+fn worktree_roles(config: &Config) -> Vec<String> {
+    let mut roles: Vec<String> = Vec::new();
+    for process in config.processes.values() {
+        for role in process.roles() {
+            if !roles.contains(&role) {
+                roles.push(role);
+            }
+        }
+    }
+    roles
 }
 
 /// The role whose port has to bind before the process counts as running.
@@ -1114,8 +1299,13 @@ fn ready_role(process: &ProcessConfig, roles: &[String]) -> Result<Option<String
         .cloned())
 }
 
-fn url_for(ports: &BTreeMap<String, u16>, ready_port: Option<u16>) -> Option<String> {
-    let port = ready_port.or_else(|| ports.get(DEFAULT_READY_ROLE).copied())?;
+/// The URL a worktree serves on: the `web` role's port when any of its
+/// processes owns that role, else the first role of the first process in
+/// config order. One worktree, one URL, however many processes it runs.
+fn url_for(ports: &BTreeMap<String, u16>, roles: &[String]) -> Option<String> {
+    let port = ports
+        .get(DEFAULT_READY_ROLE)
+        .or_else(|| roles.iter().find_map(|role| ports.get(role)))?;
     Some(format!("http://localhost:{port}"))
 }
 
@@ -1787,12 +1977,15 @@ mod tests {
 
     /// Stops whatever a test started even when an assertion panics first. No
     /// test in this crate may leave a process behind.
-    fn guard(outcome: &StartOutcome) -> Detached {
-        let p = outcome.process();
-        Detached {
-            pid: p.record.pid,
-            pgid: p.record.pgid,
-        }
+    fn guard(report: &StartReport) -> Vec<Detached> {
+        report
+            .started
+            .iter()
+            .map(|p| Detached {
+                pid: p.record.pid,
+                pgid: p.record.pgid,
+            })
+            .collect()
     }
 
     fn log_of(fx: &Fx, name: &str) -> String {
@@ -1812,19 +2005,20 @@ mod tests {
         with_dev(&mut fx, dev("sleep 30"));
         let name = worktree_named(&fx, "feat/one");
 
-        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
         let _guard = guard(&outcome);
-        let started = outcome.process();
-        assert!(matches!(outcome, StartOutcome::Started(_)));
-        assert_eq!(started.worktree, name);
+        let started = &outcome.started[0];
+        assert!(!outcome.started_nothing());
+        assert_eq!(outcome.worktree, name);
         assert_eq!(started.process, "dev");
-        assert_eq!(started.ports.len(), 1, "one role, one port");
-        let port = started.ports["web"];
+        assert!(outcome.already_running.is_empty());
+        assert_eq!(outcome.ports.len(), 1, "one role, one port");
+        let port = outcome.ports["web"];
         assert_eq!(
-            started.url.as_deref(),
+            outcome.url.as_deref(),
             Some(&*format!("http://localhost:{port}"))
         );
-        assert!(!started.reassigned);
+        assert!(!outcome.reassigned);
 
         let record = &fx.state().worktrees[&name].processes["dev"];
         assert_eq!(record.ready_port, Some(port));
@@ -1849,9 +2043,9 @@ mod tests {
         fx.config.runtime.prelude = Some("echo prelude-ran".to_string());
         let name = worktree_named(&fx, "feat/one");
 
-        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
         let _guard = guard(&outcome);
-        let port = outcome.process().ports["web"];
+        let port = outcome.ports["web"];
         let worktree = fx.worktrees_dir().join(&name).canonicalize().unwrap();
 
         assert!(
@@ -1893,9 +2087,9 @@ mod tests {
             },
         );
         let name = worktree_named(&fx, "feat/one");
-        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
         let _guard = guard(&outcome);
-        let port = outcome.process().ports["web"];
+        let port = outcome.ports["web"];
         assert!(
             wait_until(Duration::from_secs(10), || log_of(&fx, &name)
                 .contains(&format!("127.0.0.1:{port}"))),
@@ -1919,7 +2113,7 @@ mod tests {
         let worktree = fx.worktrees_dir().join(&name);
         std::fs::create_dir_all(worktree.join("apps/web")).unwrap();
 
-        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
         let _guard = guard(&outcome);
         assert!(
             wait_until(Duration::from_secs(10), || log_of(&fx, &name)
@@ -1941,7 +2135,7 @@ mod tests {
             },
         );
         let name = worktree_named(&fx, "feat/one");
-        let err = start(&fx.paths, &fx.config, &name, &noop).unwrap_err();
+        let err = start(&fx.paths, &fx.config, &name, None, &noop).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("apps/nope"), "{msg}");
         assert!(
@@ -1970,7 +2164,7 @@ mod tests {
         std::fs::create_dir_all(&outside).unwrap();
         std::os::unix::fs::symlink(&outside, worktree.join("escape")).unwrap();
 
-        let err = start(&fx.paths, &fx.config, &name, &noop).unwrap_err();
+        let err = start(&fx.paths, &fx.config, &name, None, &noop).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("outside the worktree"), "{msg}");
         assert!(msg.contains("\"dev\""), "the process is named: {msg}");
@@ -1984,7 +2178,7 @@ mod tests {
     fn a_project_with_no_processes_says_what_to_add() {
         let fx = fixture();
         let name = worktree_named(&fx, "feat/one");
-        let err = start(&fx.paths, &fx.config, &name, &noop).unwrap_err();
+        let err = start(&fx.paths, &fx.config, &name, None, &noop).unwrap_err();
         assert_eq!(
             format!("{err:#}"),
             "no processes configured; add [dev] to pando.toml"
@@ -1995,9 +2189,9 @@ mod tests {
     fn starting_a_worktree_that_does_not_exist_says_so() {
         let mut fx = fixture();
         with_dev(&mut fx, dev("sleep 30"));
-        let err = start(&fx.paths, &fx.config, "nope", &noop).unwrap_err();
+        let err = start(&fx.paths, &fx.config, "nope", None, &noop).unwrap_err();
         assert!(format!("{err:#}").contains("no worktree named"));
-        let err = start(&fx.paths, &fx.config, "acme-shop", &noop).unwrap_err();
+        let err = start(&fx.paths, &fx.config, "acme-shop", None, &noop).unwrap_err();
         assert!(format!("{err:#}").contains("main checkout"));
     }
 
@@ -2007,15 +2201,27 @@ mod tests {
         with_dev(&mut fx, dev("sleep 30"));
         let name = worktree_named(&fx, "feat/one");
 
-        let first = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let first = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
         let _guard = guard(&first);
-        let second = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let second = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
         assert!(
-            matches!(second, StartOutcome::AlreadyRunning(_)),
+            second.started_nothing(),
             "a running process is reported, not started twice"
         );
-        assert_eq!(second.process().record.pid, first.process().record.pid);
-        assert_eq!(second.process().ports, first.process().ports);
+        assert_eq!(
+            second
+                .already_running
+                .iter()
+                .map(|p| p.process.as_str())
+                .collect::<Vec<_>>(),
+            vec!["dev"],
+            "and it says which process that was"
+        );
+        assert_eq!(
+            second.already_running[0].record.pid,
+            first.started[0].record.pid
+        );
+        assert_eq!(second.ports, first.ports);
     }
 
     // A failure is sticky for display; starting is the user acting on it.
@@ -2024,9 +2230,9 @@ mod tests {
         let mut fx = fixture();
         with_dev(&mut fx, dev("sleep 30"));
         let name = worktree_named(&fx, "feat/one");
-        let first = start(&fx.paths, &fx.config, &name, &noop).unwrap();
-        let first_pid = first.process().record.pid;
-        let first_ports = first.process().ports.clone();
+        let first = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+        let first_pid = first.started[0].record.pid;
+        let first_ports = first.ports.clone();
         drop(guard(&first));
 
         assert!(wait_until(Duration::from_secs(5), || {
@@ -2047,13 +2253,12 @@ mod tests {
         };
         state::save(&fx.paths.state_file(), &store).unwrap();
 
-        let second = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let second = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
         let _guard = guard(&second);
-        assert!(matches!(second, StartOutcome::Started(_)));
-        assert_ne!(second.process().record.pid, first_pid);
+        assert!(!second.started_nothing());
+        assert_ne!(second.started[0].record.pid, first_pid);
         assert_eq!(
-            second.process().ports,
-            first_ports,
+            second.ports, first_ports,
             "ports are stable across a failure"
         );
         assert!(matches!(
@@ -2073,11 +2278,11 @@ mod tests {
             },
         );
         let name = worktree_named(&fx, "feat/one");
-        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
         let _guard = guard(&outcome);
-        assert!(outcome.process().ports.is_empty());
-        assert_eq!(outcome.process().record.ready_port, None);
-        assert_eq!(outcome.process().url, None);
+        assert!(outcome.ports.is_empty());
+        assert_eq!(outcome.started[0].record.ready_port, None);
+        assert_eq!(outcome.url, None);
 
         // Which is what makes it Running as soon as it is alive: nothing
         // is watching a port, so no probe can have an opinion.
@@ -2109,7 +2314,7 @@ mod tests {
             },
         );
         let name = worktree_named(&fx, "feat/one");
-        let err = start(&fx.paths, &fx.config, &name, &noop).unwrap_err();
+        let err = start(&fx.paths, &fx.config, &name, None, &noop).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("api") && msg.contains("web"), "{msg}");
     }
@@ -2130,9 +2335,9 @@ mod tests {
             },
         );
         let name = worktree_named(&fx, "feat/one");
-        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
         let _guard = guard(&outcome);
-        let port = outcome.process().ports["web"];
+        let port = outcome.ports["web"];
 
         assert!(
             wait_until(Duration::from_secs(20), || !crate::ports::is_port_free(
@@ -2197,9 +2402,9 @@ mod tests {
             },
         );
         let name = worktree_named(&fx, "feat/one");
-        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
         let _guard = guard(&outcome);
-        let port = outcome.process().ports["web"];
+        let port = outcome.ports["web"];
 
         assert!(
             wait_until(Duration::from_secs(20), || matches!(
@@ -2226,9 +2431,9 @@ mod tests {
         let mut fx = fixture();
         with_dev(&mut fx, dev("sleep 300"));
         let name = worktree_named(&fx, "feat/one");
-        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
         let _guard = guard(&outcome);
-        let port = outcome.process().ports["web"];
+        let port = outcome.ports["web"];
 
         let squatter = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
         let refreshed = refresh(&fx.paths);
@@ -2295,7 +2500,7 @@ time.sleep(300)
             },
         );
         let name = worktree_named(&fx, "feat/one");
-        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
         let _guard = guard(&outcome);
 
         // Polled the whole time the server is coming up, which is what
@@ -2312,6 +2517,385 @@ time.sleep(300)
         );
     }
 
+    // ---- several processes ------------------------------------------------
+
+    /// The workspace shape: a web process and an api process, each in its
+    /// own directory, with the web one told the api's port through a
+    /// template. Fixture 5, in miniature.
+    fn with_web_and_api(fx: &mut Fx) {
+        fx.config.processes.insert(
+            "web".to_string(),
+            ProcessConfig {
+                cmd: "pwd && env && sleep 30".to_string(),
+                cwd: Some("apps/web".to_string()),
+                ports: Some(PortsSpec::List(vec!["web".to_string()])),
+                env: BTreeMap::from([(
+                    "VITE_API_URL".to_string(),
+                    "http://localhost:{port:api}".to_string(),
+                )]),
+                ..Default::default()
+            },
+        );
+        fx.config.processes.insert(
+            "api".to_string(),
+            ProcessConfig {
+                cmd: "pwd && env && sleep 30".to_string(),
+                cwd: Some("apps/api".to_string()),
+                ports: Some(PortsSpec::Map(BTreeMap::from([(
+                    "PORT".to_string(),
+                    "api".to_string(),
+                )]))),
+                ..Default::default()
+            },
+        );
+    }
+
+    /// The worktree both processes need, with the directories they run in.
+    fn workspace_worktree(fx: &Fx, branch: &str) -> String {
+        let name = worktree_named(fx, branch);
+        let worktree = fx.worktrees_dir().join(&name);
+        std::fs::create_dir_all(worktree.join("apps/web")).unwrap();
+        std::fs::create_dir_all(worktree.join("apps/api")).unwrap();
+        name
+    }
+
+    fn log_source(fx: &Fx, name: &str, source: &str) -> String {
+        std::fs::read_to_string(fx.paths.log_file(name, source)).unwrap_or_default()
+    }
+
+    fn names_of(list: &[StartedProcess]) -> Vec<&str> {
+        list.iter().map(|p| p.process.as_str()).collect()
+    }
+
+    fn live_processes(fx: &Fx, name: &str) -> Vec<String> {
+        fx.state().worktrees[name]
+            .processes
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn start_spawns_every_configured_process_with_its_own_log_cwd_and_port() {
+        let mut fx = fixture();
+        with_web_and_api(&mut fx);
+        let name = workspace_worktree(&fx, "feat/one");
+
+        let report = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+        let _guard = guard(&report);
+        assert_eq!(
+            names_of(&report.started),
+            vec!["api", "web"],
+            "config order, spawned one after the other"
+        );
+        assert_eq!(report.ports.len(), 2, "a port for every role");
+        assert_eq!(
+            report.url,
+            Some(format!("http://localhost:{}", report.ports["web"])),
+            "one URL for the worktree, and it is the web role's"
+        );
+
+        let record = fx.state().worktrees[&name].clone();
+        assert_eq!(
+            record.processes.keys().cloned().collect::<Vec<_>>(),
+            vec!["api", "web"],
+            "the worktree record holds both"
+        );
+        assert_eq!(
+            record.processes["web"].ready_port,
+            Some(report.ports["web"]),
+            "each process waits on its own role's port"
+        );
+        assert_eq!(
+            record.processes["api"].ready_port,
+            Some(report.ports["api"])
+        );
+        assert_eq!(
+            record.processes["web"].log_path,
+            fx.paths.log_file(&name, "web")
+        );
+        assert_eq!(
+            record.processes["api"].log_path,
+            fx.paths.log_file(&name, "api")
+        );
+        assert_ne!(
+            record.processes["web"].pgid, record.processes["api"].pgid,
+            "each gets its own process group, so one can be stopped alone"
+        );
+
+        // Each in its own directory, and the web one carrying the api's
+        // real port: `{port:api}` is why the template language has roles.
+        let api_port = report.ports["api"];
+        // Patient: `bash -lc` reads a login profile, and a full parallel
+        // test run has a dozen of them starting at once.
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                log_source(&fx, &name, "web")
+                    .contains(&format!("VITE_API_URL=http://localhost:{api_port}"))
+            }),
+            "the web log should carry the api's port: {:?}",
+            log_source(&fx, &name, "web")
+        );
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                log_source(&fx, &name, "web").contains("apps/web")
+                    && log_source(&fx, &name, "api").contains("apps/api")
+            }),
+            "each process runs in its own cwd: {:?} / {:?}",
+            log_source(&fx, &name, "web"),
+            log_source(&fx, &name, "api")
+        );
+        assert!(
+            log_source(&fx, &name, "api").contains(&format!("PORT={api_port}")),
+            "the map form of ports reaches the process it belongs to: {:?}",
+            log_source(&fx, &name, "api")
+        );
+    }
+
+    #[test]
+    fn only_starts_the_process_it_names_and_leaves_the_other_alone() {
+        let mut fx = fixture();
+        with_web_and_api(&mut fx);
+        let name = workspace_worktree(&fx, "feat/one");
+
+        let first = start(&fx.paths, &fx.config, &name, Some("api"), &noop).unwrap();
+        let _ga = guard(&first);
+        assert_eq!(names_of(&first.started), vec!["api"]);
+        assert_eq!(live_processes(&fx, &name), vec!["api"]);
+        assert_eq!(
+            first.ports.len(),
+            2,
+            "ports are reserved for every role of the worktree, not only the one started"
+        );
+
+        let api_pid = fx.state().worktrees[&name].processes["api"].pid;
+        let second = start(&fx.paths, &fx.config, &name, Some("web"), &noop).unwrap();
+        let _gb = guard(&second);
+        assert_eq!(names_of(&second.started), vec!["web"]);
+        assert_eq!(
+            second.ports, first.ports,
+            "a second --only start never moves the ports the first one handed out"
+        );
+        assert!(!second.reassigned);
+        assert_eq!(live_processes(&fx, &name), vec!["api", "web"]);
+        assert_eq!(
+            fx.state().worktrees[&name].processes["api"].pid,
+            api_pid,
+            "the process it did not name was not touched"
+        );
+    }
+
+    // The port a worktree's *own* listener holds is not a port somebody
+    // took. Read that way, starting the second of a pair would move both
+    // ports — while the first process is still serving on the old one.
+    #[test]
+    fn starting_one_process_beside_a_listening_one_keeps_every_port() {
+        if !python3_available() {
+            eprintln!("skipping: python3 is not installed");
+            return;
+        }
+        let mut fx = fixture();
+        with_web_and_api(&mut fx);
+        let api = fx.config.processes.get_mut("api").expect("the api process");
+        api.cmd = crate::testutil::python_listener_for_role("api");
+        api.cwd = None;
+        let web = fx.config.processes.get_mut("web").expect("the web process");
+        web.cwd = None;
+        let name = worktree_named(&fx, "feat/one");
+
+        let first = start(&fx.paths, &fx.config, &name, Some("api"), &noop).unwrap();
+        let _ga = guard(&first);
+        let api_port = first.ports["api"];
+        assert!(
+            wait_until(Duration::from_secs(30), || ports::something_is_listening(
+                api_port
+            )),
+            "the api never came up on {api_port}: {:?}",
+            log_source(&fx, &name, "api")
+        );
+
+        let second = start(&fx.paths, &fx.config, &name, Some("web"), &noop).unwrap();
+        let _gb = guard(&second);
+        assert_eq!(
+            second.ports, first.ports,
+            "the worktree's own listener must not look like a squatter"
+        );
+        assert!(!second.reassigned);
+        assert_eq!(
+            fx.state().worktrees[&name].ports["api"],
+            api_port,
+            "and the api is still recorded on the port it is really serving"
+        );
+    }
+
+    #[test]
+    fn a_second_start_says_which_processes_were_already_running() {
+        let mut fx = fixture();
+        with_web_and_api(&mut fx);
+        let name = workspace_worktree(&fx, "feat/one");
+
+        let first = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+        let _guard = guard(&first);
+        let said = std::sync::Mutex::new(Vec::<String>::new());
+        let report = start(&fx.paths, &fx.config, &name, None, &|m: &str| {
+            said.lock().expect("the progress lock").push(m.to_string())
+        })
+        .unwrap();
+        let said = said.into_inner().expect("the progress lock");
+        assert!(report.started_nothing());
+        assert_eq!(names_of(&report.already_running), vec!["api", "web"]);
+        assert!(
+            said.contains(&"api is already running".to_string())
+                && said.contains(&"web is already running".to_string()),
+            "and it says so on the way: {said:?}"
+        );
+        assert_eq!(
+            fx.state().worktrees[&name].processes["web"].pid,
+            first.started[1].record.pid,
+            "nothing was started twice"
+        );
+    }
+
+    #[test]
+    fn an_only_that_names_nothing_says_what_there_is_and_starts_nothing() {
+        let mut fx = fixture();
+        with_web_and_api(&mut fx);
+        let name = workspace_worktree(&fx, "feat/one");
+
+        let err = start(&fx.paths, &fx.config, &name, Some("worker"), &noop).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("worker"), "{msg}");
+        assert!(msg.contains("api, web"), "the names there are: {msg}");
+        assert!(
+            fx.state().worktrees[&name].processes.is_empty(),
+            "a refused --only starts nothing"
+        );
+    }
+
+    // Planned in full before anything is spawned: the first process must
+    // not be left running behind a start that failed on the second.
+    #[test]
+    fn a_process_that_cannot_start_leaves_none_of_the_others_running() {
+        let mut fx = fixture();
+        with_web_and_api(&mut fx);
+        fx.config.processes.get_mut("web").unwrap().cwd = Some("apps/nope".to_string());
+        let name = workspace_worktree(&fx, "feat/one");
+
+        let err = start(&fx.paths, &fx.config, &name, None, &noop).unwrap_err();
+        assert!(format!("{err:#}").contains("apps/nope"));
+        assert!(
+            fx.state().worktrees[&name].processes.is_empty(),
+            "the api process must not have been spawned either"
+        );
+    }
+
+    #[test]
+    fn stop_signals_every_process_group_and_keeps_the_ports() {
+        let mut fx = fixture();
+        with_web_and_api(&mut fx);
+        let name = workspace_worktree(&fx, "feat/one");
+        let report = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+        let _guard = guard(&report);
+        let groups: Vec<i32> = report.started.iter().map(|p| p.record.pgid).collect();
+
+        assert_eq!(
+            stop(&fx.paths, &name, None).unwrap(),
+            StopOutcome::Stopped(vec!["api".to_string(), "web".to_string()])
+        );
+        for pgid in groups {
+            assert!(
+                !crate::process::group_alive(pgid),
+                "group {pgid} survived the stop"
+            );
+        }
+        let record = fx.state().worktrees[&name].clone();
+        assert!(record.processes.is_empty());
+        assert_eq!(
+            record.ports, report.ports,
+            "a stopped worktree keeps its ports"
+        );
+    }
+
+    #[test]
+    fn stop_only_signals_one_group_and_leaves_the_other_running() {
+        let mut fx = fixture();
+        with_web_and_api(&mut fx);
+        let name = workspace_worktree(&fx, "feat/one");
+        let report = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+        let _guard = guard(&report);
+        let web = report.started.iter().find(|p| p.process == "web").unwrap();
+        let api = report.started.iter().find(|p| p.process == "api").unwrap();
+
+        assert_eq!(
+            stop(&fx.paths, &name, Some("web")).unwrap(),
+            StopOutcome::Stopped(vec!["web".to_string()])
+        );
+        assert!(!crate::process::group_alive(web.record.pgid));
+        assert!(
+            crate::process::group_alive(api.record.pgid),
+            "the process it did not name keeps serving"
+        );
+        assert_eq!(live_processes(&fx, &name), vec!["api"]);
+    }
+
+    #[test]
+    fn stopping_a_process_a_worktree_is_not_running_names_the_ones_it_is() {
+        let mut fx = fixture();
+        with_web_and_api(&mut fx);
+        let name = workspace_worktree(&fx, "feat/one");
+        let report = start(&fx.paths, &fx.config, &name, Some("api"), &noop).unwrap();
+        let _guard = guard(&report);
+
+        let err = stop(&fx.paths, &name, Some("web")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("web"), "{msg}");
+        assert!(msg.contains("it is running: api"), "{msg}");
+        assert_eq!(live_processes(&fx, &name), vec!["api"], "and stops nothing");
+    }
+
+    #[test]
+    fn restart_only_replaces_one_process_and_keeps_every_port() {
+        let mut fx = fixture();
+        with_web_and_api(&mut fx);
+        let name = workspace_worktree(&fx, "feat/one");
+        let first = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+        let _guard = guard(&first);
+        let web_pid = fx.state().worktrees[&name].processes["web"].pid;
+        let api_pid = fx.state().worktrees[&name].processes["api"].pid;
+
+        let report = restart(&fx.paths, &fx.config, &name, Some("api"), &noop).unwrap();
+        let _g2 = guard(&report);
+        assert_eq!(names_of(&report.started), vec!["api"]);
+        assert_eq!(
+            report.ports, first.ports,
+            "a restart keeps the URL, and --only keeps the other process's too"
+        );
+        let after = fx.state().worktrees[&name].processes.clone();
+        assert_ne!(after["api"].pid, api_pid, "the api is a new process");
+        assert_eq!(after["web"].pid, web_pid, "the web process never stopped");
+        assert!(crate::process::is_alive(web_pid));
+    }
+
+    #[test]
+    fn restart_replaces_every_process_and_keeps_every_port() {
+        let mut fx = fixture();
+        with_web_and_api(&mut fx);
+        let name = workspace_worktree(&fx, "feat/one");
+        let first = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+        drop(guard(&first));
+        let before: Vec<u32> = first.started.iter().map(|p| p.record.pid).collect();
+
+        let report = restart(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+        let _guard = guard(&report);
+        assert_eq!(names_of(&report.started), vec!["api", "web"]);
+        assert_eq!(report.ports, first.ports);
+        let after: Vec<u32> = report.started.iter().map(|p| p.record.pid).collect();
+        assert_ne!(after, before);
+        for pid in before {
+            assert!(!crate::process::is_alive(pid), "pid {pid} survived");
+        }
+    }
+
     // ---- stop ------------------------------------------------------------
 
     #[test]
@@ -2319,12 +2903,15 @@ time.sleep(300)
         let mut fx = fixture();
         with_dev(&mut fx, dev("sleep 30"));
         let name = worktree_named(&fx, "feat/one");
-        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
         let _guard = guard(&outcome);
-        let pgid = outcome.process().record.pgid;
-        let ports = outcome.process().ports.clone();
+        let pgid = outcome.started[0].record.pgid;
+        let ports = outcome.ports.clone();
 
-        assert_eq!(stop(&fx.paths, &name).unwrap(), StopOutcome::Stopped);
+        assert_eq!(
+            stop(&fx.paths, &name, None).unwrap(),
+            StopOutcome::Stopped(vec!["dev".to_string()])
+        );
         assert!(
             !crate::process::group_alive(pgid),
             "the group must be empty"
@@ -2348,9 +2935,12 @@ time.sleep(300)
         let mut fx = fixture();
         with_dev(&mut fx, dev("sleep 30 & exit 0"));
         let name = worktree_named(&fx, "feat/one");
-        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
         let _guard = guard(&outcome);
-        let (pid, pgid) = (outcome.process().record.pid, outcome.process().record.pgid);
+        let (pid, pgid) = (
+            outcome.started[0].record.pid,
+            outcome.started[0].record.pgid,
+        );
 
         assert!(wait_until(Duration::from_secs(5), || {
             !crate::process::is_alive(pid)
@@ -2375,7 +2965,10 @@ time.sleep(300)
         };
         state::save(&fx.paths.state_file(), &store).unwrap();
 
-        assert_eq!(stop(&fx.paths, &name).unwrap(), StopOutcome::Stopped);
+        assert_eq!(
+            stop(&fx.paths, &name, None).unwrap(),
+            StopOutcome::Stopped(vec!["dev".to_string()])
+        );
         assert!(
             !crate::process::group_alive(pgid),
             "a failed record's group must still be killed"
@@ -2386,9 +2979,15 @@ time.sleep(300)
     fn stopping_something_that_is_not_running_is_not_an_error() {
         let mut fx = fixture();
         with_dev(&mut fx, dev("sleep 30"));
-        assert_eq!(stop(&fx.paths, "nope").unwrap(), StopOutcome::NotRunning);
+        assert_eq!(
+            stop(&fx.paths, "nope", None).unwrap(),
+            StopOutcome::NotRunning
+        );
         let name = worktree_named(&fx, "feat/one");
-        assert_eq!(stop(&fx.paths, &name).unwrap(), StopOutcome::NotRunning);
+        assert_eq!(
+            stop(&fx.paths, &name, None).unwrap(),
+            StopOutcome::NotRunning
+        );
     }
 
     #[test]
@@ -2397,21 +2996,20 @@ time.sleep(300)
         with_dev(&mut fx, dev("sleep 30"));
         let one = worktree_named(&fx, "feat/one");
         let two = worktree_named(&fx, "feat/two");
-        let a = start(&fx.paths, &fx.config, &one, &noop).unwrap();
+        let a = start(&fx.paths, &fx.config, &one, None, &noop).unwrap();
         let _ga = guard(&a);
-        let b = start(&fx.paths, &fx.config, &two, &noop).unwrap();
+        let b = start(&fx.paths, &fx.config, &two, None, &noop).unwrap();
         let _gb = guard(&b);
         assert_ne!(
-            a.process().ports["web"],
-            b.process().ports["web"],
+            a.ports["web"], b.ports["web"],
             "two worktrees never share a port"
         );
 
         let mut stopped = stop_all(&fx.paths).unwrap();
         stopped.sort();
         assert_eq!(stopped, vec![one.clone(), two.clone()]);
-        assert!(!crate::process::group_alive(a.process().record.pgid));
-        assert!(!crate::process::group_alive(b.process().record.pgid));
+        assert!(!crate::process::group_alive(a.started[0].record.pgid));
+        assert!(!crate::process::group_alive(b.started[0].record.pgid));
         assert!(fx.state().worktrees[&one].processes.is_empty());
         assert!(fx.state().worktrees[&two].processes.is_empty());
         assert!(
@@ -2454,7 +3052,7 @@ time.sleep(300)
         );
         state::save(&fx.paths.state_file(), &store).unwrap();
 
-        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
         let _guard = guard(&outcome);
         assert!(
             !crate::process::group_alive(stray_pgid),
@@ -2479,8 +3077,10 @@ time.sleep(300)
     fn orphaned_sibling(fx: &mut Fx) -> (String, Detached) {
         with_dev(fx, dev("sleep 300 & exit 0"));
         let name = worktree_named(fx, "feat/orphan");
-        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
-        let orphan = guard(&outcome);
+        let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+        let orphan = guard(&outcome)
+            .pop()
+            .expect("the start spawned exactly one process");
         assert!(
             wait_until(Duration::from_secs(5), || {
                 !crate::process::is_alive(orphan.pid)
@@ -2501,7 +3101,10 @@ time.sleep(300)
         let (orphan_name, orphan) = orphaned_sibling(&mut fx);
         let other = worktree_named(&fx, "feat/other");
 
-        assert_eq!(stop(&fx.paths, &other).unwrap(), StopOutcome::NotRunning);
+        assert_eq!(
+            stop(&fx.paths, &other, None).unwrap(),
+            StopOutcome::NotRunning
+        );
         assert!(
             !crate::process::group_alive(orphan.pgid),
             "a record dropped by reconcile must have been signalled first"
@@ -2518,7 +3121,7 @@ time.sleep(300)
         let (_orphan_name, orphan) = orphaned_sibling(&mut fx);
         let other = worktree_named(&fx, "feat/other");
 
-        let outcome = start(&fx.paths, &fx.config, &other, &noop).unwrap();
+        let outcome = start(&fx.paths, &fx.config, &other, None, &noop).unwrap();
         let _guard = guard(&outcome);
         assert!(
             !crate::process::group_alive(orphan.pgid),
@@ -2614,22 +3217,21 @@ time.sleep(300)
         let mut fx = fixture();
         with_dev(&mut fx, dev("sleep 30"));
         let name = worktree_named(&fx, "feat/one");
-        let first = start(&fx.paths, &fx.config, &name, &noop).unwrap();
-        let first_pgid = first.process().record.pgid;
-        let ports = first.process().ports.clone();
+        let first = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+        let first_pgid = first.started[0].record.pgid;
+        let ports = first.ports.clone();
         drop(guard(&first));
 
-        let second = restart(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let second = restart(&fx.paths, &fx.config, &name, None, &noop).unwrap();
         let _guard = guard(&second);
-        assert!(matches!(second, StartOutcome::Started(_)));
-        assert_ne!(second.process().record.pid, first.process().record.pid);
+        assert!(!second.started_nothing());
+        assert_ne!(second.started[0].record.pid, first.started[0].record.pid);
         assert!(!crate::process::group_alive(first_pgid));
         assert_eq!(
-            second.process().ports,
-            ports,
+            second.ports, ports,
             "a restart keeps the URL the developer had open"
         );
-        assert!(!second.process().reassigned);
+        assert!(!second.reassigned);
     }
 
     #[test]
@@ -2637,9 +3239,9 @@ time.sleep(300)
         let mut fx = fixture();
         with_dev(&mut fx, dev("sleep 30"));
         let name = worktree_named(&fx, "feat/one");
-        let outcome = restart(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let outcome = restart(&fx.paths, &fx.config, &name, None, &noop).unwrap();
         let _guard = guard(&outcome);
-        assert!(matches!(outcome, StartOutcome::Started(_)));
+        assert!(!outcome.started_nothing());
     }
 
     // ---- the install hook ------------------------------------------------
@@ -2682,7 +3284,7 @@ time.sleep(300)
         assert_eq!(install_log(&fx, &name).matches("run").count(), 1);
 
         with_dev(&mut fx, dev("sleep 30"));
-        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
         let _guard = guard(&outcome);
         assert_eq!(
             install_log(&fx, &name).matches("run").count(),
@@ -2703,7 +3305,7 @@ time.sleep(300)
         let worktree = fx.worktrees_dir().join(&name);
         std::fs::write(worktree.join("pnpm-lock.yaml"), "lockfileVersion: '10.0'\n").unwrap();
 
-        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
         let _guard = guard(&outcome);
         assert_eq!(
             install_log(&fx, &name).matches("run").count(),
@@ -2746,7 +3348,7 @@ time.sleep(300)
         fx.config.project.install = Some("echo recovered".to_string());
         with_dev(&mut fx, dev("sleep 30"));
 
-        let outcome = start(&fx.paths, &fx.config, "feat+one", &noop).unwrap();
+        let outcome = start(&fx.paths, &fx.config, "feat+one", None, &noop).unwrap();
         let _guard = guard(&outcome);
         assert!(install_log(&fx, "feat+one").contains("recovered"));
         assert!(install_fingerprint(&fx, "feat+one").is_some());
@@ -2770,7 +3372,7 @@ time.sleep(300)
             notices.borrow()
         );
 
-        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
         let _guard = guard(&outcome);
         assert_eq!(
             install_log(&fx, &name).matches("rewriting").count(),
@@ -2802,7 +3404,7 @@ time.sleep(300)
         );
         assert!(!fx.state().worktrees.contains_key("adopted"));
 
-        let first = start(&fx.paths, &fx.config, "adopted", &noop).unwrap();
+        let first = start(&fx.paths, &fx.config, "adopted", None, &noop).unwrap();
         drop(guard(&first));
         assert_eq!(install_log(&fx, "adopted").matches("run").count(), 1);
         assert!(
@@ -2814,8 +3416,8 @@ time.sleep(300)
             "and pando does not claim a worktree it found"
         );
 
-        stop(&fx.paths, "adopted").unwrap();
-        let second = start(&fx.paths, &fx.config, "adopted", &noop).unwrap();
+        stop(&fx.paths, "adopted", None).unwrap();
+        let second = start(&fx.paths, &fx.config, "adopted", None, &noop).unwrap();
         let _guard = guard(&second);
         assert_eq!(
             install_log(&fx, "adopted").matches("run").count(),
@@ -2844,7 +3446,7 @@ time.sleep(300)
             install_log(&fx, &name)
         );
 
-        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
         let _guard = guard(&outcome);
         assert!(
             wait_until(Duration::from_secs(10), || log_of(&fx, &name)
@@ -2875,7 +3477,7 @@ time.sleep(300)
         fx.config.project.install = Some("echo run".to_string());
         with_dev(&mut fx, dev("sleep 30"));
         let name = worktree_named(&fx, "feat/one");
-        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
         let _guard = guard(&outcome);
         assert_eq!(install_log(&fx, &name).matches("run").count(), 2);
     }
@@ -3158,9 +3760,9 @@ time.sleep(300)
         let mut fx = fixture();
         with_dev(&mut fx, dev("sleep 30"));
         let name = worktree_named(&fx, "feat/one");
-        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
         let _guard = guard(&outcome);
-        let pgid = outcome.process().record.pgid;
+        let pgid = outcome.started[0].record.pgid;
         assert!(crate::process::group_alive(pgid));
 
         rm(&fx.paths, &name, false, false).unwrap();
@@ -3180,9 +3782,9 @@ time.sleep(300)
         let mut fx = fixture();
         with_dev(&mut fx, dev("sleep 300"));
         let name = worktree_named(&fx, "feat/one");
-        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
         let _guard = guard(&outcome);
-        let pgid = outcome.process().record.pgid;
+        let pgid = outcome.started[0].record.pgid;
         std::fs::write(
             fx.worktrees_dir().join(&name).join("README.md"),
             "edited in the worktree\n",
@@ -3218,7 +3820,7 @@ time.sleep(300)
         fx.config.project.install = Some(format!("echo ran >> {}", marker.display()));
         with_dev(&mut fx, dev("sleep 300"));
         let name = worktree_named(&fx, "feat/one");
-        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
         let _guard = guard(&outcome);
         let runs = || {
             std::fs::read_to_string(&marker)
@@ -3232,8 +3834,8 @@ time.sleep(300)
             "the hook has to have run at all for this to mean anything"
         );
 
-        let second = start(&fx.paths, &fx.config, &name, &noop).unwrap();
-        assert!(matches!(second, StartOutcome::AlreadyRunning(_)));
+        let second = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+        assert!(second.started_nothing());
         assert_eq!(
             runs(),
             before,
@@ -3248,9 +3850,9 @@ time.sleep(300)
         let mut fx = fixture();
         with_dev(&mut fx, dev("sleep 30"));
         let name = worktree_named(&fx, "feat/one");
-        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
         let _guard = guard(&outcome);
-        let pgid = outcome.process().record.pgid;
+        let pgid = outcome.started[0].record.pgid;
 
         // Locked worktrees are always refused, before anything is touched.
         git(
@@ -3306,9 +3908,9 @@ time.sleep(300)
             },
         );
         let name = worktree_named(&fx, "feat/one");
-        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
         let _guard = guard(&outcome);
-        let port = outcome.process().ports["web"];
+        let port = outcome.ports["web"];
 
         assert!(
             wait_until(Duration::from_secs(20), || matches!(
@@ -3340,7 +3942,7 @@ time.sleep(300)
         let mut fx = fixture();
         with_dev(&mut fx, dev("echo boom && exit 1"));
         let name = worktree_named(&fx, "feat/one");
-        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
         let _guard = guard(&outcome);
 
         assert!(wait_until(Duration::from_secs(10), || matches!(
@@ -3369,7 +3971,7 @@ time.sleep(300)
             dev("echo 'Error: listen EADDRINUSE: address already in use :::3000' && exit 1"),
         );
         let name = worktree_named(&fx, "feat/one");
-        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
         let _guard = guard(&outcome);
 
         assert!(wait_until(Duration::from_secs(10), || matches!(
