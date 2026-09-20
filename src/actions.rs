@@ -204,13 +204,28 @@ pub fn install_if_needed(
     hooks::run(&log_file, &with_prelude(config, install), worktree, &env)
         .with_context(|| format!("the {INSTALL_HOOK} hook failed"))?;
 
+    // A frozen install should leave the lockfile exactly as it found it.
+    // When one does not — and package managers do, on a lockfile they
+    // consider malformed — two things have to happen: the developer is told,
+    // because a tracked file changing under a worktree is what Invariant 1
+    // exists to prevent; and the fingerprint recorded is the one the install
+    // *left behind*, or the hook sees a change it made itself and re-runs on
+    // every single start from then on.
+    let after = hooks::fingerprint(worktree, &globs);
+    if after != current {
+        progress(&format!(
+            "warning: {install:?} changed a lockfile in this worktree — that command is not as \
+             frozen as it looks, and `git status` there will show it"
+        ));
+    }
+
     let _lock = state::lock(&paths.lock_file())?;
     let mut store = state::load(&paths.state_file())?;
     if let Some(record) = store.worktrees.get_mut(name) {
         record.hooks.insert(
             INSTALL_HOOK.to_string(),
             state::HookRecord {
-                fingerprint: current,
+                fingerprint: after,
                 ran_at: Utc::now(),
             },
         );
@@ -2026,6 +2041,33 @@ mod tests {
         let _guard = guard(&outcome);
         assert!(install_log(&fx, "feat+one").contains("recovered"));
         assert!(install_fingerprint(&fx, "feat+one").is_some());
+    }
+
+    // Verified by hand against pnpm 9: `pnpm install --frozen-lockfile` on a
+    // lockfile it considers malformed rewrites it anyway. pando cannot stop
+    // that, but it must not then re-install on every start forever.
+    #[test]
+    fn an_install_that_rewrites_its_own_lockfile_still_settles() {
+        let mut fx = installable_fixture("echo rewriting && echo changed >> pnpm-lock.yaml");
+        with_dev(&mut fx, dev("sleep 30"));
+        let notices = std::cell::RefCell::new(Vec::<String>::new());
+        let record_notice = |m: &str| notices.borrow_mut().push(m.to_string());
+
+        let name = new(&fx.paths, &fx.config, "feat/one", None, &record_notice).unwrap();
+        assert_eq!(install_log(&fx, &name).matches("rewriting").count(), 1);
+        assert!(
+            notices.borrow().iter().any(|n| n.contains("not as frozen")),
+            "a lockfile changing under a worktree is worth saying out loud: {:?}",
+            notices.borrow()
+        );
+
+        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let _guard = guard(&outcome);
+        assert_eq!(
+            install_log(&fx, &name).matches("rewriting").count(),
+            1,
+            "the fingerprint recorded is the one the install left behind, so it settles"
+        );
     }
 
     #[test]
