@@ -1,0 +1,4 @@
+# Rustfmt defaults, pinned so the repo formats identically everywhere. Without
+# a file here rustfmt falls back to the user's own ~/.rustfmt.toml, which makes
+# `cargo fmt --check` machine-dependent.
+edition = "2024"

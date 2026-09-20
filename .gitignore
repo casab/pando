@@ -8,3 +8,6 @@ CLAUDE.local.md
 
 # macOS
 .DS_Store
+
+# Rust build artifacts
+target/
