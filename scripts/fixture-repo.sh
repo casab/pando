@@ -6,11 +6,14 @@
 #   scripts/fixture-repo.sh next-pnpm-compose
 #   scripts/fixture-repo.sh plain --with-origin
 #   scripts/fixture-repo.sh next-pnpm-compose --listener
+#   scripts/fixture-repo.sh mono-web-api --listener
 #   scripts/fixture-repo.sh --list
 #
 # --listener also writes a pando-home config whose dev process is a python
 # listener, so `pando start` has something real to start without installing
-# the fixture's framework.
+# the fixture's framework. For the mono-web-api workspace it writes two of
+# them, one per app, and the web one prints the VITE_API_URL it was given
+# so the cross-process template is visible in its log.
 #
 # Mutating pando commands are only ever run against one of these, never
 # against a real repository. The recipe lives in tests/common/mod.rs; this

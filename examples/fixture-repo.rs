@@ -52,7 +52,7 @@ fn main() {
     // A dev process that needs no real framework installed, so the manual
     // demo can start, watch, and stop something that really binds a port.
     if with_listener {
-        let config = common::write_listener_config(&parent.join("pando-home"), &fixture.root);
+        let config = common::write_listener_config(kind, &parent.join("pando-home"), &fixture.root);
         eprintln!("listener config: {}", config.display());
     }
     eprintln!(

@@ -122,12 +122,16 @@ fn harness() -> Harness {
 }
 
 fn harness_with(config_toml: &str) -> Harness {
+    harness_of(Kind::Plain, config_toml)
+}
+
+fn harness_of(kind: Kind, config_toml: &str) -> Harness {
     let dir = TempDir::new().unwrap();
     // Canonical throughout: on macOS the temp dir is /var/... but git (and
     // every path pando canonicalises) says /private/var/..., and the
     // comparisons below are all path equality.
     let parent = std::fs::canonicalize(dir.path()).unwrap();
-    let root = build(Kind::Plain, &parent).root;
+    let root = build(kind, &parent).root;
     let home = parent.join("pando-home");
     let paths = paths_for(&home, &root);
 
@@ -517,6 +521,169 @@ fn starting_and_stopping_never_writes_into_the_repository() {
 
     actions::stop(&h.paths, &name, None).unwrap();
     h.assert_untouched("stop again", Some(&worktree));
+
+    actions::rm(&h.paths, &name, false, false).unwrap();
+    h.assert_untouched("rm", None);
+    assert!(!worktree.exists());
+    assert!(
+        !h.paths.logs_dir(&name).exists(),
+        "rm wipes the logs it wrote"
+    );
+}
+
+/// Phase 2b: the same guarantee with two processes in two directories.
+///
+/// The workspace fixture, its listener config, and the whole lifecycle —
+/// including the two commands that only exist because there are two
+/// processes: `logs --source api` and `stop --only web`.
+#[test]
+fn two_processes_never_write_into_the_repository() {
+    if !common::python3_available() {
+        eprintln!("skipping: python3 is not installed");
+        return;
+    }
+    let h = harness_of(Kind::MonoWebApi, &common::workspace_listener_config());
+    h.assert_untouched("setup", None);
+
+    let name = actions::new(&h.paths, &h.config, "feat/one", None, &|_| {}).unwrap();
+    let worktree = h.config.worktrees_dir(&h.paths).join(&name);
+    h.assert_untouched("new", Some(&worktree));
+
+    let report = actions::start(&h.paths, &h.config, &name, None, &|_| {}).unwrap();
+    assert_eq!(
+        report
+            .started
+            .iter()
+            .map(|p| p.process.as_str())
+            .collect::<Vec<_>>(),
+        vec!["api", "web"],
+        "both processes, in config order"
+    );
+    let web_port = report.ports["web"];
+    let api_port = report.ports["api"];
+    assert_eq!(
+        report.url,
+        Some(format!("http://localhost:{web_port}")),
+        "one URL for the worktree, and it is the web role's"
+    );
+    h.assert_untouched("start", Some(&worktree));
+
+    // Both up, both observed, and the web process carrying the api's real
+    // port — which is the whole reason `{port:<role>}` exists.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut running = false;
+    while std::time::Instant::now() < deadline {
+        let state = actions::refresh(&h.paths).state;
+        let record = &state.worktrees[&name];
+        if matches!(
+            state::aggregate_phase(record),
+            Some(state::Aggregate::Running { .. })
+        ) && record.observed_ports.contains(&web_port)
+            && record.observed_ports.contains(&api_port)
+        {
+            running = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        running,
+        "the listeners never came up on {web_port} and {api_port}: {:?} / {:?}",
+        std::fs::read_to_string(h.paths.log_file(&name, "web")),
+        std::fs::read_to_string(h.paths.log_file(&name, "api"))
+    );
+    let web_log = std::fs::read_to_string(h.paths.log_file(&name, "web")).unwrap();
+    assert!(
+        web_log.contains(&format!("VITE_API_URL=http://localhost:{api_port}")),
+        "the web process is told where the api really is: {web_log}"
+    );
+    h.assert_untouched("refresh while both are running", Some(&worktree));
+
+    // What a machine reads.
+    let mut out = Vec::new();
+    pando::cli::status_json(&h.paths, None, &mut out).unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let wt = &status["worktrees"][0];
+    assert_eq!(wt["ports"]["web"], web_port);
+    assert_eq!(wt["ports"]["api"], api_port);
+    assert_eq!(wt["processes"]["web"]["phase"], "running");
+    assert_eq!(wt["processes"]["api"]["phase"], "running");
+    h.assert_untouched("status --json", Some(&worktree));
+
+    // One log per process, and `--source` picks between them.
+    let mut out = Vec::new();
+    pando::cli::logs(&h.paths, &name, "api", 5, false, false, &mut out).unwrap();
+    let api_log = String::from_utf8_lossy(&out).into_owned();
+    assert!(
+        api_log.contains(&format!("listening on {api_port}")),
+        "the api's own log: {api_log}"
+    );
+    assert!(
+        !api_log.contains("VITE_API_URL"),
+        "and not the web process's: {api_log}"
+    );
+    h.assert_untouched("logs --source api", Some(&worktree));
+
+    // Stopping one leaves the other serving.
+    let web_pgid = report
+        .started
+        .iter()
+        .find(|p| p.process == "web")
+        .expect("a web process")
+        .record
+        .pgid;
+    assert_eq!(
+        actions::stop(&h.paths, &name, Some("web")).unwrap(),
+        actions::StopOutcome::Stopped(vec!["web".to_string()])
+    );
+    assert!(!pando::process::group_alive(web_pgid));
+    let state = actions::refresh(&h.paths).state;
+    assert_eq!(
+        state.worktrees[&name]
+            .processes
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec!["api"],
+        "the api never stopped"
+    );
+    h.assert_untouched("stop --only web", Some(&worktree));
+
+    // Starting again brings the missing one back on the same ports.
+    let again = actions::start(&h.paths, &h.config, &name, None, &|_| {}).unwrap();
+    assert_eq!(
+        again
+            .started
+            .iter()
+            .map(|p| p.process.as_str())
+            .collect::<Vec<_>>(),
+        vec!["web"],
+        "only what was missing"
+    );
+    assert_eq!(
+        again
+            .already_running
+            .iter()
+            .map(|p| p.process.as_str())
+            .collect::<Vec<_>>(),
+        vec!["api"]
+    );
+    assert_eq!(again.ports, report.ports, "and on the ports it already had");
+    h.assert_untouched("start again", Some(&worktree));
+
+    actions::stop(&h.paths, &name, None).unwrap();
+    h.assert_untouched("stop", Some(&worktree));
+
+    // Every log the pair wrote lives under pando's home.
+    for source in ["web", "api", "install"] {
+        let log = h.paths.log_file(&name, source);
+        assert!(log.exists(), "{source} has no log");
+        assert!(
+            log.starts_with(&h.home),
+            "{} escaped the home",
+            log.display()
+        );
+    }
 
     actions::rm(&h.paths, &name, false, false).unwrap();
     h.assert_untouched("rm", None);

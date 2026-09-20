@@ -594,6 +594,49 @@ pub fn listener_on_port_template() -> String {
         .to_string()
 }
 
+/// A listener that prints an environment variable before it binds, so what
+/// one process was told about another is visible in its log.
+///
+/// Brace-free except the placeholder: `{` is pando's template syntax.
+pub fn listener_printing(var: &str) -> String {
+    format!(
+        "python3 -u -c \"import os,socket,time;\
+         print('{var}=' + os.environ['{var}']);s=socket.socket();\
+         s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);\
+         s.bind(('127.0.0.1',{{port:web}}));s.listen(5);\
+         print('listening on {{port:web}}');time.sleep(3600)\""
+    )
+}
+
+/// The pando-home config the `--listener` fixture writes for the workspace
+/// fixture: two processes, each in its own directory, with the web one told
+/// the api's port through a template — and printing it, so the
+/// cross-process reference is visible in its own log.
+pub fn workspace_listener_config() -> String {
+    let mut out = String::new();
+    out.push_str("# written by scripts/fixture-repo.sh --listener\n");
+    out.push_str("[project]\nprovision = [\".env\"]\ninstall = \"true\"\n\n");
+    out.push_str("[processes.web]\ncwd = \"apps/web\"\ncmd = '''");
+    out.push_str(&listener_printing("VITE_API_URL"));
+    out.push_str("'''\nports = [\"web\"]\n");
+    out.push_str("env = { VITE_API_URL = \"http://localhost:{port:api}\" }\n");
+    out.push_str("ready = { role = \"web\" }\n\n");
+    out.push_str("[processes.api]\ncwd = \"apps/api\"\ncmd = '''");
+    out.push_str(&listener_on_port_env());
+    out.push_str("'''\nports = [\"api\"]\nenv = { PORT = \"{port:api}\" }\n");
+    out.push_str("ready = { role = \"api\" }\n");
+    out
+}
+
+/// The listener config for a fixture: the workspace gets two processes,
+/// everything else the single one.
+pub fn listener_config_for(kind: Kind) -> String {
+    match kind {
+        Kind::MonoWebApi => workspace_listener_config(),
+        _ => listener_config(),
+    }
+}
+
 /// The pando-home config the `--listener` fixture writes: a dev process
 /// that needs no framework installed and no real server.
 ///
@@ -611,12 +654,12 @@ pub fn listener_config() -> String {
     out
 }
 
-/// Writes `listener_config` into an injected pando home for `root`.
-pub fn write_listener_config(home: &Path, root: &Path) -> PathBuf {
+/// Writes the fixture's listener config into an injected pando home.
+pub fn write_listener_config(kind: Kind, home: &Path, root: &Path) -> PathBuf {
     let project = ProjectRef::from_root(root).unwrap();
     let dir = home.join("projects").join(&project.id);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("pando.toml");
-    std::fs::write(&path, listener_config()).unwrap();
+    std::fs::write(&path, listener_config_for(kind)).unwrap();
     path
 }
