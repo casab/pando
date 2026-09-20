@@ -694,6 +694,176 @@ pub fn path(paths: &PandoPaths, name: &str) -> Result<PathBuf> {
         .with_context(|| format!("no worktree named {name:?}"))
 }
 
+// ---- reading state --------------------------------------------------------
+
+/// How many log lines the failure classifier reads.
+const FAILURE_TAIL_LINES: usize = 40;
+
+/// State as of right now: phases advanced, observed ports captured, and the
+/// reason a dead process died written down.
+///
+/// This is the read path. It advances phases rather than reconciling,
+/// because a crashed dev server has to stay visible as Failed until the
+/// developer acts on it — `reconcile`, which drops dead records, would erase
+/// exactly the thing worth showing. It never fails: a state file pando
+/// cannot use becomes one warning line, the same one `rm` refuses with.
+#[derive(Debug, Default, Clone)]
+pub struct Refreshed {
+    pub state: state::State,
+    pub warning: Option<String>,
+}
+
+pub fn refresh(paths: &PandoPaths) -> Refreshed {
+    // Nothing has ever been started here, so there is nothing to advance and
+    // no reason for a read-only command to create a home.
+    if !paths.state_file().exists() {
+        return Refreshed::default();
+    }
+    if let Err(e) = paths.ensure_home() {
+        return Refreshed {
+            state: state::State::new(),
+            warning: Some(format!("{e:#}")),
+        };
+    }
+    let _lock = match state::lock(&paths.lock_file()) {
+        Ok(lock) => lock,
+        Err(e) => {
+            return Refreshed {
+                state: state::State::new(),
+                warning: Some(format!("{e:#}")),
+            };
+        }
+    };
+    let mut store = match state::load(&paths.state_file()) {
+        Ok(store) => store,
+        Err(e) => {
+            return Refreshed {
+                state: state::State::new(),
+                warning: Some(format!("{e:#}")),
+            };
+        }
+    };
+
+    let failed_before = failed_processes(&store);
+    let mut changed = state::advance_phases(&mut store, proc::is_alive, ports::is_port_free);
+    changed |= capture_observed_ports(&mut store);
+    changed |= explain_new_failures(&mut store, &failed_before);
+    if changed {
+        // A read path that cannot write is still a read path: the phases are
+        // right in memory either way, so a save that fails is not worth
+        // failing the command the user actually ran.
+        if let Err(e) = state::save(&paths.state_file(), &store) {
+            return Refreshed {
+                state: store,
+                warning: Some(format!("{e:#}")),
+            };
+        }
+    }
+    Refreshed {
+        state: store,
+        warning: None,
+    }
+}
+
+/// `(worktree, process)` pairs already in `Failed`, so a reason is explained
+/// once — when it happens — rather than re-read from the log on every tick.
+fn failed_processes(store: &state::State) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (name, record) in &store.worktrees {
+        for (process, p) in &record.processes {
+            if matches!(p.phase, Phase::Failed { .. }) {
+                out.push((name.clone(), process.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// Records the ports each running group is really listening on.
+///
+/// Configured ports are what pando asked for; these are what happened. A
+/// framework that ignores `PORT`, or one that opens a second socket for hot
+/// reload, shows up here and nowhere else.
+fn capture_observed_ports(store: &mut state::State) -> bool {
+    let mut changed = false;
+    for record in store.worktrees.values_mut() {
+        let running: Vec<i32> = record
+            .processes
+            .values()
+            .filter(|p| matches!(p.phase, Phase::Running { .. }))
+            .map(|p| p.pgid)
+            .collect();
+        let mut observed: Vec<u16> = running
+            .iter()
+            .flat_map(|pgid| crate::observe::observed_ports(*pgid))
+            .collect();
+        observed.sort_unstable();
+        observed.dedup();
+        // A scan that came back empty for a process that *is* running is
+        // more likely a denied or missing `lsof` than a server with no
+        // socket, so the last good answer is kept rather than cleared.
+        if observed.is_empty() && !running.is_empty() {
+            continue;
+        }
+        if record.observed_ports != observed {
+            record.observed_ports = observed;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Appends the classifier's one-line hint to a failure that just happened.
+///
+/// pando is not the process's parent by the time it dies, so there is no
+/// exit status to read. The last lines of its log are the only evidence, and
+/// four patterns cover most of what actually goes wrong.
+fn explain_new_failures(store: &mut state::State, failed_before: &[(String, String)]) -> bool {
+    let mut changed = false;
+    for (name, record) in store.worktrees.iter_mut() {
+        for (process, p) in record.processes.iter_mut() {
+            let Phase::Failed { at, reason } = &p.phase else {
+                continue;
+            };
+            if failed_before
+                .iter()
+                .any(|(w, pr)| w == name && pr == process)
+            {
+                continue;
+            }
+            let lines =
+                crate::log_tail::snapshot(&p.log_path, FAILURE_TAIL_LINES).unwrap_or_default();
+            let Some(hint) = crate::observe::classify_failure(&lines) else {
+                continue;
+            };
+            p.phase = Phase::Failed {
+                at: *at,
+                reason: format!("{reason} — {}", hint.hint),
+            };
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Which worktrees pando created, from a state it has already read.
+pub fn ownership(
+    store: &state::State,
+    worktrees: &[Worktree],
+) -> std::collections::BTreeMap<String, bool> {
+    store
+        .worktrees
+        .iter()
+        .map(|(name, record)| {
+            let ours = record.created_by_pando
+                && worktrees
+                    .iter()
+                    .any(|w| &w.name == name && record_is_for(record, w));
+            (name.clone(), ours)
+        })
+        .collect()
+}
+
 /// Which worktrees pando created, and anything that stopped the answer
 /// being certain.
 #[derive(Debug, Default, Clone)]
@@ -705,37 +875,18 @@ pub struct Ownership {
     pub warning: Option<String>,
 }
 
-/// Which worktrees pando created, from state. A read path, so it reconciles
-/// first; it takes no lock, because it mutates nothing on disk.
+/// Which worktrees pando created, from state. A read path, so it goes
+/// through [`refresh`]: phases are advanced and a crashed process stays
+/// visible as Failed.
 ///
 /// `worktrees` is what git currently reports: a record only vouches for a
 /// worktree at the same path it was written for, so a record left behind by
 /// a worktree removed outside pando cannot adopt a later namesake.
 pub fn created_by_pando(paths: &PandoPaths, worktrees: &[Worktree]) -> Ownership {
-    let mut store = match state::load(&paths.state_file()) {
-        Ok(store) => store,
-        Err(e) => {
-            return Ownership {
-                by_name: Default::default(),
-                warning: Some(format!("{e:#}")),
-            };
-        }
-    };
-    state::reconcile(&mut store, crate::process::is_alive);
-    let by_name = store
-        .worktrees
-        .iter()
-        .map(|(name, record)| {
-            let ours = record.created_by_pando
-                && worktrees
-                    .iter()
-                    .any(|w| &w.name == name && record_is_for(record, w));
-            (name.clone(), ours)
-        })
-        .collect();
+    let refreshed = refresh(paths);
     Ownership {
-        by_name,
-        warning: None,
+        by_name: ownership(&refreshed.state, worktrees),
+        warning: refreshed.warning,
     }
 }
 
@@ -1489,6 +1640,153 @@ mod tests {
         let outcome = restart(&fx.paths, &fx.config, &name, &noop).unwrap();
         let _guard = guard(&outcome);
         assert!(matches!(outcome, StartOutcome::Started(_)));
+    }
+
+    // ---- refresh ---------------------------------------------------------
+
+    #[test]
+    fn refresh_on_a_project_that_never_started_anything_writes_nothing() {
+        let fx = fixture();
+        let refreshed = refresh(&fx.paths);
+        assert!(refreshed.state.worktrees.is_empty());
+        assert!(refreshed.warning.is_none());
+        assert!(
+            !fx.paths.state_file().exists(),
+            "a read path must not create state"
+        );
+    }
+
+    #[test]
+    fn refresh_moves_a_starting_process_to_running_once_its_port_binds() {
+        if !python3_available() {
+            eprintln!("skipping: python3 is not installed");
+            return;
+        }
+        let mut fx = fixture();
+        with_dev(
+            &mut fx,
+            ProcessConfig {
+                cmd: python_listener_template(),
+                ports: PortsSpec::List(vec!["web".to_string()]),
+                ..Default::default()
+            },
+        );
+        let name = worktree_named(&fx, "feat/one");
+        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let _guard = guard(&outcome);
+        let port = outcome.process().ports["web"];
+
+        assert!(
+            wait_until(Duration::from_secs(20), || matches!(
+                refresh(&fx.paths).state.worktrees[&name].processes["dev"].phase,
+                Phase::Running { .. }
+            )),
+            "never reached Running: {:?}",
+            log_of(&fx, &name)
+        );
+        // Saved, not just computed: the next command must see it too.
+        assert!(matches!(
+            fx.state().worktrees[&name].processes["dev"].phase,
+            Phase::Running { .. }
+        ));
+        assert!(
+            wait_until(Duration::from_secs(10), || refresh(&fx.paths)
+                .state
+                .worktrees[&name]
+                .observed_ports
+                .contains(&port)),
+            "the port it is really listening on is recorded"
+        );
+    }
+
+    // The whole reason read paths advance instead of reconciling: a crashed
+    // dev server has to stay on screen until the developer acts on it.
+    #[test]
+    fn a_crashed_process_stays_failed_across_reads() {
+        let mut fx = fixture();
+        with_dev(&mut fx, dev("echo boom && exit 1"));
+        let name = worktree_named(&fx, "feat/one");
+        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let _guard = guard(&outcome);
+
+        assert!(wait_until(Duration::from_secs(10), || matches!(
+            refresh(&fx.paths).state.worktrees[&name].processes["dev"].phase,
+            Phase::Failed { .. }
+        )));
+        for _ in 0..3 {
+            let phase = refresh(&fx.paths).state.worktrees[&name].processes["dev"]
+                .phase
+                .clone();
+            assert!(
+                matches!(&phase, Phase::Failed { reason, .. } if reason.starts_with("process exited")),
+                "a failure must not be swept away by the next read: {phase:?}"
+            );
+        }
+        // And the worktree keeps its ports, so a restart reuses them.
+        assert!(!fx.state().worktrees[&name].ports.is_empty());
+    }
+
+    #[test]
+    fn a_failure_the_log_explains_carries_the_hint() {
+        let mut fx = fixture();
+        // A port that is already taken, reported the way Node reports it.
+        with_dev(
+            &mut fx,
+            dev("echo 'Error: listen EADDRINUSE: address already in use :::3000' && exit 1"),
+        );
+        let name = worktree_named(&fx, "feat/one");
+        let outcome = start(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let _guard = guard(&outcome);
+
+        assert!(wait_until(Duration::from_secs(10), || matches!(
+            refresh(&fx.paths).state.worktrees[&name].processes["dev"].phase,
+            Phase::Failed { .. }
+        )));
+        let phase = refresh(&fx.paths).state.worktrees[&name].processes["dev"]
+            .phase
+            .clone();
+        let Phase::Failed { reason, .. } = &phase else {
+            panic!("expected a failure, got {phase:?}");
+        };
+        assert!(reason.starts_with("process exited"), "{reason}");
+        assert!(reason.contains("3000"), "the hint names the port: {reason}");
+        let again = refresh(&fx.paths).state.worktrees[&name].processes["dev"]
+            .phase
+            .clone();
+        let Phase::Failed { reason: again, .. } = &again else {
+            panic!("still failed: {again:?}");
+        };
+        assert_eq!(
+            again, reason,
+            "the hint is written once, not appended again on every read"
+        );
+    }
+
+    #[test]
+    fn refresh_reports_a_state_file_it_cannot_use_instead_of_failing() {
+        let fx = fixture();
+        fx.paths.ensure_home().unwrap();
+        std::fs::write(fx.paths.state_file(), "{ not json").unwrap();
+        let refreshed = refresh(&fx.paths);
+        assert!(refreshed.state.worktrees.is_empty());
+        let warning = refreshed.warning.expect("a broken state file is reported");
+        assert!(warning.contains("state"), "{warning}");
+        assert_eq!(
+            std::fs::read_to_string(fx.paths.state_file()).unwrap(),
+            "{ not json",
+            "and it is never overwritten"
+        );
+    }
+
+    #[test]
+    fn ownership_still_reads_through_refresh() {
+        let mut fx = fixture();
+        with_dev(&mut fx, dev("sleep 30"));
+        let name = worktree_named(&fx, "feat/one");
+        let worktrees = ls(&fx.paths).unwrap();
+        let owned = created_by_pando(&fx.paths, &worktrees);
+        assert_eq!(owned.by_name.get(&name), Some(&true));
+        assert!(owned.warning.is_none());
     }
 
     #[test]

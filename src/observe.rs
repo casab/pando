@@ -227,7 +227,7 @@ pub fn classify_failure(last_lines: &[String]) -> Option<Hint> {
                 cause: "port already in use",
                 hint: match port_in_text(&lower) {
                     Some(port) => format!(
-                        "something else is listening on port {port} — stop it, or `pando stop` \
+                        "something else is listening on port {port}; stop it, or `pando stop` \
                          the worktree that owns it"
                     ),
                     None => "something else is already listening on the port this process wanted"
@@ -238,7 +238,7 @@ pub fn classify_failure(last_lines: &[String]) -> Option<Hint> {
         if lower.contains("econnrefused") || lower.contains("connection refused") {
             return Some(Hint {
                 cause: "connection refused",
-                hint: "something the app connects to is not running — start it, or point the \
+                hint: "something the app connects to is not running; start it, or point the \
                        app at one that is"
                     .to_string(),
             });
@@ -251,7 +251,7 @@ pub fn classify_failure(last_lines: &[String]) -> Option<Hint> {
         {
             return Some(Hint {
                 cause: "native module built for another runtime",
-                hint: "a compiled dependency was built against a different runtime version — \
+                hint: "a compiled dependency was built against a different runtime version; \
                        reinstall it under the one this project uses"
                     .to_string(),
             });
@@ -263,7 +263,7 @@ pub fn classify_failure(last_lines: &[String]) -> Option<Hint> {
         {
             return Some(Hint {
                 cause: "a dependency is missing",
-                hint: "dependencies are missing or stale — the install step has not run here yet"
+                hint: "dependencies are missing or stale; the install step has not run here yet"
                     .to_string(),
             });
         }
