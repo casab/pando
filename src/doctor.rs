@@ -58,6 +58,9 @@ pub enum Section {
     Config,
     Runtime,
     Tools,
+    Worktrees,
+    Services,
+    Hooks,
 }
 
 impl Section {
@@ -67,17 +70,23 @@ impl Section {
             Section::Config => "config",
             Section::Runtime => "runtime",
             Section::Tools => "tools",
+            Section::Worktrees => "worktrees",
+            Section::Services => "services",
+            Section::Hooks => "hooks",
         }
     }
 
     /// Every section, in print order. Runtime is high, deliberately: a
     /// process started under the wrong toolchain dies of it, and what the
     /// shell pando uses resolves is the least guessable thing here.
-    const ALL: [Section; 4] = [
+    const ALL: [Section; 7] = [
         Section::Project,
         Section::Config,
         Section::Runtime,
         Section::Tools,
+        Section::Worktrees,
+        Section::Services,
+        Section::Hooks,
     ];
 }
 
@@ -138,6 +147,9 @@ pub struct Report {
     pub config: ConfigReport,
     pub runtime: RuntimeReport,
     pub tools: Vec<ToolReport>,
+    pub worktrees: Vec<WorktreeReport>,
+    pub services: ServicesReport,
+    pub hooks: Vec<HookReport>,
     pub findings: Vec<Finding>,
 }
 
@@ -263,6 +275,114 @@ pub struct ToolReport {
     pub found: bool,
 }
 
+/// One worktree, as git sees it and as pando's own records do.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorktreeReport {
+    pub name: String,
+    pub path: String,
+    /// `running`, `starting`, `failed`, or `stopped` when nothing is up.
+    pub phase: &'static str,
+    /// Whether pando created it, or adopted one that was already there.
+    /// `rm` asks before removing an adopted one.
+    pub created_by_pando: bool,
+    /// Whether this worktree runs private copies of the project's
+    /// services.
+    pub isolated: bool,
+    pub locked: bool,
+    pub prunable: bool,
+    pub prunable_reason: Option<String>,
+    /// Whether git still lists it. A record for a directory git has
+    /// forgotten is state pando is carrying for nothing.
+    pub known_to_git: bool,
+    pub processes: Vec<ProcessReport>,
+    pub services: Vec<WorktreeServiceReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcessReport {
+    pub name: String,
+    pub phase: &'static str,
+    /// Why it failed, as the record holds it — which already carries the
+    /// classifier's hint when there was one at the time.
+    pub reason: Option<String>,
+    /// What the tail of its log says now, when the record's reason does
+    /// not already say it.
+    pub hint: Option<String>,
+    pub log: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorktreeServiceReport {
+    pub name: String,
+    pub port: Option<u16>,
+    /// Whether something answers on that port right now.
+    pub up: bool,
+    /// Whether a log pump is still filling this service's log.
+    pub logging: bool,
+    /// Whether the config still includes it. A record config has dropped
+    /// still owns a container and a volume.
+    pub declared: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ServicesReport {
+    pub compose: Vec<ComposeEntryReport>,
+    /// `[[services]] kind = "native"` blocks. They parse, they validate,
+    /// and this build has no runner for them.
+    pub native: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ComposeEntryReport {
+    pub file: String,
+    pub file_exists: bool,
+    pub services: Vec<IncludedService>,
+    /// Services carrying `extends:`, whose real definition is in a file
+    /// this reader does not follow.
+    pub extends: Vec<String>,
+    /// Whether the file has a top-level `include:`, which brings in
+    /// services this list does not have.
+    pub include: bool,
+    /// Why the file could not be read, when it could not.
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IncludedService {
+    pub name: String,
+    /// `healthcheck` when the compose entry declares one, else `connect`
+    /// — the weaker probe, which only proves something is behind the port.
+    pub ready: &'static str,
+    /// Whether the compose file declares it at all.
+    pub declared: bool,
+    /// The environment key the app reads to find it, when one is mapped.
+    pub env_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HookReport {
+    pub name: String,
+    /// `create`, `install`, `services`, or `dev`.
+    pub after: &'static str,
+    pub cmd: String,
+    /// The globs whose content decides whether it has to run again.
+    pub fingerprint: Vec<String>,
+    /// How many files those globs match in the main checkout. `null` when
+    /// the hook is keyed on nothing, which means it runs every start by
+    /// design.
+    pub matches: Option<usize>,
+    /// Where it has run, and whether its inputs have changed since.
+    pub runs: Vec<HookRunReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HookRunReport {
+    pub worktree: String,
+    pub ran_at: chrono::DateTime<chrono::Utc>,
+    /// Whether the next start will run it again.
+    pub will_run_again: bool,
+}
+
 impl Report {
     /// Whether nothing found will break a command. The exit code, and the
     /// only thing that decides it.
@@ -294,6 +414,9 @@ impl Report {
                 Section::Config => render_config(&mut out, &self.config),
                 Section::Runtime => render_runtime(&mut out, &self.runtime),
                 Section::Tools => render_tools(&mut out, &self.tools),
+                Section::Worktrees => render_worktrees(&mut out, &self.worktrees),
+                Section::Services => render_services(&mut out, &self.services),
+                Section::Hooks => render_hooks(&mut out, &self.hooks),
             }
             for finding in self.of(section) {
                 render_finding(&mut out, finding);
@@ -498,6 +621,9 @@ fn render_tools(out: &mut String, tools: &[ToolReport]) {
         + 2;
     for tool in tools {
         let mut text = match (&tool.version, &tool.path) {
+            // `command -v` prints a bare word for a shell builtin, which
+            // is not a path and is not a version to ask for either.
+            (_, Some(path)) if !path.starts_with('/') => format!("a shell builtin ({path})"),
             (Some(version), Some(path)) => format!("{version}  ({path})"),
             (None, Some(path)) => format!("found, and said nothing  ({path})"),
             _ => format!("not found — {}", tool.needed_for),
@@ -506,6 +632,164 @@ fn render_tools(out: &mut String, tools: &[ToolReport]) {
             text.push_str(&format!("  {detail}"));
         }
         let _ = writeln!(out, "  {:<width$}{text}", tool.name);
+    }
+}
+
+fn render_worktrees(out: &mut String, worktrees: &[WorktreeReport]) {
+    if worktrees.is_empty() {
+        row(out, "", "none — `pando new <branch>` makes one");
+        return;
+    }
+    for worktree in worktrees {
+        let mut flags: Vec<&str> = vec![match worktree.created_by_pando {
+            true => "pando-created",
+            false => "adopted",
+        }];
+        if worktree.isolated {
+            flags.push("isolated");
+        }
+        if worktree.locked {
+            flags.push("locked");
+        }
+        if worktree.prunable {
+            flags.push("prunable");
+        }
+        if !worktree.known_to_git {
+            flags.push("git does not list it");
+        }
+        row(
+            out,
+            &worktree.name,
+            &format!("{}  [{}]", worktree.phase, flags.join(", ")),
+        );
+        row(out, "", &worktree.path);
+        for process in &worktree.processes {
+            row(
+                out,
+                "",
+                &match &process.reason {
+                    Some(reason) => format!("{}: {} — {reason}", process.name, process.phase),
+                    None => format!("{}: {}", process.name, process.phase),
+                },
+            );
+        }
+        for service in &worktree.services {
+            let port = match service.port {
+                Some(port) => port.to_string(),
+                None => "no port".to_string(),
+            };
+            let up = match service.up {
+                true => "answering",
+                false => "not answering",
+            };
+            let pump = match service.logging {
+                true => "",
+                false => ", no log pump",
+            };
+            let dropped = match service.declared {
+                true => "",
+                false => ", config no longer includes it",
+            };
+            row(
+                out,
+                "",
+                &format!("{}: {port}, {up}{pump}{dropped}", service.name),
+            );
+        }
+    }
+}
+
+fn render_services(out: &mut String, services: &ServicesReport) {
+    if services.compose.is_empty() && services.native.is_empty() {
+        row(out, "", "none configured");
+        return;
+    }
+    for entry in &services.compose {
+        row(
+            out,
+            "compose",
+            &match (&entry.error, entry.file_exists) {
+                (Some(e), _) => format!("{} — {e}", entry.file),
+                (None, false) => format!("{} — not in this repository", entry.file),
+                (None, true) => entry.file.clone(),
+            },
+        );
+        for service in &entry.services {
+            let env = match &service.env_key {
+                Some(key) => format!(", addressed by {key}"),
+                None => ", nothing in the env example points at it".to_string(),
+            };
+            row(
+                out,
+                "",
+                &match service.declared {
+                    true => format!("{}: ready by {}{env}", service.name, service.ready),
+                    false => format!("{}: this compose file does not declare it", service.name),
+                },
+            );
+        }
+        if !entry.extends.is_empty() {
+            row(
+                out,
+                "",
+                &format!("`extends:` on {} — not followed", entry.extends.join(", ")),
+            );
+        }
+        if entry.include {
+            row(out, "", "a top-level `include:` — not followed");
+        }
+    }
+    for native in &services.native {
+        row(
+            out,
+            "native",
+            &format!("{native} — this build has no runner for it"),
+        );
+    }
+}
+
+fn render_hooks(out: &mut String, hooks: &[HookReport]) {
+    if hooks.is_empty() {
+        row(out, "", "none configured");
+        return;
+    }
+    for hook in hooks {
+        row(
+            out,
+            &hook.name,
+            &format!("after {}: {}", hook.after, hook.cmd),
+        );
+        row(
+            out,
+            "",
+            &match (&hook.matches, hook.fingerprint.is_empty()) {
+                (_, true) => "keyed on nothing, so it runs on every start".to_string(),
+                (Some(0) | None, false) => format!(
+                    "keyed on {}, which matches nothing here",
+                    hook.fingerprint.join(", ")
+                ),
+                (Some(n), false) => format!(
+                    "keyed on {}, matching {n} {}",
+                    hook.fingerprint.join(", "),
+                    plural(*n, "file")
+                ),
+            },
+        );
+        for run in &hook.runs {
+            row(
+                out,
+                "",
+                &format!(
+                    "{}: ran {}{}",
+                    run.worktree,
+                    run.ran_at.format("%Y-%m-%d %H:%M"),
+                    match run.will_run_again {
+                        true => ", and will run again — its inputs changed",
+                        false => "",
+                    }
+                ),
+            );
+        }
     }
 }
 
@@ -559,14 +843,445 @@ pub fn run_on(paths: &PandoPaths, machine: &Machine<'_>) -> Report {
     let project = project_report(paths, &config, &mut findings);
     let runtime = runtime_report(paths, &config, machine, &mut findings);
     let tools = tools_report(paths, &config, machine, &mut findings);
+    let worktrees = worktrees_report(paths, &config, &mut findings);
+    let services = services_report(paths, &config, &mut findings);
+    let hooks = hooks_report(paths, &config, &worktrees, &mut findings);
 
     Report {
         project,
         config: config_report,
         runtime,
         tools,
+        worktrees,
+        services,
+        hooks,
         findings,
     }
+}
+
+// ---- worktrees ------------------------------------------------------------
+
+/// How many log lines the failure classifier reads. The same budget the
+/// read path uses.
+const FAILURE_TAIL_LINES: usize = 40;
+
+fn worktrees_report(
+    paths: &PandoPaths,
+    config: &Config,
+    findings: &mut Vec<Finding>,
+) -> Vec<WorktreeReport> {
+    // `inspect`, never `refresh`: the read path every other command uses
+    // takes the lock, saves, and signals the surviving half of a dead
+    // share. doctor reports.
+    let view = actions::inspect(paths);
+    if let Some(warning) = &view.warning {
+        findings.push(Finding::problem(
+            Section::Worktrees,
+            format!("pando's state file cannot be used: {warning}"),
+            "move it aside to start over — worktrees pando created will then read as adopted",
+        ));
+    }
+    let listed = crate::worktree::discover(&paths.project).unwrap_or_default();
+    let declared = declared_services(config);
+
+    let mut out = Vec::new();
+    for (name, record) in &view.state.worktrees {
+        let git = listed.iter().find(|w| &w.name == name);
+        let phase = state::aggregate_phase(record);
+        let mut processes = Vec::new();
+        for (process, p) in &record.processes {
+            let reason = match &p.phase {
+                state::Phase::Failed { reason, .. } => Some(reason.clone()),
+                _ => None,
+            };
+            let hint = failure_hint(&p.log_path, reason.as_deref());
+            if let Some(reason) = &reason {
+                let tail = format!("`pando logs {name} --source {process}` has the last of it");
+                findings.push(Finding::problem(
+                    Section::Worktrees,
+                    format!("{name}: the process {process:?} failed — {reason}"),
+                    match &hint {
+                        Some(hint) => format!("{hint}\n{tail}"),
+                        None => format!("{tail}; `pando start {name}` tries again"),
+                    },
+                ));
+            }
+            processes.push(ProcessReport {
+                name: process.clone(),
+                phase: match p.phase {
+                    state::Phase::Starting { .. } => "starting",
+                    state::Phase::Running { .. } => "running",
+                    state::Phase::Failed { .. } => "failed",
+                },
+                reason,
+                hint,
+                log: p.log_path.display().to_string(),
+            });
+        }
+
+        let mut services = Vec::new();
+        for status in actions::service_statuses(record) {
+            let is_declared = declared.contains(&status.name);
+            if status.up && !status.logging {
+                findings.push(
+                    Finding::note(
+                        Section::Worktrees,
+                        format!(
+                            "{name}: the service {:?} is up and nothing is filling its log — \
+                             its log pump died",
+                            status.name
+                        ),
+                    )
+                    .with_fix(format!(
+                        "`pando start {name}` puts it back; a read path never respawns one"
+                    )),
+                );
+            }
+            if !is_declared {
+                findings.push(
+                    Finding::note(
+                        Section::Worktrees,
+                        format!(
+                            "{name}: pando still has a record for the service {:?}, which this \
+                             project's config no longer includes — its container and its volume \
+                             are still there",
+                            status.name
+                        ),
+                    )
+                    .with_fix(format!(
+                        "`pando rm {name}` takes them down with the worktree, or `pando start \
+                         {name} --shared` stops them and leaves the data"
+                    )),
+                );
+            }
+            services.push(WorktreeServiceReport {
+                name: status.name,
+                port: status.port,
+                up: status.up,
+                logging: status.logging,
+                declared: is_declared,
+            });
+        }
+
+        match git {
+            None => findings.push(
+                Finding::note(
+                    Section::Worktrees,
+                    format!(
+                        "{name}: pando has a record for it and git does not list it — the \
+                         directory is gone, or `git worktree prune` has been run"
+                    ),
+                )
+                .with_fix(format!("`pando rm {name}` forgets it")),
+            ),
+            Some(git) => {
+                if git.prunable {
+                    findings.push(
+                        Finding::note(
+                            Section::Worktrees,
+                            format!(
+                                "{name}: git calls this worktree prunable{}",
+                                match &git.prunable_reason {
+                                    Some(reason) => format!(" — {reason}"),
+                                    None => String::new(),
+                                }
+                            ),
+                        )
+                        .with_fix(format!("`pando rm {name}`, or `git worktree prune`")),
+                    );
+                }
+                if git.locked {
+                    findings.push(
+                        Finding::note(
+                            Section::Worktrees,
+                            format!(
+                                "{name}: git has this worktree locked, so `pando rm` refuses it"
+                            ),
+                        )
+                        .with_fix(format!("`git worktree unlock {}`", git.path.display())),
+                    );
+                }
+            }
+        }
+        if let Some(share) = &record.share {
+            let tunnel = proc::is_alive(share.tunnel_pid);
+            let proxy = share.proxy_pid.map(proc::is_alive).unwrap_or(true);
+            if !tunnel || !proxy {
+                findings.push(
+                    Finding::note(
+                        Section::Worktrees,
+                        format!(
+                            "{name}: half of its share is gone — {} is not running, and {} is \
+                             still published",
+                            if tunnel { "the proxy" } else { "the tunnel" },
+                            share.public_url
+                        ),
+                    )
+                    .with_fix(format!("`pando unshare {name}` takes the rest of it down")),
+                );
+            }
+        }
+
+        out.push(WorktreeReport {
+            name: name.clone(),
+            path: record.path.display().to_string(),
+            phase: phase
+                .as_ref()
+                .map(state::Aggregate::word)
+                .unwrap_or("stopped"),
+            created_by_pando: record.created_by_pando,
+            isolated: record.isolated,
+            locked: git.is_some_and(|g| g.locked),
+            prunable: git.is_some_and(|g| g.prunable),
+            prunable_reason: git.and_then(|g| g.prunable_reason.clone()),
+            known_to_git: git.is_some(),
+            processes,
+            services,
+        });
+    }
+    // A worktree git lists that pando has no record of is not reported
+    // here: `pando ls` shows those, and this section is about what pando
+    // is carrying.
+    out
+}
+
+/// What the tail of a failed process's log says now, when the record's own
+/// reason does not already say it.
+///
+/// The reason usually carries the hint already — the read path writes it in
+/// when the failure is first seen. A record whose log only became
+/// explanatory afterwards has nothing, and that is the case worth reading
+/// the file for.
+fn failure_hint(log: &Path, reason: Option<&str>) -> Option<String> {
+    let reason = reason?;
+    let lines = crate::log_tail::snapshot(log, FAILURE_TAIL_LINES).unwrap_or_default();
+    let hint = crate::observe::classify_failure(&lines)?;
+    (!reason.contains(&hint.hint)).then_some(hint.hint)
+}
+
+/// Every service name the config declares, whatever kind it is.
+fn declared_services(config: &Config) -> Vec<String> {
+    config
+        .services
+        .iter()
+        .flat_map(|service| match service {
+            ServiceConfig::Compose { include, .. } => include.clone(),
+            ServiceConfig::Native { name, .. } => vec![name.clone()],
+        })
+        .collect()
+}
+
+// ---- services -------------------------------------------------------------
+
+fn services_report(
+    paths: &PandoPaths,
+    config: &Config,
+    findings: &mut Vec<Finding>,
+) -> ServicesReport {
+    let mut compose = Vec::new();
+    let mut native = Vec::new();
+    for service in &config.services {
+        let ServiceConfig::Compose {
+            file, include, env, ..
+        } = service
+        else {
+            if let ServiceConfig::Native { name, .. } = service {
+                // `load` already warns about this one, and the warning is
+                // in the config section. Listed here as a fact, so the
+                // services section is not silent about a block that
+                // configures one.
+                native.push(name.clone());
+            }
+            continue;
+        };
+        let path = paths.root().join(file);
+        let parsed = path.is_file().then(|| crate::compose::read(&path));
+        if parsed.is_none() {
+            findings.push(Finding::problem(
+                Section::Services,
+                format!(
+                    "the compose file {file:?} is not in this repository — `start --isolated` \
+                     has nothing to bring up"
+                ),
+                "point `[[services]] file` at a file that is there, or drop the entry",
+            ));
+        }
+        let read = match &parsed {
+            Some(Ok(read)) => Some(read),
+            Some(Err(e)) => {
+                findings.push(Finding::problem(
+                    Section::Services,
+                    format!("the compose file {file:?} could not be read: {e:#}"),
+                    "fix the file, or drop the `[[services]]` entry that names it",
+                ));
+                None
+            }
+            None => None,
+        };
+        let mut services = Vec::new();
+        for name in include {
+            let declared = read.is_some_and(|r| r.services.contains_key(name));
+            let healthcheck = read
+                .and_then(|r| r.services.get(name))
+                .is_some_and(|s| s.healthcheck);
+            if read.is_some() && !declared {
+                findings.push(Finding::problem(
+                    Section::Services,
+                    format!(
+                        "`include` names the service {name:?}, which {file} does not declare — \
+                         `start --isolated` would fail"
+                    ),
+                    format!("drop {name:?} from `include`, or add it to {file}"),
+                ));
+            }
+            if declared && !healthcheck {
+                findings.push(
+                    Finding::note(
+                        Section::Services,
+                        format!(
+                            "the service {name:?} declares no healthcheck, so readiness is a \
+                             connect that only proves something is behind the port — a database \
+                             still initialising can pass it"
+                        ),
+                    )
+                    .with_fix(format!("add a `healthcheck:` to {name} in {file}")),
+                );
+            }
+            services.push(IncludedService {
+                name: name.clone(),
+                ready: if healthcheck {
+                    "healthcheck"
+                } else {
+                    "connect"
+                },
+                declared,
+                env_key: env
+                    .iter()
+                    .find(|(_, service)| *service == name)
+                    .map(|(key, _)| key.clone()),
+            });
+        }
+        let unresolved = read.map(|r| r.unresolved.clone()).unwrap_or_default();
+        if let Some(described) = unresolved.describe() {
+            findings.push(
+                Finding::note(
+                    Section::Services,
+                    format!(
+                        "{file} carries {described}, which pando's own reader does not follow — \
+                         the ports and volumes it read may not be the ones compose would use"
+                    ),
+                )
+                .with_fix(
+                    "with Docker installed pando asks `docker compose config`, which resolves \
+                     them; without it, inline what the key brings in",
+                ),
+            );
+        }
+        compose.push(ComposeEntryReport {
+            file: file.clone(),
+            file_exists: parsed.is_some(),
+            services,
+            extends: unresolved.extends.clone(),
+            include: unresolved.include,
+            error: match &parsed {
+                Some(Err(e)) => Some(format!("{e:#}")),
+                _ => None,
+            },
+        });
+    }
+    ServicesReport { compose, native }
+}
+
+// ---- hooks ----------------------------------------------------------------
+
+fn hooks_report(
+    paths: &PandoPaths,
+    config: &Config,
+    worktrees: &[WorktreeReport],
+    findings: &mut Vec<Finding>,
+) -> Vec<HookReport> {
+    schema_slot_finding(paths, config, findings);
+    let view = actions::inspect(paths);
+    let mut out = Vec::new();
+    for hook in &config.hooks {
+        let matches = (!hook.fingerprint.is_empty())
+            .then(|| crate::hooks::matched(paths.root(), &hook.fingerprint).len());
+        if matches == Some(0) {
+            findings.push(
+                Finding::note(
+                    Section::Hooks,
+                    // The sentence a start prints while it happens, so the
+                    // two cannot drift apart.
+                    actions::matched_nothing(paths.root(), hook)
+                        .trim_start_matches("warning: ")
+                        .to_string(),
+                )
+                .with_fix("key it on the files it really depends on, or leave `fingerprint` out"),
+            );
+        }
+        let mut runs = Vec::new();
+        for worktree in worktrees {
+            let Some(record) = view.state.worktrees.get(&worktree.name) else {
+                continue;
+            };
+            let Some(run) = record.hooks.get(&hook.name) else {
+                continue;
+            };
+            let current = crate::hooks::fingerprint(&record.path, &hook.fingerprint, &hook.cmd);
+            runs.push(HookRunReport {
+                worktree: worktree.name.clone(),
+                ran_at: run.ran_at,
+                will_run_again: current.is_none() || current != run.fingerprint,
+            });
+        }
+        out.push(HookReport {
+            name: hook.name.clone(),
+            after: match hook.after {
+                config::HookPoint::Create => "create",
+                config::HookPoint::Install => "install",
+                config::HookPoint::Services => "services",
+                config::HookPoint::Dev => "dev",
+            },
+            cmd: hook.cmd.clone(),
+            fingerprint: hook.fingerprint.clone(),
+            matches,
+            runs,
+        });
+    }
+    out
+}
+
+/// The schema question has no way to record "this project has no schema
+/// step", so an undecided one comes back on every start.
+///
+/// Reported, not fixed: giving the slot an empty form is the same piece of
+/// design the services and provision slots each had done for them, and it
+/// belongs to whoever owns that question rather than to the command that
+/// noticed it.
+fn schema_slot_finding(paths: &PandoPaths, config: &Config, findings: &mut Vec<Finding>) {
+    if actions::already_answered(detect::Slot::SchemaHook, config) {
+        return;
+    }
+    let signals = detect::signals(paths.root());
+    let undecided = detect::propose(paths.root(), &signals)
+        .into_iter()
+        .any(|p| p.slot == detect::Slot::SchemaHook && !p.decided && !p.candidates.is_empty());
+    if !undecided {
+        return;
+    }
+    findings.push(
+        Finding::note(
+            Section::Hooks,
+            "pando has a question about the schema step that its rules cannot settle, and no \
+             way to record \"this project has none\" — so it comes back on every start until a \
+             hook is written down"
+                .to_string(),
+        )
+        .with_fix(
+            "answer it once with `pando init`, or write a `[[hooks]]` entry by hand — one whose \
+             `cmd` is `true` is the shape that means \"nothing to do\"",
+        ),
+    );
 }
 
 // ---- runtime --------------------------------------------------------------
@@ -1509,6 +2224,10 @@ mod tests {
         }
     }
 
+    fn write_compose(fx: &Fx, body: &str) {
+        std::fs::write(fx.root.join("docker-compose.yml"), body).expect("write compose");
+    }
+
     fn write_project_config(fx: &Fx, body: &str) {
         let path = fx.paths.config_file();
         std::fs::create_dir_all(path.parent().expect("project dir")).expect("mkdir");
@@ -1862,6 +2581,11 @@ mod tests {
     #[test]
     fn a_placeholder_naming_a_service_resolves_because_a_service_is_a_role_too() {
         let fx = fixture();
+        write_compose(
+            &fx,
+            "services:\n  postgres:\n    image: postgres:16\n    healthcheck:\n      \
+             test: [\"CMD\", \"true\"]\n",
+        );
         write_project_config(
             &fx,
             "[processes.web]\ncmd = \"serve\"\nports = [\"web\"]\n\
@@ -2230,6 +2954,341 @@ mod tests {
             "{}",
             report.render()
         );
+    }
+
+    // ---- services ---------------------------------------------------
+
+    fn services_config(include: &str) -> String {
+        format!(
+            "[[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\ninclude = [{include}]\n"
+        )
+    }
+
+    #[test]
+    fn a_service_without_a_healthcheck_is_flagged_as_connect_probed() {
+        let fx = fixture();
+        write_compose(
+            &fx,
+            "services:\n  postgres:\n    image: postgres:16\n  redis:\n    image: redis:7\n    \
+             healthcheck:\n      test: [\"CMD\", \"redis-cli\", \"ping\"]\n",
+        );
+        write_project_config(&fx, &services_config("\"postgres\", \"redis\""));
+        let report = report(&fx);
+        let entry = &report.services.compose[0];
+        let postgres = entry
+            .services
+            .iter()
+            .find(|s| s.name == "postgres")
+            .unwrap();
+        let redis = entry.services.iter().find(|s| s.name == "redis").unwrap();
+        assert_eq!(postgres.ready, "connect");
+        assert_eq!(redis.ready, "healthcheck");
+        assert!(
+            mentions(&report, "\"postgres\" declares no healthcheck"),
+            "{:?}",
+            messages(&report)
+        );
+        assert!(
+            !mentions(&report, "\"redis\" declares no healthcheck"),
+            "{:?}",
+            messages(&report)
+        );
+        // A weaker probe is a note: it works, it is just less sure.
+        assert!(report.healthy(), "{:?}", report.findings);
+        assert!(
+            report.render().contains("ready by connect"),
+            "{}",
+            report.render()
+        );
+    }
+
+    #[test]
+    fn a_compose_file_pando_could_not_follow_whole_says_which_key_stopped_it() {
+        let fx = fixture();
+        write_compose(
+            &fx,
+            "include:\n  - ./other.yml\nservices:\n  db:\n    extends:\n      file: base.yml\n      \
+             service: db\n",
+        );
+        write_project_config(&fx, &services_config("\"db\""));
+        let report = report(&fx);
+        let entry = &report.services.compose[0];
+        assert_eq!(entry.extends, vec!["db".to_string()]);
+        assert!(entry.include);
+        assert!(mentions(&report, "`extends:`"), "{:?}", messages(&report));
+        assert!(
+            mentions(&report, "top-level `include:`"),
+            "{:?}",
+            messages(&report)
+        );
+        assert!(
+            mentions(&report, "does not follow"),
+            "{:?}",
+            messages(&report)
+        );
+        // Reported, not fixed.
+        assert!(report.healthy(), "{:?}", report.findings);
+    }
+
+    #[test]
+    fn a_compose_file_that_is_not_there_is_a_problem() {
+        let fx = fixture();
+        write_project_config(&fx, &services_config("\"postgres\""));
+        let report = report(&fx);
+        assert!(!report.healthy());
+        assert!(
+            mentions(&report, "is not in this repository"),
+            "{:?}",
+            messages(&report)
+        );
+        assert!(!report.services.compose[0].file_exists);
+    }
+
+    #[test]
+    fn a_service_the_compose_file_does_not_declare_is_a_problem() {
+        let fx = fixture();
+        write_compose(&fx, "services:\n  postgres:\n    image: postgres:16\n");
+        write_project_config(&fx, &services_config("\"postgres\", \"mysql\""));
+        let report = report(&fx);
+        assert!(!report.healthy());
+        assert!(
+            mentions(&report, "`include` names the service \"mysql\""),
+            "{:?}",
+            messages(&report)
+        );
+    }
+
+    #[test]
+    fn a_native_service_block_is_listed_even_though_nothing_runs_it() {
+        let fx = fixture();
+        write_project_config(
+            &fx,
+            "[[services]]\nkind = \"native\"\nname = \"postgres\"\n",
+        );
+        let report = report(&fx);
+        assert_eq!(report.services.native, vec!["postgres".to_string()]);
+        assert!(
+            report.render().contains("this build has no runner for it"),
+            "{}",
+            report.render()
+        );
+        // The load warning in the config section is where it is reported;
+        // the services section is where a reader looks for it.
+        assert!(
+            mentions(&report, "kind = \"native\""),
+            "{:?}",
+            messages(&report)
+        );
+    }
+
+    // ---- hooks ------------------------------------------------------
+
+    #[test]
+    fn a_hook_whose_globs_match_nothing_is_flagged_as_running_every_start() {
+        let fx = fixture();
+        std::fs::create_dir_all(fx.root.join("prisma/migrations")).expect("migrations dir");
+        write_project_config(
+            &fx,
+            "[[hooks]]\nname = \"migrate\"\nafter = \"services\"\n\
+             fingerprint = [\"prisma/migrations\"]\ncmd = \"true\"\n",
+        );
+        let report = report(&fx);
+        assert_eq!(report.hooks[0].matches, Some(0));
+        assert!(
+            mentions(&report, "matches nothing in this worktree"),
+            "{:?}",
+            messages(&report)
+        );
+        // The shape of the mistake, named: a glob matches files.
+        assert!(
+            mentions(&report, "prisma/migrations/**"),
+            "{:?}",
+            messages(&report)
+        );
+        assert!(report.healthy(), "{:?}", report.findings);
+    }
+
+    #[test]
+    fn a_hook_keyed_on_files_that_are_there_counts_them_and_says_nothing() {
+        let fx = fixture();
+        std::fs::create_dir_all(fx.root.join("prisma/migrations")).expect("migrations dir");
+        std::fs::write(fx.root.join("prisma/migrations/001.sql"), "select 1;\n").expect("sql");
+        write_project_config(
+            &fx,
+            "[[hooks]]\nname = \"migrate\"\nafter = \"services\"\n\
+             fingerprint = [\"prisma/migrations/**\"]\ncmd = \"true\"\n",
+        );
+        let report = report(&fx);
+        assert_eq!(report.hooks[0].matches, Some(1));
+        assert_eq!(report.hooks[0].after, "services");
+        assert!(report.healthy(), "{:?}", report.findings);
+        assert!(
+            report.render().contains("matching 1 file"),
+            "{}",
+            report.render()
+        );
+    }
+
+    #[test]
+    fn a_hook_with_no_fingerprint_at_all_is_a_fact_and_not_a_finding() {
+        let fx = fixture();
+        write_project_config(
+            &fx,
+            "[[hooks]]\nname = \"seed\"\nafter = \"dev\"\ncmd = \"true\"\n",
+        );
+        let report = report(&fx);
+        assert_eq!(report.hooks[0].matches, None);
+        assert!(report.healthy(), "{:?}", report.findings);
+        assert!(
+            report
+                .render()
+                .contains("keyed on nothing, so it runs on every start"),
+            "{}",
+            report.render()
+        );
+    }
+
+    #[test]
+    fn the_schema_question_with_no_way_to_say_no_is_reported_once() {
+        let fx = fixture();
+        // Two candidates and nothing to choose between them is what makes
+        // the slot undecided, and it has no empty form to record.
+        std::fs::write(
+            fx.root.join("package.json"),
+            "{\"scripts\": {\"migrate\": \"x\", \"db:migrate\": \"y\"}}\n",
+        )
+        .expect("manifest");
+        std::fs::create_dir_all(fx.root.join("prisma")).expect("prisma");
+        std::fs::write(fx.root.join("prisma/schema.prisma"), "// schema\n").expect("schema");
+        let report = report(&fx);
+        let hits = messages(&report)
+            .iter()
+            .filter(|m| m.contains("no way to record"))
+            .count();
+        assert!(hits <= 1, "said at most once: {:?}", messages(&report));
+    }
+
+    // ---- worktrees --------------------------------------------------
+
+    /// A state file, written through the real types: doctor reads state
+    /// and never writes it, so a fixture may — and building it from
+    /// `state::State` means a field that moves breaks here loudly instead
+    /// of parsing into nothing.
+    fn write_state(fx: &Fx, store: &state::State) {
+        let path = fx.paths.state_file();
+        std::fs::create_dir_all(path.parent().expect("project dir")).expect("mkdir");
+        state::save(&path, store).expect("write state");
+    }
+
+    fn one_worktree(name: &str, record: state::WorktreeRecord) -> state::State {
+        let mut store = state::State::new();
+        store.worktrees.insert(name.to_string(), record);
+        store
+    }
+
+    #[test]
+    fn a_worktree_pando_has_a_record_for_that_git_has_forgotten_is_reported() {
+        let fx = fixture();
+        write_state(
+            &fx,
+            &one_worktree(
+                "feat+one",
+                state::WorktreeRecord::new(fx.root.join("gone"), true),
+            ),
+        );
+        let report = report(&fx);
+        assert_eq!(report.worktrees.len(), 1);
+        assert_eq!(report.worktrees[0].phase, "stopped");
+        assert!(report.worktrees[0].created_by_pando);
+        assert!(!report.worktrees[0].known_to_git);
+        assert!(
+            mentions(&report, "git does not list it"),
+            "{:?}",
+            messages(&report)
+        );
+        assert!(report.healthy(), "{:?}", report.findings);
+    }
+
+    #[test]
+    fn a_failed_process_is_a_problem_carrying_its_reason_and_a_hint_from_the_log() {
+        let fx = fixture();
+        let log = fx.paths.log_file("feat+one", "dev");
+        std::fs::create_dir_all(log.parent().expect("logs dir")).expect("mkdir");
+        std::fs::write(&log, "listen EADDRINUSE: address already in use :::17342\n")
+            .expect("write log");
+        let mut record = state::WorktreeRecord::new(&fx.root, true);
+        record.processes.insert(
+            "dev".to_string(),
+            state::ProcessRecord {
+                pid: 999_999,
+                pgid: 999_999,
+                started_at: chrono::Utc::now(),
+                log_path: log.clone(),
+                ready_port: None,
+                ready_timeout_s: None,
+                observed_ports: Vec::new(),
+                swept: false,
+                phase: state::Phase::Failed {
+                    at: chrono::Utc::now(),
+                    reason: "process exited".to_string(),
+                },
+            },
+        );
+        write_state(&fx, &one_worktree("feat+one", record));
+        let report = report(&fx);
+        assert!(!report.healthy(), "{:?}", report.findings);
+        assert_eq!(report.worktrees[0].phase, "failed");
+        assert!(
+            mentions(&report, "the process \"dev\" failed — process exited"),
+            "{:?}",
+            messages(&report)
+        );
+        let fix = report
+            .findings
+            .iter()
+            .find(|f| f.section == Section::Worktrees && f.severity == Severity::Problem)
+            .and_then(|f| f.fix.clone())
+            .unwrap_or_default();
+        assert!(fix.contains("17342"), "the classifier's hint: {fix}");
+        assert!(fix.contains("pando logs feat+one --source dev"), "{fix}");
+    }
+
+    #[test]
+    fn a_service_record_the_config_no_longer_includes_is_reported_with_its_volume() {
+        let fx = fixture();
+        write_compose(&fx, "services:\n  postgres:\n    image: postgres:16\n");
+        write_project_config(&fx, &services_config("\"postgres\""));
+        let mut record = state::WorktreeRecord::new(&fx.root, true);
+        record.isolated = true;
+        for (name, port) in [("postgres", 17_001u16), ("mailpit", 17_002)] {
+            record.services.push(state::ServiceRecord {
+                name: name.to_string(),
+                kind: state::ServiceKind::Compose,
+                port: Some(port),
+                pid: None,
+                pgid: None,
+                compose_project: None,
+            });
+        }
+        write_state(&fx, &one_worktree("feat+one", record));
+        let report = report(&fx);
+        let mailpit = report.worktrees[0]
+            .services
+            .iter()
+            .find(|s| s.name == "mailpit")
+            .expect("the dropped service");
+        assert!(!mailpit.declared);
+        assert!(
+            mentions(&report, "still has a record for the service \"mailpit\""),
+            "{:?}",
+            messages(&report)
+        );
+        assert!(
+            !mentions(&report, "record for the service \"postgres\""),
+            "the one config still includes is not news: {:?}",
+            messages(&report)
+        );
+        assert!(report.healthy(), "{:?}", report.findings);
     }
 
     #[test]

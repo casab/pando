@@ -55,26 +55,10 @@ pub enum HookOutcome {
 /// corrected in `pando.toml` never ran, since the migrations it watches
 /// had not changed.
 pub fn fingerprint(worktree: &Path, globs: &[String], cmd: &str) -> Option<String> {
-    if globs.is_empty() {
-        return None;
-    }
-    let mut matched: Vec<PathBuf> = Vec::new();
-    for glob in globs {
-        if is_literal(glob) {
-            // The common case by far, and it needs no walk at all.
-            let path = worktree.join(glob);
-            if path.is_file() {
-                matched.push(PathBuf::from(glob));
-            }
-        } else {
-            collect(worktree, Path::new(""), glob, 0, &mut matched);
-        }
-    }
+    let matched = matched(worktree, globs);
     if matched.is_empty() {
         return None;
     }
-    matched.sort();
-    matched.dedup();
     let mut context = md5::Context::new();
     for relative in &matched {
         // The path is hashed too: a file renamed is a change, even when the
@@ -92,6 +76,33 @@ pub fn fingerprint(worktree: &Path, globs: &[String], cmd: &str) -> Option<Strin
     context.consume(cmd.as_bytes());
     context.consume([0]);
     Some(format!("md5:{:x}", context.finalize()))
+}
+
+/// The files a hook's globs match, relative to the worktree, sorted and
+/// deduplicated.
+///
+/// Split out of [`fingerprint`] because `doctor` reports *what* a hook is
+/// keyed on as well as whether the hash would change, and a hook keyed on
+/// nothing runs on every start.
+pub fn matched(worktree: &Path, globs: &[String]) -> Vec<PathBuf> {
+    if globs.is_empty() {
+        return Vec::new();
+    }
+    let mut matched: Vec<PathBuf> = Vec::new();
+    for glob in globs {
+        if is_literal(glob) {
+            // The common case by far, and it needs no walk at all.
+            let path = worktree.join(glob);
+            if path.is_file() {
+                matched.push(PathBuf::from(glob));
+            }
+        } else {
+            collect(worktree, Path::new(""), glob, 0, &mut matched);
+        }
+    }
+    matched.sort();
+    matched.dedup();
+    matched
 }
 
 fn is_literal(glob: &str) -> bool {

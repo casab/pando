@@ -534,7 +534,10 @@ fn declares_hook(path: &Path, name: &str) -> bool {
 }
 
 /// One notice for a hook whose globs match nothing at all.
-fn matched_nothing(worktree: &Path, hook: &config::HookConfig) -> String {
+///
+/// Public because `doctor` reports the same thing at rest that a start
+/// says while it happens, and two spellings of it would drift.
+pub fn matched_nothing(worktree: &Path, hook: &config::HookConfig) -> String {
     let globs: Vec<String> = hook
         .fingerprint
         .iter()
@@ -4420,6 +4423,37 @@ pub fn refresh(paths: &PandoPaths) -> Refreshed {
         state: store,
         warning: None,
         notices,
+    }
+}
+
+/// State as of right now, with nothing written and nothing signalled.
+///
+/// [`refresh`] is the read path every other command uses, and it takes the
+/// lock, advances phases, sweeps a half-dead share — which *signals* the
+/// surviving half — and saves. `doctor` may do none of those: it reports.
+/// So this is the same advance, on a copy, with the sweep left out, so the
+/// report can say a share is half dead rather than quietly finish it off.
+pub fn inspect(paths: &PandoPaths) -> Refreshed {
+    if !paths.state_file().exists() {
+        return Refreshed::default();
+    }
+    let mut store = match state::load(&paths.state_file()) {
+        Ok(store) => store,
+        Err(e) => {
+            return Refreshed {
+                state: state::State::new(),
+                warning: Some(format!("{e:#}")),
+                notices: Vec::new(),
+            };
+        }
+    };
+    let scans = scan_groups(&store);
+    advance_with(&mut store, &scans);
+    capture_observed_ports(&mut store, &scans);
+    Refreshed {
+        state: store,
+        warning: None,
+        notices: Vec::new(),
     }
 }
 

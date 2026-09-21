@@ -2345,3 +2345,75 @@ fn doctor_reports_the_docker_it_would_use_and_the_context_it_is_on() {
         "and the path it resolved from, which is the shim:\n{text}"
     );
 }
+
+#[test]
+fn doctor_flags_a_dead_log_pump_beside_a_service_that_is_up() {
+    if !common::python3_available() {
+        eprintln!("skipping: python3 is not installed");
+        return;
+    }
+    let e = env_isolated();
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+    assert_eq!(
+        code(&e.pando(&["start", "feat+one", "--isolated"])),
+        EXIT_OK
+    );
+    assert!(
+        !stdout(&e.pando(&["doctor"])).contains("log pump died"),
+        "nothing to report while it is running"
+    );
+
+    let store = pando::state::load(&e.project_dir().join("state.json")).unwrap();
+    let pump = store.worktrees["feat+one"]
+        .services
+        .iter()
+        .find(|s| s.name == "postgres")
+        .expect("a postgres record")
+        .clone();
+    pando::process::stop(pump.pgid.unwrap(), std::time::Duration::from_secs(2)).unwrap();
+
+    let out = e.pando(&["doctor"]);
+    let text = stdout(&out);
+    assert!(text.lines().any(|l| l == "worktrees"), "{text}");
+    assert!(text.contains("its log pump died"), "{text}");
+    assert!(
+        text.contains("`pando start feat+one` puts it back"),
+        "and what to do about it:\n{text}"
+    );
+    // A note, not a problem: the containers are up and a start fixes it.
+    //
+    // The *exit code* is not asserted here on purpose. This fixture pins
+    // `.nvmrc` 22, and whether this machine's `bash -lc` resolves that is
+    // a fact about the machine — so doctor's exit code on it is one too.
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("  - ") && l.contains("its log pump died")),
+        "a dash, not a bang:\n{text}"
+    );
+    // And the services section says how readiness is decided.
+    assert!(text.lines().any(|l| l == "services"), "{text}");
+    assert!(text.contains("ready by connect"), "{text}");
+
+    assert_eq!(code(&e.pando(&["rm", "feat+one", "--force"])), EXIT_OK);
+    assert_eq!(status_porcelain(&e.root), "");
+}
+
+#[test]
+fn doctor_reports_a_hook_and_the_worktrees_it_has_run_in() {
+    let e = env_of(Kind::NextPnpmCompose);
+    e.write_config(
+        "[project]\nprovision = [\".env\"]\ninstall = \"true\"\n\n\
+         [dev]\ncmd = \"sleep 30\"\nports = []\n\n\
+         [[hooks]]\nname = \"migrate\"\nafter = \"install\"\n\
+         fingerprint = [\"prisma/migrations/**\"]\ncmd = \"true\"\n",
+    );
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+    let text = stdout(&e.pando(&["doctor"]));
+    assert!(text.lines().any(|l| l == "hooks"), "{text}");
+    assert!(text.contains("after install: true"), "{text}");
+    assert!(
+        text.contains("prisma/migrations/**"),
+        "the globs it is keyed on:\n{text}"
+    );
+    assert_eq!(code(&e.pando(&["rm", "feat+one", "--force"])), EXIT_OK);
+}
