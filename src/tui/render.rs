@@ -262,6 +262,12 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
     for line in process_rows(app, &name, width) {
         rows.push((KEEP_PROCESSES, line));
     }
+    // And one per private service. Kept at the same priority as the
+    // processes: in an isolated worktree a database that is down is
+    // exactly as interesting as a dev server that is.
+    for line in service_rows(app, &name, width) {
+        rows.push((KEEP_PROCESSES, line));
+    }
     if let Some(url) = app.url_of(&name) {
         rows.push((
             KEEP_URL,
@@ -1281,6 +1287,51 @@ fn process_rows<'a>(app: &App, name: &str, width: usize) -> Vec<Line<'a>> {
         .collect()
 }
 
+/// One row per private service of the selected worktree: its port, and
+/// whether anything is answering on it.
+///
+/// Read from the record rather than probed here: a paint may not make a
+/// network call, however short. The refresh worker is what asks, and the
+/// row shows what it last said.
+fn service_rows<'a>(app: &App, name: &str, width: usize) -> Vec<Line<'a>> {
+    let services = app.services_of(name);
+    if services.is_empty() {
+        return Vec::new();
+    }
+    let label_width = services
+        .iter()
+        .map(|s| s.name.chars().count())
+        .max()
+        .unwrap_or(0);
+    services
+        .iter()
+        .map(|service| {
+            let (glyph, color) = if service.up {
+                ("●", green())
+            } else {
+                ("○", red())
+            };
+            let detail = match service.port {
+                Some(port) if service.up => format!("service   port {port}"),
+                Some(port) => format!("down      port {port}"),
+                None => "service   no port".to_string(),
+            };
+            Line::from(vec![
+                Span::styled("   ", Style::new().fg(text_muted())),
+                Span::styled(glyph, Style::new().fg(color)),
+                Span::styled(
+                    format!(" {:<label_width$}  ", service.name),
+                    Style::new().fg(text_dim()),
+                ),
+                Span::styled(
+                    truncate(&detail, width.saturating_sub(label_width + 7)),
+                    Style::new().fg(text_muted()),
+                ),
+            ])
+        })
+        .collect()
+}
+
 /// One process's phase as the aggregate of itself, so the same colours and
 /// glyphs are used for a row and for the worktree above it.
 fn phase_as_aggregate(process: &str, record: &ProcessRecord) -> Aggregate {
@@ -1450,6 +1501,20 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
             Style::new().fg(text_dim()),
         ),
     ];
+    // One chip per shared service, so a dev server that will not connect
+    // says whose fault it is before the developer reads a stack trace.
+    // Shed first: on a narrow pane the project and the branch matter more.
+    for service in &app.service_health.shared {
+        spans.push(Span::styled(" · ", Style::new().fg(text_muted())));
+        spans.push(Span::styled(
+            "●",
+            Style::new().fg(if service.up { green() } else { red() }),
+        ));
+        spans.push(Span::styled(
+            format!(" {}", service.name),
+            Style::new().fg(text_dim()),
+        ));
+    }
     if app.enriching {
         spans.push(Span::styled(
             " · reading git",
@@ -1872,6 +1937,67 @@ mod tests {
             .join("\n")
     }
 
+    // Shared mode runs no containers of pando's, so the header is the only
+    // place a developer finds out the project's database is down.
+    #[test]
+    fn the_header_carries_a_chip_for_each_shared_service() {
+        let mut app = test_app(&["feat+one"]);
+        app.main = Some(wt("acme-shop"));
+        app.service_health = crate::tui::app::ServiceHealth {
+            shared: vec![
+                crate::actions::ServiceStatus {
+                    name: "postgres".into(),
+                    port: Some(5432),
+                    up: true,
+                },
+                crate::actions::ServiceStatus {
+                    name: "redis".into(),
+                    port: Some(6379),
+                    up: false,
+                },
+            ],
+            worktrees: std::collections::BTreeMap::new(),
+        };
+        let text = text_of(&draw(&mut app, 100, 12));
+        let header = text.lines().next().unwrap_or_default().to_string();
+        assert!(header.contains("postgres"), "{header}");
+        assert!(header.contains("redis"), "{header}");
+        assert!(header.contains("●"), "{header}");
+    }
+
+    // Isolated mode puts them in the detail pane instead, one row apiece,
+    // because there they belong to a worktree rather than to the project.
+    #[test]
+    fn the_detail_pane_has_a_row_for_each_private_service() {
+        let mut app = test_app(&["feat+one"]);
+        with_process(&mut app, "feat+one", running_phase());
+        app.service_health = crate::tui::app::ServiceHealth {
+            shared: Vec::new(),
+            worktrees: std::collections::BTreeMap::from([(
+                "feat+one".to_string(),
+                vec![
+                    crate::actions::ServiceStatus {
+                        name: "postgres".into(),
+                        port: Some(17_004),
+                        up: true,
+                    },
+                    crate::actions::ServiceStatus {
+                        name: "redis".into(),
+                        port: Some(17_006),
+                        up: false,
+                    },
+                ],
+            )]),
+        };
+        let text = text_of(&draw(&mut app, 120, 24));
+        assert!(text.contains("postgres"), "{text}");
+        assert!(text.contains("port 17004"), "{text}");
+        assert!(
+            text.contains("down      port 17006"),
+            "a service that is not answering says so: {text}"
+        );
+    }
+
     #[test]
     fn renders_at_any_terminal_size_without_panicking() {
         let mut app = test_app(&["feat+one", "feat+two", "a-very-long-worktree-name-here"]);
@@ -1909,6 +2035,37 @@ mod tests {
                 reason: "process exited".into(),
             },
         );
+        // Private services add another row apiece to the same pane, and
+        // another chip apiece to a header that may be one column wide.
+        app.service_health = crate::tui::app::ServiceHealth {
+            shared: vec![
+                crate::actions::ServiceStatus {
+                    name: "postgres".into(),
+                    port: Some(5432),
+                    up: true,
+                },
+                crate::actions::ServiceStatus {
+                    name: "an-extremely-long-service-name".into(),
+                    port: None,
+                    up: false,
+                },
+            ],
+            worktrees: std::collections::BTreeMap::from([(
+                "feat+one".to_string(),
+                vec![
+                    crate::actions::ServiceStatus {
+                        name: "postgres".into(),
+                        port: Some(17_004),
+                        up: true,
+                    },
+                    crate::actions::ServiceStatus {
+                        name: "an-extremely-long-service-name".into(),
+                        port: None,
+                        up: false,
+                    },
+                ],
+            )]),
+        };
 
         for width in 1..=120u16 {
             for height in [1u16, 2, 3, 5, 12, 40] {

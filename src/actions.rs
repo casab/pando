@@ -2288,6 +2288,32 @@ pub fn service_statuses(record: &WorktreeRecord) -> Vec<ServiceStatus> {
         .collect()
 }
 
+/// The project's *shared* services and whether each is answering.
+///
+/// Shared mode runs no containers of pando's, so there is nothing in state
+/// to look at: the port comes from the main checkout's own env files,
+/// through the key the `[[services]]` entry maps to that service. That is
+/// the number the developer's own `docker compose up` published, which is
+/// exactly what the header chip is claiming to know about.
+pub fn shared_service_statuses(paths: &PandoPaths, config: &Config) -> Vec<ServiceStatus> {
+    let mut out: Vec<ServiceStatus> = Vec::new();
+    for entry in compose_entries(config) {
+        for (key, service) in entry.env {
+            if out.iter().any(|status| &status.name == service) {
+                continue;
+            }
+            let port = services::port_in_env(paths.root(), key);
+            out.push(ServiceStatus {
+                name: service.clone(),
+                port,
+                up: port.map(ports::something_is_listening) == Some(true),
+            });
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
 /// The environment a command run by hand inside a worktree needs, so that
 /// it reaches the same database and the same ports the dev processes do.
 ///

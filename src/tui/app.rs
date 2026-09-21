@@ -61,6 +61,10 @@ pub enum AppEvent {
     PrsReady(Result<Vec<PrInfo>, String>),
     /// Process state, advanced and saved off the UI thread.
     Refreshed(Box<Result<State, String>>),
+    /// Whether the project's services are answering — the shared ones for
+    /// the header chips, each worktree's private ones for its detail rows.
+    /// Probed on the refresh worker: it is a TCP connect apiece.
+    ServiceHealth(Box<ServiceHealth>),
     /// A worker needs an answer before it can go on. It is blocked on the
     /// other end of this channel until one arrives — or until the channel
     /// is dropped, which is how quitting aborts it.
@@ -259,6 +263,14 @@ impl LogView {
             .filter(|p| self.log_filter.passes(p.level))
             .count()
     }
+}
+
+/// What the last probe said about the project's services: the shared ones
+/// the header chips show, and each worktree's private ones.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServiceHealth {
+    pub shared: Vec<actions::ServiceStatus>,
+    pub worktrees: BTreeMap<String, Vec<actions::ServiceStatus>>,
 }
 
 #[derive(Debug, Clone)]
@@ -482,6 +494,13 @@ pub struct App {
     /// One refresh at a time. A scan of listening sockets can take a moment,
     /// and stacking them up behind a slow one helps nobody.
     pub refreshing: bool,
+    /// Whether the project's services are answering. Computed on the
+    /// refresh worker, never in a paint or a key handler.
+    pub service_health: ServiceHealth,
+    /// Which options of an open multi-select question are ticked. Beside
+    /// the modal rather than inside it, so the modal stays the plain
+    /// `Clone` value the renderer takes.
+    pub question_checked: Vec<usize>,
     /// Open log tails, keyed by worktree, for the detail pane.
     pub log_tails: LogTails,
     /// Which of the selected worktree's processes the tail is showing, by
@@ -537,6 +556,8 @@ impl App {
             worktrees: Vec::new(),
             created_by_pando: BTreeMap::new(),
             state: State::new(),
+            service_health: ServiceHealth::default(),
+            question_checked: Vec::new(),
             refreshing: false,
             log_tails: LogTails::default(),
             tail_index: 0,
@@ -656,6 +677,11 @@ impl App {
                     }
                 }
             }
+            AppEvent::ServiceHealth(health) => {
+                let changed = *health != self.service_health;
+                self.service_health = *health;
+                changed
+            }
             AppEvent::ConfigResolved(config) => {
                 // The one place the session's config changes while it runs.
                 // Without it the modal reopens on the next `s`, with the
@@ -667,9 +693,12 @@ impl App {
             AppEvent::AskQuestion(boxed) => {
                 let (question, reply) = *boxed;
                 let selected = question.preselect.unwrap_or(0);
+                // The rules' own answer, ticked, so enter accepts it.
+                self.question_checked = question.checked.clone();
                 // No candidates to choose between means the answer can only
-                // be typed, so the input line opens straight away.
-                let custom = question.options.is_empty().then(String::new);
+                // be typed, so the input line opens straight away. Never
+                // for a set question, which has nothing to type.
+                let custom = (question.options.is_empty() && !question.multi).then(String::new);
                 self.modal = Some(Modal::Question {
                     question,
                     selected,
@@ -753,6 +782,10 @@ impl App {
             KeyCode::Char('d') => self.open_remove(),
             KeyCode::Char('y') => self.copy_selected_path(),
             KeyCode::Char('s') | KeyCode::Enter => self.start_selected(),
+            // The isolated start. Its own key rather than a mode, because
+            // isolation is remembered on the worktree: pressing it once is
+            // what turns it on, and `s` from then on keeps it.
+            KeyCode::Char('i') => self.start_selected_isolated(),
             KeyCode::Char('x') => self.stop_selected(),
             KeyCode::Char('r') => self.restart_selected(),
             KeyCode::Char('o') => self.open_selected_url(),
@@ -908,6 +941,19 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// One worktree's private services as the last probe found them.
+    ///
+    /// From the probe rather than from the record, because "is it up" is
+    /// the one thing the record cannot say — and asking here would put a
+    /// TCP connect inside a paint.
+    pub fn services_of(&self, name: &str) -> Vec<actions::ServiceStatus> {
+        self.service_health
+            .worktrees
+            .get(name)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// The process whose log the tail is showing, and the key its tail is
     /// kept under. `None` when the selected worktree is running nothing.
     pub fn tail_target(&self) -> Option<(String, String, std::path::PathBuf)> {
@@ -963,6 +1009,17 @@ impl App {
     }
 
     fn start_selected(&mut self) {
+        self.start_selected_with(false)
+    }
+
+    /// Start with private copies of the project's services. The same path
+    /// as `start_selected`; the flag reaches detection too, because the
+    /// services question is only worth asking when it is being answered.
+    fn start_selected_isolated(&mut self) {
+        self.start_selected_with(true)
+    }
+
+    fn start_selected_with(&mut self, isolated: bool) {
         let Some(name) = self.selected_name() else {
             return;
         };
@@ -978,13 +1035,13 @@ impl App {
             // Detection may have a question; it goes back to the UI thread
             // and this worker waits for the answer.
             let ask = |question: &actions::Question| ask_through_ui(&tx, question);
-            let config = actions::resolve_process(&paths, &config, false, &ask, &progress)
+            let config = actions::resolve_process(&paths, &config, isolated, &ask, &progress)
                 .map_err(|e| format!("{e:#}"))?;
             // Back to the UI thread at once: an answer written to
             // `pando.toml` that this session's own copy does not have is
             // one the next keypress asks all over again.
             let _ = tx.send(AppEvent::ConfigResolved(Box::new(config.clone())));
-            actions::start(&paths, &config, &worker_name, None, false, &progress)
+            actions::start(&paths, &config, &worker_name, None, isolated, &progress)
                 .map(|report| PendingOutcome::Started(worker_name.clone(), report.url.clone()))
                 .map_err(|e| format!("{e:#}"))
         });
@@ -1695,6 +1752,49 @@ impl App {
         // Whatever happens, the worker gets an answer: it is blocked on this
         // channel, and a modal that closes without sending would leave it
         // there forever.
+        //
+        // A set question is its own little mode: space ticks the row under
+        // the cursor, enter takes whatever is ticked, and there is no
+        // command to type in place of "which of these containers".
+        if question.multi {
+            let mut checked = std::mem::take(&mut self.question_checked);
+            match key.code {
+                KeyCode::Esc => {
+                    let _ = reply.send(Err("cancelled".to_string()));
+                    return;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    selected = (selected + 1).min(question.options.len().saturating_sub(1));
+                }
+                KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+                KeyCode::Char(' ') | KeyCode::Char('x') => {
+                    if checked.contains(&selected) {
+                        checked.retain(|i| *i != selected);
+                    } else {
+                        checked.push(selected);
+                        checked.sort_unstable();
+                    }
+                }
+                KeyCode::Char('n') => checked.clear(),
+                KeyCode::Enter => {
+                    let _ = reply.send(Ok(if checked.is_empty() {
+                        actions::Answer::None
+                    } else {
+                        actions::Answer::Many(checked)
+                    }));
+                    return;
+                }
+                _ => {}
+            }
+            self.question_checked = checked;
+            self.modal = Some(Modal::Question {
+                question,
+                selected,
+                custom,
+                reply,
+            });
+            return;
+        }
         if let Some(text) = custom.as_mut() {
             match key.code {
                 KeyCode::Esc => {
@@ -1954,14 +2054,31 @@ impl App {
         }
         self.refreshing = true;
         let paths = self.paths.clone();
+        let config = self.config.clone();
         let tx = self.event_tx.clone();
         thread::spawn(move || {
             let refreshed = actions::refresh(&paths);
+            // Before the state is handed over: probing is a TCP connect
+            // per service, and it has no business on the UI thread or in
+            // a paint.
+            let health = ServiceHealth {
+                shared: actions::shared_service_statuses(&paths, &config),
+                worktrees: refreshed
+                    .state
+                    .worktrees
+                    .iter()
+                    .filter(|(_, record)| !record.services.is_empty())
+                    .map(|(name, record)| (name.clone(), actions::service_statuses(record)))
+                    .collect(),
+            };
             let result = match refreshed.warning {
                 Some(warning) => Err(warning),
                 None => Ok(refreshed.state),
             };
             let _ = tx.send(AppEvent::Refreshed(Box::new(result)));
+            if !health.shared.is_empty() || !health.worktrees.is_empty() {
+                let _ = tx.send(AppEvent::ServiceHealth(Box::new(health)));
+            }
         });
     }
 
@@ -2252,6 +2369,8 @@ impl App {
             worktrees,
             created_by_pando: BTreeMap::new(),
             state: State::new(),
+            service_health: ServiceHealth::default(),
+            question_checked: Vec::new(),
             refreshing: false,
             log_tails: LogTails::default(),
             tail_index: 0,
@@ -2648,6 +2767,140 @@ pub mod tests {
 
     fn press(app: &mut App, code: KeyCode) {
         app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    /// The services question, as detection on fixture 6 would raise it.
+    fn a_services_question() -> actions::Question {
+        actions::Question {
+            slot: crate::detect::Slot::Services,
+            prompt: "Run private copies of these services for each worktree?".to_string(),
+            options: ["cache", "db", "mail", "queue"]
+                .iter()
+                .map(|v| (v.to_string(), "docker-compose.yml".to_string()))
+                .collect(),
+            preselect: Some(0),
+            allow_custom: false,
+            allow_none: true,
+            multi: true,
+            checked: vec![1, 2],
+        }
+    }
+
+    // ---- the multi-select modal ------------------------------------------
+
+    #[test]
+    fn a_set_question_opens_with_the_rules_answer_ticked() {
+        let mut app = test_app(&["feat+one"]);
+        let rx = open_question(&mut app, a_services_question());
+        assert_eq!(app.question_checked, vec![1, 2]);
+        assert!(
+            matches!(app.modal, Some(Modal::Question { custom: None, .. })),
+            "a set question has nothing to type"
+        );
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Ok(actions::Answer::Many(vec![1, 2]))
+        );
+    }
+
+    #[test]
+    fn space_ticks_the_row_under_the_cursor_and_enter_takes_the_set() {
+        let mut app = test_app(&["feat+one"]);
+        let rx = open_question(&mut app, a_services_question());
+        // The cursor starts on `cache`; tick it, then move to `db` and
+        // untick that.
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.question_checked, vec![0, 2]);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Ok(actions::Answer::Many(vec![0, 2]))
+        );
+    }
+
+    #[test]
+    fn an_empty_set_is_the_answer_none() {
+        let mut app = test_app(&["feat+one"]);
+        let rx = open_question(&mut app, a_services_question());
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(rx.try_recv().unwrap(), Ok(actions::Answer::None));
+    }
+
+    #[test]
+    fn escape_on_a_set_question_still_answers_the_worker() {
+        let mut app = test_app(&["feat+one"]);
+        let rx = open_question(&mut app, a_services_question());
+        press(&mut app, KeyCode::Esc);
+        assert!(
+            rx.try_recv().unwrap().is_err(),
+            "a modal that closes without sending leaves a worker waiting forever"
+        );
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn the_cursor_of_a_set_question_clamps_at_both_ends() {
+        let mut app = test_app(&["feat+one"]);
+        let _rx = open_question(&mut app, a_services_question());
+        for _ in 0..8 {
+            press(&mut app, KeyCode::Char('j'));
+        }
+        press(&mut app, KeyCode::Char(' '));
+        assert!(
+            app.question_checked.contains(&3),
+            "the last row, not past it"
+        );
+        for _ in 0..8 {
+            press(&mut app, KeyCode::Char('k'));
+        }
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.question_checked.contains(&0));
+    }
+
+    // ---- services in the app --------------------------------------------
+
+    #[test]
+    fn the_isolated_key_starts_the_selected_worktree() {
+        let mut app = test_app(&["feat+one"]);
+        press(&mut app, KeyCode::Char('i'));
+        let pending = app.pending.as_ref().expect("the key started something");
+        assert_eq!(pending.kind, PendingKind::Start);
+        assert_eq!(pending.name, "feat+one");
+    }
+
+    #[test]
+    fn service_health_reaches_the_app_off_the_ui_thread() {
+        let mut app = test_app(&["feat+one"]);
+        assert!(app.services_of("feat+one").is_empty());
+        let health = ServiceHealth {
+            shared: vec![actions::ServiceStatus {
+                name: "postgres".into(),
+                port: Some(5432),
+                up: false,
+            }],
+            worktrees: BTreeMap::from([(
+                "feat+one".to_string(),
+                vec![actions::ServiceStatus {
+                    name: "postgres".into(),
+                    port: Some(17_004),
+                    up: true,
+                }],
+            )]),
+        };
+        assert!(
+            app.handle_event(AppEvent::ServiceHealth(Box::new(health.clone()))),
+            "a change in health is a reason to repaint"
+        );
+        assert_eq!(app.services_of("feat+one")[0].port, Some(17_004));
+        assert!(!app.service_health.shared[0].up);
+        assert!(
+            !app.handle_event(AppEvent::ServiceHealth(Box::new(health))),
+            "and the same answer twice is not"
+        );
     }
 
     fn type_str(app: &mut App, text: &str) {

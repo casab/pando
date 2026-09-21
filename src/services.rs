@@ -365,6 +365,41 @@ fn rewrite_url(value: &str, service: &str, port: u16) -> Option<String> {
     Some(format!("{head}{userinfo}{host}:{port}{tail}"))
 }
 
+/// The port an env key names in this directory's env files: the port of a
+/// URL, or a bare number.
+///
+/// What shared mode probes. The services there are the ones the developer
+/// already runs, on the ports the project's own files say, so pando reads
+/// rather than assigns.
+pub fn port_in_env(dir: &Path, key: &str) -> Option<u16> {
+    let value = read_env_files(dir)
+        .iter()
+        .find_map(|(_, map)| map.get(key).cloned())?;
+    port_of_value(&value)
+}
+
+fn port_of_value(value: &str) -> Option<u16> {
+    let value = value.trim();
+    if let Ok(port) = value.parse::<u16>() {
+        return Some(port);
+    }
+    let after_scheme = value.find("://")? + 3;
+    let rest = &value[after_scheme..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let hostport = match authority.rfind('@') {
+        Some(at) => &authority[at + 1..],
+        None => authority,
+    };
+    // An IPv6 host is bracketed; only the colon after `]` is the port's.
+    let colon = if hostport.starts_with('[') {
+        hostport.find(']').map(|close| close + 1)?
+    } else {
+        hostport.rfind(':')?
+    };
+    hostport.get(colon + 1..)?.parse().ok()
+}
+
 /// Every env file the worktree has, in lookup order, each as a key map.
 fn read_env_files(worktree: &Path) -> Vec<(String, std::collections::BTreeMap<String, String>)> {
     let mut out = Vec::new();

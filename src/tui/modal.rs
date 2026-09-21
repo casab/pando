@@ -34,7 +34,14 @@ pub fn render_modal(f: &mut Frame, area: Rect, modal: &Modal, app: &App) {
             selected,
             custom,
             ..
-        } => render_question(f, area, question, *selected, custom.as_deref()),
+        } => render_question(
+            f,
+            area,
+            question,
+            *selected,
+            custom.as_deref(),
+            &app.question_checked,
+        ),
         Modal::Help => {
             let keys: &[(&str, &str)] = if app.log_view().is_some() {
                 &HELP_LOG
@@ -55,6 +62,7 @@ fn render_question(
     question: &crate::actions::Question,
     selected: usize,
     custom: Option<&str>,
+    checked: &[usize],
 ) {
     let height = (question.options.len() as u16).min(8) + 7;
     let Some(inner) = popup(f, area, "pando needs an answer", height, 64) else {
@@ -88,10 +96,15 @@ fn render_question(
         .skip(start)
         .take(visible)
         .map(|(i, (value, why))| {
-            let marker = if i == selected && custom.is_none() {
-                "▸ "
-            } else {
-                "  "
+            let marker = match (question.multi, i == selected && custom.is_none()) {
+                // A set question shows what it would take as well as where
+                // the cursor is; one marker cannot say both.
+                (true, cursor) => {
+                    let box_ = if checked.contains(&i) { "[x]" } else { "[ ]" };
+                    format!("{} {box_} ", if cursor { "▸" } else { " " })
+                }
+                (false, true) => "▸ ".to_string(),
+                (false, false) => "  ".to_string(),
             };
             let why = if why.is_empty() {
                 String::new()
@@ -139,6 +152,25 @@ fn render_question(
                 truncate("⏎ accept   esc back", width),
                 Style::new().fg(text_muted()),
             ),
+        ],
+        None if question.multi => vec![
+            Line::raw(""),
+            Line::from(vec![
+                Span::styled(
+                    "space",
+                    Style::new().fg(orange()).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" toggle   ", Style::new().fg(text_muted())),
+                Span::styled("⏎", Style::new().fg(orange()).add_modifier(Modifier::BOLD)),
+                Span::styled(" accept   ", Style::new().fg(text_muted())),
+                Span::styled("n", Style::new().fg(orange()).add_modifier(Modifier::BOLD)),
+                Span::styled(" none   ", Style::new().fg(text_muted())),
+                Span::styled(
+                    "esc",
+                    Style::new().fg(orange()).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" cancel", Style::new().fg(text_muted())),
+            ]),
         ],
         None => vec![
             Line::raw(""),
@@ -339,12 +371,13 @@ fn render_remove(
 
 /// Every key the list view answers to. Scrollable, because a tmux split is
 /// often shorter than the keymap.
-const HELP: [(&str, &str); 18] = [
+const HELP: [(&str, &str); 19] = [
     ("j / ↓", "move down"),
     ("k / ↑", "move up"),
     ("g / G", "first / last"),
     ("/", "filter by name or branch"),
     ("s / ⏎", "start the dev process"),
+    ("i", "start it with private services"),
     ("x", "stop it"),
     ("r", "restart it"),
     ("o", "open its URL"),
