@@ -92,6 +92,13 @@ fn real() -> RealDocker {
 /// The same fixture with the dev command injected, so a test can watch what
 /// the process that is running was actually told.
 fn real_with(dev: &str) -> RealDocker {
+    real_tuned(dev, 90)
+}
+
+/// …and with the readiness timeout injected, so a test about a service
+/// that never becomes ready does not have to wait a minute and a half for
+/// the answer.
+fn real_tuned(dev: &str, ready_timeout_s: u64) -> RealDocker {
     let dir = TempDir::new().unwrap();
     let root = build(Kind::NextPnpmCompose, dir.path()).root;
     std::fs::write(
@@ -114,12 +121,11 @@ fn real_with(dev: &str) -> RealDocker {
         paths.config_file(),
         format!(
             "[project]\nprovision = [\".env\"]\ninstall = \"true\"\n\n\
-             [dev]\ncmd = '''{}'''\nports = {{ PORT = \"web\" }}\n\n\
+             [dev]\ncmd = '''{dev}'''\nports = {{ PORT = \"web\" }}\n\n\
              [[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
              include = [\"postgres\", \"redis\"]\n\
              env = {{ DATABASE_URL = \"postgres\", REDIS_URL = \"redis\" }}\n\
-             ready_timeout_s = 90\n",
-            dev
+             ready_timeout_s = {ready_timeout_s}\n"
         ),
     )
     .unwrap();
@@ -357,6 +363,104 @@ fn a_service_a_worktree_cannot_isolate_is_refused_before_docker_is_asked() {
     assert!(worktree_of(&f, &name).is_dir());
     let _ = state::load(&f.paths.state_file());
     let _ = Duration::from_secs(0);
+}
+
+/// The published port answers from the moment the container is running.
+/// Only a real Docker has that proxy in front of it, so only a real Docker
+/// can prove that readiness is not satisfied by it.
+#[test]
+fn a_container_that_publishes_a_port_and_never_listens_is_never_ready() {
+    if !enabled() {
+        eprintln!("skipping: set PANDO_TEST_DOCKER=1 to run against the real Docker");
+        return;
+    }
+    let mut f = real_tuned(&listener_on_port_env(), 8);
+    std::fs::write(
+        f.paths.root().join("docker-compose.yml"),
+        "services:\n  postgres:\n    image: alpine:latest\n    \
+         command: [\"sleep\", \"300\"]\n    ports: [\"5432:5432\"]\n  \
+         redis:\n    image: redis:7\n    ports: [\"6379:6379\"]\n",
+    )
+    .unwrap();
+    common::git(f.paths.root(), &["add", "."]);
+    common::git(f.paths.root(), &["commit", "--quiet", "-m", "a sleeper"]);
+    let name = actions::new(&f.paths, &f.config, "feat/sleeper", None, &|_| {}).unwrap();
+    let project = compose::project_name(f.paths.project_id(), &name);
+    f.projects.push(project.clone());
+
+    let started = std::time::Instant::now();
+    let err = format!(
+        "{:#}",
+        actions::start(&f.paths, &f.config, &name, None, true, &|m| {
+            eprintln!("sleeper: {m}")
+        })
+        .unwrap_err()
+    );
+    assert!(err.contains("did not become ready"), "{err}");
+    assert!(
+        err.contains("postgres"),
+        "it names the one that was not: {err}"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_secs(7),
+        "it waited out the timeout rather than giving up early: {:?}",
+        started.elapsed()
+    );
+
+    // What did come up is stopped again, so a failed start leaves nothing
+    // holding a port.
+    let running = docker(&["ps", "--format", "{{.Names}}"]);
+    assert!(
+        !running
+            .lines()
+            .any(|line| line.trim().starts_with(&project)),
+        "the services were left running: {running}"
+    );
+    let store = state::load(&f.paths.state_file()).unwrap();
+    assert!(
+        store.worktrees[&name].processes.is_empty(),
+        "and nothing was spawned behind them"
+    );
+}
+
+/// The whole reason finding 3 matters: the detected `migrate` hook runs at
+/// the `services` point, right after readiness, and a postgres that has
+/// only just been created spends a second or two running `initdb` with
+/// nothing listening. If readiness is satisfied by the port proxy, the
+/// migration runs against a database that refuses connections.
+#[test]
+fn the_database_accepts_connections_by_the_time_start_returns() {
+    if !enabled() {
+        eprintln!("skipping: set PANDO_TEST_DOCKER=1 to run against the real Docker");
+        return;
+    }
+    let mut f = real();
+    let name = actions::new(&f.paths, &f.config, "feat/ready", None, &|_| {}).unwrap();
+    let project = compose::project_name(f.paths.project_id(), &name);
+    f.projects.push(project.clone());
+
+    // A fresh named volume, so this postgres really does have to
+    // initialise before it will answer anything.
+    actions::start(&f.paths, &f.config, &name, None, true, &|m| {
+        eprintln!("ready: {m}")
+    })
+    .unwrap();
+
+    // Asked the instant `start` returns, which is the instant a hook at
+    // the `services` point would have run.
+    let out = Command::new("docker")
+        .args(["exec", &format!("{project}-postgres-1"), "pg_isready"])
+        .output()
+        .expect("run pg_isready in the container");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success() && said.contains("accepting connections"),
+        "start returned before postgres was accepting connections: {said}"
+    );
 }
 
 /// The one the fake docker can never catch: it mounts nothing, so only a

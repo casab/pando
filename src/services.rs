@@ -529,13 +529,23 @@ pub fn wait_ready(
     }
 }
 
+/// Compose health when the service declares a healthcheck, because that is
+/// the project's own answer to "is this up" and nothing pando can do from
+/// outside beats it.
+///
+/// Otherwise a connect that also proves something is *behind* the port.
+/// Docker's published port is a proxy that completes the handshake as soon
+/// as the container is running, so a plain connect would declare a postgres
+/// ready while it is still running `initdb` — and the detected `migrate`
+/// hook would then run against a database refusing connections. See
+/// [`ports::something_is_serving`].
 fn is_ready(want: &Wanted, statuses: &[Status]) -> bool {
     if want.healthcheck {
         return statuses
             .iter()
             .any(|s| s.service == want.service && s.health == "healthy");
     }
-    ports::something_is_listening(want.port)
+    ports::something_is_serving(want.port)
 }
 
 #[cfg(test)]

@@ -72,6 +72,18 @@ pub fn never_ready(home: &Path, project: &str) {
     std::fs::write(dir.join("never-ready"), "1").unwrap();
 }
 
+/// Tells the shim to publish the ports with nothing behind them: the
+/// container runs, the connect succeeds, and the connection is closed at
+/// once. That is what Docker's port proxy does in front of a container
+/// that is up but is not listening inside yet — a database still running
+/// its first-boot initialisation, or an image that publishes a port and
+/// never binds it.
+pub fn proxy_only(home: &Path, project: &str) {
+    let dir = state_dir(home).join(project);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("proxy-only"), "1").unwrap();
+}
+
 /// Whether the shim still has containers for this project, and on which
 /// ports. Empty once `down -v` has run.
 pub fn services_up(home: &Path, project: &str) -> Vec<(String, u16)> {
@@ -212,15 +224,7 @@ def published():
     return out
 
 
-def listen(port):
-    code = (
-        "import socket,time\n"
-        "s=socket.socket()\n"
-        "s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n"
-        "s.bind(('127.0.0.1',%d))\n"
-        "s.listen(5)\n"
-        "time.sleep(86400)\n" % port
-    )
+def spawn(code):
     child = subprocess.Popen(
         [sys.executable, "-c", code],
         start_new_session=True,
@@ -229,6 +233,34 @@ def listen(port):
         stderr=subprocess.DEVNULL,
     )
     return child.pid
+
+
+def listen(port):
+    """A server: it holds the connection open and says nothing."""
+    return spawn(
+        "import socket,time\n"
+        "s=socket.socket()\n"
+        "s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n"
+        "s.bind(('127.0.0.1',%d))\n"
+        "s.listen(5)\n"
+        "time.sleep(86400)\n" % port
+    )
+
+
+def hang_up(port):
+    """Docker's own port proxy in front of a container that is running but
+    is not listening inside: the connect succeeds and the connection is
+    closed at once."""
+    return spawn(
+        "import socket\n"
+        "s=socket.socket()\n"
+        "s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n"
+        "s.bind(('127.0.0.1',%d))\n"
+        "s.listen(5)\n"
+        "while True:\n"
+        "    c,_=s.accept()\n"
+        "    c.close()\n" % port
+    )
 
 
 def alive(pid):
@@ -258,6 +290,7 @@ def kill_all(state):
 
 def do_up():
     stuck = os.path.exists(os.path.join(PROJ, "never-ready"))
+    proxy = os.path.exists(os.path.join(PROJ, "proxy-only"))
     checks = healthchecked()
     state = read_state()
     wanted = REST or list(published().keys())
@@ -270,7 +303,7 @@ def do_up():
         entry["port"] = host
         entry["container"] = container
         entry["stopped"] = False
-        entry["pid"] = 0 if stuck else listen(host)
+        entry["pid"] = 0 if stuck else (hang_up(host) if proxy else listen(host))
         entry["health"] = ("starting" if stuck else "healthy") if name in checks else ""
         state[name] = entry
     write_state(state)

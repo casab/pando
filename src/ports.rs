@@ -93,6 +93,67 @@ pub fn something_is_listening(port: u16) -> bool {
     false
 }
 
+/// How long the readiness probe waits for a byte once it is connected.
+/// A server that has nothing to say holds the socket open; that silence is
+/// the answer, so this is the cost of one ready service, paid once.
+const SERVING_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Whether something on `port` behaves like a server rather than a proxy
+/// with nothing behind it.
+///
+/// Docker publishes a container port by putting a proxy in front of it, and
+/// that proxy completes the handshake as soon as the *container* is
+/// running — whatever is, or is not, listening inside. So [`something_is_listening`]
+/// answers "the container exists", which is not the question readiness
+/// asks: a database that takes two seconds to open its socket would be
+/// declared ready at once, and the migration hook behind it would run
+/// against nothing.
+///
+/// One `recv` tells the two apart. A real server holds the connection open
+/// and says nothing until it is asked something — postgres and redis both
+/// do — or sends a banner unprompted, as MySQL does. The proxy-only case
+/// closes the connection immediately, which arrives as an end of file.
+///
+/// Still never a bind: taking the port would hand the server being waited
+/// for an `EADDRINUSE`.
+pub fn something_is_serving(port: u16) -> bool {
+    use std::io::Read;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
+    for host in [
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+    ] {
+        let Ok(mut stream) =
+            TcpStream::connect_timeout(&SocketAddr::new(host, port), CONNECT_TIMEOUT)
+        else {
+            continue;
+        };
+        if stream.set_read_timeout(Some(SERVING_TIMEOUT)).is_err() {
+            continue;
+        }
+        let mut byte = [0u8; 1];
+        match stream.read(&mut byte) {
+            // A banner: MySQL and a few others greet the client.
+            Ok(n) if n > 0 => return true,
+            // Nothing said, and the connection is still open — a server
+            // waiting to be asked something.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return true;
+            }
+            // `Ok(0)` is an immediate end of file, which is the shape of a
+            // published port with nothing behind it. Anything else is a
+            // connection that broke, which is not readiness either.
+            _ => continue,
+        }
+    }
+    false
+}
+
 /// The base port for a worktree, before any occupancy probing.
 pub fn derive_base(project_id: &str, name: &str) -> u16 {
     let mut input = Vec::with_capacity(project_id.len() + name.len() + 1);
@@ -295,6 +356,51 @@ mod tests {
     use std::collections::HashSet;
 
     const PROJECT: &str = "acme-shop-3f9a2c1d";
+
+    /// A listener that never accepts: the kernel completes the handshake
+    /// and the connection waits in the backlog, which is what a server
+    /// that has nothing to say looks like from outside.
+    fn quiet_server() -> (std::net::TcpListener, u16) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        (listener, port)
+    }
+
+    #[test]
+    fn a_server_that_holds_the_socket_open_is_serving() {
+        let (_listener, port) = quiet_server();
+        assert!(something_is_serving(port));
+        assert!(something_is_listening(port));
+    }
+
+    /// Docker's published port with nothing listening inside the container:
+    /// the connection is accepted and closed at once. `something_is_listening`
+    /// cannot tell that from a database, which is the whole point.
+    #[test]
+    fn a_port_that_answers_and_hangs_up_at_once_is_not_serving() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            for stream in listener.incoming().take(2) {
+                drop(stream);
+            }
+        });
+        assert!(
+            something_is_listening(port),
+            "a connect alone cannot tell the difference"
+        );
+        assert!(!something_is_serving(port), "but one recv can");
+        drop(handle);
+    }
+
+    #[test]
+    fn a_port_nothing_is_on_is_neither() {
+        let port = {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        assert!(!something_is_serving(port));
+    }
 
     #[test]
     fn derive_base_is_deterministic() {

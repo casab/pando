@@ -421,6 +421,44 @@ fn a_service_that_never_becomes_ready_fails_the_start_and_stops_what_came_up() {
     assert!(store.worktrees[&name].processes.is_empty());
 }
 
+// Docker completes the handshake on a published port as soon as the
+// container is running, whatever is listening inside it. Readiness by
+// connect alone therefore says "the container exists", and the migration
+// hook behind it runs against a database that is not accepting anything.
+#[test]
+fn a_published_port_with_nothing_behind_it_is_never_ready() {
+    if skip_without_python() {
+        return;
+    }
+    let f = iso_with(&config_toml(&listener_printing("DATABASE_URL")).replace(
+        "env = { DATABASE_URL = \"postgres\", REDIS_URL = \"redis\" }",
+        "env = { DATABASE_URL = \"postgres\", REDIS_URL = \"redis\" }\nready_timeout_s = 2",
+    ));
+    let name = new_worktree(&f, "feat/one");
+    docker::proxy_only(&f.home, &f.project(&name));
+
+    let err = format!(
+        "{:#}",
+        actions::start(&f.paths, &f.config, &name, None, true, &|_| {}).unwrap_err()
+    );
+    assert!(err.contains("did not become ready"), "{err}");
+    assert!(err.contains("postgres") || err.contains("redis"), "{err}");
+    // The connect itself succeeded throughout — that a connect cannot tell
+    // this from a database is what `ports::something_is_serving` and its
+    // unit tests pin down; here the point is that the start failed rather
+    // than reporting success and spawning behind it.
+    let store = state::load(&f.paths.state_file()).unwrap();
+    let seen = docker::invocations_for(&f.home, &f.project(&name));
+    assert!(
+        seen.iter().any(|line| line.ends_with(" stop")),
+        "what did come up is stopped again: {seen:?}"
+    );
+    assert!(
+        store.worktrees[&name].processes.is_empty(),
+        "and nothing was spawned behind it"
+    );
+}
+
 #[test]
 fn an_env_key_no_file_in_the_worktree_sets_is_an_error_naming_it() {
     let f = iso_with(&config_toml("sleep 30").replace(
