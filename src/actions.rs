@@ -651,6 +651,9 @@ pub fn rm(paths: &PandoPaths, name: &str, yes: bool, force: bool) -> Result<()> 
 
     let _ = std::fs::remove_dir_all(paths.logs_dir(name));
     let _ = std::fs::remove_dir_all(paths.data_dir(name));
+    // And the compose override, which is regenerated on every isolated
+    // start and would otherwise outlive every worktree that ever had one.
+    let _ = std::fs::remove_file(paths.compose_override_file(name));
     store.worktrees.remove(name);
     state::save(&paths.state_file(), &store)?;
     Ok(())

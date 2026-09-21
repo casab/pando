@@ -789,6 +789,105 @@ fn every_file_the_lifecycle_writes_is_under_pandos_home() {
     h.assert_untouched("the whole lifecycle", None);
 }
 
+/// Fixture 1 with a fake docker in pando's home and a config that runs
+/// private copies of its compose services.
+fn isolated_harness() -> Harness {
+    let h = harness_of(
+        Kind::NextPnpmCompose,
+        &format!(
+            "[project]\nprovision = [\".env\"]\ninstall = \"true\"\n\n\
+             [dev]\ncmd = '''{}'''\nports = {{ PORT = \"web\" }}\n\n\
+             [[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
+             include = [\"postgres\", \"redis\"]\n\
+             env = {{ DATABASE_URL = \"postgres\", REDIS_URL = \"redis\" }}\n",
+            common::listener_on_port_env()
+        ),
+    );
+    common::docker::install(&h.home);
+    h
+}
+
+/// The phase's own invariant test: isolation adds an override file, two
+/// service logs, a compose project and a set of volumes, and not one of
+/// them may land inside the developer's repository.
+#[test]
+fn an_isolated_lifecycle_never_writes_into_the_repository() {
+    if !common::python3_available() {
+        eprintln!("skipping: python3 is not installed");
+        return;
+    }
+    let h = isolated_harness();
+    let name = actions::new(&h.paths, &h.config, "feat/one", None, &|_| {}).unwrap();
+    let worktree = h.config.worktrees_dir(&h.paths).join(&name);
+    h.assert_untouched("new", Some(&worktree));
+
+    let report = actions::start(&h.paths, &h.config, &name, None, true, &|_| {}).unwrap();
+    assert!(report.ports.contains_key("postgres"), "{:?}", report.ports);
+    h.assert_untouched("start --isolated", Some(&worktree));
+
+    // The compose file pando read is the project's own, and it is
+    // untouched: the override that remaps the ports is a separate file
+    // under the home.
+    let override_file = h.paths.compose_override_file(&name);
+    assert!(override_file.is_file(), "the override was not written");
+    assert!(
+        override_file.starts_with(&h.home),
+        "{} escaped pando's home",
+        override_file.display()
+    );
+    assert!(
+        std::fs::read_to_string(&override_file)
+            .unwrap()
+            .contains("!override")
+    );
+
+    actions::refresh(&h.paths);
+    h.assert_untouched("status", Some(&worktree));
+
+    // Each service's container log is a file under the home, like any
+    // other log source.
+    for service in ["postgres", "redis"] {
+        let log = h.paths.log_file(&name, service);
+        assert!(
+            log.starts_with(&h.home),
+            "{} escaped pando's home",
+            log.display()
+        );
+        let mut text = String::new();
+        for _ in 0..80 {
+            text = std::fs::read_to_string(&log).unwrap_or_default();
+            if text.contains(service) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(text.contains(service), "{service}: {text:?}");
+    }
+    h.assert_untouched("logs", Some(&worktree));
+
+    actions::stop(&h.paths, &name, None).unwrap();
+    h.assert_untouched("stop", Some(&worktree));
+
+    // A plain start after a stop: the worktree remembers it is isolated,
+    // and still writes nothing into the repository.
+    actions::start(&h.paths, &h.config, &name, None, false, &|_| {}).unwrap();
+    assert!(state::load(&h.paths.state_file()).unwrap().worktrees[&name].isolated);
+    h.assert_untouched("start", Some(&worktree));
+
+    actions::rm(&h.paths, &name, false, false).unwrap();
+    h.assert_untouched("rm", None);
+    assert!(
+        !override_file.exists(),
+        "rm takes the override with the worktree"
+    );
+
+    // And everything the fake docker was told to pretend lives under the
+    // home too — a marker file next to the repository would be exactly
+    // the write this test exists to catch.
+    assert!(common::docker::state_dir(&h.home).starts_with(&h.home));
+    assert!(!common::docker::invocations(&h.home).is_empty());
+}
+
 // A failed install keeps the worktree — and still writes nothing into it.
 #[test]
 fn a_failed_install_leaves_the_repository_and_the_worktree_alone() {
