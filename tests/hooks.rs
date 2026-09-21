@@ -303,6 +303,96 @@ fn a_hook_cwd_that_leaves_the_worktree_is_refused() {
     assert!(err.contains("does not exist in this worktree"), "{err}");
 }
 
+// ---- probes ---------------------------------------------------------------
+
+fn with_probe(cmd: &str, match_: &str) -> String {
+    format!(
+        "[project]\ninstall = \"true\"\n\n\
+         [dev]\ncmd = \"sleep 30\"\nports = []\n\n\
+         [[probes]]\nname = \"native-abi\"\ncmd = \"{cmd}\"\n\
+         match = \"{match_}\"\n\
+         hint = \"Rebuild native modules under the dev runtime.\"\n"
+    )
+}
+
+#[test]
+fn a_probe_that_recognises_the_failure_aborts_the_start_with_its_hint() {
+    let f = hx(Kind::Plain, |_| {
+        with_probe(
+            "echo NODE_MODULE_VERSION 127 >&2 && exit 1",
+            "NODE_MODULE_VERSION",
+        )
+    });
+    let name = new_worktree(&f, "feat/one");
+    let err = format!(
+        "{:#}",
+        actions::start(&f.paths, &f.config, &name, None, false, &|_| {}).unwrap_err()
+    );
+    assert!(err.contains("native-abi"), "{err}");
+    assert!(err.contains("NODE_MODULE_VERSION"), "{err}");
+    assert!(
+        err.contains("Rebuild native modules under the dev runtime."),
+        "the hint is the point of a probe: {err}"
+    );
+    // And nothing was started behind it.
+    let store = state::load(&f.paths.state_file()).unwrap();
+    assert!(store.worktrees[&name].processes.is_empty());
+}
+
+#[test]
+fn a_probe_that_fails_some_other_way_is_ignored() {
+    let f = hx(Kind::Plain, |_| {
+        with_probe(
+            "echo something-else-entirely >&2 && exit 3",
+            "NODE_MODULE_VERSION",
+        )
+    });
+    let name = new_worktree(&f, "feat/one");
+    let said = std::sync::Mutex::new(Vec::<String>::new());
+    {
+        let notice = |m: &str| said.lock().unwrap().push(m.to_string());
+        actions::start(&f.paths, &f.config, &name, None, false, &notice).unwrap();
+    }
+    let said = said.into_inner().unwrap();
+    assert!(
+        said.iter().any(|m| m.contains("does not recognise")),
+        "ignored, but never silently: {said:?}"
+    );
+    let store = state::load(&f.paths.state_file()).unwrap();
+    assert_eq!(store.worktrees[&name].processes.len(), 1);
+}
+
+#[test]
+fn a_probe_that_passes_says_nothing_and_starts_everything() {
+    let f = hx(Kind::Plain, |_| with_probe("true", "NODE_MODULE_VERSION"));
+    let name = new_worktree(&f, "feat/one");
+    start(&f, &name);
+    let store = state::load(&f.paths.state_file()).unwrap();
+    assert_eq!(store.worktrees[&name].processes.len(), 1);
+}
+
+#[test]
+fn a_probe_runs_in_the_worktree_with_the_process_environment() {
+    let f = hx(Kind::Plain, |sink| {
+        let sink = sink.display();
+        format!(
+            "[project]\ninstall = \"true\"\n\n\
+             [dev]\ncmd = \"sleep 30\"\nports = []\n\n\
+             [[probes]]\nname = \"where\"\n\
+             cmd = \"pwd >> '{sink}' && echo name=$PANDO_NAME >> '{sink}' && exit 1\"\n\
+             match = \"never-matches\"\nhint = \"unused\"\n"
+        )
+    });
+    let name = new_worktree(&f, "feat/one");
+    start(&f, &name);
+    let ran = f.ran();
+    assert!(
+        ran[0].ends_with(&name),
+        "a probe runs inside the worktree it is about: {ran:?}"
+    );
+    assert_eq!(ran[1], format!("name={name}"));
+}
+
 #[test]
 fn a_hook_name_that_would_escape_the_log_directory_is_refused_at_load() {
     let dir = TempDir::new().unwrap();

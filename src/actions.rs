@@ -361,6 +361,67 @@ fn run_hook(
     Ok(())
 }
 
+/// Runs the pre-start probes, refusing to start when one of them fails in
+/// a way it recognised.
+///
+/// The asymmetry is the whole design. A probe that fails with the stderr
+/// it was told to watch for is a diagnosis: the start stops and the
+/// developer gets the one-line fix. A probe that fails any *other* way is
+/// ignored, because a check pando does not understand must never be the
+/// reason a project it has never seen refuses to start.
+fn run_probes(
+    paths: &PandoPaths,
+    config: &Config,
+    ctx: &HookContext<'_>,
+    progress: &dyn Fn(&str),
+) -> Result<()> {
+    if config.probes.is_empty() {
+        return Ok(());
+    }
+    let template_ctx = template::Context {
+        name: ctx.name,
+        branch: ctx.branch,
+        worktree: ctx.worktree,
+        root: paths.root(),
+        project: paths.project_id(),
+        ports: ctx.ports,
+        default_role: None,
+        log: None,
+    };
+    let mut env = pando_env(paths, ctx.name, ctx.branch, ctx.worktree);
+    env.extend(ctx.service_env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    for probe in &config.probes {
+        let cmd = template::render(&probe.cmd, &template_ctx)
+            .with_context(|| format!("in the command for probe {}", probe.name))?;
+        let Some(stderr) = hooks::probe(&with_prelude(config, &cmd), ctx.worktree, &env)
+            .with_context(|| format!("the probe {} could not be run", probe.name))?
+        else {
+            continue;
+        };
+        if !stderr.contains(&probe.match_) {
+            // Ignored on purpose — and said out loud, so a probe that has
+            // quietly stopped recognising anything is visible.
+            progress(&format!(
+                "the probe {} failed in a way it does not recognise; ignoring it",
+                probe.name
+            ));
+            continue;
+        }
+        let reason = stderr
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("")
+            .trim();
+        bail!(
+            "the probe {} failed: {reason}\n  {}",
+            probe.name,
+            probe.hint
+        );
+    }
+    Ok(())
+}
+
 fn changed_its_inputs(hook: &str, cmd: &str) -> String {
     if hook == INSTALL_HOOK {
         return format!(
@@ -1190,6 +1251,11 @@ pub fn start(
             &hook_ctx,
             progress,
         )?;
+        // The last gate before anything is spawned: a probe that
+        // recognises the failure stops the start and says how to fix it,
+        // rather than letting the dev server die of it thirty seconds
+        // later with the reason buried in a log.
+        run_probes(paths, config, &hook_ctx, progress)?;
     }
 
     let _lock = state::lock(&paths.lock_file())?;

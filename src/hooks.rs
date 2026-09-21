@@ -215,6 +215,35 @@ pub fn run(log_file: &Path, shell_cmd: &str, cwd: &Path, env: &[(String, String)
     )
 }
 
+/// Runs a pre-start check whose *answer* is its output rather than its
+/// effect: `Ok(None)` when it succeeded, `Ok(Some(stderr))` when it did
+/// not.
+///
+/// No log file. A probe is a question pando asks before it starts
+/// anything, and the only thing it can produce is the hint the developer
+/// sees; a `logs --source native-abi` tab for it would be empty on every
+/// run that mattered.
+pub fn probe(shell_cmd: &str, cwd: &Path, env: &[(String, String)]) -> Result<Option<String>> {
+    let mut command = Command::new("bash");
+    command
+        .arg("-lc")
+        .arg(shell_cmd)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let out = command
+        .output()
+        .with_context(|| format!("run the probe {shell_cmd:?}"))?;
+    if out.status.success() {
+        return Ok(None);
+    }
+    Ok(Some(String::from_utf8_lossy(&out.stderr).into_owned()))
+}
+
 /// [`run`], with a second command tried when the first one fails.
 ///
 /// The error reported is the *fallback's*. A hook with a fallback has two
