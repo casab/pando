@@ -253,6 +253,49 @@ fn ls_json_parses_and_carries_the_documented_keys() {
     }
 }
 
+// Every published shape says which shape it is, and `agent/json.md` is the
+// contract that promises so. A program pins `version` and refuses one it
+// was not written for; a shape that does not carry it cannot be pinned at
+// all.
+#[test]
+fn every_machine_readable_shape_carries_its_version() {
+    let e = env();
+    e.pando(&["new", "feat/one"]);
+    // A log with a line in it, without starting anything: `logs --json` is
+    // about the shape here, not about a process.
+    let log = e.log_file("feat+one", "dev");
+    std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+    std::fs::write(&log, "ready in 412ms\n").unwrap();
+
+    for args in [
+        vec!["ls", "--json"],
+        vec!["status", "--json"],
+        vec!["signals"],
+        // Whose exit code is a verdict about the machine, not about the
+        // shape: it prints the same object either way.
+        vec!["doctor", "--json"],
+    ] {
+        let out = e.pando(&args);
+        let printed = stdout(&out);
+        let v: serde_json::Value = serde_json::from_str(&printed)
+            .unwrap_or_else(|e| panic!("{args:?} did not print one JSON object: {e}\n{printed}"));
+        assert_eq!(v["version"], pando::cli::JSON_VERSION, "{args:?}");
+    }
+
+    // And the one that is a stream rather than a document. It carries the
+    // version on every line because a follower reading a pipe has no other
+    // object to learn the shape from.
+    let out = e.pando(&["logs", "feat+one", "--json"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    let printed = stdout(&out);
+    let line: serde_json::Value =
+        serde_json::from_str(printed.lines().next().expect("one line")).expect("one object");
+    assert_eq!(line["version"], pando::cli::JSON_VERSION);
+    assert_eq!(line["level"], "info");
+    assert_eq!(line["ts"], serde_json::Value::Null);
+    assert_eq!(line["line"], "ready in 412ms");
+}
+
 // Discovery is from porcelain, whose first entry is the main checkout from
 // any cwd — so a subdirectory sees exactly what the root sees.
 #[test]

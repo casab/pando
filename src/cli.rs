@@ -2176,8 +2176,16 @@ const FOLLOW_INTERVAL: Duration = Duration::from_millis(250);
 /// whatever `--tail` happened to be.
 const FOLLOW_CAPACITY: usize = 4096;
 
+/// One line of one log, as the machine-readable shape.
+///
+/// The one published shape that is a *stream* rather than a document: one
+/// object per line, so `pando logs -f --json | …` stays useful while it
+/// runs. It carries `version` on every line for exactly that reason — a
+/// consumer reading a pipe has no other object to learn the shape from,
+/// and running a second command to ask is not something a follower can do.
 #[derive(Serialize)]
 struct LogLineOut<'a> {
+    version: u32,
     /// The line's own timestamp when it has one pando can read, else null.
     ts: Option<String>,
     level: &'static str,
@@ -2274,6 +2282,7 @@ pub fn logs<W: Write>(
 fn write_log_line<W: Write>(out: &mut W, plain: &str, level: LogLevel, json: bool) -> Result<()> {
     if json {
         let entry = LogLineOut {
+            version: JSON_VERSION,
             ts: leading_timestamp(plain),
             level: level_word(level),
             line: plain,
@@ -3568,6 +3577,52 @@ mod tests {
             assert_eq!(slot_named(&name), Some(slot), "{name} does not round trip");
         }
         assert_eq!(slot_names().len(), actions::ALL_SLOTS.len());
+    }
+
+    /// The nine names, written out.
+    ///
+    /// `signals` publishes them and `--answers` takes them, and both get
+    /// them from `Slot`'s own serde names — so a rename stays invisible to
+    /// every test that only compares the two against each other, while
+    /// breaking every program ever written against them. This is the
+    /// assertion a rename has to walk past, and the list is also published
+    /// in `agent/json.md`, which the test below holds to the same order.
+    #[test]
+    fn the_nine_question_names_are_frozen() {
+        assert_eq!(
+            slot_names(),
+            [
+                "install",
+                "version_files",
+                "prelude",
+                "processes",
+                "dev_cmd",
+                "port_env",
+                "services",
+                "schema_hook",
+                "provision",
+            ]
+        );
+    }
+
+    /// The contract file says the same names, in the same order.
+    ///
+    /// A document is the one part of a contract nothing compiles, so it is
+    /// the part that rots. Reading it from the test is what makes a rename
+    /// fail in the commit that does it rather than in somebody's agent a
+    /// month later.
+    #[test]
+    fn the_published_contract_names_every_question_in_order() {
+        let doc = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("agent/json.md");
+        let text =
+            std::fs::read_to_string(&doc).unwrap_or_else(|e| panic!("read {}: {e}", doc.display()));
+        assert!(
+            text.contains(&slot_names().join("  ")),
+            "agent/json.md does not list the nine questions in the order pando asks them"
+        );
+        for name in slot_names() {
+            assert!(text.contains(&name), "agent/json.md never mentions {name}");
+        }
     }
 
     fn parse_err(json: &str) -> String {
