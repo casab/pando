@@ -2153,6 +2153,12 @@ impl App {
     /// `set-clipboard on`. `pbcopy` is a macOS-only fallback for terminals
     /// that ignore the sequence; it is spawned with every stdio redirected,
     /// never inheriting the alternate screen.
+    ///
+    /// The escape sequence is written from here — it is one `write` to the
+    /// terminal pando already owns — but the child is not. `y` is a key
+    /// handler, and waiting for `pbcopy` to drain its stdin there is a
+    /// blocking wait on a child inside the frame, so it goes to a detached
+    /// thread exactly as the browser opener does.
     #[cfg(not(test))]
     fn copy_to_clipboard(&mut self, text: &str) {
         use std::io::Write as _;
@@ -2160,18 +2166,28 @@ impl App {
         let _ = write!(stdout, "\x1b]52;c;{}\x07", base64(text.as_bytes()));
         let _ = stdout.flush();
 
-        if cfg!(target_os = "macos")
-            && let Ok(mut child) = std::process::Command::new("pbcopy")
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let text = text.to_string();
+        thread::spawn(move || {
+            let Ok(mut child) = std::process::Command::new("pbcopy")
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
-        {
-            if let Some(stdin) = child.stdin.as_mut() {
+            else {
+                return;
+            };
+            if let Some(mut stdin) = child.stdin.take() {
                 let _ = stdin.write_all(text.as_bytes());
             }
-            let _ = child.wait();
-        }
+            // Taking the handle above closed pando's end of the pipe, so
+            // `pbcopy` sees EOF; this reaps it rather than leaving a
+            // zombie behind every yank. It blocks a worker thread, which
+            // is what worker threads are for.
+            let _ = child.wait_with_output();
+        });
     }
 
     pub fn set_status(&mut self, message: impl Into<String>) {
@@ -4656,7 +4672,10 @@ pub mod tests {
             ("src/tui/mod.rs", 0),
         ];
         // Built rather than written, so this test does not match itself.
-        let blocking = format!(".{}()", "status");
+        // `wait` as well as `status`: waiting on a child pando spawned
+        // blocks whatever thread asks, and the rule is about the thread,
+        // not about which call is used to wait.
+        let blocking = [format!(".{}()", "status"), format!(".{}()", "wait")];
         let spawn = format!("Command::{}", "new");
         for (file, allowed) in expected {
             let whole = std::fs::read_to_string(root.join(file)).unwrap();
@@ -4666,11 +4685,13 @@ pub mod tests {
                 .filter(|line| !line.trim_start().starts_with("//"))
                 .collect::<Vec<_>>()
                 .join("\n");
-            assert!(
-                !source.contains(&blocking),
-                "{file}: a blocking wait on a child freezes the frame it is \
-                 called from"
-            );
+            for call in &blocking {
+                assert!(
+                    !source.contains(call.as_str()),
+                    "{file}: `{call}` blocks on a child, which belongs on a \
+                     worker thread and never in a key handler"
+                );
+            }
             assert_eq!(
                 source.matches(&spawn).count(),
                 allowed,
