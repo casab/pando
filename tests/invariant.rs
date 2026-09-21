@@ -1046,3 +1046,80 @@ fn a_failed_install_leaves_the_repository_and_the_worktree_alone() {
     assert!(worktree.is_dir(), "the worktree survives a failed install");
     h.assert_untouched("a failed install", Some(&worktree));
 }
+
+// The runtime question is about the machine, so its answer goes to the
+// machine-wide layer under pando's home — and the probe that provoked it
+// leaves a cache there too. Neither may land in the repository, and a
+// refused answer may land nowhere at all.
+#[test]
+fn answering_the_runtime_question_writes_only_under_pandos_home() {
+    let mut h = harness_with(
+        "[project]\nprovision = [\".env\"]\n\n[dev]\ncmd = \"sleep 30\"\nports = []\n",
+    );
+    // A pin nothing on any machine resolves, committed so the fixture's
+    // own tree is still clean.
+    std::fs::write(h.root.join(".nvmrc"), "99\n").unwrap();
+    git(&h.root, &["add", ".nvmrc"]);
+    git(&h.root, &["commit", "--quiet", "-m", "pin a runtime"]);
+    // The pin is part of the fixture from here on.
+    h.baseline = tree(&h.root);
+    let baseline = tree(&h.root);
+    let project_layer = std::fs::read_to_string(h.paths.config_file()).unwrap();
+
+    // A prelude that really does fix it: a `node` of this test's own,
+    // under pando's home rather than anywhere near the repository.
+    let bin = h.home.join("fake-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let node = bin.join("node");
+    std::fs::write(&node, "#!/bin/sh\necho v99.0.0\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let prelude = format!("export PATH=\"{}:$PATH\"", bin.display());
+
+    // A line that does not work is refused, and nothing is written.
+    let refused = actions::resolve_process(
+        &h.paths,
+        &h.config,
+        false,
+        &|_| Ok(actions::Answer::Custom("true".to_string())),
+        &|_| {},
+    );
+    assert!(refused.is_err(), "a prelude that does not work is refused");
+    assert!(
+        !h.paths.user_config_file().exists(),
+        "and a refused answer is not written down"
+    );
+    assert_eq!(
+        tree(&h.root),
+        baseline,
+        "a refused answer touched the repository"
+    );
+
+    // And one that works is written to the machine-wide layer.
+    let answer = prelude.clone();
+    let config = actions::resolve_process(
+        &h.paths,
+        &h.config,
+        false,
+        &move |_| Ok(actions::Answer::Custom(answer.clone())),
+        &|_| {},
+    )
+    .unwrap();
+    assert_eq!(config.runtime.prelude.as_deref(), Some(prelude.as_str()));
+
+    for written in [h.paths.user_config_file(), h.paths.runtime_cache_file()] {
+        assert!(
+            written.exists() && written.starts_with(&h.home),
+            "{} must exist under pando's home",
+            written.display()
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(h.paths.config_file()).unwrap(),
+        project_layer,
+        "the project layer says what the project needs, not what this laptop does"
+    );
+    assert_eq!(tree(&h.root), baseline);
+    assert_eq!(status_porcelain(&h.root), "");
+    h.assert_untouched("answering the runtime question", None);
+}

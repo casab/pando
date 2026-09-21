@@ -28,11 +28,18 @@ fn env() -> Env {
 fn env_of(kind: Kind) -> Env {
     let dir = TempDir::new().unwrap();
     let root = build(kind, dir.path()).root;
-    Env {
+    let env = Env {
         home: dir.path().join("pando-home"),
         root,
         _dir: dir,
-    }
+    };
+    // The one question that is about this machine rather than the fixture.
+    // Several fixtures pin a runtime — `.nvmrc` 22, `.python-version` 3.12
+    // — and the commands these tests actually run are `sleep` and a python
+    // listener, so nothing has to be initialised in front of them. The
+    // answer goes where that kind of answer lives: the user layer.
+    env.write_user_config("[runtime]\nprelude = \"\"\n");
+    env
 }
 
 /// Every process a test starts is stopped when its environment goes, even
@@ -61,6 +68,18 @@ impl Env {
 
     fn config_file(&self) -> std::path::PathBuf {
         self.project_dir().join("pando.toml")
+    }
+
+    /// The machine-wide layer, under every project's own config.
+    fn write_user_config(&self, toml: &str) {
+        std::fs::create_dir_all(&self.home).unwrap();
+        std::fs::write(self.home.join("config.toml"), toml).unwrap();
+    }
+
+    /// Takes the machine answer away again, for the tests that are about
+    /// pando noticing the machine does not resolve what the project pins.
+    fn unanswer_the_runtime(&self) {
+        std::fs::remove_file(self.home.join("config.toml")).unwrap();
     }
 
     fn log_file(&self, name: &str, source: &str) -> std::path::PathBuf {
@@ -1489,4 +1508,90 @@ fn start_isolated_on_a_project_with_no_services_runs_shared() {
     assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
     assert!(stderr(&out).contains("shared mode"), "{}", stderr(&out));
     assert_eq!(code(&e.pando(&["stop"])), EXIT_OK);
+}
+
+// ---- the runtime the project asks for -------------------------------------
+
+/// The fixture, plus a committed pin no machine resolves, and the machine
+/// answer taken away again.
+fn env_pinning_an_impossible_runtime() -> Env {
+    let e = env();
+    e.unanswer_the_runtime();
+    std::fs::write(e.root.join(".nvmrc"), "99\n").unwrap();
+    git(&e.root, &["add", ".nvmrc"]);
+    git(&e.root, &["commit", "--quiet", "-m", "pin node 99"]);
+    e.write_config(SLEEPER);
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+    e
+}
+
+// A dev server started under a runtime the project rejects dies of it. The
+// whole point of asking first is that nothing is started.
+#[test]
+fn a_runtime_this_machine_does_not_resolve_is_a_question_not_a_dead_process() {
+    let e = env_pinning_an_impossible_runtime();
+
+    let out = e.pando(&["start", "feat+one"]);
+    assert_eq!(code(&out), EXIT_NEEDS_ANSWER, "stdout: {}", stdout(&out));
+    let printed = stderr(&out);
+    assert!(printed.contains("node 99 (.nvmrc)"), "{printed}");
+    assert!(
+        printed.contains("bash -lc"),
+        "the shell pando actually uses is named: {printed}"
+    );
+    assert!(
+        printed.contains("~/.pando/config.toml"),
+        "and the file the answer belongs in, which is not the project's own: {printed}"
+    );
+    assert!(
+        !e.log_file("feat+one", "dev").exists(),
+        "nothing may be spawned before the runtime is settled"
+    );
+    assert!(stdout(&out).is_empty(), "{}", stdout(&out));
+    assert_eq!(status_porcelain(&e.root), "");
+}
+
+// The case that is invisible without a probe: a prelude is set, and it is
+// not doing anything.
+#[test]
+fn a_prelude_that_does_not_work_stops_the_start_and_names_the_file() {
+    let e = env_pinning_an_impossible_runtime();
+    e.write_user_config("[runtime]\nprelude = \"true\"\n");
+
+    let out = e.pando(&["start", "feat+one"]);
+    assert_eq!(code(&out), EXIT_ERROR, "stdout: {}", stdout(&out));
+    let printed = stderr(&out);
+    assert!(printed.contains("is not working"), "{printed}");
+    assert!(printed.contains("prelude: true"), "{printed}");
+    assert!(printed.contains("config.toml"), "{printed}");
+    assert!(
+        !e.log_file("feat+one", "dev").exists(),
+        "nothing may be spawned"
+    );
+}
+
+// And the answer that makes it go away: a line this machine really can
+// run, written to the machine-wide layer and never asked about again.
+#[test]
+fn a_prelude_that_works_is_written_to_the_user_layer_and_the_start_proceeds() {
+    let e = env_pinning_an_impossible_runtime();
+    let bin = e.home.join("fake-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("node"), "#!/bin/sh\necho v99.0.0\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(bin.join("node"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    e.write_user_config(&format!(
+        "[runtime]\nprelude = 'export PATH=\"{}:$PATH\"'\n",
+        bin.display()
+    ));
+
+    let out = e.pando(&["start", "feat+one"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("started feat+one"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(code(&e.pando(&["stop"])), EXIT_OK);
+    assert_eq!(status_porcelain(&e.root), "");
 }

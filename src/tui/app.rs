@@ -2906,6 +2906,7 @@ pub mod tests {
             allow_none: false,
             multi: false,
             checked: Vec::new(),
+            details: Vec::new(),
         }
     }
 
@@ -2938,6 +2939,7 @@ pub mod tests {
             allow_none: true,
             multi: true,
             checked: vec![1, 2],
+            details: Vec::new(),
         }
     }
 

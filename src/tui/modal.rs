@@ -17,6 +17,10 @@ use crate::worktree::BranchSource;
 /// rather than a sliver.
 const MIN_POPUP_WIDTH: u16 = 34;
 
+/// How much of a question's report a popup shows. The whole of it is on
+/// stderr for `pando start`; here it has to leave room for the options.
+const MAX_DETAIL_LINES: usize = 6;
+
 pub fn render_modal(f: &mut Frame, area: Rect, modal: &Modal, app: &App) {
     match modal {
         Modal::Create {
@@ -65,28 +69,35 @@ fn render_question(
     custom: Option<&str>,
     checked: &[usize],
 ) {
-    let height = (question.options.len() as u16).min(8) + 7;
+    // The report a question carries: what the project asks for, what this
+    // machine answered, and where from. Capped, because a popup in a tmux
+    // split is not a page.
+    let details: Vec<&String> = question.details.iter().take(MAX_DETAIL_LINES).collect();
+    let detail_height = details.len() as u16;
+    let height = (question.options.len() as u16).min(8) + 7 + detail_height;
     let Some(inner) = popup(f, area, "pando needs an answer", height, 64) else {
         return;
     };
     let width = inner.width as usize;
     let [prompt_area, list_area, footer_area] = Layout::vertical([
-        Constraint::Length(2),
+        Constraint::Length(2 + detail_height),
         Constraint::Fill(1),
         Constraint::Length(2),
     ])
     .areas(inner);
 
-    f.render_widget(
-        Paragraph::new(vec![
-            Line::styled(
-                truncate(&question.prompt, width),
-                Style::new().fg(text()).add_modifier(Modifier::BOLD),
-            ),
-            Line::raw(""),
-        ]),
-        prompt_area,
-    );
+    let mut prompt_lines = vec![Line::styled(
+        truncate(&question.prompt, width),
+        Style::new().fg(text()).add_modifier(Modifier::BOLD),
+    )];
+    for line in details {
+        prompt_lines.push(Line::styled(
+            truncate(line, width),
+            Style::new().fg(text_muted()),
+        ));
+    }
+    prompt_lines.push(Line::raw(""));
+    f.render_widget(Paragraph::new(prompt_lines), prompt_area);
 
     let visible = list_area.height as usize;
     let start = selected.saturating_sub(visible.saturating_sub(1));

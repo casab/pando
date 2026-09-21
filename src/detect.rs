@@ -450,6 +450,11 @@ fn binary_crate(root: &Path) -> bool {
 pub enum Slot {
     Install,
     VersionFiles,
+    /// The shell line that makes this machine resolve the runtime the
+    /// project asks for. The one slot whose answer is about the laptop
+    /// rather than the repository, which is why it is written to the user
+    /// layer — see [`Slot::layer`].
+    Prelude,
     /// The shape of the whole `[processes]` table: one process, or one per
     /// app of a workspace. Asked before the slots that fill a single
     /// process, because it decides whether there is one.
@@ -473,6 +478,21 @@ impl Slot {
         self == Slot::Services
     }
 
+    /// Which file this slot's answer is written to.
+    ///
+    /// Everything a project needs goes in the project layer, because it is
+    /// true of the repository wherever it is checked out. The prelude does
+    /// not: which version manager has to be initialised is a property of
+    /// this machine, and a developer answers it once per laptop rather
+    /// than once per project. The requirement stays a project fact; only
+    /// the mechanism moves.
+    pub fn layer(self) -> crate::config::Layer {
+        match self {
+            Slot::Prelude => crate::config::Layer::User,
+            _ => crate::config::Layer::Project,
+        }
+    }
+
     /// The array of tables this slot appends to, for the two slots whose
     /// answer is a whole `[[table]]` entry.
     pub fn array(self) -> Option<&'static str> {
@@ -489,6 +509,7 @@ impl Slot {
         Some(match self {
             Slot::Install => (&["project"], "install"),
             Slot::VersionFiles => (&["runtime"], "version_files"),
+            Slot::Prelude => (&["runtime"], "prelude"),
             Slot::DevCmd => (&["dev"], "cmd"),
             Slot::PortEnv => (&["dev"], "ports"),
             Slot::Provision => (&["project"], "provision"),
@@ -501,6 +522,10 @@ impl Slot {
         match self {
             Slot::Install => "Which command installs this project's dependencies?",
             Slot::VersionFiles => "Which file pins this project's runtime version?",
+            Slot::Prelude => {
+                "Which line should pando run first, so this shell resolves the \
+                              runtime the project asks for?"
+            }
             Slot::Processes => "Run these as separate processes?",
             Slot::DevCmd => "Which command starts the local development server?",
             Slot::PortEnv => "Which environment variable sets the web server's port?",
@@ -1702,6 +1727,10 @@ pub fn still_needed(slot: Slot, config: &Config) -> bool {
         // with `ports = []`, and asking again would hand it a port it will
         // never bind and then call it failed for not binding it.
         Slot::PortEnv => config.processes.get(DEV).is_none_or(|p| p.ports.is_none()),
+        // Unset, not empty, exactly as for the port slot: `prelude = ""`
+        // is "this machine needs nothing", which is an answer, and asking
+        // again would be asking a developer to say no twice.
+        Slot::Prelude => config.runtime.prelude.is_none(),
         // Anything already in `[[services]]` is an answer about every
         // service: a developer who listed two has said the third is not
         // wanted, and a second run must not offer it again.
@@ -1783,6 +1812,7 @@ pub fn apply(slot: Slot, candidate: &Candidate, config: &mut Config) {
     match slot {
         Slot::Install => config.project.install = Some(candidate.value.clone()),
         Slot::VersionFiles => config.runtime.version_files = split_list(&candidate.value),
+        Slot::Prelude => config.runtime.prelude = Some(candidate.value.clone()),
         Slot::Provision => config.project.provision = split_list(&candidate.value),
         Slot::Processes => {
             for (name, process) in candidate.processes.iter().flatten() {
@@ -1923,6 +1953,10 @@ pub fn edits(slot: Slot, candidate: &Candidate) -> Vec<Edit> {
     };
     let keyed = slot.key();
     match slot {
+        Slot::Prelude => {
+            let (table, key) = keyed.expect("this slot writes one key");
+            vec![single(table, key, candidate.value.clone().into())]
+        }
         Slot::Install | Slot::DevCmd => {
             let (table, key) = keyed.expect("this slot writes one key");
             let mut out = vec![single(table, key, candidate.value.clone().into())];

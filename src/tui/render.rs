@@ -2157,6 +2157,7 @@ mod tests {
                     allow_none: false,
                     multi: false,
                     checked: Vec::new(),
+                    details: Vec::new(),
                 },
                 selected: 11,
                 custom: Some("a rather long command typed by hand".into()),

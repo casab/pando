@@ -416,6 +416,26 @@ fn prompt_with(
     prompt_one(question, out, read)
 }
 
+/// The report a question carries, indented under its prompt. Everything
+/// pando knows that made it worth asking, and on stderr like the question
+/// itself.
+fn write_details(question: &actions::Question, out: &mut impl Write) -> Result<()> {
+    for line in &question.details {
+        writeln!(out, "  {line}")?;
+    }
+    Ok(())
+}
+
+/// What "none" means, which is different for each slot that offers it.
+fn none_label(slot: crate::detect::Slot) -> &'static str {
+    match slot {
+        crate::detect::Slot::Prelude => {
+            "none — this machine needs no line in front of its commands"
+        }
+        _ => "none — this process has no port",
+    }
+}
+
 /// `a, b` — the readable form of a set, for a notice.
 fn joined(values: &[&str]) -> String {
     if values.is_empty() {
@@ -445,6 +465,7 @@ fn prompt_many(
         .max()
         .unwrap_or(0);
     writeln!(out, "pando: {}", question.prompt)?;
+    write_details(question, out)?;
     loop {
         for (i, (value, why)) in question.options.iter().enumerate() {
             let box_ = if checked[i] { "[x]" } else { "[ ]" };
@@ -511,6 +532,7 @@ fn prompt_one(
         .max()
         .unwrap_or(0);
     writeln!(out, "pando: {}", question.prompt)?;
+    write_details(question, out)?;
     for (i, (value, why)) in question.options.iter().enumerate() {
         let marker = if question.preselect == Some(i) {
             "*"
@@ -523,7 +545,7 @@ fn prompt_one(
         writeln!(out, "   c) something else — type the command")?;
     }
     if question.allow_none {
-        writeln!(out, "   n) none — this process has no port")?;
+        writeln!(out, "   n) {}", none_label(question.slot))?;
     }
     let default = question.preselect.map(|i| i + 1);
     loop {
@@ -595,6 +617,9 @@ pub fn render_needs_answer(needs: &actions::NeedsAnswer) -> String {
 ",
         needs.question.prompt
     );
+    for line in &needs.question.details {
+        out.push_str(&format!("  {line}\n"));
+    }
     for (i, (value, why)) in needs.question.options.iter().enumerate() {
         // A set question shows what it would take, because that is what
         // `--yes` would accept and the thing an agent has to decide about.
@@ -617,21 +642,35 @@ pub fn render_needs_answer(needs: &actions::NeedsAnswer) -> String {
         );
         return out;
     }
+    let file = answer_file(needs.question.slot);
     if needs.question.options.is_empty() {
         // `--yes` takes the first option, and there is no first option, so
         // offering it is an instruction to run the same failure again.
-        out.push_str(
+        out.push_str(&format!(
             "  (pando found no candidates for this)
-pando: answer it in pando.toml — nothing pando can accept for you exists here
-",
-        );
+pando: answer it in {file} — nothing pando can accept for you exists here
+"
+        ));
         return out;
     }
-    out.push_str(
-        "pando: answer it in pando.toml, or rerun with --yes to take the first option
-",
-    );
+    out.push_str(&format!(
+        "pando: answer it in {file}, or rerun with --yes to take the first option
+"
+    ));
     out
+}
+
+/// Which file an answer to this question is written to, so the way out
+/// names the file to edit rather than the usual one.
+///
+/// The prelude is about the machine, not the project, and its answer lives
+/// in pando's machine-wide config — telling an agent to put it in
+/// `pando.toml` would send it to a file pando will not read it from.
+fn answer_file(slot: crate::detect::Slot) -> &'static str {
+    match slot.layer() {
+        crate::config::Layer::User => "~/.pando/config.toml",
+        crate::config::Layer::Project => "pando.toml",
+    }
 }
 
 fn url_suffix(url: Option<&str>) -> String {
@@ -1865,6 +1904,7 @@ mod tests {
             allow_none: false,
             multi: false,
             checked: Vec::new(),
+            details: Vec::new(),
         }
     }
 
@@ -1883,6 +1923,7 @@ mod tests {
             allow_none: true,
             multi: true,
             checked: vec![1, 2],
+            details: Vec::new(),
         }
     }
 

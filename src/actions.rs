@@ -836,6 +836,11 @@ pub struct Question {
     pub multi: bool,
     /// For a multi-select question, the options that start ticked.
     pub checked: Vec<usize>,
+    /// The report a question needs to be answerable: what the project
+    /// asks for, what this machine answered, and where from. Printed
+    /// above the options by every front end, and carried on the question
+    /// rather than narrated separately so the exit-3 render has it too.
+    pub details: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -892,7 +897,11 @@ pub const NEW_SLOTS: [Slot; 3] = [Slot::Install, Slot::VersionFiles, Slot::Provi
 /// too, so on a plain start it is only ever *taken*, never *asked*:
 /// "which services do you want private copies of?" is a question about a
 /// mode this start is not in.
-pub const START_SLOTS: [Slot; 5] = [
+pub const START_SLOTS: [Slot; 6] = [
+    // First, and before anything is spawned: a process started under the
+    // wrong runtime dies of it, and the point of asking is to not start
+    // it.
+    Slot::Prelude,
     Slot::Processes,
     Slot::DevCmd,
     Slot::PortEnv,
@@ -959,8 +968,49 @@ pub fn resolve_silencing(
     ask: Ask<'_>,
     progress: &dyn Fn(&str),
 ) -> Result<Config> {
+    let shell = runtime_shell(paths.root());
+    let machine = Machine {
+        shell: &shell,
+        home: user_home(),
+    };
+    resolve_on(paths, config, slots, silent, ask, progress, &machine)
+}
+
+/// [`resolve_silencing`] with the machine injected, so a test can answer
+/// for a laptop it does not have.
+pub fn resolve_on(
+    paths: &PandoPaths,
+    config: &Config,
+    slots: &[Slot],
+    silent: &[Slot],
+    ask: Ask<'_>,
+    progress: &dyn Fn(&str),
+    machine: &Machine<'_>,
+) -> Result<Config> {
     let mut config = config.clone();
-    if slots.iter().all(|slot| already_answered(*slot, &config)) {
+    // Before the early return, and not inside the slot loop: a prelude
+    // that is already set reads as an answered slot, and "the prelude is
+    // set and still does not work" is exactly the case worth reporting.
+    // It is also read-only unless it has something to say, so a project
+    // that pins nothing pays one directory read for it.
+    let runtime = if slots.contains(&Slot::Prelude) {
+        resolve_runtime(paths, &config, machine)?
+    } else {
+        RuntimeOutcome::Fine
+    };
+    let mut prelude_details: Vec<String> = Vec::new();
+    let mut prelude_proposal: Option<detect::Proposal> = None;
+    match runtime {
+        // The prelude is not working, and only the developer can say what
+        // should replace it. Nothing is spawned, which is the point.
+        RuntimeOutcome::Broken(report) => bail!("{report}"),
+        RuntimeOutcome::Ask { proposal, report } => {
+            prelude_details = report;
+            prelude_proposal = Some(proposal);
+        }
+        RuntimeOutcome::Fine => {}
+    }
+    if prelude_proposal.is_none() && slots.iter().all(|slot| already_answered(*slot, &config)) {
         return Ok(config);
     }
     let signals = detect::signals(paths.root());
@@ -979,7 +1029,11 @@ pub fn resolve_silencing(
         .config()
         .ok()
     };
-    let proposals = detect::propose_with(paths.root(), &signals, Some(&resolve));
+    let mut proposals = detect::propose_with(paths.root(), &signals, Some(&resolve));
+    // The one proposal that is not tier 1: it took a probe to find, and it
+    // is about this machine rather than this repository. It goes through
+    // the same loop as every other slot from here on.
+    proposals.extend(prelude_proposal);
     // Asked of the config as it was loaded: once detection has written
     // `[dev].cmd`, the file is indistinguishable from one a developer
     // wrote by hand, and a `[dev]` they wrote is an answer about its ports
@@ -1009,6 +1063,13 @@ pub fn resolve_silencing(
         if !proposal.decided && silent.contains(slot) {
             continue;
         }
+        // The one slot whose answer is about the machine. It is written
+        // to a different file, and it is verified before it is written,
+        // which is two reasons not to run it through the generic path.
+        if *slot == Slot::Prelude {
+            answer_prelude(paths, &mut config, proposal, &prelude_details, ask, machine)?;
+            continue;
+        }
         // The one slot whose answer is a set. It never takes the
         // single-candidate path below, because "these three" is not one of
         // the options — it is a subset of them.
@@ -1032,7 +1093,7 @@ pub fn resolve_silencing(
                 }
                 (taken, config::Note::Detected(why))
             } else {
-                let question = question_for(proposal);
+                let question = question_for(proposal, &[]);
                 let offered = question.options.len();
                 match ask(&question)? {
                     Answer::Many(indexes) => (
@@ -1080,7 +1141,7 @@ pub fn resolve_silencing(
             let why = candidate.why.clone();
             (candidate, config::Note::Detected(why))
         } else {
-            let question = question_for(proposal);
+            let question = question_for(proposal, &[]);
             let offered = question.options.len();
             match ask(&question)? {
                 Answer::Choice(index) => {
@@ -1106,6 +1167,7 @@ pub fn resolve_silencing(
                     let (table, key) = Slot::PortEnv.key().expect("the port slot writes one key");
                     config::set_detected(
                         paths,
+                        Slot::PortEnv.layer(),
                         table,
                         key,
                         toml_edit::Value::Array(toml_edit::Array::new()),
@@ -1128,7 +1190,7 @@ pub fn resolve_silencing(
         // A slot whose answer is a whole `[[table]]` entry: appended, with
         // the note on the entry's own header rather than on each key.
         if let Some((array, entries)) = detect::array_edits(*slot, &[&candidate]) {
-            config::set_detected_array_entry(paths, array, entries, note.clone())?;
+            config::set_detected_array_entry(paths, slot.layer(), array, entries, note.clone())?;
             detect::apply(*slot, &candidate, &mut config);
             continue;
         }
@@ -1139,12 +1201,19 @@ pub fn resolve_silencing(
             // five keys.
             for (table, entries) in group_by_table(edits) {
                 let table: Vec<&str> = table.iter().map(String::as_str).collect();
-                config::set_detected_table(paths, &table, entries, note.clone())?;
+                config::set_detected_table(paths, slot.layer(), &table, entries, note.clone())?;
             }
         } else {
             for edit in edits {
                 let table: Vec<&str> = edit.table.iter().map(String::as_str).collect();
-                config::set_detected(paths, &table, &edit.key, edit.value, note.clone())?;
+                config::set_detected(
+                    paths,
+                    slot.layer(),
+                    &table,
+                    &edit.key,
+                    edit.value,
+                    note.clone(),
+                )?;
             }
         }
         detect::apply(*slot, &candidate, &mut config);
@@ -1180,7 +1249,7 @@ fn apply_service_answer(
     };
     let refs: Vec<&detect::Candidate> = chosen.iter().collect();
     let (array, entries) = detect::service_entry(&file, &refs);
-    config::set_detected_array_entry(paths, array, entries, note)?;
+    config::set_detected_array_entry(paths, Slot::Services.layer(), array, entries, note)?;
     detect::apply_services(&file, &refs, config);
     Ok(())
 }
@@ -1211,7 +1280,7 @@ fn pick(proposal: &detect::Proposal, index: usize) -> Result<detect::Candidate> 
         .cloned()
 }
 
-fn question_for(proposal: &detect::Proposal) -> Question {
+fn question_for(proposal: &detect::Proposal, details: &[String]) -> Question {
     Question {
         slot: proposal.slot,
         prompt: proposal.slot.prompt().to_string(),
@@ -1224,9 +1293,14 @@ fn question_for(proposal: &detect::Proposal) -> Question {
         // A set answer takes the options as they are; there is no command
         // to type in place of "which of these containers".
         allow_custom: !proposal.slot.is_multi(),
-        allow_none: proposal.slot == Slot::PortEnv || proposal.slot.is_multi(),
+        // "This process has no port", "none of those services", and "this
+        // machine needs nothing in front of its commands": three slots
+        // whose empty answer means something and has to be recordable.
+        allow_none: matches!(proposal.slot, Slot::PortEnv | Slot::Prelude)
+            || proposal.slot.is_multi(),
         multi: proposal.slot.is_multi(),
         checked: proposal.preselected(),
+        details: details.to_vec(),
     }
 }
 
@@ -1234,6 +1308,7 @@ fn slot_label(slot: Slot) -> &'static str {
     match slot {
         Slot::Install => "install command",
         Slot::VersionFiles => "runtime version file",
+        Slot::Prelude => "runtime prelude",
         Slot::Processes => "process list",
         Slot::DevCmd => "dev command",
         Slot::PortEnv => "port variable",
@@ -1248,6 +1323,10 @@ fn already_answered(slot: Slot, config: &Config) -> bool {
     match slot {
         Slot::Install => config.project.install.is_some(),
         Slot::VersionFiles => !config.runtime.version_files.is_empty(),
+        // Set to anything at all, the empty string included: `prelude =
+        // ""` is "this machine needs nothing", and a developer who has
+        // said that is not asked again.
+        Slot::Prelude => config.runtime.prelude.is_some(),
         Slot::Provision => !config.project.provision.is_empty(),
         Slot::Services => !config.services.is_empty(),
         Slot::SchemaHook => !config.hooks.is_empty(),
@@ -1256,6 +1335,313 @@ fn already_answered(slot: Slot, config: &Config) -> bool {
         // project's processes are?
         Slot::Processes | Slot::DevCmd | Slot::PortEnv => !detect::still_needed(slot, config),
     }
+}
+
+// ---- the runtime the project asks for -------------------------------------
+
+/// What the runtime check needs from outside this process: a shell to ask,
+/// and the home directory version managers install themselves into.
+///
+/// Injected rather than read, so a test can answer for a machine it does
+/// not have.
+pub struct Machine<'a> {
+    pub shell: crate::runtime::Shell<'a>,
+    pub home: PathBuf,
+}
+
+/// How long one probe gets. It is a login shell that may source a version
+/// manager, so it is not instant — and it is cached against the
+/// requirement, so it is not often either.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// A shell that runs what a spawn runs: `bash -lc`, in the main checkout.
+/// Its output is captured rather than inherited, so nothing here can paint
+/// over the TUI, and `run_captured` bounds the wait as well as the drain.
+fn runtime_shell(cwd: &Path) -> impl Fn(&str) -> Option<String> {
+    move |command: &str| {
+        let captured = proc::run_captured(command, cwd, &[], PROBE_TIMEOUT).ok()?;
+        Some(format!("{}\n{}", captured.stdout, captured.stderr))
+    }
+}
+
+/// The developer's home, which is where version managers live.
+///
+/// Not pando's home: `~/.pando` is where pando writes, `~/.nvm` is where
+/// nvm is.
+fn user_home() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// What the probe found, and what there is to do about it.
+enum RuntimeOutcome {
+    /// Nothing to say: nothing pinned, a match, or something this build
+    /// cannot judge. Silence is the common case and the right one.
+    Fine,
+    /// A mismatch with no prelude set: a question, with the lines that
+    /// would fix it and the report that makes it answerable.
+    Ask {
+        proposal: detect::Proposal,
+        report: Vec<String>,
+    },
+    /// A mismatch with a prelude already set. The prelude is not working,
+    /// and nothing but the developer can say what should replace it.
+    Broken(String),
+}
+
+/// Asks the shell pando will spawn in what it resolves, and compares it to
+/// what the repository asks for.
+///
+/// Three outcomes, and the one that matters is the second: a process
+/// started under a runtime the project rejects dies of it, and the whole
+/// point of asking first is not to start it.
+fn resolve_runtime(
+    paths: &PandoPaths,
+    config: &Config,
+    machine: &Machine<'_>,
+) -> Result<RuntimeOutcome> {
+    let prelude = match config.runtime.prelude.as_deref() {
+        // An answer, and the one that means "this machine needs nothing".
+        // The same distinction `ports = []` makes: unset is nobody having
+        // said, empty is somebody having said no.
+        Some(prelude) if prelude.trim().is_empty() => return Ok(RuntimeOutcome::Fine),
+        Some(prelude) => prelude.trim(),
+        None => "",
+    };
+    let requirements = crate::runtime::requirements(paths.root());
+    let Some(check) = first_mismatch(paths, &requirements, prelude, machine.shell)? else {
+        return Ok(RuntimeOutcome::Fine);
+    };
+    if prelude.is_empty() {
+        let report = runtime_report(&check, &requirements, prelude, &machine.home, None);
+        Ok(RuntimeOutcome::Ask {
+            proposal: prelude_proposal(&check, &machine.home),
+            report,
+        })
+    } else {
+        let origin = config::prelude_origin(paths);
+        let report = runtime_report(&check, &requirements, prelude, &machine.home, origin);
+        Ok(RuntimeOutcome::Broken(report.join("\n  ")))
+    }
+}
+
+/// The first language whose requirement this machine definitely does not
+/// meet, probing at most once per language and remembering the ones that
+/// passed.
+///
+/// Only passes are remembered: a cached failure would go on reporting a
+/// problem the developer has just fixed, and a failure stops the start
+/// anyway, so there is no spawn to save by keeping it.
+fn first_mismatch(
+    paths: &PandoPaths,
+    requirements: &[crate::runtime::Requirement],
+    prelude: &str,
+    shell: crate::runtime::Shell<'_>,
+) -> Result<Option<crate::runtime::Check>> {
+    if requirements.is_empty() {
+        return Ok(None);
+    }
+    let cache_file = paths.runtime_cache_file();
+    let mut cache = crate::runtime::load_cache(&cache_file);
+    let mut learned = false;
+    let mut mismatch = None;
+    for language in crate::runtime::LANGUAGES {
+        // The pin if the project has one, else whatever range it stated:
+        // that is what `for_language` sorted to the front.
+        let Some(requirement) = crate::runtime::for_language(requirements, language.name) else {
+            continue;
+        };
+        let fingerprint = crate::runtime::fingerprint(requirement, prelude);
+        if cache.holds(&fingerprint) {
+            continue;
+        }
+        let check = crate::runtime::check(requirement, prelude, shell);
+        match check.verdict {
+            crate::runtime::Verdict::Satisfied => {
+                cache.remember(
+                    fingerprint,
+                    check.resolved.version.clone().unwrap_or_default(),
+                );
+                learned = true;
+            }
+            crate::runtime::Verdict::Mismatch => {
+                mismatch = Some(check);
+                break;
+            }
+            // A spec this build cannot evaluate, a probe that could not
+            // run, an output that was not a version: never a reason to
+            // stop anything, and never cached either.
+            crate::runtime::Verdict::Unknown => {}
+        }
+    }
+    if learned {
+        // The home is created through the one function that makes it 0700
+        // and refuses it inside the repository, rather than by a cache
+        // write that would know neither rule.
+        paths.ensure_home()?;
+        crate::runtime::save_cache(&cache_file, &cache)?;
+    }
+    Ok(mismatch)
+}
+
+/// The lines that make a mismatch answerable.
+///
+/// Deliberately concrete about the path: pando's shell is not the
+/// developer's shell, and "node 24" is not a diagnosis when everything
+/// works when they type it by hand. Where the binary came from is.
+fn runtime_report(
+    check: &crate::runtime::Check,
+    requirements: &[crate::runtime::Requirement],
+    prelude: &str,
+    home: &Path,
+    origin: Option<PathBuf>,
+) -> Vec<String> {
+    let requirement = &check.requirement;
+    let language = &requirement.language;
+    let mut lines: Vec<String> = Vec::new();
+
+    if !prelude.is_empty() {
+        lines.push(match &origin {
+            Some(path) => format!("the prelude in {} is not working", path.display()),
+            None => "that line does not work".to_string(),
+        });
+        lines.push(format!("prelude: {prelude}"));
+    }
+    lines.push(format!(
+        "this project asks for {language} {} ({})",
+        requirement.spec, requirement.source
+    ));
+    for other in requirements
+        .iter()
+        .filter(|r| r.language == *language && r.source != requirement.source)
+    {
+        lines.push(format!("{} also asks for {}", other.source, other.spec));
+    }
+    if !check.resolved.ran {
+        lines.push(match &check.resolved.failure {
+            Some(failure) => format!("the prelude itself failed: {failure}"),
+            None => "the prelude itself failed".to_string(),
+        });
+    } else {
+        lines.push(match (&check.resolved.version, &check.resolved.path) {
+            (Some(version), Some(path)) => {
+                format!("`bash -lc` here resolves {language} {version}, from {path}")
+            }
+            _ => format!("`bash -lc` here has no {language} at all"),
+        });
+    }
+    lines.push(
+        "pando runs every command with `bash -lc`, which is not your interactive shell".to_string(),
+    );
+
+    let Some(entry) = crate::runtime::language(language) else {
+        return lines;
+    };
+    let installed = crate::runtime::installed(entry, home);
+    lines.push(match installed.as_slice() {
+        [] => format!("no version manager pando knows about is installed for {language}"),
+        managers => format!(
+            "version managers installed here: {}",
+            managers
+                .iter()
+                .map(|m| m.name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    });
+    // Printed, never run. Installing a toolchain is the developer's
+    // decision to make on their own machine.
+    if let Some(command) = installed
+        .first()
+        .and_then(|manager| manager.install_command(entry, &requirement.spec))
+    {
+        lines.push(format!(
+            "if {language} {} is not installed yet: {command} — pando never installs one",
+            requirement.spec
+        ));
+    }
+    lines
+}
+
+/// The prelude lines worth offering, for the managers this machine has.
+fn prelude_proposal(check: &crate::runtime::Check, home: &Path) -> detect::Proposal {
+    let requirement = &check.requirement;
+    let candidates = crate::runtime::language(&requirement.language)
+        .map(|language| {
+            crate::runtime::fixes(
+                language,
+                home,
+                crate::runtime::from_version_file(language, requirement),
+            )
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .map(|fix| detect::Candidate {
+            value: fix.line,
+            why: fix.why,
+            ..detect::Candidate::default()
+        })
+        .collect();
+    detect::Proposal {
+        slot: Slot::Prelude,
+        candidates,
+        // Never decided. What one machine needs is not something a rule
+        // gets to settle on a developer's behalf, and the answer lands in
+        // a file every project on that machine shares.
+        decided: false,
+    }
+}
+
+/// Asks the prelude question, checks the answer, and writes it to the user
+/// layer.
+///
+/// Checked *before* it is written, not after: this line applies to every
+/// project on the machine, and `--yes` must not be able to persist one
+/// that does not work into a file nobody looked at.
+fn answer_prelude(
+    paths: &PandoPaths,
+    config: &mut Config,
+    proposal: &detect::Proposal,
+    report: &[String],
+    ask: Ask<'_>,
+    machine: &Machine<'_>,
+) -> Result<()> {
+    let question = question_for(proposal, report);
+    let offered = question.options.len();
+    let (line, note) = match ask(&question)? {
+        Answer::Choice(index) => {
+            let candidate = pick(proposal, index)?;
+            let why = candidate.why.clone();
+            (candidate.value, config::Note::Detected(why))
+        }
+        Answer::Auto(index) => (
+            pick(proposal, index)?.value,
+            config::Note::TookFirst(offered),
+        ),
+        Answer::Custom(value) => (value.trim().to_string(), config::Note::Answered),
+        // "This machine needs nothing." Recorded as an empty prelude
+        // rather than left unset, so it is never asked again — the shape
+        // the port slot already uses for a process with no ports.
+        Answer::None => (String::new(), config::Note::Answered),
+        Answer::Many(_) => bail!(
+            "{} is one line, not several of them",
+            slot_label(Slot::Prelude)
+        ),
+    };
+    if !line.is_empty() {
+        let mut proposed = config.clone();
+        proposed.runtime.prelude = Some(line.clone());
+        if let RuntimeOutcome::Broken(report) = resolve_runtime(paths, &proposed, machine)? {
+            bail!("{report}");
+        }
+    }
+    let (table, key) = Slot::Prelude
+        .key()
+        .expect("the prelude slot writes one key");
+    config::set_detected(paths, Slot::Prelude.layer(), table, key, line.clone(), note)?;
+    config.runtime.prelude = Some(line);
+    Ok(())
 }
 
 // ---- start, stop, restart -------------------------------------------------
@@ -9203,5 +9589,305 @@ time.sleep(300)
             ref_exists(&fx.root, "refs/heads/legacy"),
             "a branch pando did not create must survive the unwind"
         );
+    }
+
+    // ---- the runtime the project asks for --------------------------------
+
+    /// A machine a test decides entirely: a home holding the managers it
+    /// says are installed, and a shell that answers the way it says.
+    struct FakeMachine {
+        home: TempDir,
+        /// Every command the shell was asked to run.
+        asked: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    }
+
+    impl FakeMachine {
+        /// A machine with nvm installed under its own home.
+        fn with_nvm() -> FakeMachine {
+            let home = tempdir().unwrap();
+            std::fs::create_dir_all(home.path().join(".nvm")).unwrap();
+            std::fs::write(home.path().join(".nvm/nvm.sh"), "#!/bin/sh\n").unwrap();
+            FakeMachine {
+                home,
+                asked: Default::default(),
+            }
+        }
+
+        /// A shell that resolves `without` normally, and `with` once a
+        /// prelude carrying `needle` is in front of it — which is what a
+        /// version manager does.
+        fn shell(
+            &self,
+            without: &'static str,
+            needle: &'static str,
+            with: &'static str,
+        ) -> impl Fn(&str) -> Option<String> + use<'_> {
+            let asked = self.asked.clone();
+            move |command: &str| {
+                asked.borrow_mut().push(command.to_string());
+                let version = if !needle.is_empty() && command.contains(needle) {
+                    with
+                } else {
+                    without
+                };
+                Some(crate::runtime::probe_reply(
+                    &format!("/usr/local/bin/node-{version}"),
+                    version,
+                ))
+            }
+        }
+
+        fn probes(&self) -> usize {
+            self.asked.borrow().len()
+        }
+    }
+
+    /// A fixture that pins node, which is what `.nvmrc` does.
+    fn fixture_pinning(file: &str, spec: &str) -> Fx {
+        let fx = fixture();
+        std::fs::write(fx.root.join(file), format!("{spec}\n")).unwrap();
+        fx
+    }
+
+    /// Resolves the one slot these tests are about, on the machine they
+    /// describe.
+    fn resolve_runtime_slot(
+        fx: &Fx,
+        config: &Config,
+        ask: Ask<'_>,
+        shell: &dyn Fn(&str) -> Option<String>,
+        home: &Path,
+    ) -> Result<Config> {
+        let machine = Machine {
+            shell,
+            home: home.to_path_buf(),
+        };
+        resolve_on(
+            &fx.paths,
+            config,
+            &[Slot::Prelude],
+            &[],
+            ask,
+            &noop,
+            &machine,
+        )
+    }
+
+    fn user_config(fx: &Fx) -> String {
+        std::fs::read_to_string(fx.paths.user_config_file()).unwrap_or_default()
+    }
+
+    #[test]
+    fn a_project_that_pins_no_runtime_is_never_probed() {
+        let fx = fixture();
+        let machine = FakeMachine::with_nvm();
+        let shell = machine.shell("24.21.0", "", "");
+        resolve_runtime_slot(&fx, &fx.config, &refuse, &shell, machine.home.path()).unwrap();
+        assert_eq!(
+            machine.probes(),
+            0,
+            "nothing pinned, nothing to ask a shell"
+        );
+    }
+
+    // A match says nothing at all, and is remembered: a start costs one
+    // extra spawn when the requirement changes, not one on every start.
+    #[test]
+    fn a_runtime_this_machine_meets_is_silent_and_probed_once() {
+        let fx = fixture_pinning(".nvmrc", "22");
+        let machine = FakeMachine::with_nvm();
+        let shell = machine.shell("22.11.0", "", "");
+
+        for _ in 0..3 {
+            let config =
+                resolve_runtime_slot(&fx, &fx.config, &refuse, &shell, machine.home.path())
+                    .unwrap();
+            assert_eq!(config.runtime.prelude, None, "nothing is written");
+        }
+        assert_eq!(machine.probes(), 1, "the probe is cached against the pin");
+        assert!(
+            fx.paths.runtime_cache_file().exists(),
+            "and the cache is under pando's home"
+        );
+    }
+
+    // The case the whole work item exists for: the project pins one
+    // version, the shell pando spawns in resolves another, and nothing is
+    // started until that is settled.
+    #[test]
+    fn a_mismatch_asks_before_anything_is_started_and_names_the_path() {
+        let fx = fixture_pinning(".nvmrc", "22");
+        let machine = FakeMachine::with_nvm();
+        // The nvm line works; nothing in front of it does.
+        let shell = machine.shell("24.21.0", "nvm.sh", "22.11.0");
+        let (ask, asked) = scripted(vec![Answer::Choice(0)]);
+
+        let config =
+            resolve_runtime_slot(&fx, &fx.config, &ask, &shell, machine.home.path()).unwrap();
+
+        let question = &asked.borrow()[0];
+        assert_eq!(question.slot, Slot::Prelude);
+        let report = question.details.join("\n");
+        assert!(report.contains("node 22 (.nvmrc)"), "{report}");
+        assert!(report.contains("24.21.0"), "{report}");
+        assert!(
+            report.contains("/usr/local/bin/node-24.21.0"),
+            "the path it resolved from, not only the version: {report}"
+        );
+        assert!(report.contains("nvm"), "which managers are here: {report}");
+        assert!(
+            report.contains("nvm install 22"),
+            "the install command is printed, never run: {report}"
+        );
+        assert!(
+            question.options[0].0.contains("nvm.sh"),
+            "the fix is on offer: {:?}",
+            question.options
+        );
+        assert!(question.allow_none, "and \"nothing is needed\" is sayable");
+
+        // The answer is about this machine, so it is written to the user
+        // layer — and the project's own file is not touched at all.
+        assert!(user_config(&fx).contains("nvm.sh"), "{}", user_config(&fx));
+        assert!(
+            !fx.paths.config_file().exists(),
+            "the project layer is for what the project needs, not what this laptop does"
+        );
+        assert!(config.runtime.prelude.unwrap().contains("nvm.sh"));
+    }
+
+    // Verified before it is written. This line lands in a file every
+    // project on the machine shares, and `--yes` must not be able to
+    // persist one that does not work.
+    #[test]
+    fn a_prelude_that_does_not_work_is_refused_rather_than_written() {
+        let fx = fixture_pinning(".nvmrc", "22");
+        let machine = FakeMachine::with_nvm();
+        let shell = machine.shell("24.21.0", "", "");
+        let (ask, _asked) = scripted(vec![Answer::Custom("true".to_string())]);
+
+        let err =
+            resolve_runtime_slot(&fx, &fx.config, &ask, &shell, machine.home.path()).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("does not work"), "{message}");
+        assert!(message.contains("24.21.0"), "{message}");
+        assert!(
+            !fx.paths.user_config_file().exists(),
+            "a line that does not work is not written down"
+        );
+    }
+
+    // The case that is invisible without this check: a prelude is set, and
+    // it is not doing anything.
+    #[test]
+    fn a_prelude_that_is_set_and_still_wrong_stops_the_start() {
+        let fx = fixture_pinning(".nvmrc", "22");
+        let machine = FakeMachine::with_nvm();
+        let shell = machine.shell("24.21.0", "", "");
+        let mut config = fx.config.clone();
+        config.runtime.prelude = Some("nvm use 22".to_string());
+        // Written where the answer to this question goes, so the report
+        // can say which file to fix.
+        std::fs::create_dir_all(&fx.paths.home).unwrap();
+        std::fs::write(
+            fx.paths.user_config_file(),
+            "[runtime]\nprelude = \"nvm use 22\"\n",
+        )
+        .unwrap();
+
+        let err =
+            resolve_runtime_slot(&fx, &config, &refuse, &shell, machine.home.path()).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("is not working"), "{message}");
+        assert!(
+            message.contains("nvm use 22"),
+            "the prelude itself: {message}"
+        );
+        assert!(
+            message.contains("24.21.0"),
+            "and the version that still resolved: {message}"
+        );
+        assert!(
+            message.contains(&fx.paths.user_config_file().display().to_string()),
+            "and the file to change: {message}"
+        );
+    }
+
+    // A prelude that fails outright is a different sentence from one that
+    // runs and resolves the wrong thing.
+    #[test]
+    fn a_prelude_that_fails_says_that_rather_than_blaming_the_runtime() {
+        let fx = fixture_pinning(".nvmrc", "22");
+        let machine = FakeMachine::with_nvm();
+        let shell = |_: &str| Some("bash: nvm: command not found\n".to_string());
+        let mut config = fx.config.clone();
+        config.runtime.prelude = Some("nvm use 22".to_string());
+
+        let err =
+            resolve_runtime_slot(&fx, &config, &refuse, &shell, machine.home.path()).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("the prelude itself failed: bash: nvm: command not found"),
+            "{message}"
+        );
+    }
+
+    // "This machine needs nothing" is an answer, recorded as an empty
+    // prelude so it is never asked twice — the shape `ports = []` has.
+    #[test]
+    fn nothing_needed_is_an_answer_and_is_only_asked_once() {
+        let fx = fixture_pinning(".nvmrc", "22");
+        let machine = FakeMachine::with_nvm();
+        let shell = machine.shell("24.21.0", "", "");
+        let (ask, _asked) = scripted(vec![Answer::None]);
+
+        let config =
+            resolve_runtime_slot(&fx, &fx.config, &ask, &shell, machine.home.path()).unwrap();
+        assert_eq!(config.runtime.prelude.as_deref(), Some(""));
+        assert!(
+            user_config(&fx).contains("prelude = \"\""),
+            "{}",
+            user_config(&fx)
+        );
+
+        // And now nothing asks, and nothing probes.
+        let probes = machine.probes();
+        resolve_runtime_slot(&fx, &config, &refuse, &shell, machine.home.path()).unwrap();
+        assert_eq!(
+            machine.probes(),
+            probes,
+            "an answered question is not re-probed"
+        );
+    }
+
+    // Unknown is not a mismatch: a spec this build cannot evaluate, or a
+    // shell that could not be run, never stops a start.
+    #[test]
+    fn a_requirement_pando_cannot_judge_blocks_nothing() {
+        let fx = fixture_pinning(".nvmrc", "lts/hydrogen");
+        let machine = FakeMachine::with_nvm();
+        let shell = machine.shell("24.21.0", "", "");
+        resolve_runtime_slot(&fx, &fx.config, &refuse, &shell, machine.home.path()).unwrap();
+
+        let dead = fixture_pinning(".nvmrc", "22");
+        let no_shell = |_: &str| None;
+        resolve_runtime_slot(&dead, &dead.config, &refuse, &no_shell, machine.home.path()).unwrap();
+    }
+
+    // The slot list decides whether the machine is asked about at all:
+    // `new` creates a worktree and spawns no process, so it has no
+    // business probing a runtime.
+    #[test]
+    fn the_slots_new_fills_never_probe_the_runtime() {
+        let fx = fixture_pinning(".nvmrc", "22");
+        let machine = FakeMachine::with_nvm();
+        let shell = machine.shell("24.21.0", "", "");
+        let panicking = |_: &str| -> Option<String> { panic!("new must not probe a runtime") };
+        let m = Machine {
+            shell: &panicking,
+            home: machine.home.path().to_path_buf(),
+        };
+        resolve_on(&fx.paths, &fx.config, &NEW_SLOTS, &[], &refuse, &noop, &m).unwrap();
+        drop(shell);
     }
 }

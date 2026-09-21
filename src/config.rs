@@ -489,15 +489,49 @@ pub fn write(paths: &PandoPaths, config: &Config) -> Result<()> {
     write_private_atomic(&paths.config_file(), &text)
 }
 
-/// Header for a `pando.toml` pando is creating from nothing. Written once, so
-/// the first thing a developer opening the file sees is that the comments
-/// below are pando's and deleting them costs nothing.
-const NEW_FILE_HEADER: &str = "\
-# pando.toml — pando's own config for this project.
-# Lines marked \"# detected:\" or \"# answered:\" were written by pando.
-# Everything here is yours to edit; pando only ever adds keys it is missing.
+/// Which of the files pando may write an answer to.
+///
+/// Two, and the difference is what the answer is *about*. What a project
+/// needs goes in the project layer, because it is true of the repository
+/// wherever it is checked out. How this machine provides it goes in the
+/// user layer, because it is true of the laptop and of every project on
+/// it. A slot says which of the two its answer belongs to; nothing else
+/// decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Layer {
+    #[default]
+    Project,
+    User,
+}
 
-";
+impl Layer {
+    pub fn file(self, paths: &PandoPaths) -> PathBuf {
+        match self {
+            Layer::Project => paths.config_file(),
+            Layer::User => paths.user_config_file(),
+        }
+    }
+
+    /// Header for a file pando is creating from nothing. Written once, so
+    /// the first thing a developer opening it sees is that the comments
+    /// below are pando's and deleting them costs nothing.
+    fn header(self) -> &'static str {
+        match self {
+            Layer::Project => {
+                "# pando.toml — pando's own config for this project.\n\
+                 # Lines marked \"# detected:\" or \"# answered:\" were written by pando.\n\
+                 # Everything here is yours to edit; pando only ever adds keys it is missing.\n\n"
+            }
+            // One file for every project on this machine, which is the
+            // thing to say first: a version manager is installed once.
+            Layer::User => {
+                "# pando's config for this machine, under every project's own pando.toml.\n\
+                 # Lines marked \"# detected:\" or \"# answered:\" were written by pando.\n\
+                 # Everything here is yours to edit; pando only ever adds keys it is missing.\n\n"
+            }
+        }
+    }
+}
 
 /// The mode pando's config is written with. It can carry a command line, and
 /// later phases put service credentials next to it.
@@ -548,12 +582,12 @@ impl Note {
 /// the developer wrote: their comments, their ordering, and any key a newer
 /// pando understands and this one does not. So the document is parsed as a
 /// document, edited, and written back.
-pub fn patch<F>(paths: &PandoPaths, edit: F) -> Result<()>
+pub fn patch<F>(paths: &PandoPaths, layer: Layer, edit: F) -> Result<()>
 where
     F: FnOnce(&mut DocumentMut) -> Result<()>,
 {
     paths.ensure_home()?;
-    let path = paths.config_file();
+    let path = layer.file(paths);
     let existing = match std::fs::read_to_string(&path) {
         Ok(text) => Some(text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -593,7 +627,7 @@ where
         // Nothing to say and nothing to write: a patch that added no keys to
         // a project with no config leaves it without one.
         None if body.trim().is_empty() => return Ok(()),
-        None => format!("{NEW_FILE_HEADER}{body}"),
+        None => format!("{}{body}", layer.header()),
     };
     // And a file whose bytes already say exactly this is left alone too, so
     // mtime-driven watchers stay quiet and a re-run stays quiet with them.
@@ -610,6 +644,7 @@ where
 /// `["project"]`; missing tables are created.
 pub fn set_detected(
     paths: &PandoPaths,
+    layer: Layer,
     table_path: &[&str],
     key: &str,
     value: impl Into<toml_edit::Value>,
@@ -617,8 +652,8 @@ pub fn set_detected(
 ) -> Result<()> {
     let value = value.into();
     let comment = note.comment();
-    let elsewhere = other_layer_declares_processes(paths);
-    patch(paths, move |doc| {
+    let elsewhere = other_layer_declares_processes(paths, layer);
+    patch(paths, layer, move |doc| {
         let target = write_target(doc, elsewhere, table_path);
         let table = ensure_table(doc, &target)?;
         table.insert(key, Item::Value(value));
@@ -638,13 +673,14 @@ pub fn set_detected(
 /// and says it about the table rather than about a key.
 pub fn set_detected_table(
     paths: &PandoPaths,
+    layer: Layer,
     table_path: &[&str],
     entries: Vec<(String, toml_edit::Value)>,
     note: Note,
 ) -> Result<()> {
     let comment = note.comment();
-    let elsewhere = other_layer_declares_processes(paths);
-    patch(paths, move |doc| {
+    let elsewhere = other_layer_declares_processes(paths, layer);
+    patch(paths, layer, move |doc| {
         let target = write_target(doc, elsewhere, table_path);
         let table = ensure_table(doc, &target)?;
         for (key, value) in entries {
@@ -665,6 +701,7 @@ pub fn set_detected_table(
 /// makes that call.
 pub fn set_detected_array_entry(
     paths: &PandoPaths,
+    layer: Layer,
     array: &str,
     entries: Vec<(String, toml_edit::Value)>,
     note: Note,
@@ -674,7 +711,7 @@ pub fn set_detected_array_entry(
     }
     let comment = note.comment();
     let array = array.to_string();
-    patch(paths, move |doc| {
+    patch(paths, layer, move |doc| {
         let item = doc
             .entry(&array)
             .or_insert_with(|| Item::ArrayOfTables(toml_edit::ArrayOfTables::new()));
@@ -704,10 +741,39 @@ pub fn set_detected_array_entry(
 /// fill in. Read as bare tables rather than through `load`: this is a
 /// question about which *tables* exist, and it has to be answerable even
 /// when the merged config would not validate.
-fn other_layer_declares_processes(paths: &PandoPaths) -> bool {
-    [paths.root().join("pando.toml"), paths.user_config_file()]
-        .iter()
-        .any(|path| declares_processes(path))
+fn other_layer_declares_processes(paths: &PandoPaths, layer: Layer) -> bool {
+    [
+        paths.root().join("pando.toml"),
+        paths.user_config_file(),
+        paths.config_file(),
+    ]
+    .iter()
+    .filter(|path| **path != layer.file(paths))
+    .any(|path| declares_processes(path))
+}
+
+/// Which layer's file sets `[runtime].prelude`, highest precedence first.
+///
+/// A report that says a prelude is not working has to say where to change
+/// it, and with three layers that is a real question. Read as a bare table
+/// rather than through `load`, for the same reason the process check is:
+/// it has to be answerable even when the merged config would not build.
+pub fn prelude_origin(paths: &PandoPaths) -> Option<PathBuf> {
+    [
+        Layer::Project.file(paths),
+        Layer::User.file(paths),
+        paths.root().join("pando.toml"),
+    ]
+    .into_iter()
+    .find(|path| declares_prelude(path))
+}
+
+fn declares_prelude(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| toml::from_str::<Table>(&text).ok())
+        .and_then(|table| Some(table.get("runtime")?.get("prelude").is_some()))
+        .unwrap_or(false)
 }
 
 fn declares_processes(path: &Path) -> bool {
@@ -1141,6 +1207,7 @@ prelude = "nvm use"
         write_home(&f, HANDWRITTEN);
         set_detected(
             &f.paths,
+            Layer::Project,
             &["project"],
             "install",
             "pnpm install --frozen-lockfile",
@@ -1183,6 +1250,7 @@ prelude = "nvm use"
         write_home(&f, HANDWRITTEN);
         set_detected(
             &f.paths,
+            Layer::Project,
             &["runtime"],
             "version_files",
             toml_edit::Array::from_iter([".nvmrc"]),
@@ -1210,6 +1278,7 @@ prelude = "nvm use"
         let f = fixture();
         set_detected(
             &f.paths,
+            Layer::Project,
             &["dev"],
             "cmd",
             "pnpm dev",
@@ -1237,7 +1306,15 @@ prelude = "nvm use"
     #[test]
     fn an_answered_note_records_the_date() {
         let f = fixture();
-        set_detected(&f.paths, &["dev"], "cmd", "pnpm dev:web", Note::Answered).unwrap();
+        set_detected(
+            &f.paths,
+            Layer::Project,
+            &["dev"],
+            "cmd",
+            "pnpm dev:web",
+            Note::Answered,
+        )
+        .unwrap();
         let after = home_text(&f);
         let today = Utc::now().format("%Y-%m-%d").to_string();
         assert!(after.contains(&format!("# answered: {today}")), "{after}");
@@ -1246,9 +1323,25 @@ prelude = "nvm use"
     #[test]
     fn patching_the_same_value_twice_replaces_the_note_and_not_the_file() {
         let f = fixture();
-        set_detected(&f.paths, &["dev"], "cmd", "a", Note::Detected("one".into())).unwrap();
+        set_detected(
+            &f.paths,
+            Layer::Project,
+            &["dev"],
+            "cmd",
+            "a",
+            Note::Detected("one".into()),
+        )
+        .unwrap();
         let first = home_text(&f);
-        set_detected(&f.paths, &["dev"], "cmd", "b", Note::Answered).unwrap();
+        set_detected(
+            &f.paths,
+            Layer::Project,
+            &["dev"],
+            "cmd",
+            "b",
+            Note::Answered,
+        )
+        .unwrap();
         let second = home_text(&f);
         assert!(first.contains("cmd = \"a\"  # detected: one"));
         assert!(second.contains("cmd = \"b\"  # answered:"), "{second}");
@@ -1261,10 +1354,26 @@ prelude = "nvm use"
     #[test]
     fn the_config_pando_writes_is_private() {
         let f = fixture();
-        set_detected(&f.paths, &["dev"], "cmd", "pnpm dev", Note::Answered).unwrap();
+        set_detected(
+            &f.paths,
+            Layer::Project,
+            &["dev"],
+            "cmd",
+            "pnpm dev",
+            Note::Answered,
+        )
+        .unwrap();
         assert_eq!(mode_of(&f.paths.config_file()), 0o600);
         // Writing again over an existing file keeps it that way.
-        set_detected(&f.paths, &["dev"], "cwd", "apps/web", Note::Answered).unwrap();
+        set_detected(
+            &f.paths,
+            Layer::Project,
+            &["dev"],
+            "cwd",
+            "apps/web",
+            Note::Answered,
+        )
+        .unwrap();
         assert_eq!(mode_of(&f.paths.config_file()), 0o600);
         assert!(
             !f.paths.config_file().with_extension("toml.tmp").exists(),
@@ -1290,7 +1399,7 @@ prelude = "nvm use"
         ] {
             let f = fixture();
             write_home(&f, original);
-            patch(&f.paths, |_doc| Ok(())).unwrap();
+            patch(&f.paths, Layer::Project, |_doc| Ok(())).unwrap();
             assert_eq!(home_text(&f), original, "{label}");
         }
     }
@@ -1302,6 +1411,7 @@ prelude = "nvm use"
         write_committed(&f, committed);
         set_detected(
             &f.paths,
+            Layer::Project,
             &["project"],
             "install",
             "pnpm install --frozen-lockfile",
@@ -1321,7 +1431,15 @@ prelude = "nvm use"
         let f = fixture();
         let broken = "[project\nbase = \"main\"\n";
         write_home(&f, broken);
-        let err = set_detected(&f.paths, &["dev"], "cmd", "x", Note::Answered).unwrap_err();
+        let err = set_detected(
+            &f.paths,
+            Layer::Project,
+            &["dev"],
+            "cmd",
+            "x",
+            Note::Answered,
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("not valid TOML"), "{msg}");
         assert_eq!(
@@ -1341,6 +1459,7 @@ prelude = "nvm use"
         write_home(&f, "[processes.dev]\ncwd = \"apps/web\"\n");
         set_detected(
             &f.paths,
+            Layer::Project,
             &["dev"],
             "cmd",
             "pnpm dev",
@@ -1376,6 +1495,7 @@ prelude = "nvm use"
         write_home(&f, "[project]\ninstall = \"true\"\n");
         set_detected(
             &f.paths,
+            Layer::Project,
             &["dev"],
             "cmd",
             "pnpm dev",
@@ -1410,6 +1530,7 @@ prelude = "nvm use"
         write_user(&f, "[processes.dev]\nenv = { TZ = \"UTC\" }\n");
         set_detected(
             &f.paths,
+            Layer::Project,
             &["dev"],
             "cmd",
             "pnpm dev",
@@ -1440,6 +1561,7 @@ prelude = "nvm use"
         let f = fixture();
         set_detected_table(
             &f.paths,
+            Layer::Project,
             &["processes", "web"],
             vec![
                 ("cmd".to_string(), "pnpm dev".into()),
@@ -1476,7 +1598,15 @@ prelude = "nvm use"
     fn a_key_whose_table_is_a_scalar_is_refused_by_name() {
         let f = fixture();
         write_home(&f, "dev = 3\n");
-        let err = set_detected(&f.paths, &["dev"], "cmd", "x", Note::Answered).unwrap_err();
+        let err = set_detected(
+            &f.paths,
+            Layer::Project,
+            &["dev"],
+            "cmd",
+            "x",
+            Note::Answered,
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("[dev]"), "{msg}");
         assert_eq!(home_text(&f), "dev = 3\n");
@@ -1490,7 +1620,7 @@ prelude = "nvm use"
             .unwrap()
             .modified()
             .unwrap();
-        patch(&f.paths, |_doc| Ok(())).unwrap();
+        patch(&f.paths, Layer::Project, |_doc| Ok(())).unwrap();
         assert_eq!(home_text(&f), HANDWRITTEN);
         assert_eq!(
             std::fs::metadata(f.paths.config_file())

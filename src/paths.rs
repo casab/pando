@@ -70,6 +70,13 @@ impl PandoPaths {
         self.cache_dir().join("prs.json")
     }
 
+    /// Runtime probes that came back satisfied, so a start costs one extra
+    /// spawn when the requirement or the prelude changes and none when
+    /// neither has.
+    pub fn runtime_cache_file(&self) -> PathBuf {
+        self.cache_dir().join("runtime.json")
+    }
+
     /// Where `new` puts worktrees unless config overrides it. Callers must go
     /// through the config-aware helper in `actions` rather than reading this
     /// directly, so a configured `worktrees_dir` is honoured everywhere.
@@ -315,6 +322,7 @@ mod tests {
         assert_eq!(p.cache_dir(), base.join("cache"));
         assert_eq!(p.enrich_cache_file(), base.join("cache/enrich.json"));
         assert_eq!(p.pr_cache_file(), base.join("cache/prs.json"));
+        assert_eq!(p.runtime_cache_file(), base.join("cache/runtime.json"));
         assert_eq!(p.worktrees_dir(), base.join("worktrees"));
         assert_eq!(p.worktree_path("feat+x"), base.join("worktrees/feat+x"));
         assert_eq!(p.logs_dir("feat+x"), base.join("logs/feat+x"));
@@ -350,6 +358,7 @@ mod tests {
             p.cache_dir(),
             p.enrich_cache_file(),
             p.pr_cache_file(),
+            p.runtime_cache_file(),
             p.worktrees_dir(),
             p.worktree_path("feat+x"),
             p.logs_dir("feat+x"),
