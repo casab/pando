@@ -585,9 +585,31 @@ pub struct Proposal {
     /// without asking. One candidate is sure; so is a script named exactly
     /// `dev` that really is one dev server.
     pub decided: bool,
+    /// The compose file a services proposal is about, for the one case
+    /// where no candidate can carry it: every service the file declares was
+    /// filtered out, and the answer — "none of them" — is still about that
+    /// file and still has to be written down.
+    pub file: Option<String>,
+    /// Why there is nothing to choose from, when a rule settled the slot
+    /// with the empty answer instead of finding candidates for it. `None`
+    /// whenever there are any.
+    pub none_because: Option<String>,
 }
 
 impl Proposal {
+    /// What every rule but the services one makes: candidates, and whether
+    /// they settle the slot. The two fields below them belong to the one
+    /// answer that has no candidates to hang anything on.
+    pub fn of(slot: Slot, candidates: Vec<Candidate>, decided: bool) -> Proposal {
+        Proposal {
+            slot,
+            candidates,
+            decided,
+            file: None,
+            none_because: None,
+        }
+    }
+
     pub fn preferred(&self) -> Option<&Candidate> {
         self.candidates.first()
     }
@@ -614,12 +636,15 @@ impl Proposal {
 
     /// The compose file every candidate of a services proposal came from.
     /// The answer "none of them" is about that file, so it outlives the
-    /// candidates a set answer happens to pick.
+    /// candidates a set answer happens to pick — and the proposal's own
+    /// `file` outlives having any candidates at all.
     pub fn service_file(&self) -> Option<&str> {
-        self.candidates
-            .iter()
-            .find_map(|c| c.service.as_ref())
-            .map(|hint| hint.file.as_str())
+        self.file.as_deref().or_else(|| {
+            self.candidates
+                .iter()
+                .find_map(|c| c.service.as_ref())
+                .map(|hint| hint.file.as_str())
+        })
     }
 }
 
@@ -707,11 +732,7 @@ fn install_proposal(signals: &Signals) -> Option<Proposal> {
         return None;
     }
     let decided = candidates.len() == 1;
-    Some(Proposal {
-        slot: Slot::Install,
-        candidates,
-        decided,
-    })
+    Some(Proposal::of(Slot::Install, candidates, decided))
 }
 
 fn version_files_proposal(signals: &Signals) -> Option<Proposal> {
@@ -720,15 +741,15 @@ fn version_files_proposal(signals: &Signals) -> Option<Proposal> {
     }
     // Informational only — every file that pins a version is worth showing,
     // so there is nothing to choose between.
-    Some(Proposal {
-        slot: Slot::VersionFiles,
-        candidates: vec![Candidate {
+    Some(Proposal::of(
+        Slot::VersionFiles,
+        vec![Candidate {
             value: signals.version_files.join(","),
             why: signals.version_files.join(", "),
             ..Candidate::default()
         }],
-        decided: true,
-    })
+        true,
+    ))
 }
 
 /// Scripts that are never a dev server, whatever they are called.
@@ -860,11 +881,7 @@ fn dev_cmd_proposal(signals: &Signals, rule: Option<&'static FrameworkRule>) -> 
         // knows there is a server here and not how to start it, which is a
         // question, and the only slot in this phase that has one with no
         // options to offer.
-        return rule.map(|_| Proposal {
-            slot: Slot::DevCmd,
-            candidates: Vec::new(),
-            decided: false,
-        });
+        return rule.map(|_| Proposal::of(Slot::DevCmd, Vec::new(), false));
         // With no rule at all — a library, or a repository with nothing to
         // serve — there is no proposal. Asking about a dev server that does
         // not exist is worse than saying nothing.
@@ -878,11 +895,7 @@ fn dev_cmd_proposal(signals: &Signals, rule: Option<&'static FrameworkRule>) -> 
         .is_some_and(|body| !is_multiplexer(body) && !is_production(body));
     let decided =
         candidates.len() == 1 || (sure_script && candidates[0].value == format!("{runner}dev"));
-    Some(Proposal {
-        slot: Slot::DevCmd,
-        candidates,
-        decided,
-    })
+    Some(Proposal::of(Slot::DevCmd, candidates, decided))
 }
 
 /// Makefile or justfile targets that look like they start something. The
@@ -1049,11 +1062,7 @@ fn port_proposal(signals: &Signals, rule: Option<&'static FrameworkRule>) -> Opt
         return None;
     }
     let decided = candidates.len() == 1;
-    Some(Proposal {
-        slot: Slot::PortEnv,
-        candidates,
-        decided,
-    })
+    Some(Proposal::of(Slot::PortEnv, candidates, decided))
 }
 
 /// The one candidate that answers the port slot with a whole `ports` map:
@@ -1458,13 +1467,9 @@ fn processes_proposal(root: &Path, signals: &Signals) -> Option<Proposal> {
             ..Candidate::default()
         });
     }
-    Some(Proposal {
-        slot: Slot::Processes,
-        candidates,
-        // Never: two processes instead of one is a change of shape, and
-        // "ask just in time, once" is exactly what this is for.
-        decided: false,
-    })
+    // Never decided: two processes instead of one is a change of shape,
+    // and "ask just in time, once" is exactly what this is for.
+    Some(Proposal::of(Slot::Processes, candidates, false))
 }
 
 // ---- services and the schema hook -----------------------------------------
@@ -1636,7 +1641,21 @@ fn services_proposal(
     // Which service owns which key so far, in file order. A key belongs to
     // the first service a rule gave it to; the second one is a question.
     let mut claimed: BTreeMap<String, String> = BTreeMap::new();
+    // The services that are this project rather than something it depends
+    // on, kept so the refusal can name them.
+    let mut built_here: Vec<String> = Vec::new();
     for (name, service) in &parsed.services {
+        // A service compose builds out of this repository is the
+        // application. Running a private copy of it per worktree is not
+        // isolation, it is a second copy of the thing being developed, and
+        // it is the one answer that is certainly wrong — so it is not on
+        // offer at all.
+        if let Some(context) = &service.build
+            && built_from_project(root, &file, context)
+        {
+            built_here.push(name.clone());
+            continue;
+        }
         let image = service.image.as_deref();
         let found = env_key_for(name, image, &signals.env_example, &claimed);
         let app_service = is_app_service(image);
@@ -1690,16 +1709,51 @@ fn services_proposal(
             );
         }
     }
+    // Every service in the file is this project's own. There is nothing to
+    // ask — a question whose only answer is wrong is worse than silence —
+    // but the *answer* still has to be written down, or the next start
+    // works it out again and a developer reading the file never learns
+    // that pando looked. It is the same empty answer a developer gives by
+    // declining the question, recorded the same way: an entry naming the
+    // file with an empty `include`.
+    if candidates.is_empty() {
+        let mut proposal = Proposal::of(Slot::Services, Vec::new(), true);
+        proposal.none_because = Some(format!(
+            "{file} declares only {}, built from this repository",
+            listed(&built_here.iter().map(String::as_str).collect::<Vec<_>>())
+        ));
+        proposal.file = Some(file);
+        return Some(proposal);
+    }
     // Nothing to propose when no service resolved at all: a compose file
     // full of things pando cannot address is not an isolation offer.
     if candidates.iter().all(|c| !c.preselected) && resolved {
         return None;
     }
-    Some(Proposal {
-        slot: Slot::Services,
-        candidates,
-        decided: resolved,
-    })
+    Some(Proposal::of(Slot::Services, candidates, resolved))
+}
+
+/// Whether a compose service's build context points inside the project.
+///
+/// Resolved the way compose resolves it: relative to the directory the
+/// compose file is in, which is where `build: ./api` looks. A context
+/// `docker compose config` already made absolute is used as it stands.
+///
+/// [`crate::paths::resolve_for_compare`] rather than `canonicalize`: a
+/// context directory that does not exist still says where compose *would*
+/// look, and on macOS the repository's own `/var/...` and the canonical
+/// `/private/var/...` are the same directory and have to compare equal.
+fn built_from_project(root: &Path, file: &str, context: &str) -> bool {
+    let compose_file = root.join(file);
+    let dir = compose_file.parent().unwrap_or(root);
+    let context = Path::new(context);
+    let resolved = if context.is_absolute() {
+        context.to_path_buf()
+    } else {
+        dir.join(context)
+    };
+    crate::paths::resolve_for_compare(&resolved)
+        .starts_with(crate::paths::resolve_for_compare(root))
 }
 
 /// The command that brings a fresh database up to the current schema.
@@ -1712,12 +1766,9 @@ fn schema_hook_proposal(root: &Path, signals: &Signals) -> Option<Proposal> {
     if candidates.is_empty() {
         return None;
     }
-    Some(Proposal {
-        slot: Slot::SchemaHook,
-        // One candidate is one answer; several is a question.
-        decided: candidates.len() == 1,
-        candidates,
-    })
+    // One candidate is one answer; several is a question.
+    let decided = candidates.len() == 1;
+    Some(Proposal::of(Slot::SchemaHook, candidates, decided))
 }
 
 /// The name every proposed schema hook gets. One name, so a second run
@@ -1797,15 +1848,15 @@ fn provision_proposal(signals: &Signals) -> Option<Proposal> {
     if signals.ignored_present.is_empty() {
         return None;
     }
-    Some(Proposal {
-        slot: Slot::Provision,
-        candidates: vec![Candidate {
+    Some(Proposal::of(
+        Slot::Provision,
+        vec![Candidate {
             value: signals.ignored_present.join(","),
             why: "gitignored and present in the main checkout".to_string(),
             ..Candidate::default()
         }],
-        decided: true,
-    })
+        true,
+    ))
 }
 
 // ---- turning a choice into config -----------------------------------------
@@ -3005,6 +3056,130 @@ mod tests {
             config.processes["dev"].cmd,
             "./scripts/dev.sh --port {port:web}"
         );
+    }
+
+    // ---- compose services ------------------------------------------------
+
+    /// A repository with a compose file and an env example, which is all
+    /// the services rule reads.
+    fn compose_fixture(compose: &str, env: &[(&str, &str)]) -> (TempDir, Signals) {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("docker-compose.yml"), compose).unwrap();
+        let signals = Signals {
+            env_example: env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ..Default::default()
+        };
+        (dir, signals)
+    }
+
+    // The first-contact failure this rule exists for: the compose file's
+    // only candidate was the app itself, so the only answer on offer was
+    // "run a second copy of the thing you are developing".
+    #[test]
+    fn a_service_built_from_this_repository_is_not_a_dependency() {
+        let (dir, signals) = compose_fixture(
+            r#"
+services:
+  web:
+    image: acme/web:dev
+    build: .
+    ports: ["3000:3000"]
+  worker:
+    build:
+      context: ./services/worker
+  postgres:
+    image: postgres:16
+    ports: ["5432:5432"]
+"#,
+            &[("DATABASE_URL", "postgres://acme@localhost:5432/acme")],
+        );
+        let proposal = services_proposal(dir.path(), &signals, None).unwrap();
+        assert_eq!(
+            values(&proposal),
+            vec!["postgres"],
+            "the app and its worker are this repository, not things it depends on"
+        );
+        assert!(
+            proposal.decided,
+            "one resolved dependency is not a question"
+        );
+    }
+
+    // A question whose only answer is wrong is worse than silence — but the
+    // answer still has to be recorded, or the next start works it out again
+    // and nothing in the file says pando ever looked.
+    #[test]
+    fn a_compose_file_of_only_this_project_is_answered_without_being_asked() {
+        let (dir, signals) = compose_fixture(
+            "services:\n  web:\n    build: .\n  worker:\n    build: ./worker\n",
+            &[],
+        );
+        let proposal = services_proposal(dir.path(), &signals, None).unwrap();
+        assert!(
+            proposal.candidates.is_empty(),
+            "nothing survived the filter"
+        );
+        assert!(proposal.decided, "so there is nothing to ask about");
+        assert_eq!(
+            proposal.service_file(),
+            Some("docker-compose.yml"),
+            "the empty answer is still about a file, and has to be writable"
+        );
+        let why = proposal
+            .none_because
+            .expect("a reason for the empty answer");
+        assert!(why.contains("web and worker"), "{why}");
+        assert!(why.contains("built from this repository"), "{why}");
+    }
+
+    // The filter is about *this project*, not about `build:` existing. A
+    // service built out of a sibling checkout is a dependency like any
+    // other, and a worktree wants its own copy.
+    #[test]
+    fn a_build_context_outside_the_project_is_still_a_dependency() {
+        let (dir, signals) = compose_fixture(
+            r#"
+services:
+  vendor:
+    build: ../vendor-service
+    ports: ["9000:9000"]
+"#,
+            &[("VENDOR_URL", "http://localhost:9000")],
+        );
+        let proposal = services_proposal(dir.path(), &signals, None).unwrap();
+        assert_eq!(values(&proposal), vec!["vendor"]);
+        assert!(proposal.preferred().unwrap().preselected);
+    }
+
+    #[test]
+    fn a_build_context_is_resolved_against_the_compose_files_own_directory() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("deploy")).unwrap();
+        for (file, context, inside) in [
+            ("docker-compose.yml", ".", true),
+            ("docker-compose.yml", "./services/api", true),
+            ("docker-compose.yml", "../elsewhere", false),
+            // From a file one level down, `..` is still the project.
+            ("deploy/docker-compose.yml", "..", true),
+            ("deploy/docker-compose.yml", "../..", false),
+        ] {
+            assert_eq!(
+                built_from_project(root, file, context),
+                inside,
+                "{file} + {context}"
+            );
+        }
+        // What `docker compose config` hands over: already absolute.
+        assert!(built_from_project(
+            root,
+            "docker-compose.yml",
+            root.join("apps/api").to_str().unwrap()
+        ));
+        assert!(!built_from_project(root, "docker-compose.yml", "/tmp"));
     }
 
     // ---- what detection may fill in --------------------------------------

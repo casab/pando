@@ -108,6 +108,20 @@ impl Unresolved {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Service {
     pub image: Option<String>,
+    /// The build context, when this service is built rather than pulled:
+    /// the scalar of `build: ./api`, or its `context:`. A `build:` mapping
+    /// with no `context:` means `.`, which is compose's own default.
+    ///
+    /// Kept as written — relative to the compose file's own directory, which
+    /// is the directory compose resolves it against — except from
+    /// `docker compose config`, which has already made it absolute.
+    ///
+    /// What it is for: a service built out of this repository *is* the
+    /// application, not one of its dependencies, and offering a private copy
+    /// of it is the one answer that is certainly wrong. A service may carry
+    /// both `image:` and `build:`; the image is then the name to tag, not a
+    /// dependency to pull.
+    pub build: Option<String>,
     /// Every `ports:` entry, in file order.
     pub ports: Vec<Port>,
     pub volumes: Vec<Mount>,
@@ -513,6 +527,13 @@ fn service_from_json(value: &serde_json::Value) -> Service {
     let string = |key: &str| value.get(key).and_then(|v| v.as_str()).map(str::to_string);
     let mut out = Service {
         image: string("image"),
+        // Always the mapping form here, and always an absolute path:
+        // compose has resolved the context against the file's directory.
+        build: value
+            .get("build")
+            .and_then(|build| build.get("context"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
         container_name: string("container_name"),
         healthcheck: value.get("healthcheck").is_some_and(|v| !v.is_null()),
         ..Service::default()
@@ -621,6 +642,20 @@ fn service(node: &Node) -> Service {
     for (key, value) in fields {
         match key.as_str() {
             "image" => out.image = value.scalar().map(str::to_string),
+            // `build: ./api`, or `build:` with a `context:` under it. A
+            // mapping that names only a `dockerfile:` still has a context,
+            // and compose's default for it is `.`.
+            "build" => {
+                out.build = Some(match value {
+                    Node::Map(fields) => fields
+                        .iter()
+                        .find(|(key, _)| key == "context")
+                        .and_then(|(_, value)| value.scalar())
+                        .unwrap_or(".")
+                        .to_string(),
+                    other => other.scalar().unwrap_or(".").to_string(),
+                })
+            }
             "container_name" => out.container_name = value.scalar().map(str::to_string),
             // Only that it is there. What it runs is docker's business;
             // pando asks `docker compose ps` whether it passed.
@@ -1711,6 +1746,71 @@ services:
             resolve_included(&file, &["db".into(), "fromInclude".into()], &[]).unwrap(),
             vec![("db".to_string(), 5432), ("fromInclude".to_string(), 6379)]
         );
+    }
+
+    // A service compose builds is the thing being developed, not something
+    // it depends on. Every spelling of `build:` has to be readable, because
+    // the one that is missed is the one offered as a dependency.
+    #[test]
+    fn every_spelling_of_a_build_context_is_read() {
+        let file = parse(
+            r#"
+services:
+  web:
+    build: .
+  api:
+    build:
+      context: ./services/api
+      dockerfile: Dockerfile.dev
+  jobs:
+    build:
+      dockerfile: Dockerfile
+  shared:
+    build: ../shared
+  tagged:
+    image: acme/web:dev
+    build: ./web
+  postgres:
+    image: postgres:16
+"#,
+        )
+        .unwrap();
+        assert_eq!(file.services["web"].build.as_deref(), Some("."));
+        assert_eq!(
+            file.services["api"].build.as_deref(),
+            Some("./services/api")
+        );
+        assert_eq!(
+            file.services["jobs"].build.as_deref(),
+            Some("."),
+            "a build with only a dockerfile still has compose's default context"
+        );
+        assert_eq!(file.services["shared"].build.as_deref(), Some("../shared"));
+        assert_eq!(
+            file.services["tagged"].build.as_deref(),
+            Some("./web"),
+            "an image beside a build is the tag to write, not a dependency to pull"
+        );
+        assert_eq!(file.services["postgres"].build, None);
+    }
+
+    // Compose resolves the context against the file's own directory and
+    // hands back an absolute path, so the reader has to take it as given.
+    #[test]
+    fn compose_reports_a_build_context_already_resolved() {
+        let json = r#"{
+          "name": "pando-probe-build",
+          "services": {
+            "web": { "build": { "context": "/Users/me/code/acme", "dockerfile": "Dockerfile" } },
+            "postgres": { "image": "postgres:16" }
+          }
+        }"#;
+        let file = parse_config_json(json).unwrap();
+        assert_eq!(
+            file.services["web"].build.as_deref(),
+            Some("/Users/me/code/acme")
+        );
+        assert_eq!(file.services["postgres"].build, None);
     }
 
     #[test]

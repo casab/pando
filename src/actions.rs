@@ -1077,8 +1077,22 @@ pub fn resolve_on(
             let (chosen, note): (Vec<detect::Candidate>, config::Note) = if proposal.decided {
                 let taken: Vec<detect::Candidate> =
                     proposal.preferred_set().into_iter().cloned().collect();
-                let why = taken.first().map(|c| c.why.clone()).unwrap_or_default();
-                if !taken.is_empty() {
+                // With nothing taken the reason is the proposal's own: a
+                // rule settled the slot with the empty answer, and there is
+                // no candidate left to read a `why` off.
+                let why = taken
+                    .first()
+                    .map(|c| c.why.clone())
+                    .or_else(|| proposal.none_because.clone())
+                    .unwrap_or_default();
+                if taken.is_empty() {
+                    // Every guess is visible, the empty one included: this
+                    // is pando saying it looked at the compose file and
+                    // found nothing in it to run a private copy of.
+                    progress(&format!(
+                        "this project has no services to run private copies of (detected: {why})"
+                    ));
+                } else {
                     // Not "running private copies of": a start that is not
                     // isolating runs none, and this line is written on
                     // every start that fills the slot.
@@ -1583,14 +1597,10 @@ fn prelude_proposal(check: &crate::runtime::Check, home: &Path) -> detect::Propo
             ..detect::Candidate::default()
         })
         .collect();
-    detect::Proposal {
-        slot: Slot::Prelude,
-        candidates,
-        // Never decided. What one machine needs is not something a rule
-        // gets to settle on a developer's behalf, and the answer lands in
-        // a file every project on that machine shares.
-        decided: false,
-    }
+    // Never decided. What one machine needs is not something a rule gets to
+    // settle on a developer's behalf, and the answer lands in a file every
+    // project on that machine shares.
+    detect::Proposal::of(Slot::Prelude, candidates, false)
 }
 
 /// Asks the prelude question, checks the answer, and writes it to the user
@@ -8322,6 +8332,78 @@ time.sleep(300)
         );
         let again = resolve_isolating(&fx.paths, &config, &refuse).unwrap();
         assert_eq!(again.services.len(), 1);
+    }
+
+    /// A compose file whose every service is built out of this repository:
+    /// the app, and a worker sharing its image.
+    const ONLY_THIS_PROJECT: &str = "services:\n  \
+         web:\n    build: .\n    ports: [\"3000:3000\"]\n  \
+         worker:\n    build:\n      context: ./services/worker\n";
+
+    // The services question offered the app itself, because a compose file
+    // that builds it declares a service like any other. The only answer on
+    // offer was "run a second copy of the thing you are developing", and a
+    // question whose only answer is wrong is worse than silence.
+    #[test]
+    fn a_compose_file_of_only_this_project_is_never_a_question() {
+        let fx = compose_fixture(ONLY_THIS_PROJECT, "PORT=3000\n");
+        let notices = std::cell::RefCell::new(Vec::new());
+        let config = super::resolve_process(&fx.paths, &fx.config, true, &refuse, &|line| {
+            notices.borrow_mut().push(line.to_string())
+        })
+        .unwrap();
+
+        // Asked nothing — `refuse` panics on a question — and still
+        // answered: the empty answer is written down, so the next start
+        // does not work it out again.
+        let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+        assert!(written.contains("[[services]]"), "{written}");
+        assert!(written.contains("include = []"), "{written}");
+        assert!(
+            written.contains("# detected:") && written.contains("built from this repository"),
+            "the file says why pando decided this on its own: {written}"
+        );
+        assert_eq!(config.services.len(), 1);
+        assert!(
+            notices
+                .borrow()
+                .iter()
+                .any(|line| line.contains("no services") && line.contains("built from this")),
+            "every guess is visible, the empty one included: {:?}",
+            notices.borrow()
+        );
+
+        // The file pando wrote has to load, and to have answered the slot.
+        let loaded = crate::config::load(&fx.paths).unwrap();
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        let again =
+            super::resolve_process(&fx.paths, &loaded.config, true, &refuse, &noop).unwrap();
+        assert_eq!(again.services.len(), 1);
+        assert!(
+            super::service_roles(&again).is_empty(),
+            "an entry with nothing included brings no roles, so an isolated \
+             start runs shared"
+        );
+    }
+
+    // The app is filtered out; everything it really depends on is not.
+    #[test]
+    fn the_dependencies_beside_the_app_are_still_offered() {
+        let fx = compose_fixture(
+            "services:\n  \
+             web:\n    build: .\n  \
+             postgres:\n    image: postgres:16\n    ports: [\"5432:5432\"]\n",
+            "PORT=3000\nDATABASE_URL=postgres://acme:acme@localhost:5432/acme\n",
+        );
+        let config = super::resolve_process(&fx.paths, &fx.config, true, &refuse, &noop).unwrap();
+        let crate::config::ServiceConfig::Compose { include, env, .. } = &config.services[0] else {
+            panic!("a compose entry");
+        };
+        assert_eq!(include, &vec!["postgres".to_string()]);
+        assert_eq!(
+            env.get("DATABASE_URL").map(String::as_str),
+            Some("postgres")
+        );
     }
 
     /// A docker that answers nothing, which is what a machine with no
