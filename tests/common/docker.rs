@@ -244,14 +244,23 @@ def spawn(code):
 
 
 def listen(port):
-    """A server: it holds the connection open and says nothing."""
+    """A server: it accepts, holds the connection open, and says nothing.
+
+    Accepting is the point. A probe that is never accepted stays in the
+    listen backlog even after the prober hangs up, so a fake that only
+    binds runs out of queue after a handful of readiness checks and then
+    looks exactly like a service that died."""
     return spawn(
-        "import socket,time\n"
+        "import socket\n"
         "s=socket.socket()\n"
         "s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n"
         "s.bind(('127.0.0.1',%d))\n"
-        "s.listen(5)\n"
-        "time.sleep(86400)\n" % port
+        "s.listen(64)\n"
+        "held=[]\n"
+        "while True:\n"
+        "    c,_=s.accept()\n"
+        "    held.append(c)\n"
+        "    held=held[-64:]\n" % port
     )
 
 

@@ -186,16 +186,26 @@ fn a_second_isolated_start_keeps_the_containers_and_the_ports_they_were_given() 
     f.projects
         .push(compose::project_name(f.paths.project_id(), &one));
 
-    let first = actions::start(&f.paths, &f.config, &one, None, true, &|m| {
-        eprintln!("first: {m}")
-    })
+    let first = actions::start(
+        &f.paths,
+        &f.config,
+        &one,
+        None,
+        actions::Mode::Isolated,
+        &|m| eprintln!("first: {m}"),
+    )
     .unwrap();
     let before = published_ports(&f.projects);
     assert_eq!(before.len(), 2, "postgres and redis are up: {before:?}");
 
-    let second = actions::start(&f.paths, &f.config, &one, None, true, &|m| {
-        eprintln!("second: {m}")
-    })
+    let second = actions::start(
+        &f.paths,
+        &f.config,
+        &one,
+        None,
+        actions::Mode::Isolated,
+        &|m| eprintln!("second: {m}"),
+    )
     .unwrap();
     assert_eq!(second.ports, first.ports, "every port stays where it was");
     assert!(!second.reassigned, "and nothing is reported as moved");
@@ -254,13 +264,23 @@ fn two_worktrees_get_private_services_on_their_own_ports_and_volumes() {
         "a fresh fixture owns no volumes: {before:?}"
     );
 
-    let a = actions::start(&f.paths, &f.config, &one, None, true, &|m| {
-        eprintln!("one: {m}")
-    })
+    let a = actions::start(
+        &f.paths,
+        &f.config,
+        &one,
+        None,
+        actions::Mode::Isolated,
+        &|m| eprintln!("one: {m}"),
+    )
     .unwrap();
-    let b = actions::start(&f.paths, &f.config, &two, None, true, &|m| {
-        eprintln!("two: {m}")
-    })
+    let b = actions::start(
+        &f.paths,
+        &f.config,
+        &two,
+        None,
+        actions::Mode::Isolated,
+        &|m| eprintln!("two: {m}"),
+    )
     .unwrap();
 
     // Different ports for the same two services, which is the whole point.
@@ -362,7 +382,15 @@ fn a_service_a_worktree_cannot_isolate_is_refused_before_docker_is_asked() {
 
     let err = format!(
         "{:#}",
-        actions::start(&f.paths, &f.config, &name, None, true, &|_| {}).unwrap_err()
+        actions::start(
+            &f.paths,
+            &f.config,
+            &name,
+            None,
+            actions::Mode::Isolated,
+            &|_| {}
+        )
+        .unwrap_err()
     );
     assert!(err.contains("./pgdata"), "{err}");
     assert!(err.contains("named volume"), "{err}");
@@ -403,9 +431,14 @@ fn a_container_that_publishes_a_port_and_never_listens_is_never_ready() {
     let started = std::time::Instant::now();
     let err = format!(
         "{:#}",
-        actions::start(&f.paths, &f.config, &name, None, true, &|m| {
-            eprintln!("sleeper: {m}")
-        })
+        actions::start(
+            &f.paths,
+            &f.config,
+            &name,
+            None,
+            actions::Mode::Isolated,
+            &|m| { eprintln!("sleeper: {m}") }
+        )
         .unwrap_err()
     );
     assert!(err.contains("did not become ready"), "{err}");
@@ -476,9 +509,14 @@ fn a_compose_file_that_extends_another_is_resolved_by_compose_itself() {
     let project = compose::project_name(f.paths.project_id(), &name);
     f.projects.push(project.clone());
 
-    let report = actions::start(&f.paths, &f.config, &name, None, true, &|m| {
-        eprintln!("extends: {m}")
-    })
+    let report = actions::start(
+        &f.paths,
+        &f.config,
+        &name,
+        None,
+        actions::Mode::Isolated,
+        &|m| eprintln!("extends: {m}"),
+    )
     .unwrap();
     for role in ["postgres", "redis"] {
         assert!(
@@ -521,9 +559,14 @@ fn a_profiled_service_is_stopped_too_when_readiness_fails() {
 
     let err = format!(
         "{:#}",
-        actions::start(&f.paths, &f.config, &name, None, true, &|m| {
-            eprintln!("profile: {m}")
-        })
+        actions::start(
+            &f.paths,
+            &f.config,
+            &name,
+            None,
+            actions::Mode::Isolated,
+            &|m| { eprintln!("profile: {m}") }
+        )
         .unwrap_err()
     );
     assert!(err.contains("did not become ready"), "{err}");
@@ -553,9 +596,14 @@ fn the_database_accepts_connections_by_the_time_start_returns() {
 
     // A fresh named volume, so this postgres really does have to
     // initialise before it will answer anything.
-    actions::start(&f.paths, &f.config, &name, None, true, &|m| {
-        eprintln!("ready: {m}")
-    })
+    actions::start(
+        &f.paths,
+        &f.config,
+        &name,
+        None,
+        actions::Mode::Isolated,
+        &|m| eprintln!("ready: {m}"),
+    )
     .unwrap();
 
     // Asked the instant `start` returns, which is the instant a hook at
@@ -613,7 +661,15 @@ fn an_absolute_bind_mount_into_the_checkout_is_refused_and_writes_nothing() {
 
     let err = format!(
         "{:#}",
-        actions::start(&f.paths, &f.config, &name, None, true, &|_| {}).unwrap_err()
+        actions::start(
+            &f.paths,
+            &f.config,
+            &name,
+            None,
+            actions::Mode::Isolated,
+            &|_| {}
+        )
+        .unwrap_err()
     );
     assert!(err.contains(&inside.display().to_string()), "{err}");
     assert!(

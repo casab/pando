@@ -94,6 +94,10 @@ pub enum Command {
         /// them.
         #[arg(long)]
         isolated: bool,
+        /// The way back: stop this worktree's private services and use the
+        /// project's shared ones. Its processes restart, so they see them.
+        #[arg(long, conflicts_with = "isolated")]
+        shared: bool,
     },
     /// Answer every question pando has about this project, in one pass.
     ///
@@ -252,9 +256,11 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             yes,
             only,
             isolated,
+            shared,
         } => {
-            let config = &actions::resolve_process(paths, config, isolated, &asker(yes), &notice)?;
-            let report = actions::start(paths, config, &name, only.as_deref(), isolated, &notice)?;
+            let mode = actions::Mode::of(isolated, shared);
+            let config = &actions::resolve_process(paths, config, mode, &asker(yes), &notice)?;
+            let report = actions::start(paths, config, &name, only.as_deref(), mode, &notice)?;
             if report.reassigned {
                 eprintln!("pando: the ports {name} had were taken; it moved to new ones");
             }
@@ -335,9 +341,12 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             // Resolved exactly as `start` resolves it: a project whose
             // process question has never been answered gets the question,
             // not a refusal.
-            let config = &actions::resolve_process(paths, config, isolated, &asker(yes), &notice)?;
-            let report =
-                actions::restart(paths, config, &name, only.as_deref(), isolated, &notice)?;
+            // `--shared` is `start`'s: a restart into shared mode is what
+            // `start --shared` already is, since changing the mode
+            // restarts the processes anyway.
+            let mode = actions::Mode::of(isolated, false);
+            let config = &actions::resolve_process(paths, config, mode, &asker(yes), &notice)?;
+            let report = actions::restart(paths, config, &name, only.as_deref(), mode, &notice)?;
             writeln!(out, "restarted {name}{}", url_suffix(report.url.as_deref()))?;
             Ok(())
         }
@@ -1643,6 +1652,11 @@ struct ServiceOut {
     port: Option<u16>,
     /// Whether something answers on that port right now.
     up: bool,
+    /// Whether a log pump is running in front of it. `false` while the
+    /// worktree is stopped, and `false` with `up` true when the pump died:
+    /// the log tab has stopped filling, and the next `start` or `restart`
+    /// puts it back.
+    logging: bool,
     /// The compose project the container belongs to, which is what `rm`
     /// takes down.
     project: Option<String>,
@@ -1756,6 +1770,7 @@ pub fn status_json<W: Write>(paths: &PandoPaths, only: Option<&str>, out: &mut W
                                     },
                                     port: status.port,
                                     up: status.up,
+                                    logging: status.logging,
                                     project: recorded.and_then(|s| s.compose_project.clone()),
                                 },
                             )
@@ -1872,8 +1887,17 @@ pub fn status_text_at<W: Write>(
                 Some(port) => port.to_string(),
                 None => "-".to_string(),
             };
+            // Only for a service that is *up*: a stopped worktree has no
+            // pump by design, and saying so on every line of every stopped
+            // service would bury the one case that matters — a container
+            // answering while nothing fills its log tab. `start` and
+            // `restart` put the pump back; no read path ever does.
+            let pump = match service.up && !service.logging {
+                true => ", no log pump",
+                false => "",
+            };
             let row = format!(
-                "  {:<service_width$}  {:<PHASE_CELL$}  service on {port}",
+                "  {:<service_width$}  {:<PHASE_CELL$}  service on {port}{pump}",
                 service.name,
                 if service.up { "up" } else { "down" },
             );

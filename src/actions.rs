@@ -954,11 +954,14 @@ const SILENT_UNLESS_ISOLATED: [Slot; 1] = [Slot::Services];
 pub fn resolve_process(
     paths: &PandoPaths,
     config: &Config,
-    isolated: bool,
+    mode: Mode,
     ask: Ask<'_>,
     progress: &dyn Fn(&str),
 ) -> Result<Config> {
-    let silent: &[Slot] = if isolated {
+    // Only a start that is isolating may *ask* which services to run
+    // private copies of. `--shared` is a start that is putting them away,
+    // which is no more a reason to ask than a plain one.
+    let silent: &[Slot] = if mode == Mode::Isolated {
         &[]
     } else {
         &SILENT_UNLESS_ISOLATED
@@ -2027,6 +2030,36 @@ const STOP_GRACE: Duration = Duration::from_secs(5);
 /// readiness rule watches when none is named.
 const DEFAULT_READY_ROLE: &str = "web";
 
+/// What a start does about this worktree's services.
+///
+/// One value rather than two flags, because "isolated and shared" is not a
+/// state: the command line refuses the pair, and nothing downstream has to
+/// decide what it would have meant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode {
+    /// Whatever this worktree already does: private copies if it has them,
+    /// the project's shared services if it does not. A plain `start`.
+    #[default]
+    Remembered,
+    /// Private copies of the project's services, for this worktree alone.
+    Isolated,
+    /// The project's shared services, and the private copies stopped. The
+    /// way back.
+    Shared,
+}
+
+impl Mode {
+    /// The mode two flags mean. `start` and `restart` refuse the pair
+    /// before this is ever called.
+    pub fn of(isolated: bool, shared: bool) -> Mode {
+        match (isolated, shared) {
+            (true, _) => Mode::Isolated,
+            (_, true) => Mode::Shared,
+            _ => Mode::Remembered,
+        }
+    }
+}
+
 /// One process a start brought up, or found already up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartedProcess {
@@ -2121,7 +2154,7 @@ pub fn start(
     config: &Config,
     name: &str,
     only: Option<&str>,
-    isolated: bool,
+    mode: Mode,
     progress: &dyn Fn(&str),
 ) -> Result<StartReport> {
     let worktree = find_worktree(paths, name)?;
@@ -2134,7 +2167,7 @@ pub fn start(
     // Go service with no compose file runs shared and says so, because the
     // flag is a wish about this project and the project has no services.
     let isolatable = !service_roles(config).is_empty();
-    if isolated && !isolatable {
+    if mode == Mode::Isolated && !isolatable {
         progress("no services are configured for this project — starting in shared mode");
     }
     // A start that will only report what is already up must not install
@@ -2143,7 +2176,7 @@ pub fn start(
     // not that case — it is about to run code. Read without the lock, like
     // the hook's own fingerprint: the decision it guards is "can this step
     // be skipped", and the authoritative one is made under the lock below.
-    let everything_up = every_process_running(paths, name, &selection);
+    let mut everything_up = every_process_running(paths, name, &selection);
 
     paths.ensure_home()?;
     let _lock = state::lock(&paths.lock_file())?;
@@ -2170,6 +2203,24 @@ pub fn start(
         store.worktrees.remove(name);
     }
 
+    // What this worktree does about services now, against what it did
+    // before. Decided here rather than with the ports below, because a
+    // start that changes the answer is a start that has to replace the
+    // processes: an application still pointed at a database that is going
+    // away is not running in the mode it was asked for.
+    let was_isolated = store.worktrees.get(name).is_some_and(|r| r.isolated);
+    let isolate = isolatable
+        && match mode {
+            Mode::Shared => false,
+            Mode::Isolated => true,
+            Mode::Remembered => was_isolated,
+        };
+    let mode_changed = was_isolated != isolate;
+    // And the lifecycle runs again for it: a worktree whose services are
+    // being swapped underneath it is not one where "everything is already
+    // up" means there is nothing to do.
+    everything_up = everything_up && !mode_changed;
+
     // Decided before anything is touched. A process that is alive is
     // reported and left exactly as it is; one whose leader is gone is
     // signalled before its record goes, because a dead leader is not a dead
@@ -2183,7 +2234,7 @@ pub fn start(
                 existing.phase,
                 Phase::Starting { .. } | Phase::Running { .. }
             ) && proc::is_alive(existing.pid);
-            if selected && live {
+            if selected && live && !mode_changed {
                 already.push(process.clone());
             } else if selected || only.is_none() {
                 // Selected and not live: this start replaces it. Not
@@ -2207,7 +2258,10 @@ pub fn start(
         progress(&format!("{process} is already running"));
     }
     if !clear.is_empty() {
-        progress("clearing what is left of the last run");
+        progress(match mode_changed {
+            true => "the services this worktree talks to are changing, so its processes restart",
+            false => "clearing what is left of the last run",
+        });
     }
     for (_, pgid) in &clear {
         proc::stop(*pgid, STOP_GRACE)?;
@@ -2239,13 +2293,31 @@ pub fn start(
     // turns it on, and a later plain `start` of the same worktree keeps
     // the services it already has rather than quietly pointing its
     // processes back at the shared database.
-    let isolate = isolatable && (isolated || record.isolated);
+    //
     // Turned *on* only once the containers exist — see `remember_isolated`
     // below. Turned off here and now, because a worktree pando can no
     // longer isolate is one whose next start is a shared one, and there is
     // no container to contradict that.
     if !isolate {
         record.isolated = false;
+    }
+    // `--shared` is the way back, and taking it means taking the private
+    // copies down. The records stay: they carry the compose project, which
+    // is the only thing that can find those containers and their volumes
+    // again. Their *ports* do not, because the window this start is about
+    // to re-derive no longer has room for them, and a status line claiming
+    // a service is on a port another worktree now owns is worse than one
+    // that says nothing.
+    let mut going_shared: Vec<String> = Vec::new();
+    if mode == Mode::Shared && was_isolated {
+        let failures = stop_service_pumps(record, &|pgid| proc::stop(pgid, STOP_GRACE));
+        if !failures.is_empty() {
+            bail!("{name}: {}", failures.join("; "));
+        }
+        for service in record.services.iter_mut() {
+            service.port = None;
+        }
+        going_shared = compose_projects(record);
     }
     // Service roles are reserved with the process roles, in one window, so
     // `{port:postgres}` resolves in any template and the number is the
@@ -2298,6 +2370,16 @@ pub fn start(
     // long as it takes; holding the state lock through any of them would
     // freeze `pando ls` and the TUI's tick.
     drop(_lock);
+
+    // Outside the lock, like every other compose call: `docker compose
+    // stop` takes seconds, and holding the state lock through it would
+    // freeze `pando ls` and the TUI's tick.
+    if !going_shared.is_empty() {
+        progress(&format!(
+            "{name} is going back to the project's shared services — stopping its own"
+        ));
+        stop_compose_projects(paths, &going_shared, |compose| compose.stop())?;
+    }
 
     // Everything the app is told about where its services are. Computed
     // from the allocated ports alone, so a hook that runs before the
@@ -3431,7 +3513,7 @@ pub fn restart(
     config: &Config,
     name: &str,
     only: Option<&str>,
-    isolated: bool,
+    mode: Mode,
     progress: &dyn Fn(&str),
 ) -> Result<StartReport> {
     // Against config, and before anything is signalled: `stop` can only
@@ -3446,7 +3528,7 @@ pub fn restart(
     // one thing it could not do — but only while a sibling was still
     // running, which made the failure look random.
     stop_missing(paths, name, only, MissingOnly::IsNothingToDo, progress)?;
-    start(paths, config, name, only, isolated, progress)
+    start(paths, config, name, only, mode, progress)
 }
 
 /// The processes a start, stop or restart acts on: every one config
@@ -3884,6 +3966,13 @@ pub struct ServiceStatus {
     pub port: Option<u16>,
     /// Whether something answers on that port right now.
     pub up: bool,
+    /// Whether a log pump is running in front of it, so this worktree's
+    /// log tab for the service is still being filled.
+    ///
+    /// A read path only ever *reports* this: the pump comes back on the
+    /// next `start` or `restart`, and nothing that merely looks at state
+    /// is allowed to spawn a process.
+    pub logging: bool,
 }
 
 /// Every service a worktree owns, with whether it is answering.
@@ -3900,6 +3989,7 @@ pub fn service_statuses(record: &WorktreeRecord) -> Vec<ServiceStatus> {
             name: service.name.clone(),
             port: service.port,
             up: service.port.map(ports::something_is_listening) == Some(true),
+            logging: service.pid.is_some_and(proc::is_alive),
         })
         .collect()
 }
@@ -3923,6 +4013,10 @@ pub fn shared_service_statuses(paths: &PandoPaths, config: &Config) -> Vec<Servi
                 name: service.clone(),
                 port,
                 up: port.map(ports::something_is_listening) == Some(true),
+                // Shared services are the developer's own `docker compose
+                // up`; pando runs no pump in front of anything it did not
+                // start.
+                logging: false,
             });
         }
     }
@@ -4820,7 +4914,7 @@ mod tests {
         only: Option<&str>,
         progress: &dyn Fn(&str),
     ) -> Result<StartReport> {
-        super::start(paths, config, name, only, false, progress)
+        super::start(paths, config, name, only, Mode::Remembered, progress)
     }
 
     fn restart(
@@ -4830,7 +4924,7 @@ mod tests {
         only: Option<&str>,
         progress: &dyn Fn(&str),
     ) -> Result<StartReport> {
-        super::restart(paths, config, name, only, false, progress)
+        super::restart(paths, config, name, only, Mode::Remembered, progress)
     }
 
     /// `stop`, `stop_all` and `rm` as every test written before the sweep
@@ -4862,7 +4956,7 @@ mod tests {
         ask: Ask<'_>,
         progress: &dyn Fn(&str),
     ) -> Result<Config> {
-        super::resolve_process(paths, config, false, ask, progress)
+        super::resolve_process(paths, config, Mode::Remembered, ask, progress)
     }
 
     // The two lists have to stay in step: a process named `install` writes
@@ -8782,7 +8876,7 @@ time.sleep(300)
     /// The isolating form of the resolver: on a plain start the services
     /// question is silent, and these are all about what it asks.
     fn resolve_isolating(paths: &PandoPaths, config: &Config, ask: Ask<'_>) -> Result<Config> {
-        super::resolve_process(paths, config, true, ask, &noop)
+        super::resolve_process(paths, config, Mode::Isolated, ask, &noop)
     }
 
     const TWO_DATABASES: &str = "services:\n  \
@@ -8895,10 +8989,11 @@ time.sleep(300)
     fn a_compose_file_of_only_this_project_is_never_a_question() {
         let fx = compose_fixture(ONLY_THIS_PROJECT, "PORT=3000\n");
         let notices = std::cell::RefCell::new(Vec::new());
-        let config = super::resolve_process(&fx.paths, &fx.config, true, &refuse, &|line| {
-            notices.borrow_mut().push(line.to_string())
-        })
-        .unwrap();
+        let config =
+            super::resolve_process(&fx.paths, &fx.config, Mode::Isolated, &refuse, &|line| {
+                notices.borrow_mut().push(line.to_string())
+            })
+            .unwrap();
 
         // Asked nothing — `refuse` panics on a question — and still
         // answered: the empty answer is written down, so the next start
@@ -8924,7 +9019,8 @@ time.sleep(300)
         let loaded = crate::config::load(&fx.paths).unwrap();
         assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
         let again =
-            super::resolve_process(&fx.paths, &loaded.config, true, &refuse, &noop).unwrap();
+            super::resolve_process(&fx.paths, &loaded.config, Mode::Isolated, &refuse, &noop)
+                .unwrap();
         assert_eq!(again.services.len(), 1);
         assert!(
             super::service_roles(&again).is_empty(),
@@ -8942,7 +9038,8 @@ time.sleep(300)
              postgres:\n    image: postgres:16\n    ports: [\"5432:5432\"]\n",
             "PORT=3000\nDATABASE_URL=postgres://acme:acme@localhost:5432/acme\n",
         );
-        let config = super::resolve_process(&fx.paths, &fx.config, true, &refuse, &noop).unwrap();
+        let config =
+            super::resolve_process(&fx.paths, &fx.config, Mode::Isolated, &refuse, &noop).unwrap();
         let crate::config::ServiceConfig::Compose { include, env, .. } = &config.services[0] else {
             panic!("a compose entry");
         };

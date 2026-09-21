@@ -2104,3 +2104,130 @@ fn the_questions_signals_names_are_the_ones_an_answers_file_answers() {
     let written = std::fs::read_to_string(e.config_file()).unwrap();
     assert!(written.contains("# answered: a program,"), "{written}");
 }
+
+// ---- the way back, and a pump that died -----------------------------------
+
+#[test]
+fn isolated_and_shared_together_is_a_usage_error() {
+    let e = env();
+    let out = e.pando(&["start", "feat+one", "--isolated", "--shared"]);
+    assert_eq!(code(&out), EXIT_USAGE, "stdout: {}", stdout(&out));
+    assert!(
+        stderr(&out).contains("--isolated"),
+        "the pair is named: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn start_shared_puts_a_worktree_back_on_the_projects_own_services() {
+    if !common::python3_available() {
+        eprintln!("skipping: python3 is not installed");
+        return;
+    }
+    let e = env_isolated();
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+    assert_eq!(
+        code(&e.pando(&["start", "feat+one", "--isolated"])),
+        EXIT_OK
+    );
+    let before: serde_json::Value =
+        serde_json::from_str(&stdout(&e.pando(&["status", "feat+one", "--json"]))).unwrap();
+    assert_eq!(before["worktrees"][0]["isolated"], serde_json::json!(true));
+
+    let out = e.pando(&["start", "feat+one", "--shared"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+
+    let after: serde_json::Value =
+        serde_json::from_str(&stdout(&e.pando(&["status", "feat+one", "--json"]))).unwrap();
+    let worktree = &after["worktrees"][0];
+    assert_eq!(worktree["isolated"], serde_json::json!(false));
+    assert_eq!(
+        worktree["services"]["postgres"]["up"],
+        serde_json::json!(false),
+        "the private services are down: {after}"
+    );
+    assert_eq!(
+        worktree["ports"]["web"], before["worktrees"][0]["ports"]["web"],
+        "and the application keeps the port it was bookmarked on"
+    );
+
+    // `stop` never changes the mode: only a start says which one it is.
+    assert_eq!(code(&e.pando(&["stop", "feat+one"])), EXIT_OK);
+    let stopped: serde_json::Value =
+        serde_json::from_str(&stdout(&e.pando(&["status", "feat+one", "--json"]))).unwrap();
+    assert_eq!(
+        stopped["worktrees"][0]["isolated"],
+        serde_json::json!(false)
+    );
+
+    assert_eq!(code(&e.pando(&["rm", "feat+one", "--force"])), EXIT_OK);
+    assert_eq!(status_porcelain(&e.root), "");
+}
+
+// A container answering while nothing fills its log tab is the one case
+// worth a word, and `status` is where it gets one.
+#[test]
+fn status_says_when_a_service_is_up_with_no_log_pump() {
+    if !common::python3_available() {
+        eprintln!("skipping: python3 is not installed");
+        return;
+    }
+    let e = env_isolated();
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+    assert_eq!(
+        code(&e.pando(&["start", "feat+one", "--isolated"])),
+        EXIT_OK
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout(&e.pando(&["status", "feat+one", "--json"]))).unwrap();
+    assert_eq!(
+        json["worktrees"][0]["services"]["postgres"]["logging"],
+        serde_json::json!(true),
+        "{json}"
+    );
+    assert!(
+        !stdout(&e.pando(&["status", "feat+one"])).contains("no log pump"),
+        "nothing to report while it is running"
+    );
+
+    // Kill the pump the way a crash would, and read again.
+    let store = pando::state::load(&e.project_dir().join("state.json")).unwrap();
+    let pump = store.worktrees["feat+one"]
+        .services
+        .iter()
+        .find(|s| s.name == "postgres")
+        .expect("a postgres record")
+        .clone();
+    pando::process::stop(pump.pgid.unwrap(), std::time::Duration::from_secs(2)).unwrap();
+
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout(&e.pando(&["status", "feat+one", "--json"]))).unwrap();
+    let postgres = &json["worktrees"][0]["services"]["postgres"];
+    assert_eq!(postgres["up"], serde_json::json!(true), "{json}");
+    assert_eq!(
+        postgres["logging"],
+        serde_json::json!(false),
+        "the log tab has stopped filling: {json}"
+    );
+    assert!(
+        stdout(&e.pando(&["status", "feat+one"])).contains("no log pump"),
+        "and the text says so: {}",
+        stdout(&e.pando(&["status", "feat+one"]))
+    );
+
+    // `start` is what puts it back — and a read path never did.
+    let again = e.pando(&["start", "feat+one"]);
+    assert_eq!(code(&again), EXIT_OK, "stderr: {}", stderr(&again));
+    assert_eq!(code(&again), EXIT_OK, "stderr: {}", stderr(&again));
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout(&e.pando(&["status", "feat+one", "--json"]))).unwrap();
+    assert_eq!(
+        json["worktrees"][0]["services"]["postgres"]["logging"],
+        serde_json::json!(true),
+        "{json}"
+    );
+
+    assert_eq!(code(&e.pando(&["rm", "feat+one", "--force"])), EXIT_OK);
+    assert_eq!(status_porcelain(&e.root), "");
+}

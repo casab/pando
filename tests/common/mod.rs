@@ -784,3 +784,20 @@ pub fn write_listener_config(kind: Kind, home: &Path, root: &Path) -> PathBuf {
     std::fs::write(&path, listener_config_for(kind)).unwrap();
     path
 }
+
+/// Polls until `ready` is true or the timeout passes, and says which.
+///
+/// A fixed sleep is either slower than it has to be or shorter than a
+/// loaded machine needs; this is neither.
+pub fn wait_until(timeout: std::time::Duration, ready: impl Fn() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if ready() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}

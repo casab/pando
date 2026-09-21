@@ -95,7 +95,15 @@ fn new_worktree(f: &Hx, branch: &str) -> String {
 }
 
 fn start(f: &Hx, name: &str) -> actions::StartReport {
-    actions::start(&f.paths, &f.config, name, None, false, &|_| {}).unwrap()
+    actions::start(
+        &f.paths,
+        &f.config,
+        name,
+        None,
+        actions::Mode::Remembered,
+        &|_| {},
+    )
+    .unwrap()
 }
 
 #[test]
@@ -244,7 +252,15 @@ fn when_both_the_command_and_its_fallback_fail_the_fallbacks_reason_is_reported(
     let name = new_worktree(&f, "feat/one");
     let err = format!(
         "{:#}",
-        actions::start(&f.paths, &f.config, &name, None, false, &|_| {}).unwrap_err()
+        actions::start(
+            &f.paths,
+            &f.config,
+            &name,
+            None,
+            actions::Mode::Remembered,
+            &|_| {}
+        )
+        .unwrap_err()
     );
     assert!(err.contains("the migrate hook failed"), "{err}");
     assert!(err.contains("SECOND"), "{err}");
@@ -271,7 +287,15 @@ fn a_services_hook_is_told_where_this_worktrees_services_are() {
             .to_string()
     });
     let name = new_worktree(&f, "feat/one");
-    let report = actions::start(&f.paths, &f.config, &name, None, true, &|_| {}).unwrap();
+    let report = actions::start(
+        &f.paths,
+        &f.config,
+        &name,
+        None,
+        actions::Mode::Isolated,
+        &|_| {},
+    )
+    .unwrap();
     let log = f.log(&name, "migrate");
     assert!(
         log.contains(&format!(
@@ -297,7 +321,15 @@ fn a_hook_cwd_that_leaves_the_worktree_is_refused() {
     let name = new_worktree(&f, "feat/one");
     let err = format!(
         "{:#}",
-        actions::start(&f.paths, &f.config, &name, None, false, &|_| {}).unwrap_err()
+        actions::start(
+            &f.paths,
+            &f.config,
+            &name,
+            None,
+            actions::Mode::Remembered,
+            &|_| {}
+        )
+        .unwrap_err()
     );
     assert!(err.contains("\"odd\""), "{err}");
     assert!(err.contains("does not exist in this worktree"), "{err}");
@@ -326,7 +358,15 @@ fn a_probe_that_recognises_the_failure_aborts_the_start_with_its_hint() {
     let name = new_worktree(&f, "feat/one");
     let err = format!(
         "{:#}",
-        actions::start(&f.paths, &f.config, &name, None, false, &|_| {}).unwrap_err()
+        actions::start(
+            &f.paths,
+            &f.config,
+            &name,
+            None,
+            actions::Mode::Remembered,
+            &|_| {}
+        )
+        .unwrap_err()
     );
     assert!(err.contains("native-abi"), "{err}");
     assert!(err.contains("NODE_MODULE_VERSION"), "{err}");
@@ -351,7 +391,15 @@ fn a_probe_that_fails_some_other_way_is_ignored() {
     let said = std::sync::Mutex::new(Vec::<String>::new());
     {
         let notice = |m: &str| said.lock().unwrap().push(m.to_string());
-        actions::start(&f.paths, &f.config, &name, None, false, &notice).unwrap();
+        actions::start(
+            &f.paths,
+            &f.config,
+            &name,
+            None,
+            actions::Mode::Remembered,
+            &notice,
+        )
+        .unwrap();
     }
     let said = said.into_inner().unwrap();
     assert!(
@@ -404,7 +452,15 @@ fn start_saying(f: &Hx, name: &str) -> Vec<String> {
     let said = std::sync::Mutex::new(Vec::<String>::new());
     {
         let notice = |m: &str| said.lock().unwrap().push(m.to_string());
-        actions::start(&f.paths, &f.config, name, None, false, &notice).unwrap();
+        actions::start(
+            &f.paths,
+            &f.config,
+            name,
+            None,
+            actions::Mode::Remembered,
+            &notice,
+        )
+        .unwrap();
     }
     said.into_inner().unwrap()
 }
@@ -456,7 +512,15 @@ fn a_failing_hook_names_the_entry_it_came_from_and_says_it_can_be_deleted() {
     let name = new_worktree(&f, "feat/one");
     let err = format!(
         "{:#}",
-        actions::start(&f.paths, &f.config, &name, None, false, &|_| {}).unwrap_err()
+        actions::start(
+            &f.paths,
+            &f.config,
+            &name,
+            None,
+            actions::Mode::Remembered,
+            &|_| {}
+        )
+        .unwrap_err()
     );
     assert!(err.contains("the migrate hook failed"), "{err}");
     assert!(err.contains("[[hooks]]"), "{err}");

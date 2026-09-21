@@ -100,7 +100,15 @@ fn new_worktree(f: &Iso, branch: &str) -> String {
 }
 
 fn start_isolated(f: &Iso, name: &str) -> actions::StartReport {
-    actions::start(&f.paths, &f.config, name, None, true, &|_| {}).unwrap()
+    actions::start(
+        &f.paths,
+        &f.config,
+        name,
+        None,
+        actions::Mode::Isolated,
+        &|_| {},
+    )
+    .unwrap()
 }
 
 fn log_of(f: &Iso, name: &str, source: &str) -> String {
@@ -217,7 +225,15 @@ fn a_later_plain_start_keeps_the_services_and_the_mode() {
 
     actions::stop(&f.paths, &name, None, &|_| {}).unwrap();
     // A plain start, with no flag at all: the worktree remembers.
-    let second = actions::start(&f.paths, &f.config, &name, None, false, &|_| {}).unwrap();
+    let second = actions::start(
+        &f.paths,
+        &f.config,
+        &name,
+        None,
+        actions::Mode::Remembered,
+        &|_| {},
+    )
+    .unwrap();
     assert_eq!(second.ports, first.ports, "the ports do not move");
     assert!(f.record(&name).isolated);
     assert_eq!(
@@ -361,7 +377,15 @@ fn the_readiness_failure_cleanup_stops_the_project_rather_than_the_files() {
     let project = f.project(&name);
     docker::never_ready(&f.home, &project);
 
-    actions::start(&f.paths, &f.config, &name, None, true, &|_| {}).unwrap_err();
+    actions::start(
+        &f.paths,
+        &f.config,
+        &name,
+        None,
+        actions::Mode::Isolated,
+        &|_| {},
+    )
+    .unwrap_err();
     let seen = docker::invocations_for(&f.home, &project);
     assert!(
         seen.iter()
@@ -472,7 +496,15 @@ fn a_service_that_never_becomes_ready_fails_the_start_and_stops_what_came_up() {
 
     let err = format!(
         "{:#}",
-        actions::start(&f.paths, &f.config, &name, None, true, &|_| {}).unwrap_err()
+        actions::start(
+            &f.paths,
+            &f.config,
+            &name,
+            None,
+            actions::Mode::Isolated,
+            &|_| {}
+        )
+        .unwrap_err()
     );
     assert!(err.contains("did not become ready"), "{err}");
     assert!(err.contains("postgres") || err.contains("redis"), "{err}");
@@ -504,7 +536,15 @@ fn a_published_port_with_nothing_behind_it_is_never_ready() {
 
     let err = format!(
         "{:#}",
-        actions::start(&f.paths, &f.config, &name, None, true, &|_| {}).unwrap_err()
+        actions::start(
+            &f.paths,
+            &f.config,
+            &name,
+            None,
+            actions::Mode::Isolated,
+            &|_| {}
+        )
+        .unwrap_err()
     );
     assert!(err.contains("did not become ready"), "{err}");
     assert!(err.contains("postgres") || err.contains("redis"), "{err}");
@@ -548,7 +588,15 @@ fn a_start_that_fails_before_any_container_leaves_the_worktree_startable() {
 
     let err = format!(
         "{:#}",
-        actions::start(&f.paths, &f.config, &name, None, true, &|_| {}).unwrap_err()
+        actions::start(
+            &f.paths,
+            &f.config,
+            &name,
+            None,
+            actions::Mode::Isolated,
+            &|_| {}
+        )
+        .unwrap_err()
     );
     assert!(err.contains("DB_HOST"), "{err}");
     assert!(
@@ -562,7 +610,15 @@ fn a_start_that_fails_before_any_container_leaves_the_worktree_startable() {
 
     // And a plain start still works, which it could not if the worktree
     // were stuck in a mode whose first step always fails.
-    let report = actions::start(&f.paths, &f.config, &name, None, false, &|_| {}).unwrap();
+    let report = actions::start(
+        &f.paths,
+        &f.config,
+        &name,
+        None,
+        actions::Mode::Remembered,
+        &|_| {},
+    )
+    .unwrap();
     assert!(report.ports.contains_key("web"));
     assert!(!f.record(&name).isolated);
     actions::stop(&f.paths, &name, None, &|_| {}).unwrap();
@@ -579,7 +635,15 @@ fn a_docker_whose_daemon_is_down_gets_the_hint_rather_than_the_command_line() {
 
     let err = format!(
         "{:#}",
-        actions::start(&f.paths, &f.config, &name, None, true, &|_| {}).unwrap_err()
+        actions::start(
+            &f.paths,
+            &f.config,
+            &name,
+            None,
+            actions::Mode::Isolated,
+            &|_| {}
+        )
+        .unwrap_err()
     );
     assert!(err.contains("Docker daemon is not running"), "{err}");
     assert!(err.contains("without --isolated"), "{err}");
@@ -657,7 +721,15 @@ fn an_env_key_no_file_in_the_worktree_sets_is_an_error_naming_it() {
     let name = new_worktree(&f, "feat/one");
     let err = format!(
         "{:#}",
-        actions::start(&f.paths, &f.config, &name, None, true, &|_| {}).unwrap_err()
+        actions::start(
+            &f.paths,
+            &f.config,
+            &name,
+            None,
+            actions::Mode::Isolated,
+            &|_| {}
+        )
+        .unwrap_err()
     );
     assert!(err.contains("NOWHERE_URL"), "{err}");
     assert!(err.contains(".env.example"), "{err}");
@@ -743,7 +815,15 @@ fn a_project_with_no_services_runs_shared_and_says_so() {
     let said = std::sync::Mutex::new(Vec::<String>::new());
     let report = {
         let notice = |m: &str| said.lock().unwrap().push(m.to_string());
-        actions::start(&paths, &config, &name, None, true, &notice).unwrap()
+        actions::start(
+            &paths,
+            &config,
+            &name,
+            None,
+            actions::Mode::Isolated,
+            &notice,
+        )
+        .unwrap()
     };
     let said = said.into_inner().unwrap();
     assert!(
@@ -813,7 +893,15 @@ fn a_bind_mount_inside_the_repository_is_refused_by_name() {
 
     let err = format!(
         "{:#}",
-        actions::start(&f.paths, &f.config, &name, None, true, &|_| {}).unwrap_err()
+        actions::start(
+            &f.paths,
+            &f.config,
+            &name,
+            None,
+            actions::Mode::Isolated,
+            &|_| {}
+        )
+        .unwrap_err()
     );
     assert!(err.contains("postgres"), "{err}");
     assert!(err.contains("./pgdata"), "{err}");
@@ -842,4 +930,226 @@ fn a_service_name_that_collides_with_a_process_role_is_refused_at_load() {
     assert!(err.contains("\"postgres\""), "{err}");
     assert!(err.contains("role"), "{err}");
     let _: BTreeMap<String, String> = BTreeMap::new();
+}
+
+// ---- the way back ---------------------------------------------------------
+
+// `--shared` is how a worktree stops running its own copies of everything
+// and goes back to the project's. The containers stop; their volumes stay,
+// because a mode switch is not a decision to throw data away.
+#[test]
+fn start_shared_stops_the_private_services_and_clears_the_mode() {
+    if skip_without_python() {
+        return;
+    }
+    let f = iso();
+    let name = new_worktree(&f, "feat/one");
+    let isolated = start_isolated(&f, &name);
+    assert!(f.record(&name).isolated);
+    assert!(!docker::services_up(&f.home, &f.project(&name)).is_empty());
+    let pump = f.service(&name, "postgres");
+    let pump_pid = pump.pid.expect("a log pump");
+
+    let shared = actions::start(
+        &f.paths,
+        &f.config,
+        &name,
+        None,
+        actions::Mode::Shared,
+        &|_| {},
+    )
+    .unwrap();
+
+    let record = f.record(&name);
+    assert!(!record.isolated, "the mode is cleared");
+    assert!(
+        docker::services_up(&f.home, &f.project(&name)).is_empty(),
+        "the private services are stopped"
+    );
+    assert!(
+        !docker::was_downed(&f.home, &f.project(&name)),
+        "but not taken down: a mode switch is not `rm`, and the volumes stay"
+    );
+    assert!(
+        common::wait_until(Duration::from_secs(5), || !process::is_alive(pump_pid)),
+        "the log pump in front of a stopped service is stopped with it"
+    );
+    for service in &record.services {
+        assert_eq!(service.pid, None, "{}: pump forgotten", service.name);
+        assert_eq!(
+            service.port, None,
+            "{}: the port belongs to a window this start re-derived",
+            service.name
+        );
+        assert!(
+            service.compose_project.is_some(),
+            "{}: but rm can still find the container and its volumes",
+            service.name
+        );
+    }
+    assert_eq!(
+        shared.ports["web"], isolated.ports["web"],
+        "the application keeps the port it was bookmarked on"
+    );
+    // And it really is running again, in shared mode: the processes are
+    // replaced rather than left pointed at a database that has gone.
+    assert_eq!(shared.started.len(), 1, "{:?}", shared.started);
+    assert!(
+        shared.already_running.is_empty(),
+        "a process still pointed at the old database is not in shared mode"
+    );
+    assert!(
+        !f.record(&name).ports.contains_key("postgres"),
+        "and the service roles are out of the worktree's window"
+    );
+}
+
+// And a plain start afterwards stays shared: the mode is remembered in
+// both directions.
+#[test]
+fn a_plain_start_after_shared_stays_shared() {
+    if skip_without_python() {
+        return;
+    }
+    let f = iso();
+    let name = new_worktree(&f, "feat/one");
+    start_isolated(&f, &name);
+    actions::start(
+        &f.paths,
+        &f.config,
+        &name,
+        None,
+        actions::Mode::Shared,
+        &|_| {},
+    )
+    .unwrap();
+    actions::stop(&f.paths, &name, None, &|_| {}).unwrap();
+
+    actions::start(
+        &f.paths,
+        &f.config,
+        &name,
+        None,
+        actions::Mode::Remembered,
+        &|_| {},
+    )
+    .unwrap();
+    assert!(!f.record(&name).isolated, "a plain start does not undo it");
+    assert!(
+        docker::services_up(&f.home, &f.project(&name)).is_empty(),
+        "and nothing brought the private services back up"
+    );
+}
+
+// ---- a log pump that died -------------------------------------------------
+
+/// Kills a service's log pump and waits for it to go, returning its pid.
+fn kill_the_pump(f: &Iso, name: &str, service: &str) -> u32 {
+    let pump = f.service(name, service);
+    let pid = pump.pid.expect("a log pump");
+    process::stop(pump.pgid.expect("a group"), Duration::from_secs(2)).unwrap();
+    assert!(
+        common::wait_until(Duration::from_secs(5), || !process::is_alive(pid)),
+        "the pump never died"
+    );
+    pid
+}
+
+fn pump_is_running(f: &Iso, name: &str, service: &str) -> bool {
+    actions::service_statuses(&f.record(name))
+        .into_iter()
+        .find(|status| status.name == service)
+        .expect("a service status")
+        .logging
+}
+
+// A read path reports a dead pump and leaves it dead: nothing that merely
+// looks at state is allowed to spawn a process.
+#[test]
+fn a_dead_pump_is_reported_by_a_read_path_and_never_respawned_by_one() {
+    if skip_without_python() {
+        return;
+    }
+    let f = iso();
+    let name = new_worktree(&f, "feat/one");
+    start_isolated(&f, &name);
+    assert!(pump_is_running(&f, &name, "postgres"));
+
+    let dead = kill_the_pump(&f, &name, "postgres");
+    assert!(!pump_is_running(&f, &name, "postgres"), "status says so");
+
+    actions::refresh(&f.paths);
+    actions::service_statuses(&f.record(&name));
+    actions::ls(&f.paths).unwrap();
+    assert!(
+        !pump_is_running(&f, &name, "postgres"),
+        "and every read of it leaves it exactly as dead"
+    );
+    assert_eq!(
+        f.service(&name, "postgres").pid,
+        Some(dead),
+        "no read path started a new one"
+    );
+    assert!(!process::is_alive(dead));
+}
+
+// `start` is one of the two that put it back, and it does so without
+// disturbing a process that is already up.
+#[test]
+fn a_dead_pump_comes_back_on_the_next_start() {
+    if skip_without_python() {
+        return;
+    }
+    let f = iso();
+    let name = new_worktree(&f, "feat/one");
+    let first = start_isolated(&f, &name);
+    let dev = first.started[0].record.pid;
+    let dead = kill_the_pump(&f, &name, "postgres");
+
+    let report = actions::start(
+        &f.paths,
+        &f.config,
+        &name,
+        None,
+        actions::Mode::Remembered,
+        &|_| {},
+    )
+    .unwrap();
+
+    assert!(pump_is_running(&f, &name, "postgres"), "the pump is back");
+    assert_ne!(
+        f.service(&name, "postgres").pid,
+        Some(dead),
+        "and it is a new one"
+    );
+    assert!(
+        report.started.is_empty() && report.already_running.len() == 1,
+        "the process that was up was left exactly as it was: {report:?}"
+    );
+    assert!(process::is_alive(dev), "including its pid");
+}
+
+// And `restart` is the other one.
+#[test]
+fn a_dead_pump_comes_back_on_restart() {
+    if skip_without_python() {
+        return;
+    }
+    let f = iso();
+    let name = new_worktree(&f, "feat/one");
+    start_isolated(&f, &name);
+    let dead = kill_the_pump(&f, &name, "postgres");
+
+    actions::restart(
+        &f.paths,
+        &f.config,
+        &name,
+        None,
+        actions::Mode::Remembered,
+        &|_| {},
+    )
+    .unwrap();
+
+    assert!(pump_is_running(&f, &name, "postgres"));
+    assert_ne!(f.service(&name, "postgres").pid, Some(dead));
 }

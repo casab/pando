@@ -1040,17 +1040,17 @@ impl App {
     }
 
     fn start_selected(&mut self) {
-        self.start_selected_with(false)
+        self.start_selected_with(actions::Mode::Remembered)
     }
 
     /// Start with private copies of the project's services. The same path
     /// as `start_selected`; the flag reaches detection too, because the
     /// services question is only worth asking when it is being answered.
     fn start_selected_isolated(&mut self) {
-        self.start_selected_with(true)
+        self.start_selected_with(actions::Mode::Isolated)
     }
 
-    fn start_selected_with(&mut self, isolated: bool) {
+    fn start_selected_with(&mut self, mode: actions::Mode) {
         let Some(name) = self.selected_name() else {
             return;
         };
@@ -1066,13 +1066,13 @@ impl App {
             // Detection may have a question; it goes back to the UI thread
             // and this worker waits for the answer.
             let ask = |question: &actions::Question| ask_through_ui(&tx, question);
-            let config = actions::resolve_process(&paths, &config, isolated, &ask, &progress)
+            let config = actions::resolve_process(&paths, &config, mode, &ask, &progress)
                 .map_err(|e| format!("{e:#}"))?;
             // Back to the UI thread at once: an answer written to
             // `pando.toml` that this session's own copy does not have is
             // one the next keypress asks all over again.
             let _ = tx.send(AppEvent::ConfigResolved(Box::new(config.clone())));
-            actions::start(&paths, &config, &worker_name, None, isolated, &progress)
+            actions::start(&paths, &config, &worker_name, None, mode, &progress)
                 .map(|report| PendingOutcome::Started(worker_name.clone(), report.url.clone()))
                 .map_err(|e| format!("{e:#}"))
         });
@@ -1180,12 +1180,25 @@ impl App {
                 let _ = ptx.send(msg.to_string());
             };
             let ask = |question: &actions::Question| ask_through_ui(&tx, question);
-            let config = actions::resolve_process(&paths, &config, false, &ask, &progress)
-                .map_err(|e| format!("{e:#}"))?;
+            let config = actions::resolve_process(
+                &paths,
+                &config,
+                actions::Mode::Remembered,
+                &ask,
+                &progress,
+            )
+            .map_err(|e| format!("{e:#}"))?;
             let _ = tx.send(AppEvent::ConfigResolved(Box::new(config.clone())));
-            actions::restart(&paths, &config, &worker_name, None, false, &progress)
-                .map(|report| PendingOutcome::Started(worker_name.clone(), report.url.clone()))
-                .map_err(|e| format!("{e:#}"))
+            actions::restart(
+                &paths,
+                &config,
+                &worker_name,
+                None,
+                actions::Mode::Remembered,
+                &progress,
+            )
+            .map(|report| PendingOutcome::Started(worker_name.clone(), report.url.clone()))
+            .map_err(|e| format!("{e:#}"))
         });
         if started && let Some(p) = self.pending.as_mut() {
             p.progress_rx = Some(prx);
@@ -3038,6 +3051,7 @@ pub mod tests {
                 name: "postgres".into(),
                 port: Some(5432),
                 up: false,
+                logging: false,
             }],
             worktrees: BTreeMap::from([(
                 "feat+one".to_string(),
@@ -3045,6 +3059,7 @@ pub mod tests {
                     name: "postgres".into(),
                     port: Some(17_004),
                     up: true,
+                    logging: false,
                 }],
             )]),
         };
