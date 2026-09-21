@@ -10,7 +10,7 @@ use chrono::Utc;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::{self, Config, ProcessConfig, ProvisionMode};
 use crate::detect::{self, Slot};
@@ -2234,6 +2234,11 @@ pub fn share_with(
     let worktree = find_worktree(paths, name)?;
     let canonical = std::fs::canonicalize(&worktree.path).unwrap_or_else(|_| worktree.path.clone());
 
+    // Outside the lock, because `refresh` takes it: a worktree `start`
+    // returned from a moment ago is still `Starting`, and refusing it is
+    // refusing the first thing anyone types.
+    await_share_target(paths, name, progress);
+
     // Every refusal first, and the proxy's port, under the lock.
     let (target_port, share_port) = {
         let _lock = state::lock(&paths.lock_file())?;
@@ -2416,21 +2421,31 @@ fn sweep_dead_shares_with(
         };
         let tunnel_dead = !is_alive(share.tunnel_pid);
         let proxy_dead = share.proxy_pid.is_some_and(|pid| !is_alive(pid));
-        if !tunnel_dead && !proxy_dead {
+        // `stop` and `rm` unshare first, so a *stopped* worktree never
+        // keeps a public URL. A crashed one is the same thing without the
+        // announcement: the URL answers, and a proxy in front of it keeps
+        // injecting the auth cookie into requests aimed at a port whose
+        // owner is gone.
+        let nothing_serving = !share_target_is_up(record, &is_alive);
+        if !tunnel_dead && !proxy_dead && !nothing_serving {
             continue;
         }
-        let half = if tunnel_dead { "tunnel" } else { "proxy" };
+        let reason = if tunnel_dead {
+            "the share's tunnel exited"
+        } else if proxy_dead {
+            "the share's proxy exited"
+        } else {
+            "nothing is serving what its public URL pointed at"
+        };
         match tunnel::stop_share_with(&share, &stop) {
             Ok(()) => {
                 record.share = None;
-                notices.push(format!(
-                    "{name}: the share's {half} exited, so the public URL is closed"
-                ));
+                notices.push(format!("{name}: {reason}, so the public URL is closed"));
             }
             // Not cleared: the record holds the only pgid anything can use
             // to try again.
             Err(e) => notices.push(format!(
-                "{name}: the share's {half} exited and the rest of it would not stop ({e:#}) — \
+                "{name}: {reason} and the rest of it would not stop ({e:#}) — \
                  `pando unshare {name}` to try again"
             )),
         }
@@ -2438,11 +2453,114 @@ fn sweep_dead_shares_with(
     notices
 }
 
+/// How often the readiness wait asks whether the target is up yet. The
+/// same poll a developer does by hand, and `refresh` is cheap.
+const SHARE_READY_POLL: Duration = Duration::from_millis(250);
+
+/// Waits for the process a share would publish to leave `Starting`,
+/// bounded by that process's own readiness budget.
+///
+/// `start` records `Starting` and returns; the phase advances on the next
+/// read path, once the port is really bound. So `pando start x && pando
+/// share x` — the first thing anyone types — used to answer "x is not
+/// running, start it first", which is advice the developer had just
+/// followed. This is what they would do instead: look at `status` until
+/// it says running.
+///
+/// Not a refusal of its own: the wait ends when the phase changes or the
+/// budget runs out, and whatever the state is then goes through the same
+/// refusals as before. `refresh` is a read path — it signals, it never
+/// spawns — so polling it is safe from here.
+fn await_share_target(paths: &PandoPaths, name: &str, progress: &dyn Fn(&str)) {
+    let Some(budget) = share_ready_budget(&refresh(paths).state, name) else {
+        return;
+    };
+    progress(&format!(
+        "waiting up to {}s for {name} to be ready",
+        budget.as_secs().max(1)
+    ));
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        std::thread::sleep(SHARE_READY_POLL);
+        if share_ready_budget(&refresh(paths).state, name).is_none() {
+            return;
+        }
+    }
+}
+
+/// How long the process a share would publish still has to become ready,
+/// or `None` when there is nothing to wait for.
+///
+/// The budget `advance_phases` itself uses, so the wait ends when that
+/// function gives up rather than a moment before or a minute after.
+fn share_ready_budget(store: &state::State, name: &str) -> Option<Duration> {
+    let record = store.worktrees.get(name)?;
+    let starting = |p: &state::ProcessRecord| match p.phase {
+        Phase::Starting { since } => Some((p.ready_timeout_s, since)),
+        _ => None,
+    };
+    let (timeout_s, since) = match share_owner(record) {
+        Some(process) => starting(process)?,
+        None => {
+            if record
+                .processes
+                .values()
+                .any(|p| matches!(p.phase, Phase::Running { .. }))
+            {
+                return None;
+            }
+            record.processes.values().find_map(starting)?
+        }
+    };
+    let budget = timeout_s
+        .map(|s| s as i64)
+        .unwrap_or(state::START_TIMEOUT_SECS);
+    let left = budget - Utc::now().signed_duration_since(since).num_seconds();
+    Some(Duration::from_secs(left.max(0) as u64) + SHARE_READY_POLL)
+}
+
+/// Whether anything is still up to serve what a share of this worktree
+/// points at.
+///
+/// Liveness as well as phase, because this runs *before* `advance_phases`
+/// on every path: a process that died a second ago still says `Running`,
+/// and waiting a tick to notice is a tick of a public door onto nothing.
+/// `Starting` counts — a worktree that is coming up is not one with
+/// nothing serving, and tearing its share down would be the same mistake
+/// inverted.
+fn share_target_is_up(record: &WorktreeRecord, is_alive: &impl Fn(u32) -> bool) -> bool {
+    let up = |p: &state::ProcessRecord| {
+        matches!(p.phase, Phase::Running { .. } | Phase::Starting { .. }) && is_alive(p.pid)
+    };
+    match share_owner(record) {
+        Some(process) => up(process),
+        // A record written before pando tracked who owns what: anything up
+        // is as much as it can say.
+        None => record.processes.values().any(up),
+    }
+}
+
+/// The process whose port a share of this worktree publishes, when the
+/// record says who owns what.
+fn share_owner(record: &WorktreeRecord) -> Option<&state::ProcessRecord> {
+    let role = url_role(record)?;
+    let owner = record
+        .roles
+        .iter()
+        .find(|(_, roles)| roles.contains(&role))
+        .map(|(process, _)| process)?;
+    record.processes.get(owner)
+}
+
 /// The port a share points at: the one the worktree's own URL uses, and
 /// only while the process that owns it is running.
 ///
 /// The same rule and the same words as the TUI's open key, because
 /// "shareable" and "openable" have to mean the same thing.
+///
+/// A refusal says which of the three states it found. They need different
+/// answers — wait, read the log, start it — and one message for all three
+/// sent a developer who had just run `start` back to run it again.
 fn share_target_port(name: &str, record: &WorktreeRecord) -> Result<u16> {
     let Some(role) = url_role(record) else {
         bail!("{name} has no port yet — start it first");
@@ -2450,28 +2568,39 @@ fn share_target_port(name: &str, record: &WorktreeRecord) -> Result<u16> {
     let Some(assigned) = record.ports.get(&role).copied() else {
         bail!("{name} has no port yet — start it first");
     };
-    let owner = record
-        .roles
-        .iter()
-        .find(|(_, roles)| roles.contains(&role))
-        .map(|(process, _)| process.clone());
-    let running = match &owner {
-        Some(process) => record
-            .processes
-            .get(process)
-            .is_some_and(|p| matches!(p.phase, Phase::Running { .. })),
-        // A record written before pando tracked who owns what: anything up
-        // is as much as it can say.
-        None => record
-            .processes
-            .values()
-            .any(|p| matches!(p.phase, Phase::Running { .. })),
-    };
-    if !running {
-        bail!("{name} is not running — start it first, then share it");
+    match share_state(record) {
+        Some(Phase::Running { .. }) => {}
+        Some(Phase::Starting { .. }) => bail!(
+            "{name} is still starting — `pando status {name}` says when it is ready, and \
+             `pando share {name}` then works"
+        ),
+        Some(Phase::Failed { reason, .. }) => bail!(
+            "{name} failed to start ({reason}) — `pando logs {name}` says why; there is nothing \
+             for a public URL to point at yet"
+        ),
+        None => bail!("{name} is not running — start it first, then share it"),
     }
     // What is really serving, not what pando asked for.
     Ok(observed_port_for_role(record, &role).unwrap_or(assigned))
+}
+
+/// The phase of the process a share would publish: the owner of the URL's
+/// role, or — for a record written before pando tracked who owns what —
+/// the best of what the worktree is running.
+fn share_state(record: &WorktreeRecord) -> Option<Phase> {
+    if let Some(process) = share_owner(record) {
+        return Some(process.phase.clone());
+    }
+    let best = |wanted: fn(&Phase) -> bool| {
+        record
+            .processes
+            .values()
+            .find(|p| wanted(&p.phase))
+            .map(|p| p.phase.clone())
+    };
+    best(|p| matches!(p, Phase::Running { .. }))
+        .or_else(|| best(|p| matches!(p, Phase::Starting { .. })))
+        .or_else(|| best(|_| true))
 }
 
 /// Runs `[share].auth_cmd` and returns the `Cookie` header value it printed.
@@ -5859,6 +5988,58 @@ time.sleep(300)
         );
     }
 
+    // Finding 8. `start` records `Starting` and returns; the phase advances
+    // on the next read path, once the port is really bound. So
+    // `pando start x && pando share x` — the first thing anyone types —
+    // answered "x is not running — start it first". Waiting is what a
+    // developer does by hand, and `share` already blocks on the auth
+    // command and on the tunnel, both narrated.
+    #[test]
+    fn share_waits_for_a_worktree_that_start_has_only_just_returned_from() {
+        if !python3_available() {
+            eprintln!("skipping: python3 is needed for a process that really holds a port");
+            return;
+        }
+        let mut fx = fixture();
+        with_dev(
+            &mut fx,
+            ProcessConfig {
+                cmd: python_listener_template(),
+                ports: Some(PortsSpec::List(vec!["web".to_string()])),
+                ready: Some(ReadySpec {
+                    role: Some("web".to_string()),
+                    timeout_s: None,
+                }),
+                ..Default::default()
+            },
+        );
+        fake_cloudflared_publishing(&fx.paths.home);
+        let name = worktree_named(&fx, "feat/one");
+        let report = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+        let _guards = guard(&report);
+        assert!(
+            matches!(
+                fx.state().worktrees[&name].processes["dev"].phase,
+                Phase::Starting { .. }
+            ),
+            "the whole point of this test is that `start` returns before readiness"
+        );
+
+        let said = std::sync::Mutex::new(Vec::<String>::new());
+        let outcome = share(&fx.paths, &fx.config, &name, &|line| {
+            said.lock().unwrap().push(line.to_string())
+        })
+        .unwrap();
+        let _share = share_guard(&fx, &name);
+
+        assert_eq!(outcome.public_url, FAKE_TUNNEL_URL);
+        let said = said.into_inner().unwrap();
+        assert!(
+            said.iter().any(|line| line.contains("waiting")),
+            "a wait the developer cannot see is a hang: {said:?}"
+        );
+    }
+
     #[test]
     fn share_refuses_a_worktree_whose_process_has_stopped() {
         let Some((fx, name, guards, _)) = shared_fixture() else {
@@ -6359,7 +6540,10 @@ time.sleep(300)
 
     #[test]
     fn a_live_share_is_left_alone() {
-        let mut store = state_with_share(share_record_of(4242, Some(8484)));
+        // With the application it publishes still up: a share pointing at
+        // a worktree that is running nothing is closed, which is its own
+        // test further down.
+        let mut store = state_with_a_shared_application(Phase::Running { since: Utc::now() }, 777);
         let signalled = std::sync::Mutex::new(Vec::new());
         let notices = sweep_dead_shares_with(
             &mut store,
@@ -6387,6 +6571,145 @@ time.sleep(300)
             "dropping it would leave a tunnel nothing can name"
         );
         assert!(notices[0].contains("unshare"), "{:?}", notices[0]);
+    }
+
+    /// A worktree with one `dev` process owning `web`, shared, whose
+    /// process is in `phase`.
+    fn state_with_a_shared_application(phase: Phase, pid: u32) -> state::State {
+        let mut store = state_with_share(share_record_of(4242, Some(8484)));
+        let record = store.worktrees.get_mut("feat+one").unwrap();
+        record.ports.insert("web".to_string(), 17000);
+        record
+            .roles
+            .insert("dev".to_string(), vec!["web".to_string()]);
+        let mut process = fake_record(pid as i32);
+        process.phase = phase;
+        record.processes.insert("dev".to_string(), process);
+        store
+    }
+
+    // Finding 5. `stop` and `rm` unshare first, so a *stopped* worktree
+    // never keeps a public URL — but a crashed one did, and the proxy in
+    // front of it kept injecting the auth cookie into every request aimed
+    // at a port whose owner was gone.
+    #[test]
+    fn a_share_whose_application_crashed_is_closed_and_both_halves_signalled() {
+        let mut store = state_with_a_shared_application(Phase::Running { since: Utc::now() }, 777);
+        let signalled = std::sync::Mutex::new(Vec::new());
+
+        let notices = sweep_dead_shares_with(
+            &mut store,
+            // Both halves of the share are up; the application is not.
+            |pid| pid != 777,
+            |pgid| {
+                signalled.lock().unwrap().push(pgid);
+                Ok(())
+            },
+        );
+
+        assert_eq!(
+            signalled.into_inner().unwrap(),
+            vec![4242, 8484],
+            "a public URL onto nothing is worse than no public URL"
+        );
+        assert!(store.worktrees["feat+one"].share.is_none());
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(
+            notices[0].contains("public URL is closed"),
+            "{:?}",
+            notices[0]
+        );
+    }
+
+    #[test]
+    fn a_share_whose_application_is_still_up_is_left_alone() {
+        let mut store = state_with_a_shared_application(Phase::Running { since: Utc::now() }, 777);
+        let notices = sweep_dead_shares_with(&mut store, |_| true, |_| Ok(()));
+        assert!(notices.is_empty(), "{notices:?}");
+        assert!(store.worktrees["feat+one"].share.is_some());
+    }
+
+    // A worktree that is still coming up is not a worktree with nothing
+    // serving: tearing its share down would be the same mistake inverted.
+    #[test]
+    fn a_share_of_something_still_starting_is_left_alone() {
+        let mut store = state_with_a_shared_application(Phase::Starting { since: Utc::now() }, 777);
+        let notices = sweep_dead_shares_with(&mut store, |_| true, |_| Ok(()));
+        assert!(notices.is_empty(), "{notices:?}");
+        assert!(store.worktrees["feat+one"].share.is_some());
+    }
+
+    #[test]
+    fn refresh_closes_a_share_whose_application_crashed_rather_than_stopped() {
+        let Some((fx, name, guards, _)) = shared_fixture() else {
+            return;
+        };
+        share(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let record = fx.state().worktrees[&name].share.clone().unwrap();
+        let _cleanup = ShareGuard(Some(record.clone()));
+
+        // A crash, not a `stop`: nothing tells pando, and nothing unshares.
+        drop(guards);
+
+        let refreshed = refresh(&fx.paths);
+        assert!(
+            refreshed.state.worktrees[&name].share.is_none(),
+            "a crashed application left its public URL open"
+        );
+        assert!(
+            refreshed
+                .notices
+                .iter()
+                .any(|n| n.contains("public URL is closed")),
+            "{:?}",
+            refreshed.notices
+        );
+        assert!(
+            wait_until(Duration::from_secs(5), || !crate::process::group_alive(
+                record.tunnel_pgid
+            )),
+            "the tunnel onto nothing was left running"
+        );
+    }
+
+    // Finding 8. One message for three different states, and for the one
+    // that matters most — a worktree `start` returned from a moment ago —
+    // it was advice the developer had just followed.
+    #[test]
+    fn a_share_refusal_names_the_state_it_found() {
+        let mut base = WorktreeRecord::new("/tmp/feat+one", true);
+        base.ports.insert("web".to_string(), 17000);
+        base.roles
+            .insert("dev".to_string(), vec!["web".to_string()]);
+
+        let nothing = format!("{:#}", share_target_port("feat+one", &base).unwrap_err());
+        assert!(nothing.contains("start it first"), "{nothing}");
+
+        let mut starting = base.clone();
+        let mut process = fake_record(900);
+        process.phase = Phase::Starting { since: Utc::now() };
+        starting.processes.insert("dev".to_string(), process);
+        let message = format!(
+            "{:#}",
+            share_target_port("feat+one", &starting).unwrap_err()
+        );
+        assert!(
+            message.contains("still starting"),
+            "a worktree that is coming up is not one that was never started: {message}"
+        );
+
+        let mut failed = base.clone();
+        let mut process = fake_record(900);
+        process.phase = Phase::Failed {
+            at: Utc::now(),
+            reason: "timeout: nothing bound port 17000 in 30s".to_string(),
+        };
+        failed.processes.insert("dev".to_string(), process);
+        let message = format!("{:#}", share_target_port("feat+one", &failed).unwrap_err());
+        assert!(
+            message.contains("nothing bound port 17000"),
+            "a failure says what failed: {message}"
+        );
     }
 
     #[test]

@@ -2114,12 +2114,19 @@ mod tests {
     }
 
     /// A worktree with a live share recorded, so the status shapes can be
-    /// asserted without a tunnel. The pid is this process: alive, so the
-    /// refresh leaves the record alone.
+    /// asserted without a tunnel. Every pid is this process: alive, so the
+    /// refresh leaves the record alone — the application it publishes
+    /// included, because a share whose application is gone is closed.
     fn with_share(fx: &Fx, name: &str, proxy: Option<u16>) {
         let mut store = crate::state::load(&fx.paths.state_file()).unwrap();
         let record = store.worktrees.get_mut(name).unwrap();
         record.ports.insert("web".to_string(), 17_342);
+        record
+            .roles
+            .insert("dev".to_string(), vec!["web".to_string()]);
+        record
+            .processes
+            .insert("dev".to_string(), listening(std::process::id() as i32, &[]));
         record.share_port = proxy;
         record.share = Some(crate::state::ShareRecord {
             tunnel_pid: std::process::id(),
