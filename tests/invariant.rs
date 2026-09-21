@@ -1145,6 +1145,119 @@ fn an_isolated_lifecycle_never_writes_into_the_repository() {
     assert!(!common::docker::invocations(&h.home).is_empty());
 }
 
+/// Fixture 1 with a fake PostgreSQL in pando's home and a config that
+/// runs a native service rather than a container.
+fn native_harness() -> Harness {
+    let h = harness_of(
+        Kind::NextPnpmCompose,
+        &format!(
+            "[project]\nprovision = [\".env\"]\ninstall = \"true\"\n\n\
+             [dev]\ncmd = '''{}'''\nports = {{ PORT = \"web\" }}\n\n\
+             [[services]]\nkind = \"native\"\nname = \"postgres\"\n\
+             env = {{ DATABASE_URL = \"postgres\" }}\n",
+            common::listener_on_port_env()
+        ),
+    );
+    common::postgres::install(&h.home);
+    h
+}
+
+// The native path's own invariant test. A native service adds four things
+// a container never did — a data directory that an engine writes into, an
+// init marker, a Unix socket, and a server process whose working
+// directory is a real place — and not one of them may land inside the
+// developer's repository.
+//
+// The socket is the interesting one: it is the single path pando writes
+// that is *not* under its own home, because the home's own path is what
+// overflows `sun_path`. So it is asserted explicitly here rather than
+// covered by "everything is under the home".
+#[test]
+fn a_native_isolated_lifecycle_never_writes_into_the_repository() {
+    if !common::python3_available() {
+        eprintln!("skipping: python3 is not installed");
+        return;
+    }
+    let h = native_harness();
+    let name = actions::new(&h.paths, &h.config, "feat/one", None, &|_| {}).unwrap();
+    let worktree = h.config.worktrees_dir(&h.paths).join(&name);
+    h.assert_untouched("new", Some(&worktree));
+
+    let report = actions::start(
+        &h.paths,
+        &h.config,
+        &name,
+        None,
+        actions::Mode::Isolated,
+        &|_| {},
+    )
+    .unwrap();
+    assert!(report.ports.contains_key("postgres"), "{:?}", report.ports);
+    h.assert_untouched("start --isolated with a native service", Some(&worktree));
+
+    // The cluster the engine built, the marker pando wrote beside its
+    // files, and the log the server writes: all three under the home.
+    let datadir = h.paths.service_data_dir(&name, "postgres");
+    assert!(datadir.join("PG_VERSION").is_file(), "no cluster was made");
+    assert!(
+        datadir.starts_with(&h.home),
+        "{} escaped pando's home",
+        datadir.display()
+    );
+    assert!(pando::native::marker_file(&datadir).starts_with(&h.home));
+    let log = h.paths.log_file(&name, "postgres");
+    assert!(
+        log.starts_with(&h.home),
+        "{} escaped pando's home",
+        log.display()
+    );
+
+    // And the socket, which is the one thing outside it. It has to be
+    // outside the *repository*, which is what Invariant 1 is about, and
+    // outside every worktree too.
+    let socket_dir = h.paths.service_socket_dir(&name, "postgres");
+    assert!(socket_dir.is_dir(), "no socket directory was made");
+    assert!(!socket_dir.starts_with(&h.root), "{}", socket_dir.display());
+    assert!(
+        !socket_dir.starts_with(&worktree),
+        "{}",
+        socket_dir.display()
+    );
+    assert!(
+        std::fs::read_dir(&socket_dir).unwrap().next().is_some(),
+        "the server put nothing in its socket directory"
+    );
+
+    actions::refresh(&h.paths);
+    h.assert_untouched("status", Some(&worktree));
+
+    actions::stop(&h.paths, &name, None, &|_| {}).unwrap();
+    h.assert_untouched("stop", Some(&worktree));
+    assert!(
+        datadir.join("PG_VERSION").is_file(),
+        "a stop wiped the data"
+    );
+
+    // A plain start after a stop adopts the cluster it already has, and
+    // still writes nothing into the repository.
+    actions::start(
+        &h.paths,
+        &h.config,
+        &name,
+        None,
+        actions::Mode::Remembered,
+        &|_| {},
+    )
+    .unwrap();
+    assert!(state::load(&h.paths.state_file()).unwrap().worktrees[&name].isolated);
+    h.assert_untouched("start", Some(&worktree));
+
+    actions::rm(&h.paths, &name, false, false, &|_| {}).unwrap();
+    h.assert_untouched("rm", None);
+    assert!(!datadir.exists(), "rm left the database behind");
+    assert!(!socket_dir.exists(), "rm left the socket directory behind");
+}
+
 // A failed install keeps the worktree — and still writes nothing into it.
 #[test]
 fn a_failed_install_leaves_the_repository_and_the_worktree_alone() {
