@@ -1007,10 +1007,19 @@ fn target_candidates(signals: &Signals) -> Vec<Candidate> {
 /// behind it.
 ///
 /// Matched as the whole stem (`DB_PORT`), as a prefix of it
-/// (`DATABASE_REPLICA_PORT`), or as its last word (`READ_DB_PORT`), which is
-/// what the suffix list this replaced did. `REPLICA` earns its own entry for
-/// the bare `REPLICA_PORT` a project with a read replica writes; the
-/// `<FAMILY>_REPLICA_PORT` spelling is already caught by its family.
+/// (`DATABASE_REPLICA_PORT`), or as anything the stem *ends* with
+/// (`READ_DB_PORT`, `INFLUXDB_PORT`, `COUCHDB_PORT`). The suffix arm is
+/// deliberately not word-bounded: that is what the `ends_with` list this
+/// replaced did, and requiring a boundary quietly turned every
+/// `<something>DB_PORT` into one of the app's roles — a port allocated with
+/// no database behind it. It is coarse at the far edge, where `GMAIL_PORT`
+/// and `JPG_PORT` read as a mail and a Postgres port, and it was coarse
+/// there before. The prefix arm *is* bounded, so `DBX_PORT` and
+/// `PGADMIN_PORT` stay the application's own.
+///
+/// `REPLICA` earns its own entry for the bare `REPLICA_PORT` a project with
+/// a read replica writes; the `<FAMILY>_REPLICA_PORT` spelling is already
+/// caught by its family.
 const SERVICE_PORT_FAMILIES: [&str; 13] = [
     "DATABASE",
     "DB",
@@ -1047,11 +1056,7 @@ fn is_service_port(key: &str) -> bool {
     SERVICE_PORT_FAMILIES.iter().any(|family| {
         stem.strip_prefix(family)
             .is_some_and(|rest| rest.is_empty() || rest.starts_with('_'))
-            || stem.strip_suffix(family).is_some_and(|rest| {
-                // Not `is_empty()`: that is the prefix case above, and
-                // leaving it here would make `DBX_PORT` a service's.
-                rest.ends_with('_')
-            })
+            || stem.ends_with(family)
     })
 }
 
@@ -1801,7 +1806,17 @@ fn services_proposal(
     // that pando looked. It is the same empty answer a developer gives by
     // declining the question, recorded the same way: an entry naming the
     // file with an empty `include`.
+    //
+    // Unless pando could not read the file whole. "Half a file read is not
+    // a proposal" applies hardest here: a top-level `include:` brings in
+    // services this list does not have, and recording "none of them" about
+    // a file pando has not finished reading would answer the slot for good
+    // — silencing, permanently, whatever the next run with Docker present
+    // would have found. Nothing is written, and it is asked again.
     if candidates.is_empty() {
+        if parsed.unresolved.any() {
+            return None;
+        }
         let mut proposal = Proposal::of(Slot::Services, Vec::new(), true);
         proposal.none_because = Some(format!(
             "{file} declares only {}, built from this repository",
@@ -2762,6 +2777,12 @@ mod tests {
             "DATABASE_REPLICA_PORT",
             "DB_PORT",
             "READ_DB_PORT",
+            // Every `<something>DB_PORT`: the suffix list this replaced
+            // caught these with a plain `ends_with`, and a word boundary
+            // here would hand each of them a role with nothing behind it.
+            "INFLUXDB_PORT",
+            "COUCHDB_PORT",
+            "DYNAMODB_PORT",
             "REPLICA_PORT",
             "REDIS_PORT",
             "MONGO_PORT",
@@ -2775,7 +2796,18 @@ mod tests {
         ] {
             assert!(is_service_port(key), "{key} is a service's port");
         }
-        for key in ["PORT", "WEB_PORT", "API_PORT", "ADMIN_PORT", "DBX_PORT"] {
+        // The prefix arm is word-bounded, so a family that merely *starts*
+        // a longer word is not a match.
+        for key in [
+            "PORT",
+            "WEB_PORT",
+            "API_PORT",
+            "ADMIN_PORT",
+            "DBX_PORT",
+            "PGADMIN_PORT",
+            "METRICS_PORT",
+            "GRPC_PORT",
+        ] {
             assert!(!is_service_port(key), "{key} is the application's own");
         }
     }
@@ -3290,6 +3322,29 @@ services:
             .expect("a reason for the empty answer");
         assert!(why.contains("web and worker"), "{why}");
         assert!(why.contains("built from this repository"), "{why}");
+    }
+
+    // The empty answer is permanent — `already_answered` is true from then
+    // on — so it may only be recorded about a file pando read whole. A
+    // top-level `include:` brings in services this list does not even have,
+    // and "none of them" about those is an answer nobody gave.
+    #[test]
+    fn a_file_pando_could_not_read_whole_records_no_empty_answer() {
+        let (dir, signals) = compose_fixture(
+            r#"
+include:
+  - infra/compose.yml
+services:
+  web:
+    build: .
+"#,
+            &[],
+        );
+        assert!(
+            services_proposal(dir.path(), &signals, None).is_none(),
+            "nothing is offered and nothing is written down: the next run \
+             with Docker present gets to decide"
+        );
     }
 
     // The filter is about *this project*, not about `build:` existing. A
