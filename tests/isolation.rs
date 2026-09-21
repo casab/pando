@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use common::{Kind, build, docker, listener_printing, paths_for};
+use common::{Kind, build, docker, listener_on_port_env, listener_printing, paths_for};
 use pando::compose;
 use pando::config::{self, Config};
 use pando::paths::PandoPaths;
@@ -457,6 +457,50 @@ fn a_published_port_with_nothing_behind_it_is_never_ready() {
         store.worktrees[&name].processes.is_empty(),
         "and nothing was spawned behind it"
     );
+}
+
+// Isolation is remembered, and only `rm` forgets it. Writing it down
+// before anything was brought up therefore turned a start that created
+// nothing into a worktree that could not be started at all — not even
+// shared — until `pando.toml` was edited by hand.
+#[test]
+fn a_start_that_fails_before_any_container_leaves_the_worktree_startable() {
+    if skip_without_python() {
+        return;
+    }
+    let f = iso_with(&config_toml(&listener_on_port_env()).replace(
+        "env = { DATABASE_URL = \"postgres\", REDIS_URL = \"redis\" }",
+        "env = { DB_HOST = \"postgres\" }",
+    ));
+    // A mapping `rewrite` can never satisfy: a bare host name has nowhere
+    // to put a port number.
+    let example = f.root.join(".env.example");
+    let text = std::fs::read_to_string(&example).unwrap();
+    std::fs::write(&example, format!("{text}DB_HOST=postgres\n")).unwrap();
+    common::git(&f.root, &["add", "."]);
+    common::git(&f.root, &["commit", "--quiet", "-m", "a host key"]);
+    let name = new_worktree(&f, "feat/h");
+
+    let err = format!(
+        "{:#}",
+        actions::start(&f.paths, &f.config, &name, None, true, &|_| {}).unwrap_err()
+    );
+    assert!(err.contains("DB_HOST"), "{err}");
+    assert!(
+        !f.record(&name).isolated,
+        "nothing was brought up, so nothing is remembered"
+    );
+    assert!(
+        docker::invocations(&f.home).is_empty(),
+        "docker was never even asked"
+    );
+
+    // And a plain start still works, which it could not if the worktree
+    // were stuck in a mode whose first step always fails.
+    let report = actions::start(&f.paths, &f.config, &name, None, false, &|_| {}).unwrap();
+    assert!(report.ports.contains_key("web"));
+    assert!(!f.record(&name).isolated);
+    actions::stop(&f.paths, &name, None).unwrap();
 }
 
 #[test]

@@ -573,6 +573,16 @@ impl Proposal {
         }
         self.preferred().into_iter().collect()
     }
+
+    /// The compose file every candidate of a services proposal came from.
+    /// The answer "none of them" is about that file, so it outlives the
+    /// candidates a set answer happens to pick.
+    pub fn service_file(&self) -> Option<&str> {
+        self.candidates
+            .iter()
+            .find_map(|c| c.service.as_ref())
+            .map(|hint| hint.file.as_str())
+    }
 }
 
 /// Everything tier 1 has to say, in the order the slots are filled.
@@ -1339,14 +1349,42 @@ const UTILITY_IMAGES: [(&str, &[&str]); 3] = [
 /// and `_PASSWORD` are about the same service and hold nothing pando can
 /// point anywhere, so they are not candidates.
 ///
-/// In preference order: a URL carries everything, a DSN nearly as much, a
-/// port is a number pando can simply replace, and a host is a string it
-/// cannot — a bare `localhost` has nowhere to put a port number.
-const ADDRESS_SUFFIXES: [&str; 4] = ["_URL", "_DSN", "_PORT", "_HOST"];
+/// `_HOST` is not one either, and deliberately: `services::rewrite` can put
+/// a port into a URL or replace a bare number, and a bare `localhost` has
+/// nowhere to put one. Proposing it wrote a mapping that could never be
+/// satisfied and failed the start that used it.
+///
+/// In preference order: a URL carries everything, a DSN nearly as much, and
+/// a port is a number pando can simply replace.
+const ADDRESS_SUFFIXES: [&str; 3] = ["_URL", "_DSN", "_PORT"];
+
+/// What a rule can say about which env key names one compose service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EnvKey {
+    /// This key, and no other service is using it.
+    Found(String),
+    /// The only key a rule would have used is already pointed at another
+    /// service of the same file. Two databases from one image is the
+    /// ordinary case; pando cannot tell which one the app means, so it asks.
+    TakenBy { key: String, service: String },
+    /// Nothing in the env example names this service at all.
+    Nothing,
+}
 
 /// The env key the app reads to find one compose service, when a rule can
 /// say which.
-fn env_key_for(service: &str, image: Option<&str>, env: &[(String, String)]) -> Option<String> {
+///
+/// `claimed` is every key an earlier service of the same file already owns.
+/// An env map with one key pointing at two services is not a thing that can
+/// be written down: the later one silently wins, the earlier one runs with
+/// nothing addressing it, and the app talks to whichever pando happened to
+/// write last.
+fn env_key_for(
+    service: &str,
+    image: Option<&str>,
+    env: &[(String, String)],
+    claimed: &BTreeMap<String, String>,
+) -> EnvKey {
     let mut prefixes: Vec<String> = vec![service.to_uppercase()];
     if let Some(image) = image {
         let family = image_family(image);
@@ -1357,20 +1395,34 @@ fn env_key_for(service: &str, image: Option<&str>, env: &[(String, String)]) -> 
         }
     }
     // By suffix first, then by prefix: the best *kind* of key wins over
-    // the best-matching name, because a `_HOST` pando cannot rewrite is
-    // worse than a `_URL` that merely belongs to a differently named
-    // prefix for the same service.
+    // the best-matching name, because a `_PORT` that merely belongs to a
+    // differently named prefix for the same service is a worse answer than
+    // the `_URL` that carries the credentials too.
+    let mut taken: Option<EnvKey> = None;
     for suffix in ADDRESS_SUFFIXES {
         for prefix in &prefixes {
-            if let Some((key, _)) = env
+            let Some((key, _)) = env
                 .iter()
                 .find(|(key, _)| key == &format!("{prefix}{suffix}"))
-            {
-                return Some(key.clone());
+            else {
+                continue;
+            };
+            match claimed.get(key) {
+                None => return EnvKey::Found(key.clone()),
+                // Remembered rather than returned: a later suffix may still
+                // find this service a key of its own, and only when none
+                // does is "somebody else has it" the answer.
+                Some(owner) if taken.is_none() => {
+                    taken = Some(EnvKey::TakenBy {
+                        key: key.clone(),
+                        service: owner.clone(),
+                    });
+                }
+                Some(_) => {}
             }
         }
     }
-    None
+    taken.unwrap_or(EnvKey::Nothing)
 }
 
 /// The image's last path segment with its tag stripped, when pando knows
@@ -1408,18 +1460,33 @@ fn services_proposal(root: &Path, signals: &Signals) -> Option<Proposal> {
     }
     let mut candidates = Vec::new();
     let mut resolved = true;
+    // Which service owns which key so far, in file order. A key belongs to
+    // the first service a rule gave it to; the second one is a question.
+    let mut claimed: BTreeMap<String, String> = BTreeMap::new();
     for (name, service) in &parsed.services {
         let image = service.image.as_deref();
-        let env_key = env_key_for(name, image, &signals.env_example);
+        let found = env_key_for(name, image, &signals.env_example, &claimed);
         let app_service = is_app_service(image);
-        if env_key.is_none() && app_service {
+        if !matches!(found, EnvKey::Found(_)) && app_service {
             resolved = false;
         }
-        let why = match (&env_key, image) {
-            (Some(key), Some(image)) => format!("{file}, {image} → {key}"),
-            (Some(key), None) => format!("{file} → {key}"),
-            (None, Some(image)) => format!("{file}, {image}; nothing in the env example names it"),
-            (None, None) => format!("{file}; nothing in the env example names it"),
+        let of_the_image = match image {
+            Some(image) => format!("{file}, {image}"),
+            None => file.clone(),
+        };
+        let why = match &found {
+            EnvKey::Found(key) => format!("{of_the_image} → {key}"),
+            EnvKey::TakenBy { key, service } => {
+                format!("{of_the_image}; {key} already points at {service}")
+            }
+            EnvKey::Nothing => format!("{of_the_image}; nothing in the env example names it"),
+        };
+        let env_key = match found {
+            EnvKey::Found(key) => {
+                claimed.insert(key.clone(), name.clone());
+                Some(key)
+            }
+            _ => None,
         };
         candidates.push(Candidate {
             value: name.clone(),
@@ -1693,16 +1760,12 @@ pub fn apply(slot: Slot, candidate: &Candidate, config: &mut Config) {
 
 /// Writes a chosen *set* of compose services as one `[[services]]` entry.
 ///
-/// Nothing is written for an empty set: "none of them" is an answer, and
-/// the answer is that this project has no services pando runs.
-pub fn apply_services(chosen: &[&Candidate], config: &mut Config) {
-    let Some(file) = chosen
-        .iter()
-        .find_map(|c| c.service.as_ref())
-        .map(|hint| hint.file.clone())
-    else {
-        return;
-    };
+/// An empty set is written too, as an entry with an empty `include`:
+/// "none of them" is an answer, and an answer nothing records is asked
+/// again on every start. It is the same shape the port slot uses for a
+/// process that really has no ports.
+pub fn apply_services(file: &str, chosen: &[&Candidate], config: &mut Config) {
+    let file = file.to_string();
     let include: Vec<String> = chosen.iter().map(|c| c.value.clone()).collect();
     let env: BTreeMap<String, String> = chosen
         .iter()
@@ -1719,6 +1782,40 @@ pub fn apply_services(chosen: &[&Candidate], config: &mut Config) {
     });
 }
 
+/// The keys of the one `[[services]]` entry a set answer appends.
+///
+/// Takes the file rather than reading it off a candidate, because the empty
+/// answer has no candidates to read it from and still has to be written:
+/// "none of them" is about a compose file that exists.
+pub fn service_entry(
+    file: &str,
+    chosen: &[&Candidate],
+) -> (&'static str, Vec<(String, toml_edit::Value)>) {
+    let array = Slot::Services
+        .array()
+        .expect("the services slot appends a [[table]] entry");
+    let mut entries: Vec<(String, toml_edit::Value)> = vec![
+        ("kind".to_string(), "compose".into()),
+        ("file".to_string(), file.to_string().into()),
+        (
+            "include".to_string(),
+            toml_edit::Value::Array(toml_edit::Array::from_iter(
+                chosen.iter().map(|c| c.value.clone()),
+            )),
+        ),
+    ];
+    let mut env = toml_edit::InlineTable::new();
+    for candidate in chosen {
+        if let Some(key) = candidate.service.as_ref().and_then(|h| h.env_key.as_ref()) {
+            env.insert(key, candidate.value.as_str().into());
+        }
+    }
+    if !env.is_empty() {
+        entries.push(("env".to_string(), toml_edit::Value::InlineTable(env)));
+    }
+    (array, entries)
+}
+
 /// The keys of the one `[[table]]` entry a set answer appends, or `None`
 /// for a slot whose answer is a key in a table.
 pub fn array_edits(
@@ -1730,23 +1827,7 @@ pub fn array_edits(
     match slot {
         Slot::Services => {
             let hint = chosen.iter().find_map(|c| c.service.as_ref())?;
-            entries.push(("kind".to_string(), "compose".into()));
-            entries.push(("file".to_string(), hint.file.clone().into()));
-            entries.push((
-                "include".to_string(),
-                toml_edit::Value::Array(toml_edit::Array::from_iter(
-                    chosen.iter().map(|c| c.value.clone()),
-                )),
-            ));
-            let mut env = toml_edit::InlineTable::new();
-            for candidate in chosen {
-                if let Some(key) = candidate.service.as_ref().and_then(|h| h.env_key.as_ref()) {
-                    env.insert(key, candidate.value.as_str().into());
-                }
-            }
-            if !env.is_empty() {
-                entries.push(("env".to_string(), toml_edit::Value::InlineTable(env)));
-            }
+            return Some(service_entry(&hint.file, chosen));
         }
         Slot::SchemaHook => {
             let hook = chosen.first()?.hook.as_ref()?;

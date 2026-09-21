@@ -38,7 +38,9 @@ fn detected(root: &Path) -> (Config, Vec<Proposal>) {
             if !proposal.decided {
                 asked.push(proposal.clone());
             }
-            detect::apply_services(&proposal.preferred_set(), &mut config);
+            if let Some(file) = proposal.service_file() {
+                detect::apply_services(file, &proposal.preferred_set(), &mut config);
+            }
             continue;
         }
         let Some(candidate) = proposal.preferred() else {

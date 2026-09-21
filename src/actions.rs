@@ -897,7 +897,7 @@ pub fn resolve_silencing(
                     ),
                 }
             };
-            apply_service_answer(paths, &mut config, *slot, &chosen, note)?;
+            apply_service_answer(paths, &mut config, proposal, &chosen, note)?;
             continue;
         }
         let candidate = if proposal.decided {
@@ -997,24 +997,27 @@ pub fn resolve_silencing(
 /// Writes the answer to the one multi-select slot: a `[[services]]` entry
 /// listing the services chosen and the env keys that point at them.
 ///
-/// An empty set is a real answer — "none of them" — and it writes
-/// nothing, because a project with no private services is a project with
-/// no `[[services]]` table.
+/// An empty set is a real answer — "none of them" — and it is written down
+/// as an entry with an empty `include`. An answer nothing records is asked
+/// again on every start: a prompt the developer already declined, and exit
+/// 3 for a script, with nowhere to put the answer but the TOML by hand.
+/// `Slot::PortEnv` writes `ports = []` for exactly this reason.
 fn apply_service_answer(
     paths: &PandoPaths,
     config: &mut Config,
-    slot: Slot,
+    proposal: &detect::Proposal,
     chosen: &[detect::Candidate],
     note: config::Note,
 ) -> Result<()> {
-    if chosen.is_empty() {
+    // The compose file the question was about. Without one there is
+    // nothing to write an entry for, and nothing was asked either.
+    let Some(file) = proposal.service_file().map(str::to_string) else {
         return Ok(());
-    }
+    };
     let refs: Vec<&detect::Candidate> = chosen.iter().collect();
-    if let Some((array, entries)) = detect::array_edits(slot, &refs) {
-        config::set_detected_array_entry(paths, array, entries, note)?;
-    }
-    detect::apply_services(&refs, config);
+    let (array, entries) = detect::service_entry(&file, &refs);
+    config::set_detected_array_entry(paths, array, entries, note)?;
+    detect::apply_services(&file, &refs, config);
     Ok(())
 }
 
@@ -1311,7 +1314,13 @@ pub fn start(
     // the services it already has rather than quietly pointing its
     // processes back at the shared database.
     let isolate = isolatable && (isolated || record.isolated);
-    record.isolated = isolate;
+    // Turned *on* only once the containers exist — see `remember_isolated`
+    // below. Turned off here and now, because a worktree pando can no
+    // longer isolate is one whose next start is a shared one, and there is
+    // no container to contradict that.
+    if !isolate {
+        record.isolated = false;
+    }
     // Service roles are reserved with the process roles, in one window, so
     // `{port:postgres}` resolves in any template and the number is the
     // same on every restart.
@@ -1407,6 +1416,7 @@ pub fn start(
 
     if isolate {
         bring_up_services(paths, config, name, &canonical, &assignment.ports, progress)?;
+        remember_isolated(paths, name)?;
     }
 
     if !everything_up {
@@ -2154,6 +2164,13 @@ fn bring_up_services(
             timeout = configured;
         }
     }
+    // A `[[services]]` entry with an empty `include` is the written-down
+    // answer "none of them". `docker compose up -d` with no service named
+    // brings up *everything* in the file, on the ports the project
+    // hardcoded, which is the opposite of what was asked for.
+    if include.is_empty() {
+        return Ok(());
+    }
 
     let override_file = paths.compose_override_file(name);
     if let Some(parent) = override_file.parent() {
@@ -2182,6 +2199,30 @@ fn bring_up_services(
     }
 
     pump_service_logs(paths, name, &compose, &include, worktree)
+}
+
+/// Remembers that this worktree runs private services, once they are up.
+///
+/// Written *after* `bring_up_services` rather than with the rest of the
+/// record, because the flag is what a later plain `start` reads to keep
+/// using them: a start that failed before any container existed — a
+/// mapping the env rewriter cannot satisfy, a service the compose file
+/// cannot isolate — would otherwise leave the worktree unable to start at
+/// all, isolated or shared, until `pando.toml` was edited by hand.
+///
+/// A worktree that was already isolated keeps the flag through such a
+/// failure, because its containers are real and nothing here clears it.
+fn remember_isolated(paths: &PandoPaths, name: &str) -> Result<()> {
+    let _lock = state::lock(&paths.lock_file())?;
+    let mut store = state::load(&paths.state_file())?;
+    let Some(record) = store.worktrees.get_mut(name) else {
+        return Ok(());
+    };
+    if record.isolated {
+        return Ok(());
+    }
+    record.isolated = true;
+    state::save(&paths.state_file(), &store)
 }
 
 /// One detached `docker compose logs -f` per service, writing into the
@@ -5709,6 +5750,150 @@ time.sleep(300)
         // And asked once: a second resolve has nothing left to ask about.
         let again = resolve_process(&fx.paths, &config, &refuse, &noop).unwrap();
         assert!(again.processes["dev"].roles().is_empty());
+    }
+
+    // ---- the services slot -----------------------------------------------
+
+    /// [`detectable_fixture`] with a compose file, which is what the
+    /// services slot is proposed from.
+    fn compose_fixture(compose: &str, env_example: &str) -> Fx {
+        let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, env_example);
+        std::fs::write(fx.root.join("docker-compose.yml"), compose).unwrap();
+        git(&fx.root, &["add", "."]);
+        git(&fx.root, &["commit", "--quiet", "-m", "compose"]);
+        fx
+    }
+
+    /// The isolating form of the resolver: on a plain start the services
+    /// question is silent, and these are all about what it asks.
+    fn resolve_isolating(paths: &PandoPaths, config: &Config, ask: Ask<'_>) -> Result<Config> {
+        super::resolve_process(paths, config, true, ask, &noop)
+    }
+
+    const TWO_DATABASES: &str = "services:\n  \
+         db:\n    image: postgres:16\n    ports: [\"5432:5432\"]\n  \
+         db_test:\n    image: postgres:16\n    ports: [\"5433:5432\"]\n";
+
+    // A dev database beside a test one is an ordinary layout, and both of
+    // them resolve to `DATABASE_URL` through the image's prefixes. Taking
+    // that as decided pointed the app — and the migration hook — at the
+    // test database, and left the real one with nothing addressing it.
+    #[test]
+    fn two_services_that_would_claim_one_env_key_are_asked_about_rather_than_guessed() {
+        let fx = compose_fixture(
+            TWO_DATABASES,
+            "PORT=3000\nDATABASE_URL=postgres://acme:acme@localhost:5432/acme\n\
+             TEST_DATABASE_URL=postgres://acme:acme@localhost:5433/acme_test\n",
+        );
+        let (ask, asked) = scripted(vec![Answer::Many(vec![0, 1])]);
+        let config = resolve_isolating(&fx.paths, &fx.config, &ask).unwrap();
+
+        assert_eq!(
+            asked.borrow().len(),
+            1,
+            "a second database pando cannot address is a question, not a guess"
+        );
+        let question = &asked.borrow()[0];
+        assert_eq!(question.slot, Slot::Services);
+        assert_eq!(
+            question.checked,
+            vec![0],
+            "only the one a rule really resolved starts ticked"
+        );
+        assert!(
+            question.options[1].1.contains("DATABASE_URL"),
+            "and the other says whose key it would have taken: {}",
+            question.options[1].1
+        );
+
+        let crate::config::ServiceConfig::Compose { env, include, .. } = &config.services[0] else {
+            panic!("a compose entry");
+        };
+        assert_eq!(include, &vec!["db".to_string(), "db_test".to_string()]);
+        assert_eq!(
+            env.get("DATABASE_URL").map(String::as_str),
+            Some("db"),
+            "the key belongs to the service that claimed it first: {env:?}"
+        );
+        assert_eq!(env.len(), 1, "and no key is written twice: {env:?}");
+        let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+        assert!(!written.contains("DATABASE_URL = \"db_test\""), "{written}");
+    }
+
+    /// A compose file with one service nothing in the env example names.
+    const ONE_UNNAMED_CACHE: &str =
+        "services:\n  cache:\n    image: redis:7\n    ports: [\"6379:6379\"]\n";
+
+    // "None of them" is an answer, and an answer that is not written down
+    // is asked again on every start — exit 3 for a script, with no way to
+    // answer it except editing TOML by hand.
+    #[test]
+    fn answering_none_to_the_services_question_is_written_down_as_no_services() {
+        let fx = compose_fixture(ONE_UNNAMED_CACHE, "PORT=3000\n");
+        let (ask, asked) = scripted(vec![Answer::None]);
+        let config = resolve_isolating(&fx.paths, &fx.config, &ask).unwrap();
+        assert_eq!(asked.borrow().len(), 1);
+
+        let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+        assert!(written.contains("[[services]]"), "{written}");
+        assert!(
+            written.contains("include = []"),
+            "an empty list, so it reads as answered rather than missing: {written}"
+        );
+        assert_eq!(config.services.len(), 1);
+
+        // And asked once: a second resolve has nothing left to ask about.
+        let again = resolve_isolating(&fx.paths, &config, &refuse).unwrap();
+        assert_eq!(again.services.len(), 1);
+    }
+
+    #[test]
+    fn yes_with_nothing_the_rules_resolved_is_written_down_the_same_way() {
+        let fx = compose_fixture(ONE_UNNAMED_CACHE, "PORT=3000\n");
+        let (ask, _) = scripted(vec![Answer::Auto(0)]);
+        let config = resolve_isolating(&fx.paths, &fx.config, &ask).unwrap();
+
+        let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+        assert!(
+            written.contains("include = []"),
+            "--yes that takes nothing still answers the question: {written}"
+        );
+        assert!(
+            written.contains("--yes took the 0 of 1"),
+            "and says a flag did it, not a human: {written}"
+        );
+        let again = resolve_isolating(&fx.paths, &config, &refuse).unwrap();
+        assert_eq!(again.services.len(), 1);
+    }
+
+    // `rewrite` can put a port into a URL or replace a bare number. A bare
+    // host name has nowhere to put one, so proposing a `_HOST` key wrote a
+    // mapping that could never be satisfied — and the failed start left the
+    // worktree recorded as isolated, so it could not be started at all.
+    #[test]
+    fn a_host_key_is_never_proposed_because_a_port_cannot_be_put_into_one() {
+        let fx = compose_fixture(
+            "services:\n  db:\n    image: postgres:16\n    ports: [\"5432:5432\"]\n",
+            "PORT=3000\nDB_HOST=db\n",
+        );
+        let (ask, _) = scripted(vec![Answer::Auto(0)]);
+        let config = resolve_isolating(&fx.paths, &fx.config, &ask).unwrap();
+
+        let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+        assert!(
+            !written.contains("DB_HOST"),
+            "a key pando cannot rewrite is not a mapping it may write: {written}"
+        );
+        let crate::config::ServiceConfig::Compose { env, .. } = &config.services[0] else {
+            panic!("a compose entry");
+        };
+        assert!(env.is_empty(), "{env:?}");
+
+        // And the project still starts, which is the whole point.
+        let name = super::new(&fx.paths, &config, "feat/h", None, &noop).unwrap();
+        let report = start(&fx.paths, &config, &name, None, &noop).unwrap();
+        assert!(report.ports.contains_key("web"));
+        let _ = super::stop(&fx.paths, &name, None);
     }
 
     #[test]
