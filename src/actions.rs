@@ -2288,6 +2288,9 @@ pub fn start(
             Mode::Remembered => was_isolated,
         };
     let mode_changed = was_isolated != isolate;
+    if mode_changed {
+        refuse_only_across_a_mode_change(name, only, isolate)?;
+    }
     // And the lifecycle runs again for it: a worktree whose services are
     // being swapped underneath it is not one where "everything is already
     // up" means there is nothing to do.
@@ -3631,6 +3634,11 @@ pub fn restart(
     // unrelated state, and never the one that lists the names config
     // declares.
     selected_processes(config, only)?;
+    // Before the stop below, not after it: a refusal that has already
+    // taken the process down is not a refusal.
+    if mode_would_change(paths, config, name, mode) {
+        refuse_only_across_a_mode_change(name, only, mode == Mode::Isolated)?;
+    }
     // And a name config does know, whose process is simply not up, is a
     // no-op to stop rather than a refusal. Bringing a stopped process back
     // is the one thing `restart --only` exists for, and it used to be the
@@ -3638,6 +3646,57 @@ pub fn restart(
     // running, which made the failure look random.
     stop_missing(paths, name, only, MissingOnly::IsNothingToDo, progress)?;
     start(paths, config, name, only, mode, progress)
+}
+
+/// Refuses `--only` on a start that would change which services the
+/// worktree talks to.
+///
+/// A mode change replaces every process's environment: the database
+/// address they were given is about to point somewhere else. `--only dev`
+/// through that change restarts `dev` against the new services and leaves
+/// `api` running against the old ones — two halves of one application
+/// talking to two different databases, with nothing saying so. The other
+/// way out is to carry every process across, but that restarts processes
+/// the developer did not name, which is its own surprise; refusing says
+/// what is true and costs one word on the command line.
+///
+/// Checked before anything is stopped or spawned, and again under the
+/// lock where the decision is actually made.
+fn refuse_only_across_a_mode_change(
+    name: &str,
+    only: Option<&str>,
+    going_isolated: bool,
+) -> Result<()> {
+    let Some(only) = only else { return Ok(()) };
+    bail!(
+        "{name} is switching to {} services, and `--only {only}` cannot do that for one \
+         process: the others would keep talking to the services that are going away. Run it \
+         without `--only`, or leave the mode as it is",
+        match going_isolated {
+            true => "its own",
+            false => "the project's shared",
+        }
+    )
+}
+
+/// Whether a start in this mode would change what the worktree's
+/// processes talk to, read without the lock.
+///
+/// The answer the refusal above needs *before* `restart` stops anything.
+/// `start` makes the same decision again under the lock, where it is
+/// authoritative; this one only has to be right often enough to refuse
+/// before a side effect, and a mode that is flipping under a concurrent
+/// command is caught there.
+fn mode_would_change(paths: &PandoPaths, config: &Config, name: &str, mode: Mode) -> bool {
+    if !matches!(mode, Mode::Isolated | Mode::Shared) {
+        return false;
+    }
+    let was_isolated = state::load(&paths.state_file())
+        .ok()
+        .and_then(|store| store.worktrees.get(name).map(|r| r.isolated))
+        .unwrap_or(false);
+    let isolate = !service_roles(config).is_empty() && mode == Mode::Isolated;
+    was_isolated != isolate
 }
 
 /// The processes a start, stop or restart acts on: every one config

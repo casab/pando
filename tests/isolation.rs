@@ -1153,3 +1153,151 @@ fn a_dead_pump_comes_back_on_restart() {
     assert!(pump_is_running(&f, &name, "postgres"));
     assert_ne!(f.service(&name, "postgres").pid, Some(dead));
 }
+
+// ---- `--only` through a mode change ---------------------------------------
+
+/// Two processes, so "the one you named and the one you did not" is a
+/// real distinction, plus compose services to switch between.
+fn two_processes_with_services() -> String {
+    format!(
+        "[project]\nprovision = [\".env\"]\ninstall = \"true\"\n\n\
+         [processes.web]\ncmd = '''{}'''\nports = {{ PORT = \"web\" }}\n\n\
+         [processes.api]\ncmd = \"sleep 30\"\nports = []\n\n\
+         [[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
+         include = [\"postgres\"]\nenv = {{ DATABASE_URL = \"postgres\" }}\n",
+        listener_printing("DATABASE_URL")
+    )
+}
+
+// A mode change replaces the address every process was given. `--only web`
+// through it would restart `web` against the new database and leave `api`
+// on the old one — two halves of one application on two databases, with
+// nothing saying so.
+#[test]
+fn only_is_refused_when_the_start_would_change_which_services_are_used() {
+    let f = iso_with(&two_processes_with_services());
+    let name = new_worktree(&f, "feat/one");
+    start_isolated(&f, &name);
+    let before: Vec<String> = f.record(&name).processes.keys().cloned().collect();
+    assert_eq!(before, vec!["api".to_string(), "web".to_string()]);
+
+    let e = format!(
+        "{:#}",
+        actions::start(
+            &f.paths,
+            &f.config,
+            &name,
+            Some("web"),
+            actions::Mode::Shared,
+            &|_| {},
+        )
+        .unwrap_err()
+    );
+    assert!(e.contains("--only web"), "{e}");
+    assert!(e.contains("the project's shared"), "{e}");
+    assert!(e.contains("without `--only`"), "{e}");
+
+    // Refused, so nothing moved: both processes are the ones that were
+    // running, and the worktree is still isolated.
+    let after = f.record(&name);
+    assert!(after.isolated, "the mode changed under a refusal");
+    assert_eq!(
+        after.processes.keys().cloned().collect::<Vec<_>>(),
+        before,
+        "a process was replaced by a start that refused"
+    );
+
+    // The same refusal the other way round, on a worktree that is
+    // running against the project's shared services.
+    let two = new_worktree(&f, "feat/two");
+    actions::start(
+        &f.paths,
+        &f.config,
+        &two,
+        None,
+        actions::Mode::Shared,
+        &|_| {},
+    )
+    .unwrap();
+    let e = format!(
+        "{:#}",
+        actions::start(
+            &f.paths,
+            &f.config,
+            &two,
+            Some("web"),
+            actions::Mode::Isolated,
+            &|_| {},
+        )
+        .unwrap_err()
+    );
+    assert!(e.contains("its own"), "{e}");
+    assert!(!f.record(&two).isolated, "the mode changed under a refusal");
+
+    // And asking for the mode a worktree is already in is no change at
+    // all, so `--only` is fine: the refusal is about the switch, not
+    // about the flag.
+    actions::start(
+        &f.paths,
+        &f.config,
+        &name,
+        Some("web"),
+        actions::Mode::Isolated,
+        &|_| {},
+    )
+    .expect("an isolated worktree asked for isolated again");
+}
+
+// `restart` stops before it starts, so the refusal has to come first — a
+// refusal that has already taken the process down is not a refusal.
+#[test]
+fn restart_only_across_a_mode_change_refuses_before_it_stops_anything() {
+    let f = iso_with(&two_processes_with_services());
+    let name = new_worktree(&f, "feat/one");
+    start_isolated(&f, &name);
+    let before = f.record(&name);
+    let web = before.processes["web"].pid;
+
+    let e = format!(
+        "{:#}",
+        actions::restart(
+            &f.paths,
+            &f.config,
+            &name,
+            Some("web"),
+            actions::Mode::Shared,
+            &|_| {},
+        )
+        .unwrap_err()
+    );
+    assert!(e.contains("--only web"), "{e}");
+    assert!(
+        process::is_alive(web),
+        "the process was stopped by a command that then refused"
+    );
+    assert!(f.record(&name).isolated);
+}
+
+// `--only` is fine when the mode is not changing, which is the whole
+// point of having it: restarting one process of several is the common
+// case and must keep working.
+#[test]
+fn only_still_works_when_the_mode_stays_as_it_is() {
+    let f = iso_with(&two_processes_with_services());
+    let name = new_worktree(&f, "feat/one");
+    start_isolated(&f, &name);
+    let api = f.record(&name).processes["api"].pid;
+
+    actions::restart(
+        &f.paths,
+        &f.config,
+        &name,
+        Some("web"),
+        actions::Mode::Remembered,
+        &|_| {},
+    )
+    .expect("a restart that changes no mode");
+    let after = f.record(&name);
+    assert_eq!(after.processes["api"].pid, api, "the sibling was replaced");
+    assert!(after.isolated);
+}
