@@ -2495,9 +2495,29 @@ pub fn start(
         )?;
     }
 
+    let mut fresh = Fresh(false);
     if isolate {
-        bring_up_services(paths, config, name, &canonical, &assignment.ports, progress)?;
+        fresh = bring_up_services(paths, config, name, &canonical, &assignment.ports, progress)?;
         remember_isolated(paths, name)?;
+    }
+
+    // The database the hooks after this point run against has changed, and
+    // a fingerprint cannot see a database. A mode change swaps it in either
+    // direction; a data directory initialised just now is a new and empty
+    // one even without a mode change, which is what a developer who
+    // deleted it by hand gets. Either way the recorded answer to "have the
+    // inputs changed" is wrong, so it is discarded rather than trusted —
+    // and the hooks are let through even on a worktree that was otherwise
+    // fully up, because an empty schema is not "nothing to do".
+    let why = match (mode_changed, fresh.0) {
+        (true, _) if isolate => Some("this worktree now runs its own services"),
+        (true, _) => Some("this worktree is back on the project's shared services"),
+        (_, true) => Some("a service here was given a new, empty data directory"),
+        _ => None,
+    };
+    if let Some(why) = why {
+        forget_hooks_after_services(paths, config, name, why, progress)?;
+        everything_up = false;
     }
 
     if !everything_up {
@@ -3897,10 +3917,11 @@ fn bring_up_services(
     worktree: &Path,
     ports: &BTreeMap<String, u16>,
     progress: &dyn Fn(&str),
-) -> Result<()> {
+) -> Result<Fresh> {
     bring_up_compose_services(paths, config, name, worktree, ports, progress)?;
-    let Err(e) = bring_up_native_services(paths, config, name, worktree, ports, progress) else {
-        return Ok(());
+    let e = match bring_up_native_services(paths, config, name, worktree, ports, progress) {
+        Ok(fresh) => return Ok(fresh),
+        Err(e) => e,
     };
     if !compose_entries(config).is_empty() {
         let project = crate::compose::project_name(paths.project_id(), name);
@@ -4040,10 +4061,10 @@ fn bring_up_native_services(
     worktree: &Path,
     ports: &BTreeMap<String, u16>,
     progress: &dyn Fn(&str),
-) -> Result<()> {
+) -> Result<Fresh> {
     let entries = native::Entry::all(config);
     if entries.is_empty() {
-        return Ok(());
+        return Ok(Fresh(false));
     }
     let recipes = crate::recipes::Recipes::load(&paths.recipes_dir());
     let urls = native_urls(paths, config, worktree, ports);
@@ -4075,13 +4096,18 @@ fn bring_up_native_services(
     let live = live_native_services(paths, name)?;
 
     let mut started: Vec<native::Native> = Vec::new();
+    let mut fresh = Fresh(false);
     for service in planned {
         if live.contains(&service.service) {
             continue;
         }
-        if let Err(e) = start_one_native(paths, name, &service, progress) {
-            stop_native_services(paths, name, &started);
-            return Err(e);
+        match start_one_native(paths, name, &service, progress) {
+            Ok(native::Init::Ran) => fresh = Fresh(true),
+            Ok(_) => {}
+            Err(e) => {
+                stop_native_services(paths, name, &started);
+                return Err(e);
+            }
         }
         started.push(service);
     }
@@ -4097,8 +4123,16 @@ fn bring_up_native_services(
             return Err(e);
         }
     }
-    Ok(())
+    Ok(fresh)
 }
+
+/// Whether a start built a data directory that was not there before, and
+/// so handed the application an empty database.
+///
+/// Carried out of the bring-up rather than worked out again, because the
+/// only place that knows is the one that ran the init.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Fresh(bool);
 
 /// Initialises, spawns, and records one native service — recorded under
 /// the lock before anything waits on it, because a readiness failure has
@@ -4108,8 +4142,8 @@ fn start_one_native(
     name: &str,
     service: &native::Native,
     progress: &dyn Fn(&str),
-) -> Result<()> {
-    service.ensure_init(progress)?;
+) -> Result<native::Init> {
+    let init = service.ensure_init(progress)?;
     reset_log(&service.log_file)?;
     progress(&format!("starting services: {}", service.service));
     let spawned = service.spawn()?;
@@ -4123,7 +4157,8 @@ fn start_one_native(
         record.pid = Some(spawned.pid);
         record.pgid = Some(spawned.pgid);
     }
-    state::save(&paths.state_file(), &store)
+    state::save(&paths.state_file(), &store)?;
+    Ok(init)
 }
 
 /// The native services of this worktree whose server is still alive.
@@ -4197,6 +4232,69 @@ fn clear_native_sockets(paths: &PandoPaths, name: &str, record: &WorktreeRecord)
         let dir = paths.service_socket_dir(name, &service.name);
         let _ = std::fs::remove_dir_all(dir);
     }
+}
+
+/// Forgets the recorded fingerprints of every hook that runs *after* the
+/// services, so the next gate lets them through.
+///
+/// The bug this exists for is the worst shape a bug can have. Switching a
+/// worktree to isolated hands it a brand new, empty database; the
+/// migration hook's fingerprint — a hash of the migration files and the
+/// command — has not changed, so the hook is skipped, and the application
+/// meets an empty schema. Nothing fails at `start`. It fails later, in the
+/// app, somewhere else entirely.
+///
+/// The fingerprint answers "have this hook's *inputs* changed", and the
+/// database it runs against is an input it cannot see. So when the
+/// database changes underneath it — a mode change in either direction, or
+/// a data directory that was just initialised — the recorded answer is
+/// discarded rather than trusted.
+///
+/// Only the points that run after the services: `create` and `install`
+/// are about the worktree and its dependencies, and a new database is no
+/// reason to install again.
+fn forget_hooks_after_services(
+    paths: &PandoPaths,
+    config: &Config,
+    name: &str,
+    why: &str,
+    progress: &dyn Fn(&str),
+) -> Result<()> {
+    let after_services: Vec<String> = config
+        .hooks
+        .iter()
+        .filter(|hook| {
+            matches!(
+                hook.after,
+                config::HookPoint::Services | config::HookPoint::Dev
+            )
+        })
+        .map(|hook| hook.name.clone())
+        .collect();
+    if after_services.is_empty() {
+        return Ok(());
+    }
+    let _lock = state::lock(&paths.lock_file())?;
+    let mut store = state::load(&paths.state_file())?;
+    let Some(record) = store.worktrees.get_mut(name) else {
+        return Ok(());
+    };
+    let mut forgotten: Vec<String> = Vec::new();
+    for hook in &after_services {
+        if record.hooks.remove(hook).is_some() {
+            forgotten.push(hook.clone());
+        }
+    }
+    if forgotten.is_empty() {
+        return Ok(());
+    }
+    // Said out loud: a hook running that a developer expected to be
+    // skipped is a surprise, and the reason for it is not guessable.
+    progress(&format!(
+        "{why}, so {} will run again",
+        forgotten.join(", ")
+    ));
+    state::save(&paths.state_file(), &store)
 }
 
 /// Remembers that this worktree runs private services, once they are up.

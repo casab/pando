@@ -620,3 +620,145 @@ fn a_hook_name_that_would_escape_the_log_directory_is_refused_at_load() {
         assert!(err.contains(name), "{name}: {err}");
     }
 }
+
+// ---- a database the fingerprint cannot see --------------------------------
+
+/// A compose project with a migration hook keyed on a file, so the hook
+/// can be skipped — and a switch between shared and isolated services to
+/// skip it across.
+fn gated_with_services(sink: &Path) -> String {
+    let sink = sink.display();
+    format!(
+        "[project]\ninstall = \"true\"\n\n\
+         [dev]\ncmd = \"sleep 30\"\nports = []\n\n\
+         [[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
+         include = [\"postgres\"]\nenv = {{ DATABASE_URL = \"postgres\" }}\n\n\
+         [[hooks]]\nname = \"migrate\"\nafter = \"services\"\n\
+         fingerprint = [\"seed.sql\"]\n\
+         cmd = \"echo migrated >> '{sink}'\"\n"
+    )
+}
+
+fn start_in(f: &Hx, name: &str, mode: actions::Mode) -> actions::StartReport {
+    actions::start(&f.paths, &f.config, name, None, mode, &|_| {}).unwrap()
+}
+
+// The silent-wrongness bug this closes: switching a worktree to isolated
+// hands it a brand new, empty database, but the migration hook's
+// fingerprint is a hash of migration files and a command, neither of which
+// changed. The hook was skipped and the application met an empty schema —
+// and nothing failed at `start`, so the failure surfaced later and
+// somewhere else.
+#[test]
+fn a_mode_change_runs_the_hooks_that_come_after_the_services_again() {
+    let f = hx(Kind::NextPnpmCompose, gated_with_services);
+    std::fs::write(f.root.join("seed.sql"), "one\n").unwrap();
+    common::git(&f.root, &["add", "."]);
+    common::git(&f.root, &["commit", "--quiet", "-m", "seed"]);
+    let name = new_worktree(&f, "feat/one");
+
+    start_in(&f, &name, actions::Mode::Shared);
+    assert_eq!(f.ran(), vec!["migrated"], "the first start runs it");
+
+    actions::stop(&f.paths, &name, None, &|_| {}).unwrap();
+    start_in(&f, &name, actions::Mode::Shared);
+    assert_eq!(
+        f.ran(),
+        vec!["migrated"],
+        "nothing changed, so it is skipped — which is the behaviour the bug abused"
+    );
+
+    // The database is about to be replaced by an empty one.
+    actions::stop(&f.paths, &name, None, &|_| {}).unwrap();
+    start_in(&f, &name, actions::Mode::Isolated);
+    assert_eq!(
+        f.ran(),
+        vec!["migrated", "migrated"],
+        "a new empty database is a changed input, whatever the files say"
+    );
+
+    // And the way back is a database change too: the shared one may be on
+    // an older schema than the private one just abandoned.
+    actions::stop(&f.paths, &name, None, &|_| {}).unwrap();
+    start_in(&f, &name, actions::Mode::Shared);
+    assert_eq!(f.ran(), vec!["migrated", "migrated", "migrated"]);
+
+    // A start that changes nothing still skips it, so the fix has not
+    // simply turned the fingerprint off.
+    actions::stop(&f.paths, &name, None, &|_| {}).unwrap();
+    start_in(&f, &name, actions::Mode::Shared);
+    assert_eq!(f.ran().len(), 3, "{:?}", f.ran());
+}
+
+// `create` and `install` are about the worktree and its dependencies. A
+// new database is no reason to install again, and re-running `npm ci`
+// every time someone flips `--isolated` would be its own surprise.
+#[test]
+fn a_mode_change_does_not_run_the_hooks_that_come_before_the_services() {
+    let f = hx(Kind::NextPnpmCompose, |sink| {
+        let sink = sink.display();
+        format!(
+            "[project]\ninstall = \"true\"\n\n\
+             [dev]\ncmd = \"sleep 30\"\nports = []\n\n\
+             [[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
+             include = [\"postgres\"]\nenv = {{ DATABASE_URL = \"postgres\" }}\n\n\
+             [[hooks]]\nname = \"deps\"\nafter = \"install\"\n\
+             fingerprint = [\"seed.sql\"]\ncmd = \"echo deps >> '{sink}'\"\n\n\
+             [[hooks]]\nname = \"migrate\"\nafter = \"services\"\n\
+             fingerprint = [\"seed.sql\"]\ncmd = \"echo migrated >> '{sink}'\"\n"
+        )
+    });
+    std::fs::write(f.root.join("seed.sql"), "one\n").unwrap();
+    common::git(&f.root, &["add", "."]);
+    common::git(&f.root, &["commit", "--quiet", "-m", "seed"]);
+    let name = new_worktree(&f, "feat/one");
+
+    start_in(&f, &name, actions::Mode::Shared);
+    assert_eq!(f.ran(), vec!["deps", "migrated"]);
+
+    actions::stop(&f.paths, &name, None, &|_| {}).unwrap();
+    start_in(&f, &name, actions::Mode::Isolated);
+    assert_eq!(
+        f.ran(),
+        vec!["deps", "migrated", "migrated"],
+        "only the hooks that run after the services"
+    );
+}
+
+// doctor reports whether each hook will run on the next start. It read the
+// fingerprint alone, so for a worktree about to change mode it stated the
+// opposite of what would happen. It is right for free now, and this is
+// what makes sure it stays that way.
+#[test]
+fn doctor_agrees_with_what_the_next_start_will_do() {
+    let f = hx(Kind::NextPnpmCompose, gated_with_services);
+    std::fs::write(f.root.join("seed.sql"), "one\n").unwrap();
+    common::git(&f.root, &["add", "."]);
+    common::git(&f.root, &["commit", "--quiet", "-m", "seed"]);
+    let name = new_worktree(&f, "feat/one");
+    start_in(&f, &name, actions::Mode::Shared);
+    actions::stop(&f.paths, &name, None, &|_| {}).unwrap();
+
+    let report = pando::doctor::run(&f.paths);
+    let hook = report
+        .hooks
+        .iter()
+        .find(|h| h.name == "migrate")
+        .expect("a report for the hook");
+    let run = hook
+        .runs
+        .iter()
+        .find(|r| r.worktree == name)
+        .expect("a report for the worktree");
+    assert!(
+        !run.will_run_again,
+        "nothing has changed, so a plain start skips it"
+    );
+    f.clear();
+    start_in(&f, &name, actions::Mode::Remembered);
+    assert!(
+        f.ran().is_empty(),
+        "and it really is skipped: {:?}",
+        f.ran()
+    );
+}

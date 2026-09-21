@@ -194,6 +194,13 @@ fn a_second_start_reuses_the_database_it_already_has() {
     start_isolated(&f, &name);
     let first = f.service(&name, "postgres");
     let datadir = f.datadir(&name, "postgres");
+    // A precondition, not the claim: if the server died between the two
+    // starts for some reason of its own, the second start is *right* to
+    // replace it, and the assertion below would blame the wrong thing.
+    assert!(
+        process::is_alive(first.pid.unwrap()),
+        "the server was already gone before the second start"
+    );
 
     start_isolated(&f, &name);
     let second = f.service(&name, "postgres");
@@ -518,4 +525,50 @@ fn a_compose_service_and_a_native_one_share_a_role_space_and_come_up_together() 
         common::docker::services_up(&f.home, compose.compose_project.as_ref().unwrap()).is_empty(),
         "the container outlived the stop"
     );
+}
+
+// ---- a data directory the fingerprint cannot see --------------------------
+
+// The other half of the hook-fingerprint bug, and the one only a native
+// service has: no mode change at all, but the data directory is gone — a
+// developer cleared it by hand — so the next start builds an empty one
+// while the migration hook's inputs are untouched. Same silent wrongness,
+// different cause.
+#[test]
+fn a_data_directory_built_from_nothing_runs_the_migration_again() {
+    let sink = std::env::temp_dir().join(format!("pando-fresh-hook-{}.txt", std::process::id()));
+    let _ = std::fs::remove_file(&sink);
+    let f = nat_with(&format!(
+        "[project]\ninstall = \"true\"\n\n\
+         [dev]\ncmd = \"sleep 30\"\nports = []\n\n\
+         [[services]]\nkind = \"native\"\nname = \"postgres\"\n\
+         env = {{ DATABASE_URL = \"postgres\" }}\n\n\
+         [[hooks]]\nname = \"migrate\"\nafter = \"services\"\n\
+         fingerprint = [\"package.json\"]\ncmd = \"echo migrated >> '{}'\"\n",
+        sink.display()
+    ));
+    let ran = || {
+        std::fs::read_to_string(&sink)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let name = new_worktree(&f, "feat/one");
+    start_isolated(&f, &name);
+    assert_eq!(ran(), 1, "the first start migrates");
+
+    actions::stop(&f.paths, &name, None, &|_| {}).unwrap();
+    start_isolated(&f, &name);
+    assert_eq!(ran(), 1, "nothing changed, so it is skipped");
+
+    // The cluster is gone; the migration files are not.
+    actions::stop(&f.paths, &name, None, &|_| {}).unwrap();
+    std::fs::remove_dir_all(f.datadir(&name, "postgres")).unwrap();
+    start_isolated(&f, &name);
+    assert_eq!(
+        ran(),
+        2,
+        "an empty database is a changed input, whatever the files say"
+    );
+    let _ = std::fs::remove_file(&sink);
 }
