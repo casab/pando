@@ -9720,7 +9720,20 @@ time.sleep(300)
         let machine = FakeMachine::with_nvm();
         // The nvm line works; nothing in front of it does.
         let shell = machine.shell("24.21.0", "nvm.sh", "22.11.0");
-        let (ask, asked) = scripted(vec![Answer::Choice(0)]);
+        // The nvm option by what it *is*, never by where it sits: the
+        // table's order is a product decision, and this test would
+        // otherwise start checking a different manager the day it changes.
+        let asked: AskedQuestions = Default::default();
+        let seen = asked.clone();
+        let ask = move |question: &Question| -> Result<Answer> {
+            seen.borrow_mut().push(question.clone());
+            let index = question
+                .options
+                .iter()
+                .position(|(line, _)| line.contains("nvm.sh"))
+                .ok_or_else(|| anyhow::anyhow!("the nvm line was not on offer"))?;
+            Ok(Answer::Choice(index))
+        };
 
         let config =
             resolve_runtime_slot(&fx, &fx.config, &ask, &shell, machine.home.path()).unwrap();
@@ -9740,7 +9753,10 @@ time.sleep(300)
             "the install command is printed, never run: {report}"
         );
         assert!(
-            question.options[0].0.contains("nvm.sh"),
+            question
+                .options
+                .iter()
+                .any(|(line, _)| line.contains("nvm.sh")),
             "the fix is on offer: {:?}",
             question.options
         );

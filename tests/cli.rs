@@ -651,19 +651,33 @@ fn running_from_a_deleted_directory_says_which_directory() {
 /// prove the lifecycle, and `sleep` is available everywhere.
 const SLEEPER: &str = "[dev]\ncmd = \"echo started-ok && sleep 30\"\nports = { PORT = \"web\" }\n";
 
-/// Polls a log file until it holds `needle`. A spawned process writes when
-/// it gets round to it, which is not when `start` returns.
-fn log_contains(path: &Path, needle: &str) -> bool {
-    for _ in 0..40 {
-        if std::fs::read_to_string(path)
-            .unwrap_or_default()
-            .contains(needle)
-        {
+/// Polls until `check` passes, or gives up.
+///
+/// A spawned process writes when it gets round to it, which is not when
+/// `start` returns — and a busy CI runner gets round to it a lot later
+/// than an idle laptop does. The budget is therefore generous rather than
+/// tight, and costs nothing when the machine is quick: the loop ends on
+/// the first pass either way.
+fn poll_until(mut check: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if check() {
             return true;
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    false
+}
+
+/// Polls a log file until it holds `needle`.
+fn log_contains(path: &Path, needle: &str) -> bool {
+    poll_until(|| {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .contains(needle)
+    })
 }
 
 // Committed < user < project, end to end. The machine-wide file answers
@@ -752,16 +766,11 @@ fn start_status_logs_and_stop_work_from_the_cli() {
     assert!(stdout(&out).contains(&port.to_string()), "{}", stdout(&out));
 
     // Logs.
-    let mut found = false;
-    for _ in 0..40 {
+    let found = poll_until(|| {
         let out = e.pando(&["logs", "feat+one", "--tail", "5"]);
         assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
-        if stdout(&out).contains("started-ok") {
-            found = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+        stdout(&out).contains("started-ok")
+    });
     assert!(found, "the dev process's output never reached its log");
 
     let out = e.pando(&["logs", "feat+one", "--json"]);
@@ -1000,16 +1009,16 @@ fn a_crashed_process_stays_visible_as_failed() {
     assert_eq!(code(&e.pando(&["start", "feat+one"])), EXIT_OK);
 
     let mut reason = String::new();
-    for _ in 0..40 {
+    poll_until(|| {
         let v: serde_json::Value =
             serde_json::from_str(&stdout(&e.pando(&["status", "--json"]))).unwrap();
         let process = &v["worktrees"][0]["processes"]["dev"];
         if process["phase"] == "failed" {
             reason = process["reason"].as_str().unwrap_or_default().to_string();
-            break;
+            return true;
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+        false
+    });
     assert!(
         reason.starts_with("process exited"),
         "reason was {reason:?}"

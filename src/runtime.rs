@@ -1510,9 +1510,12 @@ mod tests {
     fn a_source_and_eval_manager_gets_an_init_line_and_a_use_line() {
         let home = home_with(&[".nvm/nvm.sh"]);
         let requirement = Requirement::new("node", "22", ".nvmrc".into());
-        let fixes = fixes(node(), home.path(), from_version_file(node(), &requirement));
+        // Scoped to the injected home: Homebrew installs nvm and fnm
+        // outside `$HOME`, so an unfiltered count is a fact about the host
+        // and not about the code.
+        let fixes = from_home(node(), &home, from_version_file(node(), &requirement));
         assert_eq!(fixes.len(), 1, "{fixes:?}");
-        let line = &fixes[0].line;
+        let line = &fix_from(&fixes, "nvm").line;
         assert!(line.contains("nvm.sh"), "{line}");
         // No version in it: the line lands in a file every project on the
         // machine shares, and `nvm use` reads the repository's own file.
@@ -1526,8 +1529,9 @@ mod tests {
     fn a_requirement_no_manager_can_read_gets_the_init_line_alone() {
         let home = home_with(&[".nvm/nvm.sh"]);
         let requirement = Requirement::new("node", ">=18", "package.json engines.node".into());
-        let fixes = fixes(node(), home.path(), from_version_file(node(), &requirement));
-        assert!(!fixes[0].line.contains("nvm use"), "{:?}", fixes[0]);
+        let fixes = from_home(node(), &home, from_version_file(node(), &requirement));
+        let nvm = fix_from(&fixes, "nvm");
+        assert!(!nvm.line.contains("nvm use"), "{nvm:?}");
     }
 
     // A shim manager resolves per directory by itself. When it fails it is
@@ -1536,36 +1540,54 @@ mod tests {
     /// Only the fixes that came from the injected home. A manager can also
     /// be installed system-wide — Homebrew puts nvm in its own prefix —
     /// and whether this machine has one is not something a test decides.
-    fn from_home(language: &Language, home: &TempDir) -> Vec<Fix> {
+    fn from_home(language: &Language, home: &TempDir, reads_version_file: bool) -> Vec<Fix> {
         let home_path = home.path().display().to_string();
-        fixes(language, home.path(), true)
+        fixes(language, home.path(), reads_version_file)
             .into_iter()
             .filter(|fix| fix.line.contains(&home_path))
             .collect()
     }
 
+    /// One installed manager, by name.
+    fn manager_named(language: &Language, home: &Path, name: &str) -> &'static Manager {
+        installed(language, home)
+            .into_iter()
+            .find(|manager| manager.name == name)
+            .unwrap_or_else(|| panic!("{name} is installed in this home"))
+    }
+
+    /// The fix from one named manager. By name, never by index: the table's
+    /// order is a product decision, and a test that quietly checked a
+    /// different manager after a reorder would be worse than one that fails.
+    fn fix_from<'a>(fixes: &'a [Fix], manager: &str) -> &'a Fix {
+        fixes
+            .iter()
+            .find(|fix| fix.manager == manager)
+            .unwrap_or_else(|| panic!("{manager} is installed in this home: {fixes:?}"))
+    }
+
     #[test]
     fn a_shim_manager_gets_a_path_line_and_never_a_use_line() {
         let home = home_with(&[".volta/bin"]);
-        let fixes = from_home(node(), &home);
-        assert_eq!(fixes.len(), 1, "{fixes:?}");
-        assert!(fixes[0].line.starts_with("export PATH="), "{:?}", fixes[0]);
-        assert!(!fixes[0].line.contains("use"), "{:?}", fixes[0]);
-        assert!(fixes[0].line.contains(".volta/bin"), "{:?}", fixes[0]);
+        let fixes = from_home(node(), &home, true);
+        let volta = fix_from(&fixes, "volta");
+        assert!(volta.line.starts_with("export PATH="), "{volta:?}");
+        assert!(!volta.line.contains("use"), "{volta:?}");
+        assert!(volta.line.contains(".volta/bin"), "{volta:?}");
     }
 
     #[test]
     fn only_the_managers_this_machine_has_are_offered() {
         let empty = TempDir::new().unwrap();
         assert!(
-            from_home(node(), &empty).is_empty(),
+            from_home(node(), &empty, true).is_empty(),
             "a home with no manager in it offers no line"
         );
 
         // And the order is the table's: a PATH line is the sturdier fix in
         // a non-interactive shell, so it comes first.
         let home = home_with(&[".nvm/nvm.sh", ".volta/bin"]);
-        let offered: Vec<&str> = from_home(node(), &home)
+        let offered: Vec<&str> = from_home(node(), &home, true)
             .iter()
             .map(|fix| fix.manager)
             .collect();
@@ -1576,14 +1598,14 @@ mod tests {
     #[test]
     fn an_install_command_uses_the_name_the_manager_itself_uses() {
         let home = home_with(&[".asdf/shims"]);
-        let asdf = installed(node(), home.path())[0];
+        let asdf = manager_named(node(), home.path(), "asdf");
         assert_eq!(
             asdf.install_command(node(), "22").as_deref(),
             Some("asdf install nodejs 22"),
             "asdf's plugin is nodejs, not node"
         );
         let volta_home = home_with(&[".volta/bin"]);
-        let volta = installed(node(), volta_home.path())[0];
+        let volta = manager_named(node(), volta_home.path(), "volta");
         assert_eq!(
             volta.install_command(node(), "v22").as_deref(),
             Some("volta install node@22")
