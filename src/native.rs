@@ -72,6 +72,198 @@ fn is_plain_identifier(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
 }
 
+/// One `[[services]] kind = "native"` entry, flattened.
+///
+/// Borrowed from the config rather than copied, and built here rather than
+/// in `actions`, so the one place that knows what a native block *means*
+/// is the module that runs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Entry<'a> {
+    pub name: &'a str,
+    pub preset: Option<&'a str>,
+    pub port_env: Option<&'a str>,
+    pub init: Option<&'a str>,
+    pub cmd: Option<&'a str>,
+    pub ready: Option<&'a str>,
+    pub ready_timeout_s: Option<u64>,
+    pub env: &'a std::collections::BTreeMap<String, String>,
+}
+
+impl<'a> Entry<'a> {
+    /// The entry a `[[services]]` block is, when it is a native one.
+    pub fn of(service: &'a crate::config::ServiceConfig) -> Option<Entry<'a>> {
+        match service {
+            crate::config::ServiceConfig::Compose { .. } => None,
+            crate::config::ServiceConfig::Native {
+                name,
+                preset,
+                port_env,
+                init,
+                cmd,
+                ready,
+                ready_timeout_s,
+                env,
+            } => Some(Entry {
+                name,
+                preset: preset.as_deref(),
+                port_env: port_env.as_deref(),
+                init: init.as_deref(),
+                cmd: cmd.as_deref(),
+                ready: ready.as_deref(),
+                ready_timeout_s: *ready_timeout_s,
+                env,
+            }),
+        }
+    }
+
+    /// Every native entry of a config, in file order.
+    pub fn all(config: &'a crate::config::Config) -> Vec<Entry<'a>> {
+        config.services.iter().filter_map(Entry::of).collect()
+    }
+
+    /// Which recipe this entry names. `preset` when it says, otherwise its
+    /// own name — `name = "postgres"` needs no second line saying so.
+    pub fn preset(&self) -> &'a str {
+        self.preset.unwrap_or(self.name)
+    }
+
+    /// What the app reads to find this service, and whether the entry said
+    /// so itself.
+    ///
+    /// A key the *recipe* supplied is a default rather than an
+    /// instruction: a project with no `DATABASE_URL` anywhere has not
+    /// asked for one to be rewritten, and failing its start over a key it
+    /// never wrote would be pando inventing a requirement.
+    pub fn env_map(
+        &self,
+        recipe: Option<&Recipe>,
+    ) -> (std::collections::BTreeMap<String, String>, bool) {
+        if !self.env.is_empty() {
+            return (self.env.clone(), true);
+        }
+        if let Some(key) = self.port_env {
+            return (
+                std::collections::BTreeMap::from([(key.to_string(), self.name.to_string())]),
+                true,
+            );
+        }
+        let defaulted = recipe
+            .and_then(|r| r.service())
+            .and_then(|s| s.port_env.clone());
+        match defaulted {
+            Some(key) => (
+                std::collections::BTreeMap::from([(key, self.name.to_string())]),
+                false,
+            ),
+            None => (std::collections::BTreeMap::new(), true),
+        }
+    }
+}
+
+/// Where the recipe a native service runs actually came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    /// A recipe, built-in or the developer's own.
+    Recipe(crate::recipes::Origin),
+    /// No recipe at all: the `[[services]]` entry carries its own `cmd`.
+    Inline,
+}
+
+impl Source {
+    pub fn describe(&self) -> String {
+        match self {
+            Source::Recipe(origin) => origin.describe(),
+            Source::Inline => "the [[services]] entry itself".to_string(),
+        }
+    }
+}
+
+/// A recipe with the entry's own fields laid over it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolved {
+    pub recipe: Recipe,
+    pub source: Source,
+    /// Which fields the entry overrode, for a report that has to explain
+    /// why a built-in is not behaving like the built-in.
+    pub overrides: Vec<&'static str>,
+}
+
+/// Which recipe a native entry runs, with its inline fields applied.
+///
+/// A named `preset` that does not resolve is always a refusal, even when
+/// the entry carries its own `cmd`: it is a typo far more often than it is
+/// a leftover. A preset that came from the entry's *name* is a guess, so
+/// an entry called `db` with its own `cmd` and no recipe called `db` is
+/// simply an inline service.
+pub fn resolve(recipes: &crate::recipes::Recipes, entry: &Entry<'_>) -> Result<Resolved> {
+    let found = recipes.get(entry.preset());
+    let (mut recipe, source) = match found {
+        Ok(loaded) => (loaded.recipe.clone(), Source::Recipe(loaded.origin.clone())),
+        Err(e) if entry.preset.is_some() || entry.cmd.is_none() => {
+            return Err(e).with_context(|| {
+                format!(
+                    "the service {:?} names the recipe {:?}",
+                    entry.name,
+                    entry.preset()
+                )
+            });
+        }
+        Err(_) => (
+            Recipe {
+                kind: crate::recipes::Kind::Service,
+                name: entry.name.to_string(),
+                aliases: Vec::new(),
+                summary: None,
+                binaries: Vec::new(),
+                version_flag: None,
+                install: None,
+                notes: None,
+                body: crate::recipes::Body::Service(crate::recipes::ServiceRecipe::default()),
+            },
+            Source::Inline,
+        ),
+    };
+    let name = recipe.name.clone();
+    let service = recipe.service_mut().with_context(|| {
+        format!(
+            "the service {:?} names the recipe {name:?}, which is a language recipe — a              [[services]] entry needs one that starts a server",
+            entry.name
+        )
+    })?;
+    let mut overrides = Vec::new();
+    if let Some(cmd) = entry.cmd {
+        service.cmd = cmd.to_string();
+        overrides.push("cmd");
+    }
+    if let Some(init) = entry.init {
+        service.init = Some(init.to_string());
+        overrides.push("init");
+    }
+    if let Some(ready) = entry.ready {
+        service.ready = Some(ready.to_string());
+        overrides.push("ready");
+    }
+    if let Some(timeout) = entry.ready_timeout_s {
+        service.ready_timeout_s = Some(timeout);
+        overrides.push("ready_timeout_s");
+    }
+    if let Some(port_env) = entry.port_env {
+        service.port_env = Some(port_env.to_string());
+        overrides.push("port_env");
+    }
+    if service.cmd.trim().is_empty() {
+        bail!(
+            "the service {:?} has no command to start: name a `preset`, or give the entry its              own `cmd`",
+            entry.name
+        );
+    }
+    Ok(Resolved {
+        recipe,
+        source,
+        overrides,
+    })
+}
+
 /// One native service of one worktree, fully resolved: which recipe, which
 /// port, which directories, and what the app's own URL calls its database.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 
 pub mod docker;
+pub mod postgres;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

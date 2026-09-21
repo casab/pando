@@ -993,51 +993,109 @@ fn validate_services(config: &Config) -> Result<()> {
         }
     }
     for service in &config.services {
-        let ServiceConfig::Compose {
-            file, include, env, ..
-        } = service
-        else {
-            // Native services are Phase 6. Nothing validates their shape
-            // yet, and nothing reads it either.
-            continue;
-        };
-        // The same refusals `compose::file_in` makes, at load time rather
-        // than at the first isolated start.
-        crate::compose::file_in(Path::new("/"), file)?;
-        for name in include {
-            crate::paths::validate_owned_log_source("service name", name)?;
-            // A service is a log source, and so is a hook. Two of them with
-            // one name both write `logs/<worktree>/<name>.log`: the
-            // service's pump truncates it, the hook appends to it, and
-            // `logs --source <name>` shows a mixture of the two.
-            if config.hooks.iter().any(|hook| &hook.name == name) {
-                bail!(
-                    "the hook {name:?} and the service {name:?} have the same name — both \
-                     write the log logs/<worktree>/{name}.log, so the service's log pump \
-                     would truncate what the hook appended; rename one of them"
-                );
+        match service {
+            ServiceConfig::Compose {
+                file, include, env, ..
+            } => {
+                // The same refusals `compose::file_in` makes, at load time
+                // rather than at the first isolated start.
+                crate::compose::file_in(Path::new("/"), file)?;
+                for name in include {
+                    claim_service_name(config, &mut role_owner, name, "drop it from `include`")?;
+                }
+                for (key, service_name) in env {
+                    if key.trim().is_empty() {
+                        bail!("a [[services]] env key must not be empty");
+                    }
+                    if !include.iter().any(|name| name == service_name) {
+                        bail!(
+                            "env.{key} points at the service {service_name:?}, which is not in \
+                             `include` — pando has no port for a service it does not run"
+                        );
+                    }
+                }
             }
-            if let Some(owner) = role_owner.get(name) {
-                bail!(
-                    "the service {name:?} and {owner} both claim the role {name:?} — a role is \
-                     one port and belongs to one thing; rename the process's role, or drop \
-                     {name:?} from `include`"
-                );
-            }
-            role_owner.insert(name.clone(), format!("the service {name:?}"));
-        }
-        for (key, service_name) in env {
-            if key.trim().is_empty() {
-                bail!("a [[services]] env key must not be empty");
-            }
-            if !include.iter().any(|name| name == service_name) {
-                bail!(
-                    "env.{key} points at the service {service_name:?}, which is not in \
-                     `include` — pando has no port for a service it does not run"
-                );
+            ServiceConfig::Native {
+                name,
+                port_env,
+                env,
+                ..
+            } => {
+                // A native service is a role, a log tab and a data
+                // directory under its own name, so it is held to every
+                // rule a compose service's name is.
+                claim_service_name(config, &mut role_owner, name, "rename it")?;
+                for (key, service_name) in env {
+                    if key.trim().is_empty() {
+                        bail!("a [[services]] env key must not be empty");
+                    }
+                    // A native entry runs exactly one service, so the only
+                    // thing its env map can point at is itself.
+                    if service_name != name {
+                        bail!(
+                            "env.{key} points at the service {service_name:?}, but this \
+                             [[services]] entry runs {name:?} — a native entry is one service, \
+                             so its env map can only name that one"
+                        );
+                    }
+                }
+                if port_env.as_ref().is_some_and(|key| key.trim().is_empty()) {
+                    bail!("[[services]] {name:?} has an empty `port_env`");
+                }
+                // Which recipe runs it is *not* checked here. Resolving a
+                // `preset` means reading the user's recipes directory, and
+                // a build that refused a name only because it is not one of
+                // the built-ins would be giving built-ins exactly the
+                // privilege a user's own file is supposed to have. The
+                // start path and `doctor` resolve it, where the directory
+                // is in hand.
             }
         }
     }
+    Ok(())
+}
+
+/// The rules every service name is held to, whichever kind of service it
+/// is: it is a log file component, it must not collide with a hook's log,
+/// and it owns a role no process may also own.
+///
+/// `escape` is what the developer can do about a collision, which differs
+/// between the two kinds — a compose service can be dropped from
+/// `include`, a native one has to be renamed.
+fn claim_service_name(
+    config: &Config,
+    role_owner: &mut BTreeMap<String, String>,
+    name: &str,
+    escape: &str,
+) -> Result<()> {
+    crate::paths::validate_owned_log_source("service name", name)?;
+    // A service is a log source, and so is a hook. Two of them with one
+    // name both write `logs/<worktree>/<name>.log`: the service's log
+    // truncates it, the hook appends to it, and `logs --source <name>`
+    // shows a mixture of the two.
+    if config.hooks.iter().any(|hook| hook.name == name) {
+        bail!(
+            "the hook {name:?} and the service {name:?} have the same name — both write the \
+             log logs/<worktree>/{name}.log, so the service's log would truncate what the \
+             hook appended; rename one of them"
+        );
+    }
+    if let Some(owner) = role_owner.get(name) {
+        // Two services with one name is its own sentence: "the service
+        // \"postgres\" and the service \"postgres\"" reads like a bug in
+        // pando rather than a duplicate in the file.
+        if owner.starts_with("the service") {
+            bail!(
+                "two [[services]] entries both run a service called {name:?} — a service is \
+                 one role, one port and one log, so it can only be declared once"
+            );
+        }
+        bail!(
+            "the service {name:?} and {owner} both claim the role {name:?} — a role is one \
+             port and belongs to one thing; rename the process's role, or {escape}"
+        );
+    }
+    role_owner.insert(name.to_string(), format!("the service {name:?}"));
     Ok(())
 }
 
@@ -2079,16 +2137,16 @@ ready = { role = "web", timeout_s = 30 }
 [[services]]
 kind = "compose"
 file = "docker-compose.yml"
-include = ["postgres", "redis"]
-env = { DATABASE_URL = "postgres", REDIS_URL = "redis" }
+include = ["redis"]
+env = { REDIS_URL = "redis" }
 
 [[services]]
 kind = "native"
 name = "postgres"
 preset = "postgres"
-port_env = "DATABASE_PORT"
-init = "initdb -D {datadir}"
-cmd = "postgres -D {datadir} -p {port}"
+port_env = "DATABASE_URL"
+init = "initdb --pgdata {datadir}"
+cmd = "exec postgres -D {datadir} -p {port} -k {socket_dir}"
 ready = "pg_isready -h 127.0.0.1 -p {port}"
 
 [[hooks]]
@@ -2186,6 +2244,80 @@ port_env = "DATABASE_PORT"
         assert_eq!(named.len(), 2, "{named:?}");
         assert!(named[0].contains("postgres"), "{named:?}");
         assert!(named[1].contains("redis"), "{named:?}");
+    }
+
+    // A native service is a role, a port, a log tab and a data directory
+    // under its own name, so every rule a compose service's name obeys
+    // applies to it too — and until now nothing checked any of them.
+
+    #[test]
+    fn a_native_service_may_not_take_a_role_a_process_already_owns() {
+        let f = fixture();
+        write_home(
+            &f,
+            "[processes.dev]\ncmd = \"x\"\nports = [\"postgres\"]\n\n\
+             [[services]]\nkind = \"native\"\nname = \"postgres\"\n",
+        );
+        let e = format!("{:#}", load(&f.paths).unwrap_err());
+        assert!(e.contains("both claim the role \"postgres\""), "{e}");
+    }
+
+    #[test]
+    fn a_native_service_may_not_share_a_name_with_a_compose_service() {
+        let f = fixture();
+        write_home(
+            &f,
+            "[[services]]\nkind = \"compose\"\nfile = \"c.yml\"\ninclude = [\"postgres\"]\n\n\
+             [[services]]\nkind = \"native\"\nname = \"postgres\"\n",
+        );
+        let e = format!("{:#}", load(&f.paths).unwrap_err());
+        // One sentence about a duplicate, not two identical halves of a
+        // role collision.
+        assert!(e.contains("two [[services]] entries"), "{e}");
+        assert!(e.contains("\"postgres\""), "{e}");
+    }
+
+    #[test]
+    fn a_native_service_may_not_share_a_name_with_a_hook() {
+        let f = fixture();
+        write_home(
+            &f,
+            "[[services]]\nkind = \"native\"\nname = \"migrate\"\n\n\
+             [[hooks]]\nname = \"migrate\"\nafter = \"services\"\ncmd = \"m\"\n",
+        );
+        let e = format!("{:#}", load(&f.paths).unwrap_err());
+        assert!(e.contains("logs/<worktree>/migrate.log"), "{e}");
+    }
+
+    #[test]
+    fn a_native_service_name_that_is_a_path_is_refused() {
+        let f = fixture();
+        write_home(&f, "[[services]]\nkind = \"native\"\nname = \"../evil\"\n");
+        let e = format!("{:#}", load(&f.paths).unwrap_err());
+        assert!(e.contains("single name, not a path"), "{e}");
+    }
+
+    #[test]
+    fn a_native_env_key_may_only_point_at_the_service_the_entry_runs() {
+        let f = fixture();
+        write_home(
+            &f,
+            "[[services]]\nkind = \"native\"\nname = \"postgres\"\n\
+             env = { DATABASE_URL = \"pg\" }\n",
+        );
+        let e = format!("{:#}", load(&f.paths).unwrap_err());
+        assert!(
+            e.contains("this [[services]] entry runs \"postgres\""),
+            "{e}"
+        );
+
+        // And the same key pointing at itself is fine.
+        write_home(
+            &f,
+            "[[services]]\nkind = \"native\"\nname = \"postgres\"\n\
+             env = { DATABASE_URL = \"postgres\" }\n",
+        );
+        load(&f.paths).unwrap();
     }
 
     #[test]

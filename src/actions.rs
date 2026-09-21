@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use crate::config::{self, Config, ProcessConfig, ProvisionMode};
 use crate::detect::{self, Slot};
 use crate::hooks;
+use crate::native;
 use crate::paths::PandoPaths;
 use crate::ports;
 use crate::process::{self as proc, SpawnOptions};
@@ -802,7 +803,12 @@ pub fn rm(
     }
 
     let _ = std::fs::remove_dir_all(paths.logs_dir(name));
+    // Every native service's data directory is under this one, so this is
+    // also what makes "`rm` wipes the database" true for them.
     let _ = std::fs::remove_dir_all(paths.data_dir(name));
+    if let Some(record) = store.worktrees.get(name) {
+        clear_native_sockets(paths, name, record);
+    }
     // And the compose override, which is regenerated on every isolated
     // start and would otherwise outlive every worktree that ever had one.
     let _ = std::fs::remove_file(paths.compose_override_file(name));
@@ -2383,6 +2389,7 @@ pub fn start(
         for service in record.services.iter_mut() {
             service.port = None;
         }
+        clear_native_sockets(paths, name, record);
         going_shared = compose_projects(record);
     }
     // Service roles are reserved with the process roles, in one window, so
@@ -2451,7 +2458,7 @@ pub fn start(
     // from the allocated ports alone, so a hook that runs before the
     // containers exist sees exactly what the processes will.
     let service_env = if isolate {
-        resolve_service_env(config, &canonical, &assignment.ports)?
+        resolve_service_env(paths, config, &canonical, &assignment.ports)?
     } else {
         BTreeMap::new()
     };
@@ -2709,6 +2716,9 @@ fn stop_missing(
         }
         advance_before_reconcile(&mut store);
         state::reconcile(&mut store, proc::is_alive);
+        if let Some(record) = store.worktrees.get(name) {
+            clear_native_sockets(paths, name, record);
+        }
         state::save(&paths.state_file(), &store)?;
         outcome
     };
@@ -2803,6 +2813,11 @@ pub fn stop_all_with(
             Err(e) => sweep_failed = Some(e),
         }
     }
+    for name in &stopped {
+        if let Some(record) = store.worktrees.get(name) {
+            clear_native_sockets(paths, name, record);
+        }
+    }
     // Saved either way, so the groups that *were* signalled do not come
     // back as phantom records on the next read.
     state::save(&paths.state_file(), &store)?;
@@ -2890,6 +2905,14 @@ fn stop_recorded_with(
         if only.is_some() {
             return missing_only(name, only, missing, record);
         }
+        // Read before anything is signalled: a native service *is* its
+        // process, so a worktree whose only service is a database has
+        // something to stop even though it has no compose project and no
+        // process record at all.
+        let had_native = record
+            .services
+            .iter()
+            .any(|s| s.kind == state::ServiceKind::Native && s.pgid.is_some());
         let mut failures = stop_service_pumps(record, &stop);
         // A worktree whose every process crashed can still be shared: the
         // tunnel outlives them, and a public URL onto nothing is the worst
@@ -2899,7 +2922,7 @@ fn stop_recorded_with(
         if !failures.is_empty() {
             bail!("{name}: {}", failures.join("; "));
         }
-        if projects.is_empty() && !was_shared {
+        if projects.is_empty() && !was_shared && !had_native {
             return Ok(StopOutcome::NotRunning);
         }
         services_to_stop.extend(projects);
@@ -3701,10 +3724,8 @@ fn compose_entries(config: &Config) -> Vec<ComposeEntry<'_>> {
                 env,
                 ready_timeout_s: *ready_timeout_s,
             }),
-            // Nothing in this build runs a native service. Dropped here,
-            // but not silently: `config::load` warns once per block, by
-            // name, so "no services configured" is never said about a file
-            // that configures one.
+            // Native entries are this list's opposite number; see
+            // `native::Entry::all`.
             config::ServiceConfig::Native { .. } => None,
         })
         .collect()
@@ -3712,16 +3733,38 @@ fn compose_entries(config: &Config) -> Vec<ComposeEntry<'_>> {
 
 /// Every service this project can run a private copy of, in config order.
 /// Each one is a role, so `{port:postgres}` resolves like any other.
+///
+/// Compose and native entries share one role space and are listed in the
+/// order the file writes them, so a project that has both hands out ports
+/// in a stable order whichever kind comes first.
 fn service_roles(config: &Config) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for entry in compose_entries(config) {
-        for name in entry.include {
-            if !out.contains(name) {
-                out.push(name.clone());
+    for service in &config.services {
+        match service {
+            config::ServiceConfig::Compose { include, .. } => {
+                for name in include {
+                    if !out.contains(name) {
+                        out.push(name.clone());
+                    }
+                }
+            }
+            config::ServiceConfig::Native { name, .. } => {
+                if !out.contains(name) {
+                    out.push(name.clone());
+                }
             }
         }
     }
     out
+}
+
+/// The names of the services this project runs as pando's own processes
+/// rather than as containers.
+fn native_names(config: &Config) -> Vec<String> {
+    native::Entry::all(config)
+        .iter()
+        .map(|entry| entry.name.to_string())
+        .collect()
 }
 
 /// The service records an isolated start writes, before anything is up.
@@ -3742,16 +3785,27 @@ fn planned_services(
     record: &WorktreeRecord,
 ) -> Vec<state::ServiceRecord> {
     let project = crate::compose::project_name(paths.project_id(), name);
+    let native = native_names(config);
     let mut out: Vec<state::ServiceRecord> = Vec::new();
     for service in service_roles(config) {
         let existing = record.services.iter().find(|s| s.name == service);
+        // A native record's pid *is* the server, and `reconcile` drops the
+        // record when it dies; a compose record's pid is only the log
+        // pump in front of a container. Same field, and the two must not
+        // be confused — a record written with the wrong kind would either
+        // lose a container pando can never find again, or keep a database
+        // record for a process that exited.
+        let is_native = native.contains(&service);
         out.push(state::ServiceRecord {
             name: service.clone(),
-            kind: state::ServiceKind::Compose,
+            kind: match is_native {
+                true => state::ServiceKind::Native,
+                false => state::ServiceKind::Compose,
+            },
             port: ports.get(&service).copied(),
             pid: existing.and_then(|s| s.pid),
             pgid: existing.and_then(|s| s.pgid),
-            compose_project: Some(project.clone()),
+            compose_project: (!is_native).then(|| project.clone()),
         });
     }
     for service in &record.services {
@@ -3767,7 +3821,17 @@ fn planned_services(
 
 /// The env every process and hook of an isolated worktree is given, so it
 /// talks to its own services rather than the shared ones.
+///
+/// Compose and native entries go through the same rewriter: a URL keeps
+/// its credentials and its database and has its port replaced, a bare
+/// number becomes the port. The one difference is whose idea the key was.
+/// A key the *config* names is an instruction, and a worktree that cannot
+/// satisfy it fails the start. A key a *recipe* supplied is a default —
+/// `DATABASE_URL` is what a Postgres recipe expects an app to read — and
+/// a project that has no such variable anywhere has not asked for one, so
+/// it is dropped rather than turned into a refusal.
 fn resolve_service_env(
+    paths: &PandoPaths,
     config: &Config,
     worktree: &Path,
     ports: &BTreeMap<String, u16>,
@@ -3776,16 +3840,83 @@ fn resolve_service_env(
     for entry in compose_entries(config) {
         out.extend(services::app_env(worktree, entry.env, ports)?);
     }
+    let native = native::Entry::all(config);
+    if native.is_empty() {
+        return Ok(out);
+    }
+    let recipes = crate::recipes::Recipes::load(&paths.recipes_dir());
+    for entry in &native {
+        let recipe = native::resolve(&recipes, entry).ok().map(|r| r.recipe);
+        let (mapping, from_config) = entry.env_map(recipe.as_ref());
+        if mapping.is_empty() {
+            continue;
+        }
+        match services::app_env(worktree, &mapping, ports) {
+            Ok(resolved) => out.extend(resolved),
+            Err(e) if from_config => return Err(e),
+            Err(_) => continue,
+        }
+    }
     Ok(out)
 }
 
-/// Brings this worktree's private services up, waits for them, and starts
-/// a log pump in front of each one.
+/// The URL each native service's app env points at, so a recipe's
+/// `create` step knows which database and role to make.
+fn native_urls(
+    paths: &PandoPaths,
+    config: &Config,
+    worktree: &Path,
+    ports: &BTreeMap<String, u16>,
+) -> BTreeMap<String, String> {
+    let recipes = crate::recipes::Recipes::load(&paths.recipes_dir());
+    let mut out = BTreeMap::new();
+    for entry in native::Entry::all(config) {
+        let recipe = native::resolve(&recipes, &entry).ok().map(|r| r.recipe);
+        let (mapping, _) = entry.env_map(recipe.as_ref());
+        let Ok(resolved) = services::app_env(worktree, &mapping, ports) else {
+            continue;
+        };
+        if let Some(value) = resolved.into_values().next() {
+            out.insert(entry.name.to_string(), value);
+        }
+    }
+    out
+}
+
+/// Brings this worktree's private services up, of either kind, and waits
+/// for them.
+///
+/// Compose first, then native, and a native service that fails takes the
+/// containers down with it — "a service that never comes up leaves
+/// nothing running" is the rule the compose half already follows, and a
+/// worktree half in one mode and half in another is worse than either.
+fn bring_up_services(
+    paths: &PandoPaths,
+    config: &Config,
+    name: &str,
+    worktree: &Path,
+    ports: &BTreeMap<String, u16>,
+    progress: &dyn Fn(&str),
+) -> Result<()> {
+    bring_up_compose_services(paths, config, name, worktree, ports, progress)?;
+    let Err(e) = bring_up_native_services(paths, config, name, worktree, ports, progress) else {
+        return Ok(());
+    };
+    if !compose_entries(config).is_empty() {
+        let project = crate::compose::project_name(paths.project_id(), name);
+        let program = services::docker_program(paths);
+        let _ = services::Compose::by_project(&program, &project).stop();
+    }
+    Err(e)
+}
+
+/// Brings this worktree's private *containers* up, waits for them, and
+/// starts a log pump in front of each one.
 ///
 /// The override that remaps the ports is regenerated every time: the
 /// ports can move, the compose file can change under a rebase, and a
 /// stale override would publish a port nothing is on.
-fn bring_up_services(
+fn bring_up_compose_services(
     paths: &PandoPaths,
     config: &Config,
     name: &str,
@@ -3889,6 +4020,183 @@ fn bring_up_services(
     }
 
     pump_service_logs(paths, name, &compose, &include, worktree)
+}
+
+/// Brings this worktree's native services up: initialise once, spawn
+/// detached, wait for the recipe's own check, then let the recipe create
+/// whatever the app's own URL names.
+///
+/// Planned in full before anything is created or spawned, the way
+/// processes are: a second service whose recipe does not resolve, or
+/// whose engine is not installed, must not leave the first one's data
+/// directory behind a failed start. The engine check is part of planning
+/// for the same reason — a start that initialises a cluster and *then*
+/// discovers there is no server to run against it has done work for
+/// nothing.
+fn bring_up_native_services(
+    paths: &PandoPaths,
+    config: &Config,
+    name: &str,
+    worktree: &Path,
+    ports: &BTreeMap<String, u16>,
+    progress: &dyn Fn(&str),
+) -> Result<()> {
+    let entries = native::Entry::all(config);
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let recipes = crate::recipes::Recipes::load(&paths.recipes_dir());
+    let urls = native_urls(paths, config, worktree, ports);
+    let mut planned: Vec<native::Native> = Vec::new();
+    for entry in &entries {
+        let resolved = native::resolve(&recipes, entry)?;
+        let port = *ports
+            .get(entry.name)
+            .with_context(|| format!("no port was allocated for the service {:?}", entry.name))?;
+        let service = native::Native::plan(
+            paths,
+            name,
+            entry.name,
+            resolved.recipe,
+            port,
+            urls.get(entry.name).map(String::as_str),
+        )?;
+        let missing = service.missing_binaries();
+        if !missing.is_empty() {
+            return Err(service.missing_binaries_error(&missing));
+        }
+        planned.push(service);
+    }
+
+    // A server that is already running is left exactly as it is. Starting
+    // a second one on the same data directory is how a database gets
+    // corrupted, and it is what a plain `start` beside a live isolated
+    // worktree would otherwise do.
+    let live = live_native_services(paths, name)?;
+
+    let mut started: Vec<native::Native> = Vec::new();
+    for service in planned {
+        if live.contains(&service.service) {
+            continue;
+        }
+        if let Err(e) = start_one_native(paths, name, &service, progress) {
+            stop_native_services(paths, name, &started);
+            return Err(e);
+        }
+        started.push(service);
+    }
+    for service in &started {
+        let Some(pid) = recorded_native_pid(paths, name, &service.service)? else {
+            continue;
+        };
+        let waited = service
+            .wait_ready(pid, service.ready_timeout(), progress)
+            .and_then(|()| service.create());
+        if let Err(e) = waited {
+            stop_native_services(paths, name, &started);
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// Initialises, spawns, and records one native service — recorded under
+/// the lock before anything waits on it, because a readiness failure has
+/// to leave a pgid the orphan sweep can find.
+fn start_one_native(
+    paths: &PandoPaths,
+    name: &str,
+    service: &native::Native,
+    progress: &dyn Fn(&str),
+) -> Result<()> {
+    service.ensure_init(progress)?;
+    reset_log(&service.log_file)?;
+    progress(&format!("starting services: {}", service.service));
+    let spawned = service.spawn()?;
+    let _lock = state::lock(&paths.lock_file())?;
+    let mut store = state::load(&paths.state_file())?;
+    if let Some(record) = store
+        .worktrees
+        .get_mut(name)
+        .and_then(|r| r.services.iter_mut().find(|s| s.name == service.service))
+    {
+        record.pid = Some(spawned.pid);
+        record.pgid = Some(spawned.pgid);
+    }
+    state::save(&paths.state_file(), &store)
+}
+
+/// The native services of this worktree whose server is still alive.
+fn live_native_services(paths: &PandoPaths, name: &str) -> Result<Vec<String>> {
+    let store = state::load(&paths.state_file())?;
+    Ok(store
+        .worktrees
+        .get(name)
+        .map(|record| {
+            record
+                .services
+                .iter()
+                .filter(|s| s.kind == state::ServiceKind::Native)
+                .filter(|s| s.pid.is_some_and(proc::is_alive))
+                .map(|s| s.name.clone())
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+fn recorded_native_pid(paths: &PandoPaths, name: &str, service: &str) -> Result<Option<u32>> {
+    let store = state::load(&paths.state_file())?;
+    Ok(store
+        .worktrees
+        .get(name)
+        .and_then(|record| record.services.iter().find(|s| s.name == service))
+        .and_then(|s| s.pid))
+}
+
+/// Signals every native service this call started and forgets its pid, so
+/// a failed start leaves no server holding a port and no record claiming
+/// one is there.
+fn stop_native_services(paths: &PandoPaths, name: &str, started: &[native::Native]) {
+    if started.is_empty() {
+        return;
+    }
+    let Ok(_lock) = state::lock(&paths.lock_file()) else {
+        return;
+    };
+    let Ok(mut store) = state::load(&paths.state_file()) else {
+        return;
+    };
+    for service in started {
+        let Some(record) = store
+            .worktrees
+            .get_mut(name)
+            .and_then(|r| r.services.iter_mut().find(|s| s.name == service.service))
+        else {
+            continue;
+        };
+        if let Some(pgid) = record.pgid {
+            let _ = proc::stop(pgid, STOP_GRACE);
+        }
+        record.pid = None;
+        record.pgid = None;
+        let _ = std::fs::remove_dir_all(&service.socket_dir);
+    }
+    let _ = state::save(&paths.state_file(), &store);
+}
+
+/// Removes the socket directories of a worktree's native services.
+///
+/// The one thing pando puts outside its own home, so the one thing a stop
+/// has to clean up by hand. Harmless if it is already gone: a server that
+/// shut down cleanly took its own socket with it.
+fn clear_native_sockets(paths: &PandoPaths, name: &str, record: &WorktreeRecord) {
+    for service in &record.services {
+        if service.kind != state::ServiceKind::Native {
+            continue;
+        }
+        let dir = paths.service_socket_dir(name, &service.name);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 /// Remembers that this worktree runs private services, once they are up.
@@ -4069,21 +4377,35 @@ pub fn service_statuses(record: &WorktreeRecord) -> Vec<ServiceStatus> {
 /// exactly what the header chip is claiming to know about.
 pub fn shared_service_statuses(paths: &PandoPaths, config: &Config) -> Vec<ServiceStatus> {
     let mut out: Vec<ServiceStatus> = Vec::new();
+    let mut add = |key: &str, service: &str| {
+        if out.iter().any(|status| status.name == service) {
+            return;
+        }
+        let port = services::port_in_env(paths.root(), key);
+        out.push(ServiceStatus {
+            name: service.to_string(),
+            port,
+            up: port.map(ports::something_is_listening) == Some(true),
+            // Shared services are the developer's own `docker compose up`
+            // or their own `brew services start`; pando runs no pump in
+            // front of anything it did not start.
+            logging: false,
+        });
+    };
     for entry in compose_entries(config) {
         for (key, service) in entry.env {
-            if out.iter().any(|status| &status.name == service) {
-                continue;
+            add(key, service);
+        }
+    }
+    let native = native::Entry::all(config);
+    if !native.is_empty() {
+        let recipes = crate::recipes::Recipes::load(&paths.recipes_dir());
+        for entry in &native {
+            let recipe = native::resolve(&recipes, entry).ok().map(|r| r.recipe);
+            let (mapping, _) = entry.env_map(recipe.as_ref());
+            for (key, service) in &mapping {
+                add(key, service);
             }
-            let port = services::port_in_env(paths.root(), key);
-            out.push(ServiceStatus {
-                name: service.clone(),
-                port,
-                up: port.map(ports::something_is_listening) == Some(true),
-                // Shared services are the developer's own `docker compose
-                // up`; pando runs no pump in front of anything it did not
-                // start.
-                logging: false,
-            });
         }
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -4121,7 +4443,12 @@ pub fn resolved_env(
     }
     let mut out: BTreeMap<String, String> = BTreeMap::new();
     if record.isolated {
-        out.extend(resolve_service_env(config, &canonical, &record.ports)?);
+        out.extend(resolve_service_env(
+            paths,
+            config,
+            &canonical,
+            &record.ports,
+        )?);
     }
     for (process_name, process) in &config.processes {
         let log_file = paths.log_file(name, process_name);

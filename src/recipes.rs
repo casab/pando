@@ -149,6 +149,15 @@ impl Recipe {
         }
     }
 
+    /// The service body, to be overridden by what a `[[services]]` entry
+    /// says inline.
+    pub fn service_mut(&mut self) -> Option<&mut ServiceRecipe> {
+        match &mut self.body {
+            Body::Service(s) => Some(s),
+            Body::Language(_) => None,
+        }
+    }
+
     pub fn language(&self) -> Option<&LanguageRecipe> {
         match &self.body {
             Body::Language(l) => Some(l),
