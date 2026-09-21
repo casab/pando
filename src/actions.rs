@@ -13,6 +13,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crate::config::{self, Config, ProcessConfig, ProvisionMode};
+use crate::decisions;
 use crate::detect::{self, Slot};
 use crate::hooks;
 use crate::native;
@@ -919,6 +920,122 @@ impl Answerer {
 
 /// Peels [`Answer::Program`] off the shape underneath it, so one match
 /// handles the four shapes and the provenance is decided once.
+/// A program's answer, held until the answer is actually on disk.
+///
+/// The record says what config says *afterwards*, so it cannot be written
+/// at the moment the answer arrives: an answer that is refused a moment
+/// later by [`refuse_unloadable`] never happened, and a log that claims
+/// otherwise is worse than no log.
+struct Pending {
+    slot: Slot,
+    answer: serde_json::Value,
+    shape: decisions::Shape,
+    evidence: decisions::Evidence,
+}
+
+/// What a program answered, in the shape an answers file would have sent.
+///
+/// `None` for every other answerer. A person's answer is not this file's
+/// business — the rules are not being asked to learn from it — and
+/// neither is `--yes`, which took what the rules already preferred.
+fn pending_decision(
+    question: &Question,
+    proposal: &detect::Proposal,
+    answer: &Answer,
+    by: Answerer,
+) -> Option<Pending> {
+    if by != Answerer::Program {
+        return None;
+    }
+    // By value, exactly as the answers file names it, so the log can be
+    // turned back into one.
+    let option = |index: usize| {
+        question
+            .options
+            .get(index)
+            .map(|(value, _)| value.clone())
+            .unwrap_or_default()
+    };
+    let (answer, shape) = match answer {
+        Answer::Choice(index) => (
+            serde_json::Value::String(option(*index)),
+            decisions::Shape::Choice,
+        ),
+        Answer::Custom(text) => (
+            serde_json::Value::String(text.trim().to_string()),
+            decisions::Shape::Custom,
+        ),
+        Answer::Many(indexes) => (
+            serde_json::Value::Array(
+                indexes
+                    .iter()
+                    .map(|index| serde_json::Value::String(option(*index)))
+                    .collect(),
+            ),
+            decisions::Shape::Set,
+        ),
+        Answer::None => (serde_json::Value::Null, decisions::Shape::None),
+        // `--yes` never reaches here, and every wrapper is peeled before
+        // this is called.
+        Answer::Auto(_) | Answer::Program(_) => return None,
+    };
+    Some(Pending {
+        slot: question.slot,
+        answer,
+        shape,
+        evidence: decisions::Evidence {
+            prompt: question.prompt.clone(),
+            details: question.details.clone(),
+            mechanism: proposal.mechanism.map(str::to_string),
+            weighed: proposal.evidence.clone(),
+            preferred: question.preselect,
+            // The candidates rather than the question's options, because
+            // the two are the same list and only one of them carries why
+            // an option was preselected and whether a flag was allowed to
+            // take it.
+            options: proposal
+                .candidates
+                .iter()
+                .map(|c| decisions::Opt {
+                    value: c.value.clone(),
+                    why: c.why.clone(),
+                    preselected: c.preselected,
+                    needs_a_human: c.needs_a_human,
+                })
+                .collect(),
+        },
+    })
+}
+
+/// Writes one pending decision down, now that its answer is on disk.
+///
+/// `wrote` is read back through [`config::load`] rather than taken from
+/// the config in hand: a later run compares against what it computes from
+/// the file, and recording anything else is a false override waiting to
+/// happen.
+///
+/// Never fatal. A corpus that costs somebody their `init` is one nobody
+/// will leave switched on.
+fn record_decision(paths: &PandoPaths, pending: Option<Pending>, progress: &dyn Fn(&str)) {
+    let Some(pending) = pending else { return };
+    let wrote = config::load(paths)
+        .ok()
+        .and_then(|loaded| slot_value(&loaded.config, pending.slot));
+    let entry = decisions::Entry::answered(
+        pending.slot,
+        pending.answer,
+        pending.shape,
+        wrote,
+        pending.evidence,
+    );
+    if let Err(e) = decisions::append(paths, &entry) {
+        progress(&format!(
+            "could not record the answer to the {} question: {e:#}",
+            slot_label(pending.slot)
+        ));
+    }
+}
+
 fn answered_by(answer: Answer) -> (Answer, Answerer) {
     let mut answer = answer;
     let mut by = Answerer::Human;
@@ -1038,6 +1155,17 @@ pub fn resolve_on(
     machine: &Machine<'_>,
 ) -> Result<Config> {
     let mut config = config.clone();
+    // First, and before the early return below: the commonest shape for a
+    // developer changing an answer a program wrote is a project where
+    // every slot is answered already, and nothing else in a run like that
+    // looks at config twice.
+    for slot in decisions::note_overrides(paths, &|slot| slot_value(&config, slot), progress) {
+        progress(&format!(
+            "{}: this is not what a program answered any more — recorded in {}",
+            slot_label(slot),
+            paths.decisions_file().display()
+        ));
+    }
     // Before the early return, and not inside the slot loop: a prelude
     // that is already set reads as an answered slot, and "the prelude is
     // set and still does not work" is exactly the case worth reporting.
@@ -1137,9 +1265,14 @@ pub fn resolve_on(
         // to a different file, and it is verified before it is written,
         // which is two reasons not to run it through the generic path.
         if *slot == Slot::Prelude {
-            answer_prelude(paths, &mut config, proposal, &prelude_details, ask, machine)?;
+            let pending =
+                answer_prelude(paths, &mut config, proposal, &prelude_details, ask, machine)?;
+            record_decision(paths, pending, progress);
             continue;
         }
+        // What a program answered, if it was a program: filled where the
+        // question is asked, written down where the answer lands on disk.
+        let mut pending: Option<Pending> = None;
         // The one slot whose answer is a set. It never takes the
         // single-candidate path below, because "these three" is not one of
         // the options — it is a subset of them.
@@ -1180,6 +1313,7 @@ pub fn resolve_on(
                 let question = question_for(proposal, &[]);
                 let offered = question.options.len();
                 let (answer, by) = answered_by(ask(&question)?);
+                pending = pending_decision(&question, proposal, &answer, by);
                 match answer {
                     Answer::Many(indexes) => (
                         indexes
@@ -1208,6 +1342,7 @@ pub fn resolve_on(
                 }
             };
             apply_service_answer(paths, &mut config, proposal, &chosen, note)?;
+            record_decision(paths, pending, progress);
             continue;
         }
         let candidate = if proposal.decided {
@@ -1229,6 +1364,7 @@ pub fn resolve_on(
             let question = question_for(proposal, &[]);
             let offered = question.options.len();
             let (answer, by) = answered_by(ask(&question)?);
+            pending = pending_decision(&question, proposal, &answer, by);
             match answer {
                 Answer::Choice(index) => {
                     let candidate = pick(proposal, index)?;
@@ -1270,6 +1406,7 @@ pub fn resolve_on(
                         by.note(config::Note::Answered),
                     )?;
                     apply_empty(*slot, &mut config);
+                    record_decision(paths, pending, progress);
                     continue;
                 }
                 Answer::None => bail!("{} has no \"none\" answer", slot_label(*slot)),
@@ -1291,6 +1428,7 @@ pub fn resolve_on(
         if let Some((array, entries)) = detect::array_edits(*slot, &[&candidate]) {
             config::set_detected_array_entry(paths, slot.layer(), array, entries, note.clone())?;
             detect::apply(*slot, &candidate, &mut config);
+            record_decision(paths, pending, progress);
             continue;
         }
         let edits = detect::edits(*slot, &candidate);
@@ -1316,6 +1454,7 @@ pub fn resolve_on(
             }
         }
         detect::apply(*slot, &candidate, &mut config);
+        record_decision(paths, pending, progress);
         if *slot == Slot::Processes {
             // The answer decided the shape. The per-app form leaves the
             // single-process slots nothing to fill; the root-script form
@@ -2209,10 +2348,14 @@ fn answer_prelude(
     report: &[String],
     ask: Ask<'_>,
     machine: &Machine<'_>,
-) -> Result<()> {
+) -> Result<Option<Pending>> {
     let question = question_for(proposal, report);
     let offered = question.options.len();
     let (answer, by) = answered_by(ask(&question)?);
+    // Before the match takes it apart. The caller writes it down once the
+    // line is on disk — and only if it gets there, since a prelude that
+    // fails its own probe is refused below.
+    let pending = pending_decision(&question, proposal, &answer, by);
     let (line, note) = match answer {
         Answer::Choice(index) => {
             let candidate = pick(proposal, index)?;
@@ -2246,7 +2389,7 @@ fn answer_prelude(
         .expect("the prelude slot writes one key");
     config::set_detected(paths, Slot::Prelude.layer(), table, key, line.clone(), note)?;
     config.runtime.prelude = Some(line);
-    Ok(())
+    Ok(pending)
 }
 
 // ---- start, stop, restart -------------------------------------------------

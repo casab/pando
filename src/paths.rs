@@ -54,6 +54,16 @@ impl PandoPaths {
         self.project_dir().join("state.json")
     }
 
+    /// Every question a program answered for this project, one JSON object
+    /// per line, appended and never rewritten.
+    ///
+    /// Beside the config rather than inside the cache directory: a cache is
+    /// something pando may throw away and rebuild, and this is the opposite
+    /// — a record of decisions nothing else remembers.
+    pub fn decisions_file(&self) -> PathBuf {
+        self.project_dir().join("decisions.jsonl")
+    }
+
     pub fn lock_file(&self) -> PathBuf {
         self.project_dir().join("state.lock")
     }

@@ -19,6 +19,11 @@ Five shapes are published:
 There is one write path, and it is not JSON output: `pando init --answers`.
 It is documented in [The answers file](#the-answers-file) below.
 
+One more file is published rather than printed:
+`~/.pando/projects/<id>/decisions.jsonl`, one object per line, which
+records every question a program answered. See
+[The decisions log](#the-decisions-log).
+
 ## Compatibility
 
 Every shape carries `version`, an integer, currently **1**. It is bumped
@@ -306,6 +311,56 @@ the line, not the writer's: a line containing no level word is `info`.
 
 `--source` picks the log: `dev` by default, or a process name, a service
 name, or a hook name. `status --json` names every one a worktree has.
+
+## The decisions log
+
+`~/.pando/projects/<id>/decisions.jsonl`. Appended to, never rewritten;
+one JSON object per line, oldest first.
+
+Every answer a **program** supplies to a question the rules could not
+decide is written here with the evidence it was decided from, and a later
+line records it if a person changes it afterwards. Nothing else goes in:
+not a rule's own answer, not a person's, and not `--yes` taking what the
+rules already preferred.
+
+It exists because a skill that answers pando's questions is a crutch
+unless somebody reads what it answered. This is the labelled corpus that
+improves the rules — and the rules are what every developer gets,
+including the ones with no agent.
+
+```jsonc
+// a program answered a question
+{ "version": 1, "at": "2026-09-21T23:22:05Z", "slot": "dev_cmd", "kind": "answer",
+  "answer": "pnpm dev:web",   // exactly the shape an answers file sends
+  "shape": "choice|custom|set|none",
+  "wrote": "pnpm dev:web",    // what config says about the slot afterwards
+  "evidence": {
+    "prompt": "Which command starts the local development server?",
+    "details": [],            // what the question printed above its options
+    "mechanism": null,        // "compose" or "native", at the services question
+    "weighed": [],            // and the facts that chose that mechanism
+    "preferred": 0,           // the option the rules would have taken
+    "options": [ { "value": "pnpm dev", "why": "package.json scripts.dev",
+                   "preselected": true, "needs_a_human": false } ]
+  } }
+
+// …and a person later changed it
+{ "version": 1, "at": "2026-09-22T09:04:11Z", "slot": "dev_cmd", "kind": "override",
+  "was": "pnpm dev:web", "now": "pnpm dev:all" }
+```
+
+Two things follow from `answer` being the shape an answers file sends:
+the log **replays** — every `answer` line for a project is an answers
+file, with `jq` and nothing else — and it is directly comparable with
+what pando would propose today, which is what makes it a corpus rather
+than an audit trail.
+
+An override is noticed by comparing what config says about the slot
+against what the log last recorded, on the next command that resolves
+anything. A change that does not change the slot's answer — a comment, a
+reordering — is not an override, and pando would rather miss one than
+invent one. `version` here is the line's own, bumped independently of the
+`version` on the printed shapes.
 
 ## The answers file
 

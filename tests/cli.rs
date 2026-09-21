@@ -1979,6 +1979,170 @@ fn dry_run_prints_the_config_it_would_write_and_writes_nothing() {
     );
 }
 
+// ---- the decisions log ----------------------------------------------------
+//
+// Every answer a program supplies that the rules could not decide, with
+// the evidence it had, and — later — whether a person replaced it. Without
+// it the skill that answers these questions is a crutch that hides rule
+// weakness from everybody who does not have one.
+
+fn decisions_of(e: &Env) -> Vec<serde_json::Value> {
+    let path = e.project_dir().join("decisions.jsonl");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("one JSON object per line"))
+        .collect()
+}
+
+#[test]
+fn an_answers_file_records_what_a_program_decided_and_the_evidence_for_it() {
+    let e = env_of(Kind::NextMessy);
+    assert_eq!(
+        code(&e.pando_stdin(&["init", "--answers", "-"], ANSWERS)),
+        EXIT_OK
+    );
+
+    let log = decisions_of(&e);
+    let slots: Vec<&str> = log.iter().map(|d| d["slot"].as_str().unwrap()).collect();
+    assert_eq!(
+        slots,
+        vec!["dev_cmd", "port_env", "services"],
+        "the three the rules could not settle, and nothing a rule decided: {log:#?}"
+    );
+    assert!(log.iter().all(|d| d["kind"] == "answer"));
+    assert!(log.iter().all(|d| d["version"] == 1));
+
+    // The answer is recorded in the shape the answers file sent, so the
+    // log can be turned back into one.
+    assert_eq!(log[0]["answer"], "pnpm dev:web");
+    assert_eq!(log[0]["shape"], "choice");
+    assert_eq!(log[2]["answer"], serde_json::json!(["db", "cache"]));
+    assert_eq!(log[2]["shape"], "set");
+
+    // And the evidence is what `signals` published for the slot, not a
+    // summary written afterwards: a corpus whose evidence column is a
+    // paraphrase cannot be used to test a rule against the case it came
+    // from.
+    let evidence = &log[0]["evidence"];
+    assert!(
+        evidence["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("development server")
+    );
+    let offered: Vec<&str> = evidence["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["value"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        offered,
+        vec![
+            "pnpm dev",
+            "pnpm dev:all",
+            "pnpm dev:web",
+            "pnpm dev:worker"
+        ]
+    );
+    assert_eq!(evidence["options"][0]["why"], "package.json scripts.dev");
+    assert_eq!(
+        evidence["preferred"], 0,
+        "and what the rules would have taken"
+    );
+
+    // `wrote` is what config says about the slot afterwards, read back
+    // from the file. It is what the next run compares against.
+    assert_eq!(log[0]["wrote"], "pnpm dev:web");
+}
+
+// The trap under the override check: `wrote` is read back through
+// `config::load`, and if it were taken from the config in hand instead,
+// every later run would report a person changing an answer nobody
+// touched.
+#[test]
+fn a_second_run_that_changes_nothing_records_no_override() {
+    let e = env_of(Kind::NextMessy);
+    assert_eq!(
+        code(&e.pando_stdin(&["init", "--answers", "-"], ANSWERS)),
+        EXIT_OK
+    );
+    let after_first = decisions_of(&e);
+
+    for _ in 0..2 {
+        let out = e.pando(&["init"]);
+        assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    }
+    // And a command that resolves on its way to doing something else.
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+
+    assert_eq!(
+        decisions_of(&e),
+        after_first,
+        "nothing changed, so there is nothing to record"
+    );
+}
+
+// The label the whole file exists for: an answer nobody corrected is weak
+// evidence that it was right, and one somebody replaced is strong
+// evidence that it was wrong.
+#[test]
+fn an_answer_a_person_replaced_is_recorded_once_as_an_override() {
+    let e = env_of(Kind::NextMessy);
+    assert_eq!(
+        code(&e.pando_stdin(&["init", "--answers", "-"], ANSWERS)),
+        EXIT_OK
+    );
+    let written = std::fs::read_to_string(e.config_file()).unwrap();
+    std::fs::write(
+        e.config_file(),
+        written.replace(r#"cmd = "pnpm dev:web""#, r#"cmd = "pnpm dev:all""#),
+    )
+    .unwrap();
+
+    let out = e.pando(&["init"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("not what a program answered any more"),
+        "a guess pando records is a guess it says out loud: {}",
+        stderr(&out)
+    );
+
+    let log = decisions_of(&e);
+    let overrides: Vec<&serde_json::Value> =
+        log.iter().filter(|d| d["kind"] == "override").collect();
+    assert_eq!(overrides.len(), 1, "{log:#?}");
+    assert_eq!(overrides[0]["slot"], "dev_cmd");
+    assert_eq!(overrides[0]["was"], "pnpm dev:web");
+    assert_eq!(overrides[0]["now"], "pnpm dev:all");
+
+    // Once, not on every run afterwards: the override is itself the last
+    // word about the slot.
+    assert_eq!(code(&e.pando(&["init"])), EXIT_OK);
+    assert_eq!(decisions_of(&e).len(), log.len());
+}
+
+// Only what a program decided. A rule that settled a slot is not a gap in
+// the rules, and `--yes` taking what the rules preferred is not one
+// either — recording those would bury the lines that mean something.
+#[test]
+fn nothing_is_recorded_for_a_project_the_rules_understand() {
+    let e = env_of(Kind::NextPnpmCompose);
+    assert_eq!(code(&e.pando(&["init", "--yes"])), EXIT_OK);
+    assert!(
+        !e.project_dir().join("decisions.jsonl").exists(),
+        "a project the rules understand leaves no decisions to record"
+    );
+
+    // And a flag answering for a developer is not a program deciding.
+    let e = env_of(Kind::NextMessy);
+    assert_eq!(code(&e.pando(&["init", "--yes"])), EXIT_OK);
+    assert!(decisions_of(&e).is_empty());
+}
+
 // ---- signals --------------------------------------------------------------
 
 fn signals_of(e: &Env) -> serde_json::Value {
