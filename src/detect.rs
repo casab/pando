@@ -651,6 +651,15 @@ pub struct Candidate {
     /// the ordinary answer, where every path is a file that is already
     /// there.
     pub provision_from: BTreeMap<String, String>,
+    /// Whether only a human may take this option. `--yes` takes a
+    /// question's preselected option, and every other slot's options are
+    /// a command or a name pando itself authored and can vouch for. An
+    /// option that makes pando **create a file out of contents it did not
+    /// write and cannot read** is not one a flag may accept on a
+    /// developer's behalf, so it is never preselected: `--yes` falls
+    /// through to the first option that is, and prints the question when
+    /// there is none.
+    pub needs_a_human: bool,
 }
 
 /// What the rules found for one slot.
@@ -1961,6 +1970,14 @@ fn provision_proposal(signals: &Signals) -> Option<Proposal> {
         return None;
     }
     let mut candidates: Vec<Candidate> = Vec::new();
+    // The files that are already here lead, and are what `--yes` takes.
+    if !present.is_empty() {
+        candidates.push(Candidate {
+            value: present.join(","),
+            why: "gitignored and present in the main checkout".to_string(),
+            ..Candidate::default()
+        });
+    }
     if !seeds.is_empty() {
         let mut paths = present.clone();
         for (destination, _) in seeds {
@@ -1968,26 +1985,23 @@ fn provision_proposal(signals: &Signals) -> Option<Proposal> {
                 paths.push(destination.clone());
             }
         }
+        // Naming the source in the option text is the whole safeguard on
+        // this path: a developer reading the prompt can open the file and
+        // judge what is in it, which is the judgement pando cannot make.
         let seeded = listed(
             &seeds
                 .iter()
-                .map(|(destination, source)| format!("{destination} from {source}"))
+                .map(|(destination, source)| format!("{destination} copied from {source}"))
                 .collect::<Vec<_>>(),
         );
         candidates.push(Candidate {
             value: paths.join(","),
             why: match present.is_empty() {
                 true => format!("{seeded} — this clone has none of its own"),
-                false => format!("gitignored and present, plus {seeded}"),
+                false => format!("the same, plus {seeded}"),
             },
             provision_from: seeds.iter().cloned().collect(),
-            ..Candidate::default()
-        });
-    }
-    if !present.is_empty() {
-        candidates.push(Candidate {
-            value: present.join(","),
-            why: "gitignored and present in the main checkout".to_string(),
+            needs_a_human: true,
             ..Candidate::default()
         });
     }
@@ -2091,6 +2105,8 @@ pub fn custom(slot: Slot, value: &str) -> Candidate {
         // A list the developer typed is a list of files they have. Seeding
         // from an example is an offer, and they did not take it.
         provision_from: BTreeMap::new(),
+        // Typed by a human, by definition.
+        needs_a_human: false,
         processes: (slot == Slot::Processes).then(|| {
             BTreeMap::from([(
                 DEV.to_string(),
@@ -3573,21 +3589,43 @@ services:
             !proposal.decided,
             "copying a tracked example into a worktree is the developer's call"
         );
-        assert_eq!(values(&proposal), vec![".env.local,.env", ".env.local"]);
-        let seeded = proposal.preferred().unwrap();
+        assert_eq!(values(&proposal), vec![".env.local", ".env.local,.env"]);
+
+        let plain = proposal.preferred().unwrap();
+        assert!(
+            plain.provision_from.is_empty() && !plain.needs_a_human,
+            "only what is already here leads, and it is what --yes takes"
+        );
+
+        let seeded = &proposal.candidates[1];
         assert_eq!(
             seeded.provision_from,
             BTreeMap::from([(".env".to_string(), ".env.example".to_string())])
         );
         assert!(
-            seeded.why.contains(".env from .env.example"),
-            "{}",
-            seeded.why
+            seeded.needs_a_human,
+            "copying a file pando did not write is not a flag's decision"
         );
         assert!(
-            proposal.candidates[1].provision_from.is_empty(),
-            "the plain answer takes only what is already here"
+            seeded.why.contains(".env copied from .env.example"),
+            "the option names the source, so a human can go and read it: {}",
+            seeded.why
         );
+    }
+
+    // The case the whole feature is for — a clone with nothing local at all
+    // — has no plain answer to lead with, so there is nothing `--yes` may
+    // take and the question is what an unattended run gets.
+    #[test]
+    fn a_clone_with_only_a_seed_to_offer_has_nothing_yes_may_take() {
+        let signals = Signals {
+            provision_seeds: vec![(".env".to_string(), ".env.example".to_string())],
+            ..Default::default()
+        };
+        let proposal = provision_proposal(&signals).unwrap();
+        assert_eq!(values(&proposal), vec![".env"]);
+        assert!(proposal.candidates[0].needs_a_human);
+        assert!(!proposal.decided);
     }
 
     #[test]

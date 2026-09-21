@@ -139,7 +139,7 @@ pub fn new(
     // undo before it is reported.
     let finish = (|| -> Result<()> {
         progress("provisioning");
-        provision_worktree_files(paths, config, &target)?;
+        provision_worktree_files(paths, config, &target, progress)?;
         let canonical = std::fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
         store
             .worktrees
@@ -1309,7 +1309,14 @@ fn question_for(proposal: &detect::Proposal, details: &[String]) -> Question {
             .iter()
             .map(|c| (c.value.clone(), c.why.clone()))
             .collect(),
-        preselect: (!proposal.candidates.is_empty()).then_some(0),
+        // The first option a flag may take on a developer's behalf, which
+        // is the first one for every slot but provisioning: `--yes` takes
+        // the preselection, and an option that copies a file pando did not
+        // write is not one it may accept unattended. `None` means there is
+        // nothing here `--yes` can take, and the question is printed
+        // instead — "agents never hang" is about failing loudly, not about
+        // accepting anything rather than stopping.
+        preselect: proposal.candidates.iter().position(|c| !c.needs_a_human),
         // A set answer takes the options as they are; there is no command
         // to type in place of "which of these containers".
         allow_custom: !proposal.slot.is_multi(),
@@ -4334,7 +4341,12 @@ fn ensure_gitignored(dir: &Path, rel: &str) -> Result<()> {
 /// read. Invariant 1 is about the worktree the file lands in, so the
 /// authorising `check-ignore` is re-run there, immediately before each
 /// write.
-fn provision_worktree_files(paths: &PandoPaths, config: &Config, worktree: &Path) -> Result<()> {
+fn provision_worktree_files(
+    paths: &PandoPaths,
+    config: &Config,
+    worktree: &Path,
+    progress: &dyn Fn(&str),
+) -> Result<()> {
     for rel in config.project.provision_paths() {
         let dst = worktree.join(rel);
         if dst.exists() {
@@ -4356,7 +4368,19 @@ fn provision_worktree_files(paths: &PandoPaths, config: &Config, worktree: &Path
         // into the repository, which is the invariant this whole path
         // exists to keep.
         let mode = match seeded {
-            true => ProvisionMode::Copy,
+            true => {
+                // Every guess is visible, and this one is a file being
+                // created out of contents pando did not write: the notice
+                // names the source, so the developer can go and read it.
+                let from = config
+                    .project
+                    .provision_from
+                    .get(rel)
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                progress(&format!("seeding {rel} from {from}"));
+                ProvisionMode::Copy
+            }
             false => config.project.provision_mode,
         };
         match mode {
@@ -9364,6 +9388,89 @@ time.sleep(300)
         let loaded = crate::config::load(&fx.paths).unwrap();
         assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
         resolve_for_new(&fx.paths, &loaded.config, &refuse, &noop).unwrap();
+    }
+
+    // `--yes` must not take a seed. Every other slot's options are a
+    // command or a name pando authored and can vouch for; this one makes
+    // pando create a file out of contents it did not write and cannot
+    // read. On a clone with nothing local at all there is no safe option
+    // to fall back to, so the question is what an unattended run gets —
+    // loudly, with the source named, rather than a file copied blind.
+    #[test]
+    fn yes_refuses_to_seed_a_file_on_a_developers_behalf() {
+        let fx = fresh_clone_fixture();
+        let (ask, asked) = scripted(vec![Answer::Auto(0)]);
+        let question = asked.clone();
+        let refuse_auto = move |q: &Question| -> Result<Answer> {
+            question.borrow_mut().push(q.clone());
+            assert_eq!(
+                q.preselect, None,
+                "nothing here is an option --yes may take: {:?}",
+                q.options
+            );
+            Err(anyhow::anyhow!("--yes would have printed this question"))
+        };
+        let err = resolve_for_new(&fx.paths, &fx.config, &refuse_auto, &noop).unwrap_err();
+        assert!(format!("{err:#}").contains("--yes"), "{err:#}");
+        drop(ask);
+
+        // And nothing was written: a refused answer is not an answer.
+        assert!(!fx.paths.config_file().exists());
+    }
+
+    // With a local file already here, that is the answer `--yes` takes —
+    // and the seed beside it is left alone.
+    #[test]
+    fn yes_takes_the_files_that_are_already_here_and_never_the_seed() {
+        let fx = fresh_clone_fixture();
+        std::fs::write(fx.root.join(".env.local"), "FLAG=1\n").unwrap();
+        std::fs::write(
+            fx.root.join(".gitignore"),
+            ".env\n.env.local\nnode_modules/\n",
+        )
+        .unwrap();
+        git(
+            &fx.root,
+            &["commit", "--quiet", "-am", "ignore .env.local too"],
+        );
+
+        let (ask, asked) = scripted(vec![Answer::Auto(0)]);
+        let config = resolve_for_new(&fx.paths, &fx.config, &ask, &noop).unwrap();
+        assert_eq!(asked.borrow()[0].preselect, Some(0));
+        assert_eq!(
+            config.project.provision_paths(),
+            [".env.local".to_string()],
+            "--yes took what is already here"
+        );
+        assert!(
+            config.project.provision_from.is_empty(),
+            "and copied nothing from an example"
+        );
+        let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+        assert!(!written.contains("provision_from"), "{written}");
+    }
+
+    // The human path still gets the offer, and taking it says out loud
+    // which file was copied from where.
+    #[test]
+    fn choosing_the_seed_says_which_source_it_copied() {
+        let fx = fresh_clone_fixture();
+        let (ask, _) = scripted(vec![Answer::Choice(0)]);
+        let config = resolve_for_new(&fx.paths, &fx.config, &ask, &noop).unwrap();
+        assert_eq!(config.project.provision_from[".env"], ".env.example");
+
+        let said = std::cell::RefCell::new(Vec::new());
+        new(&fx.paths, &config, "feat/one", None, &|line| {
+            said.borrow_mut().push(line.to_string())
+        })
+        .unwrap();
+        assert!(
+            said.borrow()
+                .iter()
+                .any(|line| line == "seeding .env from .env.example"),
+            "the notice names the source, so it can be read: {:?}",
+            said.borrow()
+        );
     }
 
     // "No thanks" is an answer. Without somewhere to put it the question

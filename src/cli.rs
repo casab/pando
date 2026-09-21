@@ -432,6 +432,7 @@ fn none_label(slot: crate::detect::Slot) -> &'static str {
         crate::detect::Slot::Prelude => {
             "none — this machine needs no line in front of its commands"
         }
+        crate::detect::Slot::Provision => "none — a new worktree needs no local file of yours",
         _ => "none — this process has no port",
     }
 }
@@ -649,6 +650,17 @@ pub fn render_needs_answer(needs: &actions::NeedsAnswer) -> String {
         out.push_str(&format!(
             "  (pando found no candidates for this)
 pando: answer it in {file} — nothing pando can accept for you exists here
+"
+        ));
+        return out;
+    }
+    if needs.question.preselect.is_none() {
+        // There are options, and none of them is one a flag may take: this
+        // slot's answer would have pando create a file out of contents it
+        // did not write. Pointing at `--yes` here is an instruction to run
+        // the same failure again.
+        out.push_str(&format!(
+            "pando: answer it in {file} — none of these is an option --yes may take for you
 "
         ));
         return out;
