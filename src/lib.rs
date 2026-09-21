@@ -7,6 +7,7 @@
 //! paths → compose → project · config · ports · process · runtime · state
 //!       · template · recipes
 //!       → detect · hooks · worktree · cache · log_tail · observe · services
+//!         · native
 //!       → tunnel · share_proxy
 //!       → actions
 //!       → doctor
@@ -22,6 +23,7 @@ pub mod detect;
 pub mod doctor;
 pub mod hooks;
 pub mod log_tail;
+pub mod native;
 pub mod observe;
 pub mod paths;
 pub mod ports;

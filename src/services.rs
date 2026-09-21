@@ -224,7 +224,7 @@ impl Compose {
 
 /// Single quotes, with any single quote inside closed, escaped, reopened.
 /// A worktree path can hold a space, and a docker shim path can hold both.
-fn shell_quote(text: &str) -> String {
+pub fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 
@@ -396,6 +396,42 @@ fn rewrite_url(value: &str, service: &str, port: u16) -> Option<String> {
     }
     let host = if host == service { "localhost" } else { host };
     Some(format!("{head}{userinfo}{host}:{port}{tail}"))
+}
+
+/// The user and the database name a connection URL carries, if it carries
+/// them.
+///
+/// A native service has to *create* what the app's own URL asks for: a
+/// Postgres cluster that initdb made has one database called `postgres`
+/// and nothing called `acme_dev`. The port is rewritten by [`app_env`];
+/// these two are what a recipe's `create` command needs on top of it.
+///
+/// Percent-escapes are not decoded. A user name with a `%40` in it is
+/// vanishingly rare in a development URL, and a wrong guess here would be
+/// spliced into a SQL statement — so the caller checks the shape of what
+/// comes back and refuses anything that is not a plain identifier.
+pub fn url_identity(value: &str) -> (Option<String>, Option<String>) {
+    let Some(after_scheme) = value.find("://").map(|at| at + 3) else {
+        return (None, None);
+    };
+    let rest = &value[after_scheme..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let user = authority
+        .rfind('@')
+        .map(|at| &authority[..at])
+        .map(|userinfo| match userinfo.find(':') {
+            Some(colon) => &userinfo[..colon],
+            None => userinfo,
+        })
+        .filter(|user| !user.is_empty())
+        .map(str::to_string);
+    let database = tail
+        .strip_prefix('/')
+        .map(|path| path.split(['?', '#']).next().unwrap_or_default())
+        .filter(|database| !database.is_empty())
+        .map(str::to_string);
+    (user, database)
 }
 
 /// The port an env key names in this directory's env files: the port of a

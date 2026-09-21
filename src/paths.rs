@@ -107,6 +107,37 @@ impl PandoPaths {
         self.project_dir().join("data").join(name)
     }
 
+    /// One native service's data directory, beside what compose mode uses
+    /// so `rm`'s existing `remove_dir_all(data_dir)` already takes it.
+    pub fn service_data_dir(&self, name: &str, service: &str) -> PathBuf {
+        self.data_dir(name).join(service)
+    }
+
+    /// Where a native service puts its Unix socket, if it insists on one.
+    ///
+    /// The one thing pando writes outside its own home, and it has no
+    /// choice: `sockaddr_un.sun_path` is 104 bytes on macOS, and
+    /// `~/.pando/projects/<id>/data/<worktree>/<service>/.s.PGSQL.65432`
+    /// is past that before the branch name is interesting. So the path is
+    /// a *fixed length* — the temporary directory, then `pando-` and eight
+    /// hex characters of a hash over the project, the worktree and the
+    /// service — and it stays the same however long those three are.
+    /// Clients connect over TCP regardless; this exists because Postgres
+    /// and MariaDB create a socket whether anyone asked for one or not.
+    ///
+    /// Nothing about the repository is written here, so Invariant 1 is
+    /// untouched: it is a socket directory in the temporary directory,
+    /// removed when the service stops.
+    pub fn service_socket_dir(&self, name: &str, service: &str) -> PathBuf {
+        let mut context = md5::Context::new();
+        for part in [self.project_id(), name, service] {
+            context.consume(part.as_bytes());
+            context.consume([0]);
+        }
+        let digest = format!("{:x}", context.finalize());
+        socket_base().join(format!("pando-{}", &digest[..8]))
+    }
+
     pub fn compose_dir(&self) -> PathBuf {
         self.project_dir().join("compose")
     }
@@ -153,6 +184,38 @@ impl PandoPaths {
             .with_context(|| format!("create {}", self.project_dir().display()))?;
         Ok(())
     }
+}
+
+/// The longest name an engine is assumed to give a socket inside its
+/// socket directory. Postgres's is `.s.PGSQL.65535.lock`, nineteen
+/// characters; MariaDB's compiled-in default is `mysql.sock`, ten. Twenty
+/// four leaves room without pretending to know every engine.
+pub const SOCKET_NAME_BUDGET: usize = 24;
+
+/// `sockaddr_un.sun_path` on macOS, which is the smaller of the two
+/// platforms pando targets. Linux allows 108.
+pub const SUN_PATH_MAX: usize = 104;
+
+/// The longest socket path that can be bound, leaving room for the
+/// terminating NUL byte the kernel counts.
+pub const MAX_SOCKET_PATH: usize = SUN_PATH_MAX - 1;
+
+/// What [`PandoPaths::service_socket_dir`] hangs its fixed-length name
+/// off.
+///
+/// The temporary directory, unless that is itself so long that a socket
+/// under it could not be bound — on macOS `$TMPDIR` is a per-user path in
+/// `/var/folders`, about fifty characters, and a shell can set it to
+/// anything. `/tmp` is the fallback because it is the one directory that
+/// is short on every Unix.
+fn socket_base() -> PathBuf {
+    let base = std::env::temp_dir();
+    // `/pando-xxxxxxxx` plus `/` plus the longest socket name.
+    let overhead = 1 + 14 + 1 + SOCKET_NAME_BUDGET;
+    if base.as_os_str().len() + overhead > MAX_SOCKET_PATH {
+        return PathBuf::from("/tmp");
+    }
+    base
 }
 
 /// Log names pando keeps for its own use: the install hook's log, and the

@@ -73,6 +73,14 @@ pub struct ServiceRecipe {
     /// when the `[[services]]` block names no `env` map of its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port_env: Option<String>,
+    /// What `{db_user}` means when the app's own URL names no user, and
+    /// what `{db_name}` means when it names no database. Recipe data
+    /// rather than adapter policy: `postgres`/`postgres` is true of
+    /// Postgres and of nothing else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub db_user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub db_name: Option<String>,
 }
 
 /// One file that pins a language, in the shape [`crate::runtime::Source`]
@@ -474,6 +482,11 @@ notes = "trust authentication on 127.0.0.1 — any password in the URL is accept
 [service]
 port_env = "DATABASE_URL"
 ready_timeout_s = 60
+
+# What initdb makes, and so what `{db_user}` and `{db_name}` mean when the
+# app's own URL names neither.
+db_user = "postgres"
+db_name = "postgres"
 
 init = "initdb --pgdata {datadir} --username postgres --auth trust --encoding UTF8 --no-locale"
 
