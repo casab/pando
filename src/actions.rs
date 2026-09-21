@@ -1079,7 +1079,21 @@ pub fn resolve_on(
         .config()
         .ok()
     };
-    let mut proposals = detect::propose_with(paths.root(), &signals, Some(&resolve));
+    // Only when something is still unanswered about the services: the
+    // probe is a login shell, and a project that has already said what it
+    // runs is not asking this question.
+    let recipes = crate::recipes::Recipes::load(&paths.recipes_dir());
+    let evidence = match already_answered(Slot::Services, &config) {
+        true => detect::MachineEvidence::unknown(),
+        false => machine_evidence(paths, &recipes),
+    };
+    let mut proposals = detect::propose_with(
+        paths.root(),
+        &signals,
+        Some(&resolve),
+        &evidence,
+        config.isolation.preferred(),
+    );
     // The one proposal that is not tier 1: it took a probe to find, and it
     // is about this machine rather than this repository. It goes through
     // the same loop as every other slot from here on.
@@ -1321,12 +1335,15 @@ fn apply_service_answer(
     chosen: &[detect::Candidate],
     note: config::Note,
 ) -> Result<()> {
+    let refs: Vec<&detect::Candidate> = chosen.iter().collect();
+    if proposal.mechanism == Some("native") {
+        return apply_native_service_answer(paths, config, &refs, note);
+    }
     // The compose file the question was about. Without one there is
     // nothing to write an entry for, and nothing was asked either.
     let Some(file) = proposal.service_file().map(str::to_string) else {
         return Ok(());
     };
-    let refs: Vec<&detect::Candidate> = chosen.iter().collect();
     let mut proposed = config.clone();
     detect::apply_services(&file, &refs, &mut proposed);
     let names: Vec<&str> = refs.iter().map(|c| c.value.as_str()).collect();
@@ -1334,6 +1351,58 @@ fn apply_service_answer(
     let (array, entries) = detect::service_entry(&file, &refs);
     config::set_detected_array_entry(paths, Slot::Services.layer(), array, entries, note)?;
     detect::apply_services(&file, &refs, config);
+    Ok(())
+}
+
+/// Writes the answer to the native half of the services question: one
+/// `[[services]] kind = "native"` entry per service chosen.
+///
+/// The negative is the interesting half. A compose entry records "none of
+/// them" as an empty `include`; a native entry is one service and has
+/// nowhere to put it, so the answer goes in `[isolation] none` instead —
+/// a project fact, in the project layer, beside the machine-wide
+/// `prefer`. Without somewhere to record it the question would return on
+/// every isolated start, with nowhere to answer it but the TOML by hand.
+fn apply_native_service_answer(
+    paths: &PandoPaths,
+    config: &mut Config,
+    chosen: &[&detect::Candidate],
+    note: config::Note,
+) -> Result<()> {
+    if chosen.is_empty() {
+        let mut proposed = config.clone();
+        proposed.isolation.none = true;
+        refuse_unloadable(paths, Slot::Services, "none of them", &proposed)?;
+        config::set_detected(
+            paths,
+            config::Layer::Project,
+            &["isolation"],
+            "none",
+            toml_edit::Value::from(true),
+            note,
+        )?;
+        config.isolation.none = true;
+        return Ok(());
+    }
+    // Every entry checked against the loader before any of them is
+    // written: two services that are legal apart and not together — a
+    // name a process already owns as a role — must not leave the file
+    // half answered.
+    let mut proposed = config.clone();
+    detect::apply_native_services(chosen, &mut proposed);
+    let names: Vec<&str> = chosen.iter().map(|c| c.value.as_str()).collect();
+    refuse_unloadable(paths, Slot::Services, &names.join(", "), &proposed)?;
+    for candidate in chosen {
+        let (array, entries) = detect::native_entry(candidate);
+        config::set_detected_array_entry(
+            paths,
+            Slot::Services.layer(),
+            array,
+            entries,
+            note.clone(),
+        )?;
+    }
+    detect::apply_native_services(chosen, config);
     Ok(())
 }
 
@@ -1787,6 +1856,87 @@ fn services_summary(config: &Config) -> Option<String> {
         false => names.join(", "),
     })
 }
+
+/// What this machine can run, probed through the shell a real spawn uses.
+///
+/// One `bash -lc` for every engine and for docker at once, and only when
+/// the services slot is still unanswered — a project that has already
+/// said what it runs is not asking this question, and a start is not the
+/// place to pay for an answer nobody wanted.
+///
+/// A probe that cannot run leaves the evidence `unknown`, which is not
+/// the same as "nothing is installed": a decision made from a failed
+/// probe would be a guess wearing evidence's clothes.
+pub fn machine_evidence(
+    paths: &PandoPaths,
+    recipes: &crate::recipes::Recipes,
+) -> detect::MachineEvidence {
+    let (script, names) = machine_evidence_script(paths, recipes);
+    let root = paths.root();
+    let Ok(captured) = proc::run_captured(&script, root, &[], EVIDENCE_TIMEOUT) else {
+        return detect::MachineEvidence::unknown();
+    };
+    machine_evidence_from(&captured.stdout, &names)
+}
+
+/// The one script both probes run, and the recipe names it answers for.
+///
+/// Shared so that what `doctor` reports and what the start path decides
+/// from cannot drift: `doctor` asks the shell it was given, the start
+/// path asks the shell a real spawn uses, and both read the same lines.
+pub fn machine_evidence_script(
+    paths: &PandoPaths,
+    recipes: &crate::recipes::Recipes,
+) -> (String, Vec<String>) {
+    use std::fmt::Write as _;
+    let mut script = String::new();
+    // The same PATH a recipe command gets, and for the same reason: a
+    // shim in pando's own `bin` is what the adapter will run, so it is
+    // what the evidence has to be about. Without this the report and the
+    // start path could disagree about whether an engine is there at all.
+    let _ = writeln!(
+        script,
+        "export PATH={}:\"$PATH\"",
+        proc::shell_quote(&paths.home.join("bin").display().to_string())
+    );
+    let _ = writeln!(script, "command -v docker >/dev/null 2>&1 && echo docker");
+    let mut names: Vec<String> = Vec::new();
+    for (name, loaded) in recipes.entries() {
+        let Some(_) = loaded.recipe.service() else {
+            continue;
+        };
+        if loaded.recipe.binaries.is_empty() {
+            continue;
+        }
+        let checks: Vec<String> = loaded
+            .recipe
+            .binaries
+            .iter()
+            .map(|b| format!("command -v {} >/dev/null 2>&1", proc::shell_quote(b)))
+            .collect();
+        let _ = writeln!(script, "{} && echo {name}", checks.join(" && "));
+        names.push(name.to_string());
+    }
+    (script, names)
+}
+
+/// What the probe's output means.
+pub fn machine_evidence_from(stdout: &str, names: &[String]) -> detect::MachineEvidence {
+    let found: Vec<&str> = stdout.lines().map(str::trim).collect();
+    detect::MachineEvidence {
+        probed: true,
+        docker: found.contains(&"docker"),
+        engines: names
+            .iter()
+            .map(|name| (name.clone(), found.contains(&name.as_str())))
+            .collect(),
+    }
+}
+
+/// How long the machine probe gets. It is one login shell asking
+/// `command -v` a dozen times, which is fast; the budget is for a shell
+/// whose profile is slow, not for the lookups.
+const EVIDENCE_TIMEOUT: Duration = Duration::from_secs(20);
 
 // ---- the runtime the project asks for -------------------------------------
 

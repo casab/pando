@@ -52,6 +52,8 @@ pub struct Config {
     pub project: ProjectSection,
     #[serde(default, skip_serializing_if = "RuntimeSection::is_empty")]
     pub runtime: RuntimeSection,
+    #[serde(default, skip_serializing_if = "IsolationSection::is_empty")]
+    pub isolation: IsolationSection,
     /// Shorthand for a single process named `dev`. Normalised into
     /// `processes` at load time; never both.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -149,6 +151,52 @@ impl RuntimeSection {
         *self == Self::default()
     }
 }
+
+/// How this worktree's private services are run, and whether it runs any.
+///
+/// Two keys in two layers, the same split `[runtime]` makes. Which
+/// mechanism a developer wants is a property of their laptop — whether
+/// they have Docker running all day, whether they already have Postgres
+/// installed — so `prefer` is written to the user layer and answered once
+/// per machine. Whether this project has private services at all is a
+/// property of the repository, so `none` is written to the project layer.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IsolationSection {
+    /// `native` or `compose`, spelled the way `[[services]] kind` is,
+    /// because the answer literally selects which kind gets written.
+    ///
+    /// `None` is "nobody has said", and pando then takes what the project
+    /// itself declares — a compose file is the project's own statement
+    /// about how to run its services, and preferring it keeps the common
+    /// path unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefer: Option<String>,
+    /// The recorded form of "this project runs no private services".
+    ///
+    /// A compose entry can say that with an empty `include`; a native
+    /// entry is one service and has nowhere to put it. Without a place to
+    /// record the negative the question returns on every isolated start,
+    /// with nowhere to answer it but the TOML by hand — the same gap
+    /// `ports = []` and `provision = []` each closed for their own slot.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub none: bool,
+}
+
+impl IsolationSection {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Which mechanism this machine asks for, if it asks for one.
+    pub fn preferred(&self) -> Option<&str> {
+        self.prefer.as_deref()
+    }
+}
+
+/// The two spellings `[isolation] prefer` takes, which are the two
+/// spellings `[[services]] kind` takes.
+pub const ISOLATION_KINDS: [&str; 2] = ["compose", "native"];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -904,6 +952,22 @@ pub fn validate(config: &Config, project: &ProjectRef) -> Result<()> {
     }
     validate_processes(config)?;
     validate_services(config)?;
+    if let Some(prefer) = config.isolation.preferred()
+        && !ISOLATION_KINDS.contains(&prefer)
+    {
+        bail!(
+            "[isolation] prefer = {prefer:?} is not something pando can run — it is {}, the \
+             same two spellings `[[services]] kind` takes",
+            ISOLATION_KINDS.join(" or ")
+        );
+    }
+    if config.isolation.none && !config.services.is_empty() {
+        bail!(
+            "[isolation] none = true says this project runs no private services, and \
+             [[services]] configures {} — delete whichever of them is out of date",
+            config.services.len()
+        );
+    }
     // A hook writes `logs/<worktree>/<name>.log` under exactly the same
     // rules as a process, and shares the namespace with it.
     for hook in &config.hooks {

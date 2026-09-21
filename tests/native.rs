@@ -572,3 +572,178 @@ fn a_data_directory_built_from_nothing_runs_the_migration_again() {
     );
     let _ = std::fs::remove_file(&sink);
 }
+
+// ---- what a native answer writes ------------------------------------------
+
+/// A project that needs a database and has no file describing one: the
+/// shape the native path exists for.
+fn needs_a_database(config_text: &str) -> Nat {
+    let dir = TempDir::new().unwrap();
+    let root = build(Kind::Plain, dir.path()).root;
+    std::fs::write(
+        root.join(".env.example"),
+        "DATABASE_URL=postgres://acme:acme@localhost:5432/acme\n",
+    )
+    .unwrap();
+    common::git(&root, &["add", "."]);
+    common::git(&root, &["commit", "--quiet", "-m", "env example"]);
+    let home = dir.path().join("pando-home");
+    postgres::install(&home);
+    let paths = paths_for(&home, &root);
+    std::fs::create_dir_all(paths.project_dir()).unwrap();
+    std::fs::write(paths.config_file(), config_text).unwrap();
+    let config = config::load(&paths).unwrap().config;
+    Nat {
+        _dir: dir,
+        root,
+        home,
+        paths,
+        config,
+    }
+}
+
+/// Answers every question the way `--yes` does: takes what a rule
+/// pre-ticked, and refuses anything it did not.
+fn take_the_ticked(question: &actions::Question) -> anyhow::Result<actions::Answer> {
+    if question.multi {
+        return Ok(actions::Answer::Many(question.checked.clone()));
+    }
+    match question.preselect {
+        Some(index) => Ok(actions::Answer::Auto(index)),
+        None => anyhow::bail!("nothing to take for {:?}", question.prompt),
+    }
+}
+
+/// Declines every set question, and takes the first of every other.
+fn decline_the_set(question: &actions::Question) -> anyhow::Result<actions::Answer> {
+    if question.multi {
+        return Ok(actions::Answer::Many(Vec::new()));
+    }
+    take_the_ticked(question)
+}
+
+fn config_text(f: &Nat) -> String {
+    std::fs::read_to_string(f.paths.config_file()).unwrap()
+}
+
+#[test]
+fn a_native_answer_is_written_as_a_services_entry_of_its_own() {
+    let f = needs_a_database(
+        "[project]\ninstall = \"true\"\n\n[dev]\ncmd = \"sleep 30\"\nports = []\n",
+    );
+    let resolved = actions::resolve_process(
+        &f.paths,
+        &f.config,
+        actions::Mode::Isolated,
+        &take_the_ticked,
+        &|_| {},
+    )
+    .expect("resolve the services question");
+
+    let text = config_text(&f);
+    assert!(text.contains("kind = \"native\""), "{text}");
+    assert!(text.contains("name = \"postgres\""), "{text}");
+    assert!(text.contains("DATABASE_URL = \"postgres\""), "{text}");
+    // `name` already says which recipe, so nothing repeats it.
+    assert!(!text.contains("preset ="), "{text}");
+    // And the provenance, as every written answer carries.
+    assert!(
+        text.contains("# detected:") || text.contains("# answered:"),
+        "{text}"
+    );
+    assert_eq!(resolved.services.len(), 1);
+
+    // It really runs, which is the point of writing it.
+    let name = new_worktree(&f, "feat/one");
+    actions::start(
+        &f.paths,
+        &resolved,
+        &name,
+        None,
+        actions::Mode::Isolated,
+        &|_| {},
+    )
+    .expect("start what detection wrote");
+    assert!(f.datadir(&name, "postgres").join("PG_VERSION").is_file());
+}
+
+// A native entry is one service and has nowhere to put "none of them",
+// where a compose entry says it with an empty `include`. Without a place
+// to record the negative the question returns on every isolated start,
+// with nowhere to answer it but the TOML by hand.
+#[test]
+fn declining_the_native_services_question_is_recorded_and_never_asked_again() {
+    let f = needs_a_database(
+        "[project]\ninstall = \"true\"\n\n[dev]\ncmd = \"sleep 30\"\nports = []\n",
+    );
+    // An engine no machine has, so the question is really asked rather
+    // than taken: a recipe whose binary is missing is offered unticked.
+    // Injected as a user recipe rather than by deleting a shim, because
+    // this laptop has a real PostgreSQL and deleting the shim would only
+    // make *that* answer.
+    let recipes = f.paths.recipes_dir();
+    std::fs::create_dir_all(&recipes).unwrap();
+    std::fs::write(
+        recipes.join("postgres.toml"),
+        "kind = \"service\"\nname = \"postgres\"\n\
+         binaries = [\"pando-no-such-engine\"]\n\n\
+         [service]\ncmd = \"exec pando-no-such-engine -p {port}\"\n",
+    )
+    .unwrap();
+    let resolved = actions::resolve_process(
+        &f.paths,
+        &f.config,
+        actions::Mode::Isolated,
+        &decline_the_set,
+        &|_| {},
+    )
+    .expect("decline the services question");
+    assert!(resolved.services.is_empty());
+    assert!(resolved.isolation.none, "the answer was not recorded");
+    let text = config_text(&f);
+    assert!(text.contains("[isolation]"), "{text}");
+    assert!(text.contains("none = true"), "{text}");
+
+    // And the second pass asks nothing: an asker that panics proves it.
+    let reloaded = config::load(&f.paths).unwrap().config;
+    actions::resolve_process(
+        &f.paths,
+        &reloaded,
+        actions::Mode::Isolated,
+        &|q: &actions::Question| panic!("asked again: {:?}", q.prompt),
+        &|_| {},
+    )
+    .expect("nothing left to ask");
+}
+
+// The preference lives in the user layer, because which mechanism a
+// developer wants is a property of their laptop. `[services]` could not
+// be the table: a `[services]` table and a `[[services]]` array of
+// tables cannot both exist in one TOML document.
+#[test]
+fn the_preference_is_read_from_the_machine_wide_layer() {
+    let f = needs_a_database(
+        "[project]\ninstall = \"true\"\n\n[dev]\ncmd = \"sleep 30\"\nports = []\n",
+    );
+    std::fs::write(
+        f.paths.user_config_file(),
+        "[isolation]\nprefer = \"native\"\n",
+    )
+    .unwrap();
+    let config = config::load(&f.paths).unwrap().config;
+    assert_eq!(config.isolation.preferred(), Some("native"));
+    // And a spelling that is not one of the two kinds is refused rather
+    // than silently ignored.
+    std::fs::write(
+        f.paths.user_config_file(),
+        "[isolation]\nprefer = \"podman\"\n",
+    )
+    .unwrap();
+    let loaded = config::load(&f.paths).unwrap();
+    assert!(
+        loaded.warnings.iter().any(|w| w.contains("prefer")),
+        "{:?}",
+        loaded.warnings
+    );
+    assert_eq!(loaded.config.isolation.preferred(), None);
+}

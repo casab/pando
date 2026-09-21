@@ -640,12 +640,31 @@ impl Slot {
 
 /// What a compose service candidate carries besides its name: the file it
 /// is declared in, and the environment key the app reads to find it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceHint {
-    pub file: String,
+    /// The compose file that declares it, or the recipe that runs it.
+    pub source: ServiceSource,
     /// `None` when nothing in the env example points at this service. Such
     /// a service can still be run, but the app is never told where it is.
     pub env_key: Option<String>,
+}
+
+impl ServiceHint {
+    /// The compose file, when this is a compose service.
+    pub fn file(&self) -> Option<&str> {
+        match &self.source {
+            ServiceSource::Compose { file } => Some(file),
+            ServiceSource::Native { .. } => None,
+        }
+    }
+
+    /// The recipe, when this is a native one.
+    pub fn recipe(&self) -> Option<&str> {
+        match &self.source {
+            ServiceSource::Native { recipe } => Some(recipe),
+            ServiceSource::Compose { .. } => None,
+        }
+    }
 }
 
 /// One thing a rule found, and why.
@@ -708,6 +727,10 @@ pub struct Proposal {
     /// with the empty answer instead of finding candidates for it. `None`
     /// whenever there are any.
     pub none_because: Option<String>,
+    /// For a services proposal: `compose` or `native`, and the evidence
+    /// that decided between them.
+    pub mechanism: Option<&'static str>,
+    pub evidence: Vec<String>,
 }
 
 impl Proposal {
@@ -721,6 +744,8 @@ impl Proposal {
             decided,
             file: None,
             none_because: None,
+            mechanism: None,
+            evidence: Vec::new(),
         }
     }
 
@@ -757,7 +782,7 @@ impl Proposal {
             self.candidates
                 .iter()
                 .find_map(|c| c.service.as_ref())
-                .map(|hint| hint.file.as_str())
+                .and_then(ServiceHint::file)
         })
     }
 }
@@ -772,7 +797,7 @@ pub type ComposeResolver<'a> = &'a dyn Fn(&Path) -> Option<crate::compose::Compo
 
 /// Everything tier 1 has to say, in the order the slots are filled.
 pub fn propose(root: &Path, signals: &Signals) -> Vec<Proposal> {
-    propose_with(root, signals, None)
+    propose_with(root, signals, None, &MachineEvidence::unknown(), None)
 }
 
 /// [`propose`] with a way to resolve a compose file the parser is a subset
@@ -781,6 +806,8 @@ pub fn propose_with(
     root: &Path,
     signals: &Signals,
     resolve: Option<ComposeResolver<'_>>,
+    evidence: &MachineEvidence,
+    prefer: Option<&str>,
 ) -> Vec<Proposal> {
     let rule = framework(root, signals);
     [
@@ -794,7 +821,7 @@ pub fn propose_with(
         // After the processes, because a service is only worth proposing
         // once there is something to talk to it; before the schema hook,
         // whose whole point is to run once the services are up.
-        services_proposal(root, signals, resolve),
+        services_proposal(root, signals, resolve, evidence, prefer),
         schema_hook_proposal(root, signals),
         provision_proposal(signals),
     ]
@@ -1736,6 +1763,322 @@ fn is_app_service(image: Option<&str>) -> bool {
     SERVICE_IMAGES.iter().any(|(known, _)| *known == family)
 }
 
+/// Where a service a proposal offers would come from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceSource {
+    /// Declared by the project's own compose file.
+    Compose { file: String },
+    /// Run by a recipe, because nothing in the repository says how.
+    Native { recipe: String },
+}
+
+/// What this machine can actually run, as evidence rather than as a guess.
+///
+/// Injected rather than probed here: `detect` is pure file reading and
+/// runs on the start path before anything is spawned. `actions` probes it
+/// through the shell a real spawn uses and `doctor` through the one it
+/// was given, so what each of them reports is what the start path would
+/// have found. An empty one means "nobody looked", which is not the same
+/// as "nothing is installed" — see [`MachineEvidence::unknown`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MachineEvidence {
+    /// Whether anything looked at all.
+    pub probed: bool,
+    /// Whether a `docker` that answers is on PATH.
+    pub docker: bool,
+    /// Recipe name to whether every binary it needs is on PATH.
+    pub engines: BTreeMap<String, bool>,
+}
+
+impl MachineEvidence {
+    /// Nobody looked. Every question about this machine answers "maybe",
+    /// which is what keeps detection's own tests independent of the host
+    /// they run on.
+    pub fn unknown() -> MachineEvidence {
+        MachineEvidence::default()
+    }
+
+    /// Whether this machine can run the recipe, or `None` when nobody
+    /// looked.
+    pub fn can_run(&self, recipe: &str) -> Option<bool> {
+        if !self.probed {
+            return None;
+        }
+        Some(self.engines.get(recipe).copied().unwrap_or(false))
+    }
+
+    pub fn has_docker(&self) -> Option<bool> {
+        self.probed.then_some(self.docker)
+    }
+}
+
+/// What a project's env example says it talks to, by the one thing that
+/// names an engine unambiguously: the scheme of a URL, or the port a bare
+/// number defaults to.
+///
+/// Not the key's prefix. `DATABASE_URL` is `DATABASE` for Postgres, MySQL
+/// and MongoDB alike in [`SERVICE_IMAGES`] — good enough to *match* a key
+/// to a compose service whose image already named the engine, and no use
+/// at all for working out which engine a project wants when nothing else
+/// says. `postgres://` says it; `5432` says it.
+const SERVICE_ADDRESSES: [(&str, &[&str], u16); 4] = [
+    ("postgres", &["postgres", "postgresql", "pgsql"], 5432),
+    ("mariadb", &["mysql", "mariadb"], 3306),
+    ("redis", &["redis", "rediss", "valkey"], 6379),
+    ("mongodb", &["mongodb", "mongodb+srv"], 27017),
+];
+
+/// The recipe an env value names, by its URL scheme or its port.
+fn recipe_for_address(value: &str) -> Option<&'static str> {
+    let value = value.trim();
+    if let Some(scheme) = value.split("://").next().filter(|s| *s != value) {
+        let scheme = scheme.to_ascii_lowercase();
+        if let Some((recipe, _, _)) = SERVICE_ADDRESSES
+            .iter()
+            .find(|(_, schemes, _)| schemes.contains(&scheme.as_str()))
+        {
+            return Some(recipe);
+        }
+    }
+    // A bare number, or the port at the end of a URL whose scheme said
+    // nothing. The default port is weaker evidence than a scheme and is
+    // only ever reached when the scheme was silent.
+    let port = crate::services::parse_env(&format!("X={value}"))
+        .get("X")
+        .and_then(|v| port_of(v))?;
+    SERVICE_ADDRESSES
+        .iter()
+        .find(|(_, _, default)| *default == port)
+        .map(|(recipe, _, _)| *recipe)
+}
+
+fn port_of(value: &str) -> Option<u16> {
+    let value = value.trim();
+    if let Ok(port) = value.parse::<u16>() {
+        return Some(port);
+    }
+    let rest = value.split("://").nth(1)?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let hostport = authority.rsplit('@').next()?;
+    hostport.rsplit(':').next()?.parse().ok()
+}
+
+/// Every service this project appears to need that no file in it explains.
+///
+/// One candidate per recipe, not per key: two keys naming the same engine
+/// are one server. Sorted by the recipe name so two runs agree.
+fn native_candidates(signals: &Signals, evidence: &MachineEvidence) -> Vec<Candidate> {
+    let mut by_recipe: BTreeMap<&str, (String, String)> = BTreeMap::new();
+    for (key, value) in &signals.env_example {
+        if !ADDRESS_SUFFIXES.iter().any(|s| key.ends_with(s)) {
+            continue;
+        }
+        let Some(recipe) = recipe_for_address(value) else {
+            continue;
+        };
+        // The first key wins, which is file order: a project that names
+        // a database twice means one database.
+        by_recipe
+            .entry(recipe)
+            .or_insert_with(|| (key.clone(), value.clone()));
+    }
+    by_recipe
+        .into_iter()
+        .map(|(recipe, (key, value))| {
+            let runnable = evidence.can_run(recipe);
+            let why = match runnable {
+                Some(true) => format!(".env.example {key}={value}; {recipe} is on this machine"),
+                Some(false) => format!(
+                    ".env.example {key}={value}; {recipe} is not installed here, so starting \
+                     it will say what to install"
+                ),
+                None => format!(".env.example {key}={value}"),
+            };
+            Candidate {
+                value: recipe.to_string(),
+                why,
+                // Ticked when this machine can actually run it: an engine
+                // that is not installed is still offered, because the
+                // project plainly wants one, but it is not taken silently.
+                preselected: runnable != Some(false),
+                service: Some(ServiceHint {
+                    source: ServiceSource::Native {
+                        recipe: recipe.to_string(),
+                    },
+                    env_key: Some(key),
+                }),
+                ..Candidate::default()
+            }
+        })
+        .collect()
+}
+
+/// Which mechanism a project's private services would use, and the
+/// evidence that decided it.
+///
+/// Three inputs, in this order: what the project itself declares, what
+/// this machine can actually run, and what the developer said they
+/// prefer. Never a bare verdict — `evidence` is what `doctor` prints
+/// under the answer, because "pando will use native" with no reason
+/// behind it is a thing to argue with rather than a thing to act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceChoice {
+    /// `compose`, `native`, or `None` when the project declares nothing
+    /// to isolate.
+    pub mechanism: Option<&'static str>,
+    /// Whether the project's own compose file offers anything worth a
+    /// private copy.
+    pub compose_declared: bool,
+    /// Whether the env example names a dependency a recipe could run.
+    pub native_declared: bool,
+    /// One line per fact that went into the answer, in the order they
+    /// were weighed.
+    pub evidence: Vec<String>,
+}
+
+/// [`service_choice`] for a project, reading the two halves the way
+/// `propose` reads them.
+///
+/// The one entry point a caller outside detection uses: `doctor` reports
+/// the answer, the proposal machinery acts on it, and neither of them
+/// gets its own copy of how the decision is made.
+pub fn service_choice_for(
+    root: &Path,
+    signals: &Signals,
+    evidence: &MachineEvidence,
+    config: &Config,
+) -> ServiceChoice {
+    let compose = compose_services_proposal(root, signals, None);
+    let native = native_candidates(signals, evidence);
+    let file = compose
+        .as_ref()
+        .and_then(|p| p.service_file())
+        .map(str::to_string)
+        .or_else(|| crate::compose::find(root));
+    service_choice(
+        file.as_deref(),
+        compose.as_ref().map(|p| p.candidates.len()).unwrap_or(0),
+        &native,
+        evidence,
+        config.isolation.preferred(),
+    )
+}
+
+/// Decides between the two mechanisms from evidence.
+///
+/// `compose_candidates` is what the compose file offers after the
+/// build-from-this-repository filter; `native` is what the env example
+/// names. The preference only ever breaks a tie — it cannot conjure a
+/// mechanism the project does not declare, and it cannot pick one this
+/// machine has been shown not to have.
+pub fn service_choice(
+    compose_file: Option<&str>,
+    compose_candidates: usize,
+    native: &[Candidate],
+    evidence: &MachineEvidence,
+    prefer: Option<&str>,
+) -> ServiceChoice {
+    let compose_declared = compose_candidates > 0;
+    let native_declared = !native.is_empty();
+    let mut why: Vec<String> = Vec::new();
+    match compose_file {
+        Some(file) if compose_declared => why.push(format!(
+            "{file} declares {compose_candidates} service{} this project depends on",
+            if compose_candidates == 1 { "" } else { "s" }
+        )),
+        Some(file) => why.push(format!("{file} declares nothing this project depends on")),
+        None => why.push("this repository has no compose file".to_string()),
+    }
+    match native_declared {
+        true => why.push(format!(
+            "its env example addresses {}",
+            listed(&native.iter().map(|c| c.value.as_str()).collect::<Vec<_>>())
+        )),
+        false => why
+            .push("nothing in its env example names an engine pando has a recipe for".to_string()),
+    }
+
+    let mechanism = match (compose_declared, native_declared) {
+        (false, false) => None,
+        // One option is not a choice, and saying so is shorter than
+        // explaining a preference that could not have applied.
+        (true, false) => Some("compose"),
+        (false, true) => {
+            if let Some(unrunnable) = native
+                .iter()
+                .find(|c| evidence.can_run(&c.value) == Some(false))
+            {
+                why.push(format!(
+                    "{} is not installed here, and there is no compose file to fall back to — \
+                     starting it will say what to install",
+                    unrunnable.value
+                ));
+            }
+            Some("native")
+        }
+        (true, true) => {
+            let docker = evidence.has_docker();
+            let every_engine = native
+                .iter()
+                .all(|c| evidence.can_run(&c.value) != Some(false));
+            if let Some(prefer) = prefer {
+                why.push(format!(
+                    "this machine prefers {prefer} (~/.pando/config.toml)"
+                ));
+                match prefer {
+                    "native" if every_engine => Some("native"),
+                    // A preference this machine cannot honour is not
+                    // overruled quietly: the other mechanism is used and
+                    // the evidence says which engine was missing.
+                    "native" => {
+                        let missing: Vec<&str> = native
+                            .iter()
+                            .filter(|c| evidence.can_run(&c.value) == Some(false))
+                            .map(|c| c.value.as_str())
+                            .collect();
+                        why.push(format!(
+                            "but {} is not installed here, so compose it is",
+                            listed(&missing)
+                        ));
+                        Some("compose")
+                    }
+                    "compose" if docker == Some(false) => {
+                        why.push(
+                            "but docker is not on this machine, so the recipes it is".to_string(),
+                        );
+                        Some("native")
+                    }
+                    _ => Some("compose"),
+                }
+            } else if docker == Some(false) && every_engine {
+                // Not a preference and not a guess: the mechanism the
+                // project declares is one this machine has been shown
+                // not to have.
+                why.push("docker is not on this machine".to_string());
+                Some("native")
+            } else {
+                // The project's own compose file is the project's own
+                // statement about how to run its services, and nobody
+                // has said otherwise. The line below is how a developer
+                // learns there was a choice at all.
+                why.push(
+                    "nobody has said which to prefer, so the project's own compose file wins — \
+                     set `[isolation] prefer = \"native\"` in ~/.pando/config.toml to run the \
+                     recipes instead"
+                        .to_string(),
+                );
+                Some("compose")
+            }
+        }
+    };
+    ServiceChoice {
+        mechanism,
+        compose_declared,
+        native_declared,
+        evidence: why,
+    }
+}
+
 /// Every service the project's compose file declares, with the env key
 /// that names it where a rule found one.
 ///
@@ -1743,7 +2086,7 @@ fn is_app_service(image: Option<&str>) -> bool {
 /// either an env key points at it, or its image is not one an application
 /// talks to. One redis with nothing pointing at it is enough to ask,
 /// because pando cannot tell whether the project wants a private copy.
-fn services_proposal(
+fn compose_services_proposal(
     root: &Path,
     signals: &Signals,
     resolve: Option<ComposeResolver<'_>>,
@@ -1811,7 +2154,7 @@ fn services_proposal(
             why,
             preselected: env_key.is_some(),
             service: Some(ServiceHint {
-                file: file.clone(),
+                source: ServiceSource::Compose { file: file.clone() },
                 env_key,
             }),
             ..Candidate::default()
@@ -1881,6 +2224,55 @@ fn services_proposal(
         return Some(proposal);
     }
     Some(Proposal::of(Slot::Services, candidates, resolved))
+}
+
+/// Which services this project runs private copies of, and by which
+/// mechanism.
+///
+/// The compose half and the native half are worked out independently —
+/// each is a fact about the repository — and [`service_choice`] decides
+/// between them from those facts, this machine, and the developer's
+/// preference. Only the chosen half becomes a question.
+fn services_proposal(
+    root: &Path,
+    signals: &Signals,
+    resolve: Option<ComposeResolver<'_>>,
+    evidence: &MachineEvidence,
+    prefer: Option<&str>,
+) -> Option<Proposal> {
+    let compose = compose_services_proposal(root, signals, resolve);
+    let native = native_candidates(signals, evidence);
+    let compose_file = compose
+        .as_ref()
+        .and_then(|p| p.service_file())
+        .map(str::to_string)
+        .or_else(|| crate::compose::find(root));
+    let compose_candidates = compose.as_ref().map(|p| p.candidates.len()).unwrap_or(0);
+    let choice = service_choice(
+        compose_file.as_deref(),
+        compose_candidates,
+        &native,
+        evidence,
+        prefer,
+    );
+    match choice.mechanism {
+        Some("native") => {
+            // Decided when this machine can run every one of them.
+            // An engine that is not installed is still offered — the
+            // project plainly wants one — but it is not taken silently.
+            let decided = native.iter().all(|c| c.preselected);
+            let mut proposal = Proposal::of(Slot::Services, native, decided);
+            proposal.mechanism = Some("native");
+            proposal.evidence = choice.evidence;
+            Some(proposal)
+        }
+        _ => {
+            let mut proposal = compose?;
+            proposal.mechanism = choice.mechanism;
+            proposal.evidence = choice.evidence;
+            Some(proposal)
+        }
+    }
 }
 
 /// Whether a compose service's build context points inside the project.
@@ -2084,8 +2476,12 @@ pub fn still_needed(slot: Slot, config: &Config) -> bool {
         Slot::Provision => config.project.provision.is_none(),
         // Anything already in `[[services]]` is an answer about every
         // service: a developer who listed two has said the third is not
-        // wanted, and a second run must not offer it again.
-        Slot::Services => config.services.is_empty(),
+        // wanted, and a second run must not offer it again. So is
+        // `[isolation] none`, which is how the native half records the
+        // answer "none of them" — a compose entry can say that with an
+        // empty `include` and a native one, being a single service, has
+        // nowhere to put it.
+        Slot::Services => config.services.is_empty() && !config.isolation.none,
         // Likewise for hooks: one the developer wrote is their schema
         // step, whatever it is called.
         Slot::SchemaHook => config.hooks.is_empty(),
@@ -2226,6 +2622,30 @@ pub fn apply(slot: Slot, candidate: &Candidate, config: &mut Config) {
 /// "none of them" is an answer, and an answer nothing records is asked
 /// again on every start. It is the same shape the port slot uses for a
 /// process that really has no ports.
+pub fn apply_native_services(chosen: &[&Candidate], config: &mut Config) {
+    for candidate in chosen {
+        let hint = candidate.service.as_ref();
+        let recipe = hint
+            .and_then(|h| h.recipe())
+            .filter(|recipe| *recipe != candidate.value)
+            .map(str::to_string);
+        let env = hint
+            .and_then(|h| h.env_key.clone())
+            .map(|key| BTreeMap::from([(key, candidate.value.clone())]))
+            .unwrap_or_default();
+        config.services.push(crate::config::ServiceConfig::Native {
+            name: candidate.value.clone(),
+            preset: recipe,
+            port_env: None,
+            init: None,
+            cmd: None,
+            ready: None,
+            ready_timeout_s: None,
+            env,
+        });
+    }
+}
+
 pub fn apply_services(file: &str, chosen: &[&Candidate], config: &mut Config) {
     let file = file.to_string();
     let include: Vec<String> = chosen.iter().map(|c| c.value.clone()).collect();
@@ -2278,6 +2698,37 @@ pub fn service_entry(
     (array, entries)
 }
 
+/// The keys of one `[[services]] kind = "native"` entry.
+///
+/// One entry per service, because a native entry runs one server — which
+/// is also why the recorded negative for this mechanism is not an empty
+/// `include` but `[isolation] none`.
+pub fn native_entry(chosen: &Candidate) -> (&'static str, Vec<(String, toml_edit::Value)>) {
+    let array = Slot::Services
+        .array()
+        .expect("the services slot appends a [[table]] entry");
+    let recipe = chosen
+        .service
+        .as_ref()
+        .and_then(ServiceHint::recipe)
+        .unwrap_or(chosen.value.as_str());
+    let mut entries: Vec<(String, toml_edit::Value)> = vec![
+        ("kind".to_string(), "native".into()),
+        ("name".to_string(), chosen.value.clone().into()),
+    ];
+    // Only when it differs: `name = "postgres"` already names the recipe,
+    // and a second line saying so is noise in a file people read.
+    if recipe != chosen.value {
+        entries.push(("preset".to_string(), recipe.to_string().into()));
+    }
+    if let Some(key) = chosen.service.as_ref().and_then(|h| h.env_key.as_ref()) {
+        let mut env = toml_edit::InlineTable::new();
+        env.insert(key, chosen.value.as_str().into());
+        entries.push(("env".to_string(), toml_edit::Value::InlineTable(env)));
+    }
+    (array, entries)
+}
+
 /// The keys of the one `[[table]]` entry a set answer appends, or `None`
 /// for a slot whose answer is a key in a table.
 pub fn array_edits(
@@ -2289,7 +2740,13 @@ pub fn array_edits(
     match slot {
         Slot::Services => {
             let hint = chosen.iter().find_map(|c| c.service.as_ref())?;
-            return Some(service_entry(&hint.file, chosen));
+            return Some(match &hint.source {
+                ServiceSource::Compose { file } => service_entry(file, chosen),
+                // One entry per native service, so this path is only ever
+                // reached for the first of them; `apply_service_answer`
+                // writes them one at a time.
+                ServiceSource::Native { .. } => native_entry(chosen.first()?),
+            });
         }
         Slot::SchemaHook => {
             let hook = chosen.first()?.hook.as_ref()?;
@@ -3349,7 +3806,14 @@ services:
 "#,
             &[("DATABASE_URL", "postgres://acme@localhost:5432/acme")],
         );
-        let proposal = services_proposal(dir.path(), &signals, None).unwrap();
+        let proposal = services_proposal(
+            dir.path(),
+            &signals,
+            None,
+            &MachineEvidence::unknown(),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             values(&proposal),
             vec!["postgres"],
@@ -3370,7 +3834,14 @@ services:
             "services:\n  web:\n    build: .\n  worker:\n    build: ./worker\n",
             &[],
         );
-        let proposal = services_proposal(dir.path(), &signals, None).unwrap();
+        let proposal = services_proposal(
+            dir.path(),
+            &signals,
+            None,
+            &MachineEvidence::unknown(),
+            None,
+        )
+        .unwrap();
         assert!(
             proposal.candidates.is_empty(),
             "nothing survived the filter"
@@ -3405,7 +3876,14 @@ services:
 "#,
             &[("PORT", "3000")],
         );
-        let proposal = services_proposal(dir.path(), &signals, None).unwrap();
+        let proposal = services_proposal(
+            dir.path(),
+            &signals,
+            None,
+            &MachineEvidence::unknown(),
+            None,
+        )
+        .unwrap();
         assert!(proposal.candidates.is_empty());
         assert!(proposal.decided);
         assert_eq!(proposal.service_file(), Some("docker-compose.yml"));
@@ -3436,7 +3914,14 @@ services:
             &[],
         );
         assert!(
-            services_proposal(dir.path(), &signals, None).is_none(),
+            services_proposal(
+                dir.path(),
+                &signals,
+                None,
+                &MachineEvidence::unknown(),
+                None
+            )
+            .is_none(),
             "nothing is offered and nothing is written down: the next run \
              with Docker present gets to decide"
         );
@@ -3456,7 +3941,14 @@ services:
 "#,
             &[("VENDOR_URL", "http://localhost:9000")],
         );
-        let proposal = services_proposal(dir.path(), &signals, None).unwrap();
+        let proposal = services_proposal(
+            dir.path(),
+            &signals,
+            None,
+            &MachineEvidence::unknown(),
+            None,
+        )
+        .unwrap();
         assert_eq!(values(&proposal), vec!["vendor"]);
         assert!(proposal.preferred().unwrap().preselected);
     }
@@ -3753,5 +4245,310 @@ services:
         assert_eq!(edits.len(), 2, "the command and the role it needs");
         assert_eq!(edits[1].key, "ports");
         assert_eq!(edits[1].value.to_string().trim(), "[\"web\"]");
+    }
+
+    // ---- native versus container, decided from evidence ------------------
+
+    /// A project whose env example names these addresses, and optionally
+    /// a compose file declaring these services.
+    fn project(env: &[(&str, &str)], compose: Option<&str>) -> (TempDir, Signals) {
+        let dir = tempdir().unwrap();
+        if let Some(yaml) = compose {
+            std::fs::write(dir.path().join("docker-compose.yml"), yaml).unwrap();
+        }
+        let signals = Signals {
+            env_example: env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ..Default::default()
+        };
+        (dir, signals)
+    }
+
+    /// A machine that has everything, or one that has nothing.
+    fn machine(docker: bool, engines: &[(&str, bool)]) -> MachineEvidence {
+        MachineEvidence {
+            probed: true,
+            docker,
+            engines: engines.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+        }
+    }
+
+    const COMPOSE_PG: &str =
+        "services:\n  postgres:\n    image: postgres:16\n  redis:\n    image: redis:7\n";
+
+    fn choice_of(
+        dir: &TempDir,
+        signals: &Signals,
+        evidence: &MachineEvidence,
+        prefer: Option<&str>,
+    ) -> ServiceChoice {
+        let compose = compose_services_proposal(dir.path(), signals, None);
+        let native = native_candidates(signals, evidence);
+        let file = compose
+            .as_ref()
+            .and_then(|p| p.service_file())
+            .map(str::to_string)
+            .or_else(|| crate::compose::find(dir.path()));
+        service_choice(
+            file.as_deref(),
+            compose.as_ref().map(|p| p.candidates.len()).unwrap_or(0),
+            &native,
+            evidence,
+            prefer,
+        )
+    }
+
+    // The engine is named by the scheme of the URL or by the port a bare
+    // number defaults to — never by the key's prefix. `DATABASE_URL` is
+    // `DATABASE` for Postgres, MySQL and Mongo alike, and using it to
+    // pick an engine would be a coin toss wearing a rule's clothes.
+    #[test]
+    fn the_engine_comes_from_the_scheme_or_the_port_and_never_from_the_key() {
+        for (value, expected) in [
+            ("postgres://u:p@localhost:5432/app", Some("postgres")),
+            ("postgresql://localhost/app", Some("postgres")),
+            ("mysql://u:p@localhost:3306/app", Some("mariadb")),
+            ("redis://localhost:6379", Some("redis")),
+            ("mongodb+srv://localhost/app", Some("mongodb")),
+            // No scheme pando knows: the port is the fallback.
+            ("5432", Some("postgres")),
+            ("27017", Some("mongodb")),
+            ("http://localhost:3000", None),
+            ("8080", None),
+        ] {
+            assert_eq!(recipe_for_address(value), expected, "{value}");
+        }
+        // The same key spelling, three different engines: the proof that
+        // the prefix is not what decided any of them.
+        for (value, expected) in [
+            ("postgres://localhost:5432/a", "postgres"),
+            ("mysql://localhost:3306/a", "mariadb"),
+            ("mongodb://localhost:27017/a", "mongodb"),
+        ] {
+            let (dir, signals) = project(&[("DATABASE_URL", value)], None);
+            let native = native_candidates(&signals, &MachineEvidence::unknown());
+            assert_eq!(values_of(&native), vec![expected], "{value}");
+            let _ = dir;
+        }
+    }
+
+    fn values_of(candidates: &[Candidate]) -> Vec<&str> {
+        candidates.iter().map(|c| c.value.as_str()).collect()
+    }
+
+    // Two keys naming the same engine are one server, and two engines
+    // are two candidates, sorted so two runs agree.
+    #[test]
+    fn one_candidate_per_engine_however_many_keys_name_it() {
+        let (dir, signals) = project(
+            &[
+                ("REDIS_URL", "redis://localhost:6379"),
+                ("DATABASE_URL", "postgres://localhost:5432/app"),
+                ("CACHE_URL", "redis://localhost:6379/1"),
+            ],
+            None,
+        );
+        let native = native_candidates(&signals, &MachineEvidence::unknown());
+        assert_eq!(values_of(&native), vec!["postgres", "redis"]);
+        let _ = dir;
+    }
+
+    // The shape Phase 6 exists for: a project that needs services and has
+    // no file describing them. There is no compose option at all, so the
+    // preference never comes into it.
+    #[test]
+    fn a_project_with_no_compose_file_and_a_database_in_its_env_gets_the_recipes() {
+        let (dir, signals) = project(
+            &[
+                ("DATABASE_URL", "postgres://localhost:5432/app"),
+                ("REDIS_URL", "redis://localhost:6379"),
+            ],
+            None,
+        );
+        let evidence = machine(true, &[("postgres", true), ("redis", true)]);
+        let choice = choice_of(&dir, &signals, &evidence, None);
+        assert_eq!(choice.mechanism, Some("native"));
+        assert!(choice.native_declared);
+        assert!(!choice.compose_declared);
+        assert!(
+            choice.evidence[0].contains("no compose file"),
+            "{:?}",
+            choice.evidence
+        );
+        assert!(
+            choice.evidence[1].contains("postgres and redis"),
+            "{:?}",
+            choice.evidence
+        );
+
+        let proposal = propose_with(dir.path(), &signals, None, &evidence, None)
+            .into_iter()
+            .find(|p| p.slot == Slot::Services)
+            .expect("a services proposal");
+        assert_eq!(proposal.mechanism, Some("native"));
+        assert_eq!(values(&proposal), vec!["postgres", "redis"]);
+        assert!(proposal.decided, "this machine has both engines");
+    }
+
+    // The common path is unchanged: a compose file is the project's own
+    // statement about how to run its services, and nobody has said
+    // otherwise. The evidence line is how a developer learns there was a
+    // choice at all.
+    #[test]
+    fn a_compose_file_wins_when_nobody_has_said_which_to_prefer() {
+        let (dir, signals) = project(
+            &[
+                ("DATABASE_URL", "postgres://localhost:5432/app"),
+                ("REDIS_URL", "redis://localhost:6379"),
+            ],
+            Some(COMPOSE_PG),
+        );
+        let evidence = machine(true, &[("postgres", true), ("redis", true)]);
+        let choice = choice_of(&dir, &signals, &evidence, None);
+        assert_eq!(choice.mechanism, Some("compose"));
+        assert!(choice.compose_declared && choice.native_declared);
+        let said = choice.evidence.join(" | ");
+        assert!(said.contains("nobody has said which to prefer"), "{said}");
+        assert!(said.contains("[isolation] prefer"), "{said}");
+    }
+
+    #[test]
+    fn a_machine_that_prefers_the_recipes_gets_them() {
+        let (dir, signals) = project(
+            &[("DATABASE_URL", "postgres://localhost:5432/app")],
+            Some(COMPOSE_PG),
+        );
+        let evidence = machine(true, &[("postgres", true), ("redis", true)]);
+        let choice = choice_of(&dir, &signals, &evidence, Some("native"));
+        assert_eq!(choice.mechanism, Some("native"));
+        assert!(
+            choice.evidence.iter().any(|l| l.contains("prefers native")),
+            "{:?}",
+            choice.evidence
+        );
+    }
+
+    // A preference this machine cannot honour is not overruled quietly.
+    #[test]
+    fn a_preference_for_an_engine_that_is_not_installed_falls_back_and_says_so() {
+        let (dir, signals) = project(
+            &[("DATABASE_URL", "postgres://localhost:5432/app")],
+            Some(COMPOSE_PG),
+        );
+        let evidence = machine(true, &[("postgres", false)]);
+        let choice = choice_of(&dir, &signals, &evidence, Some("native"));
+        assert_eq!(choice.mechanism, Some("compose"));
+        let said = choice.evidence.join(" | ");
+        assert!(said.contains("postgres is not installed here"), "{said}");
+        assert!(said.contains("so compose it is"), "{said}");
+    }
+
+    // And the mirror: a project that declares a compose file, on a
+    // machine with no docker and every engine. Not a preference and not
+    // a guess — the mechanism the project declares is one this machine
+    // has been shown not to have.
+    #[test]
+    fn no_docker_and_every_engine_takes_the_recipes_without_being_asked() {
+        let (dir, signals) = project(
+            &[
+                ("DATABASE_URL", "postgres://localhost:5432/app"),
+                ("REDIS_URL", "redis://localhost:6379"),
+            ],
+            Some(COMPOSE_PG),
+        );
+        let evidence = machine(false, &[("postgres", true), ("redis", true)]);
+        let choice = choice_of(&dir, &signals, &evidence, None);
+        assert_eq!(choice.mechanism, Some("native"));
+        assert!(
+            choice
+                .evidence
+                .iter()
+                .any(|l| l.contains("docker is not on this machine")),
+            "{:?}",
+            choice.evidence
+        );
+
+        // …and the other way, for a machine that prefers compose and has
+        // no docker.
+        let choice = choice_of(&dir, &signals, &evidence, Some("compose"));
+        assert_eq!(choice.mechanism, Some("native"));
+        assert!(
+            choice
+                .evidence
+                .iter()
+                .any(|l| l.contains("docker is not on this machine")),
+            "{:?}",
+            choice.evidence
+        );
+    }
+
+    // An engine the project wants and this machine lacks is still
+    // offered — the project plainly needs one — but it is not ticked, so
+    // the question is asked rather than the answer taken.
+    #[test]
+    fn an_engine_this_machine_lacks_is_offered_unticked_and_asks() {
+        let (dir, signals) = project(&[("DATABASE_URL", "postgres://localhost:5432/app")], None);
+        let evidence = machine(false, &[("postgres", false)]);
+        let proposal = propose_with(dir.path(), &signals, None, &evidence, None)
+            .into_iter()
+            .find(|p| p.slot == Slot::Services)
+            .expect("a services proposal");
+        assert_eq!(proposal.mechanism, Some("native"));
+        assert!(!proposal.decided, "it was taken without asking");
+        assert!(proposal.preselected().is_empty());
+        assert!(
+            proposal.candidates[0].why.contains("not installed here"),
+            "{:?}",
+            proposal.candidates[0].why
+        );
+    }
+
+    // Detection's own tests must not depend on the laptop they run on,
+    // so "nobody looked" is a distinct answer from "nothing is there".
+    #[test]
+    fn evidence_nobody_gathered_answers_maybe_rather_than_no() {
+        let unknown = MachineEvidence::unknown();
+        assert_eq!(unknown.can_run("postgres"), None);
+        assert_eq!(unknown.has_docker(), None);
+        let looked = machine(false, &[]);
+        assert_eq!(looked.can_run("postgres"), Some(false));
+        assert_eq!(looked.has_docker(), Some(false));
+
+        // With nobody having looked, a project with both options keeps
+        // the compose file its own repository declares.
+        let (dir, signals) = project(
+            &[("DATABASE_URL", "postgres://localhost:5432/app")],
+            Some(COMPOSE_PG),
+        );
+        assert_eq!(
+            choice_of(&dir, &signals, &unknown, None).mechanism,
+            Some("compose")
+        );
+    }
+
+    // The entry a native answer writes: the recipe is implied by the
+    // name when they match, and spelled out when they do not.
+    #[test]
+    fn a_native_entry_names_its_recipe_only_when_it_has_to() {
+        let (dir, signals) = project(&[("DATABASE_URL", "postgres://localhost:5432/app")], None);
+        let native = native_candidates(&signals, &MachineEvidence::unknown());
+        let (array, entries) = native_entry(&native[0]);
+        assert_eq!(array, "services");
+        let keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["kind", "name", "env"]);
+        assert_eq!(entries[0].1.as_str(), Some("native"));
+        assert_eq!(entries[1].1.as_str(), Some("postgres"));
+
+        // A MySQL URL wants the `mariadb` recipe under a name of its
+        // own, so the preset has to be written down.
+        let (dir2, signals) = project(&[("DB_URL", "mysql://localhost:3306/app")], None);
+        let native = native_candidates(&signals, &MachineEvidence::unknown());
+        let (_, entries) = native_entry(&native[0]);
+        let keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["kind", "name", "env"]);
+        assert_eq!(entries[1].1.as_str(), Some("mariadb"));
+        let _ = (dir, dir2);
     }
 }

@@ -1563,7 +1563,13 @@ struct CandidateOut {
 
 #[derive(Serialize)]
 struct ServiceHintOut {
+    /// The compose file that declares it. Empty for a native service,
+    /// which no file in the repository declares — `recipe` names what
+    /// would run it instead. Kept rather than made optional so a program
+    /// reading this since Phase 5 still finds the key it knows.
     file: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recipe: Option<String>,
     env_key: Option<String>,
 }
 
@@ -1641,7 +1647,8 @@ fn proposal_out(proposal: &crate::detect::Proposal) -> ProposalOut {
                 ports: candidate.ports.clone(),
                 processes: candidate.processes.clone(),
                 service: candidate.service.as_ref().map(|hint| ServiceHintOut {
-                    file: hint.file.clone(),
+                    file: hint.file().unwrap_or_default().to_string(),
+                    recipe: hint.recipe().map(str::to_string),
                     env_key: hint.env_key.clone(),
                 }),
                 hook: candidate.hook.clone(),

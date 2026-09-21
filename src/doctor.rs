@@ -335,6 +335,27 @@ pub struct WorktreeServiceReport {
 pub struct ServicesReport {
     pub compose: Vec<ComposeEntryReport>,
     pub native: Vec<NativeServiceReport>,
+    pub isolation: IsolationReport,
+}
+
+/// How this project's private services would be run, and why.
+///
+/// Never a bare verdict: `evidence` is every fact that went into the
+/// answer, in the order they were weighed. "pando will use native" with
+/// nothing behind it is a thing to argue with; the same line with the
+/// compose file, the env example, this machine and the preference under
+/// it is a thing to act on.
+#[derive(Debug, Clone, Serialize)]
+pub struct IsolationReport {
+    /// `compose`, `native`, or `null` when the project declares nothing
+    /// to isolate.
+    pub mechanism: Option<String>,
+    /// What this machine asked for, from `[isolation] prefer`.
+    pub prefer: Option<String>,
+    /// Whether the answer is already recorded, so none of this is a
+    /// prediction: `[[services]]` entries, or `[isolation] none`.
+    pub answered: bool,
+    pub evidence: Vec<String>,
 }
 
 /// What a `[[services]] kind = "native"` block resolved to.
@@ -778,6 +799,23 @@ fn render_worktrees(out: &mut String, worktrees: &[WorktreeReport]) {
 }
 
 fn render_services(out: &mut String, services: &ServicesReport) {
+    let isolation = &services.isolation;
+    match &isolation.mechanism {
+        Some(mechanism) => row(
+            out,
+            "isolation",
+            &match isolation.answered {
+                true => format!("{mechanism}, as this project's config already says"),
+                false => format!("{mechanism}, if this worktree is started isolated"),
+            },
+        ),
+        None => row(out, "isolation", "nothing here to run a private copy of"),
+    }
+    // Never a bare verdict: the facts that decided it, in the order they
+    // were weighed.
+    for line in &isolation.evidence {
+        row(out, "", line);
+    }
     if services.compose.is_empty() && services.native.is_empty() {
         row(out, "", "none configured");
         return;
@@ -1287,6 +1325,8 @@ fn services_report(
     findings: &mut Vec<Finding>,
 ) -> ServicesReport {
     let mut compose = Vec::new();
+    let recipes = recipes::Recipes::load(&paths.recipes_dir());
+    let isolation = isolation_report(paths, config, machine, &recipes);
     let native = native_report(paths, config, machine, findings);
     for service in &config.services {
         let ServiceConfig::Compose {
@@ -1391,7 +1431,39 @@ fn services_report(
         });
     }
     name_collisions(paths, config, findings);
-    ServicesReport { compose, native }
+    ServicesReport {
+        compose,
+        native,
+        isolation,
+    }
+}
+
+/// Which mechanism this project's private services would use, and the
+/// evidence that decided it.
+///
+/// Asked of the same function the start path asks, through the shell
+/// doctor was given, so the report is the decision rather than a second
+/// opinion about it.
+fn isolation_report(
+    paths: &PandoPaths,
+    config: &Config,
+    machine: &Machine<'_>,
+    recipes: &recipes::Recipes,
+) -> IsolationReport {
+    let answered = !config.services.is_empty() || config.isolation.none;
+    let signals = detect::signals(paths.root());
+    let (script, names) = actions::machine_evidence_script(paths, recipes);
+    let evidence = match (machine.shell)(&script) {
+        Some(text) => actions::machine_evidence_from(&text, &names),
+        None => detect::MachineEvidence::unknown(),
+    };
+    let choice = detect::service_choice_for(paths.root(), &signals, &evidence, config);
+    IsolationReport {
+        mechanism: choice.mechanism.map(str::to_string),
+        prefer: config.isolation.prefer.clone(),
+        answered,
+        evidence: choice.evidence,
+    }
 }
 
 /// What each `[[services]] kind = "native"` block resolved to, and
@@ -4091,6 +4163,114 @@ mod tests {
             .find(|n| n.name == name)
             .unwrap_or_else(|| panic!("no native report for {name}"))
             .clone()
+    }
+
+    /// The machine-evidence probe's answer, for a machine that has the
+    /// named things and nothing else. Injected like every other probe:
+    /// this laptop really has Docker and Postgres, and a test that asked
+    /// the real PATH would pass here and fail on a runner without them.
+    fn evidence_answer(script: &str, has: &[&str]) -> Option<String> {
+        if !script.contains("command -v docker") {
+            return None;
+        }
+        let mut out = String::new();
+        for name in has {
+            let _ = writeln!(out, "{name}");
+        }
+        Some(out)
+    }
+
+    fn shell_with(has: &'static [&'static str]) -> impl Fn(&str) -> Option<String> {
+        move |script: &str| {
+            evidence_answer(script, has)
+                .or_else(|| engine_answer(script, true))
+                .or_else(|| every_tool(script))
+        }
+    }
+
+    #[test]
+    fn doctor_says_which_mechanism_would_run_the_services_and_why() {
+        let fx = fixture();
+        // A project that needs a database and says nothing about how to
+        // run one: the shape the native path exists for.
+        std::fs::write(
+            fx.root.join(".env.example"),
+            "DATABASE_URL=postgres://acme:acme@localhost:5432/acme\n",
+        )
+        .unwrap();
+        let report = report_of(&fx, &shell_with(&["docker", "postgres"]));
+        let isolation = &report.services.isolation;
+        assert_eq!(isolation.mechanism.as_deref(), Some("native"));
+        assert_eq!(isolation.prefer, None);
+        assert!(!isolation.answered, "nothing is configured yet");
+        // Never a bare verdict.
+        let said = isolation.evidence.join(" | ");
+        assert!(said.contains("no compose file"), "{said}");
+        assert!(said.contains("postgres"), "{said}");
+        let text = report.render();
+        assert!(
+            text.contains("native, if this worktree is started isolated"),
+            "{text}"
+        );
+        assert!(text.contains("no compose file"), "{text}");
+    }
+
+    #[test]
+    fn doctor_names_the_preference_and_the_engine_that_overruled_it() {
+        let fx = fixture();
+        std::fs::write(
+            fx.root.join(".env.example"),
+            "DATABASE_URL=postgres://acme:acme@localhost:5432/acme\n",
+        )
+        .unwrap();
+        std::fs::write(
+            fx.root.join("docker-compose.yml"),
+            "services:\n  postgres:\n    image: postgres:16\n",
+        )
+        .unwrap();
+        std::fs::write(
+            fx.paths.user_config_file(),
+            "[isolation]\nprefer = \"native\"\n",
+        )
+        .unwrap();
+
+        // With the engine there, the preference is honoured.
+        let report = report_of(&fx, &shell_with(&["docker", "postgres"]));
+        assert_eq!(
+            report.services.isolation.mechanism.as_deref(),
+            Some("native")
+        );
+        assert_eq!(
+            report.services.isolation.prefer.as_deref(),
+            Some("native"),
+            "the preference has to be reported whether or not it won"
+        );
+
+        // Without it, the other mechanism is used and the report says
+        // which engine was missing rather than silently disagreeing.
+        let report = report_of(&fx, &shell_with(&["docker"]));
+        assert_eq!(
+            report.services.isolation.mechanism.as_deref(),
+            Some("compose")
+        );
+        let said = report.services.isolation.evidence.join(" | ");
+        assert!(said.contains("prefers native"), "{said}");
+        assert!(said.contains("postgres is not installed here"), "{said}");
+    }
+
+    #[test]
+    fn a_project_with_nothing_to_isolate_says_that_rather_than_guessing() {
+        let fx = fixture();
+        let report = report_of(&fx, &shell_with(&["docker", "postgres"]));
+        assert_eq!(report.services.isolation.mechanism, None);
+        assert!(
+            report
+                .render()
+                .contains("nothing here to run a private copy of"),
+            "{}",
+            report.render()
+        );
+        assert!(report.healthy(), "{:?}", report.findings);
     }
 
     #[test]
