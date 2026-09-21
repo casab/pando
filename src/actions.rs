@@ -1083,9 +1083,15 @@ pub fn resolve_on(
     // probe is a login shell, and a project that has already said what it
     // runs is not asking this question.
     let recipes = crate::recipes::Recipes::load(&paths.recipes_dir());
-    let evidence = match already_answered(Slot::Services, &config) {
-        true => detect::MachineEvidence::unknown(),
-        false => machine_evidence(paths, &recipes),
+    // …and only for a start that could act on the answer. A plain
+    // `start` never asks which services to run private copies of — see
+    // `SILENT_UNLESS_ISOLATED` — so paying for a login shell to find out
+    // what this machine has would be a cost with no question behind it.
+    let asking_about_services =
+        !already_answered(Slot::Services, &config) && !silent.contains(&Slot::Services);
+    let evidence = match asking_about_services {
+        true => machine_evidence(paths, &recipes),
+        false => detect::MachineEvidence::unknown(),
     };
     let mut proposals = detect::propose_with(
         paths.root(),

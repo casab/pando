@@ -42,6 +42,16 @@ const PROJECT_LAYER_ONLY: [&str; 2] = ["root", "worktrees_dir"];
 /// Why a layer beneath the project one may not decide where pando writes.
 /// Each layer says it in its own terms, because the two reasons differ: one
 /// file is inside the repository, the other is shared by every project.
+/// The two layers beneath pando's own, which are hand-written and so are
+/// held to what each of them is *for*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LowerLayer {
+    /// A `pando.toml` a team committed: shared by everyone who clones.
+    Committed,
+    /// `~/.pando/config.toml`: shared by every project on one laptop.
+    User,
+}
+
 const COMMITTED_REASON: &str = "a committed config may not decide where pando writes";
 const USER_REASON: &str = "a machine-wide config may not decide where pando writes for one project";
 
@@ -470,8 +480,20 @@ fn load_layers(paths: &PandoPaths, use_home: bool) -> Result<Loaded> {
     // what a *newer* pando's config looks like. The user layer is one file
     // for every project on the machine, so a mistake in it has an even
     // wider blast radius.
-    let committed = read_lower_layer(paths, &committed_path, COMMITTED_REASON, &mut warnings);
-    let user = read_lower_layer(paths, &user_path, USER_REASON, &mut warnings);
+    let committed = read_lower_layer(
+        paths,
+        &committed_path,
+        LowerLayer::Committed,
+        COMMITTED_REASON,
+        &mut warnings,
+    );
+    let user = read_lower_layer(
+        paths,
+        &user_path,
+        LowerLayer::User,
+        USER_REASON,
+        &mut warnings,
+    );
     // Strictly, and only when it is wanted: a file pando wrote and cannot
     // parse is not one to carry on past the way the others are. The caller
     // decides whether this command can do without it.
@@ -519,11 +541,12 @@ fn load_layers(paths: &PandoPaths, use_home: bool) -> Result<Loaded> {
 fn read_lower_layer(
     paths: &PandoPaths,
     path: &Path,
+    layer: LowerLayer,
     reason: &str,
     warnings: &mut Vec<String>,
 ) -> Option<Table> {
     let mut table = read_table(path, warnings)?;
-    strip_keys_only_pando_may_set(&mut table, path, reason, warnings);
+    strip_keys_only_pando_may_set(&mut table, path, layer, reason, warnings);
     if let Err(e) = build(table.clone(), &paths.project) {
         warnings.push(format!("ignoring {}: {e:#}", path.display()));
         return None;
@@ -1226,24 +1249,53 @@ fn read_table(path: &Path, warnings: &mut Vec<String>) -> Option<Table> {
     }
 }
 
-/// Removes the keys only pando's own project layer may set, warning by name
-/// for each one, with the reason that layer cannot set it.
+/// Removes the keys this layer may not set, warning by name for each
+/// one, with the reason it may not.
+///
+/// Three kinds of key, and the reason differs for each. `project.root`
+/// and `project.worktrees_dir` decide where pando writes, which only
+/// pando's own file may say. `[isolation] none` is a fact about one
+/// repository, so a machine-wide file may not answer it for every
+/// project at once. `[isolation] prefer` is a fact about one laptop, so
+/// a file the team shares may not answer it for everyone's.
 fn strip_keys_only_pando_may_set(
     table: &mut Table,
     path: &Path,
+    layer: LowerLayer,
     reason: &str,
     warnings: &mut Vec<String>,
 ) {
-    let Some(Value::Table(project)) = table.get_mut("project") else {
-        return;
-    };
-    for key in PROJECT_LAYER_ONLY {
-        if project.remove(key).is_some() {
-            warnings.push(format!(
-                "ignoring project.{key} in {}: {reason}",
-                path.display()
-            ));
+    if let Some(Value::Table(project)) = table.get_mut("project") {
+        for key in PROJECT_LAYER_ONLY {
+            if project.remove(key).is_some() {
+                warnings.push(format!(
+                    "ignoring project.{key} in {}: {reason}",
+                    path.display()
+                ));
+            }
         }
+    }
+    let (key, why) = match layer {
+        // A machine-wide file saying "this project has no private
+        // services" says it about every project on the laptop.
+        LowerLayer::User => (
+            "none",
+            "a machine-wide config may not answer that for every project",
+        ),
+        // A file the team shares saying "prefer native" imposes one
+        // developer's laptop on everyone who clones the repository.
+        LowerLayer::Committed => (
+            "prefer",
+            "which mechanism to use is a property of a machine, not of a repository",
+        ),
+    };
+    if let Some(Value::Table(isolation)) = table.get_mut("isolation")
+        && isolation.remove(key).is_some()
+    {
+        warnings.push(format!(
+            "ignoring isolation.{key} in {}: {why}",
+            path.display()
+        ));
     }
 }
 
@@ -2228,6 +2280,73 @@ auth_cmd = "./scripts/dev-cookie.sh"
     // `kind = "native"` parses, validates, and is then dropped by the start
     // path, so a developer read "no services configured" while looking at a
     // file that configures one. It is not an error — the block is legal and
+
+    // `[isolation]` holds one key per layer, and each is wrong in the
+    // other's file: "this project has no services" in a machine-wide
+    // file says it for every project on the laptop, and "prefer native"
+    // in a committed file imposes one developer's machine on everyone
+    // who clones the repository.
+    #[test]
+    fn a_machine_wide_file_may_not_say_a_project_has_no_services() {
+        let f = fixture();
+        write_user(
+            &f,
+            "[runtime]\nprelude = \"\"\n\n[isolation]\nnone = true\n",
+        );
+        let loaded = load(&f.paths).unwrap();
+        assert!(!loaded.config.isolation.none, "it applied to every project");
+        // The rest of the file survives: one wrong key is stripped, not
+        // the whole layer.
+        assert_eq!(loaded.config.runtime.prelude.as_deref(), Some(""));
+        assert!(
+            loaded
+                .warnings
+                .iter()
+                .any(|w| w.contains("isolation.none") && w.contains("every project")),
+            "{:?}",
+            loaded.warnings
+        );
+    }
+
+    #[test]
+    fn a_committed_file_may_not_say_which_mechanism_this_machine_prefers() {
+        let f = fixture();
+        write_committed(&f, "[isolation]\nprefer = \"native\"\n");
+        let loaded = load(&f.paths).unwrap();
+        assert_eq!(loaded.config.isolation.preferred(), None);
+        assert!(
+            loaded
+                .warnings
+                .iter()
+                .any(|w| w.contains("isolation.prefer") && w.contains("property of a machine")),
+            "{:?}",
+            loaded.warnings
+        );
+
+        // And the machine-wide file, which is its home, keeps it.
+        write_user(&f, "[isolation]\nprefer = \"native\"\n");
+        assert_eq!(
+            load(&f.paths).unwrap().config.isolation.preferred(),
+            Some("native")
+        );
+    }
+
+    // Two layers that are each fine alone and cannot both apply: the
+    // refusal names every file present rather than picking a winner.
+    #[test]
+    fn a_committed_service_and_a_recorded_none_cannot_both_apply() {
+        let f = fixture();
+        write_committed(
+            &f,
+            "[[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\ninclude = []\n",
+        );
+        write_home(&f, "[isolation]\nnone = true\n");
+        let e = format!("{:#}", load(&f.paths).unwrap_err());
+        assert!(e.contains("none = true"), "{e}");
+        assert!(e.contains("cannot all apply"), "{e}");
+        assert!(e.contains("pando.toml"), "it names the files: {e}");
+    }
+
     #[test]
     fn a_native_block_is_kept_as_written_and_no_longer_warns() {
         let f = fixture();

@@ -2042,7 +2042,12 @@ pub fn service_choice(
                         ));
                         Some("compose")
                     }
-                    "compose" if docker == Some(false) => {
+                    // Only when the recipes could actually run. A
+                    // machine with neither docker nor the engines gets
+                    // the compose it asked for and the refusal that
+                    // comes with it, rather than an evidence line
+                    // promising recipes that are not there either.
+                    "compose" if docker == Some(false) && every_engine => {
                         why.push(
                             "but docker is not on this machine, so the recipes it is".to_string(),
                         );
