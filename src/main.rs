@@ -8,6 +8,10 @@ use pando::{actions, config, project, tui};
 
 /// 0 ok, 1 error, 2 usage (clap's own), 3 needs-answer.
 const EXIT_ERROR: u8 = 1;
+/// A mistake in what was asked for: clap's own code for it, used for the
+/// argument errors clap cannot catch — an answers file naming a question
+/// pando does not ask.
+const EXIT_USAGE: u8 = 2;
 /// pando has a question it cannot answer on its own. Its own code, so an
 /// agent can tell "ask the human" from "it broke" without parsing text.
 pub const EXIT_NEEDS_ANSWER: u8 = 3;
@@ -26,6 +30,13 @@ fn main() -> ExitCode {
                 .expect("just checked");
             eprint!("{}", pando::cli::render_needs_answer(needs));
             ExitCode::from(EXIT_NEEDS_ANSWER)
+        }
+        // And a question that was answered *wrongly* is not a failure
+        // either: it is the same class of mistake as a misspelled flag,
+        // and it gets the same code.
+        Err(e) if e.downcast_ref::<pando::cli::UsageError>().is_some() => {
+            eprintln!("pando: {e:#}");
+            ExitCode::from(EXIT_USAGE)
         }
         Err(e) => {
             // `{:#}` flattens the context chain onto one line: a CLI failure

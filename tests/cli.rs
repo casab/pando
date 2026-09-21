@@ -94,6 +94,27 @@ impl Env {
         self.home.join("projects").join(&project.id)
     }
 
+    /// Runs pando with something on its stdin, for `--answers -`.
+    fn pando_stdin(&self, args: &[&str], input: &str) -> Output {
+        use std::io::Write;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pando"))
+            .env("PANDO_HOME", &self.home)
+            .current_dir(&self.root)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("run pando");
+        child
+            .stdin
+            .take()
+            .expect("a piped stdin")
+            .write_all(input.as_bytes())
+            .expect("write the answers");
+        child.wait_with_output().expect("wait for pando")
+    }
+
     fn pando_in(&self, cwd: &Path, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_pando"))
             .env("PANDO_HOME", &self.home)
@@ -1721,5 +1742,164 @@ fn init_with_yes_records_that_a_flag_chose() {
         written.contains("# answered: --yes took the first of"),
         "a config that claims a rule decided what a flag decided is one nobody can review: \
          {written}"
+    );
+}
+
+// ---- an answers file ------------------------------------------------------
+
+/// The answers a program would send for the deliberately ambiguous
+/// fixture: the two questions its rules cannot settle, plus the services.
+const ANSWERS: &str = r#"{
+  "dev_cmd": "pnpm dev:web",
+  "port_env": "WEB_PORT",
+  "services": ["db", "cache"]
+}"#;
+
+#[test]
+fn an_answers_file_fills_the_config_and_says_a_program_answered() {
+    let e = env_of(Kind::NextMessy);
+    let path = e.home.join("answers.json");
+    std::fs::write(&path, ANSWERS).unwrap();
+
+    let out = e.pando(&["init", "--answers", path.to_str().unwrap()]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+
+    let written = std::fs::read_to_string(e.config_file()).unwrap();
+    assert!(
+        written.contains(r#"cmd = "pnpm dev:web""#),
+        "the option was named by its own text: {written}"
+    );
+    assert!(
+        written.contains(r#"ports = { WEB_PORT = "web" }"#),
+        "{written}"
+    );
+    assert!(
+        written.contains(r#"include = ["db", "cache"]"#),
+        "{written}"
+    );
+    assert!(
+        written.matches("# answered: a program,").count() >= 3,
+        "every key a program answered says so, and none of the detected ones do: {written}"
+    );
+    assert!(
+        written.contains(r#"install = "pnpm install --frozen-lockfile"  # detected:"#),
+        "a rule's own answer still says a rule decided it: {written}"
+    );
+    assert_eq!(status_porcelain(&e.root), "");
+}
+
+#[test]
+fn an_answers_file_can_come_from_stdin() {
+    let e = env_of(Kind::NextMessy);
+    let out = e.pando_stdin(&["init", "--answers", "-"], ANSWERS);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    assert!(
+        std::fs::read_to_string(e.config_file())
+            .unwrap()
+            .contains(r#"cmd = "pnpm dev:web""#)
+    );
+}
+
+// Never a silent skip: a program that named a question pando does not ask
+// has to hear about it, with the names it could have used.
+#[test]
+fn a_question_pando_does_not_ask_is_a_usage_error() {
+    let e = env_of(Kind::NextMessy);
+    let out = e.pando_stdin(
+        &["init", "--answers", "-"],
+        r#"{"dev_command": "pnpm dev"}"#,
+    );
+    assert_eq!(code(&out), EXIT_USAGE, "stdout: {}", stdout(&out));
+    let printed = stderr(&out);
+    assert!(printed.contains("dev_command"), "{printed}");
+    assert!(printed.contains("dev_cmd"), "{printed}");
+    assert!(
+        !e.config_file().exists(),
+        "the file is checked before a single key is written"
+    );
+}
+
+#[test]
+fn an_answer_that_is_not_on_offer_names_what_is() {
+    let e = env_of(Kind::NextMessy);
+    let out = e.pando_stdin(
+        &["init", "--answers", "-"],
+        r#"{"services": ["postgres"], "dev_cmd": "pnpm dev", "port_env": "PORT"}"#,
+    );
+    assert_eq!(code(&out), EXIT_USAGE, "stdout: {}", stdout(&out));
+    let printed = stderr(&out);
+    assert!(printed.contains("postgres"), "{printed}");
+    assert!(
+        printed.contains("cache, db, mail, queue"),
+        "a service the compose file does not declare is not one pando can run: {printed}"
+    );
+}
+
+// Re-running is safe: the answers for slots that already have one are
+// reported and left alone, comment and all.
+#[test]
+fn answers_for_questions_already_answered_are_reported_and_not_reapplied() {
+    let e = env_of(Kind::NextMessy);
+    assert_eq!(
+        code(&e.pando_stdin(&["init", "--answers", "-"], ANSWERS)),
+        EXIT_OK
+    );
+    let first = std::fs::read_to_string(e.config_file()).unwrap();
+
+    let out = e.pando_stdin(&["init", "--answers", "-"], ANSWERS);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    let printed = stderr(&out);
+    for name in ["dev_cmd", "port_env", "services"] {
+        assert!(
+            printed.contains(&format!("{name} is already answered")),
+            "{printed}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(e.config_file()).unwrap(),
+        first,
+        "a second run with the same answers changes nothing"
+    );
+}
+
+// The preview is the real renderer against a copy, so what it prints is
+// what would land — and nothing is kept.
+#[test]
+fn dry_run_prints_the_config_it_would_write_and_writes_nothing() {
+    let e = env_of(Kind::NextMessy);
+    let out = e.pando_stdin(&["init", "--answers", "-", "--dry-run"], ANSWERS);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+
+    let printed = stdout(&out);
+    assert!(
+        printed.contains(&format!("# {}", e.config_file().display())),
+        "the file it would write is named: {printed}"
+    );
+    assert!(printed.contains(r#"cmd = "pnpm dev:web""#), "{printed}");
+    assert!(printed.contains("# answered: a program,"), "{printed}");
+    assert!(
+        stderr(&out).contains("would write"),
+        "the summary says it did not: {}",
+        stderr(&out)
+    );
+    assert!(
+        !e.config_file().exists(),
+        "a preview that writes the file is not a preview"
+    );
+    assert!(
+        !e.home.join("preview").exists(),
+        "and the scratch copy it made is gone"
+    );
+    assert_eq!(status_porcelain(&e.root), "");
+
+    // And the real run then writes exactly what the preview showed.
+    assert_eq!(
+        code(&e.pando_stdin(&["init", "--answers", "-"], ANSWERS)),
+        EXIT_OK
+    );
+    let written = std::fs::read_to_string(e.config_file()).unwrap();
+    assert!(
+        printed.contains(&written),
+        "the preview was the real thing: {printed}"
     );
 }

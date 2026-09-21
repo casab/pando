@@ -608,6 +608,13 @@ pub enum Note {
     /// options the rules had already resolved and left the rest. "The
     /// first of N" would be a sentence about a list nobody picked from.
     TookRuled { taken: usize, offered: usize },
+    /// A program answered, through `init --answers`: `# answered: a
+    /// program, 2026-09-21`.
+    ///
+    /// Its own note rather than [`Note::Answered`], because a developer
+    /// reading their config has to be able to see which decisions a
+    /// machine made for them and go and check those first.
+    Program,
 }
 
 impl Note {
@@ -623,6 +630,7 @@ impl Note {
             Note::TookRuled { taken, offered } => {
                 format!("  # answered: --yes took the {taken} of {offered} the rules resolved")
             }
+            Note::Program => format!("  # answered: a program, {}", Utc::now().format("%Y-%m-%d")),
         }
     }
 }

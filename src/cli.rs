@@ -105,6 +105,17 @@ pub enum Command {
         /// Without it, an unanswerable question exits 3.
         #[arg(long)]
         yes: bool,
+        /// A JSON file of answers — `-` reads stdin. One key per question,
+        /// named as `pando signals` names it, whose value is the option's
+        /// own text, a command of your own, a list for a question whose
+        /// answer is a set, or null for "none of them". Every answer goes
+        /// through the same checks a person's does and is written down as
+        /// a program's.
+        #[arg(long, value_name = "PATH")]
+        answers: Option<String>,
+        /// Print the config this would write, and write nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Stop a worktree's processes, or every worktree's when given no name.
     Stop {
@@ -250,12 +261,37 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             }
             Ok(())
         }
-        Command::Init { yes } => {
-            let report = actions::init(paths, config, &asker(yes), &notice)?;
+        Command::Init {
+            yes,
+            answers,
+            dry_run,
+        } => {
+            let answers = answers.as_deref().map(read_answers).transpose()?;
+            let ask = init_asker(answers.as_ref(), yes);
+            let (report, preview) = match dry_run {
+                true => actions::init_dry_run(paths, config, &ask, &notice)?,
+                false => (actions::init(paths, config, &ask, &notice)?, Vec::new()),
+            };
+            // Before the summary, because it is about what the file the
+            // summary describes does *not* say.
+            if let Some(answers) = &answers {
+                report_unused(answers, config);
+            }
             for warning in &report.warnings {
                 notice(warning);
             }
-            write!(out, "{}", render_init(&report))?;
+            if !dry_run {
+                write!(out, "{}", render_init(&report, "wrote"))?;
+                return Ok(());
+            }
+            for (path, body) in &preview {
+                writeln!(out, "# {}", path.display())?;
+                write!(out, "{body}")?;
+            }
+            // The summary goes to stderr on this path: stdout is the
+            // config, so `pando init --dry-run > preview.toml` is a file
+            // and nothing else.
+            eprint!("{}", render_init(&report, "would write"));
             Ok(())
         }
         Command::Stop { name, only } => match name {
@@ -635,19 +671,310 @@ fn prompt_one(
     }
 }
 
+// ---- an answers file ------------------------------------------------------
+
+/// A mistake in what was asked for, rather than a failure of what pando
+/// tried to do. Exit 2, the code clap's own argument errors use.
+///
+/// Its own type because `--answers` is a contract a program writes
+/// against: "you named a question pando does not ask" has to be
+/// distinguishable from "the command failed" without reading English.
+#[derive(Debug, Clone)]
+pub struct UsageError(pub String);
+
+impl std::fmt::Display for UsageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for UsageError {}
+
+fn usage(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(UsageError(message.into()))
+}
+
+/// The name a slot goes by in an answers file and in `signals` — derived
+/// from the type itself, so the file a program writes and the JSON it read
+/// cannot drift apart.
+pub fn slot_name(slot: crate::detect::Slot) -> String {
+    serde_json::to_value(slot)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .expect("every slot serialises to its name")
+}
+
+fn slot_named(name: &str) -> Option<crate::detect::Slot> {
+    serde_json::from_value(serde_json::Value::String(name.to_string())).ok()
+}
+
+/// Every name an answers file may use, in the order the questions come.
+fn slot_names() -> Vec<String> {
+    actions::ALL_SLOTS.iter().copied().map(slot_name).collect()
+}
+
+/// What a program answered, slot by slot.
+///
+/// The write path an agent uses, so it is a contract rather than a
+/// convenience. Nothing here writes TOML: every value goes through the
+/// same `resolve` a person's answer does — the same candidates, the same
+/// checks, the same file — and lands with a comment saying a program chose
+/// it.
+#[derive(Debug)]
+pub struct Answers {
+    by_slot: BTreeMap<crate::detect::Slot, serde_json::Value>,
+    /// Which slots a question actually reached, so the ones nothing asked
+    /// about can be reported instead of silently dropped.
+    asked: std::cell::RefCell<std::collections::BTreeSet<crate::detect::Slot>>,
+}
+
+impl Answers {
+    /// Parses the file. A name pando does not ask about is a usage error
+    /// naming it: a silent skip would leave a program believing it had
+    /// answered something.
+    pub fn parse(text: &str) -> Result<Answers> {
+        let parsed: serde_json::Value =
+            serde_json::from_str(text).map_err(|e| usage(format!("--answers is not JSON: {e}")))?;
+        let serde_json::Value::Object(object) = parsed else {
+            return Err(usage(
+                "--answers takes a JSON object of question name to answer",
+            ));
+        };
+        let mut by_slot = BTreeMap::new();
+        for (name, value) in object {
+            let slot = slot_named(&name).ok_or_else(|| {
+                usage(format!(
+                    "--answers names {name:?}, which is not a question pando asks — it asks \
+                     about: {}",
+                    slot_names().join(", ")
+                ))
+            })?;
+            // Checked here, before a single key is written: a shape this
+            // slot cannot take is knowable from the slot alone, and a
+            // program should learn it from the file it just sent rather
+            // than from a half-written config.
+            check_shape(slot, &value)?;
+            by_slot.insert(slot, value);
+        }
+        Ok(Answers {
+            by_slot,
+            asked: std::cell::RefCell::new(std::collections::BTreeSet::new()),
+        })
+    }
+
+    /// The answer for this question, when the file has one for its slot.
+    fn for_question(&self, question: &actions::Question) -> Option<Result<actions::Answer>> {
+        let value = self.by_slot.get(&question.slot)?;
+        self.asked.borrow_mut().insert(question.slot);
+        Some(answer_from(question, value))
+    }
+
+    /// Slots the file answered that no question ever asked about.
+    fn unasked(&self) -> Vec<crate::detect::Slot> {
+        let asked = self.asked.borrow();
+        self.by_slot
+            .keys()
+            .copied()
+            .filter(|slot| !asked.contains(slot))
+            .collect()
+    }
+}
+
+/// Which shapes a slot's answer may take, decided from the slot alone.
+///
+/// Three, and each one means the same thing everywhere: the text of an
+/// option or a command of your own, a list for an answer that is a set or
+/// a list of files, and null for "none of them". Anything else is a usage
+/// error naming the question, never a silent skip — and it is caught when
+/// the file is read, so a bad shape on a slot no rule ends up asking
+/// about is still reported.
+fn check_shape(slot: crate::detect::Slot, value: &serde_json::Value) -> Result<()> {
+    let name = slot_name(slot);
+    match value {
+        serde_json::Value::Null if !slot.allows_none() => Err(usage(format!(
+            "{name} has no \"none\" answer — null answers only the questions that have one"
+        ))),
+        serde_json::Value::Null => Ok(()),
+        serde_json::Value::String(text) if text.trim().is_empty() => Err(usage(format!(
+            "{name} was answered with an empty string — null is how you say none"
+        ))),
+        serde_json::Value::String(_) if slot.is_multi() => Err(usage(format!(
+            "{name} is answered with a list of the options, or null for none of them"
+        ))),
+        serde_json::Value::String(_) => Ok(()),
+        serde_json::Value::Array(items) => {
+            if !slot.is_multi() && !slot.is_list() {
+                return Err(usage(format!(
+                    "{name} takes one answer, not a list of them"
+                )));
+            }
+            if items.iter().any(|item| !item.is_string()) {
+                return Err(usage(format!("{name} takes a list of strings")));
+            }
+            // An empty list is the recorded answer "none of them" at the
+            // set question, and nothing at all at a list of files.
+            if !slot.is_multi() && items.is_empty() {
+                return Err(usage(format!(
+                    "{name} was answered with an empty list — null is how you say none"
+                )));
+            }
+            Ok(())
+        }
+        other => Err(usage(format!(
+            "{name} takes a string, a list of strings, or null — not {other}"
+        ))),
+    }
+}
+
+/// One JSON value, as an answer to one question.
+///
+/// The shapes are [`check_shape`]'s; what is left here is matching what a
+/// program sent against what the rules actually offered.
+fn answer_from(question: &actions::Question, value: &serde_json::Value) -> Result<actions::Answer> {
+    check_shape(question.slot, value)?;
+    let name = slot_name(question.slot);
+    // Everything from here is a program's answer, which is what the note
+    // beside the key it fills has to say.
+    let program = |answer| Ok(actions::Answer::Program(Box::new(answer)));
+    match value {
+        serde_json::Value::Null => program(actions::Answer::None),
+        serde_json::Value::String(text) => {
+            let text = text.trim();
+            match option_named(question, text) {
+                // By value, not by index: the option carries more than its
+                // text — the roles a command owns, the whole process table
+                // a workspace answer is — and a list of indexes is a
+                // contract that breaks the day a rule finds one more
+                // candidate.
+                Some(index) => program(actions::Answer::Choice(index)),
+                None if question.allow_custom => program(actions::Answer::Custom(text.to_string())),
+                None => Err(unknown_option(question, &name, text)),
+            }
+        }
+        serde_json::Value::Array(items) => {
+            let chosen: Vec<String> = items
+                .iter()
+                .filter_map(|item| item.as_str().map(|text| text.trim().to_string()))
+                .collect();
+            if question.multi {
+                let mut indexes = Vec::new();
+                for text in &chosen {
+                    let index = option_named(question, text)
+                        .ok_or_else(|| unknown_option(question, &name, text))?;
+                    indexes.push(index);
+                }
+                // The empty set is the recorded answer "none of them",
+                // which is a different thing from never having been asked.
+                return match indexes.is_empty() {
+                    true => program(actions::Answer::None),
+                    false => program(actions::Answer::Many(indexes)),
+                };
+            }
+            // A list slot's answer is one value with the files in it, and
+            // a program should not have to know how they are joined.
+            let joined = crate::detect::join_list(&chosen);
+            match option_named(question, &joined) {
+                Some(index) => program(actions::Answer::Choice(index)),
+                None => program(actions::Answer::Custom(joined)),
+            }
+        }
+        other => Err(usage(format!(
+            "{name} takes a string, a list of strings, or null — not {other}"
+        ))),
+    }
+}
+
+fn option_named(question: &actions::Question, text: &str) -> Option<usize> {
+    question
+        .options
+        .iter()
+        .position(|(value, _)| value.trim() == text)
+}
+
+/// Naming what was on offer, because a set answer has no other way in: a
+/// service pando did not find is not a service it can run.
+fn unknown_option(question: &actions::Question, name: &str, text: &str) -> anyhow::Error {
+    let offered: Vec<&str> = question
+        .options
+        .iter()
+        .map(|(value, _)| value.as_str())
+        .collect();
+    usage(format!(
+        "{name} was answered {text:?}, which is not one of its options — they are: {}",
+        match offered.is_empty() {
+            true => "none at all".to_string(),
+            false => offered.join(", "),
+        }
+    ))
+}
+
+/// Reads an answers file, or stdin for `-`.
+fn read_answers(path: &str) -> Result<Answers> {
+    let text = match path {
+        "-" => {
+            let mut buf = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+                .map_err(|e| usage(format!("--answers -: {e}")))?;
+            buf
+        }
+        path => {
+            std::fs::read_to_string(path).map_err(|e| usage(format!("--answers {path}: {e}")))?
+        }
+    };
+    Answers::parse(&text)
+}
+
+/// The `init` asker: the answers file where it has something to say, and
+/// the ordinary one — a terminal, `--yes`, or exit 3 — everywhere else.
+fn init_asker(
+    answers: Option<&Answers>,
+    yes: bool,
+) -> impl Fn(&actions::Question) -> Result<actions::Answer> + '_ {
+    let fallback = asker(yes);
+    move |question: &actions::Question| {
+        if let Some(answers) = answers
+            && let Some(answer) = answers.for_question(question)
+        {
+            return answer;
+        }
+        fallback(question)
+    }
+}
+
+/// What the answers file said that nothing used.
+///
+/// Never silent: a program that answered a question pando did not ask has
+/// to learn that from the run rather than from a config that looks nothing
+/// like what it sent.
+fn report_unused(answers: &Answers, before: &Config) {
+    for slot in answers.unasked() {
+        let name = slot_name(slot);
+        if actions::already_answered(slot, before) {
+            notice(&format!(
+                "{name} is already answered — the answers file was not applied to it"
+            ));
+        } else {
+            notice(&format!(
+                "nothing asked about {name} in this run — the answers file's value for it was \
+                 not used"
+            ));
+        }
+    }
+}
+
 /// What `init` prints: where the answers went, and what they say.
 ///
 /// The path first, because the one thing a developer wants after a batch
 /// of questions is the file to go and read.
-fn render_init(report: &actions::InitReport) -> String {
+fn render_init(report: &actions::InitReport, verb: &str) -> String {
     let mut out = String::new();
     if report.answered_anything() {
-        out.push_str(&format!("wrote {}\n", report.config_file.display()));
+        out.push_str(&format!("{verb} {}\n", report.config_file.display()));
         // Named only when this run put something there: the prelude is
         // about the machine, and a developer who never answered it should
         // not be pointed at a file pando did not touch.
         if let Some(user) = &report.user_file {
-            out.push_str(&format!("and  {}\n", user.display()));
+            out.push_str(&format!("{verb} {}\n", user.display()));
         }
     } else if report.config_file.exists() {
         out.push_str(&format!(
@@ -2863,5 +3190,161 @@ mod tests {
         w.head = None;
         w.head_sha = None;
         assert_eq!(short_head(&w), None);
+    }
+
+    // ---- an answers file -------------------------------------------------
+
+    // The names in the file are the names `signals` publishes, because
+    // they are the same function of the same type.
+    #[test]
+    fn every_question_has_one_name_that_round_trips() {
+        for slot in actions::ALL_SLOTS {
+            let name = slot_name(slot);
+            assert!(!name.is_empty(), "{slot:?} has no name");
+            assert_eq!(slot_named(&name), Some(slot), "{name} does not round trip");
+        }
+        assert_eq!(slot_names().len(), actions::ALL_SLOTS.len());
+    }
+
+    fn parse_err(json: &str) -> String {
+        format!("{:#}", Answers::parse(json).unwrap_err())
+    }
+
+    #[test]
+    fn a_name_pando_does_not_ask_about_is_a_usage_error_naming_it() {
+        let err = parse_err(r#"{"dev_command": "pnpm dev"}"#);
+        assert!(err.contains("dev_command"), "{err}");
+        assert!(err.contains("dev_cmd"), "and what it does ask about: {err}");
+        assert!(
+            Answers::parse(r#"{"dev_command": "x"}"#)
+                .unwrap_err()
+                .downcast_ref::<UsageError>()
+                .is_some(),
+            "a name that is not a question is a usage error, not a failure"
+        );
+    }
+
+    // Caught when the file is read, not when a question happens to reach
+    // the slot: a shape this slot cannot take is knowable from the slot.
+    #[test]
+    fn a_shape_the_slot_cannot_take_is_refused_before_anything_is_written() {
+        let err = parse_err(r#"{"install": 42}"#);
+        assert!(err.contains("install"), "{err}");
+        assert!(err.contains("string"), "{err}");
+
+        let err = parse_err(r#"{"install": null}"#);
+        assert!(err.contains("no \"none\" answer"), "{err}");
+
+        let err = parse_err(r#"{"install": ["a", "b"]}"#);
+        assert!(err.contains("not a list"), "{err}");
+
+        let err = parse_err(r#"{"services": "db"}"#);
+        assert!(err.contains("list of the options"), "{err}");
+
+        let err = parse_err(r#"{"install": "   "}"#);
+        assert!(err.contains("empty string"), "{err}");
+
+        // And the shapes that are fine everywhere they are offered.
+        assert!(Answers::parse(r#"{"port_env": null}"#).is_ok());
+        assert!(Answers::parse(r#"{"services": []}"#).is_ok());
+        assert!(Answers::parse(r#"{"provision": [".env"]}"#).is_ok());
+        assert!(Answers::parse(r#"{"version_files": [".nvmrc"]}"#).is_ok());
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_json_object_is_a_usage_error() {
+        assert!(parse_err("[1, 2]").contains("JSON object"));
+        assert!(parse_err("{").contains("not JSON"));
+    }
+
+    // By value, never by index: the option carries the roles a command
+    // owns and the process tables a workspace answer is, and a list of
+    // indexes is a contract that breaks the day a rule finds one more
+    // candidate.
+    #[test]
+    fn an_option_is_answered_by_its_own_text() {
+        let question = dev_question(&["pnpm dev", "pnpm dev:web"]);
+        let answer = answer_from(&question, &serde_json::json!("pnpm dev:web")).unwrap();
+        assert_eq!(
+            answer,
+            actions::Answer::Program(Box::new(actions::Answer::Choice(1)))
+        );
+    }
+
+    // Every question has a custom answer, and a program gets the same one.
+    #[test]
+    fn a_value_no_option_has_is_a_command_of_your_own() {
+        let question = dev_question(&["pnpm dev"]);
+        let answer = answer_from(&question, &serde_json::json!("./serve.sh")).unwrap();
+        assert_eq!(
+            answer,
+            actions::Answer::Program(Box::new(actions::Answer::Custom("./serve.sh".to_string())))
+        );
+    }
+
+    // Except at the set question, where there is nothing to type: a
+    // service the compose file does not declare is not one pando can run.
+    #[test]
+    fn a_set_answer_that_names_nothing_on_offer_says_what_is() {
+        let question = services_question();
+        let err = answer_from(&question, &serde_json::json!(["postgres"])).unwrap_err();
+        let printed = format!("{err:#}");
+        assert!(printed.contains("postgres"), "{printed}");
+        assert!(printed.contains("cache, db, mail, queue"), "{printed}");
+        assert!(err.downcast_ref::<UsageError>().is_some());
+    }
+
+    #[test]
+    fn a_set_answer_is_the_options_it_names_and_an_empty_one_is_none_of_them() {
+        let question = services_question();
+        assert_eq!(
+            answer_from(&question, &serde_json::json!(["db", "cache"])).unwrap(),
+            actions::Answer::Program(Box::new(actions::Answer::Many(vec![1, 0])))
+        );
+        assert_eq!(
+            answer_from(&question, &serde_json::json!([])).unwrap(),
+            actions::Answer::Program(Box::new(actions::Answer::None))
+        );
+        assert_eq!(
+            answer_from(&question, &serde_json::Value::Null).unwrap(),
+            actions::Answer::Program(Box::new(actions::Answer::None))
+        );
+    }
+
+    // A list slot takes a JSON array, joined into the one value the slot
+    // writes — so a program never has to know the separator.
+    #[test]
+    fn a_list_slot_takes_an_array_and_joins_it_the_way_the_slot_splits_it() {
+        let question = actions::Question {
+            slot: crate::detect::Slot::Provision,
+            prompt: crate::detect::Slot::Provision.prompt().to_string(),
+            options: vec![(".env,.env.local".to_string(), "here".to_string())],
+            preselect: Some(0),
+            allow_custom: true,
+            allow_none: true,
+            multi: false,
+            checked: Vec::new(),
+            details: Vec::new(),
+        };
+        // The option's own text, reached without spelling the separator.
+        assert_eq!(
+            answer_from(&question, &serde_json::json!([".env", ".env.local"])).unwrap(),
+            actions::Answer::Program(Box::new(actions::Answer::Choice(0)))
+        );
+        // And a list nothing offered is still an answer.
+        assert_eq!(
+            answer_from(&question, &serde_json::json!([".env", ".envrc"])).unwrap(),
+            actions::Answer::Program(Box::new(actions::Answer::Custom(".env,.envrc".to_string())))
+        );
+    }
+
+    // An answer nothing asked about is reported rather than dropped: a
+    // program that answered a question pando did not ask has to hear it.
+    #[test]
+    fn the_answers_a_run_never_used_are_the_ones_nothing_asked_about() {
+        let answers = Answers::parse(r#"{"install": "npm ci", "dev_cmd": "pnpm dev"}"#).unwrap();
+        let question = dev_question(&["pnpm dev"]);
+        assert!(answers.for_question(&question).is_some());
+        assert_eq!(answers.unasked(), vec![crate::detect::Slot::Install]);
     }
 }

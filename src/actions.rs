@@ -859,6 +859,14 @@ pub enum Answer {
     /// an empty answer that means something: the port, and the empty set
     /// at the services question.
     None,
+    /// One of the shapes above, from a program rather than a person:
+    /// `init --answers`.
+    ///
+    /// A wrapper rather than four more variants, so the shapes stay four
+    /// and the one thing that differs — the note written beside the key —
+    /// is decided in one place. [`answered_by`] peels it before anything
+    /// matches on what is inside.
+    Program(Box<Answer>),
 }
 
 /// How a front end asks. The CLI prompts on a terminal and refuses
@@ -881,6 +889,36 @@ impl std::fmt::Display for NeedsAnswer {
 }
 
 impl std::error::Error for NeedsAnswer {}
+
+/// Who answered, for the comment written beside the key it fills.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answerer {
+    Human,
+    Program,
+}
+
+impl Answerer {
+    /// The note for this answer: what a person choosing or typing it
+    /// earns, or the one that says a program did.
+    fn note(self, human: config::Note) -> config::Note {
+        match self {
+            Answerer::Human => human,
+            Answerer::Program => config::Note::Program,
+        }
+    }
+}
+
+/// Peels [`Answer::Program`] off the shape underneath it, so one match
+/// handles the four shapes and the provenance is decided once.
+fn answered_by(answer: Answer) -> (Answer, Answerer) {
+    let mut answer = answer;
+    let mut by = Answerer::Human;
+    while let Answer::Program(inner) = answer {
+        by = Answerer::Program;
+        answer = *inner;
+    }
+    (answer, by)
+}
 
 /// The slots `new` fills: what to install, what pins the runtime, and which
 /// local files a worktree needs a copy of.
@@ -1109,13 +1147,14 @@ pub fn resolve_on(
             } else {
                 let question = question_for(proposal, &[]);
                 let offered = question.options.len();
-                match ask(&question)? {
+                let (answer, by) = answered_by(ask(&question)?);
+                match answer {
                     Answer::Many(indexes) => (
                         indexes
                             .iter()
                             .map(|index| pick(proposal, *index))
                             .collect::<Result<Vec<_>>>()?,
-                        config::Note::Answered,
+                        by.note(config::Note::Answered),
                     ),
                     // `--yes`. Written down as what it is: a flag took the
                     // options the rules had resolved. A config that claims
@@ -1129,7 +1168,7 @@ pub fn resolve_on(
                         };
                         (taken, note)
                     }
-                    Answer::None => (Vec::new(), config::Note::Answered),
+                    Answer::None => (Vec::new(), by.note(config::Note::Answered)),
                     _ => bail!(
                         "{} is answered with a set of the {offered} options",
                         slot_label(*slot)
@@ -1157,16 +1196,18 @@ pub fn resolve_on(
         } else {
             let question = question_for(proposal, &[]);
             let offered = question.options.len();
-            match ask(&question)? {
+            let (answer, by) = answered_by(ask(&question)?);
+            match answer {
                 Answer::Choice(index) => {
                     let candidate = pick(proposal, index)?;
                     let why = candidate.why.clone();
-                    (candidate, config::Note::Detected(why))
+                    (candidate, by.note(config::Note::Detected(why)))
                 }
                 Answer::Auto(index) => (pick(proposal, index)?, config::Note::TookFirst(offered)),
-                Answer::Custom(value) => {
-                    (detect::custom(*slot, value.trim()), config::Note::Answered)
-                }
+                Answer::Custom(value) => (
+                    detect::custom(*slot, value.trim()),
+                    by.note(config::Note::Answered),
+                ),
                 // Only the multi-select slot has a set for an answer, and
                 // it never reaches here.
                 Answer::Many(_) => bail!(
@@ -1186,7 +1227,7 @@ pub fn resolve_on(
                         table,
                         key,
                         toml_edit::Value::Array(toml_edit::Array::new()),
-                        config::Note::Answered,
+                        by.note(config::Note::Answered),
                     )?;
                     match slot {
                         Slot::PortEnv => {
@@ -1201,6 +1242,7 @@ pub fn resolve_on(
                     continue;
                 }
                 Answer::None => bail!("{} has no \"none\" answer", slot_label(*slot)),
+                Answer::Program(_) => unreachable!("answered_by peels every wrapper"),
             }
         };
         let (candidate, note) = candidate;
@@ -1317,17 +1359,11 @@ fn question_for(proposal: &detect::Proposal, details: &[String]) -> Question {
         // instead — "agents never hang" is about failing loudly, not about
         // accepting anything rather than stopping.
         preselect: proposal.candidates.iter().position(|c| !c.needs_a_human),
-        // A set answer takes the options as they are; there is no command
-        // to type in place of "which of these containers".
-        allow_custom: !proposal.slot.is_multi(),
-        // "This process has no port", "none of those services", "this
-        // machine needs nothing in front of its commands", and "no
-        // worktree needs a local file of mine": four slots whose empty
-        // answer means something and has to be recordable.
-        allow_none: matches!(
-            proposal.slot,
-            Slot::PortEnv | Slot::Prelude | Slot::Provision
-        ) || proposal.slot.is_multi(),
+        // Both off the slot itself, so an answers file can check the
+        // shape of what a program sent the moment the file is read —
+        // before a question exists to check it against.
+        allow_custom: proposal.slot.allows_custom(),
+        allow_none: proposal.slot.allows_none(),
         multi: proposal.slot.is_multi(),
         checked: proposal.preselected(),
         details: details.to_vec(),
@@ -1459,6 +1495,100 @@ pub fn init(
     // than at the start of whatever the developer runs next.
     let loaded = config::load(paths)?;
     Ok(init_report(paths, &loaded, &before))
+}
+
+/// [`init`], against a copy of the files it would write.
+///
+/// Returns the report and the files as they would be, each with the path
+/// it would really land at. The same pass, the same resolver and the same
+/// renderer: a preview that re-implemented the writing would be a preview
+/// of something else.
+///
+/// The copies live in a scratch directory under pando's **own home**,
+/// which is one of the three places Invariant 1 names — a preview is not
+/// a reason to add a fourth — and it is removed before this returns.
+pub fn init_dry_run(
+    paths: &PandoPaths,
+    config: &Config,
+    ask: Ask<'_>,
+    progress: &dyn Fn(&str),
+) -> Result<(InitReport, Vec<(PathBuf, String)>)> {
+    let scratch = Scratch::new(paths)?;
+    let previewed = PandoPaths::new(scratch.dir.clone(), paths.project.clone());
+    // What pando has already written for this project and this machine, so
+    // the preview edits the real file rather than one that starts empty:
+    // the answer it adds lands among the developer's own keys and
+    // comments, exactly where it would.
+    let files = [
+        (paths.config_file(), previewed.config_file()),
+        (paths.user_config_file(), previewed.user_config_file()),
+    ];
+    for (from, to) in &files {
+        let Ok(text) = std::fs::read_to_string(from) else {
+            continue;
+        };
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+        std::fs::write(to, text).with_context(|| format!("write {}", to.display()))?;
+    }
+    let report = init(&previewed, config, ask, progress)?;
+    // Only the files this pass would *change*. A machine-wide config the
+    // run never touched is not part of the answer to "what would you
+    // write", and printing it back is noise in front of the thing that is.
+    let rendered: Vec<(PathBuf, String)> = files
+        .iter()
+        .filter_map(|(real, preview)| {
+            let body = std::fs::read_to_string(preview).ok()?;
+            let before = std::fs::read_to_string(real).ok();
+            (before.as_deref() != Some(body.as_str())).then(|| (real.clone(), body))
+        })
+        .collect();
+    Ok((
+        InitReport {
+            // Named as the files it would really write, not the copies it
+            // wrote instead.
+            config_file: paths.config_file(),
+            user_file: report.user_file.map(|_| paths.user_config_file()),
+            ..report
+        },
+        rendered,
+    ))
+}
+
+/// A throwaway pando home, removed when it goes out of scope — including
+/// when the pass it was made for failed partway through.
+struct Scratch {
+    dir: PathBuf,
+}
+
+impl Scratch {
+    fn new(paths: &PandoPaths) -> Result<Scratch> {
+        // Through the one function that makes the home 0700 and refuses it
+        // inside the repository, rather than beside it with a `create_dir`
+        // that knows neither rule.
+        paths.ensure_home()?;
+        let dir = paths.home.join("preview").join(format!(
+            "{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        Ok(Scratch { dir })
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+        // And the directory they all share, once the last one has gone:
+        // `remove_dir` only succeeds on an empty one, so a preview running
+        // beside this one keeps it.
+        if let Some(parent) = self.dir.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
 }
 
 fn init_report(paths: &PandoPaths, loaded: &config::Loaded, before: &[bool]) -> InitReport {
@@ -1845,25 +1975,27 @@ fn answer_prelude(
 ) -> Result<()> {
     let question = question_for(proposal, report);
     let offered = question.options.len();
-    let (line, note) = match ask(&question)? {
+    let (answer, by) = answered_by(ask(&question)?);
+    let (line, note) = match answer {
         Answer::Choice(index) => {
             let candidate = pick(proposal, index)?;
             let why = candidate.why.clone();
-            (candidate.value, config::Note::Detected(why))
+            (candidate.value, by.note(config::Note::Detected(why)))
         }
         Answer::Auto(index) => (
             pick(proposal, index)?.value,
             config::Note::TookFirst(offered),
         ),
-        Answer::Custom(value) => (value.trim().to_string(), config::Note::Answered),
+        Answer::Custom(value) => (value.trim().to_string(), by.note(config::Note::Answered)),
         // "This machine needs nothing." Recorded as an empty prelude
         // rather than left unset, so it is never asked again — the shape
         // the port slot already uses for a process with no ports.
-        Answer::None => (String::new(), config::Note::Answered),
+        Answer::None => (String::new(), by.note(config::Note::Answered)),
         Answer::Many(_) => bail!(
             "{} is one line, not several of them",
             slot_label(Slot::Prelude)
         ),
+        Answer::Program(_) => unreachable!("answered_by peels every wrapper"),
     };
     if !line.is_empty() {
         let mut proposed = config.clone();

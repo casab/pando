@@ -551,6 +551,33 @@ impl Slot {
         self == Slot::Services
     }
 
+    /// Whether "none of them" is an answer here, and one worth recording:
+    /// a process with no port, a machine that needs no line in front of
+    /// its commands, a worktree that needs no local file, an empty set of
+    /// services. An answer nothing can record is asked again on every run.
+    pub fn allows_none(self) -> bool {
+        matches!(self, Slot::PortEnv | Slot::Prelude | Slot::Provision) || self.is_multi()
+    }
+
+    /// Whether a command typed by hand is an answer. Every slot but the
+    /// set question: "these three" is a subset of the options, and there
+    /// is no command to type in place of "which of these containers".
+    pub fn allows_custom(self) -> bool {
+        !self.is_multi()
+    }
+
+    /// Whether this slot's single answer is a *list* written as one
+    /// comma-separated value: which files pin the runtime, which files a
+    /// worktree gets a copy of.
+    ///
+    /// One value rather than a set of options, because a developer may
+    /// name a file no rule found — but still a list, which is why
+    /// `--answers` takes a JSON array here and [`join_list`] turns it
+    /// into the form [`edits`] splits again.
+    pub fn is_list(self) -> bool {
+        matches!(self, Slot::VersionFiles | Slot::Provision)
+    }
+
     /// Which file this slot's answer is written to.
     ///
     /// Everything a project needs goes in the project layer, because it is
@@ -2456,6 +2483,13 @@ pub fn roles_in(cmd: &str) -> Vec<String> {
 
 /// Multi-valued slots carry their list as one comma-separated string, so a
 /// `Candidate` stays one value whatever the slot holds.
+/// The one-value form of a list slot's answer, which [`split_list`] takes
+/// apart again. A program answering through `init --answers` sends a JSON
+/// array and never has to know the separator.
+pub fn join_list(values: &[String]) -> String {
+    values.join(",")
+}
+
 fn split_list(value: &str) -> Vec<String> {
     value
         .split(',')
