@@ -789,6 +789,154 @@ fn every_file_the_lifecycle_writes_is_under_pandos_home() {
     h.assert_untouched("the whole lifecycle", None);
 }
 
+/// The whole share lifecycle, against a fake provider: a tunnel, an auth
+/// command, and a proxy all write logs and spawn processes, and none of it
+/// may touch the repository.
+#[test]
+fn sharing_never_writes_into_the_repository() {
+    if !common::python3_available() {
+        eprintln!("skipping: python3 is not installed");
+        return;
+    }
+    let mut toml = String::new();
+    toml.push_str("[project]\nprovision = [\".env\", \".env.local\"]\ninstall = \"true\"\n\n");
+    toml.push_str("[dev]\ncmd = '''");
+    toml.push_str(&common::listener_on_port_template());
+    toml.push_str("'''\nports = [\"web\"]\n\n");
+    // An auth command that runs *in the worktree* — the one thing about a
+    // share that executes a project's own script there.
+    toml.push_str("[share]\nauth_cmd = \"printf 'pando_session=abc123'\"\n");
+
+    let h = harness_with(&toml);
+    common::fake_cloudflared(&h.home);
+    h.assert_untouched("setup", None);
+
+    let name = actions::new(&h.paths, &h.config, "feat/one", None, &|_| {}).unwrap();
+    let worktree = h.config.worktrees_dir(&h.paths).join(&name);
+    let outcome = actions::start(&h.paths, &h.config, &name, None, false, &|_| {}).unwrap();
+    let port = outcome.ports["web"];
+    assert!(
+        wait_for(|| {
+            matches!(
+                actions::refresh(&h.paths).state.worktrees[&name].processes["dev"].phase,
+                state::Phase::Running { .. }
+            )
+        }),
+        "the listener never came up on {port}: {:?}",
+        std::fs::read_to_string(h.paths.log_file(&name, "dev"))
+    );
+    h.assert_untouched("start", Some(&worktree));
+
+    let shared = share_through_the_binary(&h, &name);
+    assert_eq!(shared.public_url, common::FAKE_TUNNEL_URL);
+    assert!(shared.pre_authed, "auth_cmd means a proxy");
+    h.assert_untouched("share", Some(&worktree));
+
+    // Everything the share wrote is under the home, including the isolated
+    // cloudflared config that exists to shadow the user's own.
+    for path in [
+        h.paths.log_file(&name, "tunnel"),
+        h.paths.log_file(&name, "proxy"),
+        h.paths.tunnel_config_file(),
+    ] {
+        assert!(path.exists(), "{} should have been written", path.display());
+        assert!(
+            path.starts_with(&h.home),
+            "{} escaped pando's home",
+            path.display()
+        );
+    }
+    assert!(
+        !std::fs::read_to_string(h.paths.tunnel_config_file())
+            .unwrap()
+            .contains("ingress:"),
+        "the config pando writes must define no ingress"
+    );
+
+    let mut out = Vec::new();
+    pando::cli::status_json(&h.paths, None, &mut out).unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        status["worktrees"][0]["share"]["url"],
+        common::FAKE_TUNNEL_URL
+    );
+    h.assert_untouched("status --json while shared", Some(&worktree));
+
+    // The cookie is in the proxy's environment and nowhere on disk.
+    let logs = h.paths.logs_dir(&name);
+    let written: String = std::fs::read_dir(&logs)
+        .unwrap()
+        .flatten()
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let state_text = std::fs::read_to_string(h.paths.state_file()).unwrap();
+    for haystack in [&written, &state_text] {
+        assert!(
+            !haystack.contains("pando_session=abc123"),
+            "the cookie reached something that outlives the share:\n{haystack}"
+        );
+    }
+
+    actions::unshare(&h.paths, &name).unwrap();
+    h.assert_untouched("unshare", Some(&worktree));
+
+    // And again, so the second share reuses the proxy port and starts from
+    // a truncated tunnel log rather than the last session's URL.
+    let again = share_through_the_binary(&h, &name);
+    assert_eq!(again.public_url, common::FAKE_TUNNEL_URL);
+    h.assert_untouched("share again", Some(&worktree));
+
+    actions::stop(&h.paths, &name, None).unwrap();
+    assert!(
+        state::load(&h.paths.state_file()).unwrap().worktrees[&name]
+            .share
+            .is_none(),
+        "a stopped worktree never keeps a public URL"
+    );
+    h.assert_untouched("stop", Some(&worktree));
+
+    actions::rm(&h.paths, &name, false, false).unwrap();
+    h.assert_untouched("rm", None);
+    assert!(
+        !h.paths.logs_dir(&name).exists(),
+        "rm wipes the tunnel and proxy logs with the rest"
+    );
+}
+
+/// `share`, with the proxy told to re-exec the real `pando` binary.
+///
+/// The proxy runs `pando __share-proxy` in whatever binary is running —
+/// which inside an integration test is this test harness, and it exits at
+/// once. Everything else here is the real path.
+fn share_through_the_binary(h: &Harness, name: &str) -> actions::ShareOutcome {
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_pando"));
+    let provider = pando::tunnel::provider_for(h.config.share.provider.as_deref()).unwrap();
+    actions::share_with(
+        &h.paths,
+        &h.config,
+        name,
+        provider.as_ref(),
+        &|paths, name, listen, upstream, cookie| {
+            pando::share_proxy::spawn_with(paths, name, listen, upstream, cookie, &binary)
+        },
+        &|_| {},
+    )
+    .expect("share")
+}
+
+/// Polls until `ready` or twenty seconds pass.
+fn wait_for(ready: impl Fn() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        if ready() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    false
+}
+
 /// Fixture 1 with a fake docker in pando's home and a config that runs
 /// private copies of its compose services.
 fn isolated_harness() -> Harness {
