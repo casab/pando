@@ -849,38 +849,55 @@ pub fn resolve_silencing(
         // single-candidate path below, because "these three" is not one of
         // the options — it is a subset of them.
         if slot.is_multi() {
-            let chosen: Vec<detect::Candidate> = if proposal.decided {
+            let (chosen, note): (Vec<detect::Candidate>, config::Note) = if proposal.decided {
                 let taken: Vec<detect::Candidate> =
                     proposal.preferred_set().into_iter().cloned().collect();
+                let why = taken.first().map(|c| c.why.clone()).unwrap_or_default();
                 if !taken.is_empty() {
+                    // Not "running private copies of": a start that is not
+                    // isolating runs none, and this line is written on
+                    // every start that fills the slot.
                     progress(&format!(
-                        "running private copies of {} (detected: {})",
+                        "using {} as this project's services (detected: {why})",
                         taken
                             .iter()
                             .map(|c| c.value.as_str())
                             .collect::<Vec<_>>()
                             .join(", "),
-                        taken[0].why
                     ));
                 }
-                taken
+                (taken, config::Note::Detected(why))
             } else {
                 let question = question_for(proposal);
                 let offered = question.options.len();
                 match ask(&question)? {
-                    Answer::Many(indexes) => indexes
-                        .iter()
-                        .map(|index| pick(proposal, *index))
-                        .collect::<Result<Vec<_>>>()?,
-                    Answer::Auto(_) => proposal.preferred_set().into_iter().cloned().collect(),
-                    Answer::None => Vec::new(),
+                    Answer::Many(indexes) => (
+                        indexes
+                            .iter()
+                            .map(|index| pick(proposal, *index))
+                            .collect::<Result<Vec<_>>>()?,
+                        config::Note::Answered,
+                    ),
+                    // `--yes`. Written down as what it is: a flag took the
+                    // options the rules had resolved. A config that claims
+                    // a human chose them is one nobody can review.
+                    Answer::Auto(_) => {
+                        let taken: Vec<detect::Candidate> =
+                            proposal.preferred_set().into_iter().cloned().collect();
+                        let note = config::Note::TookRuled {
+                            taken: taken.len(),
+                            offered,
+                        };
+                        (taken, note)
+                    }
+                    Answer::None => (Vec::new(), config::Note::Answered),
                     _ => bail!(
                         "{} is answered with a set of the {offered} options",
                         slot_label(*slot)
                     ),
                 }
             };
-            apply_service_answer(paths, &mut config, *slot, &chosen, proposal)?;
+            apply_service_answer(paths, &mut config, *slot, &chosen, note)?;
             continue;
         }
         let candidate = if proposal.decided {
@@ -988,17 +1005,12 @@ fn apply_service_answer(
     config: &mut Config,
     slot: Slot,
     chosen: &[detect::Candidate],
-    proposal: &detect::Proposal,
+    note: config::Note,
 ) -> Result<()> {
     if chosen.is_empty() {
         return Ok(());
     }
     let refs: Vec<&detect::Candidate> = chosen.iter().collect();
-    let note = if proposal.decided {
-        config::Note::Detected(chosen[0].why.clone())
-    } else {
-        config::Note::Answered
-    };
     if let Some((array, entries)) = detect::array_edits(slot, &refs) {
         config::set_detected_array_entry(paths, array, entries, note)?;
     }

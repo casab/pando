@@ -1392,6 +1392,32 @@ fn status_env_without_a_name_is_a_usage_error() {
     );
 }
 
+// Every guess is visible, and so is every non-guess: a flag taking the
+// services must not be written down as if a human had chosen them.
+#[test]
+fn yes_says_in_the_file_that_a_flag_took_the_services() {
+    let e = env_of(Kind::NextMessy);
+    common::docker::install(&e.home);
+    // The process slots are already answered, so `--isolated --yes` has
+    // exactly one question left to take.
+    e.write_config("[project]\ninstall = \"true\"\n\n[dev]\ncmd = \"sleep 30\"\nports = []\n");
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+    let out = e.pando(&["start", "feat+one", "--isolated", "--yes"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+
+    let text = std::fs::read_to_string(e.config_file()).unwrap();
+    assert!(text.contains("[[services]]"), "{text}");
+    assert!(
+        text.contains("include = [\"db\", \"mail\"]"),
+        "--yes takes the ones a rule resolved and leaves cache and queue: {text}"
+    );
+    assert!(
+        text.contains("--yes took the 2 of 4 the rules resolved"),
+        "the file has to say a flag decided this: {text}"
+    );
+    assert_eq!(code(&e.pando(&["stop"])), EXIT_OK);
+}
+
 // The plan's own words: an isolated start on a project with no services
 // runs shared and says so, rather than refusing.
 #[test]

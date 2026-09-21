@@ -478,6 +478,10 @@ pub enum Note {
     /// `Detected`: no rule decided this, a flag did, and the file has to
     /// say so or it claims a confidence nothing had.
     TookFirst(usize),
+    /// The same, for a question whose answer is a *set*: `--yes` took the
+    /// options the rules had already resolved and left the rest. "The
+    /// first of N" would be a sentence about a list nobody picked from.
+    TookRuled { taken: usize, offered: usize },
 }
 
 impl Note {
@@ -489,6 +493,9 @@ impl Note {
             Note::Answered => format!("  # answered: {}", Utc::now().format("%Y-%m-%d")),
             Note::TookFirst(options) => {
                 format!("  # answered: --yes took the first of {options} options")
+            }
+            Note::TookRuled { taken, offered } => {
+                format!("  # answered: --yes took the {taken} of {offered} the rules resolved")
             }
         }
     }

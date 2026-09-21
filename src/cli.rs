@@ -305,7 +305,10 @@ fn asker(yes: bool) -> impl Fn(&actions::Question) -> Result<actions::Answer> {
                     .map(|(value, _)| value.as_str())
                     .collect();
                 notice(&format!("--yes: taking {}", joined(&taken)));
-                return Ok(actions::Answer::Many(question.checked.clone()));
+                // `Auto`, not `Many`: nobody chose these, a flag took the
+                // ones the rules had resolved, and the comment written to
+                // `pando.toml` has to say which of the two happened.
+                return Ok(actions::Answer::Auto(0));
             }
             return match question.preselect {
                 Some(index) => {
@@ -1843,13 +1846,14 @@ mod tests {
         );
     }
 
+    // `Auto`, not `Many`: the resolver turns `Auto` into the ticked set
+    // *and* into a comment saying a flag took it. A `Many` would be
+    // written down as if a human had chosen, which is a config nobody can
+    // review.
     #[test]
-    fn yes_takes_the_ticked_set_of_a_question_it_cannot_ask() {
+    fn yes_takes_the_ticked_set_as_an_auto_answer_not_a_choice() {
         let question = services_question();
-        assert_eq!(
-            asker(true)(&question).unwrap(),
-            actions::Answer::Many(vec![1, 2])
-        );
+        assert_eq!(asker(true)(&question).unwrap(), actions::Answer::Auto(0));
     }
 
     #[test]
