@@ -1385,7 +1385,7 @@ fn doctor_writes_nothing_anywhere() {
     let worktree = h.config.worktrees_dir(&h.paths).join(&name);
     h.assert_untouched("new", Some(&worktree));
 
-    let home_before = tree(&h.home);
+    let home_before = stamped(&h.home);
     for args in [
         vec!["doctor"],
         vec!["doctor", "--json"],
@@ -1395,8 +1395,9 @@ fn doctor_writes_nothing_anywhere() {
     ] {
         let out = pando(&h, &args);
         // 0 or 1: this fixture pins a runtime, and whether this machine
-        // resolves it is a fact about the machine. Anything else would be
-        // a crash.
+        // resolves it is a fact about the machine. The failing path is
+        // pinned deliberately below, so that a host which happens to
+        // resolve it still exercises both.
         assert!(
             matches!(out.status.code(), Some(0) | Some(1)),
             "{args:?} exited {:?}: {}",
@@ -1405,9 +1406,61 @@ fn doctor_writes_nothing_anywhere() {
         );
         h.assert_untouched(&args.join(" "), Some(&worktree));
         assert_eq!(
-            tree(&h.home),
+            stamped(&h.home),
             home_before,
             "after {args:?}: pando's own home changed — doctor reports, it does not write"
         );
     }
+
+    // And the failing run, which is the one worth being sure about: a
+    // command that exits non-zero is the shape most likely to have
+    // written something on its way to the exit. Made to fail by a rule
+    // that holds on every machine — a non-frozen install — rather than by
+    // the runtime mismatch above, which is a fact about the host.
+    // Written whole rather than appended: a second `[project]` table on
+    // top of the one detection wrote is a TOML error, and the run would
+    // then exit 1 for a reason this test is not about.
+    std::fs::write(
+        h.paths.config_file(),
+        "[project]\ninstall = \"npm install\"\n",
+    )
+    .unwrap();
+    let home_before = stamped(&h.home);
+    for args in [vec!["doctor"], vec!["doctor", "--json"]] {
+        let out = pando(&h, &args);
+        let printed = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{args:?} should have found the non-frozen install: {printed}"
+        );
+        assert!(
+            printed.contains("non-frozen install"),
+            "and for that reason, not another one: {printed}"
+        );
+        h.assert_untouched(&args.join(" "), Some(&worktree));
+        assert_eq!(
+            stamped(&h.home),
+            home_before,
+            "after a failing {args:?}: pando's own home changed"
+        );
+    }
+}
+
+/// Every path under `root` with its size *and* its modification time.
+///
+/// Stricter than [`tree`], and only doctor needs it: "this command writes
+/// nothing" is a claim about bytes touched, and a file rewritten with the
+/// same length — a state file re-serialised, a cache rewritten unchanged —
+/// is a write that a size comparison would call no change at all.
+fn stamped(root: &Path) -> BTreeMap<String, (Entry, Option<std::time::SystemTime>)> {
+    tree(root)
+        .into_iter()
+        .map(|(relative, entry)| {
+            let modified = std::fs::symlink_metadata(root.join(&relative))
+                .and_then(|m| m.modified())
+                .ok();
+            (relative, (entry, modified))
+        })
+        .collect()
 }
