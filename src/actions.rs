@@ -1349,7 +1349,11 @@ fn slot_label(slot: Slot) -> &'static str {
 }
 
 /// Whether config already says what this slot needs, from any layer.
-fn already_answered(slot: Slot, config: &Config) -> bool {
+///
+/// Public because it is the one answer to "is there still a question
+/// here": `init` reports it, `signals` publishes it, and a second
+/// implementation of it would be a second opinion.
+pub fn already_answered(slot: Slot, config: &Config) -> bool {
     match slot {
         Slot::Install => config.project.install.is_some(),
         Slot::VersionFiles => !config.runtime.version_files.is_empty(),
@@ -1368,6 +1372,209 @@ fn already_answered(slot: Slot, config: &Config) -> bool {
         // project's processes are?
         Slot::Processes | Slot::DevCmd | Slot::PortEnv => !detect::still_needed(slot, config),
     }
+}
+
+// ---- init -----------------------------------------------------------------
+
+/// Every slot `init` fills: everything `new` needs and everything `start`
+/// needs, in the order the config file reads.
+///
+/// Deliberately the same slots, asked through the same [`resolve`] those
+/// two commands call. `init` is the batch form of the just-in-time
+/// questions, not a second set of them: one implementation of each
+/// question, or the two drift and a developer gets a different config
+/// depending on which command reached the slot first.
+pub const ALL_SLOTS: [Slot; 9] = [
+    Slot::Install,
+    Slot::VersionFiles,
+    Slot::Prelude,
+    // Before the slots that fill a single process, exactly as
+    // `START_SLOTS` orders them: this one decides whether there is one.
+    Slot::Processes,
+    Slot::DevCmd,
+    Slot::PortEnv,
+    // Asked here, unlike on a plain `start`, which silences it: a start
+    // that is not isolating has no business asking about a mode it is not
+    // in, and `init` is the pass where every question is on the table.
+    Slot::Services,
+    Slot::SchemaHook,
+    Slot::Provision,
+];
+
+/// One slot, after `init` has been through it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotSummary {
+    pub slot: Slot,
+    /// The slot in a sentence: "install command", "dev command".
+    pub label: &'static str,
+    /// What config says now, short enough for one line. `None` when
+    /// nothing says anything: a slot no rule found a candidate for and
+    /// nobody answered.
+    pub value: Option<String>,
+    /// Whether this run is what answered it.
+    pub answered_now: bool,
+}
+
+/// What `init` did, and what config says afterwards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitReport {
+    /// The project layer: the file every answer about this project is in.
+    pub config_file: PathBuf,
+    /// The machine-wide file, named only when this run put an answer
+    /// there — the prelude is the one slot that belongs to the laptop.
+    pub user_file: Option<PathBuf>,
+    /// One entry per slot, in the order they were asked.
+    pub slots: Vec<SlotSummary>,
+    /// What loading the written config back had to say.
+    pub warnings: Vec<String>,
+}
+
+impl InitReport {
+    /// Whether this run answered anything at all. A second `init` answers
+    /// nothing, which is the point of writing the first one down.
+    pub fn answered_anything(&self) -> bool {
+        self.slots.iter().any(|s| s.answered_now)
+    }
+}
+
+/// Asks every unanswered question in one pass, writes every answer, and
+/// reports what config holds afterwards.
+///
+/// Starts nothing: it is [`resolve`] over [`ALL_SLOTS`] and a summary. Like
+/// every other answer path it writes inside pando's home and nowhere else.
+pub fn init(
+    paths: &PandoPaths,
+    config: &Config,
+    ask: Ask<'_>,
+    progress: &dyn Fn(&str),
+) -> Result<InitReport> {
+    let before: Vec<bool> = ALL_SLOTS
+        .iter()
+        .map(|slot| already_answered(*slot, config))
+        .collect();
+    resolve(paths, config, &ALL_SLOTS, ask, progress)?;
+    // Read back from disk rather than reported from memory. The summary is
+    // then a statement about the file that exists, and a file pando cannot
+    // read again is a failure worth having at the end of `init` rather
+    // than at the start of whatever the developer runs next.
+    let loaded = config::load(paths)?;
+    Ok(init_report(paths, &loaded, &before))
+}
+
+fn init_report(paths: &PandoPaths, loaded: &config::Loaded, before: &[bool]) -> InitReport {
+    let slots: Vec<SlotSummary> = ALL_SLOTS
+        .iter()
+        .enumerate()
+        .map(|(i, slot)| SlotSummary {
+            slot: *slot,
+            label: slot_label(*slot),
+            value: slot_value(&loaded.config, *slot),
+            answered_now: !before[i] && already_answered(*slot, &loaded.config),
+        })
+        .collect();
+    let user_file = slots
+        .iter()
+        .any(|s| s.answered_now && s.slot.layer() == config::Layer::User)
+        .then(|| paths.user_config_file());
+    InitReport {
+        config_file: paths.config_file(),
+        user_file,
+        slots,
+        warnings: loaded.warnings.clone(),
+    }
+}
+
+/// What config says about one slot, in the fewest words that are still
+/// true. A line for a human to read; nothing parses it back.
+fn slot_value(config: &Config, slot: Slot) -> Option<String> {
+    match slot {
+        Slot::Install => config.project.install.clone(),
+        Slot::VersionFiles => (!config.runtime.version_files.is_empty())
+            .then(|| config.runtime.version_files.join(", ")),
+        // The empty prelude is an answer — "this machine needs nothing" —
+        // and an empty cell would read as no answer at all.
+        Slot::Prelude => config
+            .runtime
+            .prelude
+            .as_ref()
+            .map(|line| match line.trim().is_empty() {
+                true => "nothing in front of this project's commands".to_string(),
+                false => line.clone(),
+            }),
+        Slot::Processes => (!config.processes.is_empty()).then(|| {
+            config
+                .processes
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        }),
+        Slot::DevCmd => config
+            .processes
+            .get(detect::DEV)
+            .map(|process| process.cmd.clone())
+            .filter(|cmd| !cmd.trim().is_empty()),
+        Slot::PortEnv => config
+            .processes
+            .get(detect::DEV)
+            .and_then(|process| process.ports.as_ref())
+            .map(ports_summary),
+        Slot::Services => services_summary(config),
+        // The command, with the name of the hook that runs it: the label
+        // says "schema command", and a bare `migrate` is the tab it logs
+        // to rather than the thing it does.
+        Slot::SchemaHook => (!config.hooks.is_empty()).then(|| {
+            config
+                .hooks
+                .iter()
+                .map(|hook| format!("{}: {}", hook.name, hook.cmd))
+                .collect::<Vec<_>>()
+                .join("; ")
+        }),
+        // `[]` is an answer here too: no worktree needs a local file of
+        // this developer's.
+        Slot::Provision => config
+            .project
+            .provision
+            .as_ref()
+            .map(|paths| match paths.is_empty() {
+                true => "none".to_string(),
+                false => paths.join(", "),
+            }),
+    }
+}
+
+fn ports_summary(ports: &config::PortsSpec) -> String {
+    match ports {
+        config::PortsSpec::Map(map) if !map.is_empty() => map
+            .iter()
+            .map(|(var, role)| format!("{var} = {role}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        config::PortsSpec::List(roles) if !roles.is_empty() => roles.join(", "),
+        // Both empty forms mean the same thing, and it is an answer.
+        _ => "no ports".to_string(),
+    }
+}
+
+/// The services a worktree would run private copies of. `none` when an
+/// entry exists and includes nothing, which is the written-down answer
+/// "none of them"; `None` when no entry exists at all.
+fn services_summary(config: &Config) -> Option<String> {
+    if config.services.is_empty() {
+        return None;
+    }
+    let mut names: Vec<String> = Vec::new();
+    for service in &config.services {
+        match service {
+            config::ServiceConfig::Compose { include, .. } => names.extend(include.iter().cloned()),
+            config::ServiceConfig::Native { name, .. } => names.push(name.clone()),
+        }
+    }
+    Some(match names.is_empty() {
+        true => "none".to_string(),
+        false => names.join(", "),
+    })
 }
 
 // ---- the runtime the project asks for -------------------------------------
@@ -8286,6 +8493,140 @@ time.sleep(300)
         assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
         let again = resolve_process(&fx.paths, &loaded.config, &refuse, &noop).unwrap();
         assert_eq!(again.processes["dev"].roles(), vec!["api", "web"]);
+    }
+
+    // ---- init ------------------------------------------------------------
+
+    // The batch form asks the same questions, through the same resolver:
+    // a project whose rules all decide is configured without a prompt.
+    #[test]
+    fn init_takes_every_slot_a_rule_decided_and_asks_nothing() {
+        let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");
+        let report = init(&fx.paths, &fx.config, &refuse, &noop).unwrap();
+
+        assert!(report.answered_anything());
+        let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+        assert!(
+            written.contains(r#"install = "pnpm install --frozen-lockfile""#),
+            "{written}"
+        );
+        assert!(written.contains(r#"cmd = "pnpm dev""#), "{written}");
+        assert!(written.contains("provision = [\".env\"]"), "{written}");
+    }
+
+    // Ask just in time, once: the second pass has nothing left to ask,
+    // which is what writing the first one down was for.
+    #[test]
+    fn a_second_init_asks_nothing_and_answers_nothing() {
+        let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");
+        init(&fx.paths, &fx.config, &refuse, &noop).unwrap();
+        let first = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+
+        let loaded = crate::config::load(&fx.paths).unwrap();
+        let report = init(&fx.paths, &loaded.config, &refuse, &noop).unwrap();
+        assert!(!report.answered_anything());
+        assert_eq!(
+            std::fs::read_to_string(fx.paths.config_file()).unwrap(),
+            first,
+            "a second init rewrites nothing at all"
+        );
+    }
+
+    // One question per undecided slot, in one pass, and every answer on
+    // disk when it ends.
+    #[test]
+    fn init_asks_one_question_per_undecided_slot() {
+        let fx = detectable_fixture(
+            r#"{ "dev": "concurrently 'next dev' 'node worker.js'", "dev:web": "next dev" }"#,
+            "PORT=3000\n",
+        );
+        let (ask, asked) = scripted(vec![Answer::Custom("pnpm dev".to_string())]);
+        let report = init(&fx.paths, &fx.config, &ask, &noop).unwrap();
+
+        let slots: Vec<Slot> = asked.borrow().iter().map(|q| q.slot).collect();
+        assert_eq!(
+            slots,
+            vec![Slot::DevCmd],
+            "the dev command is the only thing the rules could not settle here"
+        );
+        assert_eq!(
+            report
+                .slots
+                .iter()
+                .find(|s| s.slot == Slot::DevCmd)
+                .and_then(|s| s.value.clone()),
+            Some("pnpm dev".to_string())
+        );
+        let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+        assert!(written.contains(r#"cmd = "pnpm dev""#), "{written}");
+    }
+
+    // `init` is the batch form of the questions and nothing else. Answering
+    // them must not bring a worktree up.
+    #[test]
+    fn init_starts_nothing() {
+        let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");
+        let name = worktree_named(&fx, "feat/one");
+        init(&fx.paths, &fx.config, &refuse, &noop).unwrap();
+        assert!(
+            fx.state().worktrees[&name].processes.is_empty(),
+            "init answered questions and started something"
+        );
+    }
+
+    // The summary is about the file, not about the run: it is read back
+    // from disk, so a config pando could not load again is a failure `init`
+    // reports rather than one the next command discovers.
+    #[test]
+    fn the_summary_says_what_the_written_config_holds() {
+        let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");
+        let report = init(&fx.paths, &fx.config, &refuse, &noop).unwrap();
+        let value = |slot: Slot| {
+            report
+                .slots
+                .iter()
+                .find(|s| s.slot == slot)
+                .and_then(|s| s.value.clone())
+        };
+        assert_eq!(
+            value(Slot::Install),
+            Some("pnpm install --frozen-lockfile".to_string())
+        );
+        assert_eq!(value(Slot::DevCmd), Some("pnpm dev".to_string()));
+        assert_eq!(value(Slot::PortEnv), Some("PORT = web".to_string()));
+        assert_eq!(value(Slot::Provision), Some(".env".to_string()));
+        assert_eq!(value(Slot::Services), None, "there is no compose file here");
+        assert_eq!(report.config_file, fx.paths.config_file());
+        assert_eq!(report.user_file, None, "nothing here was about the machine");
+    }
+
+    // The prelude is the one answer that belongs to the laptop, so it is
+    // the one that makes `init` name a second file.
+    #[test]
+    fn a_machine_answer_names_the_machine_wide_file() {
+        let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");
+        std::fs::write(fx.root.join(".nvmrc"), "99\n").unwrap();
+        git(&fx.root, &["add", "."]);
+        git(&fx.root, &["commit", "--quiet", "-m", "pin node 99"]);
+
+        // No machine has node 99, so the probe is a mismatch on any host,
+        // and "this machine needs nothing" is the answer given.
+        let (ask, asked) = scripted(vec![
+            Answer::None,
+            Answer::Choice(0),
+            Answer::Choice(0),
+            Answer::Choice(0),
+        ]);
+        let report = init(&fx.paths, &fx.config, &ask, &noop).unwrap();
+        assert_eq!(
+            asked.borrow().first().map(|q| q.slot),
+            Some(Slot::Prelude),
+            "the runtime is asked about before anything else: {:?}",
+            asked.borrow().iter().map(|q| q.slot).collect::<Vec<_>>()
+        );
+        assert_eq!(report.user_file, Some(fx.paths.user_config_file()));
+        let written = std::fs::read_to_string(fx.paths.user_config_file()).unwrap();
+        assert!(written.contains(r#"prelude = """#), "{written}");
     }
 
     // ---- the services slot -----------------------------------------------

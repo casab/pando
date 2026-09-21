@@ -95,6 +95,17 @@ pub enum Command {
         #[arg(long)]
         isolated: bool,
     },
+    /// Answer every question pando has about this project, in one pass.
+    ///
+    /// The batch form of the questions `new` and `start` ask just in time,
+    /// through the same paths: nothing is started, nothing is written into
+    /// the repository, and a second run asks nothing.
+    Init {
+        /// Accept pando's own recommendation for anything it would ask.
+        /// Without it, an unanswerable question exits 3.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Stop a worktree's processes, or every worktree's when given no name.
     Stop {
         name: Option<String>,
@@ -175,6 +186,11 @@ impl Command {
                 // holds both pgids, and taking a URL down is something you
                 // want most when the config is broken.
                 | Command::Share { .. }
+                // `init`'s whole job is to fill this file in. A layer
+                // pando cannot read is exactly the thing to fix first,
+                // and patching on top of one it could not parse would
+                // lose whatever is in it.
+                | Command::Init { .. }
                 // `--env` renders templates, which only config holds. Plain
                 // `status` still runs on whatever is left.
                 | Command::Status { env: true, .. }
@@ -232,6 +248,14 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             } else {
                 writeln!(out, "started {name}{url}")?;
             }
+            Ok(())
+        }
+        Command::Init { yes } => {
+            let report = actions::init(paths, config, &asker(yes), &notice)?;
+            for warning in &report.warnings {
+                notice(warning);
+            }
+            write!(out, "{}", render_init(&report))?;
             Ok(())
         }
         Command::Stop { name, only } => match name {
@@ -609,6 +633,42 @@ fn prompt_one(
             )?,
         }
     }
+}
+
+/// What `init` prints: where the answers went, and what they say.
+///
+/// The path first, because the one thing a developer wants after a batch
+/// of questions is the file to go and read.
+fn render_init(report: &actions::InitReport) -> String {
+    let mut out = String::new();
+    if report.answered_anything() {
+        out.push_str(&format!("wrote {}\n", report.config_file.display()));
+        // Named only when this run put something there: the prelude is
+        // about the machine, and a developer who never answered it should
+        // not be pointed at a file pando did not touch.
+        if let Some(user) = &report.user_file {
+            out.push_str(&format!("and  {}\n", user.display()));
+        }
+    } else if report.config_file.exists() {
+        out.push_str(&format!(
+            "nothing left to answer — {} already says it all\n",
+            report.config_file.display()
+        ));
+    } else {
+        out.push_str("nothing to answer — pando has no questions about this project\n");
+    }
+    let width = report
+        .slots
+        .iter()
+        .filter(|slot| slot.value.is_some())
+        .map(|slot| slot.label.chars().count())
+        .max()
+        .unwrap_or(0);
+    for slot in &report.slots {
+        let Some(value) = &slot.value else { continue };
+        out.push_str(&format!("  {:<width$}  {value}\n", slot.label));
+    }
+    out
 }
 
 /// What exit code 3 prints: the question, its options, and the two ways out.

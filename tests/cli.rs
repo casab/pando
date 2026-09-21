@@ -1630,3 +1630,96 @@ fn a_prelude_that_works_is_written_to_the_user_layer_and_the_start_proceeds() {
     assert_eq!(code(&e.pando(&["stop"])), EXIT_OK);
     assert_eq!(status_porcelain(&e.root), "");
 }
+
+// ---- init -----------------------------------------------------------------
+
+// The batch form of every question, in one pass, through the same paths
+// `new` and `start` use. It prints where the answers went.
+#[test]
+fn init_answers_every_slot_and_says_which_file_it_wrote() {
+    let e = env_of(Kind::NextPnpmCompose);
+
+    let out = e.pando(&["init", "--yes"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    let printed = stdout(&out);
+    assert!(
+        printed.contains(&format!("wrote {}", e.config_file().display())),
+        "the file to go and read is the first thing it says: {printed}"
+    );
+    assert!(
+        printed.contains("pnpm install --frozen-lockfile"),
+        "{printed}"
+    );
+    assert!(printed.contains("pnpm dev"), "{printed}");
+    assert!(printed.contains("postgres, redis"), "{printed}");
+
+    let written = std::fs::read_to_string(e.config_file()).unwrap();
+    assert!(written.contains(r#"cmd = "pnpm dev""#), "{written}");
+    assert!(written.contains("[[services]]"), "{written}");
+    // Nothing was started, and nothing was written into the repository.
+    assert_eq!(
+        stdout(&e.pando(&["ls"])),
+        "no worktrees — `pando new <branch>` creates one\n"
+    );
+    assert_eq!(status_porcelain(&e.root), "");
+}
+
+#[test]
+fn a_second_init_has_nothing_left_to_answer() {
+    let e = env_of(Kind::NextPnpmCompose);
+    assert_eq!(code(&e.pando(&["init", "--yes"])), EXIT_OK);
+    let first = std::fs::read_to_string(e.config_file()).unwrap();
+
+    // No `--yes` this time: a run that asks nothing needs no flag, which
+    // is the whole point of having written the answers down.
+    let out = e.pando(&["init"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("nothing left to answer"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(std::fs::read_to_string(e.config_file()).unwrap(), first);
+}
+
+// Agents never hang: with nothing to read an answer from, the first
+// undecided slot is exit 3 and the question is on stderr.
+#[test]
+fn init_with_nobody_to_ask_exits_three_with_the_question() {
+    let e = env_of(Kind::NextMessy);
+
+    let out = e.pando(&["init"]);
+    assert_eq!(code(&out), EXIT_NEEDS_ANSWER, "stdout: {}", stdout(&out));
+    let printed = stderr(&out);
+    assert!(
+        printed.contains("Which command starts the local development server?"),
+        "{printed}"
+    );
+    assert!(
+        printed.contains("pnpm dev"),
+        "the options are printed: {printed}"
+    );
+    assert!(printed.contains("--yes"), "and the way out: {printed}");
+    // What the rules settled on the way is written down — the pass got
+    // that far — and the slot it stopped on is not: a question is not an
+    // answer.
+    let written = std::fs::read_to_string(e.config_file()).unwrap();
+    assert!(written.contains("install = "), "{written}");
+    assert!(!written.contains("[dev]"), "{written}");
+    assert_eq!(status_porcelain(&e.root), "");
+}
+
+// `--yes` answers the same questions and says in the file that a flag did.
+#[test]
+fn init_with_yes_records_that_a_flag_chose() {
+    let e = env_of(Kind::NextMessy);
+    let out = e.pando(&["init", "--yes"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+
+    let written = std::fs::read_to_string(e.config_file()).unwrap();
+    assert!(
+        written.contains("# answered: --yes took the first of"),
+        "a config that claims a rule decided what a flag decided is one nobody can review: \
+         {written}"
+    );
+}
