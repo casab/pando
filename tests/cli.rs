@@ -866,6 +866,33 @@ fn logs_for_a_worktree_that_has_never_run_says_where_they_would_be() {
     );
 }
 
+// A dev server that prints a binary blob leaves invalid UTF-8 in its log;
+// `from_utf8_lossy` turns it into U+FFFD, and a short date-ish token a few
+// bytes later used to put a timestamp match inside that character. Slicing
+// there panicked the process — `pando logs` exited 101, and the TUI died
+// with it. Reading a log must never be able to crash pando.
+#[test]
+fn logs_reads_a_file_with_invalid_utf8_before_a_short_timestamp() {
+    let e = env();
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+    let log = e.log_file("feat+one", "dev");
+    std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+    std::fs::write(
+        &log,
+        b"starting up fine\n\xff 21-09-26T10:00:00 hello\nafter\n",
+    )
+    .unwrap();
+
+    let out = e.pando(&["logs", "feat+one"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("21-09-26T10:00:00"),
+        "the line is printed, not swallowed: {}",
+        stdout(&out)
+    );
+    assert!(stdout(&out).contains("after"), "{}", stdout(&out));
+}
+
 #[test]
 fn a_crashed_process_stays_visible_as_failed() {
     let e = env();

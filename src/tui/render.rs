@@ -1963,6 +1963,10 @@ mod tests {
             "  \"detail\": \"…\"".to_string(),
             "}".to_string(),
             "日本語のログ行 with 🎉 emoji and e\u{0301} combining".to_string(),
+            // A date-ish token eleven bytes after a multi-byte character:
+            // the timestamp match starts inside the character unless the
+            // parser checks.
+            "日 21-09-26T10:00:00 起動".to_string(),
             "x".repeat(4000),
             "ERROR the last one".to_string(),
         ]

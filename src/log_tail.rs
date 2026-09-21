@@ -288,23 +288,55 @@ fn keyword_colorize(line: &str, lower: &str) -> Line<'static> {
     rich_colorize(line)
 }
 
+/// The nearest char boundary at or below `i`, `i` clamped to the string.
+fn floor_boundary(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// The nearest char boundary at or above `i`, `i` clamped to the string.
+fn ceil_boundary(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
 fn rich_colorize(line: &str) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut pos = 0;
 
     while pos < line.len() {
         if let Some(m) = find_pattern(&line[pos..]) {
-            if m.start > 0 {
+            // Belt and braces. A pattern that reported a start or an end
+            // inside a multi-byte character would panic the whole process
+            // on the slices below — `pando logs` and the TUI with it — so
+            // every offset is widened to the character that contains it
+            // before it is used. `find_pattern` is careful, but it is one
+            // pattern away from not being.
+            let rest = &line[pos..];
+            let start = floor_boundary(rest, m.start);
+            let end = ceil_boundary(rest, m.end).max(start);
+            if start > 0 {
                 spans.push(Span::styled(
-                    line[pos..pos + m.start].to_string(),
+                    line[pos..pos + start].to_string(),
                     Style::new().fg(text_dim()),
                 ));
             }
             spans.push(Span::styled(
-                line[pos + m.start..pos + m.end].to_string(),
+                line[pos + start..pos + end].to_string(),
                 m.style,
             ));
-            pos += m.end;
+            // Every pattern ends at least one byte in, so this makes
+            // progress and the loop terminates.
+            if end == 0 {
+                break;
+            }
+            pos += end;
         } else {
             spans.push(Span::styled(
                 line[pos..].to_string(),
@@ -491,11 +523,20 @@ fn find_pattern(s: &str) -> Option<PatternMatch> {
                 // A date prefix (2024-01-02T) puts an alphanumeric `T` right
                 // before the time, so anchor the word-boundary check on the
                 // start of the full stamp rather than on the bare time.
+                //
+                // Four of those eleven bytes are checked, so a shorter,
+                // date-*ish* token (`21-09-26T`) preceded by a multi-byte
+                // character lands `t - 11` inside that character. Slicing
+                // there panics, and a binary blob in a log is enough to
+                // produce one through `from_utf8_lossy`. When the eleven
+                // bytes back are not a character boundary, this is not a
+                // date prefix: colour the bare time instead.
                 let has_date_prefix = t >= 11
                     && b[t - 1] == b'T'
                     && b[t - 2].is_ascii_digit()
                     && b[t - 4] == b'-'
-                    && b[t - 7] == b'-';
+                    && b[t - 7] == b'-'
+                    && s.is_char_boundary(t - 11);
                 let ts_start = if has_date_prefix { t - 11 } else { t };
                 let at_start = ts_start == 0 || !b[ts_start - 1].is_ascii_alphanumeric();
                 if at_start {
@@ -961,6 +1002,64 @@ mod tests {
         let first = &tail.lines()[0].styled.spans[0];
         assert_eq!(first.content.as_ref(), "2024-01-02T15:04:05");
         assert_eq!(first.style.fg, Some(text_muted()));
+    }
+
+    // A date-*ish* token eleven bytes after a multi-byte character used to
+    // put the timestamp match's start inside that character, and
+    // `rich_colorize` sliced the line there — panicking the whole process,
+    // `pando logs` and the TUI alike. Every shape in the review's table,
+    // including the one a binary blob produces through `from_utf8_lossy`.
+    #[test]
+    fn a_date_ish_token_after_a_multibyte_character_does_not_panic() {
+        let panicky = [
+            // CJK + a two-digit-year ISO stamp.
+            "\u{65e5} 21-09-26T10:00:00 \u{8d77}\u{52d5}",
+            // Emoji + a US-shaped date.
+            "\u{2705} 9-21-24T10:00:00 build ok",
+            // And the shapes that were always fine, so the fallback to the
+            // bare time does not lose the full stamp.
+            "\u{1f680} 2026-09-21T10:00:00",
+            "\u{e9}2026-09-21T10:00:00",
+        ];
+        for raw in panicky {
+            let parsed = parse_plain(raw);
+            assert_eq!(parsed.plain, raw, "the text survives verbatim");
+            let painted: String = parsed
+                .styled
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect();
+            assert_eq!(painted, raw, "and every span joins back to it: {raw:?}");
+        }
+    }
+
+    // The same crash, reached the way a dev server really reaches it: raw
+    // bytes that are not UTF-8 become U+FFFD in `poll`'s `from_utf8_lossy`,
+    // and a two-digit-year stamp eleven-ish bytes later did the rest.
+    #[test]
+    fn invalid_utf8_before_a_two_digit_year_stamp_does_not_panic() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("binary.log");
+        // No level keyword in the text: `keyword_colorize` would otherwise
+        // paint the whole line in one span and never reach the pattern
+        // scanner this is about.
+        std::fs::write(&path, b"\xff 21-09-26T10:00:00 hello\n").unwrap();
+        let mut tail = LogTail::new(path, 10);
+        tail.poll().unwrap();
+        let line = &tail.lines()[0];
+        assert!(
+            line.plain.starts_with('\u{FFFD}'),
+            "the invalid byte is replaced, not dropped: {:?}",
+            line.plain
+        );
+        let painted: String = line
+            .styled
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(painted, line.plain);
     }
 
     #[test]
