@@ -817,7 +817,16 @@ fn render_services(out: &mut String, services: &ServicesReport) {
         row(out, "", line);
     }
     if services.compose.is_empty() && services.native.is_empty() {
-        row(out, "", "none configured");
+        // Not "none configured" after a line that just explained what
+        // *would* run: the two together read as a contradiction.
+        row(
+            out,
+            "",
+            match isolation.mechanism.is_some() {
+                true => "nothing is written down yet — an isolated start is what writes it",
+                false => "none configured",
+            },
+        );
         return;
     }
     for entry in &services.compose {
