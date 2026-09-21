@@ -1219,3 +1219,68 @@ fn answering_the_runtime_question_writes_only_under_pandos_home() {
     assert_eq!(status_porcelain(&h.root), "");
     h.assert_untouched("answering the runtime question", None);
 }
+
+// ---- the commands that answer questions -----------------------------------
+
+/// The real binary, with its home injected, in the fixture's main
+/// checkout. These commands are the ones a developer or an agent runs
+/// *before* anything is configured, which is exactly when a tool is most
+/// tempted to leave something behind.
+fn pando(h: &Harness, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_pando"))
+        .env("PANDO_HOME", &h.home)
+        .current_dir(&h.root)
+        .args(args)
+        .output()
+        .expect("run pando")
+}
+
+#[test]
+fn init_and_signals_never_write_into_the_repository() {
+    // No config at all, and the fixture whose rules cannot settle
+    // everything, so these runs really do answer questions rather than
+    // finding it all decided.
+    let h = harness_of(Kind::NextMessy, "");
+    // The one answer that is about this machine rather than the fixture.
+    // Without it a host whose `bash -lc` does not resolve the pinned node
+    // would be answering a different question.
+    std::fs::write(h.home.join("config.toml"), "[runtime]\nprelude = \"\"\n").unwrap();
+
+    // A worktree, so "every worktree" has one to check.
+    let name = actions::new(&h.paths, &h.config, "feat/one", None, &|_| {}).unwrap();
+    let worktree = h.config.worktrees_dir(&h.paths).join(&name);
+    h.assert_untouched("new", Some(&worktree));
+
+    let answers = h.home.join("answers.json");
+    std::fs::write(
+        &answers,
+        r#"{"dev_cmd": "pnpm dev:web", "port_env": "PORT", "services": ["db", "cache"]}"#,
+    )
+    .unwrap();
+    let answers = answers.to_str().unwrap().to_string();
+
+    for args in [
+        vec!["signals"],
+        vec!["init", "--dry-run", "--yes"],
+        vec!["init", "--answers", &answers, "--dry-run"],
+        vec!["init", "--answers", &answers],
+        vec!["init", "--yes"],
+        vec!["init"],
+        vec!["signals"],
+    ] {
+        let out = pando(&h, &args);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        h.assert_untouched(&args.join(" "), Some(&worktree));
+    }
+
+    // And the answers really did land, so this is a test about a pass that
+    // did something rather than one that found nothing to do.
+    let written = std::fs::read_to_string(h.paths.config_file()).unwrap();
+    assert!(written.contains("# answered: a program,"), "{written}");
+    assert!(written.contains(r#"cmd = "pnpm dev:web""#), "{written}");
+}

@@ -26,8 +26,21 @@ fn env() -> Env {
 }
 
 fn env_of(kind: Kind) -> Env {
+    env_built(kind, true)
+}
+
+/// The same, cloned rather than worked in: no local `.env`, which is what
+/// a fresh clone of a repository really looks like.
+fn env_fresh_clone(kind: Kind) -> Env {
+    env_built(kind, false)
+}
+
+fn env_built(kind: Kind, local_files: bool) -> Env {
     let dir = TempDir::new().unwrap();
-    let root = build(kind, dir.path()).root;
+    let root = match local_files {
+        true => build(kind, dir.path()).root,
+        false => common::build_fresh_clone(kind, dir.path()).root,
+    };
     let env = Env {
         home: dir.path().join("pando-home"),
         root,
@@ -1902,4 +1915,192 @@ fn dry_run_prints_the_config_it_would_write_and_writes_nothing() {
         printed.contains(&written),
         "the preview was the real thing: {printed}"
     );
+}
+
+// ---- signals --------------------------------------------------------------
+
+fn signals_of(e: &Env) -> serde_json::Value {
+    let out = e.pando(&["signals"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    serde_json::from_str(&stdout(&out)).expect("signals parses as JSON")
+}
+
+#[test]
+fn signals_is_json_identical_on_two_runs_and_writes_nothing() {
+    let e = env_of(Kind::NextPnpmCompose);
+    let first = e.pando(&["signals"]);
+    let second = e.pando(&["signals"]);
+    assert_eq!(code(&first), EXIT_OK, "stderr: {}", stderr(&first));
+    assert_eq!(
+        stdout(&first),
+        stdout(&second),
+        "detection is read-only, so two runs say the same thing"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&stdout(&first)).unwrap();
+    assert_eq!(parsed["version"], 1, "versioned like the other shapes");
+    assert_eq!(parsed["project"]["name"], "next-pnpm-compose");
+    assert!(
+        !e.config_file().exists(),
+        "signals reads; it never answers anything"
+    );
+    assert_eq!(status_porcelain(&e.root), "");
+}
+
+// Completeness over brevity: what the rules considered, why, and what they
+// would take — including the two things the last two work items added.
+#[test]
+fn signals_publishes_every_proposal_with_its_reasons() {
+    let e = env_of(Kind::NextPnpmCompose);
+    let signals = signals_of(&e);
+
+    let slot = |name: &str| {
+        signals["slots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["slot"] == name)
+            .unwrap_or_else(|| panic!("no slot named {name}"))
+            .clone()
+    };
+
+    let install = slot("install");
+    assert_eq!(
+        install["prompt"],
+        "Which command installs this project's dependencies?"
+    );
+    assert_eq!(install["answered"], false);
+    assert_eq!(install["proposal"]["decided"], true);
+    assert_eq!(install["proposal"]["preferred"], 0);
+    assert_eq!(
+        install["proposal"]["candidates"][0]["value"],
+        "pnpm install --frozen-lockfile"
+    );
+    assert_eq!(
+        install["proposal"]["candidates"][0]["why"],
+        "pnpm-lock.yaml"
+    );
+
+    // The set question publishes what starts ticked and that it is a set,
+    // which is exactly what an answers file needs to answer it.
+    let services = slot("services");
+    assert_eq!(services["proposal"]["multi"], true);
+    assert_eq!(services["proposal"]["allow_custom"], false);
+    assert_eq!(services["proposal"]["allow_none"], true);
+    assert_eq!(services["proposal"]["file"], "docker-compose.yml");
+    assert_eq!(
+        services["proposal"]["checked"].as_array().unwrap().len(),
+        2,
+        "postgres and redis are resolved; the mail catcher is not"
+    );
+    let postgres = services["proposal"]["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["value"] == "postgres")
+        .unwrap()
+        .clone();
+    assert_eq!(postgres["service"]["env_key"], "DATABASE_URL");
+    assert_eq!(postgres["service"]["file"], "docker-compose.yml");
+
+    // The whole `[[hooks]]` entry, not only its command.
+    let hook = slot("schema_hook");
+    assert_eq!(hook["proposal"]["candidates"][0]["hook"]["name"], "migrate");
+    assert_eq!(
+        hook["proposal"]["candidates"][0]["hook"]["after"],
+        "services"
+    );
+
+    // A slot no rule had anything to say about is present and empty,
+    // which is not the same as a rule deciding the answer is "none".
+    assert_eq!(slot("processes")["proposal"], serde_json::Value::Null);
+
+    // The runtime requirement is a project fact and is published; the
+    // machine's answer to it is not, because asking costs a spawn.
+    assert_eq!(
+        signals["signals"]["runtime_requirements"][0]["language"],
+        "node"
+    );
+    assert_eq!(
+        signals["signals"]["runtime_requirements"][0]["source"],
+        ".nvmrc"
+    );
+
+    // And what this build's own compose reader saw.
+    assert_eq!(signals["compose"][0]["file"], "docker-compose.yml");
+    assert_eq!(signals["compose"][0]["include"], false);
+    assert!(signals["compose"][0]["error"].is_null());
+}
+
+// A clone with no local files is the case the provision seeds exist for.
+#[test]
+fn signals_carries_the_provision_seeds_of_a_fresh_clone() {
+    let e = env_fresh_clone(Kind::NextPnpmCompose);
+    let signals = signals_of(&e);
+    let seeds = signals["signals"]["provision_seeds"].as_array().unwrap();
+    assert!(
+        seeds
+            .iter()
+            .any(|pair| pair[0] == ".env" && pair[1] == ".env.example"),
+        "{seeds:?}"
+    );
+}
+
+// The keys pando does not follow are published, so an agent can tell a
+// missing services proposal from a project with no services.
+#[test]
+fn signals_says_what_its_compose_reader_could_not_follow() {
+    let e = env_of(Kind::Plain);
+    std::fs::write(
+        e.root.join("docker-compose.yml"),
+        "include:\n  - other.yml\nservices:\n  db:\n    image: postgres:16\n",
+    )
+    .unwrap();
+    git(&e.root, &["add", "."]);
+    git(&e.root, &["commit", "--quiet", "-m", "compose"]);
+
+    let signals = signals_of(&e);
+    assert_eq!(signals["compose"][0]["include"], true);
+    assert_eq!(signals["compose"][0]["services"][0], "db");
+}
+
+// The names `signals` publishes are the names an answers file uses,
+// because both are the slot's own. Proven by answering what it reports.
+#[test]
+fn the_questions_signals_names_are_the_ones_an_answers_file_answers() {
+    let e = env_of(Kind::NextMessy);
+    let signals = signals_of(&e);
+
+    let mut answers = serde_json::Map::new();
+    for slot in signals["slots"].as_array().unwrap() {
+        let proposal = &slot["proposal"];
+        if proposal.is_null() || proposal["decided"] == true || slot["answered"] == true {
+            continue;
+        }
+        let candidates = proposal["candidates"].as_array().unwrap();
+        let name = slot["slot"].as_str().unwrap().to_string();
+        if proposal["multi"] == true {
+            let checked: Vec<serde_json::Value> = proposal["checked"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| candidates[i.as_u64().unwrap() as usize]["value"].clone())
+                .collect();
+            answers.insert(name, serde_json::Value::Array(checked));
+            continue;
+        }
+        let preferred = proposal["preferred"].as_u64().expect("an option to take") as usize;
+        answers.insert(name, candidates[preferred]["value"].clone());
+    }
+    assert!(!answers.is_empty(), "this fixture has questions to answer");
+
+    let sent = serde_json::Value::Object(answers).to_string();
+    let out = e.pando_stdin(&["init", "--answers", "-"], &sent);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    assert!(
+        !stderr(&out).contains("not used"),
+        "every answer it published a question for was used: {}",
+        stderr(&out)
+    );
+    let written = std::fs::read_to_string(e.config_file()).unwrap();
+    assert!(written.contains("# answered: a program,"), "{written}");
 }

@@ -1342,7 +1342,13 @@ fn pick(proposal: &detect::Proposal, index: usize) -> Result<detect::Candidate> 
         .cloned()
 }
 
-fn question_for(proposal: &detect::Proposal, details: &[String]) -> Question {
+/// The question a proposal becomes: the options, which one a flag may
+/// take, and which shapes are answers here.
+///
+/// Public because `signals` publishes exactly this — an agent reading it
+/// is looking at the question it would be asked, not at a second
+/// description of one.
+pub fn question_for(proposal: &detect::Proposal, details: &[String]) -> Question {
     Question {
         slot: proposal.slot,
         prompt: proposal.slot.prompt().to_string(),
