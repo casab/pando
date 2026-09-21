@@ -413,9 +413,15 @@ pub fn assign_share_port_with(
     }
 
     let base = derive_base(paths.project_id(), name);
-    let used = record.ports.len() as u16;
-    let found = (used..BASE_STEP)
-        .map(|offset| base.saturating_add(offset))
+    // From the far end of the worktree's own window, walking *down*. The
+    // first free port after the roles in use is exactly the port the next
+    // role would be given, and `assign_with` may not hand a role the share
+    // port — so taking it moved the whole window to another base the first
+    // time the project grew a process, under a notice claiming something
+    // had taken the worktree's ports. The top of the window is the one
+    // place role growth reaches last.
+    let found = (0..BASE_STEP)
+        .map(|offset| base.saturating_add(BASE_STEP - 1 - offset))
         .find(|port| *port <= PORT_MAX && is_free(*port) && !taken.contains(port))
         .or_else(|| {
             // The worktree's own window is full, so take a whole base of
@@ -747,6 +753,110 @@ mod tests {
             "a start after a share must not move a port"
         );
         assert!(!after.reassigned, "and must not claim it did");
+    }
+
+    // Finding 6. The share port used to sit immediately after the roles in
+    // use — exactly the port the next role would take — and `assign_with`
+    // is forbidden to give a role the share port. So the first time the
+    // project grew a process, the whole window failed to fit and moved to
+    // another base: a worktree that had once been shared lost eight ports
+    // and its URL changed, for a reason the developer never caused and
+    // under a notice claiming something had taken its ports.
+    #[test]
+    fn growing_a_role_after_a_share_leaves_the_ports_where_they_would_have_been() {
+        let (_dir, paths) = assign_fixture();
+
+        // The control: the same worktree and the same growth, never shared.
+        let mut control = crate::state::State::new();
+        with_record(&mut control, "feat+one");
+        assign_with(
+            &paths,
+            &mut control,
+            "feat+one",
+            &roles(&["web"]),
+            &[],
+            all_free,
+        )
+        .unwrap();
+        let grown = assign_with(
+            &paths,
+            &mut control,
+            "feat+one",
+            &roles(&["api", "web"]),
+            &[],
+            all_free,
+        )
+        .unwrap();
+
+        let mut shared = crate::state::State::new();
+        with_record(&mut shared, "feat+one");
+        assign_with(
+            &paths,
+            &mut shared,
+            "feat+one",
+            &roles(&["web"]),
+            &[],
+            all_free,
+        )
+        .unwrap();
+        let share = assign_share_port_with(&paths, &mut shared, "feat+one", all_free).unwrap();
+        let after = assign_with(
+            &paths,
+            &mut shared,
+            "feat+one",
+            &roles(&["api", "web"]),
+            &[],
+            all_free,
+        )
+        .unwrap();
+
+        assert_eq!(
+            after.ports, grown.ports,
+            "having once been shared cost the worktree its whole window"
+        );
+        assert_eq!(
+            after.reassigned, grown.reassigned,
+            "a share must not change what growing a role does, in either direction"
+        );
+        assert!(
+            !after.ports.values().any(|p| *p == share),
+            "the proxy's own port {share} went to a role: {after:?}"
+        );
+    }
+
+    #[test]
+    fn a_share_port_is_taken_from_the_top_of_the_worktrees_own_window() {
+        let (_dir, paths) = assign_fixture();
+        let mut store = crate::state::State::new();
+        with_record(&mut store, "feat+one");
+        assign_with(
+            &paths,
+            &mut store,
+            "feat+one",
+            &roles(&["web"]),
+            &[],
+            all_free,
+        )
+        .unwrap();
+
+        let base = derive_base(paths.project_id(), "feat+one");
+        let share = assign_share_port_with(&paths, &mut store, "feat+one", all_free).unwrap();
+        assert_eq!(
+            share,
+            base + BASE_STEP - 1,
+            "the far end of the window, so role growth never reaches it"
+        );
+
+        // …and a foreign listener on it still makes the proxy walk, down
+        // rather than up, into the same window.
+        let mut squatted = crate::state::State::new();
+        with_record(&mut squatted, "feat+two");
+        let base_two = derive_base(paths.project_id(), "feat+two");
+        let moved = assign_share_port_with(&paths, &mut squatted, "feat+two", |port| {
+            port != base_two + BASE_STEP - 1
+        })
+        .unwrap();
+        assert_eq!(moved, base_two + BASE_STEP - 2);
     }
 
     #[test]
