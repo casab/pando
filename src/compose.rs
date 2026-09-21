@@ -65,6 +65,44 @@ pub struct ComposeFile {
     /// The top-level `volumes:` block. Only the keys that decide whether
     /// the compose project name isolates a volume are kept.
     pub volumes: BTreeMap<String, TopVolume>,
+    /// What this reader knew it could not answer. Empty for a file it read
+    /// whole, and for anything `docker compose config` resolved.
+    pub unresolved: Unresolved,
+}
+
+/// Keys this reader does not follow, recorded rather than ignored.
+///
+/// `extends:` pulls a service's real definition out of another file, and a
+/// top-level `include:` adds whole services this file never names. Either
+/// one means the ports and volumes pando is reading are not the ones
+/// compose would use — so every refusal has to say so rather than tell the
+/// developer to add a `ports:` entry their file already has.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Unresolved {
+    /// Services that carry an `extends:` key, in file order.
+    pub extends: Vec<String>,
+    /// Whether the file has a top-level `include:`.
+    pub include: bool,
+}
+
+impl Unresolved {
+    pub fn any(&self) -> bool {
+        !self.extends.is_empty() || self.include
+    }
+
+    /// The keys, named the way the compose specification names them, for a
+    /// message. `None` when there is nothing to say.
+    pub fn describe(&self) -> Option<String> {
+        match (self.extends.is_empty(), self.include) {
+            (true, false) => None,
+            (false, false) => Some(format!("`extends:` (on {})", self.extends.join(", "))),
+            (true, true) => Some("a top-level `include:`".to_string()),
+            (false, true) => Some(format!(
+                "`extends:` (on {}) and a top-level `include:`",
+                self.extends.join(", ")
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -226,12 +264,13 @@ pub fn resolve_included(
         let service = file.services.get(name).with_context(|| {
             let known: Vec<&str> = file.services.keys().map(String::as_str).collect();
             format!(
-                "the compose file has no service named {name:?} — it declares: {}",
+                "the compose file has no service named {name:?} — it declares: {}{}",
                 if known.is_empty() {
                     "none".to_string()
                 } else {
                     known.join(", ")
-                }
+                },
+                caveat(file)
             )
         })?;
         check_mounts(name, service, file, repository)?;
@@ -240,13 +279,31 @@ pub fn resolve_included(
             format!(
                 "service {name:?} publishes no port and its image ({}) is not one pando knows a \
                  port for — add a `ports:` entry to it in the compose file, or drop it from \
-                 `include`",
-                service.image.as_deref().unwrap_or("none")
+                 `include`{}",
+                service.image.as_deref().unwrap_or("none"),
+                caveat(file)
             )
         })?;
         out.push((name.clone(), port));
     }
     Ok(out)
+}
+
+/// The sentence every refusal gains when this reader knew it was working
+/// from half a file.
+///
+/// Without it a service that `extends` one declaring `ports: ["5432:5432"]`
+/// is refused with "add a `ports:` entry", which tells the developer to add
+/// something their file already has, somewhere they cannot usefully add it.
+fn caveat(file: &ComposeFile) -> String {
+    match file.unresolved.describe() {
+        None => String::new(),
+        Some(keys) => format!(
+            ". Note that this file uses {keys}, which pando's own reader does not follow — it \
+             asks `docker compose config` to resolve them when Docker is available, and could \
+             not here"
+        ),
+    }
 }
 
 /// A bind mount relative to the compose file lands inside the worktree,
@@ -422,6 +479,101 @@ pub fn file_in(worktree: &Path, file: &str) -> Result<PathBuf> {
     Ok(worktree.join(relative))
 }
 
+// ---- what compose itself says ---------------------------------------------
+
+/// `docker compose config --format json`, read into the same shape the
+/// hand-rolled parser produces.
+///
+/// Compose has already followed `extends:` and a top-level `include:` here,
+/// so nothing is left unresolved — and it has normalised everything else:
+/// `published` is a string, `depends_on` is a map, a relative bind source
+/// is an absolute path, and *every* volume carries a `name`. A plain
+/// volume's name is `<project>_<key>`, which is the project-name prefix
+/// pando relies on, so only a name that is something else is pinned.
+pub fn parse_config_json(text: &str) -> Result<ComposeFile> {
+    let value: serde_json::Value =
+        serde_json::from_str(text).context("parse `docker compose config --format json`")?;
+    let project = value.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let mut file = ComposeFile::default();
+    if let Some(services) = value.get("services").and_then(|v| v.as_object()) {
+        for (name, body) in services {
+            file.services.insert(name.clone(), service_from_json(body));
+        }
+    }
+    if let Some(volumes) = value.get("volumes").and_then(|v| v.as_object()) {
+        for (name, body) in volumes {
+            file.volumes
+                .insert(name.clone(), top_volume_from_json(project, name, body));
+        }
+    }
+    Ok(file)
+}
+
+fn service_from_json(value: &serde_json::Value) -> Service {
+    let string = |key: &str| value.get(key).and_then(|v| v.as_str()).map(str::to_string);
+    let mut out = Service {
+        image: string("image"),
+        container_name: string("container_name"),
+        healthcheck: value.get("healthcheck").is_some_and(|v| !v.is_null()),
+        ..Service::default()
+    };
+    if let Some(ports) = value.get("ports").and_then(|v| v.as_array()) {
+        for entry in ports {
+            let Some(container) = entry.get("target").and_then(|v| v.as_u64()) else {
+                continue;
+            };
+            out.ports.push(Port {
+                container: container as u16,
+                // A string here, and possibly a range: compose renders
+                // `9000-9001:6379-6380` as `"9000-9001"`.
+                published: entry
+                    .get("published")
+                    .and_then(|v| v.as_str())
+                    .and_then(first_of_range),
+                host: entry
+                    .get("host_ip")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+            });
+        }
+    }
+    if let Some(volumes) = value.get("volumes").and_then(|v| v.as_array()) {
+        for entry in volumes {
+            let source = entry.get("source").and_then(|v| v.as_str());
+            match (entry.get("type").and_then(|v| v.as_str()), source) {
+                (Some("bind"), Some(source)) => out.volumes.push(Mount::Bind(source.to_string())),
+                (Some("volume"), Some(source)) => {
+                    out.volumes.push(Mount::Named(source.to_string()))
+                }
+                (Some("volume"), None) => out.volumes.push(Mount::Anonymous),
+                // tmpfs, npipe, cluster: nothing on the host to isolate.
+                _ => {}
+            }
+        }
+    }
+    // Always the map form once compose has normalised it.
+    if let Some(depends) = value.get("depends_on").and_then(|v| v.as_object()) {
+        out.depends_on = depends.keys().cloned().collect();
+    }
+    out
+}
+
+fn top_volume_from_json(project: &str, key: &str, value: &serde_json::Value) -> TopVolume {
+    let external = value
+        .get("external")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let name = value.get("name").and_then(|v| v.as_str());
+    // `<project>_<key>` is the prefix compose applies on its own, which is
+    // exactly what isolates the data per worktree. Anything else is a name
+    // the project pinned, and every worktree would share it.
+    let pinned = name.filter(|name| *name != format!("{project}_{key}"));
+    TopVolume {
+        name: pinned.map(str::to_string),
+        external,
+    }
+}
+
 // ---- parsing --------------------------------------------------------------
 
 pub fn parse(text: &str) -> Result<ComposeFile> {
@@ -435,6 +587,9 @@ pub fn parse(text: &str) -> Result<ComposeFile> {
             "services" => {
                 let Node::Map(services) = value else { continue };
                 for (name, body) in services {
+                    if has_key(body, "extends") {
+                        file.unresolved.extends.push(name.clone());
+                    }
                     file.services.insert(name.clone(), service(body));
                 }
             }
@@ -444,10 +599,18 @@ pub fn parse(text: &str) -> Result<ComposeFile> {
                     file.volumes.insert(name.clone(), top_volume(body));
                 }
             }
+            // Not followed, but not ignored either: it brings in services
+            // this file never names, so a refusal about "what it declares"
+            // would be untrue of the file compose reads.
+            "include" => file.unresolved.include = true,
             _ => {}
         }
     }
     Ok(file)
+}
+
+fn has_key(node: &Node, want: &str) -> bool {
+    matches!(node, Node::Map(fields) if fields.iter().any(|(key, _)| key == want))
 }
 
 fn service(node: &Node) -> Service {
@@ -1454,6 +1617,134 @@ services:
         assert!(err.contains("odd"), "{err}");
         assert!(err.contains("acme/thing:1"), "it names the image: {err}");
         assert!(err.contains("ports:"), "it says what to add: {err}");
+    }
+
+    const EXTENDING: &str = "include:\n  - extra.yml\n\
+         services:\n  \
+         db:\n    extends:\n      file: base.yml\n      service: template\n  \
+         cache:\n    image: redis:7\n    ports: [\"6379:6379\"]\n";
+
+    #[test]
+    fn extends_and_a_top_level_include_are_recorded_rather_than_ignored() {
+        let file = parse(EXTENDING).unwrap();
+        assert_eq!(file.unresolved.extends, vec!["db".to_string()]);
+        assert!(file.unresolved.include);
+        assert!(file.unresolved.any());
+        // The service pando *can* read is unaffected.
+        assert_eq!(file.services["cache"].container_port(), Some(6379));
+    }
+
+    // "add a `ports:` entry to it in the compose file" is what a developer
+    // whose file already has one was told, in a place they cannot usefully
+    // add it. The refusal has to say which key pando did not follow.
+    #[test]
+    fn a_refusal_about_an_unfollowed_file_says_which_key_it_did_not_follow() {
+        let file = parse(EXTENDING).unwrap();
+        let err = format!(
+            "{:#}",
+            resolve_included(&file, &["db".into()], &[]).unwrap_err()
+        );
+        assert!(err.contains("extends"), "{err}");
+        assert!(err.contains("include"), "{err}");
+        assert!(err.contains("docker compose config"), "{err}");
+
+        // And a service only the `include:` declares is not flatly "not
+        // there", which is untrue of the file compose reads.
+        let err = format!(
+            "{:#}",
+            resolve_included(&file, &["fromInclude".into()], &[]).unwrap_err()
+        );
+        assert!(err.contains("fromInclude"), "{err}");
+        assert!(err.contains("include"), "{err}");
+    }
+
+    /// Captured verbatim from `docker compose config --format json` on
+    /// Compose 5.0.1, against a file using `extends` and a top-level
+    /// `include:`. Every shape here is one the hand-rolled parser does not
+    /// produce: `published` a string, `depends_on` a map, and a `name` on
+    /// every volume.
+    const COMPOSE_CONFIG_JSON: &str = r#"{
+      "name": "pando-probe-cfg",
+      "services": {
+        "db": {
+          "depends_on": { "fromInclude": { "condition": "service_started", "required": true } },
+          "environment": { "POSTGRES_PASSWORD": "x" },
+          "healthcheck": { "test": ["CMD", "true"] },
+          "image": "postgres:16",
+          "ports": [ { "mode": "ingress", "target": 5432, "published": "5432", "protocol": "tcp" } ],
+          "volumes": [ { "type": "volume", "source": "pgdata", "target": "/var/lib/postgresql/data", "volume": {} } ]
+        },
+        "fromInclude": {
+          "image": "redis:7",
+          "ports": [ { "mode": "ingress", "target": 6379, "published": "6379", "protocol": "tcp" } ]
+        }
+      },
+      "volumes": { "pgdata": { "name": "pando-probe-cfg_pgdata" } }
+    }"#;
+
+    #[test]
+    fn what_compose_itself_says_reads_into_the_same_shape() {
+        let file = parse_config_json(COMPOSE_CONFIG_JSON).unwrap();
+        assert_eq!(
+            file.services.keys().collect::<Vec<_>>(),
+            vec!["db", "fromInclude"],
+            "the service the `include:` brought in is there too"
+        );
+        let db = &file.services["db"];
+        assert_eq!(db.image.as_deref(), Some("postgres:16"));
+        assert_eq!(db.container_port(), Some(5432));
+        assert_eq!(db.ports[0].published, Some(5432), "published is a string");
+        assert!(db.healthcheck, "so readiness goes through health");
+        assert_eq!(db.depends_on, vec!["fromInclude".to_string()]);
+        assert_eq!(db.volumes, vec![Mount::Named("pgdata".to_string())]);
+        assert_eq!(file.services["fromInclude"].container_port(), Some(6379));
+        assert!(
+            !file.unresolved.any(),
+            "compose resolved it, so nothing is left unfollowed"
+        );
+
+        // `<project>_<key>` is the prefix compose applies itself, which is
+        // what isolates the data — not a name the project pinned.
+        assert_eq!(file.volumes["pgdata"].name, None);
+        assert!(!file.volumes["pgdata"].external);
+        assert_eq!(
+            resolve_included(&file, &["db".into(), "fromInclude".into()], &[]).unwrap(),
+            vec![("db".to_string(), 5432), ("fromInclude".to_string(), 6379)]
+        );
+    }
+
+    #[test]
+    fn a_pinned_or_external_volume_survives_composes_normalisation() {
+        let json = r#"{
+          "name": "pando-probe-vol",
+          "services": { "a": {
+            "image": "postgres:16",
+            "container_name": "fixed-name",
+            "ports": [ { "target": 5432, "published": "5432" } ],
+            "volumes": [ { "type": "volume", "source": "pinned", "target": "/p", "volume": {} } ]
+          } },
+          "volumes": {
+            "plain": { "name": "pando-probe-vol_plain" },
+            "pinned": { "name": "literally-this" },
+            "shared": { "name": "shared", "external": true }
+          }
+        }"#;
+        let file = parse_config_json(json).unwrap();
+        assert_eq!(file.volumes["plain"].name, None);
+        assert_eq!(
+            file.volumes["pinned"].name.as_deref(),
+            Some("literally-this")
+        );
+        assert!(file.volumes["shared"].external);
+        assert_eq!(
+            file.services["a"].container_name.as_deref(),
+            Some("fixed-name")
+        );
+        let err = format!(
+            "{:#}",
+            resolve_included(&file, &["a".into()], &[]).unwrap_err()
+        );
+        assert!(err.contains("literally-this"), "{err}");
     }
 
     #[test]

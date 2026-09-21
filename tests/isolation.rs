@@ -566,6 +566,86 @@ fn a_start_that_fails_before_any_container_leaves_the_worktree_startable() {
     actions::stop(&f.paths, &name, None).unwrap();
 }
 
+// The binary is there and the daemon is not. The friendly sentence was
+// the context on a *spawn* failure only, so what the developer got was the
+// whole `docker compose -p … -f … -f … up -d postgres redis` line.
+#[test]
+fn a_docker_whose_daemon_is_down_gets_the_hint_rather_than_the_command_line() {
+    let f = iso_with(&config_toml("sleep 30"));
+    let name = new_worktree(&f, "feat/one");
+    docker::daemon_down(&f.home);
+
+    let err = format!(
+        "{:#}",
+        actions::start(&f.paths, &f.config, &name, None, true, &|_| {}).unwrap_err()
+    );
+    assert!(err.contains("Docker daemon is not running"), "{err}");
+    assert!(err.contains("without --isolated"), "{err}");
+    assert!(
+        !err.contains("compose -p"),
+        "not the command line, which is not something to act on: {err}"
+    );
+}
+
+// A record for a service config no longer includes is kept, because only
+// it knows which compose project to take down. Keeping its *port* as well
+// made `status` show two services on one number, and only one of them was
+// telling the truth.
+#[test]
+fn a_service_config_no_longer_includes_keeps_its_name_but_not_its_port() {
+    if skip_without_python() {
+        return;
+    }
+    let mut f = iso_with(&config_toml(&listener_on_port_env()));
+    let name = new_worktree(&f, "feat/one");
+    let first = start_isolated(&f, &name);
+    assert_eq!(f.record(&name).services.len(), 2);
+    actions::stop(&f.paths, &name, None).unwrap();
+
+    // The include list changed under the worktree: only redis now, so the
+    // window is two ports and redis lands on the number postgres had.
+    std::fs::write(
+        f.paths.config_file(),
+        config_toml(&listener_on_port_env())
+            .replace(
+                "include = [\"postgres\", \"redis\"]",
+                "include = [\"redis\"]",
+            )
+            .replace(
+                "env = { DATABASE_URL = \"postgres\", REDIS_URL = \"redis\" }",
+                "env = { REDIS_URL = \"redis\" }",
+            ),
+    )
+    .unwrap();
+    f.config = config::load(&f.paths).unwrap().config;
+
+    let second = start_isolated(&f, &name);
+    assert_eq!(
+        second.ports["redis"], first.ports["postgres"],
+        "the window moved up, which is what makes the stale record a lie"
+    );
+    let record = f.record(&name);
+    let stale = record
+        .services
+        .iter()
+        .find(|s| s.name == "postgres")
+        .expect("the record survives, so rm can still name the compose project");
+    assert_eq!(stale.port, None, "but it claims no port it does not have");
+    assert!(stale.compose_project.is_some());
+
+    let statuses = actions::service_statuses(&record);
+    let mut ports: Vec<u16> = statuses.iter().filter_map(|s| s.port).collect();
+    let before = ports.len();
+    ports.sort_unstable();
+    ports.dedup();
+    assert_eq!(
+        ports.len(),
+        before,
+        "no two services on one port: {statuses:?}"
+    );
+    actions::stop(&f.paths, &name, None).unwrap();
+}
+
 #[test]
 fn an_env_key_no_file_in_the_worktree_sets_is_an_error_naming_it() {
     let f = iso_with(&config_toml("sleep 30").replace(

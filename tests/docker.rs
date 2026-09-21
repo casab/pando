@@ -423,6 +423,71 @@ fn a_container_that_publishes_a_port_and_never_listens_is_never_ready() {
     );
 }
 
+/// Only compose resolves `extends:` and a top-level `include:`. pando's own
+/// reader sees a service with no image and no ports, and used to refuse it
+/// by telling the developer to add a `ports:` entry their file already has.
+#[test]
+fn a_compose_file_that_extends_another_is_resolved_by_compose_itself() {
+    if !enabled() {
+        eprintln!("skipping: set PANDO_TEST_DOCKER=1 to run against the real Docker");
+        return;
+    }
+    let mut f = real();
+    let root = f.paths.root().to_path_buf();
+    std::fs::write(
+        root.join("base.yml"),
+        "services:\n  pg-template:\n    image: postgres:16-alpine\n    \
+         environment:\n      POSTGRES_PASSWORD: pando\n    ports: [\"5432:5432\"]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("extra.yml"),
+        "services:\n  extra:\n    image: redis:7\n    ports: [\"6390:6379\"]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("docker-compose.yml"),
+        "include:\n  - extra.yml\n\
+         services:\n  \
+         postgres:\n    extends:\n      file: base.yml\n      service: pg-template\n  \
+         redis:\n    image: redis:7\n    ports: [\"6379:6379\"]\n",
+    )
+    .unwrap();
+    common::git(&root, &["add", "."]);
+    common::git(&root, &["commit", "--quiet", "-m", "extends and include"]);
+
+    // What pando's own reader makes of it: a service it cannot place.
+    let parsed = compose::read(&root.join("docker-compose.yml")).unwrap();
+    assert_eq!(parsed.unresolved.extends, vec!["postgres".to_string()]);
+    assert!(parsed.unresolved.include);
+    assert_eq!(parsed.services["postgres"].container_port(), None);
+
+    let name = actions::new(&f.paths, &f.config, "feat/ext", None, &|_| {}).unwrap();
+    let project = compose::project_name(f.paths.project_id(), &name);
+    f.projects.push(project.clone());
+
+    let report = actions::start(&f.paths, &f.config, &name, None, true, &|m| {
+        eprintln!("extends: {m}")
+    })
+    .unwrap();
+    for role in ["postgres", "redis"] {
+        assert!(
+            pando::ports::something_is_listening(report.ports[role]),
+            "{role} is up on {}",
+            report.ports[role]
+        );
+    }
+    // The `include:` brought `extra` into the file, and it is not in
+    // `include = [...]`, so nothing started it.
+    let running = docker(&["ps", "--format", "{{.Names}}"]);
+    let mine: Vec<&str> = running
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with(&project))
+        .collect();
+    assert_eq!(mine.len(), 2, "only what `include` asked for: {mine:?}");
+}
+
 /// `up -d <name>` enables that service's profile implicitly; a `stop` with
 /// the same `-f` files does not. Only a real compose has profiles, so only
 /// a real compose can prove the cleanup reaches one.

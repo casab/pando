@@ -37,6 +37,14 @@ const POLL: Duration = Duration::from_millis(250);
 /// that died without making the wait itself expensive.
 const CHECK_EVERY: u32 = 8;
 
+/// What docker says when the binary is present and the daemon is not. Two
+/// spellings, because the classic Unix-socket message and the newer one
+/// differ, and both mean the same thing to the developer.
+const DAEMON_DOWN: [&str; 2] = [
+    "Cannot connect to the Docker daemon",
+    "docker daemon is not running",
+];
+
 /// The docker executable pando runs.
 ///
 /// `<home>/bin/docker` when it is there and executable, else whatever
@@ -137,6 +145,15 @@ impl Compose {
         })?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
+            // The binary is there and the daemon is not. That is one thing
+            // to do about it, and a compose command line with two `-f`
+            // paths in it is not how to say so.
+            if DAEMON_DOWN.iter().any(|needle| stderr.contains(needle)) {
+                bail!(
+                    "isolated mode needs Docker, and the Docker daemon is not running — start \
+                     Docker, or start without --isolated"
+                );
+            }
             let reason = stderr
                 .lines()
                 .rev()
@@ -151,6 +168,16 @@ impl Compose {
             );
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// The fully resolved file, as compose itself reads it.
+    ///
+    /// `extends:` and a top-level `include:` are followed and every default
+    /// is filled in — none of which pando's own reader does. Nothing is
+    /// created or started: `config` only prints.
+    pub fn config(&self) -> Result<crate::compose::ComposeFile> {
+        let text = self.run(&["config", "--format", "json"])?;
+        crate::compose::parse_config_json(&text)
     }
 
     /// Brings the included services up in the background. Idempotent:

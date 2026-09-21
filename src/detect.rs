@@ -585,8 +585,26 @@ impl Proposal {
     }
 }
 
+/// Reads a compose file this crate's own parser could not follow whole.
+///
+/// `extends:` and a top-level `include:` are the two, and only compose
+/// itself resolves them. Detection is handed one of these so it can ask
+/// when Docker is there; [`propose`] passes none and falls back to what the
+/// parser could read, which is why a refusal says so.
+pub type ComposeResolver<'a> = &'a dyn Fn(&Path) -> Option<crate::compose::ComposeFile>;
+
 /// Everything tier 1 has to say, in the order the slots are filled.
 pub fn propose(root: &Path, signals: &Signals) -> Vec<Proposal> {
+    propose_with(root, signals, None)
+}
+
+/// [`propose`] with a way to resolve a compose file the parser is a subset
+/// of.
+pub fn propose_with(
+    root: &Path,
+    signals: &Signals,
+    resolve: Option<ComposeResolver<'_>>,
+) -> Vec<Proposal> {
     let rule = framework(root, signals);
     [
         install_proposal(signals),
@@ -599,7 +617,7 @@ pub fn propose(root: &Path, signals: &Signals) -> Vec<Proposal> {
         // After the processes, because a service is only worth proposing
         // once there is something to talk to it; before the schema hook,
         // whose whole point is to run once the services are up.
-        services_proposal(root, signals),
+        services_proposal(root, signals, resolve),
         schema_hook_proposal(root, signals),
         provision_proposal(signals),
     ]
@@ -1452,9 +1470,22 @@ fn is_app_service(image: Option<&str>) -> bool {
 /// either an env key points at it, or its image is not one an application
 /// talks to. One redis with nothing pointing at it is enough to ask,
 /// because pando cannot tell whether the project wants a private copy.
-fn services_proposal(root: &Path, signals: &Signals) -> Option<Proposal> {
+fn services_proposal(
+    root: &Path,
+    signals: &Signals,
+    resolve: Option<ComposeResolver<'_>>,
+) -> Option<Proposal> {
     let file = crate::compose::find(root)?;
-    let parsed = crate::compose::read(&root.join(&file)).ok()?;
+    let path = root.join(&file);
+    let mut parsed = crate::compose::read(&path).ok()?;
+    // Half a file read is not a proposal. Compose resolves `extends:` and a
+    // top-level `include:`; ask it when it is available.
+    if parsed.unresolved.any()
+        && let Some(resolve) = resolve
+        && let Some(resolved) = resolve(&path)
+    {
+        parsed = resolved;
+    }
     if parsed.services.is_empty() {
         return None;
     }
@@ -1498,6 +1529,24 @@ fn services_proposal(root: &Path, signals: &Signals) -> Option<Proposal> {
             }),
             ..Candidate::default()
         });
+    }
+    // A file that could not be read whole — no Docker to ask, or compose
+    // refused it — is never decided: the ports and images here may not be
+    // the ones compose uses, and an `include:` brings in services this list
+    // does not even have. It still proposes, because a project with a
+    // compose file silently looking like a project with none is worse than
+    // a question.
+    if let Some(keys) = parsed.unresolved.describe() {
+        resolved = false;
+        for candidate in &mut candidates {
+            if parsed.unresolved.include || parsed.unresolved.extends.contains(&candidate.value) {
+                candidate.preselected = false;
+            }
+            candidate.why = format!(
+                "{}; pando does not follow {keys} in this file, so check this one",
+                candidate.why
+            );
+        }
     }
     // Nothing to propose when no service resolved at all: a compose file
     // full of things pando cannot address is not an isolation offer.

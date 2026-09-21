@@ -952,7 +952,22 @@ pub fn resolve_silencing(
         return Ok(config);
     }
     let signals = detect::signals(paths.root());
-    let proposals = detect::propose(paths.root(), &signals);
+    // Only ever called for a compose file pando's own reader could not
+    // follow — `extends:` or a top-level `include:` — so a plain project
+    // costs no process spawn. `config` prints; it creates nothing.
+    let program = services::docker_program(paths);
+    let resolve = |file: &Path| -> Option<crate::compose::ComposeFile> {
+        let dir = file.parent()?;
+        services::Compose::new(
+            &program,
+            crate::compose::project_name(paths.project_id(), "detect"),
+            vec![file.to_path_buf()],
+            dir,
+        )
+        .config()
+        .ok()
+    };
+    let proposals = detect::propose_with(paths.root(), &signals, Some(&resolve));
     // Asked of the config as it was loaded: once detection has written
     // `[dev].cmd`, the file is indistinguishable from one a developer
     // wrote by hand, and a `[dev]` they wrote is an answer about its ports
@@ -2220,7 +2235,10 @@ fn service_roles(config: &Config) -> Vec<String> {
 /// beside live services does not lose the pid that stops it. A record for
 /// a service config no longer includes is kept too: it still names the
 /// compose project, and dropping it would leave a container and its volume
-/// with nothing in pando able to take them down.
+/// with nothing in pando able to take them down — but its *port* is
+/// blanked, because the window has moved on and another service has that
+/// number now. `status` would otherwise show two services on one port, and
+/// only one of them would be telling the truth.
 fn planned_services(
     config: &Config,
     paths: &PandoPaths,
@@ -2243,7 +2261,10 @@ fn planned_services(
     }
     for service in &record.services {
         if !out.iter().any(|kept| kept.name == service.name) {
-            out.push(service.clone());
+            out.push(state::ServiceRecord {
+                port: None,
+                ..service.clone()
+            });
         }
     }
     out
@@ -2294,9 +2315,21 @@ fn bring_up_services(
         config.worktrees_dir(paths),
         worktree.to_path_buf(),
     ];
+    let project = crate::compose::project_name(paths.project_id(), name);
+    let program = services::docker_program(paths);
     for entry in &entries {
         let file = crate::compose::file_in(worktree, entry.file)?;
-        let parsed = crate::compose::read(&file)?;
+        let mut parsed = crate::compose::read(&file)?;
+        // `extends:` and a top-level `include:` put the real definition in
+        // a file this reader does not follow, so what it read is not what
+        // compose would run. Compose can say; it is already the thing
+        // about to bring the services up.
+        if parsed.unresolved.any()
+            && let Ok(resolved) =
+                services::Compose::new(&program, &project, vec![file.clone()], worktree).config()
+        {
+            parsed = resolved;
+        }
         for (service, container) in
             crate::compose::resolve_included(&parsed, entry.include, &repository)?
         {
@@ -2341,9 +2374,7 @@ fn bring_up_services(
     .with_context(|| format!("write {}", override_file.display()))?;
     files.push(override_file);
 
-    let project = crate::compose::project_name(paths.project_id(), name);
-    let compose =
-        services::Compose::new(services::docker_program(paths), &project, files, worktree);
+    let compose = services::Compose::new(&program, &project, files, worktree);
     progress(&format!("starting services: {}", include.join(", ")));
     compose.up(&include)?;
 
@@ -2358,7 +2389,7 @@ fn bring_up_services(
     // `stop` and `rm` use this form too.
     if let Err(e) = services::wait_ready(&compose, &wanted, Duration::from_secs(timeout), progress)
     {
-        let _ = services::Compose::by_project(services::docker_program(paths), &project).stop();
+        let _ = services::Compose::by_project(&program, &project).stop();
         return Err(e);
     }
 
@@ -6028,6 +6059,52 @@ time.sleep(300)
         );
         let again = resolve_isolating(&fx.paths, &config, &refuse).unwrap();
         assert_eq!(again.services.len(), 1);
+    }
+
+    /// A docker that answers nothing, which is what a machine with no
+    /// daemon looks like to `docker compose config`. Installed so the test
+    /// below exercises the fallback rather than this machine's Docker.
+    fn docker_that_cannot_answer(paths: &PandoPaths) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = paths.home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let path = bin.join("docker");
+        std::fs::write(&path, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // `extends:` and a top-level `include:` are common in real
+    // repositories, and pando's own reader follows neither. Reading half a
+    // file and concluding "this project has no services pando can address"
+    // is the one answer that is certainly wrong.
+    #[test]
+    fn a_compose_file_pando_cannot_read_whole_is_asked_about_rather_than_passed_over() {
+        let fx = compose_fixture(
+            "services:\n  db:\n    extends:\n      file: base.yml\n      service: template\n",
+            "PORT=3000\nDATABASE_URL=postgres://acme:acme@localhost:5432/acme\n",
+        );
+        fx.paths.ensure_home().unwrap();
+        docker_that_cannot_answer(&fx.paths);
+
+        let (ask, asked) = scripted(vec![Answer::None]);
+        resolve_isolating(&fx.paths, &fx.config, &ask).unwrap();
+        assert_eq!(
+            asked.borrow().len(),
+            1,
+            "a file pando could not read whole is a question, not silence"
+        );
+        let question = &asked.borrow()[0];
+        assert_eq!(question.slot, Slot::Services);
+        assert_eq!(question.options.len(), 1);
+        assert!(
+            question.options[0].1.contains("extends"),
+            "and it says why it could not decide: {}",
+            question.options[0].1
+        );
+        assert!(
+            question.checked.is_empty(),
+            "nothing pando read through an unfollowed key starts ticked"
+        );
     }
 
     // `rewrite` can put a port into a URL or replace a bare number. A bare

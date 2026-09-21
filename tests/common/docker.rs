@@ -72,6 +72,14 @@ pub fn never_ready(home: &Path, project: &str) {
     std::fs::write(dir.join("never-ready"), "1").unwrap();
 }
 
+/// Tells the shim to behave like a docker binary whose daemon is down:
+/// every invocation fails with the message docker itself prints.
+pub fn daemon_down(home: &Path) {
+    let dir = state_dir(home);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("daemon-down"), "1").unwrap();
+}
+
 /// Tells the shim to publish the ports with nothing behind them: the
 /// container runs, the connect succeeds, and the connection is closed at
 /// once. That is what Docker's port proxy does in front of a container
@@ -353,6 +361,12 @@ def do_down():
 
 
 record()
+if os.path.exists(os.path.join(ROOT, "daemon-down")):
+    sys.stderr.write(
+        "Cannot connect to the Docker daemon at unix:///var/run/docker.sock."
+        " Is the docker daemon running?\n"
+    )
+    sys.exit(1)
 if VERB == "up":
     do_up()
 elif VERB == "ps":
