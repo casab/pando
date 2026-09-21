@@ -211,7 +211,16 @@ pub struct Published {
 /// Invariant 1 forbids pando to edit a compose file, and rewriting a bind
 /// mount underneath the developer would put the isolated database
 /// somewhere they did not ask for.
-pub fn resolve_included(file: &ComposeFile, include: &[String]) -> Result<Vec<(String, u16)>> {
+/// `repository` is every directory a bind mount must not land in: the main
+/// checkout, and the worktrees pando keeps for it. A path pando can test is
+/// tested rather than waved through — an absolute source does not move with
+/// the worktree, so it is either a write into the repository or one
+/// directory shared by every worktree.
+pub fn resolve_included(
+    file: &ComposeFile,
+    include: &[String],
+    repository: &[PathBuf],
+) -> Result<Vec<(String, u16)>> {
     let mut out = Vec::new();
     for name in include {
         let service = file.services.get(name).with_context(|| {
@@ -225,7 +234,7 @@ pub fn resolve_included(file: &ComposeFile, include: &[String]) -> Result<Vec<(S
                 }
             )
         })?;
-        check_mounts(name, service, file)?;
+        check_mounts(name, service, file, repository)?;
         check_depends_on(name, service, include)?;
         let port = service.container_port().with_context(|| {
             format!(
@@ -243,15 +252,43 @@ pub fn resolve_included(file: &ComposeFile, include: &[String]) -> Result<Vec<(S
 /// A bind mount relative to the compose file lands inside the worktree,
 /// and a named volume the project pins by name or borrows from outside is
 /// one every worktree would share.
-fn check_mounts(name: &str, service: &Service, file: &ComposeFile) -> Result<()> {
+fn check_mounts(
+    name: &str,
+    service: &Service,
+    file: &ComposeFile,
+    repository: &[PathBuf],
+) -> Result<()> {
     for mount in &service.volumes {
         match mount {
-            Mount::Bind(source) if source.starts_with('/') || source.starts_with('~') => {}
             Mount::Bind(source) if source.starts_with('$') => bail!(
                 "service {name:?} mounts {source:?}, and pando cannot tell whether that is \
                  inside the repository — isolating it could write into your worktree. Use a \
                  named volume for it, or drop {name:?} from `include`"
             ),
+            Mount::Bind(source) if source.starts_with('/') || source.starts_with('~') => {
+                // A path pando *can* test is tested. An absolute source
+                // does not move with the worktree, so it is one of two
+                // things, and neither of them is isolation.
+                let resolved = crate::paths::resolve_for_compare(&expand_home(source));
+                if let Some(inside) = repository
+                    .iter()
+                    .find(|dir| resolved.starts_with(crate::paths::resolve_for_compare(dir)))
+                {
+                    bail!(
+                        "service {name:?} mounts {source:?}, which is inside {} — an isolated \
+                         copy would write its data into your repository, which pando never \
+                         does. Change it to a named volume in the compose file, or drop \
+                         {name:?} from `include`",
+                        inside.display()
+                    );
+                }
+                bail!(
+                    "service {name:?} mounts {source:?}, an absolute path that does not move \
+                     with the worktree — every worktree would bind that one directory and \
+                     share the data in it, which is not an isolated copy. Change it to a \
+                     named volume in the compose file, or drop {name:?} from `include`"
+                );
+            }
             Mount::Bind(source) => bail!(
                 "service {name:?} mounts {source:?}, which is inside the repository — an \
                  isolated copy would write its data into your worktree, which pando never \
@@ -281,6 +318,25 @@ fn check_mounts(name: &str, service: &Service, file: &ComposeFile) -> Result<()>
         }
     }
     Ok(())
+}
+
+/// `~` and `~/…` replaced with the home directory, which is what docker
+/// itself does with a bind source before it mounts it. Anything else is
+/// returned as written.
+fn expand_home(source: &str) -> PathBuf {
+    let Some(rest) = source.strip_prefix('~') else {
+        return PathBuf::from(source);
+    };
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return PathBuf::from(source);
+    };
+    match rest.strip_prefix('/') {
+        Some(tail) => home.join(tail),
+        // `~user/…` is a different user's home and not one pando can
+        // resolve; left as written, so it is judged as an absolute path.
+        None if rest.is_empty() => home,
+        None => PathBuf::from(source),
+    }
 }
 
 /// `up -d <included>` starts anything an included service depends on, and
@@ -1194,7 +1250,7 @@ services:
     fn included_services_resolve_to_their_container_ports() {
         let file = parse(FIXTURE_ONE).unwrap();
         assert_eq!(
-            resolve_included(&file, &["postgres".into(), "redis".into()]).unwrap(),
+            resolve_included(&file, &["postgres".into(), "redis".into()], &[]).unwrap(),
             vec![("postgres".to_string(), 5432), ("redis".to_string(), 6379)]
         );
     }
@@ -1204,7 +1260,7 @@ services:
         let file = parse(FIXTURE_ONE).unwrap();
         let err = format!(
             "{:#}",
-            resolve_included(&file, &["pgsql".into()]).unwrap_err()
+            resolve_included(&file, &["pgsql".into()], &[]).unwrap_err()
         );
         assert!(err.contains("pgsql"), "{err}");
         assert!(
@@ -1217,7 +1273,10 @@ services:
     fn a_relative_bind_mount_is_refused_by_name() {
         let text = "services:\n  db:\n    image: postgres:16\n    volumes:\n      - ./data:/var/lib/postgresql/data\n";
         let file = parse(text).unwrap();
-        let err = format!("{:#}", resolve_included(&file, &["db".into()]).unwrap_err());
+        let err = format!(
+            "{:#}",
+            resolve_included(&file, &["db".into()], &[]).unwrap_err()
+        );
         assert!(err.contains("\"db\""), "{err}");
         assert!(err.contains("./data"), "{err}");
         assert!(
@@ -1226,11 +1285,106 @@ services:
         );
     }
 
+    /// A compose file with one service and one bind mount of `source`.
+    fn with_bind(source: &str) -> ComposeFile {
+        parse(&format!(
+            "services:\n  db:\n    image: postgres:16\n    volumes:\n      - {source}:/data\n"
+        ))
+        .unwrap()
+    }
+
     #[test]
-    fn an_absolute_bind_mount_is_allowed_because_it_is_not_in_the_repository() {
-        let text = "services:\n  db:\n    image: postgres:16\n    volumes:\n      - /var/run/docker.sock:/var/run/docker.sock\n      - ~/caches:/caches\n";
-        let file = parse(text).unwrap();
-        assert!(resolve_included(&file, &["db".into()]).is_ok());
+    fn an_absolute_bind_mount_inside_the_repository_is_refused_naming_the_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("acme-shop");
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        let source = root.join("data").join("pg");
+        let file = with_bind(&source.display().to_string());
+        let err = format!(
+            "{:#}",
+            resolve_included(&file, &["db".into()], std::slice::from_ref(&root)).unwrap_err()
+        );
+        assert!(err.contains("\"db\""), "{err}");
+        assert!(err.contains(&source.display().to_string()), "{err}");
+        assert!(
+            err.contains("named volume"),
+            "it says what to change: {err}"
+        );
+    }
+
+    #[test]
+    fn an_absolute_bind_mount_inside_a_worktree_is_refused_the_same_way() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("acme-shop");
+        let worktree = dir.path().join("worktrees").join("feat+one");
+        std::fs::create_dir_all(worktree.join("pgdata")).unwrap();
+        let source = worktree.join("pgdata");
+        let file = with_bind(&source.display().to_string());
+        let err = format!(
+            "{:#}",
+            resolve_included(&file, &["db".into()], &[root, worktree]).unwrap_err()
+        );
+        assert!(err.contains(&source.display().to_string()), "{err}");
+        assert!(err.contains("named volume"), "{err}");
+    }
+
+    /// The path does not have to exist yet, and it may reach the same
+    /// directory through a symlinked ancestor — `/var` and `/private/var`
+    /// are one directory on macOS. Both are what `resolve_for_compare`
+    /// exists for, and a bind mount gets the same treatment as a
+    /// configured home.
+    #[test]
+    fn a_bind_mount_is_compared_after_the_same_canonicalisation_paths_uses() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("acme-shop");
+        std::fs::create_dir_all(&root).unwrap();
+        let canonical = std::fs::canonicalize(&root).unwrap();
+        // Through the canonical form, into a directory nothing created.
+        let source = canonical.join("var").join("pg");
+        let file = with_bind(&source.display().to_string());
+        assert!(
+            resolve_included(&file, &["db".into()], &[root]).is_err(),
+            "a path under the repository is inside it however it is spelled"
+        );
+    }
+
+    #[test]
+    fn a_home_relative_bind_mount_is_expanded_before_it_is_judged() {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            return;
+        };
+        let file = with_bind("~/acme-data");
+        // With the home directory itself standing in for the repository,
+        // `~/acme-data` is inside it — which only a `~` that was expanded
+        // can be.
+        let err = format!(
+            "{:#}",
+            resolve_included(&file, &["db".into()], &[home]).unwrap_err()
+        );
+        assert!(
+            err.contains("~/acme-data"),
+            "it names what the file says: {err}"
+        );
+        assert!(err.contains("named volume"), "{err}");
+    }
+
+    #[test]
+    fn an_absolute_bind_mount_outside_the_repository_is_refused_as_one_every_worktree_shares() {
+        let file = with_bind("/var/lib/acme/pgdata");
+        let err = format!(
+            "{:#}",
+            resolve_included(
+                &file,
+                &["db".into()],
+                &[PathBuf::from("/nowhere/acme-shop")]
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("/var/lib/acme/pgdata"), "{err}");
+        assert!(
+            err.contains("every worktree"),
+            "it says why it matters: {err}"
+        );
     }
 
     #[test]
@@ -1238,7 +1392,10 @@ services:
         let text =
             "services:\n  db:\n    image: postgres:16\n    volumes:\n      - $PWD/data:/data\n";
         let file = parse(text).unwrap();
-        let err = format!("{:#}", resolve_included(&file, &["db".into()]).unwrap_err());
+        let err = format!(
+            "{:#}",
+            resolve_included(&file, &["db".into()], &[]).unwrap_err()
+        );
         assert!(err.contains("cannot tell"), "{err}");
     }
 
@@ -1252,7 +1409,10 @@ services:
                 "services:\n  db:\n    image: postgres:16\n    volumes:\n      - dbdata:/var/lib/postgresql/data\n{tail}"
             );
             let file = parse(&text).unwrap();
-            let err = format!("{:#}", resolve_included(&file, &["db".into()]).unwrap_err());
+            let err = format!(
+                "{:#}",
+                resolve_included(&file, &["db".into()], &[]).unwrap_err()
+            );
             assert!(err.contains("dbdata"), "{err}");
             assert!(err.contains(needle), "{err}");
             assert!(err.contains("share"), "it says why it matters: {err}");
@@ -1264,7 +1424,7 @@ services:
         let text = "services:\n  db:\n    image: postgres:16\n    volumes:\n      - dbdata:/var/lib/postgresql/data\nvolumes:\n  dbdata:\n";
         let file = parse(text).unwrap();
         assert_eq!(
-            resolve_included(&file, &["db".into()]).unwrap(),
+            resolve_included(&file, &["db".into()], &[]).unwrap(),
             vec![("db".to_string(), 5432)]
         );
     }
@@ -1275,12 +1435,12 @@ services:
         let file = parse(text).unwrap();
         let err = format!(
             "{:#}",
-            resolve_included(&file, &["api".into()]).unwrap_err()
+            resolve_included(&file, &["api".into()], &[]).unwrap_err()
         );
         assert!(err.contains("\"api\""), "{err}");
         assert!(err.contains("\"db\""), "{err}");
         // And it is fine once both are in.
-        assert!(resolve_included(&file, &["api".into(), "db".into()]).is_ok());
+        assert!(resolve_included(&file, &["api".into(), "db".into()], &[]).is_ok());
     }
 
     #[test]
@@ -1289,7 +1449,7 @@ services:
         let file = parse(text).unwrap();
         let err = format!(
             "{:#}",
-            resolve_included(&file, &["odd".into()]).unwrap_err()
+            resolve_included(&file, &["odd".into()], &[]).unwrap_err()
         );
         assert!(err.contains("odd"), "{err}");
         assert!(err.contains("acme/thing:1"), "it names the image: {err}");

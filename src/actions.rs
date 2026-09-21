@@ -2118,10 +2118,20 @@ fn bring_up_services(
     let mut wanted: Vec<services::Wanted> = Vec::new();
     let mut include: Vec<String> = Vec::new();
     let mut timeout = services::DEFAULT_READY_TIMEOUT_S;
+    // Everywhere a bind mount must not land: the main checkout, the
+    // directory every worktree lives under, and this worktree itself for
+    // the adopted case, where it is somewhere else entirely.
+    let repository = vec![
+        paths.root().to_path_buf(),
+        config.worktrees_dir(paths),
+        worktree.to_path_buf(),
+    ];
     for entry in &entries {
         let file = crate::compose::file_in(worktree, entry.file)?;
         let parsed = crate::compose::read(&file)?;
-        for (service, container) in crate::compose::resolve_included(&parsed, entry.include)? {
+        for (service, container) in
+            crate::compose::resolve_included(&parsed, entry.include, &repository)?
+        {
             let host = *ports
                 .get(&service)
                 .with_context(|| format!("no port was allocated for the service {service:?}"))?;

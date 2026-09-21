@@ -4,7 +4,7 @@
 //! direction is inner to outer with no upward imports:
 //!
 //! ```text
-//! paths · compose → project · config · ports · process · state · template
+//! paths → compose → project · config · ports · process · state · template
 //!       → detect · hooks · worktree · cache · log_tail · observe · services
 //!       → actions
 //!       → cli · tui

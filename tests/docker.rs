@@ -358,3 +358,68 @@ fn a_service_a_worktree_cannot_isolate_is_refused_before_docker_is_asked() {
     let _ = state::load(&f.paths.state_file());
     let _ = Duration::from_secs(0);
 }
+
+/// The one the fake docker can never catch: it mounts nothing, so only a
+/// real container can prove that an absolute bind source really does land
+/// in the developer's own checkout.
+#[test]
+fn an_absolute_bind_mount_into_the_checkout_is_refused_and_writes_nothing() {
+    if !enabled() {
+        eprintln!("skipping: set PANDO_TEST_DOCKER=1 to run against the real Docker");
+        return;
+    }
+    let mut f = real();
+    let inside = f.paths.root().join("data").join("pg");
+    // An absolute path does not move with the worktree: this one is the
+    // main checkout, and the container would write straight into it.
+    std::fs::write(
+        f.paths.root().join("docker-compose.yml"),
+        format!(
+            "services:\n  postgres:\n    image: alpine:latest\n    \
+             command: [\"sh\",\"-c\",\"touch /mnt/pando-wrote-into-your-repo && sleep 120\"]\n    \
+             ports: [\"5432:5432\"]\n    volumes:\n      - {}:/mnt\n  \
+             redis:\n    image: redis:7\n    ports: [\"6379:6379\"]\n",
+            inside.display()
+        ),
+    )
+    .unwrap();
+    common::git(f.paths.root(), &["add", "."]);
+    common::git(
+        f.paths.root(),
+        &["commit", "--quiet", "-m", "absolute bind"],
+    );
+    assert_eq!(common::status_porcelain(f.paths.root()), "");
+    let name = actions::new(&f.paths, &f.config, "feat/abs", None, &|_| {}).unwrap();
+    // Registered before the start, so the guard takes anything down that a
+    // regression here would leave behind.
+    f.projects
+        .push(compose::project_name(f.paths.project_id(), &name));
+
+    let err = format!(
+        "{:#}",
+        actions::start(&f.paths, &f.config, &name, None, true, &|_| {}).unwrap_err()
+    );
+    assert!(err.contains(&inside.display().to_string()), "{err}");
+    assert!(
+        err.contains("named volume"),
+        "it says what to change: {err}"
+    );
+
+    let project = compose::project_name(f.paths.project_id(), &name);
+    assert!(
+        !pando_items("container")
+            .iter()
+            .any(|c| c.starts_with(&project)),
+        "nothing was started for a worktree pando refused"
+    );
+    assert!(
+        !inside.join("pando-wrote-into-your-repo").exists(),
+        "pando never writes into your repository"
+    );
+    assert_eq!(
+        common::status_porcelain(f.paths.root()),
+        "",
+        "and the main checkout is untouched"
+    );
+    assert_eq!(common::status_porcelain(&worktree_of(&f, &name)), "");
+}
