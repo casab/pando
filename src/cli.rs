@@ -88,6 +88,11 @@ pub enum Command {
         /// rest are left exactly as they are, on the ports they have.
         #[arg(long)]
         only: Option<String>,
+        /// Run private copies of the project's services for this worktree,
+        /// on ports of its own. Remembered: a later plain `start` keeps
+        /// them.
+        #[arg(long)]
+        isolated: bool,
     },
     /// Stop a worktree's processes, or every worktree's when given no name.
     Stop {
@@ -106,12 +111,20 @@ pub enum Command {
         /// One process by name. The others are not restarted.
         #[arg(long)]
         only: Option<String>,
+        /// Run private copies of the project's services for this worktree.
+        #[arg(long)]
+        isolated: bool,
     },
     /// What is running, and on which ports.
     Status {
         name: Option<String>,
         #[arg(long)]
         json: bool,
+        /// `export KEY=value` lines for this worktree's resolved
+        /// environment, so a shell can `eval "$(pando status --env <name>)"`
+        /// and run the project's own commands by hand.
+        #[arg(long, requires = "name", conflicts_with = "json")]
+        env: bool,
     },
     /// Print a worktree's log.
     Logs {
@@ -140,7 +153,12 @@ impl Command {
     pub fn needs_config(&self) -> bool {
         matches!(
             self,
-            Command::New { .. } | Command::Start { .. } | Command::Restart { .. }
+            Command::New { .. }
+                | Command::Start { .. }
+                | Command::Restart { .. }
+                // `--env` renders templates, which only config holds. Plain
+                // `status` still runs on whatever is left.
+                | Command::Status { env: true, .. }
         )
     }
 }
@@ -178,9 +196,14 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             writeln!(out, "{}", actions::path(paths, &name)?.display())?;
             Ok(())
         }
-        Command::Start { name, yes, only } => {
-            let config = &actions::resolve_process(paths, config, false, &asker(yes), &notice)?;
-            let report = actions::start(paths, config, &name, only.as_deref(), false, &notice)?;
+        Command::Start {
+            name,
+            yes,
+            only,
+            isolated,
+        } => {
+            let config = &actions::resolve_process(paths, config, isolated, &asker(yes), &notice)?;
+            let report = actions::start(paths, config, &name, only.as_deref(), isolated, &notice)?;
             if report.reassigned {
                 eprintln!("pando: the ports {name} had were taken; it moved to new ones");
             }
@@ -196,7 +219,12 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             Some(name) => {
                 match actions::stop(paths, &name, only.as_deref())? {
                     actions::StopOutcome::Stopped(processes) => {
-                        notice(&format!("stopped {}", processes.join(", ")));
+                        // Empty when the worktree had only its services
+                        // left up, which is a real thing to stop and a
+                        // silly thing to narrate as "stopped ".
+                        if !processes.is_empty() {
+                            notice(&format!("stopped {}", processes.join(", ")));
+                        }
                         writeln!(out, "stopped {name}")?;
                     }
                     actions::StopOutcome::NotRunning => writeln!(out, "{name} was not running")?,
@@ -213,16 +241,28 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
                 Ok(())
             }
         },
-        Command::Restart { name, yes, only } => {
+        Command::Restart {
+            name,
+            yes,
+            only,
+            isolated,
+        } => {
             // Resolved exactly as `start` resolves it: a project whose
             // process question has never been answered gets the question,
             // not a refusal.
-            let config = &actions::resolve_process(paths, config, false, &asker(yes), &notice)?;
-            let report = actions::restart(paths, config, &name, only.as_deref(), false, &notice)?;
+            let config = &actions::resolve_process(paths, config, isolated, &asker(yes), &notice)?;
+            let report =
+                actions::restart(paths, config, &name, only.as_deref(), isolated, &notice)?;
             writeln!(out, "restarted {name}{}", url_suffix(report.url.as_deref()))?;
             Ok(())
         }
-        Command::Status { name, json } => {
+        Command::Status { name, json, env } => {
+            if env {
+                let name = name.as_deref().expect("--env requires a name");
+                let resolved = actions::resolved_env(paths, config, name)?;
+                write!(out, "{}", actions::export_lines(&resolved))?;
+                return Ok(());
+            }
             if json {
                 status_json(paths, name.as_deref(), &mut out)
             } else {
@@ -884,6 +924,19 @@ struct HookOut {
     ran_at: DateTime<Utc>,
 }
 
+/// One private service, flattened for the machine-readable shape.
+#[derive(Serialize)]
+struct ServiceOut {
+    /// `compose` for now; `native` joins it in Phase 6.
+    kind: &'static str,
+    port: Option<u16>,
+    /// Whether something answers on that port right now.
+    up: bool,
+    /// The compose project the container belongs to, which is what `rm`
+    /// takes down.
+    project: Option<String>,
+}
+
 #[derive(Serialize)]
 struct StatusWorktreeOut {
     name: String,
@@ -893,7 +946,11 @@ struct StatusWorktreeOut {
     observed_ports: Vec<u16>,
     /// The readiness role's URL, when this worktree has one.
     url: Option<String>,
+    /// Whether this worktree runs private copies of the project's
+    /// services.
+    isolated: bool,
     processes: BTreeMap<String, ProcessOut>,
+    services: BTreeMap<String, ServiceOut>,
     hooks: BTreeMap<String, HookOut>,
 }
 
@@ -953,6 +1010,25 @@ pub fn status_json<W: Write>(paths: &PandoPaths, only: Option<&str>, out: &mut W
                     ports: record.ports.clone(),
                     observed_ports: record.observed_ports.clone(),
                     url: worktree_url(record),
+                    isolated: record.isolated,
+                    services: actions::service_statuses(record)
+                        .into_iter()
+                        .map(|status| {
+                            let recorded = record.services.iter().find(|s| s.name == status.name);
+                            (
+                                status.name,
+                                ServiceOut {
+                                    kind: match recorded.map(|s| s.kind) {
+                                        Some(crate::state::ServiceKind::Native) => "native",
+                                        _ => "compose",
+                                    },
+                                    port: status.port,
+                                    up: status.up,
+                                    project: recorded.and_then(|s| s.compose_project.clone()),
+                                },
+                            )
+                        })
+                        .collect(),
                     processes: record
                         .processes
                         .iter()
@@ -1049,6 +1125,27 @@ pub fn status_text_at<W: Write>(
                 name,
                 process_line(p),
                 process_width = process_width
+            );
+            writeln!(out, "{}", ellipsize(&row, width))?;
+        }
+        // And one per private service, so a worktree whose database is
+        // down says which one rather than only that its app failed.
+        let services = actions::service_statuses(record);
+        let service_width = services
+            .iter()
+            .map(|s| s.name.chars().count())
+            .max()
+            .unwrap_or(0)
+            .max(process_width);
+        for service in &services {
+            let port = match service.port {
+                Some(port) => port.to_string(),
+                None => "-".to_string(),
+            };
+            let row = format!(
+                "  {:<service_width$}  {:<PHASE_CELL$}  service on {port}",
+                service.name,
+                if service.up { "up" } else { "down" },
             );
             writeln!(out, "{}", ellipsize(&row, width))?;
         }

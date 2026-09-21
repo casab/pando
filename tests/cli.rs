@@ -85,6 +85,22 @@ impl Env {
     }
 }
 
+/// A fixture with compose services, a fake docker in its home, and a dev
+/// process that needs no framework — everything `--isolated` needs.
+fn env_isolated() -> Env {
+    let e = env_of(Kind::NextPnpmCompose);
+    common::docker::install(&e.home);
+    e.write_config(&format!(
+        "[project]\nprovision = [\".env\"]\ninstall = \"true\"\n\n\
+         [dev]\ncmd = '''{}'''\nports = {{ PORT = \"web\" }}\n\n\
+         [[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
+         include = [\"postgres\", \"redis\"]\n\
+         env = {{ DATABASE_URL = \"postgres\", REDIS_URL = \"redis\" }}\n",
+        common::listener_on_port_env()
+    ));
+    e
+}
+
 fn code(out: &Output) -> i32 {
     out.status.code().expect("pando exited via a signal")
 }
@@ -1242,4 +1258,150 @@ fn stopping_one_process_leaves_the_others_crash_visible() {
     );
     assert_eq!(code(&e.pando(&["stop"])), EXIT_OK);
     assert_eq!(status_porcelain(&e.root), "");
+}
+
+// ---- isolation from the command line --------------------------------------
+
+#[test]
+fn start_isolated_brings_up_services_and_status_shows_them() {
+    if !common::python3_available() {
+        eprintln!("skipping: python3 is not installed");
+        return;
+    }
+    let e = env_isolated();
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+    let out = e.pando(&["start", "feat+one", "--isolated"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+
+    let text = e.pando(&["status", "feat+one"]);
+    let shown = stdout(&text);
+    assert!(shown.contains("postgres"), "{shown}");
+    assert!(shown.contains("redis"), "{shown}");
+    assert!(shown.contains("service on"), "with its port: {shown}");
+    assert!(shown.contains("up"), "and whether it is answering: {shown}");
+
+    let json = stdout(&e.pando(&["status", "feat+one", "--json"]));
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let worktree = &value["worktrees"][0];
+    assert_eq!(worktree["isolated"], serde_json::json!(true), "{json}");
+    let postgres = &worktree["services"]["postgres"];
+    assert_eq!(postgres["kind"], serde_json::json!("compose"));
+    assert_eq!(postgres["up"], serde_json::json!(true), "{json}");
+    assert_eq!(
+        postgres["port"],
+        serde_json::json!(worktree["ports"]["postgres"].as_u64().unwrap())
+    );
+    assert!(
+        postgres["project"]
+            .as_str()
+            .unwrap()
+            .starts_with("pando-next-pnpm-compose-"),
+        "{json}"
+    );
+
+    // The service's container log is a source like any other.
+    let logs = e.pando(&["logs", "feat+one", "--source", "postgres"]);
+    assert_eq!(code(&logs), EXIT_OK, "stderr: {}", stderr(&logs));
+    assert!(
+        stdout(&logs).contains("fake docker log for postgres"),
+        "{}",
+        stdout(&logs)
+    );
+
+    assert_eq!(code(&e.pando(&["rm", "feat+one", "--force"])), EXIT_OK);
+    assert_eq!(status_porcelain(&e.root), "");
+}
+
+#[test]
+fn status_env_prints_lines_a_shell_can_eval() {
+    if !common::python3_available() {
+        eprintln!("skipping: python3 is not installed");
+        return;
+    }
+    let e = env_isolated();
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+    assert_eq!(
+        code(&e.pando(&["start", "feat+one", "--isolated"])),
+        EXIT_OK
+    );
+    let json = stdout(&e.pando(&["status", "feat+one", "--json"]));
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let ports = &value["worktrees"][0]["ports"];
+    let postgres = ports["postgres"].as_u64().unwrap();
+    let web = ports["web"].as_u64().unwrap();
+
+    let out = e.pando(&["status", "feat+one", "--env"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains(&format!(
+            "export DATABASE_URL='postgres://acme:acme@localhost:{postgres}/acme'"
+        )),
+        "{text}"
+    );
+    assert!(text.contains(&format!("export PORT='{web}'")), "{text}");
+    assert!(text.contains("export PANDO_NAME='feat+one'"), "{text}");
+    // Every line is an export, so `eval` on the whole thing is safe.
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        assert!(line.starts_with("export "), "{line:?}");
+    }
+
+    // And a shell really does read it back.
+    let shell = Command::new("bash")
+        .arg("-c")
+        .arg("eval \"$(cat)\" && echo \"$DATABASE_URL|$PANDO_NAME\"")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child
+                .stdin
+                .as_mut()
+                .expect("stdin")
+                .write_all(text.as_bytes())?;
+            child.wait_with_output()
+        })
+        .expect("run bash");
+    assert_eq!(
+        stdout(&shell).trim(),
+        format!("postgres://acme:acme@localhost:{postgres}/acme|feat+one")
+    );
+
+    assert_eq!(code(&e.pando(&["rm", "feat+one", "--force"])), EXIT_OK);
+}
+
+#[test]
+fn status_env_on_a_worktree_that_has_never_started_says_so() {
+    let e = env_isolated();
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+    let out = e.pando(&["status", "feat+one", "--env"]);
+    assert_eq!(code(&out), EXIT_ERROR, "stdout: {}", stdout(&out));
+    assert!(stderr(&out).contains("start it once"), "{}", stderr(&out));
+    assert!(stdout(&out).is_empty(), "nothing to eval: {}", stdout(&out));
+}
+
+#[test]
+fn status_env_without_a_name_is_a_usage_error() {
+    let e = env();
+    assert_eq!(code(&e.pando(&["status", "--env"])), EXIT_USAGE);
+    assert_eq!(
+        code(&e.pando(&["status", "feat+one", "--env", "--json"])),
+        EXIT_USAGE,
+        "--env and --json are two different shapes"
+    );
+}
+
+// The plan's own words: an isolated start on a project with no services
+// runs shared and says so, rather than refusing.
+#[test]
+fn start_isolated_on_a_project_with_no_services_runs_shared() {
+    let e = env_of(Kind::GoService);
+    common::docker::install(&e.home);
+    e.write_config("[project]\ninstall = \"true\"\n\n[dev]\ncmd = \"sleep 30\"\nports = []\n");
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+    let out = e.pando(&["start", "feat+one", "--isolated"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("shared mode"), "{}", stderr(&out));
+    assert_eq!(code(&e.pando(&["stop"])), EXIT_OK);
 }

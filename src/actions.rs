@@ -2261,6 +2261,105 @@ fn ready_role(process: &ProcessConfig, roles: &[String]) -> Result<Option<String
         .cloned())
 }
 
+/// One of a worktree's private services, as `status` and the TUI show it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceStatus {
+    pub name: String,
+    pub port: Option<u16>,
+    /// Whether something answers on that port right now.
+    pub up: bool,
+}
+
+/// Every service a worktree owns, with whether it is answering.
+///
+/// A TCP connect, never a bind — the same rule readiness follows, for the
+/// same reason: a bind probe would take the port from the container that
+/// owns it. It says nothing about *whose* listener answered, which is
+/// exactly as much as a status line needs to claim.
+pub fn service_statuses(record: &WorktreeRecord) -> Vec<ServiceStatus> {
+    record
+        .services
+        .iter()
+        .map(|service| ServiceStatus {
+            name: service.name.clone(),
+            port: service.port,
+            up: service.port.map(ports::something_is_listening) == Some(true),
+        })
+        .collect()
+}
+
+/// The environment a command run by hand inside a worktree needs, so that
+/// it reaches the same database and the same ports the dev processes do.
+///
+/// This is what `status --env` prints. It replaces materialising a
+/// rewritten `.env` inside the worktree, which Invariant 1 forbids unless
+/// the project already ignores that path — and which would be wrong the
+/// moment two worktrees disagreed about it.
+///
+/// Merged in one fixed order — the services, then each process by name,
+/// then pando's own variables — so two runs of the same command print the
+/// same thing.
+pub fn resolved_env(
+    paths: &PandoPaths,
+    config: &Config,
+    name: &str,
+) -> Result<BTreeMap<String, String>> {
+    let worktree = find_worktree(paths, name)?;
+    let canonical = std::fs::canonicalize(&worktree.path).unwrap_or_else(|_| worktree.path.clone());
+    let store = state::load(&paths.state_file())?;
+    let record = store
+        .worktrees
+        .get(name)
+        .with_context(|| format!("pando has no record of {name}"))?;
+    if record.ports.is_empty() {
+        bail!(
+            "{name} has no ports yet — start it once, and `pando status --env {name}` can say \
+             where everything is"
+        );
+    }
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    if record.isolated {
+        out.extend(resolve_service_env(config, &canonical, &record.ports)?);
+    }
+    for (process_name, process) in &config.processes {
+        let log_file = paths.log_file(name, process_name);
+        let ctx = template::Context {
+            name,
+            branch: worktree.branch.as_deref(),
+            worktree: &canonical,
+            root: paths.root(),
+            project: paths.project_id(),
+            ports: &record.ports,
+            default_role: None,
+            log: Some(&log_file),
+        };
+        // Through the same function the processes are started with, so a
+        // developer who evals this gets exactly what the dev server got.
+        for (var, value) in process_env(paths, name, &worktree, process, &out.clone(), &ctx)
+            .with_context(|| format!("in process {process_name}"))?
+        {
+            out.insert(var, value);
+        }
+    }
+    Ok(out)
+}
+
+/// `export KEY='value'` lines a shell can `eval`.
+///
+/// Single quotes with the close-escape-reopen trick, because a value can
+/// hold anything: a password with a `$` in it must not be expanded, and a
+/// value with a quote in it must not end the string early.
+pub fn export_lines(env: &BTreeMap<String, String>) -> String {
+    let mut out = String::new();
+    for (key, value) in env {
+        out.push_str(&format!(
+            "export {key}='{}'\n",
+            value.replace('\'', "'\\''")
+        ));
+    }
+    out
+}
+
 /// The URL a worktree serves on. One worktree, one URL, however many
 /// processes it runs — and one function, because `start`, `status`, `ls`,
 /// the TUI's row and the TUI's `o` key all have to hand out the same one.
