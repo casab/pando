@@ -1473,26 +1473,34 @@ fn native_report(
             .map(|b| b.name.as_str())
             .collect();
         if !missing.is_empty() {
-            findings.push(Finding::problem(
-                Section::Services,
-                format!(
-                    "the service {:?} runs the {:?} recipe, and {} not on PATH — \
-                     `start --isolated` would refuse rather than start it",
-                    entry.name,
-                    resolved.recipe.name,
-                    match missing.len() {
-                        1 => format!("{} is", missing[0]),
-                        _ => format!("{} are", missing.join(", ")),
-                    }
-                ),
-                match &resolved.recipe.install {
+            // A note, not a problem, for the same reason a missing Docker
+            // is one: only `start --isolated` needs this engine, and a
+            // project whose developer runs against a shared database is
+            // not broken by not having a private one. `doctor` exits 1 on
+            // a problem, and "you could not run a mode you are not using"
+            // is not that.
+            findings.push(
+                Finding::note(
+                    Section::Services,
+                    format!(
+                        "the service {:?} runs the {:?} recipe, and {} not on PATH — \
+                         `start --isolated` cannot run it, though a plain `start` still can",
+                        entry.name,
+                        resolved.recipe.name,
+                        match missing.len() {
+                            1 => format!("{} is", missing[0]),
+                            _ => format!("{} are", missing.join(", ")),
+                        }
+                    ),
+                )
+                .with_fix(match &resolved.recipe.install {
                     Some(hint) => format!("install it: {hint} — pando never will"),
                     None => format!(
                         "install it, or put a shim in {} — pando never installs an engine",
                         bin_dir.display()
                     ),
-                },
-            ));
+                }),
+            );
         }
         report.engine = engine;
         report.version = version;
@@ -4123,12 +4131,24 @@ mod tests {
             native.version, None,
             "a version from a binary that is not there"
         );
-        assert!(mentions(&report, "not on PATH"), "{:?}", messages(&report));
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.message.contains("not on PATH"))
+            .unwrap_or_else(|| panic!("{:?}", messages(&report)));
+        // A note, not a problem, exactly as a missing Docker is: only
+        // `--isolated` needs the engine, so a developer running against a
+        // shared database is not broken by not having a private one.
+        assert_eq!(finding.severity, Severity::Note);
+        assert!(
+            finding.message.contains("a plain `start` still can"),
+            "{finding:?}"
+        );
+        assert!(report.healthy(), "{:?}", report.findings);
         let text = report.render();
         assert!(text.contains("postgres is not on PATH"), "{text}");
         assert!(text.contains("brew install postgresql"), "{text}");
         assert!(text.contains("pando never will"), "{text}");
-        assert!(!report.healthy());
     }
 
     #[test]

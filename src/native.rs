@@ -194,20 +194,22 @@ pub struct Resolved {
 /// a leftover. A preset that came from the entry's *name* is a guess, so
 /// an entry called `db` with its own `cmd` and no recipe called `db` is
 /// simply an inline service.
+///
+/// The guess is checked against recipe *names* only, never their aliases.
+/// An entry called `pg` with its own `cmd` means what it says; resolving
+/// it through Postgres's `pg` alias would run `initdb` against it and
+/// demand an engine on PATH for a service the developer wrote out in
+/// full. An alias still resolves a `preset` that names one, and still
+/// resolves a name that has no command of its own — those are both asking
+/// for a recipe.
 pub fn resolve(recipes: &crate::recipes::Recipes, entry: &Entry<'_>) -> Result<Resolved> {
-    let found = recipes.get(entry.preset());
-    let (mut recipe, source) = match found {
-        Ok(loaded) => (loaded.recipe.clone(), Source::Recipe(loaded.origin.clone())),
-        Err(e) if entry.preset.is_some() || entry.cmd.is_none() => {
-            return Err(e).with_context(|| {
-                format!(
-                    "the service {:?} names the recipe {:?}",
-                    entry.name,
-                    entry.preset()
-                )
-            });
-        }
-        Err(_) => (
+    let preset = entry.preset();
+    // A *broken* file claiming this name is not an absent recipe: falling
+    // through to the entry's own `cmd` would silently ignore the file the
+    // developer is trying to fix.
+    let known = recipes.exact(preset).is_some() || recipes.is_broken(preset);
+    let (mut recipe, source) = if !known && entry.preset.is_none() && entry.cmd.is_some() {
+        (
             Recipe {
                 kind: crate::recipes::Kind::Service,
                 name: entry.name.to_string(),
@@ -220,7 +222,12 @@ pub fn resolve(recipes: &crate::recipes::Recipes, entry: &Entry<'_>) -> Result<R
                 body: crate::recipes::Body::Service(crate::recipes::ServiceRecipe::default()),
             },
             Source::Inline,
-        ),
+        )
+    } else {
+        let loaded = recipes
+            .get(preset)
+            .with_context(|| format!("the service {:?} names the recipe {preset:?}", entry.name))?;
+        (loaded.recipe.clone(), Source::Recipe(loaded.origin.clone()))
     };
     let name = recipe.name.clone();
     let service = recipe.service_mut().with_context(|| {
@@ -873,6 +880,70 @@ mod tests {
         );
         assert!(e.contains("plain identifier"), "{e}");
         assert!(e.contains("acme';DROP"), "{e}");
+    }
+
+    #[test]
+    fn a_recipes_alias_never_beats_an_entrys_own_command() {
+        let fx = fixture();
+        let recipes = Recipes::built_in();
+        // `pg` is an alias of the built-in Postgres recipe. An entry with
+        // its own `cmd` and no `preset` is not asking for that recipe,
+        // and resolving it through the alias would run `initdb` against
+        // the service and demand an engine on PATH.
+        let env = std::collections::BTreeMap::new();
+        let inline = Entry {
+            name: "pg",
+            preset: None,
+            port_env: None,
+            init: None,
+            cmd: Some("exec sleep 300"),
+            ready: None,
+            ready_timeout_s: None,
+            env: &env,
+        };
+        let resolved = resolve(&recipes, &inline).unwrap();
+        assert_eq!(resolved.source, Source::Inline);
+        assert!(resolved.recipe.binaries.is_empty(), "{:?}", resolved.recipe);
+        assert_eq!(resolved.recipe.service().unwrap().init, None);
+
+        // The same name with no command of its own *is* asking for a
+        // recipe, so the alias still answers.
+        let by_alias = Entry {
+            cmd: None,
+            ..inline
+        };
+        let resolved = resolve(&recipes, &by_alias).unwrap();
+        assert_eq!(resolved.recipe.name, "postgres");
+
+        // And so does an alias written down as a preset.
+        let spelled = Entry {
+            preset: Some("pg"),
+            ..inline
+        };
+        assert_eq!(resolve(&recipes, &spelled).unwrap().recipe.name, "postgres");
+        let _ = fx;
+    }
+
+    #[test]
+    fn a_broken_recipe_file_is_not_answered_by_the_entrys_own_command() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("db.toml"), "kind = \"service\"\nname =").unwrap();
+        let recipes = Recipes::load(dir.path());
+        let env = std::collections::BTreeMap::new();
+        let entry = Entry {
+            name: "db",
+            preset: None,
+            port_env: None,
+            init: None,
+            cmd: Some("exec sleep 300"),
+            ready: None,
+            ready_timeout_s: None,
+            env: &env,
+        };
+        // Falling through to the inline command would silently ignore the
+        // file the developer is trying to fix.
+        let e = format!("{:#}", resolve(&recipes, &entry).unwrap_err());
+        assert!(e.contains("does not load"), "{e}");
     }
 
     // ---- the socket path ------------------------------------------------

@@ -342,6 +342,21 @@ impl Recipes {
         )
     }
 
+    /// The recipe registered under exactly this name, with no alias
+    /// lookup and no error for a name nothing has.
+    ///
+    /// What "is there a recipe called this?" means when the answer decides
+    /// whether a `[[services]]` entry is running a recipe at all.
+    pub fn exact(&self, name: &str) -> Option<&Loaded> {
+        self.entries.get(name)
+    }
+
+    /// Whether a file claiming this name is there and does not load. A
+    /// name in this state is *unusable*, which is not the same as absent.
+    pub fn is_broken(&self, name: &str) -> bool {
+        self.broken.contains_key(name)
+    }
+
     /// Every name, built-in and user, alphabetically.
     pub fn names(&self) -> Vec<&str> {
         self.entries.keys().map(String::as_str).collect()
