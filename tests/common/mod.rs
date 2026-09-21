@@ -6,6 +6,8 @@
 
 #![allow(dead_code)]
 
+pub mod docker;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
