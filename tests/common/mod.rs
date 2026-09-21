@@ -401,12 +401,19 @@ fn files_for(kind: Kind) -> Vec<(&'static str, &'static str)> {
     environment:
       POSTGRES_PASSWORD: acme
     ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
   redis:
     image: redis:7
     ports: ["6379:6379"]
+    volumes:
+      - redisdata:/data
   mailpit:
     image: axllent/mailpit
     ports: ["1025:1025"]
+volumes:
+  pgdata:
+  redisdata:
 "#,
             ),
             (
