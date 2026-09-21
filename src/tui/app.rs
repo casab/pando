@@ -978,7 +978,7 @@ impl App {
             // Detection may have a question; it goes back to the UI thread
             // and this worker waits for the answer.
             let ask = |question: &actions::Question| ask_through_ui(&tx, question);
-            let config = actions::resolve_process(&paths, &config, &ask, &progress)
+            let config = actions::resolve_process(&paths, &config, false, &ask, &progress)
                 .map_err(|e| format!("{e:#}"))?;
             // Back to the UI thread at once: an answer written to
             // `pando.toml` that this session's own copy does not have is
@@ -1020,7 +1020,7 @@ impl App {
                 let _ = ptx.send(msg.to_string());
             };
             let ask = |question: &actions::Question| ask_through_ui(&tx, question);
-            let config = actions::resolve_process(&paths, &config, &ask, &progress)
+            let config = actions::resolve_process(&paths, &config, false, &ask, &progress)
                 .map_err(|e| format!("{e:#}"))?;
             let _ = tx.send(AppEvent::ConfigResolved(Box::new(config.clone())));
             actions::restart(&paths, &config, &worker_name, None, false, &progress)
@@ -2630,6 +2630,8 @@ pub mod tests {
             preselect: Some(0),
             allow_custom: true,
             allow_none: false,
+            multi: false,
+            checked: Vec::new(),
         }
     }
 

@@ -179,7 +179,7 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             Ok(())
         }
         Command::Start { name, yes, only } => {
-            let config = &actions::resolve_process(paths, config, &asker(yes), &notice)?;
+            let config = &actions::resolve_process(paths, config, false, &asker(yes), &notice)?;
             let report = actions::start(paths, config, &name, only.as_deref(), false, &notice)?;
             if report.reassigned {
                 eprintln!("pando: the ports {name} had were taken; it moved to new ones");
@@ -217,7 +217,7 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             // Resolved exactly as `start` resolves it: a project whose
             // process question has never been answered gets the question,
             // not a refusal.
-            let config = &actions::resolve_process(paths, config, &asker(yes), &notice)?;
+            let config = &actions::resolve_process(paths, config, false, &asker(yes), &notice)?;
             let report = actions::restart(paths, config, &name, only.as_deref(), false, &notice)?;
             writeln!(out, "restarted {name}{}", url_suffix(report.url.as_deref()))?;
             Ok(())
@@ -1544,6 +1544,8 @@ mod tests {
             preselect: (!options.is_empty()).then_some(0),
             allow_custom: true,
             allow_none: false,
+            multi: false,
+            checked: Vec::new(),
         }
     }
 

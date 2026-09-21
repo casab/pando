@@ -1958,6 +1958,8 @@ mod tests {
                     preselect: Some(11),
                     allow_custom: true,
                     allow_none: false,
+                    multi: false,
+                    checked: Vec::new(),
                 },
                 selected: 11,
                 custom: Some("a rather long command typed by hand".into()),

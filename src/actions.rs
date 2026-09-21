@@ -676,8 +676,14 @@ pub struct Question {
     pub allow_custom: bool,
     /// Whether "this process has none" is an answer. True for the port
     /// question: a worker or a watcher really has no port, and that has to
-    /// be sayable, or the question comes back on every start.
+    /// be sayable, or the question comes back on every start. True for the
+    /// services question too, where it means "none of them".
     pub allow_none: bool,
+    /// Whether the answer is a *set* of the options rather than one of
+    /// them: which services this project runs private copies of.
+    pub multi: bool,
+    /// For a multi-select question, the options that start ticked.
+    pub checked: Vec<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -689,8 +695,12 @@ pub enum Answer {
     /// can review.
     Auto(usize),
     Custom(String),
+    /// Several of the options, for a question whose answer is a set: which
+    /// of the compose file's services this project runs private copies of.
+    Many(Vec<usize>),
     /// "This process has none of those." Only offered where a question has
-    /// an empty answer that means something, which this phase is the port.
+    /// an empty answer that means something: the port, and the empty set
+    /// at the services question.
     None,
 }
 
@@ -720,18 +730,41 @@ impl std::error::Error for NeedsAnswer {}
 pub const NEW_SLOTS: [Slot; 3] = [Slot::Install, Slot::VersionFiles, Slot::Provision];
 
 /// The slots `start` fills: how many processes there are, then the dev
-/// process and how it takes its port. `Processes` first, because the
-/// answer to it decides whether the other two have anything left to ask.
-pub const START_SLOTS: [Slot; 3] = [Slot::Processes, Slot::DevCmd, Slot::PortEnv];
+/// process and how it takes its port, then the schema step. `Processes`
+/// first, because the answer to it decides whether the others have
+/// anything left to ask.
+///
+/// `Services` is in the list on every start, because a project whose
+/// services a rule resolved outright should have them in config — that is
+/// what the shared-mode health chips read. It is in [`SILENT_UNLESS_ISOLATED`]
+/// too, so on a plain start it is only ever *taken*, never *asked*:
+/// "which services do you want private copies of?" is a question about a
+/// mode this start is not in.
+pub const START_SLOTS: [Slot; 5] = [
+    Slot::Processes,
+    Slot::DevCmd,
+    Slot::PortEnv,
+    Slot::Services,
+    Slot::SchemaHook,
+];
+
+/// Slots a start that is not isolating may accept but must not ask about.
+const SILENT_UNLESS_ISOLATED: [Slot; 1] = [Slot::Services];
 
 /// Fills the dev process from detection when config has none.
 pub fn resolve_process(
     paths: &PandoPaths,
     config: &Config,
+    isolated: bool,
     ask: Ask<'_>,
     progress: &dyn Fn(&str),
 ) -> Result<Config> {
-    resolve(paths, config, &START_SLOTS, ask, progress)
+    let silent: &[Slot] = if isolated {
+        &[]
+    } else {
+        &SILENT_UNLESS_ISOLATED
+    };
+    resolve_silencing(paths, config, &START_SLOTS, silent, ask, progress)
 }
 
 /// Fills what `new` needs before it creates anything.
@@ -752,6 +785,25 @@ pub fn resolve(
     paths: &PandoPaths,
     config: &Config,
     slots: &[Slot],
+    ask: Ask<'_>,
+    progress: &dyn Fn(&str),
+) -> Result<Config> {
+    resolve_silencing(paths, config, slots, &[], ask, progress)
+}
+
+/// [`resolve`], with slots that may be *taken* when the rules decided them
+/// and must never be *asked* about.
+///
+/// One case so far: the services question is about isolation, and a start
+/// that is not isolating has no business asking it — but a project whose
+/// services the rules resolved outright should still get them written
+/// down, because that is what shared mode reads to show whether the
+/// global database is up.
+pub fn resolve_silencing(
+    paths: &PandoPaths,
+    config: &Config,
+    slots: &[Slot],
+    silent: &[Slot],
     ask: Ask<'_>,
     progress: &dyn Fn(&str),
 ) -> Result<Config> {
@@ -787,6 +839,47 @@ pub fn resolve(
         let Some(proposal) = proposals.iter().find(|p| p.slot == *slot) else {
             continue;
         };
+        if !proposal.decided && silent.contains(slot) {
+            continue;
+        }
+        // The one slot whose answer is a set. It never takes the
+        // single-candidate path below, because "these three" is not one of
+        // the options — it is a subset of them.
+        if slot.is_multi() {
+            let chosen: Vec<detect::Candidate> = if proposal.decided {
+                let taken: Vec<detect::Candidate> =
+                    proposal.preferred_set().into_iter().cloned().collect();
+                if !taken.is_empty() {
+                    progress(&format!(
+                        "running private copies of {} (detected: {})",
+                        taken
+                            .iter()
+                            .map(|c| c.value.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        taken[0].why
+                    ));
+                }
+                taken
+            } else {
+                let question = question_for(proposal);
+                let offered = question.options.len();
+                match ask(&question)? {
+                    Answer::Many(indexes) => indexes
+                        .iter()
+                        .map(|index| pick(proposal, *index))
+                        .collect::<Result<Vec<_>>>()?,
+                    Answer::Auto(_) => proposal.preferred_set().into_iter().cloned().collect(),
+                    Answer::None => Vec::new(),
+                    _ => bail!(
+                        "{} is answered with a set of the {offered} options",
+                        slot_label(*slot)
+                    ),
+                }
+            };
+            apply_service_answer(paths, &mut config, *slot, &chosen, proposal)?;
+            continue;
+        }
         let candidate = if proposal.decided {
             let candidate = proposal
                 .preferred()
@@ -815,6 +908,12 @@ pub fn resolve(
                 Answer::Custom(value) => {
                     (detect::custom(*slot, value.trim()), config::Note::Answered)
                 }
+                // Only the multi-select slot has a set for an answer, and
+                // it never reaches here.
+                Answer::Many(_) => bail!(
+                    "{} takes one of its {offered} options, not several",
+                    slot_label(*slot)
+                ),
                 // Written down as an empty list rather than left out: "this
                 // process has no ports" and "nobody has said yet" have to
                 // be different states, or the question returns on every
@@ -842,6 +941,13 @@ pub fn resolve(
         if candidate.value.trim().is_empty() {
             bail!("an empty answer is not a {}", slot_label(*slot));
         }
+        // A slot whose answer is a whole `[[table]]` entry: appended, with
+        // the note on the entry's own header rather than on each key.
+        if let Some((array, entries)) = detect::array_edits(*slot, &[&candidate]) {
+            config::set_detected_array_entry(paths, array, entries, note.clone())?;
+            detect::apply(*slot, &candidate, &mut config);
+            continue;
+        }
         let edits = detect::edits(*slot, &candidate);
         if *slot == Slot::Processes {
             // A whole process table is one answer to one question, so the
@@ -866,6 +972,35 @@ pub fn resolve(
         }
     }
     Ok(config)
+}
+
+/// Writes the answer to the one multi-select slot: a `[[services]]` entry
+/// listing the services chosen and the env keys that point at them.
+///
+/// An empty set is a real answer — "none of them" — and it writes
+/// nothing, because a project with no private services is a project with
+/// no `[[services]]` table.
+fn apply_service_answer(
+    paths: &PandoPaths,
+    config: &mut Config,
+    slot: Slot,
+    chosen: &[detect::Candidate],
+    proposal: &detect::Proposal,
+) -> Result<()> {
+    if chosen.is_empty() {
+        return Ok(());
+    }
+    let refs: Vec<&detect::Candidate> = chosen.iter().collect();
+    let note = if proposal.decided {
+        config::Note::Detected(chosen[0].why.clone())
+    } else {
+        config::Note::Answered
+    };
+    if let Some((array, entries)) = detect::array_edits(slot, &refs) {
+        config::set_detected_array_entry(paths, array, entries, note)?;
+    }
+    detect::apply_services(&refs, config);
+    Ok(())
 }
 
 /// Edits gathered per table, keeping the order they were produced in.
@@ -904,8 +1039,12 @@ fn question_for(proposal: &detect::Proposal) -> Question {
             .map(|c| (c.value.clone(), c.why.clone()))
             .collect(),
         preselect: (!proposal.candidates.is_empty()).then_some(0),
-        allow_custom: true,
-        allow_none: proposal.slot == Slot::PortEnv,
+        // A set answer takes the options as they are; there is no command
+        // to type in place of "which of these containers".
+        allow_custom: !proposal.slot.is_multi(),
+        allow_none: proposal.slot == Slot::PortEnv || proposal.slot.is_multi(),
+        multi: proposal.slot.is_multi(),
+        checked: proposal.preselected(),
     }
 }
 
@@ -916,6 +1055,8 @@ fn slot_label(slot: Slot) -> &'static str {
         Slot::Processes => "process list",
         Slot::DevCmd => "dev command",
         Slot::PortEnv => "port variable",
+        Slot::Services => "service list",
+        Slot::SchemaHook => "schema command",
         Slot::Provision => "provision list",
     }
 }
@@ -926,6 +1067,8 @@ fn already_answered(slot: Slot, config: &Config) -> bool {
         Slot::Install => config.project.install.is_some(),
         Slot::VersionFiles => !config.runtime.version_files.is_empty(),
         Slot::Provision => !config.project.provision.is_empty(),
+        Slot::Services => !config.services.is_empty(),
+        Slot::SchemaHook => !config.hooks.is_empty(),
         // Both of these now live in one place, because they are the same
         // question asked twice: has anything already said what this
         // project's processes are?
@@ -2883,6 +3026,17 @@ mod tests {
         progress: &dyn Fn(&str),
     ) -> Result<StartReport> {
         super::restart(paths, config, name, only, false, progress)
+    }
+
+    /// Detection for a shared-mode start, which is what every test written
+    /// before isolation existed means.
+    fn resolve_process(
+        paths: &PandoPaths,
+        config: &Config,
+        ask: Ask<'_>,
+        progress: &dyn Fn(&str),
+    ) -> Result<Config> {
+        super::resolve_process(paths, config, false, ask, progress)
     }
 
     // The two lists have to stay in step: a process named `install` writes

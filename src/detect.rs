@@ -445,10 +445,32 @@ pub enum Slot {
     Processes,
     DevCmd,
     PortEnv,
+    /// Which of the compose file's services a worktree runs private
+    /// copies of. The one multi-select slot: its answer is a set rather
+    /// than a value.
+    Services,
+    /// The command that brings a fresh database up to the current schema,
+    /// and the files whose change means it has to run again.
+    SchemaHook,
     Provision,
 }
 
 impl Slot {
+    /// Whether this slot's answer is a set of the options rather than one
+    /// of them.
+    pub fn is_multi(self) -> bool {
+        self == Slot::Services
+    }
+
+    /// The array of tables this slot appends to, for the two slots whose
+    /// answer is a whole `[[table]]` entry.
+    pub fn array(self) -> Option<&'static str> {
+        match self {
+            Slot::Services => Some("services"),
+            Slot::SchemaHook => Some("hooks"),
+            _ => None,
+        }
+    }
     /// Where the answer is written, as a table path plus a key. `None` for
     /// [`Slot::Processes`], whose answer is whole tables rather than one
     /// key; [`edits`] is what knows how to write that.
@@ -459,7 +481,7 @@ impl Slot {
             Slot::DevCmd => (&["dev"], "cmd"),
             Slot::PortEnv => (&["dev"], "ports"),
             Slot::Provision => (&["project"], "provision"),
-            Slot::Processes => return None,
+            Slot::Processes | Slot::Services | Slot::SchemaHook => return None,
         })
     }
 
@@ -471,9 +493,21 @@ impl Slot {
             Slot::Processes => "Run these as separate processes?",
             Slot::DevCmd => "Which command starts the local development server?",
             Slot::PortEnv => "Which environment variable sets the web server's port?",
+            Slot::Services => "Run private copies of these services for each worktree?",
+            Slot::SchemaHook => "Which command brings a fresh database up to the schema?",
             Slot::Provision => "Which local files should each worktree get a copy of?",
         }
     }
+}
+
+/// What a compose service candidate carries besides its name: the file it
+/// is declared in, and the environment key the app reads to find it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServiceHint {
+    pub file: String,
+    /// `None` when nothing in the env example points at this service. Such
+    /// a service can still be run, but the app is never told where it is.
+    pub env_key: Option<String>,
 }
 
 /// One thing a rule found, and why.
@@ -492,6 +526,15 @@ pub struct Candidate {
     /// Whole processes, for the one slot whose answer is not a single
     /// value: the workspace form proposes a table per app.
     pub processes: Option<BTreeMap<String, ProcessConfig>>,
+    /// For a compose service: where it is declared and which env key
+    /// points at it.
+    pub service: Option<ServiceHint>,
+    /// Whether a multi-select question starts with this option ticked,
+    /// because a rule resolved it rather than guessed at it.
+    pub preselected: bool,
+    /// For the schema slot: the whole `[[hooks]]` entry, because a hook is
+    /// a command *and* the files it is keyed on.
+    pub hook: Option<crate::config::HookConfig>,
 }
 
 /// What the rules found for one slot.
@@ -510,6 +553,26 @@ impl Proposal {
     pub fn preferred(&self) -> Option<&Candidate> {
         self.candidates.first()
     }
+
+    /// The options a multi-select question pre-checks: the ones a rule
+    /// already resolved.
+    pub fn preselected(&self) -> Vec<usize> {
+        self.candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.preselected)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// What the rules would take with nobody asked: the pre-checked set
+    /// for a multi-select slot, the first candidate for every other one.
+    pub fn preferred_set(&self) -> Vec<&Candidate> {
+        if self.slot.is_multi() {
+            return self.candidates.iter().filter(|c| c.preselected).collect();
+        }
+        self.preferred().into_iter().collect()
+    }
 }
 
 /// Everything tier 1 has to say, in the order the slots are filled.
@@ -523,6 +586,11 @@ pub fn propose(root: &Path, signals: &Signals) -> Vec<Proposal> {
         processes_proposal(root, signals),
         dev_cmd_proposal(signals, rule),
         port_proposal(signals, rule),
+        // After the processes, because a service is only worth proposing
+        // once there is something to talk to it; before the schema hook,
+        // whose whole point is to run once the services are up.
+        services_proposal(root, signals),
+        schema_hook_proposal(root, signals),
         provision_proposal(signals),
     ]
     .into_iter()
@@ -1229,6 +1297,244 @@ fn processes_proposal(root: &Path, signals: &Signals) -> Option<Proposal> {
     })
 }
 
+// ---- services and the schema hook -----------------------------------------
+
+/// Images an application talks to, and the env-key prefixes that name one
+/// when the service's own name does not.
+///
+/// A service whose image is on this list and that nothing in the env
+/// example points at is the ambiguous case: the developer may want a
+/// private copy of it and pando cannot tell, so it asks. A service whose
+/// image is *not* on this list — a mail catcher, a dashboard, something
+/// pando has never heard of — is left unticked without a question, because
+/// an app that never reads an address for it is not talking to it.
+const SERVICE_IMAGES: [(&str, &[&str]); 12] = [
+    (
+        "postgres",
+        &["DATABASE", "DB", "POSTGRES", "PG", "POSTGRESQL"],
+    ),
+    ("postgis", &["DATABASE", "DB", "POSTGRES", "PG"]),
+    ("mysql", &["DATABASE", "DB", "MYSQL"]),
+    ("mariadb", &["DATABASE", "DB", "MYSQL", "MARIADB"]),
+    ("redis", &["REDIS", "CACHE"]),
+    ("valkey", &["REDIS", "VALKEY", "CACHE"]),
+    ("mongo", &["MONGO", "MONGODB", "DATABASE"]),
+    ("elasticsearch", &["ELASTIC", "ELASTICSEARCH", "SEARCH"]),
+    ("rabbitmq", &["RABBITMQ", "AMQP", "QUEUE", "BROKER"]),
+    ("kafka", &["KAFKA", "BROKER"]),
+    ("minio", &["MINIO", "S3", "STORAGE"]),
+    ("clickhouse", &["CLICKHOUSE"]),
+];
+
+/// Prefixes for images an app usually does not address, so a missing key
+/// is not a question. A mail catcher is the classic: it exists so nothing
+/// leaves the machine, and half of them are never configured at all.
+const UTILITY_IMAGES: [(&str, &[&str]); 3] = [
+    ("mailpit", &["SMTP", "MAIL", "MAILER"]),
+    ("mailhog", &["SMTP", "MAIL", "MAILER"]),
+    ("maildev", &["SMTP", "MAIL", "MAILER"]),
+];
+
+/// Key suffixes that hold an address pando can rewrite. `_NAME`, `_USER`
+/// and `_PASSWORD` are about the same service and hold nothing pando can
+/// point anywhere, so they are not candidates.
+///
+/// In preference order: a URL carries everything, a DSN nearly as much, a
+/// port is a number pando can simply replace, and a host is a string it
+/// cannot — a bare `localhost` has nowhere to put a port number.
+const ADDRESS_SUFFIXES: [&str; 4] = ["_URL", "_DSN", "_PORT", "_HOST"];
+
+/// The env key the app reads to find one compose service, when a rule can
+/// say which.
+fn env_key_for(service: &str, image: Option<&str>, env: &[(String, String)]) -> Option<String> {
+    let mut prefixes: Vec<String> = vec![service.to_uppercase()];
+    if let Some(image) = image {
+        let family = image_family(image);
+        for (known, keys) in SERVICE_IMAGES.iter().chain(UTILITY_IMAGES.iter()) {
+            if Some(*known) == family {
+                prefixes.extend(keys.iter().map(|k| (*k).to_string()));
+            }
+        }
+    }
+    // By suffix first, then by prefix: the best *kind* of key wins over
+    // the best-matching name, because a `_HOST` pando cannot rewrite is
+    // worse than a `_URL` that merely belongs to a differently named
+    // prefix for the same service.
+    for suffix in ADDRESS_SUFFIXES {
+        for prefix in &prefixes {
+            if let Some((key, _)) = env
+                .iter()
+                .find(|(key, _)| key == &format!("{prefix}{suffix}"))
+            {
+                return Some(key.clone());
+            }
+        }
+    }
+    None
+}
+
+/// The image's last path segment with its tag stripped, when pando knows
+/// it as either kind of service.
+fn image_family(image: &str) -> Option<&'static str> {
+    let image = image.split('@').next().unwrap_or(image);
+    let last = image.rsplit('/').next().unwrap_or(image);
+    let name = last.split(':').next().unwrap_or(last);
+    SERVICE_IMAGES
+        .iter()
+        .chain(UTILITY_IMAGES.iter())
+        .map(|(known, _)| *known)
+        .find(|known| *known == name)
+}
+
+fn is_app_service(image: Option<&str>) -> bool {
+    let Some(family) = image.and_then(image_family) else {
+        return false;
+    };
+    SERVICE_IMAGES.iter().any(|(known, _)| *known == family)
+}
+
+/// Every service the project's compose file declares, with the env key
+/// that names it where a rule found one.
+///
+/// Decided — no question at all — only when every service is resolved:
+/// either an env key points at it, or its image is not one an application
+/// talks to. One redis with nothing pointing at it is enough to ask,
+/// because pando cannot tell whether the project wants a private copy.
+fn services_proposal(root: &Path, signals: &Signals) -> Option<Proposal> {
+    let file = crate::compose::find(root)?;
+    let parsed = crate::compose::read(&root.join(&file)).ok()?;
+    if parsed.services.is_empty() {
+        return None;
+    }
+    let mut candidates = Vec::new();
+    let mut resolved = true;
+    for (name, service) in &parsed.services {
+        let image = service.image.as_deref();
+        let env_key = env_key_for(name, image, &signals.env_example);
+        let app_service = is_app_service(image);
+        if env_key.is_none() && app_service {
+            resolved = false;
+        }
+        let why = match (&env_key, image) {
+            (Some(key), Some(image)) => format!("{file}, {image} → {key}"),
+            (Some(key), None) => format!("{file} → {key}"),
+            (None, Some(image)) => format!("{file}, {image}; nothing in the env example names it"),
+            (None, None) => format!("{file}; nothing in the env example names it"),
+        };
+        candidates.push(Candidate {
+            value: name.clone(),
+            why,
+            preselected: env_key.is_some(),
+            service: Some(ServiceHint {
+                file: file.clone(),
+                env_key,
+            }),
+            ..Candidate::default()
+        });
+    }
+    // Nothing to propose when no service resolved at all: a compose file
+    // full of things pando cannot address is not an isolation offer.
+    if candidates.iter().all(|c| !c.preselected) && resolved {
+        return None;
+    }
+    Some(Proposal {
+        slot: Slot::Services,
+        candidates,
+        decided: resolved,
+    })
+}
+
+/// The command that brings a fresh database up to the current schema.
+///
+/// Each rule carries the globs whose change means it has to run again,
+/// because a hook without them runs on every start and one with the wrong
+/// ones never runs at all.
+fn schema_hook_proposal(root: &Path, signals: &Signals) -> Option<Proposal> {
+    let candidates = schema_candidates(root, signals);
+    if candidates.is_empty() {
+        return None;
+    }
+    Some(Proposal {
+        slot: Slot::SchemaHook,
+        // One candidate is one answer; several is a question.
+        decided: candidates.len() == 1,
+        candidates,
+    })
+}
+
+/// The name every proposed schema hook gets. One name, so a second run
+/// recognises the hook it wrote rather than appending another one.
+pub const SCHEMA_HOOK: &str = "migrate";
+
+fn schema_candidates(root: &Path, signals: &Signals) -> Vec<Candidate> {
+    let mut out = Vec::new();
+    let mut push = |cmd: String, globs: &[&str], why: &str| {
+        out.push(Candidate {
+            value: cmd.clone(),
+            why: why.to_string(),
+            hook: Some(crate::config::HookConfig {
+                name: SCHEMA_HOOK.to_string(),
+                after: crate::config::HookPoint::Services,
+                fingerprint: globs.iter().map(|g| (*g).to_string()).collect(),
+                cmd,
+                cwd: None,
+                fallback: None,
+            }),
+            ..Candidate::default()
+        })
+    };
+    let exec = package_runner(signals);
+    if root.join("prisma/schema.prisma").is_file() {
+        push(
+            format!("{exec} prisma migrate deploy"),
+            &["prisma/migrations/**"],
+            "prisma/schema.prisma",
+        );
+    }
+    if root.join("drizzle.config.ts").is_file() || root.join("drizzle.config.js").is_file() {
+        push(
+            format!("{exec} drizzle-kit migrate"),
+            &["drizzle/**"],
+            "drizzle.config",
+        );
+    }
+    if root.join("manage.py").is_file() {
+        // `python_runner` carries its own trailing space, or is empty for
+        // a project whose interpreter is simply on PATH.
+        push(
+            format!("{}python manage.py migrate", python_runner(signals)),
+            &["*/migrations/*.py"],
+            "manage.py",
+        );
+    }
+    if root.join("alembic.ini").is_file() {
+        push(
+            format!("{}alembic upgrade head", python_runner(signals)),
+            &["**/versions/*.py"],
+            "alembic.ini",
+        );
+    }
+    if root.join("config/database.yml").is_file() {
+        push(
+            "bin/rails db:prepare".to_string(),
+            &["db/migrate/*.rb"],
+            "config/database.yml",
+        );
+    }
+    out
+}
+
+/// How this project runs a binary from its dependencies. `pnpm foo` and
+/// `bunx foo` run it; `npm foo` does not, which is what `npx` is for.
+fn package_runner(signals: &Signals) -> &'static str {
+    match signals.lockfiles.first().map(String::as_str) {
+        Some("pnpm-lock.yaml") => "pnpm",
+        Some("yarn.lock") => "yarn",
+        Some("bun.lockb") | Some("bun.lock") => "bunx",
+        _ => "npx",
+    }
+}
+
 fn provision_proposal(signals: &Signals) -> Option<Proposal> {
     if signals.ignored_present.is_empty() {
         return None;
@@ -1269,6 +1575,13 @@ pub fn still_needed(slot: Slot, config: &Config) -> bool {
         // with `ports = []`, and asking again would hand it a port it will
         // never bind and then call it failed for not binding it.
         Slot::PortEnv => config.processes.get(DEV).is_none_or(|p| p.ports.is_none()),
+        // Anything already in `[[services]]` is an answer about every
+        // service: a developer who listed two has said the third is not
+        // wanted, and a second run must not offer it again.
+        Slot::Services => config.services.is_empty(),
+        // Likewise for hooks: one the developer wrote is their schema
+        // step, whatever it is called.
+        Slot::SchemaHook => config.hooks.is_empty(),
         _ => true,
     }
 }
@@ -1320,6 +1633,9 @@ pub fn custom(slot: Slot, value: &str) -> Candidate {
         // A command typed at the processes question is one process, named
         // `dev`: every question has a custom answer, and the custom answer
         // to "several processes?" is "no, this one".
+        service: None,
+        hook: None,
+        preselected: false,
         processes: (slot == Slot::Processes).then(|| {
             BTreeMap::from([(
                 DEV.to_string(),
@@ -1365,7 +1681,90 @@ pub fn apply(slot: Slot, candidate: &Candidate, config: &mut Config) {
                 crate::config::WEB_ROLE.to_string(),
             )])));
         }
+        Slot::SchemaHook => {
+            if let Some(hook) = &candidate.hook {
+                config.hooks.push(hook.clone());
+            }
+        }
+        // A set, not a value: it goes through [`apply_services`].
+        Slot::Services => {}
     }
+}
+
+/// Writes a chosen *set* of compose services as one `[[services]]` entry.
+///
+/// Nothing is written for an empty set: "none of them" is an answer, and
+/// the answer is that this project has no services pando runs.
+pub fn apply_services(chosen: &[&Candidate], config: &mut Config) {
+    let Some(file) = chosen
+        .iter()
+        .find_map(|c| c.service.as_ref())
+        .map(|hint| hint.file.clone())
+    else {
+        return;
+    };
+    let include: Vec<String> = chosen.iter().map(|c| c.value.clone()).collect();
+    let env: BTreeMap<String, String> = chosen
+        .iter()
+        .filter_map(|c| {
+            let hint = c.service.as_ref()?;
+            Some((hint.env_key.clone()?, c.value.clone()))
+        })
+        .collect();
+    config.services.push(crate::config::ServiceConfig::Compose {
+        file,
+        include,
+        env,
+        ready_timeout_s: None,
+    });
+}
+
+/// The keys of the one `[[table]]` entry a set answer appends, or `None`
+/// for a slot whose answer is a key in a table.
+pub fn array_edits(
+    slot: Slot,
+    chosen: &[&Candidate],
+) -> Option<(&'static str, Vec<(String, toml_edit::Value)>)> {
+    let array = slot.array()?;
+    let mut entries: Vec<(String, toml_edit::Value)> = Vec::new();
+    match slot {
+        Slot::Services => {
+            let hint = chosen.iter().find_map(|c| c.service.as_ref())?;
+            entries.push(("kind".to_string(), "compose".into()));
+            entries.push(("file".to_string(), hint.file.clone().into()));
+            entries.push((
+                "include".to_string(),
+                toml_edit::Value::Array(toml_edit::Array::from_iter(
+                    chosen.iter().map(|c| c.value.clone()),
+                )),
+            ));
+            let mut env = toml_edit::InlineTable::new();
+            for candidate in chosen {
+                if let Some(key) = candidate.service.as_ref().and_then(|h| h.env_key.as_ref()) {
+                    env.insert(key, candidate.value.as_str().into());
+                }
+            }
+            if !env.is_empty() {
+                entries.push(("env".to_string(), toml_edit::Value::InlineTable(env)));
+            }
+        }
+        Slot::SchemaHook => {
+            let hook = chosen.first()?.hook.as_ref()?;
+            entries.push(("name".to_string(), hook.name.clone().into()));
+            entries.push(("after".to_string(), "services".into()));
+            if !hook.fingerprint.is_empty() {
+                entries.push((
+                    "fingerprint".to_string(),
+                    toml_edit::Value::Array(toml_edit::Array::from_iter(
+                        hook.fingerprint.iter().cloned(),
+                    )),
+                ));
+            }
+            entries.push(("cmd".to_string(), hook.cmd.clone().into()));
+        }
+        _ => return None,
+    }
+    Some((array, entries))
 }
 
 /// The same choice, as the keys to patch into `pando.toml`.
@@ -1410,6 +1809,9 @@ pub fn edits(slot: Slot, candidate: &Candidate) -> Vec<Edit> {
             vec![single(table, key, toml_edit::Value::InlineTable(inline))]
         }
         Slot::Processes => process_edits(candidate),
+        // Both of these append a whole `[[table]]` entry; [`array_edits`]
+        // is what knows how to write one.
+        Slot::Services | Slot::SchemaHook => Vec::new(),
     }
 }
 

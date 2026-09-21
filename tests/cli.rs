@@ -498,11 +498,16 @@ fn a_configured_process_is_never_given_a_dev_table_beside_it() {
     let out = e.pando(&["start", "feat+one", "--yes"]);
     assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
     let after = std::fs::read_to_string(e.config_file()).unwrap();
-    assert_eq!(
-        after, before,
-        "a project that declares its processes is not detected at"
+    // Detection may still fill slots this file says nothing about — the
+    // services and the schema step — but never a process, and never by
+    // rewriting what was already there.
+    assert!(
+        after.starts_with(&before),
+        "a project that declares its processes is not detected at\n\
+         before:\n{before}\nafter:\n{after}"
     );
     assert!(!after.contains("[dev]"), "{after}");
+    assert!(after.contains("[processes.web]"), "{after}");
 
     for args in [vec!["ls"], vec!["status"], vec!["stop"]] {
         let out = e.pando(&args);

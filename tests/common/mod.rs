@@ -11,7 +11,9 @@ pub mod docker;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use pando::config::{Config, PortsSpec, ProcessConfig, ReadySpec};
+use pando::config::{
+    Config, HookConfig, HookPoint, PortsSpec, ProcessConfig, ReadySpec, ServiceConfig,
+};
 use pando::paths::PandoPaths;
 use pando::project::ProjectRef;
 
@@ -138,6 +140,26 @@ impl Kind {
                         ..Default::default()
                     },
                 );
+                if self == Kind::NextPnpmCompose {
+                    // `mailpit` is offered unticked: it is a mail catcher,
+                    // and nothing in the env example names it.
+                    config.services.push(compose_service(
+                        &["postgres", "redis"],
+                        &[("DATABASE_URL", "postgres"), ("REDIS_URL", "redis")],
+                    ));
+                    config.hooks.push(migrate_hook(
+                        &["prisma/migrations/**"],
+                        "pnpm prisma migrate deploy",
+                    ));
+                } else {
+                    // `db` and `mail` resolve by rule; `cache` and `queue`
+                    // have nothing pointing at them, so they are the
+                    // question, and declining them is the answer taken here.
+                    config.services.push(compose_service(
+                        &["db", "mail"],
+                        &[("DB_PORT", "db"), ("SMTP_PORT", "mail")],
+                    ));
+                }
             }
             Kind::DjangoUvPostgres => {
                 config.project.install = Some("uv sync --frozen".to_string());
@@ -153,6 +175,16 @@ impl Kind {
                         ..Default::default()
                     },
                 );
+                // `DB_PORT` is a plain value, so it becomes the bare port;
+                // `REDIS_URL` is a URL, so its port is rewritten in place.
+                config.services.push(compose_service(
+                    &["db", "redis"],
+                    &[("DB_PORT", "db"), ("REDIS_URL", "redis")],
+                ));
+                config.hooks.push(migrate_hook(
+                    &["*/migrations/*.py"],
+                    "uv run python manage.py migrate",
+                ));
             }
             Kind::GoService => {
                 // No install step: `go run` resolves its own modules.
@@ -212,6 +244,10 @@ impl Kind {
                         }),
                     },
                 );
+                config.services.push(compose_service(
+                    &["postgres"],
+                    &[("DATABASE_URL", "postgres")],
+                ));
             }
         }
         config
@@ -341,7 +377,8 @@ fn files_for(kind: Kind) -> Vec<(&'static str, &'static str)> {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "prisma": "echo prisma-stub"
   }
 }
 "#,
@@ -549,6 +586,31 @@ fn ignored_files_for(kind: Kind) -> Vec<(&'static str, &'static str)> {
 
 fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|v| v.to_string()).collect()
+}
+
+/// The `[[services]]` entry detection writes for a fixture's compose file.
+fn compose_service(include: &[&str], env: &[(&str, &str)]) -> ServiceConfig {
+    ServiceConfig::Compose {
+        file: "docker-compose.yml".to_string(),
+        include: strings(include),
+        env: env
+            .iter()
+            .map(|(key, service)| (key.to_string(), service.to_string()))
+            .collect(),
+        ready_timeout_s: None,
+    }
+}
+
+/// The `[[hooks]]` entry detection writes for a project's schema step.
+fn migrate_hook(fingerprint: &[&str], cmd: &str) -> HookConfig {
+    HookConfig {
+        name: "migrate".to_string(),
+        after: HookPoint::Services,
+        fingerprint: strings(fingerprint),
+        cmd: cmd.to_string(),
+        cwd: None,
+        fallback: None,
+    }
 }
 
 /// `ports = { <VAR> = "web" }`: the sugar for one role reached through an

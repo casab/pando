@@ -249,7 +249,7 @@ pub enum ServiceConfig {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HookConfig {
     pub name: String,
@@ -604,6 +604,45 @@ pub fn set_detected_table(
             table.insert(&key, Item::Value(value));
         }
         table.decor_mut().set_suffix(comment);
+        Ok(())
+    })
+}
+
+/// Appends one entry to an array of tables — `[[services]]`, `[[hooks]]`
+/// — with the note on the entry's own header.
+///
+/// Appended, never replaced: an array of tables a developer wrote is a
+/// list they curated, and a detection that rewrote it would silently
+/// delete an entry pando has no opinion about. The caller has already
+/// decided there is nothing there to conflict with; `still_needed` is what
+/// makes that call.
+pub fn set_detected_array_entry(
+    paths: &PandoPaths,
+    array: &str,
+    entries: Vec<(String, toml_edit::Value)>,
+    note: Note,
+) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let comment = note.comment();
+    let array = array.to_string();
+    patch(paths, move |doc| {
+        let item = doc
+            .entry(&array)
+            .or_insert_with(|| Item::ArrayOfTables(toml_edit::ArrayOfTables::new()));
+        let tables = item.as_array_of_tables_mut().with_context(|| {
+            format!(
+                "[[{array}]] in pando.toml is not an array of tables — pando will not \
+                     overwrite it"
+            )
+        })?;
+        let mut table = EditTable::new();
+        for (key, value) in entries {
+            table.insert(&key, Item::Value(value));
+        }
+        table.decor_mut().set_suffix(comment);
+        tables.push(table);
         Ok(())
     })
 }
