@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! paths → compose → project · config · ports · process · runtime · state
-//!       · template
+//!       · template · recipes
 //!       → detect · hooks · worktree · cache · log_tail · observe · services
 //!       → tunnel · share_proxy
 //!       → actions
@@ -27,6 +27,7 @@ pub mod paths;
 pub mod ports;
 pub mod process;
 pub mod project;
+pub mod recipes;
 pub mod runtime;
 pub mod services;
 pub mod share_proxy;

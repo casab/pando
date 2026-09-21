@@ -36,9 +36,35 @@ pub struct Context<'a> {
     pub log: Option<&'a Path>,
 }
 
+/// What a set of placeholder names means.
+///
+/// The lexer below — `{{`, `}}`, the `${…}` exemption, what counts as a
+/// placeholder at all — is the one thing every template in pando shares,
+/// and only the *names* differ: a process command resolves `{port:web}`
+/// against a worktree's roles, a service recipe resolves `{datadir}`
+/// against a directory under pando's home. Splitting the two here is what
+/// keeps a recipe a template without a second, subtly different
+/// substitution language growing up beside this one.
+pub trait Resolver {
+    /// The value for `{key}` or `{key:arg}`, or an error naming what it
+    /// could have been instead.
+    fn resolve(&self, key: &str, arg: Option<&str>) -> Result<String>;
+}
+
+impl Resolver for Context<'_> {
+    fn resolve(&self, key: &str, arg: Option<&str>) -> Result<String> {
+        resolve(key, arg, self)
+    }
+}
+
 /// Substitutes every placeholder in `text`, or fails naming the first one it
 /// cannot resolve.
 pub fn render(text: &str, ctx: &Context<'_>) -> Result<String> {
+    render_with(text, ctx)
+}
+
+/// [`render`] against any other set of names.
+pub fn render_with(text: &str, resolver: &dyn Resolver) -> Result<String> {
     let mut out = String::with_capacity(text.len());
     let bytes: Vec<char> = text.chars().collect();
     let mut i = 0;
@@ -62,7 +88,7 @@ pub fn render(text: &str, ctx: &Context<'_>) -> Result<String> {
         {
             let inner: String = bytes[i + 1..end].iter().collect();
             if let Some((key, arg)) = split_placeholder(&inner) {
-                out.push_str(&resolve(key, arg, ctx)?);
+                out.push_str(&resolver.resolve(key, arg)?);
                 i = end + 1;
                 continue;
             }

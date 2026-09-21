@@ -131,6 +131,17 @@ impl PandoPaths {
         self.home.join("config.toml")
     }
 
+    /// The developer's own service and language recipes, merged over the
+    /// ones compiled into the binary.
+    ///
+    /// Beside `config.toml` under the home rather than under a project,
+    /// and for the same reason: how this laptop runs Postgres is a
+    /// property of the laptop, not of one repository. A file here replaces
+    /// the built-in whose name it shares.
+    pub fn recipes_dir(&self) -> PathBuf {
+        self.home.join("recipes")
+    }
+
     /// Creates the home directory 0700 and the project directory under it.
     /// Idempotent; called before the first write of any run.
     pub fn ensure_home(&self) -> Result<()> {
