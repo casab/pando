@@ -42,9 +42,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::paths::{MAX_SOCKET_PATH, PandoPaths, SOCKET_NAME_BUDGET};
-use crate::process as proc;
+use crate::process::{self as proc, shell_quote};
 use crate::recipes::Recipe;
-use crate::services::shell_quote;
 use crate::template;
 
 /// How long an init command gets. `initdb` on a cold page cache is

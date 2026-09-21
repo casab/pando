@@ -440,12 +440,13 @@ fn a_pando_home_inside_the_repository_is_refused() {
 // `adopted` in the listing and `rm`'s confirmation rule read the same state
 // file. When it cannot be read, the listing has to say so rather than call
 // every worktree adopted with exit 0 while `rm` fails hard on the same file.
-// A config that configures a service, and a build with no way to run it.
-// The block is legal and is kept; saying nothing about it left the
-// developer reading "no services configured" over a file that configures
-// one.
+// A config that configures a native service. It warned for as long as
+// nothing could run it, because saying nothing left the developer reading
+// "no services configured" over a file that configures one. Something can
+// run it now, so the warning would be the false statement — and a command
+// that prints one on every run trains people to ignore stderr.
 #[test]
-fn a_service_kind_this_build_cannot_run_is_warned_about_on_every_command() {
+fn a_native_service_block_is_run_by_this_build_and_is_not_warned_about() {
     let e = env();
     e.write_config(
         "[project]\nprovision = [\".env\"]\n\n\
@@ -453,16 +454,24 @@ fn a_service_kind_this_build_cannot_run_is_warned_about_on_every_command() {
     );
     let out = e.pando(&["ls"]);
     assert_eq!(code(&out), EXIT_OK, "a legal block is not an error");
-    let said = stderr(&out);
-    assert!(said.contains("postgres"), "it names the block: {said}");
-    assert!(said.contains("native"), "{said}");
+    assert!(
+        !stderr(&out).contains("no runner"),
+        "the block is run by this build now: {}",
+        stderr(&out)
+    );
 
-    // And on stderr, so `--json` is still parseable by whatever reads it.
     let out = e.pando(&["ls", "--json"]);
     assert_eq!(code(&out), EXIT_OK);
-    assert!(stderr(&out).contains("postgres"), "{}", stderr(&out));
     serde_json::from_str::<serde_json::Value>(&stdout(&out))
-        .expect("the warning must go to stderr, leaving stdout parseable");
+        .expect("anything printed must go to stderr, leaving stdout parseable");
+
+    // And `doctor` is where it is explained: which recipe, from where,
+    // and where its data would go.
+    let out = e.pando(&["doctor"]);
+    let said = stdout(&out);
+    assert!(said.contains("postgres"), "{said}");
+    assert!(said.contains("built-in"), "{said}");
+    assert!(said.contains("data/<worktree>/postgres"), "{said}");
 }
 
 #[test]

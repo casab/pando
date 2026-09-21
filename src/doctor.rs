@@ -29,7 +29,7 @@ use crate::config::{self, Config, ServiceConfig};
 use crate::paths::PandoPaths;
 use crate::process as proc;
 use crate::runtime::{self, Verdict};
-use crate::{actions, detect, ports, services, state, template, tunnel};
+use crate::{actions, detect, native, ports, recipes, services, state, template, tunnel};
 
 /// Exit 1, with nothing more to say.
 ///
@@ -334,9 +334,66 @@ pub struct WorktreeServiceReport {
 #[derive(Debug, Clone, Serialize)]
 pub struct ServicesReport {
     pub compose: Vec<ComposeEntryReport>,
-    /// `[[services]] kind = "native"` blocks. They parse, they validate,
-    /// and this build has no runner for them.
-    pub native: Vec<String>,
+    pub native: Vec<NativeServiceReport>,
+}
+
+/// What a `[[services]] kind = "native"` block resolved to.
+///
+/// The first question about a native service is always "which recipe is
+/// this actually running, and whose?" — a file in the recipes directory
+/// replaces a built-in outright, and a `[[services]]` entry can override
+/// any field of either. Nothing here is a guess: it is what the start
+/// path would resolve, computed the same way.
+#[derive(Debug, Clone, Serialize)]
+pub struct NativeServiceReport {
+    pub name: String,
+    /// The recipe the entry asks for: its `preset`, or its own name.
+    pub preset: String,
+    /// Where the recipe came from: `built-in`, the path of the file that
+    /// replaced it, or the entry itself.
+    pub source: Option<String>,
+    /// Fields the `[[services]]` entry overrode on top of the recipe.
+    pub overrides: Vec<String>,
+    /// The data directory, with `<worktree>` where the worktree's name
+    /// goes. Under pando's home, never in the repository.
+    pub datadir: String,
+    /// Where the Unix socket directories live. One fixed-length hashed
+    /// name per worktree and service, because `sun_path` is 104 bytes.
+    pub socket_root: String,
+    /// The engine binaries the recipe needs and where each resolved.
+    pub engine: Vec<EngineBinary>,
+    /// The first line the engine printed when asked for its version.
+    pub version: Option<String>,
+    /// How to install it. Printed, never run.
+    pub install: Option<String>,
+    /// The environment key the app reads to find it.
+    pub env_key: Option<String>,
+    /// Something the recipe says about itself that is worth knowing —
+    /// Postgres's trust authentication, for one.
+    pub notes: Option<String>,
+    /// The worktrees that already have data for this service.
+    pub instances: Vec<NativeInstance>,
+    /// Why the recipe could not be resolved, when it could not.
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EngineBinary {
+    pub name: String,
+    /// Where it resolved on PATH. `None` means this machine has no such
+    /// binary, and pando will refuse the start rather than install one.
+    pub path: Option<String>,
+}
+
+/// One worktree's copy of a native service, as it is on disk.
+#[derive(Debug, Clone, Serialize)]
+pub struct NativeInstance {
+    pub worktree: String,
+    pub datadir: String,
+    pub socket_dir: String,
+    /// `initialised`, `adopted`, or `None` when the data directory has no
+    /// marker — which pando would adopt on the next start.
+    pub initialised: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -762,8 +819,70 @@ fn render_services(out: &mut String, services: &ServicesReport) {
         row(
             out,
             "native",
-            &format!("{native} — this build has no runner for it"),
+            &match (&native.error, &native.source) {
+                (Some(e), _) => format!("{}: {e}", native.name),
+                (None, Some(source)) => format!(
+                    "{}: the {:?} recipe, {source}{}",
+                    native.name,
+                    native.preset,
+                    match native.overrides.is_empty() {
+                        true => String::new(),
+                        false => format!(" ({} from this entry)", native.overrides.join(", ")),
+                    }
+                ),
+                (None, None) => native.name.clone(),
+            },
         );
+        if native.error.is_some() {
+            continue;
+        }
+        for binary in &native.engine {
+            row(
+                out,
+                "",
+                &match &binary.path {
+                    Some(path) => format!("{} at {path}", binary.name),
+                    None => format!("{} is not on PATH", binary.name),
+                },
+            );
+        }
+        if let Some(version) = &native.version {
+            row(out, "", version);
+        }
+        if let Some(install) = &native.install
+            && native.engine.iter().any(|b| b.path.is_none())
+        {
+            row(
+                out,
+                "",
+                &format!("install it with: {install} — pando never will"),
+            );
+        }
+        row(out, "", &format!("data in {}", native.datadir));
+        row(out, "", &format!("sockets under {}", native.socket_root));
+        match &native.env_key {
+            Some(key) => row(out, "", &format!("addressed by {key}")),
+            None => row(out, "", "nothing in the env points at it"),
+        }
+        if let Some(notes) = &native.notes {
+            row(out, "", notes);
+        }
+        for instance in &native.instances {
+            row(
+                out,
+                "",
+                &format!(
+                    "{}: {}",
+                    instance.worktree,
+                    match &instance.initialised {
+                        Some(how) => format!("{how}, socket in {}", instance.socket_dir),
+                        None =>
+                            "a data directory with no marker — the next start adopts it as it is"
+                                .to_string(),
+                    }
+                ),
+            );
+        }
     }
 }
 
@@ -896,7 +1015,7 @@ pub fn run_on(paths: &PandoPaths, machine: &Machine<'_>) -> Report {
     // advance a phase, and that is a real cost to pay twice.
     let view = actions::inspect(paths);
     let worktrees = worktrees_report(paths, &config, &view, &mut findings);
-    let services = services_report(paths, &config, &mut findings);
+    let services = services_report(paths, &config, machine, &mut findings);
     let hooks = hooks_report(paths, &config, &view, &worktrees, &mut findings);
     let adoption = adoption_report(paths, &mut findings);
 
@@ -1155,22 +1274,16 @@ fn declared_services(config: &Config) -> Vec<String> {
 fn services_report(
     paths: &PandoPaths,
     config: &Config,
+    machine: &Machine<'_>,
     findings: &mut Vec<Finding>,
 ) -> ServicesReport {
     let mut compose = Vec::new();
-    let mut native = Vec::new();
+    let native = native_report(paths, config, machine, findings);
     for service in &config.services {
         let ServiceConfig::Compose {
             file, include, env, ..
         } = service
         else {
-            if let ServiceConfig::Native { name, .. } = service {
-                // `load` already warns about this one, and the warning is
-                // in the config section. Listed here as a fact, so the
-                // services section is not silent about a block that
-                // configures one.
-                native.push(name.clone());
-            }
             continue;
         };
         let path = paths.root().join(file);
@@ -1270,6 +1383,246 @@ fn services_report(
     }
     name_collisions(paths, config, findings);
     ServicesReport { compose, native }
+}
+
+/// What each `[[services]] kind = "native"` block resolved to, and
+/// whether this machine can run it.
+///
+/// A missing engine is a line, not a crash: doctor reports, and pando
+/// never installs one. The same goes for a recipe file that does not
+/// parse — it is reported once, as a problem, and the recipes it shadows
+/// are named.
+fn native_report(
+    paths: &PandoPaths,
+    config: &Config,
+    machine: &Machine<'_>,
+    findings: &mut Vec<Finding>,
+) -> Vec<NativeServiceReport> {
+    let entries = native::Entry::all(config);
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let recipes = recipes::Recipes::load(&paths.recipes_dir());
+    for (name, broken) in recipes.broken() {
+        findings.push(Finding::problem(
+            Section::Services,
+            format!(
+                "the recipe file {} does not load: {}",
+                broken.path.display(),
+                broken.error
+            ),
+            format!(
+                "fix it, or delete it — until then nothing can run the recipe {name:?}, not \
+                 even a built-in of that name, because a file that shadows one must not fail \
+                 quietly back to it"
+            ),
+        ));
+    }
+    let bin_dir = paths.home.join("bin");
+    let mut out = Vec::new();
+    for entry in &entries {
+        let datadir = paths.service_data_dir(WORKTREE_PLACEHOLDER, entry.name);
+        let socket_root = paths
+            .service_socket_dir(WORKTREE_PLACEHOLDER, entry.name)
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let mut report = NativeServiceReport {
+            name: entry.name.to_string(),
+            preset: entry.preset().to_string(),
+            source: None,
+            overrides: Vec::new(),
+            datadir: datadir.display().to_string(),
+            socket_root,
+            engine: Vec::new(),
+            version: None,
+            install: None,
+            env_key: None,
+            notes: None,
+            instances: native_instances(paths, entry.name),
+            error: None,
+        };
+        let resolved = match native::resolve(&recipes, entry) {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                report.error = Some(format!("{e:#}"));
+                findings.push(Finding::problem(
+                    Section::Services,
+                    format!("{e:#}"),
+                    format!(
+                        "name a `preset` that exists, give the entry its own `cmd`, or write \
+                         {}.toml in {}",
+                        entry.preset(),
+                        paths.recipes_dir().display()
+                    ),
+                ));
+                out.push(report);
+                continue;
+            }
+        };
+        report.source = Some(resolved.source.describe());
+        report.overrides = resolved.overrides.iter().map(|o| o.to_string()).collect();
+        report.install = resolved.recipe.install.clone();
+        report.notes = resolved.recipe.notes.clone();
+        let (mapping, _) = entry.env_map(Some(&resolved.recipe));
+        report.env_key = mapping.keys().next().cloned();
+        let (engine, version) = probe_engine(machine, &bin_dir, &resolved.recipe);
+        let missing: Vec<&str> = engine
+            .iter()
+            .filter(|b| b.path.is_none())
+            .map(|b| b.name.as_str())
+            .collect();
+        if !missing.is_empty() {
+            findings.push(Finding::problem(
+                Section::Services,
+                format!(
+                    "the service {:?} runs the {:?} recipe, and {} not on PATH — \
+                     `start --isolated` would refuse rather than start it",
+                    entry.name,
+                    resolved.recipe.name,
+                    match missing.len() {
+                        1 => format!("{} is", missing[0]),
+                        _ => format!("{} are", missing.join(", ")),
+                    }
+                ),
+                match &resolved.recipe.install {
+                    Some(hint) => format!("install it: {hint} — pando never will"),
+                    None => format!(
+                        "install it, or put a shim in {} — pando never installs an engine",
+                        bin_dir.display()
+                    ),
+                },
+            ));
+        }
+        report.engine = engine;
+        report.version = version;
+        out.push(report);
+    }
+    out
+}
+
+/// Stands where a worktree's name goes, so the data directory can be
+/// reported for a project rather than for one worktree.
+const WORKTREE_PLACEHOLDER: &str = "<worktree>";
+
+/// Marks the engine probe's two answers, the way the tools probe marks
+/// its three.
+const NATIVE_BIN_MARK: &str = "pando-native-bin ";
+const NATIVE_VERSION_MARK: &str = "pando-native-version ";
+
+/// Where each of a recipe's binaries resolved, and what the first of them
+/// says its version is.
+///
+/// Asked through the same injected shell the tools probe uses, and with
+/// the same PATH the start path would give the recipe — pando's own `bin`
+/// first, so a shim a developer put there is what doctor reports.
+fn probe_engine(
+    machine: &Machine<'_>,
+    bin_dir: &Path,
+    recipe: &recipes::Recipe,
+) -> (Vec<EngineBinary>, Option<String>) {
+    let binaries = recipe.binaries.clone();
+    if binaries.is_empty() {
+        return (Vec::new(), None);
+    }
+    let mut script = format!(
+        "export PATH={}:\"$PATH\"\n",
+        proc::shell_quote(&bin_dir.display().to_string())
+    );
+    for binary in &binaries {
+        let quoted = proc::shell_quote(binary);
+        let _ = writeln!(
+            script,
+            "if __pando_b=$(command -v {quoted} 2>/dev/null); then \
+             printf '{NATIVE_BIN_MARK}%s %s\\n' {quoted} \"$__pando_b\"; fi"
+        );
+    }
+    if let Some(version) = recipe.version_cmd() {
+        let _ = writeln!(
+            script,
+            "printf '{NATIVE_VERSION_MARK}%s\\n' \"$({version} 2>&1 | head -n 1)\""
+        );
+    }
+    let Some(text) = (machine.shell)(&script) else {
+        // The shell did not answer. That is not evidence about the
+        // engine, so nothing is claimed about it.
+        return (
+            binaries
+                .iter()
+                .map(|name| EngineBinary {
+                    name: name.clone(),
+                    path: None,
+                })
+                .collect(),
+            None,
+        );
+    };
+    let mut found: BTreeMap<String, String> = BTreeMap::new();
+    let mut version = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix(NATIVE_BIN_MARK)
+            && let Some((name, path)) = rest.split_once(' ')
+        {
+            found.insert(name.to_string(), path.trim().to_string());
+        }
+        if let Some(rest) = line.strip_prefix(NATIVE_VERSION_MARK)
+            && !rest.trim().is_empty()
+        {
+            version = Some(rest.trim().to_string());
+        }
+    }
+    let engine = binaries
+        .iter()
+        .map(|name| EngineBinary {
+            name: name.clone(),
+            path: found.get(name).cloned(),
+        })
+        .collect();
+    // A version printed by a binary that is not there is the shell
+    // reporting its own "command not found", not an engine.
+    let version = version.filter(|_| found.contains_key(&binaries[0]));
+    (engine, version)
+}
+
+/// The worktrees that already have data for this service, and what their
+/// data directories say about themselves.
+fn native_instances(paths: &PandoPaths, service: &str) -> Vec<NativeInstance> {
+    let Ok(entries) = std::fs::read_dir(paths.project_dir().join("data")) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .collect();
+    names.sort();
+    names
+        .into_iter()
+        .filter(|worktree| paths.service_data_dir(worktree, service).is_dir())
+        .map(|worktree| {
+            let datadir = paths.service_data_dir(&worktree, service);
+            let marker = native::marker(&datadir);
+            NativeInstance {
+                initialised: marker.map(|marker| {
+                    format!(
+                        "{} {}",
+                        match marker.adopted {
+                            true => "adopted",
+                            false => "initialised",
+                        },
+                        marker.at.format("%Y-%m-%d")
+                    )
+                }),
+                socket_dir: paths
+                    .service_socket_dir(&worktree, service)
+                    .display()
+                    .to_string(),
+                datadir: datadir.display().to_string(),
+                worktree,
+            }
+        })
+        .collect()
 }
 
 /// A compose service whose name is already a role of one of this project's
@@ -3650,26 +4003,258 @@ mod tests {
         );
     }
 
+    /// A shell that finds every engine binary a native recipe asks about
+    /// and lets the tools probe through unchanged.
+    ///
+    /// Injected for the same reason the tools shell is: this laptop
+    /// really does have PostgreSQL installed, and a test that asked the
+    /// real PATH would pass here and fail on a runner without it.
+    fn every_tool_and_engine(script: &str) -> Option<String> {
+        engine_answer(script, true).or_else(|| every_tool(script))
+    }
+
+    /// The same shell on a machine with no engine at all.
+    fn no_engine(script: &str) -> Option<String> {
+        engine_answer(script, false).or_else(|| every_tool(script))
+    }
+
+    fn engine_answer(script: &str, found: bool) -> Option<String> {
+        if !script.contains(NATIVE_BIN_MARK) {
+            return None;
+        }
+        let mut out = String::new();
+        if found {
+            for line in script.lines() {
+                let Some(rest) = line.split("command -v ").nth(1) else {
+                    continue;
+                };
+                let Some(name) = rest.split('\'').nth(1) else {
+                    continue;
+                };
+                let _ = writeln!(out, "{NATIVE_BIN_MARK}{name} /usr/local/bin/{name}");
+            }
+            let _ = writeln!(
+                out,
+                "{NATIVE_VERSION_MARK}postgres (PostgreSQL) 16.10 (Homebrew)"
+            );
+        }
+        Some(out)
+    }
+
+    fn native_of(report: &Report, name: &str) -> NativeServiceReport {
+        report
+            .services
+            .native
+            .iter()
+            .find(|n| n.name == name)
+            .unwrap_or_else(|| panic!("no native report for {name}"))
+            .clone()
+    }
+
     #[test]
-    fn a_native_service_block_is_listed_even_though_nothing_runs_it() {
+    fn a_native_service_says_which_recipe_it_resolved_to_and_from_where() {
+        let fx = fixture();
+        write_project_config(
+            &fx,
+            "[[services]]\nkind = \"native\"\nname = \"postgres\"\n\
+             env = { DATABASE_URL = \"postgres\" }\n",
+        );
+        let report = report_of(&fx, &every_tool_and_engine);
+        let native = native_of(&report, "postgres");
+        assert_eq!(native.preset, "postgres", "a preset defaults to the name");
+        assert_eq!(native.source.as_deref(), Some("built-in"));
+        assert!(native.overrides.is_empty());
+        assert_eq!(native.env_key.as_deref(), Some("DATABASE_URL"));
+        assert!(native.error.is_none());
+        // Where its data goes, with the worktree left as a placeholder,
+        // and under pando's home rather than in the repository.
+        assert!(
+            native.datadir.ends_with("data/<worktree>/postgres"),
+            "{native:?}"
+        );
+        assert!(native.datadir.starts_with(&fx.home.display().to_string()));
+        // And where the sockets go, which is the one thing that is not
+        // under the home — because the home's own path is what overflows
+        // `sun_path`.
+        assert!(
+            !native
+                .socket_root
+                .starts_with(&fx.home.display().to_string())
+        );
+
+        assert_eq!(
+            native
+                .engine
+                .iter()
+                .map(|b| b.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["postgres", "initdb", "pg_isready", "psql", "createdb"]
+        );
+        assert!(native.engine.iter().all(|b| b.path.is_some()));
+        assert_eq!(
+            native.version.as_deref(),
+            Some("postgres (PostgreSQL) 16.10 (Homebrew)")
+        );
+
+        let text = report.render();
+        assert!(text.contains("the \"postgres\" recipe, built-in"), "{text}");
+        assert!(
+            text.contains("postgres at /usr/local/bin/postgres"),
+            "{text}"
+        );
+        assert!(text.contains("addressed by DATABASE_URL"), "{text}");
+        // The authentication choice, said out loud rather than buried in
+        // a recipe nobody reads.
+        assert!(text.contains("trust authentication on 127.0.0.1"), "{text}");
+        assert!(report.healthy(), "{:?}", report.findings);
+    }
+
+    #[test]
+    fn an_engine_this_machine_does_not_have_is_a_line_and_not_a_crash() {
         let fx = fixture();
         write_project_config(
             &fx,
             "[[services]]\nkind = \"native\"\nname = \"postgres\"\n",
         );
-        let report = report(&fx);
-        assert_eq!(report.services.native, vec!["postgres".to_string()]);
+        let report = report_of(&fx, &no_engine);
+        let native = native_of(&report, "postgres");
+        assert!(native.engine.iter().all(|b| b.path.is_none()));
+        assert_eq!(
+            native.version, None,
+            "a version from a binary that is not there"
+        );
+        assert!(mentions(&report, "not on PATH"), "{:?}", messages(&report));
+        let text = report.render();
+        assert!(text.contains("postgres is not on PATH"), "{text}");
+        assert!(text.contains("brew install postgresql"), "{text}");
+        assert!(text.contains("pando never will"), "{text}");
+        assert!(!report.healthy());
+    }
+
+    #[test]
+    fn a_users_own_recipe_is_named_by_its_path_and_a_broken_one_is_a_problem() {
+        let fx = fixture();
+        write_project_config(
+            &fx,
+            "[[services]]\nkind = \"native\"\nname = \"postgres\"\n",
+        );
+        let recipes = fx.paths.recipes_dir();
+        std::fs::create_dir_all(&recipes).unwrap();
+        std::fs::write(
+            recipes.join("postgres.toml"),
+            "kind = \"service\"\nname = \"postgres\"\nbinaries = [\"postgres\"]\n\n\
+             [service]\ncmd = \"mine -p {port}\"\n",
+        )
+        .unwrap();
+        let report = report_of(&fx, &every_tool_and_engine);
+        let native = native_of(&report, "postgres");
+        assert_eq!(
+            native.source.as_deref(),
+            Some(recipes.join("postgres.toml").display().to_string().as_str()),
+            "a replaced built-in has to say which file replaced it"
+        );
+
+        // And a file that does not parse is a problem, not a silent
+        // fallback to the built-in it shadows.
+        std::fs::write(recipes.join("postgres.toml"), "kind = \"service\"\nname =").unwrap();
+        let report = report_of(&fx, &every_tool_and_engine);
         assert!(
-            report.render().contains("this build has no runner for it"),
+            mentions(&report, "does not load"),
+            "{:?}",
+            messages(&report)
+        );
+        assert!(
+            messages(&report)
+                .iter()
+                .any(|m| m.contains("postgres.toml")),
+            "{:?}",
+            messages(&report)
+        );
+        assert!(native_of(&report, "postgres").error.is_some());
+        assert!(!report.healthy());
+    }
+
+    #[test]
+    fn a_preset_no_recipe_answers_to_is_a_problem_naming_the_ones_there_are() {
+        let fx = fixture();
+        write_project_config(
+            &fx,
+            "[[services]]\nkind = \"native\"\nname = \"db\"\npreset = \"cassandra\"\n",
+        );
+        let report = report_of(&fx, &every_tool_and_engine);
+        let native = native_of(&report, "db");
+        assert!(
+            native.error.as_deref().unwrap().contains("cassandra"),
+            "{native:?}"
+        );
+        assert!(
+            mentions(&report, "no recipe named \"cassandra\""),
+            "{:?}",
+            messages(&report)
+        );
+        assert!(mentions(&report, "postgres"), "{:?}", messages(&report));
+        assert!(!report.healthy());
+    }
+
+    #[test]
+    fn an_entry_that_overrides_the_recipe_says_which_fields_it_overrode() {
+        let fx = fixture();
+        write_project_config(
+            &fx,
+            "[[services]]\nkind = \"native\"\nname = \"postgres\"\n\
+             ready = \"pg_isready -p {port}\"\nready_timeout_s = 120\n",
+        );
+        let report = report_of(&fx, &every_tool_and_engine);
+        let native = native_of(&report, "postgres");
+        assert_eq!(native.overrides, vec!["ready", "ready_timeout_s"]);
+        assert!(
+            report
+                .render()
+                .contains("(ready, ready_timeout_s from this entry)"),
             "{}",
             report.render()
         );
-        // The load warning in the config section is where it is reported;
-        // the services section is where a reader looks for it.
+    }
+
+    #[test]
+    fn a_worktree_that_already_has_data_is_listed_with_where_it_is() {
+        let fx = fixture();
+        write_project_config(
+            &fx,
+            "[[services]]\nkind = \"native\"\nname = \"postgres\"\n",
+        );
+        let datadir = fx.paths.service_data_dir("feat+one", "postgres");
+        std::fs::create_dir_all(&datadir).unwrap();
+        // No marker yet: a directory pando did not initialise is one it
+        // would adopt, and saying so is the point.
+        let report = report_of(&fx, &every_tool_and_engine);
+        let native = native_of(&report, "postgres");
+        assert_eq!(native.instances.len(), 1);
+        assert_eq!(native.instances[0].worktree, "feat+one");
+        assert_eq!(native.instances[0].initialised, None);
         assert!(
-            mentions(&report, "kind = \"native\""),
-            "{:?}",
-            messages(&report)
+            report
+                .render()
+                .contains("the next start adopts it as it is")
+        );
+
+        std::fs::write(
+            crate::native::marker_file(&datadir),
+            "recipe = \"postgres\"\nat = \"2026-09-21T10:00:00Z\"\nadopted = false\n",
+        )
+        .unwrap();
+        let report = report_of(&fx, &every_tool_and_engine);
+        let native = native_of(&report, "postgres");
+        assert_eq!(
+            native.instances[0].initialised.as_deref(),
+            Some("initialised 2026-09-21")
+        );
+        assert_eq!(
+            native.instances[0].socket_dir,
+            fx.paths
+                .service_socket_dir("feat+one", "postgres")
+                .display()
+                .to_string()
         );
     }
 

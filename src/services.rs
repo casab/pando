@@ -224,7 +224,7 @@ impl Compose {
 
 /// Single quotes, with any single quote inside closed, escaped, reopened.
 /// A worktree path can hold a space, and a docker shim path can hold both.
-pub fn shell_quote(text: &str) -> String {
+fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 
