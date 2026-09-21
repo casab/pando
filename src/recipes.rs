@@ -504,7 +504,12 @@ init = "initdb --pgdata {datadir} --username postgres --auth trust --encoding UT
 # `localhost`, also binds `::1`.
 cmd = "exec postgres -D {datadir} -p {port} -k {socket_dir} -c listen_addresses=127.0.0.1"
 
-ready = "pg_isready -h 127.0.0.1 -p {port} -q"
+# `-U postgres -d postgres`, not because pg_isready authenticates — it
+# does not, and returns 0 either way — but because the connection it opens
+# is refused by name, and a bare probe leaves
+# `FATAL: role "<your login>" does not exist` in the server's own log every
+# time it is asked. A developer reading that log has enough to worry about.
+ready = "pg_isready -h 127.0.0.1 -p {port} -U postgres -d postgres -q"
 
 # Idempotent, and run after every readiness: the role and the database the
 # app's own URL names have to exist, and which ones those are can change
