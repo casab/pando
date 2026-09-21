@@ -274,6 +274,138 @@ fn status_from(value: &serde_json::Value) -> Status {
     }
 }
 
+// ---- telling the app where its services are -------------------------------
+
+/// Where a value is looked up, in order. `.env` first because it holds the
+/// real credentials for this project; the example files are the fallback
+/// for a worktree that has none.
+const ENV_FILES: [&str; 4] = [".env", ".env.example", ".env.sample", ".env.template"];
+
+/// The environment that points an app at *this* worktree's services.
+///
+/// For each `ENV_KEY = "service"` in a `[[services]]` entry, the value the
+/// project already uses is read from the worktree's own env files and its
+/// port replaced with the one pando allocated. A URL keeps its
+/// credentials, its database name, and its query string; a bare number
+/// becomes the port.
+///
+/// This is what replaces materialising a rewritten `.env` inside the
+/// worktree, which Invariant 1 forbids unless the project ignores it. The
+/// same map reaches the processes, the hooks, and `pando status --env`.
+pub fn app_env(
+    worktree: &Path,
+    mapping: &std::collections::BTreeMap<String, String>,
+    ports: &std::collections::BTreeMap<String, u16>,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let files = read_env_files(worktree);
+    let mut out = std::collections::BTreeMap::new();
+    for (key, service) in mapping {
+        let port = *ports.get(service).with_context(|| {
+            format!("no port was allocated for the service {service:?} (env.{key})")
+        })?;
+        let Some((source, value)) = files
+            .iter()
+            .find_map(|(name, map)| map.get(key).map(|value| (name.as_str(), value.as_str())))
+        else {
+            bail!(
+                "env.{key} points at the service {service:?}, but nothing in this worktree says \
+                 what {key} normally looks like — add it to .env.example (or .env), or drop it \
+                 from the [[services]] env map"
+            );
+        };
+        out.insert(key.clone(), rewrite(key, value, source, service, port)?);
+    }
+    Ok(out)
+}
+
+fn rewrite(key: &str, value: &str, source: &str, service: &str, port: u16) -> Result<String> {
+    let trimmed = value.trim();
+    if !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return Ok(port.to_string());
+    }
+    if let Some(rewritten) = rewrite_url(trimmed, service, port) {
+        return Ok(rewritten);
+    }
+    bail!(
+        "{key}={trimmed:?} in {source} is neither a URL nor a port number, so pando cannot point \
+         it at {service:?} — make it a URL or a bare port, or drop {key} from the [[services]] \
+         env map"
+    )
+}
+
+/// A URL with its port replaced, and its host replaced too when the host
+/// is the compose service's own name: inside the compose network a service
+/// is reachable as `postgres`, and from the host it is `localhost`.
+fn rewrite_url(value: &str, service: &str, port: u16) -> Option<String> {
+    let after_scheme = value.find("://")? + 3;
+    let (head, rest) = value.split_at(after_scheme);
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let (userinfo, hostport) = match authority.rfind('@') {
+        Some(at) => authority.split_at(at + 1),
+        None => ("", authority),
+    };
+    // An IPv6 host is bracketed and full of colons; only the one after the
+    // closing bracket separates the port.
+    let host = if hostport.starts_with('[') {
+        match hostport.find(']') {
+            Some(close) => &hostport[..=close],
+            None => hostport,
+        }
+    } else {
+        match hostport.rfind(':') {
+            Some(colon) => &hostport[..colon],
+            None => hostport,
+        }
+    };
+    if host.is_empty() {
+        return None;
+    }
+    let host = if host == service { "localhost" } else { host };
+    Some(format!("{head}{userinfo}{host}:{port}{tail}"))
+}
+
+/// Every env file the worktree has, in lookup order, each as a key map.
+fn read_env_files(worktree: &Path) -> Vec<(String, std::collections::BTreeMap<String, String>)> {
+    let mut out = Vec::new();
+    for name in ENV_FILES {
+        let Ok(text) = std::fs::read_to_string(worktree.join(name)) else {
+            continue;
+        };
+        out.push((name.to_string(), parse_env(&text)));
+    }
+    out
+}
+
+/// `KEY=value` lines, with `export` and surrounding quotes dropped. Not a
+/// dotenv implementation: it reads what a key looks like, and the only
+/// thing pando does with the answer is swap a number inside it.
+pub fn parse_env(text: &str) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        let value = value.trim();
+        let value = match (value.starts_with('"'), value.starts_with('\'')) {
+            (true, _) if value.len() >= 2 && value.ends_with('"') => &value[1..value.len() - 1],
+            (_, true) if value.len() >= 2 && value.ends_with('\'') => &value[1..value.len() - 1],
+            _ => value,
+        };
+        out.insert(key.to_string(), value.to_string());
+    }
+    out
+}
+
 /// A service being waited on: which port it was given, and whether its
 /// compose entry declares a healthcheck.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -596,6 +728,178 @@ mod tests {
         );
         assert!(err.contains("cache"), "{err}");
         assert!(err.contains("did not become ready"), "{err}");
+    }
+
+    // ---- env rewriting ---------------------------------------------------
+
+    fn worktree_with(files: &[(&str, &str)]) -> TempDir {
+        let dir = TempDir::new().unwrap();
+        for (name, body) in files {
+            std::fs::write(dir.path().join(name), body).unwrap();
+        }
+        dir
+    }
+
+    fn map(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn ports(pairs: &[(&str, u16)]) -> std::collections::BTreeMap<String, u16> {
+        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    #[test]
+    fn a_url_keeps_everything_but_its_port() {
+        let dir = worktree_with(&[(
+            ".env",
+            "DATABASE_URL=postgres://acme:secret@localhost:5432/acme?sslmode=disable\n\
+             REDIS_URL=redis://localhost:6379\n",
+        )]);
+        let env = app_env(
+            dir.path(),
+            &map(&[("DATABASE_URL", "postgres"), ("REDIS_URL", "redis")]),
+            &ports(&[("postgres", 17_004), ("redis", 17_006)]),
+        )
+        .unwrap();
+        assert_eq!(
+            env["DATABASE_URL"],
+            "postgres://acme:secret@localhost:17004/acme?sslmode=disable"
+        );
+        assert_eq!(env["REDIS_URL"], "redis://localhost:17006");
+    }
+
+    #[test]
+    fn a_url_that_names_the_compose_service_as_its_host_is_pointed_at_localhost() {
+        let dir = worktree_with(&[(
+            ".env.example",
+            "DATABASE_URL=postgres://app@postgres:5432/app\nOTHER_URL=redis://cache-a:6379\n",
+        )]);
+        let env = app_env(
+            dir.path(),
+            &map(&[("DATABASE_URL", "postgres"), ("OTHER_URL", "redis")]),
+            &ports(&[("postgres", 17_004), ("redis", 17_006)]),
+        )
+        .unwrap();
+        assert_eq!(env["DATABASE_URL"], "postgres://app@localhost:17004/app");
+        assert_eq!(
+            env["OTHER_URL"], "redis://cache-a:17006",
+            "a host that is not the service's name is the developer's and is kept"
+        );
+    }
+
+    #[test]
+    fn a_url_with_no_port_gains_one() {
+        let dir = worktree_with(&[(".env", "REDIS_URL=redis://localhost\n")]);
+        let env = app_env(
+            dir.path(),
+            &map(&[("REDIS_URL", "redis")]),
+            &ports(&[("redis", 17_006)]),
+        )
+        .unwrap();
+        assert_eq!(env["REDIS_URL"], "redis://localhost:17006");
+    }
+
+    #[test]
+    fn an_ipv6_host_keeps_its_brackets() {
+        let dir = worktree_with(&[(".env", "DB=postgres://[::1]:5432/app\n")]);
+        let env = app_env(
+            dir.path(),
+            &map(&[("DB", "postgres")]),
+            &ports(&[("postgres", 17_004)]),
+        )
+        .unwrap();
+        assert_eq!(env["DB"], "postgres://[::1]:17004/app");
+    }
+
+    #[test]
+    fn a_bare_number_becomes_the_port() {
+        let dir = worktree_with(&[(".env", "DB_HOST=localhost\nDB_PORT=5432\n")]);
+        let env = app_env(
+            dir.path(),
+            &map(&[("DB_PORT", "db")]),
+            &ports(&[("db", 17_004)]),
+        )
+        .unwrap();
+        assert_eq!(env["DB_PORT"], "17004");
+    }
+
+    // The real credentials live in `.env`; the example is the fallback.
+    #[test]
+    fn the_worktrees_own_env_wins_over_the_example() {
+        let dir = worktree_with(&[
+            (
+                ".env",
+                "DATABASE_URL=postgres://real:pw@localhost:5432/real\n",
+            ),
+            (
+                ".env.example",
+                "DATABASE_URL=postgres://user:pass@localhost:5432/db\nEXTRA_URL=redis://localhost:6379\n",
+            ),
+        ]);
+        let env = app_env(
+            dir.path(),
+            &map(&[("DATABASE_URL", "postgres"), ("EXTRA_URL", "redis")]),
+            &ports(&[("postgres", 17_004), ("redis", 17_006)]),
+        )
+        .unwrap();
+        assert_eq!(
+            env["DATABASE_URL"],
+            "postgres://real:pw@localhost:17004/real"
+        );
+        assert_eq!(
+            env["EXTRA_URL"], "redis://localhost:17006",
+            "a key only the example has still resolves"
+        );
+    }
+
+    #[test]
+    fn a_key_nothing_in_the_worktree_sets_is_an_error_naming_it() {
+        let dir = worktree_with(&[(".env", "SOMETHING_ELSE=1\n")]);
+        let err = format!(
+            "{:#}",
+            app_env(
+                dir.path(),
+                &map(&[("DATABASE_URL", "postgres")]),
+                &ports(&[("postgres", 17_004)]),
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("DATABASE_URL"), "{err}");
+        assert!(
+            err.contains(".env.example"),
+            "it says where to put it: {err}"
+        );
+    }
+
+    #[test]
+    fn a_value_that_is_neither_a_url_nor_a_port_is_an_error_naming_it() {
+        let dir = worktree_with(&[(".env", "DB=localhost\n")]);
+        let err = format!(
+            "{:#}",
+            app_env(
+                dir.path(),
+                &map(&[("DB", "postgres")]),
+                &ports(&[("postgres", 17_004)]),
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("DB=\"localhost\""), "{err}");
+        assert!(err.contains(".env"), "{err}");
+    }
+
+    #[test]
+    fn env_files_are_read_the_way_a_shell_would_read_them() {
+        let parsed = parse_env(
+            "# a comment\n\nexport A=1\nB = \"two\"\nC='three'\nD=four=five\nbroken\n=nokey\n",
+        );
+        assert_eq!(parsed["A"], "1");
+        assert_eq!(parsed["B"], "two");
+        assert_eq!(parsed["C"], "three");
+        assert_eq!(parsed["D"], "four=five");
+        assert_eq!(parsed.len(), 4);
     }
 
     #[test]

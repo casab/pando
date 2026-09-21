@@ -18,6 +18,7 @@ use crate::hooks;
 use crate::paths::PandoPaths;
 use crate::ports;
 use crate::process::{self as proc, SpawnOptions};
+use crate::services;
 use crate::state::{self, Phase, ProcessRecord, WorktreeRecord};
 use crate::template;
 use crate::worktree::{self, Worktree};
@@ -397,7 +398,27 @@ pub fn rm(paths: &PandoPaths, name: &str, yes: bool, force: bool) -> Result<()> 
     // Whatever is running goes next. A dev server whose working directory
     // has just been deleted is not a process anyone can do anything with,
     // and `rm` removes the record that is the only way to find it again.
-    let stopped = stop_recorded(&mut store, name, None, MissingOnly::IsAnError)?;
+    let mut projects: Vec<String> = Vec::new();
+    let stopped = stop_recorded(
+        &mut store,
+        name,
+        None,
+        MissingOnly::IsAnError,
+        &mut projects,
+    )?;
+
+    // The containers, the network, and the volumes, before git is asked to
+    // remove anything: the record that names the compose project is about
+    // to be dropped, and a `down -v` that failed after the worktree was
+    // gone would leave a database nothing could ever find. Saved first, so
+    // a retry of `rm` has the record it needs.
+    if !projects.is_empty() {
+        state::save(&paths.state_file(), &store)?;
+        stop_compose_projects(paths, &projects, |compose| compose.down_with_volumes())
+            .with_context(|| {
+                format!("{name} was left in place; its services could not be taken down")
+            })?;
+    }
 
     // Nothing is unlinked first. Verified against git 2.51: an ignored file
     // does not block `git worktree remove`, and `--force` does not follow a
@@ -818,37 +839,31 @@ pub fn start(
     config: &Config,
     name: &str,
     only: Option<&str>,
+    isolated: bool,
     progress: &dyn Fn(&str),
 ) -> Result<StartReport> {
     let worktree = find_worktree(paths, name)?;
     // Before anything is installed, signalled or spawned: a `--only` naming
     // a process that does not exist must have no side effects at all.
     let selection = selected_processes(config, only)?;
-    let roles = worktree_roles(config);
     let canonical = std::fs::canonicalize(&worktree.path).unwrap_or_else(|_| worktree.path.clone());
 
-    paths.ensure_home()?;
-    // Before the lock, and before anything is spawned: a worktree whose
-    // lockfiles changed under it — a rebase, a branch switch — gets its
-    // dependencies brought up to date, and a long install does not hold the
-    // lock the rest of pando needs.
+    // A project with nothing to isolate is not an error: `--isolated` on a
+    // Go service with no compose file runs shared and says so, because the
+    // flag is a wish about this project and the project has no services.
+    let isolatable = !service_roles(config).is_empty();
+    if isolated && !isolatable {
+        progress("no services are configured for this project — starting in shared mode");
+    }
     // A start that will only report what is already up must not install
     // first: `npm ci` inside a worktree whose dev server is live is a
     // surprise nobody asked for. Starting one process beside a live one is
     // not that case — it is about to run code. Read without the lock, like
     // the hook's own fingerprint: the decision it guards is "can this step
     // be skipped", and the authoritative one is made under the lock below.
-    if !every_process_running(paths, name, &selection) {
-        install_if_needed(
-            paths,
-            config,
-            name,
-            worktree.branch.as_deref(),
-            &canonical,
-            progress,
-        )?;
-    }
+    let everything_up = every_process_running(paths, name, &selection);
 
+    paths.ensure_home()?;
     let _lock = state::lock(&paths.lock_file())?;
     let mut store = state::load(&paths.state_file())?;
 
@@ -936,6 +951,16 @@ pub fn start(
     if only.is_none() {
         record.observed_ports.clear();
     }
+    // Isolation is per start and remembered per worktree: `--isolated`
+    // turns it on, and a later plain `start` of the same worktree keeps
+    // the services it already has rather than quietly pointing its
+    // processes back at the shared database.
+    let isolate = isolatable && (isolated || record.isolated);
+    record.isolated = isolate;
+    // Service roles are reserved with the process roles, in one window, so
+    // `{port:postgres}` resolves in any template and the number is the
+    // same on every restart.
+    let roles = worktree_roles(config, isolate);
     // Ports this worktree's own surviving processes are holding. They will
     // not pass a freeness probe, and they are not somebody else's either.
     let keep: Vec<u16> = record
@@ -962,7 +987,52 @@ pub fn start(
         .collect();
     if let Some(record) = store.worktrees.get_mut(name) {
         record.roles = owners;
+        if isolate {
+            record.services = planned_services(config, paths, name, &assignment.ports, record);
+        }
     }
+    // Written down before anything is brought up: a start that fails
+    // halfway must still leave `rm` able to name the compose project and
+    // take its volumes with it.
+    state::save(&paths.state_file(), &store)?;
+    // And unlocked from here to the spawn. An install takes minutes, a
+    // database takes seconds to become ready, and a migration takes as
+    // long as it takes; holding the state lock through any of them would
+    // freeze `pando ls` and the TUI's tick.
+    drop(_lock);
+
+    // Everything the app is told about where its services are. Computed
+    // from the allocated ports alone, so a hook that runs before the
+    // containers exist sees exactly what the processes will.
+    let service_env = if isolate {
+        resolve_service_env(config, &canonical, &assignment.ports)?
+    } else {
+        BTreeMap::new()
+    };
+
+    if !everything_up {
+        install_if_needed(
+            paths,
+            config,
+            name,
+            worktree.branch.as_deref(),
+            &canonical,
+            progress,
+        )?;
+    }
+
+    if isolate {
+        bring_up_services(paths, config, name, &canonical, &assignment.ports, progress)?;
+    }
+
+    let _lock = state::lock(&paths.lock_file())?;
+    let mut store = state::load(&paths.state_file())?;
+    // The record this call left behind, unless something removed the
+    // worktree while the services were coming up.
+    store
+        .worktrees
+        .entry(name.to_string())
+        .or_insert_with(|| WorktreeRecord::new(canonical.clone(), false));
 
     let mut planned: Vec<Planned> = Vec::new();
     for (process_name, process) in &selection {
@@ -993,7 +1063,7 @@ pub fn start(
         let cmd = template::render(&process.cmd, &ctx)
             .with_context(|| format!("in the command for process {process_name}"))?;
         let cwd = process_cwd(&canonical, process_name, process, &ctx)?;
-        let env = process_env(paths, name, &worktree, process, &ctx)?;
+        let env = process_env(paths, name, &worktree, process, &service_env, &ctx)?;
         planned.push(Planned {
             process: process_name.clone(),
             shell_cmd: with_prelude(config, &cmd),
@@ -1130,16 +1200,49 @@ fn stop_missing(
     missing: MissingOnly,
 ) -> Result<StopOutcome> {
     paths.ensure_home()?;
-    let _lock = state::lock(&paths.lock_file())?;
-    let mut store = state::load(&paths.state_file())?;
-    let outcome = stop_recorded(&mut store, name, only, missing)?;
-    // `reconcile` drops dead-leader records for every worktree in the
-    // project, not only this one, so every one of them is signalled first.
-    sweep_orphaned_groups(&mut store)?;
-    advance_before_reconcile(&mut store);
-    state::reconcile(&mut store, proc::is_alive);
-    state::save(&paths.state_file(), &store)?;
+    let mut projects: Vec<String> = Vec::new();
+    let outcome = {
+        let _lock = state::lock(&paths.lock_file())?;
+        let mut store = state::load(&paths.state_file())?;
+        let outcome = stop_recorded(&mut store, name, only, missing, &mut projects)?;
+        // `reconcile` drops dead-leader records for every worktree in the
+        // project, not only this one, so every one is signalled first.
+        sweep_orphaned_groups(&mut store)?;
+        advance_before_reconcile(&mut store);
+        state::reconcile(&mut store, proc::is_alive);
+        state::save(&paths.state_file(), &store)?;
+        outcome
+    };
+    // Outside the lock: `docker compose stop` takes as long as the
+    // containers take to shut down, and the records that name the project
+    // are already saved, so a failure here is recoverable by running
+    // `stop` again.
+    stop_compose_projects(paths, &projects, |compose| compose.stop())?;
     Ok(outcome)
+}
+
+/// Runs one compose verb against every project a worktree owns, reporting
+/// the failures together.
+fn stop_compose_projects(
+    paths: &PandoPaths,
+    projects: &[String],
+    run: impl Fn(&services::Compose) -> Result<()>,
+) -> Result<()> {
+    if projects.is_empty() {
+        return Ok(());
+    }
+    let program = services::docker_program(paths);
+    let mut failures = Vec::new();
+    for project in projects {
+        let compose = services::Compose::by_project(&program, project.as_str());
+        if let Err(e) = run(&compose) {
+            failures.push(format!("{project}: {e:#}"));
+        }
+    }
+    if failures.is_empty() {
+        return Ok(());
+    }
+    bail!("could not reach the services of {}", failures.join("; "))
 }
 
 /// Stops every worktree pando has a process for, returning their names.
@@ -1153,19 +1256,30 @@ pub fn stop_all_with(paths: &PandoPaths, stop: impl Fn(i32) -> Result<()>) -> Re
     paths.ensure_home()?;
     let _lock = state::lock(&paths.lock_file())?;
     let mut store = state::load(&paths.state_file())?;
+    // Services as well as processes: a worktree whose dev server crashed
+    // still has a database up, and `stop` with no name is how you make
+    // sure nothing of pando's is left running.
     let names: Vec<String> = store
         .worktrees
         .iter()
-        .filter(|(_, r)| !r.processes.is_empty())
+        .filter(|(_, r)| !r.processes.is_empty() || !r.services.is_empty())
         .map(|(name, _)| name.clone())
         .collect();
     let mut stopped = Vec::new();
     let mut failures = Vec::new();
+    let mut projects: Vec<String> = Vec::new();
     for name in names {
         // One worktree that will not die must not leave the rest running —
         // and must not lose its record either. The failures are collected
         // and reported once every other group has been signalled.
-        match stop_recorded_with(&mut store, &name, None, MissingOnly::IsAnError, &stop) {
+        match stop_recorded_with(
+            &mut store,
+            &name,
+            None,
+            MissingOnly::IsAnError,
+            &stop,
+            &mut projects,
+        ) {
             Ok(StopOutcome::Stopped(_)) => stopped.push(name),
             Ok(StopOutcome::NotRunning) => {}
             Err(e) => failures.push(format!("stopping {name}: {e:#}")),
@@ -1186,12 +1300,14 @@ pub fn stop_all_with(paths: &PandoPaths, stop: impl Fn(i32) -> Result<()>) -> Re
     // Saved either way, so the groups that *were* signalled do not come
     // back as phantom records on the next read.
     state::save(&paths.state_file(), &store)?;
+    drop(_lock);
     if !failures.is_empty() {
         bail!("{}", failures.join("; "));
     }
     if let Some(e) = sweep_failed {
         return Err(e);
     }
+    stop_compose_projects(paths, &projects, |compose| compose.stop())?;
     Ok(stopped)
 }
 
@@ -1209,10 +1325,16 @@ fn stop_recorded(
     name: &str,
     only: Option<&str>,
     missing: MissingOnly,
+    services_to_stop: &mut Vec<String>,
 ) -> Result<StopOutcome> {
-    stop_recorded_with(store, name, only, missing, |pgid| {
-        proc::stop(pgid, STOP_GRACE)
-    })
+    stop_recorded_with(
+        store,
+        name,
+        only,
+        missing,
+        |pgid| proc::stop(pgid, STOP_GRACE),
+        services_to_stop,
+    )
 }
 
 fn stop_recorded_with(
@@ -1221,12 +1343,25 @@ fn stop_recorded_with(
     only: Option<&str>,
     missing: MissingOnly,
     stop: impl Fn(i32) -> Result<()>,
+    services_to_stop: &mut Vec<String>,
 ) -> Result<StopOutcome> {
     let Some(record) = store.worktrees.get_mut(name) else {
         return Ok(StopOutcome::NotRunning);
     };
+    // A worktree whose processes are all down may still have containers
+    // up: it was started isolated and then every process crashed. `stop`
+    // is how you make sure, so the services are taken down either way.
     if record.processes.is_empty() {
-        return Ok(StopOutcome::NotRunning);
+        let failures = stop_service_pumps(record, &stop);
+        let projects = compose_projects(record);
+        if !failures.is_empty() {
+            bail!("{name}: {}", failures.join("; "));
+        }
+        if projects.is_empty() {
+            return Ok(StopOutcome::NotRunning);
+        }
+        services_to_stop.extend(projects);
+        return Ok(StopOutcome::Stopped(Vec::new()));
     }
     let groups: Vec<(String, i32)> = record
         .processes
@@ -1263,6 +1398,12 @@ fn stop_recorded_with(
     }
     if record.processes.is_empty() {
         record.observed_ports.clear();
+    }
+    // A worktree-wide stop takes its services with it; `--only` is about
+    // one process and leaves the database its siblings are still using.
+    if only.is_none() {
+        failures.extend(stop_service_pumps(record, &stop));
+        services_to_stop.extend(compose_projects(record));
     }
     if !failures.is_empty() {
         bail!("{name}: {}", failures.join("; "));
@@ -1315,6 +1456,29 @@ fn sweep_orphaned_groups_with(
                 Err(e) => failures.push(format!("{name}/{process} (group {}): {e:#}", p.pgid)),
             }
         }
+        // A log pump is a process group like any other, and `reconcile`
+        // forgets its pid the moment its leader dies — so it is signalled
+        // here first, or a `docker compose logs -f` whose leader exited
+        // keeps a child attached to the daemon with nothing able to name
+        // it again.
+        for service in record.services.iter_mut() {
+            let (Some(pid), Some(pgid)) = (service.pid, service.pgid) else {
+                continue;
+            };
+            if proc::is_alive(pid) {
+                continue;
+            }
+            match stop(pgid) {
+                Ok(()) => {
+                    service.pid = None;
+                    service.pgid = None;
+                }
+                Err(e) => failures.push(format!(
+                    "{name}/{} log pump (group {pgid}): {e:#}",
+                    service.name
+                )),
+            }
+        }
     }
     if failures.is_empty() {
         return Ok(());
@@ -1334,6 +1498,7 @@ pub fn restart(
     config: &Config,
     name: &str,
     only: Option<&str>,
+    isolated: bool,
     progress: &dyn Fn(&str),
 ) -> Result<StartReport> {
     // Against config, and before anything is signalled: `stop` can only
@@ -1348,7 +1513,7 @@ pub fn restart(
     // one thing it could not do — but only while a sibling was still
     // running, which made the failure look random.
     stop_missing(paths, name, only, MissingOnly::IsNothingToDo)?;
-    start(paths, config, name, only, progress)
+    start(paths, config, name, only, isolated, progress)
 }
 
 /// The processes a start, stop or restart acts on: every one config
@@ -1404,7 +1569,15 @@ fn selected_processes<'a>(
 /// for: a role belongs to the worktree, and starting one process must
 /// never move another one's port. `config::validate` has already refused
 /// two processes claiming one role, so this only deduplicates defensively.
-fn worktree_roles(config: &Config) -> Vec<String> {
+/// Every role the worktree needs a port for: the processes' first, then
+/// the services' when this worktree runs private copies of them.
+///
+/// Services last, deliberately. Ports are handed out in role order from
+/// one window, so putting them after the processes means a worktree that
+/// switches from shared to isolated keeps the web port it already had and
+/// simply grows the window — no bookmarked URL changes for turning
+/// isolation on.
+fn worktree_roles(config: &Config, isolated: bool) -> Vec<String> {
     let mut roles: Vec<String> = Vec::new();
     for process in config.processes.values() {
         for role in process.roles() {
@@ -1413,7 +1586,270 @@ fn worktree_roles(config: &Config) -> Vec<String> {
             }
         }
     }
+    if isolated {
+        for role in service_roles(config) {
+            if !roles.contains(&role) {
+                roles.push(role);
+            }
+        }
+    }
     roles
+}
+
+/// One `[[services]]` entry of `kind = "compose"`, flattened.
+struct ComposeEntry<'a> {
+    file: &'a str,
+    include: &'a [String],
+    env: &'a BTreeMap<String, String>,
+    ready_timeout_s: Option<u64>,
+}
+
+fn compose_entries(config: &Config) -> Vec<ComposeEntry<'_>> {
+    config
+        .services
+        .iter()
+        .filter_map(|service| match service {
+            config::ServiceConfig::Compose {
+                file,
+                include,
+                env,
+                ready_timeout_s,
+            } => Some(ComposeEntry {
+                file,
+                include,
+                env,
+                ready_timeout_s: *ready_timeout_s,
+            }),
+            // Native services are Phase 6.
+            config::ServiceConfig::Native { .. } => None,
+        })
+        .collect()
+}
+
+/// Every service this project can run a private copy of, in config order.
+/// Each one is a role, so `{port:postgres}` resolves like any other.
+fn service_roles(config: &Config) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for entry in compose_entries(config) {
+        for name in entry.include {
+            if !out.contains(name) {
+                out.push(name.clone());
+            }
+        }
+    }
+    out
+}
+
+/// The service records an isolated start writes, before anything is up.
+///
+/// A record that already exists keeps its log pump, so a plain `start`
+/// beside live services does not lose the pid that stops it. A record for
+/// a service config no longer includes is kept too: it still names the
+/// compose project, and dropping it would leave a container and its volume
+/// with nothing in pando able to take them down.
+fn planned_services(
+    config: &Config,
+    paths: &PandoPaths,
+    name: &str,
+    ports: &BTreeMap<String, u16>,
+    record: &WorktreeRecord,
+) -> Vec<state::ServiceRecord> {
+    let project = crate::compose::project_name(paths.project_id(), name);
+    let mut out: Vec<state::ServiceRecord> = Vec::new();
+    for service in service_roles(config) {
+        let existing = record.services.iter().find(|s| s.name == service);
+        out.push(state::ServiceRecord {
+            name: service.clone(),
+            kind: state::ServiceKind::Compose,
+            port: ports.get(&service).copied(),
+            pid: existing.and_then(|s| s.pid),
+            pgid: existing.and_then(|s| s.pgid),
+            compose_project: Some(project.clone()),
+        });
+    }
+    for service in &record.services {
+        if !out.iter().any(|kept| kept.name == service.name) {
+            out.push(service.clone());
+        }
+    }
+    out
+}
+
+/// The env every process and hook of an isolated worktree is given, so it
+/// talks to its own services rather than the shared ones.
+fn resolve_service_env(
+    config: &Config,
+    worktree: &Path,
+    ports: &BTreeMap<String, u16>,
+) -> Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    for entry in compose_entries(config) {
+        out.extend(services::app_env(worktree, entry.env, ports)?);
+    }
+    Ok(out)
+}
+
+/// Brings this worktree's private services up, waits for them, and starts
+/// a log pump in front of each one.
+///
+/// The override that remaps the ports is regenerated every time: the
+/// ports can move, the compose file can change under a rebase, and a
+/// stale override would publish a port nothing is on.
+fn bring_up_services(
+    paths: &PandoPaths,
+    config: &Config,
+    name: &str,
+    worktree: &Path,
+    ports: &BTreeMap<String, u16>,
+    progress: &dyn Fn(&str),
+) -> Result<()> {
+    let entries = compose_entries(config);
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut published: Vec<crate::compose::Published> = Vec::new();
+    let mut wanted: Vec<services::Wanted> = Vec::new();
+    let mut include: Vec<String> = Vec::new();
+    let mut timeout = services::DEFAULT_READY_TIMEOUT_S;
+    for entry in &entries {
+        let file = crate::compose::file_in(worktree, entry.file)?;
+        let parsed = crate::compose::read(&file)?;
+        for (service, container) in crate::compose::resolve_included(&parsed, entry.include)? {
+            let host = *ports
+                .get(&service)
+                .with_context(|| format!("no port was allocated for the service {service:?}"))?;
+            wanted.push(services::Wanted {
+                service: service.clone(),
+                port: host,
+                healthcheck: parsed.services[&service].healthcheck,
+            });
+            published.push(crate::compose::Published {
+                service: service.clone(),
+                container,
+                host,
+            });
+            include.push(service);
+        }
+        files.push(file);
+    }
+    for entry in &entries {
+        if let Some(configured) = entry.ready_timeout_s {
+            timeout = configured;
+        }
+    }
+
+    let override_file = paths.compose_override_file(name);
+    if let Some(parent) = override_file.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    std::fs::write(
+        &override_file,
+        crate::compose::render_override(name, &published),
+    )
+    .with_context(|| format!("write {}", override_file.display()))?;
+    files.push(override_file);
+
+    let project = crate::compose::project_name(paths.project_id(), name);
+    let compose =
+        services::Compose::new(services::docker_program(paths), &project, files, worktree);
+    progress(&format!("starting services: {}", include.join(", ")));
+    compose.up(&include)?;
+
+    // A service that never comes up leaves nothing running: the ones that
+    // did are stopped again, so a failed start does not leave half an
+    // environment holding ports.
+    if let Err(e) = services::wait_ready(&compose, &wanted, Duration::from_secs(timeout), progress)
+    {
+        let _ = compose.stop();
+        return Err(e);
+    }
+
+    pump_service_logs(paths, name, &compose, &include, worktree)
+}
+
+/// One detached `docker compose logs -f` per service, writing into the
+/// worktree's log directory so the viewer has a tab for it.
+///
+/// Recorded as the service's pid and pgid, which is what makes it a
+/// process `stop` signals and the orphan sweep covers.
+fn pump_service_logs(
+    paths: &PandoPaths,
+    name: &str,
+    compose: &services::Compose,
+    include: &[String],
+    worktree: &Path,
+) -> Result<()> {
+    let _lock = state::lock(&paths.lock_file())?;
+    let mut store = state::load(&paths.state_file())?;
+    for service in include {
+        let running = store
+            .worktrees
+            .get(name)
+            .and_then(|r| r.services.iter().find(|s| &s.name == service))
+            .and_then(|s| s.pid)
+            .is_some_and(proc::is_alive);
+        if running {
+            continue;
+        }
+        let log_file = paths.log_file(name, service);
+        reset_log(&log_file)?;
+        let spawned = proc::spawn_detached(SpawnOptions {
+            shell_cmd: &compose.logs_shell_cmd(service),
+            cwd: worktree,
+            log_file: &log_file,
+            env: &[],
+        })
+        .with_context(|| format!("start the log pump for the service {service:?}"))?;
+        if let Some(record) = store
+            .worktrees
+            .get_mut(name)
+            .and_then(|r| r.services.iter_mut().find(|s| &s.name == service))
+        {
+            record.pid = Some(spawned.pid);
+            record.pgid = Some(spawned.pgid);
+        }
+    }
+    state::save(&paths.state_file(), &store)
+}
+
+/// Signals every log pump of a worktree and forgets it, leaving the rest
+/// of the service record — the port and the compose project — in place.
+fn stop_service_pumps(
+    record: &mut WorktreeRecord,
+    stop: &impl Fn(i32) -> Result<()>,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    for service in record.services.iter_mut() {
+        let Some(pgid) = service.pgid else { continue };
+        match stop(pgid) {
+            Ok(()) => {
+                service.pid = None;
+                service.pgid = None;
+            }
+            Err(e) => failures.push(format!(
+                "the log pump for {} (group {pgid}): {e:#}",
+                service.name
+            )),
+        }
+    }
+    failures
+}
+
+/// The compose projects a worktree's records name, each once.
+fn compose_projects(record: &WorktreeRecord) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for service in &record.services {
+        if service.kind != state::ServiceKind::Compose {
+            continue;
+        }
+        if let Some(project) = &service.compose_project
+            && !out.contains(project)
+        {
+            out.push(project.clone());
+        }
+    }
+    out
 }
 
 /// The role whose port has to bind before the process counts as running.
@@ -1566,6 +2002,7 @@ fn process_env(
     name: &str,
     worktree: &Worktree,
     process: &ProcessConfig,
+    service_env: &BTreeMap<String, String>,
     ctx: &template::Context<'_>,
 ) -> Result<Vec<(String, String)>> {
     let mut env: BTreeMap<String, String> = BTreeMap::new();
@@ -1574,6 +2011,12 @@ fn process_env(
             var.clone(),
             template::render(&tmpl, ctx).with_context(|| format!("in ports.{var}"))?,
         );
+    }
+    // Between the port sugar and the process's own `env`, so a developer
+    // who spells a service URL out by hand still wins: pando's rewrite is
+    // the default, not the law.
+    for (var, value) in service_env {
+        env.insert(var.clone(), value.clone());
     }
     for (var, tmpl) in &process.env {
         env.insert(
@@ -2177,6 +2620,30 @@ mod tests {
     use crate::project::ProjectRef;
     use crate::testutil::git;
     use tempfile::{TempDir, tempdir};
+
+    /// The shared-mode `start`, which is what every test written before
+    /// isolation existed means. Shadowing the real one keeps those tests
+    /// reading as they did — `--isolated` is a separate question, and they
+    /// were never asking it.
+    fn start(
+        paths: &PandoPaths,
+        config: &Config,
+        name: &str,
+        only: Option<&str>,
+        progress: &dyn Fn(&str),
+    ) -> Result<StartReport> {
+        super::start(paths, config, name, only, false, progress)
+    }
+
+    fn restart(
+        paths: &PandoPaths,
+        config: &Config,
+        name: &str,
+        only: Option<&str>,
+        progress: &dyn Fn(&str),
+    ) -> Result<StartReport> {
+        super::restart(paths, config, name, only, false, progress)
+    }
 
     // The two lists have to stay in step: a process named `install` writes
     // the install hook's log file, and `reset_log` truncates it on every

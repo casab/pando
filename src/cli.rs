@@ -180,7 +180,7 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
         }
         Command::Start { name, yes, only } => {
             let config = &actions::resolve_process(paths, config, &asker(yes), &notice)?;
-            let report = actions::start(paths, config, &name, only.as_deref(), &notice)?;
+            let report = actions::start(paths, config, &name, only.as_deref(), false, &notice)?;
             if report.reassigned {
                 eprintln!("pando: the ports {name} had were taken; it moved to new ones");
             }
@@ -218,7 +218,7 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             // process question has never been answered gets the question,
             // not a refusal.
             let config = &actions::resolve_process(paths, config, &asker(yes), &notice)?;
-            let report = actions::restart(paths, config, &name, only.as_deref(), &notice)?;
+            let report = actions::restart(paths, config, &name, only.as_deref(), false, &notice)?;
             writeln!(out, "restarted {name}{}", url_suffix(report.url.as_deref()))?;
             Ok(())
         }

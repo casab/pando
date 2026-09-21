@@ -52,6 +52,16 @@ pub struct WorktreeRecord {
     pub observed_ports: Vec<u16>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub services: Vec<ServiceRecord>,
+    /// Whether this worktree runs private copies of the project's
+    /// services.
+    ///
+    /// Per start and remembered per worktree: `start --isolated` sets it,
+    /// a later plain `start` keeps the services already up, and only `rm`
+    /// forgets it. Without the memory, restarting an isolated worktree
+    /// would hand its processes the *shared* database's address while its
+    /// own database was still running beside it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub isolated: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub hooks: BTreeMap<String, HookRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -69,6 +79,7 @@ impl WorktreeRecord {
             roles: BTreeMap::new(),
             observed_ports: Vec::new(),
             services: Vec::new(),
+            isolated: false,
             hooks: BTreeMap::new(),
             share: None,
         }
@@ -240,10 +251,24 @@ pub fn reconcile(state: &mut State, is_alive: impl Fn(u32) -> bool) -> bool {
             .retain(|_, p| is_alive(p.pid) || matches!(p.phase, Phase::Failed { .. }));
         changed |= rec.processes.len() != before;
 
+        // A native service *is* its process, so a dead pid is a dead
+        // service. A compose service is a container, and the pid on its
+        // record is only the log pump in front of it: dropping the record
+        // because the pump died would leave a running container — with its
+        // volume — that nothing in pando could ever find again, let alone
+        // take down. So the pump is forgotten and the service is kept.
         let before = rec.services.len();
         rec.services
-            .retain(|s| s.pid.map(&is_alive).unwrap_or(true));
+            .retain(|s| s.kind != ServiceKind::Native || s.pid.map(&is_alive).unwrap_or(true));
         changed |= rec.services.len() != before;
+        for service in rec.services.iter_mut() {
+            if service.kind == ServiceKind::Compose && service.pid.is_some_and(|pid| !is_alive(pid))
+            {
+                service.pid = None;
+                service.pgid = None;
+                changed = true;
+            }
+        }
 
         // Nothing is up, whatever records are left, so the worktree is not
         // listening on anything.
@@ -894,6 +919,29 @@ mod tests {
         let services = &state.worktrees.get("feat+x").unwrap().services;
         assert_eq!(services.len(), 1);
         assert_eq!(services[0].name, "postgres");
+    }
+
+    // A compose service's pid is the log pump in front of the container,
+    // not the container. Dropping the record when the pump dies would
+    // orphan a container and its volume with nothing able to name them.
+    #[test]
+    fn reconcile_forgets_a_dead_log_pump_and_keeps_the_service() {
+        let mut state = full_state();
+        if let Some(rec) = state.worktrees.get_mut("feat+x") {
+            rec.services[0].pid = Some(9001);
+            rec.services[0].pgid = Some(9001);
+        }
+        assert!(reconcile(&mut state, |pid| pid != 9001));
+        let services = &state.worktrees.get("feat+x").unwrap().services;
+        let compose = services.iter().find(|s| s.name == "postgres").unwrap();
+        assert_eq!(compose.pid, None, "the pump is forgotten");
+        assert_eq!(compose.pgid, None);
+        assert_eq!(
+            compose.compose_project.as_deref(),
+            Some("pando-acme-feat+x"),
+            "what `rm` needs to take it down survives"
+        );
+        assert_eq!(compose.port, Some(17_002));
     }
 
     #[test]

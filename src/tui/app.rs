@@ -984,7 +984,7 @@ impl App {
             // `pando.toml` that this session's own copy does not have is
             // one the next keypress asks all over again.
             let _ = tx.send(AppEvent::ConfigResolved(Box::new(config.clone())));
-            actions::start(&paths, &config, &worker_name, None, &progress)
+            actions::start(&paths, &config, &worker_name, None, false, &progress)
                 .map(|report| PendingOutcome::Started(worker_name.clone(), report.url.clone()))
                 .map_err(|e| format!("{e:#}"))
         });
@@ -1023,7 +1023,7 @@ impl App {
             let config = actions::resolve_process(&paths, &config, &ask, &progress)
                 .map_err(|e| format!("{e:#}"))?;
             let _ = tx.send(AppEvent::ConfigResolved(Box::new(config.clone())));
-            actions::restart(&paths, &config, &worker_name, None, &progress)
+            actions::restart(&paths, &config, &worker_name, None, false, &progress)
                 .map(|report| PendingOutcome::Started(worker_name.clone(), report.url.clone()))
                 .map_err(|e| format!("{e:#}"))
         });

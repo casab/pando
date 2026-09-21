@@ -460,7 +460,7 @@ fn starting_and_stopping_never_writes_into_the_repository() {
         "the install hook logs under pando's home"
     );
 
-    let outcome = actions::start(&h.paths, &h.config, &name, None, &|_| {}).unwrap();
+    let outcome = actions::start(&h.paths, &h.config, &name, None, false, &|_| {}).unwrap();
     let port = outcome.ports["web"];
     h.assert_untouched("start", Some(&worktree));
 
@@ -512,7 +512,7 @@ fn starting_and_stopping_never_writes_into_the_repository() {
     );
     h.assert_untouched("stop", Some(&worktree));
 
-    let restarted = actions::restart(&h.paths, &h.config, &name, None, &|_| {}).unwrap();
+    let restarted = actions::restart(&h.paths, &h.config, &name, None, false, &|_| {}).unwrap();
     assert_eq!(
         restarted.ports["web"], port,
         "a restart keeps the port, so the URL keeps working"
@@ -577,7 +577,7 @@ fn an_adversarial_process_name_writes_nothing_outside_pandos_home() {
             Ok(loaded) => {
                 // Unfixed: the name loads, and starting it is what writes
                 // the file. The assertions below are the ones that fail.
-                let _ = actions::start(&h.paths, &loaded.config, &name, None, &|_| {});
+                let _ = actions::start(&h.paths, &loaded.config, &name, None, false, &|_| {});
                 h.assert_untouched(&format!("start of {escape:?}"), Some(&worktree));
                 panic!("a process name that escapes the log directory must be refused at load");
             }
@@ -612,7 +612,7 @@ fn two_processes_never_write_into_the_repository() {
     let worktree = h.config.worktrees_dir(&h.paths).join(&name);
     h.assert_untouched("new", Some(&worktree));
 
-    let report = actions::start(&h.paths, &h.config, &name, None, &|_| {}).unwrap();
+    let report = actions::start(&h.paths, &h.config, &name, None, false, &|_| {}).unwrap();
     assert_eq!(
         report
             .started
@@ -714,7 +714,7 @@ fn two_processes_never_write_into_the_repository() {
     h.assert_untouched("stop --only web", Some(&worktree));
 
     // Starting again brings the missing one back on the same ports.
-    let again = actions::start(&h.paths, &h.config, &name, None, &|_| {}).unwrap();
+    let again = actions::start(&h.paths, &h.config, &name, None, false, &|_| {}).unwrap();
     assert_eq!(
         again
             .started
@@ -764,7 +764,7 @@ fn two_processes_never_write_into_the_repository() {
 fn every_file_the_lifecycle_writes_is_under_pandos_home() {
     let h = harness_with("[project]\ninstall = \"true\"\n\n[dev]\ncmd = \"sleep 30\"\n");
     let name = actions::new(&h.paths, &h.config, "feat/one", None, &|_| {}).unwrap();
-    let outcome = actions::start(&h.paths, &h.config, &name, None, &|_| {}).unwrap();
+    let outcome = actions::start(&h.paths, &h.config, &name, None, false, &|_| {}).unwrap();
     actions::refresh(&h.paths);
 
     for path in [

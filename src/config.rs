@@ -224,6 +224,11 @@ pub enum ServiceConfig {
         include: Vec<String>,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         env: BTreeMap<String, String>,
+        /// How long each of these services gets to become ready. Sixty
+        /// seconds by default; a database that restores a dump on first
+        /// boot needs to be able to say so.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ready_timeout_s: Option<u64>,
     },
     Native {
         name: String,
@@ -709,10 +714,19 @@ pub fn validate(config: &Config, project: &ProjectRef) -> Result<()> {
         )?;
     }
     validate_processes(config)?;
+    validate_services(config)?;
     // A hook writes `logs/<worktree>/<name>.log` under exactly the same
     // rules as a process, and shares the namespace with it.
     for hook in &config.hooks {
         crate::paths::validate_owned_log_source("hook name", &hook.name)?;
+    }
+    for probe in &config.probes {
+        if probe.name.trim().is_empty() {
+            bail!("a [[probes]] entry needs a name");
+        }
+        if probe.cmd.trim().is_empty() {
+            bail!("probe {:?} has no cmd", probe.name);
+        }
     }
     for entry in &config.project.provision {
         let path = Path::new(entry);
@@ -727,6 +741,61 @@ pub fn validate(config: &Config, project: &ProjectRef) -> Result<()> {
         }
         if entry.trim().is_empty() {
             bail!("provision paths must not be empty");
+        }
+    }
+    Ok(())
+}
+
+/// A service is three things at once and has to be legal as all of them.
+///
+/// It is a **role**, so its port is allocated with the processes' and
+/// `{port:postgres}` resolves; two things claiming one role would be handed
+/// one number. It is a **log source**, so its container log lands at
+/// `logs/<worktree>/<service>.log`, under the same single-path-component
+/// rule a process name has had since Phase 2b — a service called `../x`
+/// would write outside pando's home. And its `file` is read from inside
+/// the worktree, which is also the directory compose resolves every
+/// relative path in that file against.
+fn validate_services(config: &Config) -> Result<()> {
+    let mut role_owner: BTreeMap<String, String> = BTreeMap::new();
+    for (process, spec) in &config.processes {
+        for role in spec.roles() {
+            role_owner.insert(role, format!("process {process:?}"));
+        }
+    }
+    for service in &config.services {
+        let ServiceConfig::Compose {
+            file, include, env, ..
+        } = service
+        else {
+            // Native services are Phase 6. Nothing validates their shape
+            // yet, and nothing reads it either.
+            continue;
+        };
+        // The same refusals `compose::file_in` makes, at load time rather
+        // than at the first isolated start.
+        crate::compose::file_in(Path::new("/"), file)?;
+        for name in include {
+            crate::paths::validate_owned_log_source("service name", name)?;
+            if let Some(owner) = role_owner.get(name) {
+                bail!(
+                    "the service {name:?} and {owner} both claim the role {name:?} — a role is \
+                     one port and belongs to one thing; rename the process's role, or drop \
+                     {name:?} from `include`"
+                );
+            }
+            role_owner.insert(name.clone(), format!("the service {name:?}"));
+        }
+        for (key, service_name) in env {
+            if key.trim().is_empty() {
+                bail!("a [[services]] env key must not be empty");
+            }
+            if !include.iter().any(|name| name == service_name) {
+                bail!(
+                    "env.{key} points at the service {service_name:?}, which is not in \
+                     `include` — pando has no port for a service it does not run"
+                );
+            }
         }
     }
     Ok(())
