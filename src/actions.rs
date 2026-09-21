@@ -153,8 +153,21 @@ pub fn new(
     // A failed install keeps the worktree. The branch is checked out, the
     // files are provisioned, and the next `start` tries the install again —
     // so the error is worth an exit code, but not an unwind.
+    //
+    // No ports yet: they are allocated at `start`, so a create hook that
+    // names one fails here by name rather than silently rendering the
+    // wrong number. Almost none do; the install step never does.
     progress("installing");
-    install_if_needed(paths, config, &dir_name, Some(branch), &target, progress)
+    let no_ports: BTreeMap<String, u16> = BTreeMap::new();
+    let no_services: BTreeMap<String, String> = BTreeMap::new();
+    let ctx = HookContext {
+        name: &dir_name,
+        branch: Some(branch),
+        worktree: &target,
+        ports: &no_ports,
+        service_env: &no_services,
+    };
+    run_hooks(paths, config, config::HookPoint::Create, &ctx, progress)
         .with_context(|| format!("{dir_name} was created, but its install step failed"))?;
     Ok(dir_name)
 }
@@ -190,79 +203,155 @@ fn dirty_entry(worktree: &Worktree) -> Option<String> {
 /// name would have its log truncated on every start.
 pub const INSTALL_HOOK: &str = "install";
 
-/// Runs `[project].install` when the lockfiles have changed since it last
-/// ran here.
+/// `[project].install` expressed as the `[[hooks]]` entry it is: a
+/// create-point hook keyed on the lockfiles, because a lockfile changing
+/// is what "the dependencies changed" means.
 ///
-/// A built-in hook rather than a special case: the same fingerprint gate
-/// `[[hooks]]` gets in the next phase, keyed on the lockfiles because a
-/// lockfile changing is what "the dependencies changed" means.
+/// One mechanism rather than two. The only thing still special about it is
+/// the warning below when a "frozen" install rewrites a lockfile.
+fn install_hook(config: &Config) -> Option<config::HookConfig> {
+    let install = config.project.install.as_deref()?.trim();
+    if install.is_empty() {
+        return None;
+    }
+    Some(config::HookConfig {
+        name: INSTALL_HOOK.to_string(),
+        after: config::HookPoint::Create,
+        fingerprint: detect::LOCKFILES.iter().map(|l| l.to_string()).collect(),
+        cmd: install.to_string(),
+        cwd: None,
+        fallback: None,
+    })
+}
+
+/// Every hook that runs at one lifecycle point, in the order they run: the
+/// built-in install first, then whatever `[[hooks]]` declares, in file
+/// order.
+fn hooks_at(config: &Config, point: config::HookPoint) -> Vec<config::HookConfig> {
+    let mut out: Vec<config::HookConfig> = Vec::new();
+    if point == config::HookPoint::Create
+        && let Some(install) = install_hook(config)
+    {
+        out.push(install);
+    }
+    out.extend(config.hooks.iter().filter(|h| h.after == point).cloned());
+    out
+}
+
+/// What a hook is given: the worktree it runs in, the ports of its roles,
+/// and the environment the processes get.
+pub struct HookContext<'a> {
+    pub name: &'a str,
+    pub branch: Option<&'a str>,
+    pub worktree: &'a Path,
+    pub ports: &'a BTreeMap<String, u16>,
+    /// Service addresses, so a migration talks to this worktree's own
+    /// database rather than the shared one.
+    pub service_env: &'a BTreeMap<String, String>,
+}
+
+/// Runs every hook at one lifecycle point whose fingerprint has changed.
 ///
-/// Deliberately not under the state lock. It reads the recorded fingerprint
-/// without one — the worst a race can do is run an idempotent install twice
-/// — and takes the lock only to write the result.
-pub fn install_if_needed(
+/// Deliberately not under the state lock. The recorded fingerprint is read
+/// without one — the worst a race can do is run an idempotent hook twice —
+/// and the lock is taken only to write the result, because a migration can
+/// take a minute and nothing else should wait on it.
+pub fn run_hooks(
     paths: &PandoPaths,
     config: &Config,
-    name: &str,
-    branch: Option<&str>,
-    worktree: &Path,
+    point: config::HookPoint,
+    ctx: &HookContext<'_>,
     progress: &dyn Fn(&str),
 ) -> Result<()> {
-    let Some(install) = config.project.install.as_deref() else {
-        return Ok(());
-    };
-    if install.trim().is_empty() {
-        return Ok(());
+    for hook in hooks_at(config, point) {
+        run_hook(paths, config, &hook, ctx, progress)?;
     }
-    let globs: Vec<String> = detect::LOCKFILES.iter().map(|l| l.to_string()).collect();
-    let current = hooks::fingerprint(worktree, &globs);
+    Ok(())
+}
+
+fn run_hook(
+    paths: &PandoPaths,
+    config: &Config,
+    hook: &config::HookConfig,
+    ctx: &HookContext<'_>,
+    progress: &dyn Fn(&str),
+) -> Result<()> {
+    let log_file = paths.log_file(ctx.name, &hook.name);
+    let template_ctx = template::Context {
+        name: ctx.name,
+        branch: ctx.branch,
+        worktree: ctx.worktree,
+        root: paths.root(),
+        project: paths.project_id(),
+        ports: ctx.ports,
+        default_role: None,
+        log: Some(&log_file),
+    };
+    let cmd = template::render(&hook.cmd, &template_ctx)
+        .with_context(|| format!("in the command for hook {}", hook.name))?;
+    let fallback = hook
+        .fallback
+        .as_deref()
+        .map(|f| template::render(f, &template_ctx))
+        .transpose()
+        .with_context(|| format!("in the fallback for hook {}", hook.name))?;
+    let cwd = hook_cwd(ctx.worktree, hook, &template_ctx)?;
+
+    // The command is part of the fingerprint, not only the files: editing
+    // what a hook runs is a reason to run it again, and keying on the
+    // files alone meant a corrected migration command never ran.
+    let current = hooks::fingerprint(ctx.worktree, &hook.fingerprint, &cmd);
     let recorded = state::load(&paths.state_file()).ok().and_then(|store| {
         store
             .worktrees
-            .get(name)
-            .and_then(|r| r.hooks.get(INSTALL_HOOK))
+            .get(ctx.name)
+            .and_then(|r| r.hooks.get(&hook.name))
             .and_then(|h| h.fingerprint.clone())
     });
-    // No fingerprint at all means nothing here can say the dependencies are
+    // No fingerprint at all means nothing here can say the inputs are
     // unchanged, so the hook runs every time.
     if current.is_some() && current == recorded {
         return Ok(());
     }
 
-    let log_file = paths.log_file(name, INSTALL_HOOK);
-    progress(&format!("{INSTALL_HOOK}: {install}"));
-    let env = pando_env(paths, name, branch, worktree);
-    hooks::run(&log_file, &with_prelude(config, install), worktree, &env)
-        .with_context(|| format!("the {INSTALL_HOOK} hook failed"))?;
+    progress(&format!("{}: {cmd}", hook.name));
+    let mut env = pando_env(paths, ctx.name, ctx.branch, ctx.worktree);
+    env.extend(ctx.service_env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    hooks::run_with_fallback(
+        &log_file,
+        &with_prelude(config, &cmd),
+        fallback
+            .as_deref()
+            .map(|f| with_prelude(config, f))
+            .as_deref(),
+        &cwd,
+        &env,
+    )
+    .with_context(|| format!("the {} hook failed", hook.name))?;
 
-    // A frozen install should leave the lockfile exactly as it found it.
-    // When one does not — and package managers do, on a lockfile they
-    // consider malformed — two things have to happen: the developer is told,
-    // because a tracked file changing under a worktree is what Invariant 1
-    // exists to prevent; and the fingerprint recorded is the one the install
-    // *left behind*, or the hook sees a change it made itself and re-runs on
-    // every single start from then on.
-    let after = hooks::fingerprint(worktree, &globs);
+    // A hook that rewrites one of its own inputs — a "frozen" install that
+    // normalises a lockfile is the classic — has to be reported, because a
+    // tracked file changing under a worktree is what Invariant 1 exists to
+    // prevent. And the fingerprint recorded is the one the hook *left
+    // behind*, or it sees its own change and re-runs on every start.
+    let after = hooks::fingerprint(ctx.worktree, &hook.fingerprint, &cmd);
     if after != current {
-        progress(&format!(
-            "warning: {install:?} changed a lockfile in this worktree — that command is not as \
-             frozen as it looks, and `git status` there will show it"
-        ));
+        progress(&changed_its_inputs(&hook.name, &cmd));
     }
 
     let _lock = state::lock(&paths.lock_file())?;
     let mut store = state::load(&paths.state_file())?;
     // `or_insert_with`, not `get_mut`: on `start` for an adopted worktree
     // there is no record yet — `start` creates it after this returns — and
-    // dropping the result on the floor would re-install on every start
+    // dropping the result on the floor would re-run on every start
     // forever. A record pando did not create is not claimed as its own.
     store
         .worktrees
-        .entry(name.to_string())
-        .or_insert_with(|| WorktreeRecord::new(worktree, false))
+        .entry(ctx.name.to_string())
+        .or_insert_with(|| WorktreeRecord::new(ctx.worktree, false))
         .hooks
         .insert(
-            INSTALL_HOOK.to_string(),
+            hook.name.clone(),
             state::HookRecord {
                 fingerprint: after,
                 ran_at: Utc::now(),
@@ -270,6 +359,53 @@ pub fn install_if_needed(
         );
     state::save(&paths.state_file(), &store)?;
     Ok(())
+}
+
+fn changed_its_inputs(hook: &str, cmd: &str) -> String {
+    if hook == INSTALL_HOOK {
+        return format!(
+            "warning: {cmd:?} changed a lockfile in this worktree — that command is not as \
+             frozen as it looks, and `git status` there will show it"
+        );
+    }
+    format!(
+        "warning: the {hook} hook changed one of the files it is keyed on — `git status` in \
+         this worktree will show it, and the hook will run again next time"
+    )
+}
+
+/// A hook runs in the worktree, or in the subdirectory it names. The same
+/// refusals a process's `cwd` gets: a hook that ran outside its own
+/// worktree would be writing into a repository.
+fn hook_cwd(
+    worktree: &Path,
+    hook: &config::HookConfig,
+    ctx: &template::Context<'_>,
+) -> Result<PathBuf> {
+    let Some(relative) = hook.cwd.as_deref() else {
+        return Ok(worktree.to_path_buf());
+    };
+    let rendered = template::render(relative, ctx)
+        .with_context(|| format!("in the cwd for hook {}", hook.name))?;
+    let dir = worktree.join(&rendered);
+    if !dir.is_dir() {
+        bail!(
+            "cwd {rendered:?} does not exist in this worktree ({}) — check the cwd of hook {:?}",
+            dir.display(),
+            hook.name
+        );
+    }
+    let resolved = crate::paths::resolve_for_compare(&dir);
+    let owner = crate::paths::resolve_for_compare(worktree);
+    if !resolved.starts_with(&owner) {
+        bail!(
+            "cwd {rendered:?} for hook {:?} resolves to {}, which is outside the worktree ({})",
+            hook.name,
+            resolved.display(),
+            owner.display()
+        );
+    }
+    Ok(dir)
 }
 
 /// The variables every command pando runs gets, whether or not it has ports
@@ -1010,19 +1146,50 @@ pub fn start(
         BTreeMap::new()
     };
 
+    // The lifecycle in order: create (which is where the install step
+    // lives), install, the services coming up, then services. Every hook
+    // is gated by its own fingerprint, so a start that changes nothing
+    // runs none of them.
+    //
+    // A worktree that is already running every process it was asked for
+    // is not starting anything, so nothing is re-run for it either: `npm
+    // ci` inside a live worktree is a surprise nobody asked for.
+    let hook_ctx = HookContext {
+        name,
+        branch: worktree.branch.as_deref(),
+        worktree: &canonical,
+        ports: &assignment.ports,
+        service_env: &service_env,
+    };
     if !everything_up {
-        install_if_needed(
+        run_hooks(
             paths,
             config,
-            name,
-            worktree.branch.as_deref(),
-            &canonical,
+            config::HookPoint::Create,
+            &hook_ctx,
+            progress,
+        )?;
+        run_hooks(
+            paths,
+            config,
+            config::HookPoint::Install,
+            &hook_ctx,
             progress,
         )?;
     }
 
     if isolate {
         bring_up_services(paths, config, name, &canonical, &assignment.ports, progress)?;
+    }
+
+    if !everything_up {
+        run_hooks(
+            paths,
+            config,
+            config::HookPoint::Services,
+            &hook_ctx,
+            progress,
+        )?;
     }
 
     let _lock = state::lock(&paths.lock_file())?;
@@ -1138,6 +1305,13 @@ pub fn start(
             })
         })
         .collect();
+    // The last point, and the only one that runs with the processes up.
+    // Outside the lock, because a `dev` hook is a command like any other
+    // and holding the lock through it would freeze the TUI's tick.
+    drop(_lock);
+    if !everything_up {
+        run_hooks(paths, config, config::HookPoint::Dev, &hook_ctx, progress)?;
+    }
     // From the record, through the one function every read path uses, so
     // that `pando start` and a `pando status` a second later cannot
     // disagree about the URL of the same worktree.

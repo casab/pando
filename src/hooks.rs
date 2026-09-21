@@ -43,13 +43,18 @@ pub enum HookOutcome {
     Skipped,
 }
 
-/// A content hash over the files the globs match, or `None` when the globs
-/// match nothing at all.
+/// A content hash over the files the globs match *and* the command itself,
+/// or `None` when the globs match nothing at all.
 ///
 /// `None` is "no fingerprint", which means the hook runs every time — the
 /// same thing an empty `fingerprint` list means. A project with no lockfile
 /// has no way to tell pando its dependencies are unchanged.
-pub fn fingerprint(worktree: &Path, globs: &[String]) -> Option<String> {
+///
+/// The command is part of the hash because editing a hook is a reason to
+/// run it again: keying on the files alone meant a migration command
+/// corrected in `pando.toml` never ran, since the migrations it watches
+/// had not changed.
+pub fn fingerprint(worktree: &Path, globs: &[String], cmd: &str) -> Option<String> {
     if globs.is_empty() {
         return None;
     }
@@ -84,6 +89,8 @@ pub fn fingerprint(worktree: &Path, globs: &[String]) -> Option<String> {
         }
         context.consume([0]);
     }
+    context.consume(cmd.as_bytes());
+    context.consume([0]);
     Some(format!("md5:{:x}", context.finalize()))
 }
 
@@ -208,6 +215,34 @@ pub fn run(log_file: &Path, shell_cmd: &str, cwd: &Path, env: &[(String, String)
     )
 }
 
+/// [`run`], with a second command tried when the first one fails.
+///
+/// The error reported is the *fallback's*. A hook with a fallback has two
+/// ways of doing one job; when both are gone, the reason the second one
+/// failed is the one that says what is actually wrong with the machine —
+/// the first one's reason is why the fallback exists at all. It is still
+/// named, so nobody has to guess which command the message came from.
+pub fn run_with_fallback(
+    log_file: &Path,
+    shell_cmd: &str,
+    fallback: Option<&str>,
+    cwd: &Path,
+    env: &[(String, String)],
+) -> Result<()> {
+    let Err(first) = run(log_file, shell_cmd, cwd, env) else {
+        return Ok(());
+    };
+    let Some(fallback) = fallback else {
+        return Err(first);
+    };
+    append(
+        log_file,
+        &format!("\npando: {shell_cmd} failed; trying the fallback\n"),
+    );
+    run(log_file, fallback, cwd, env)
+        .with_context(|| format!("the fallback ran because {shell_cmd:?} failed ({first:#})"))
+}
+
 fn append(path: &Path, text: &str) {
     use std::io::Write;
     if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -235,6 +270,13 @@ fn last_line(text: &str) -> String {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// The command a fingerprint test that is about the *files* uses.
+    /// Shadowing the real function keeps those tests reading the way they
+    /// did before the command joined the hash.
+    fn fingerprint(worktree: &Path, globs: &[String]) -> Option<String> {
+        super::fingerprint(worktree, globs, "pnpm install --frozen-lockfile")
+    }
 
     fn write(root: &Path, rel: &str, body: &str) {
         let path = root.join(rel);
@@ -322,6 +364,91 @@ mod tests {
         let first = fingerprint(dir.path(), &globs).unwrap();
         write(dir.path(), "node_modules/pkg/index.js", "changed");
         assert_eq!(fingerprint(dir.path(), &globs).unwrap(), first);
+    }
+
+    // The Phase 2 gap: editing what a hook runs changed nothing, so the
+    // corrected command never ran until one of its inputs happened to.
+    #[test]
+    fn editing_the_command_is_a_reason_to_run_again() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "prisma/migrations/1/up.sql", "create;");
+        let globs = vec!["prisma/migrations/**".to_string()];
+        let first = super::fingerprint(dir.path(), &globs, "prisma migrate deploy").unwrap();
+        assert_eq!(
+            super::fingerprint(dir.path(), &globs, "prisma migrate deploy").unwrap(),
+            first,
+            "the same command over the same files is the same fingerprint"
+        );
+        assert_ne!(
+            super::fingerprint(dir.path(), &globs, "pnpm prisma migrate deploy").unwrap(),
+            first
+        );
+    }
+
+    // ...but a hook with nothing to watch has no fingerprint at all, so it
+    // runs every time whatever its command is.
+    #[test]
+    fn a_command_alone_is_not_a_fingerprint() {
+        let dir = tempdir().unwrap();
+        assert_eq!(super::fingerprint(dir.path(), &[], "anything"), None);
+        assert_eq!(
+            super::fingerprint(dir.path(), &["absent.lock".to_string()], "anything"),
+            None
+        );
+    }
+
+    // ---- fallbacks -------------------------------------------------------
+
+    #[test]
+    fn a_fallback_runs_only_when_the_first_command_failed() {
+        let dir = tempdir().unwrap();
+        let log = dir.path().join("migrate.log");
+        run_with_fallback(&log, "echo first", Some("echo second"), dir.path(), &[]).unwrap();
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.contains("first"), "{text}");
+        assert!(
+            !text.contains("second"),
+            "the fallback is a fallback: {text}"
+        );
+    }
+
+    #[test]
+    fn a_fallback_that_succeeds_makes_the_hook_succeed() {
+        let dir = tempdir().unwrap();
+        let log = dir.path().join("migrate.log");
+        run_with_fallback(
+            &log,
+            "echo no-migrations >&2 && exit 1",
+            Some("echo pushed-the-schema"),
+            dir.path(),
+            &[],
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.contains("no-migrations"), "{text}");
+        assert!(text.contains("trying the fallback"), "{text}");
+        assert!(text.contains("pushed-the-schema"), "{text}");
+    }
+
+    #[test]
+    fn when_both_fail_the_fallbacks_reason_is_the_reported_one() {
+        let dir = tempdir().unwrap();
+        let log = dir.path().join("migrate.log");
+        let err = run_with_fallback(
+            &log,
+            "echo FIRST_REASON >&2 && exit 1",
+            Some("echo SECOND_REASON >&2 && exit 2"),
+            dir.path(),
+            &[],
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("exited 2"), "{msg}");
+        assert!(msg.contains("SECOND_REASON"), "{msg}");
+        assert!(
+            msg.contains("FIRST_REASON"),
+            "and it still says which command sent it there: {msg}"
+        );
     }
 
     #[test]
