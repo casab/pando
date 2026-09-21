@@ -229,6 +229,55 @@ fn a_later_plain_start_keeps_the_services_and_the_mode() {
     );
 }
 
+// A worktree's own containers hold its own service ports. A second start
+// that reads them as "taken" re-derives the whole window — web included —
+// and points a live application at ports nothing is on.
+#[test]
+fn a_second_isolated_start_of_a_running_worktree_keeps_every_port() {
+    if skip_without_python() {
+        return;
+    }
+    let f = iso_with(&config_toml(&listener_printing("DATABASE_URL")).replace(
+        "env = { DATABASE_URL = \"postgres\", REDIS_URL = \"redis\" }",
+        "env = { DATABASE_URL = \"postgres\", REDIS_URL = \"redis\" }\nready_timeout_s = 3",
+    ));
+    let name = new_worktree(&f, "feat/one");
+    let first = start_isolated(&f, &name);
+    let up = docker::services_up(&f.home, &f.project(&name));
+    let pids = docker::service_pids(&f.home, &f.project(&name));
+
+    // Nothing has stopped, so nothing may move: not the web port the
+    // developer bookmarked, and not the database the app is connected to.
+    let second = start_isolated(&f, &name);
+    assert_eq!(
+        second.ports, first.ports,
+        "every port the worktree owns, services included"
+    );
+    assert!(
+        !second.reassigned,
+        "the ports were held by this worktree, not taken by anybody"
+    );
+    assert_eq!(
+        docker::services_up(&f.home, &f.project(&name)),
+        up,
+        "the same services on the same ports"
+    );
+    assert_eq!(
+        docker::service_pids(&f.home, &f.project(&name)),
+        pids,
+        "and the containers that were already up were left alone"
+    );
+    // The map the app was given still agrees with the ports that exist.
+    let env = actions::resolved_env(&f.paths, &f.config, &name).unwrap();
+    assert_eq!(
+        env["DATABASE_URL"],
+        format!(
+            "postgres://acme:acme@localhost:{}/acme",
+            first.ports["postgres"]
+        )
+    );
+}
+
 #[test]
 fn stop_takes_the_processes_and_the_services_down_together() {
     if skip_without_python() {

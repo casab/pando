@@ -1318,13 +1318,21 @@ pub fn start(
     let roles = worktree_roles(config, isolate);
     // Ports this worktree's own surviving processes are holding. They will
     // not pass a freeness probe, and they are not somebody else's either.
-    let keep: Vec<u16> = record
+    let mut keep: Vec<u16> = record
         .processes
         .keys()
         .filter_map(|process| config.processes.get(process))
         .flat_map(|process| process.roles())
         .filter_map(|role| record.ports.get(&role).copied())
         .collect();
+    // And the ports its own *containers* are holding, for exactly the same
+    // reason. Without these, a second isolated start of a running worktree
+    // reads its own database as somebody else's listener, decides the
+    // window was taken, and moves every port — web included — leaving the
+    // live application pointed at ports nothing is on.
+    if isolate {
+        keep.extend(record.services.iter().filter_map(|service| service.port));
+    }
 
     let assignment = ports::assign_keeping(paths, &mut store, name, &roles, &keep)?;
 

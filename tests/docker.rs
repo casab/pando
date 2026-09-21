@@ -86,6 +86,12 @@ impl Drop for RealDocker {
 /// already on this machine, and with named volumes — the thing a
 /// per-worktree project name has to isolate.
 fn real() -> RealDocker {
+    real_with(&listener_on_port_env())
+}
+
+/// The same fixture with the dev command injected, so a test can watch what
+/// the process that is running was actually told.
+fn real_with(dev: &str) -> RealDocker {
     let dir = TempDir::new().unwrap();
     let root = build(Kind::NextPnpmCompose, dir.path()).root;
     std::fs::write(
@@ -113,7 +119,7 @@ fn real() -> RealDocker {
              include = [\"postgres\", \"redis\"]\n\
              env = {{ DATABASE_URL = \"postgres\", REDIS_URL = \"redis\" }}\n\
              ready_timeout_s = 90\n",
-            listener_on_port_env()
+            dev
         ),
     )
     .unwrap();
@@ -128,6 +134,80 @@ fn real() -> RealDocker {
 
 fn worktree_of(f: &RealDocker, name: &str) -> PathBuf {
     f.config.worktrees_dir(&f.paths).join(name)
+}
+
+/// `<container> <ports>` for one compose project, sorted, so two samples
+/// compare as one value.
+fn published_ports(project: &str) -> Vec<String> {
+    let mut out: Vec<String> = docker(&["ps", "--format", "{{.Names}} {{.Ports}}"])
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with(project))
+        .map(str::to_string)
+        .collect();
+    out.sort();
+    out
+}
+
+/// A second `start` of a worktree that is already running must keep every
+/// port it owns. The containers hold the service ports themselves, and
+/// reading that as "somebody took them" moves the whole window and leaves
+/// the live application pointed at nothing.
+#[test]
+fn a_second_isolated_start_keeps_the_containers_and_the_ports_they_were_given() {
+    if !enabled() {
+        eprintln!("skipping: set PANDO_TEST_DOCKER=1 to run against the real Docker");
+        return;
+    }
+    let mut f = real_with(&common::listener_printing("DATABASE_URL"));
+    let one = actions::new(&f.paths, &f.config, "feat/one", None, &|_| {}).unwrap();
+    f.projects
+        .push(compose::project_name(f.paths.project_id(), &one));
+
+    let first = actions::start(&f.paths, &f.config, &one, None, true, &|m| {
+        eprintln!("first: {m}")
+    })
+    .unwrap();
+    let before = published_ports(&f.projects[0]);
+    assert_eq!(before.len(), 2, "postgres and redis are up: {before:?}");
+
+    let second = actions::start(&f.paths, &f.config, &one, None, true, &|m| {
+        eprintln!("second: {m}")
+    })
+    .unwrap();
+    assert_eq!(second.ports, first.ports, "every port stays where it was");
+    assert!(!second.reassigned, "and nothing is reported as moved");
+    assert_eq!(
+        published_ports(&f.projects[0]),
+        before,
+        "the containers keep the ports they were published on"
+    );
+    for role in ["postgres", "redis"] {
+        assert!(
+            pando::ports::something_is_listening(first.ports[role]),
+            "{role} still answers on {}",
+            first.ports[role]
+        );
+    }
+
+    // The process that never stopped printed its DATABASE_URL when it was
+    // spawned. `status --env` must still say the same thing.
+    let env = actions::resolved_env(&f.paths, &f.config, &one).unwrap();
+    let path = f.paths.log_file(&one, "dev");
+    let mut log = String::new();
+    for _ in 0..100 {
+        log = std::fs::read_to_string(&path).unwrap_or_default();
+        if log.contains("DATABASE_URL=") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        log.contains(&format!("DATABASE_URL={}", env["DATABASE_URL"])),
+        "the running process and `status --env` disagree: env={:?} log={log:?} at {}",
+        env["DATABASE_URL"],
+        path.display()
+    );
 }
 
 #[test]

@@ -94,6 +94,28 @@ pub fn services_up(home: &Path, project: &str) -> Vec<(String, u16)> {
     out
 }
 
+/// The pid of the listener the shim put behind each service, so a test can
+/// tell "the container that was already up was left alone" from "it was
+/// replaced by one on a different port".
+pub fn service_pids(home: &Path, project: &str) -> Vec<(String, u64)> {
+    let path = state_dir(home).join(project).join("services.json");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    let Some(map) = value.as_object() else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, u64)> = map
+        .iter()
+        .filter_map(|(name, entry)| Some((name.clone(), entry.get("pid")?.as_u64()?)))
+        .collect();
+    out.sort();
+    out
+}
+
 /// Whether `down -v` has been run for this project.
 pub fn was_downed(home: &Path, project: &str) -> bool {
     state_dir(home).join(format!("{project}.down")).exists()
