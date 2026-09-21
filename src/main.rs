@@ -38,6 +38,13 @@ fn main() -> ExitCode {
             eprintln!("pando: {e:#}");
             ExitCode::from(EXIT_USAGE)
         }
+        // `doctor` has already printed every problem it found, with what
+        // to do about each one. All that is left is the code, and a line
+        // under the report repeating that it failed would be a reason the
+        // command did not print.
+        Err(e) if e.downcast_ref::<pando::doctor::Unhealthy>().is_some() => {
+            ExitCode::from(EXIT_ERROR)
+        }
         Err(e) => {
             // `{:#}` flattens the context chain onto one line: a CLI failure
             // is one sentence, not a stack.

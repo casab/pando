@@ -23,7 +23,7 @@ pub const BASE_STEP: u16 = 8;
 
 /// How many bases fit in the range with a full [`BASE_STEP`] window each, so
 /// every port a base can hand out stays inside `PORT_MIN..=PORT_MAX`.
-const BASE_COUNT: u32 = (PORT_MAX as u32 - PORT_MIN as u32 + 1) / BASE_STEP as u32;
+pub const BASE_COUNT: u32 = (PORT_MAX as u32 - PORT_MIN as u32 + 1) / BASE_STEP as u32;
 
 /// Bases tried before giving up. A caller that exhausts this has ~400 ports
 /// bound in its neighbourhood and wants a real error, not a longer walk.

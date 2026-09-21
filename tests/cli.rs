@@ -84,8 +84,15 @@ impl Env {
     }
 
     /// The machine-wide layer, under every project's own config.
+    ///
+    /// The home is created 0700 here, which is what
+    /// `PandoPaths::ensure_home` does: a harness that left it at whatever
+    /// the umask says would be testing against a home pando would never
+    /// have made.
     fn write_user_config(&self, toml: &str) {
+        use std::os::unix::fs::PermissionsExt;
         std::fs::create_dir_all(&self.home).unwrap();
+        std::fs::set_permissions(&self.home, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::write(self.home.join("config.toml"), toml).unwrap();
     }
 
@@ -2230,4 +2237,79 @@ fn status_says_when_a_service_is_up_with_no_log_pump() {
 
     assert_eq!(code(&e.pando(&["rm", "feat+one", "--force"])), EXIT_OK);
     assert_eq!(status_porcelain(&e.root), "");
+}
+
+// ---- doctor ---------------------------------------------------------------
+
+#[test]
+fn doctor_on_a_project_with_nothing_wrong_exits_zero_and_names_every_layer() {
+    let e = env();
+    let out = e.pando(&["doctor"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    for line in ["project", "config"] {
+        assert!(
+            text.lines().any(|l| l == line),
+            "{line} is missing:\n{text}"
+        );
+    }
+    assert!(text.contains("committed"), "{text}");
+    assert!(text.contains("user"), "{text}");
+    assert!(
+        text.contains(&e.config_file().display().to_string()),
+        "the project layer is named even when it is not there:\n{text}"
+    );
+    assert!(text.contains("nothing to report"), "{text}");
+}
+
+#[test]
+fn doctor_exits_one_for_a_problem_it_printed_and_says_nothing_else() {
+    let e = env();
+    e.write_config("[project]\ninstall = \"pnpm install\"\n");
+    let out = e.pando(&["doctor"]);
+    assert_eq!(code(&out), EXIT_ERROR, "stdout: {}", stdout(&out));
+    let text = stdout(&out);
+    assert!(text.contains("non-frozen install"), "{text}");
+    assert!(
+        text.contains("pnpm install --frozen-lockfile"),
+        "the fix is printed: {text}"
+    );
+    assert!(text.contains("1 problem, 0 notes"), "{text}");
+    // Exit 1 is the whole message. A `pando: …` line under the report
+    // would be a reason the report did not give.
+    assert!(!stderr(&out).contains("pando:"), "stderr: {}", stderr(&out));
+}
+
+#[test]
+fn doctor_still_runs_when_the_project_layer_cannot_be_loaded() {
+    let e = env();
+    e.write_config("[project]\na_key_pando_has_never_heard_of = 1\n");
+    let out = e.pando(&["doctor"]);
+    assert_eq!(code(&out), EXIT_ERROR);
+    let text = stdout(&out);
+    assert!(text.contains("the config does not load"), "{text}");
+    assert!(
+        text.contains("a_key_pando_has_never_heard_of"),
+        "and the file is still shown, key by key:\n{text}"
+    );
+}
+
+#[test]
+fn doctor_writes_nothing_and_does_not_create_a_home() {
+    let dir = TempDir::new().unwrap();
+    let root = build(Kind::Plain, dir.path()).root;
+    let home = dir.path().join("pando-home");
+    let out = Command::new(env!("CARGO_BIN_EXE_pando"))
+        .env("PANDO_HOME", &home)
+        .current_dir(&root)
+        .arg("doctor")
+        .output()
+        .expect("run pando");
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    assert!(
+        !home.exists(),
+        "doctor created {} — it reads, it does not write",
+        home.display()
+    );
+    assert_eq!(status_porcelain(&root), "");
 }

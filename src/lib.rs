@@ -9,6 +9,7 @@
 //!       → detect · hooks · worktree · cache · log_tail · observe · services
 //!       → tunnel · share_proxy
 //!       → actions
+//!       → doctor
 //!       → cli · tui
 //! ```
 
@@ -18,6 +19,7 @@ pub mod cli;
 pub mod compose;
 pub mod config;
 pub mod detect;
+pub mod doctor;
 pub mod hooks;
 pub mod log_tail;
 pub mod observe;

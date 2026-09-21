@@ -126,6 +126,12 @@ pub enum Command {
     /// Read-only, and identical on two runs: the input an agent reads
     /// before deciding anything.
     Signals,
+    /// What pando found, from where, and what is wrong.
+    ///
+    /// Read-only. Exits 0 when nothing found will break a command and 1
+    /// when something will — and everything it exits 1 for is printed
+    /// above, with what to do about it.
+    Doctor,
     /// Stop a worktree's processes, or every worktree's when given no name.
     Stop {
         name: Option<String>,
@@ -306,6 +312,10 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             Ok(())
         }
         Command::Signals => signals_json(paths, config, &mut out),
+        // Deliberately not given the config `main` loaded: the one thing
+        // worth reporting about a project layer pando cannot read is the
+        // error, and `main` keeps that to itself.
+        Command::Doctor => doctor(paths, &mut out),
         Command::Stop { name, only } => match name {
             Some(name) => {
                 match actions::stop(paths, &name, only.as_deref(), &notice)? {
@@ -1621,6 +1631,22 @@ fn proposal_out(proposal: &crate::detect::Proposal) -> ProposalOut {
                 provision_from: candidate.provision_from.clone(),
             })
             .collect(),
+    }
+}
+
+// ---- doctor ---------------------------------------------------------------
+
+/// Prints the report and turns it into an exit code.
+///
+/// The failing case carries no message of its own: every problem is
+/// already on stdout with its fix, and `pando: <something>` beneath the
+/// report would be a reason the command did not give.
+pub fn doctor<W: Write>(paths: &PandoPaths, out: &mut W) -> Result<()> {
+    let report = crate::doctor::run(paths);
+    write!(out, "{}", report.render())?;
+    match report.healthy() {
+        true => Ok(()),
+        false => Err(crate::doctor::Unhealthy.into()),
     }
 }
 

@@ -340,7 +340,7 @@ fn provision_seeds(root: &Path) -> Vec<(String, String)> {
 /// exists. Exit 0 means ignored; anything else — including a git that could
 /// not run — means it is not, because only a definite yes may authorise a
 /// write.
-fn is_gitignored(root: &Path, rel: &str) -> bool {
+pub fn is_gitignored(root: &Path, rel: &str) -> bool {
     Command::new("git")
         .arg("-C")
         .arg(root)
