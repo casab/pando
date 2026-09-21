@@ -485,6 +485,9 @@ fn render_log_viewer(f: &mut Frame, area: Rect, app: &mut App) {
     app.viewer_height = body_height;
     if let Some(view) = app.log_view_mut() {
         view.available = sources;
+        // The tick compares a stat against this to know whether the frame
+        // still tells the truth about the file.
+        view.gone = gone;
         view.scroll = scroll_out;
         view.cursor = cursor;
         if !view.follow && visible_count > 0 && cursor == last_rank {

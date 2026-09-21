@@ -184,6 +184,12 @@ pub struct LogView {
     pub search: SearchState,
     /// The file was not there when the viewer opened.
     pub missing: bool,
+    /// The file was there and is not any more. Separate from `missing`
+    /// because the buffer still holds everything that was read of it, and
+    /// that is worth keeping on screen. Decided by the paint, which reads
+    /// the whole log directory; the tick only notices when it has gone
+    /// stale.
+    pub gone: bool,
     pub log_filter: LogFilter,
     /// Collapse to the lines matching the search, grep-style (`&`).
     pub filter_to_matches: bool,
@@ -214,6 +220,7 @@ impl LogView {
             search_mode: SearchMode::Inactive,
             search: SearchState::default(),
             missing,
+            gone: false,
             log_filter: LogFilter::All,
             filter_to_matches: false,
             wrap: true,
@@ -1588,17 +1595,28 @@ impl App {
         let Some(view) = self.log_view_mut() else {
             return false;
         };
-        // The viewer is most often opened on a source whose file does not
-        // exist yet — before `start`, or while it is still installing. One
-        // `exists` per tick is what turns that into a live tail the moment
-        // the process writes its first line, instead of a pane that says
-        // `no log file for this source yet` until it is reopened.
+        // One `exists` per tick, in both directions. The viewer is most
+        // often opened on a source whose file does not exist yet — before
+        // `start`, or while it is still installing — and this is what
+        // turns that into a live tail the moment the process writes its
+        // first line, instead of a pane that says `no log file for this
+        // source yet` until it is reopened.
+        let exists = view.tail.path().exists();
+        let mut changed = false;
         if view.missing {
-            if !view.tail.path().exists() {
+            if !exists {
                 return false;
             }
             view.missing = false;
             view.follow = true;
+            changed = true;
+        }
+        // The other direction: the paint decides `gone` from the log
+        // directory, and when a plain stat disagrees the frame on screen
+        // is out of date. Nothing else would repaint it — a tail whose
+        // file has been deleted never grows again.
+        if view.gone == exists {
+            changed = true;
         }
         let before = view.tail.lines().len();
         let grew = view.tail.poll().unwrap_or(false);
@@ -1662,7 +1680,7 @@ impl App {
                 .filter(|parsed| view.log_filter.passes(parsed.level))
                 .count();
         }
-        grew
+        grew || changed
     }
 
     // ---- background work -------------------------------------------------
@@ -3626,6 +3644,31 @@ pub mod tests {
              so `tab` can leave it"
         );
         assert!(!view.follow, "nothing to follow");
+    }
+
+    // The other half of finding 4: the title and the tab list are decided
+    // by the paint, and a tail whose file has been deleted never grows —
+    // so without this the frame goes on naming a file that is not there
+    // until something else happens to repaint it.
+    #[test]
+    fn a_log_deleted_under_the_viewer_asks_for_the_repaint_that_says_so() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["one"]);
+        open_viewer(&mut app, 80, 12);
+        assert!(!viewer(&app).gone);
+
+        std::fs::remove_file(app.paths.log_file("feat+one", "dev")).unwrap();
+        assert!(
+            app.handle_event(AppEvent::Tick),
+            "the tick has to ask for a repaint; nothing else will"
+        );
+        paint(&mut app, 80, 12);
+        assert!(viewer(&app).gone, "and the paint records what it decided");
+
+        assert!(
+            !app.handle_event(AppEvent::Tick),
+            "once the frame agrees with the file, the viewer settles"
+        );
     }
 
     // Phase 2c review, finding 5. `poll_viewer` returned early while
