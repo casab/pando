@@ -140,9 +140,27 @@ pub fn run_in_process(listen_port: u16, upstream_port: u16, cookie: &str) -> Res
     Ok(())
 }
 
-fn handle_connection(mut client: TcpStream, upstream_port: u16, cookie: &str) -> Result<()> {
-    client.set_read_timeout(Some(HEADER_READ_TIMEOUT)).ok();
+fn handle_connection(client: TcpStream, upstream_port: u16, cookie: &str) -> Result<()> {
+    handle_connection_with(client, upstream_port, cookie, HEADER_READ_TIMEOUT)
+}
+
+/// [`handle_connection`] with the header deadline given, so a test can
+/// watch what happens once it passes without sitting through thirty
+/// seconds of it.
+fn handle_connection_with(
+    mut client: TcpStream,
+    upstream_port: u16,
+    cookie: &str,
+    header_timeout: Duration,
+) -> Result<()> {
+    client.set_read_timeout(Some(header_timeout)).ok();
     let (head, leftover) = read_until_headers_end(&mut client)?;
+    // The deadline was for the headers, and they are here. A request whose
+    // body is already sent — which is every GET — then has nothing more to
+    // say for as long as the response takes, and a deadline left on turns
+    // that ordinary silence into a failed read, a half-closed application,
+    // and an SSE or streaming response cut off mid-flight.
+    client.set_read_timeout(None).ok();
     let rewritten = rewrite_headers(&head, cookie);
 
     let upstream_addr = format!("127.0.0.1:{upstream_port}");
@@ -172,8 +190,14 @@ fn handle_connection(mut client: TcpStream, upstream_port: u16, cookie: &str) ->
         let _ = std::io::copy(&mut up_read, &mut cli_write);
         let _ = cli_write.shutdown(std::net::Shutdown::Write);
     });
-    let _ = std::io::copy(&mut client, &mut upstream);
-    let _ = upstream.shutdown(std::net::Shutdown::Write);
+    // Half-closed only at a real end of file: "the client is done sending"
+    // is something an `Ok` says and an `Err` does not. A copy that ended in
+    // an error — a reset, a timeout — says nothing about the request, and
+    // passing that on as a FIN tells the application the body is complete
+    // when it may not be.
+    if std::io::copy(&mut client, &mut upstream).is_ok() {
+        let _ = upstream.shutdown(std::net::Shutdown::Write);
+    }
     let _ = back.join();
     Ok(())
 }
@@ -220,21 +244,34 @@ fn find_headers_end(buf: &[u8]) -> Option<(usize, usize)> {
 
 /// Replaces the `Cookie` header with the one the auth command produced, and
 /// forces `Connection: close` so each request is a fresh hop through the
-/// proxy. Every other header is passed through byte for byte.
+/// proxy. Every other header is passed through byte for byte, obs-fold
+/// continuations included.
 pub fn rewrite_headers(head: &str, cookie: &str) -> String {
     let mut lines = split_header_lines(head);
     let request_line = lines.next().unwrap_or("").to_string();
     let mut kept: Vec<String> = Vec::new();
+    let mut dropping = false;
     for line in lines {
         if line.is_empty() {
             continue;
         }
+        // An obs-fold continuation belongs to the header line above it, so
+        // it leaves with that line or not at all. Keeping the continuation
+        // of a dropped header folds it onto the header *before* that one —
+        // a visitor's `Cookie:` line whose second half becomes part of
+        // `Host:`.
+        if line.starts_with([' ', '\t']) {
+            if !dropping {
+                kept.push(line.to_string());
+            }
+            continue;
+        }
         let lower = line.to_ascii_lowercase();
-        if lower.starts_with("cookie:")
+        dropping = lower.starts_with("cookie:")
             || lower.starts_with("connection:")
             || lower.starts_with("keep-alive:")
-            || lower.starts_with("proxy-connection:")
-        {
+            || lower.starts_with("proxy-connection:");
+        if dropping {
             continue;
         }
         kept.push(line.to_string());
@@ -384,6 +421,46 @@ mod tests {
         assert!(out.contains("Cookie: k=v\r\n"), "{out}");
     }
 
+    // Finding 7. `split_header_lines` splits on `\n`, so an obs-fold
+    // continuation of a dropped header used to survive on its own — and a
+    // line that begins with whitespace folds onto whatever header came
+    // before it, which here is `Host`.
+    #[test]
+    fn a_folded_header_is_dropped_with_the_line_it_belongs_to() {
+        let head = "GET / HTTP/1.1\r\n\
+                    Host: h\r\n\
+                    Cookie: a=1\r\n\
+                    \x20b=2\r\n\
+                    X-Other: z\r\n";
+        let out = rewrite_headers(head, "k=v");
+
+        assert!(
+            !out.contains("b=2"),
+            "the visitor's folded cookie became part of Host: {out}"
+        );
+        assert!(out.contains("Host: h\r\n"), "{out}");
+        assert!(out.contains("X-Other: z\r\n"), "{out}");
+        assert!(out.contains("Cookie: k=v\r\n"), "{out}");
+    }
+
+    #[test]
+    fn a_folded_connection_header_goes_the_same_way() {
+        let head = "GET / HTTP/1.1\r\nHost: h\r\nConnection: keep-alive,\r\n\tUpgrade\r\n";
+        let out = rewrite_headers(head, "k=v");
+        assert!(!out.contains("Upgrade"), "{out}");
+        assert_eq!(out.matches("Connection:").count(), 1, "{out}");
+    }
+
+    // …and a fold on a header that is *kept* stays exactly where it was:
+    // the contract is "every other header is passed through byte for byte".
+    #[test]
+    fn a_folded_header_that_is_kept_is_left_alone() {
+        let head = "GET / HTTP/1.1\r\nHost: h\r\nX-Long: a,\r\n\tb\r\nCookie: old=1\r\n";
+        let out = rewrite_headers(head, "k=v");
+        assert!(out.contains("X-Long: a,\r\n\tb\r\n"), "{out}");
+        assert!(!out.contains("old=1"), "{out}");
+    }
+
     #[test]
     fn the_end_of_the_headers_is_found_in_both_spellings() {
         let crlf = b"GET / HTTP/1.1\r\nHost: x\r\n\r\nbody-bytes";
@@ -477,6 +554,99 @@ mod tests {
         assert!(response.contains("200 OK"), "{response}");
         let head = seen.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(head.contains("Content-Length: 5"), "{head}");
+    }
+
+    /// An upstream that answers and then keeps writing to the response,
+    /// reporting which chunk it was on when the proxy half-closed the
+    /// connection at it — or `None` if it never did.
+    fn streaming_upstream(chunks: usize, every: Duration) -> (u16, mpsc::Receiver<Option<usize>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = mpsc::channel::<Option<usize>>();
+        thread::spawn(move || {
+            let Ok((mut socket, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let mut acc: Vec<u8> = Vec::new();
+            loop {
+                match socket.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        acc.extend_from_slice(&buf[..n]);
+                        if find_headers_end(&acc).is_some() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = socket.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            );
+            // Short, so watching for the end of the client's half costs
+            // almost nothing between chunks.
+            let _ = socket.set_read_timeout(Some(Duration::from_millis(10)));
+            let mut fin_at = None;
+            for i in 0..chunks {
+                if socket
+                    .write_all(format!("data: tick-{i}\n\n").as_bytes())
+                    .is_err()
+                {
+                    break;
+                }
+                thread::sleep(every);
+                if fin_at.is_none() {
+                    let mut probe = [0u8; 1];
+                    if let Ok(0) = socket.read(&mut probe) {
+                        fin_at = Some(i);
+                    }
+                }
+            }
+            tx.send(fin_at).ok();
+        });
+        (port, rx)
+    }
+
+    // Finding 3. The read timeout is for the *headers*; a request whose
+    // body is already sent — every GET — then says nothing for as long as
+    // the response takes. Leaving the timeout on made the client-to-upstream
+    // copy fail at thirty seconds and the proxy send FIN to the
+    // application, cutting every SSE, long-poll and streaming response.
+    //
+    // 200 ms stands in for the 30 s: the defect is that the deadline was
+    // never cleared, not what it was set to.
+    #[test]
+    fn a_streaming_response_survives_a_client_with_nothing_more_to_say() {
+        let tick = Duration::from_millis(60);
+        let (upstream_port, fin) = streaming_upstream(12, tick);
+        let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_port = proxy.local_addr().unwrap().port();
+        let header_timeout = Duration::from_millis(200);
+        thread::spawn(move || {
+            if let Ok((stream, _)) = proxy.accept() {
+                let _ = handle_connection_with(stream, upstream_port, COOKIE, header_timeout);
+            }
+        });
+
+        let mut client = TcpStream::connect(("127.0.0.1", proxy_port)).unwrap();
+        client
+            .write_all(b"GET /stream HTTP/1.1\r\nHost: h\r\nAccept: text/event-stream\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+
+        assert_eq!(
+            fin.recv_timeout(Duration::from_secs(10)).unwrap(),
+            None,
+            "the proxy half-closed the application while the response was still streaming, \
+             {}ms in",
+            header_timeout.as_millis()
+        );
+        assert!(
+            response.contains("tick-11"),
+            "the stream was cut short: {response}"
+        );
     }
 
     #[test]
