@@ -29,7 +29,13 @@ const STOP_GRACE: Duration = Duration::from_secs(5);
 /// complaint, short enough to read on one screen.
 const TAIL_LINES: usize = 5;
 
+const URL_SCHEME: &str = "https://";
 const URL_HOST: &str = ".trycloudflare.com";
+/// Where cloudflared asks for a quick tunnel. It is in the installed
+/// binary, and a run that is offline or rate limited logs
+/// `Post "https://api.trycloudflare.com/tunnel": …` — which is a URL on a
+/// log line and is never one that was published.
+const API_HOST: &str = "api.trycloudflare.com";
 
 /// The only value `[share].provider` takes in v1.
 pub const DEFAULT_PROVIDER: &str = "cloudflared";
@@ -173,11 +179,14 @@ pub fn start_tunnel(paths: &PandoPaths, name: &str, local_port: u16) -> Result<T
     ensure_tunnel_config(&config_path)?;
 
     // `--no-autoupdate` keeps the background updater from restarting a
-    // detached child mid-session. `--output default` forces the bordered
-    // log format the parser expects even where `TUNNEL_LOG_OUTPUT=json` is
-    // in the inherited environment. `--config` shadows the user's own.
+    // detached child mid-session. `--output json` asks for the machine
+    // readable log — one object per line, with the published URL in a
+    // field rather than loose in a sentence — and pins it against a
+    // `TUNNEL_LOG_OUTPUT` in the inherited environment; a cloudflared too
+    // old to honour it falls back to the banner parser. `--config` shadows
+    // the user's own.
     let shell_cmd = format!(
-        "exec {program} tunnel --no-autoupdate --output default --config {config} \
+        "exec {program} tunnel --no-autoupdate --output json --config {config} \
          --url http://127.0.0.1:{local_port}",
         program = process::shell_quote(&cloudflared_program(paths).to_string_lossy()),
         config = process::shell_quote(&config_path.to_string_lossy()),
@@ -300,18 +309,83 @@ fn ensure_tunnel_config(path: &Path) -> Result<()> {
 
 fn parse_url_from_log(path: &Path) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
-    content.lines().find_map(extract_trycloudflare_url)
+    content.lines().find_map(published_url)
 }
 
-/// The quick-tunnel URL on a log line, host only.
+/// The URL a provider says it *published*, on one log line — never a URL it
+/// merely mentioned.
+///
+/// Two shapes, because `--output json` is what pando asks for and a
+/// cloudflared too old to honour it logs the human format instead. The
+/// structured form is tried first: it keeps the URL cloudflared published
+/// in a field of its own, away from the URLs it names in errors.
+fn published_url(line: &str) -> Option<String> {
+    url_from_json_line(line).or_else(|| bordered_url(line))
+}
+
+/// The URL in one `--output json` log line.
+///
+/// `url`/`hostname` first, so a cloudflared that ever names the URL
+/// outright is read straight. 2025.11.1 does not: it logs the same ASCII
+/// box the human format shows, one line per `message`, so every string
+/// field is offered to the banner rule — which means the `error` field of
+/// a failed request, whose URL is not bordered, cannot be mistaken for one.
+fn url_from_json_line(line: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    let object = value.as_object()?;
+    for key in ["url", "hostname"] {
+        if let Some(text) = object.get(key).and_then(|v| v.as_str())
+            && let Some(url) = quick_tunnel_url(text.trim())
+        {
+            return Some(url);
+        }
+    }
+    object
+        .values()
+        .filter_map(|v| v.as_str())
+        .find_map(bordered_url)
+}
+
+/// The URL inside cloudflared's own banner, which is an ASCII box: the URL
+/// is always alone between two pipes.
+///
+/// Anchoring on the box is the difference between "cloudflared published
+/// this" and "cloudflared wrote this URL down". Its failure to *request* a
+/// quick tunnel renders as `Post "https://api.trycloudflare.com/tunnel":
+/// …`, which is a sentence, not a box.
+fn bordered_url(line: &str) -> Option<String> {
+    let open = line.find('|')?;
+    let close = line.rfind('|')?;
+    if close <= open {
+        return None;
+    }
+    let inner = line[open + 1..close].trim();
+    if inner.is_empty() || inner.contains(char::is_whitespace) {
+        return None;
+    }
+    quick_tunnel_url(inner)
+}
+
+/// A quick-tunnel URL, host only, or nothing.
 ///
 /// Everything past the host is dropped, so a future cloudflared that prints
-/// a path or a query string still yields a URL that can be opened.
-fn extract_trycloudflare_url(line: &str) -> Option<String> {
-    let start = line.find("https://")?;
-    let rest = &line[start..];
-    let host_end = rest.find(URL_HOST)? + URL_HOST.len();
-    Some(rest[..host_end].to_string())
+/// a path or a query string still yields a URL that can be opened — and a
+/// token in a query string never travels with the URL pando hands out.
+fn quick_tunnel_url(candidate: &str) -> Option<String> {
+    let rest = candidate.strip_prefix(URL_SCHEME)?;
+    let host = match rest.find(['/', '?', '#']) {
+        Some(end) => &rest[..end],
+        None => rest,
+    };
+    if host.len() <= URL_HOST.len() || !host.ends_with(URL_HOST) {
+        return None;
+    }
+    // The host cloudflared *asks* for a tunnel. It is in the error an
+    // offline or rate-limited run logs, and it is never what was published.
+    if host.eq_ignore_ascii_case(API_HOST) {
+        return None;
+    }
+    Some(format!("{URL_SCHEME}{host}"))
 }
 
 fn tail_log(path: &Path) -> String {
@@ -406,21 +480,60 @@ mod tests {
     #[test]
     fn a_url_is_extracted_from_the_line_cloudflared_really_prints() {
         assert_eq!(
-            extract_trycloudflare_url(
+            published_url(
                 "2026-09-21T12:00:00Z INF |  https://threaded-fathers-explore-supplier.trycloudflare.com  |"
             ),
             Some("https://threaded-fathers-explore-supplier.trycloudflare.com".into())
         );
+    }
+
+    // The whole of finding 2. `api.trycloudflare.com` is the host
+    // cloudflared *asks* for a quick tunnel, and a run that is offline or
+    // rate limited logs it inside a Go `*url.Error`. Handing it back turns
+    // a failed share into a successful one pointing at Cloudflare's API.
+    #[test]
+    fn the_quick_tunnel_api_host_is_never_a_published_url() {
         assert_eq!(
-            extract_trycloudflare_url("Visit https://abc-123-xyz.trycloudflare.com to try it"),
-            Some("https://abc-123-xyz.trycloudflare.com".into())
+            published_url(
+                "2026-09-21T12:00:00Z ERR failed to request quick Tunnel \
+                 error=\"Post \\\"https://api.trycloudflare.com/tunnel\\\": dial tcp: lookup\""
+            ),
+            None
+        );
+        assert_eq!(
+            published_url(
+                "{\"level\":\"error\",\"error\":\"Post \\\"https://api.trycloudflare.com/tunnel\\\": \
+                 dial tcp\",\"message\":\"failed to request quick Tunnel\"}"
+            ),
+            None,
+            "and not in the structured form either"
+        );
+        assert_eq!(
+            published_url("INF |  https://api.trycloudflare.com  |"),
+            None,
+            "not even bordered like the real banner"
+        );
+    }
+
+    // The banner is an ASCII box cloudflared builds itself, so the URL is
+    // always between two pipes. A URL anywhere else on a line is prose, an
+    // error, or a request cloudflared is making — never what it published.
+    #[test]
+    fn a_url_outside_the_bordered_banner_is_not_a_published_url() {
+        assert_eq!(
+            published_url("Visit https://abc-123-xyz.trycloudflare.com to try it"),
+            None
+        );
+        assert_eq!(
+            published_url("INF connecting to https://abc.trycloudflare.com now"),
+            None
         );
     }
 
     #[test]
     fn a_url_is_cut_at_the_host_so_nothing_after_it_is_carried() {
         assert_eq!(
-            extract_trycloudflare_url("INF | https://named.trycloudflare.com/foo?token=secret |"),
+            published_url("INF | https://named.trycloudflare.com/foo?token=secret |"),
             Some("https://named.trycloudflare.com".into()),
             "a path or query must never travel with the URL pando hands out"
         );
@@ -428,12 +541,58 @@ mod tests {
 
     #[test]
     fn lines_without_a_quick_tunnel_url_yield_nothing() {
-        assert_eq!(extract_trycloudflare_url("INF Starting tunnel..."), None);
+        assert_eq!(published_url("INF Starting tunnel..."), None);
+        assert_eq!(published_url("INF | https://example.com |"), None);
+        assert_eq!(published_url(""), None);
+    }
+
+    // `--output json` wraps every log line in an object; 2025.11.1 puts the
+    // banner in `message`, and a later one may name the URL outright.
+    #[test]
+    fn a_url_is_read_out_of_a_json_log_line() {
         assert_eq!(
-            extract_trycloudflare_url("INF | https://example.com |"),
+            published_url(
+                "{\"level\":\"info\",\"time\":\"2026-09-21T12:00:00Z\",\
+                 \"message\":\"|  https://json-shaped.trycloudflare.com  |\"}"
+            ),
+            Some("https://json-shaped.trycloudflare.com".into())
+        );
+        assert_eq!(
+            published_url("{\"level\":\"info\",\"url\":\"https://a-field.trycloudflare.com\"}"),
+            Some("https://a-field.trycloudflare.com".into()),
+            "a future cloudflared that names the URL is read straight"
+        );
+        assert_eq!(
+            published_url("{\"level\":\"info\",\"message\":\"Requesting new quick Tunnel\"}"),
             None
         );
-        assert_eq!(extract_trycloudflare_url(""), None);
+    }
+
+    #[test]
+    fn a_provider_that_logs_json_publishes_its_url_just_the_same() {
+        let fx = fixture();
+        crate::testutil::fake_cloudflared_json_publishing(&fx.paths.home);
+
+        let spawn = start_tunnel(&fx.paths, "feat+one", 17000).unwrap();
+        let _ = process::stop(spawn.pgid, STOP_GRACE);
+        assert_eq!(spawn.public_url, FAKE_TUNNEL_URL);
+    }
+
+    #[test]
+    fn a_provider_whose_request_for_a_tunnel_fails_is_not_a_published_url() {
+        let fx = fixture();
+        crate::testutil::fake_cloudflared_api_error(&fx.paths.home);
+
+        let err = start_tunnel(&fx.paths, "feat+one", 17000).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("exited before publishing") || message.contains("no URL"),
+            "a failed request must fail the share: {message}"
+        );
+        assert!(
+            message.contains("failed to request quick Tunnel"),
+            "with the provider's own complaint in it: {message}"
+        );
     }
 
     #[test]
@@ -620,7 +779,10 @@ mod tests {
             "the user's own ~/.cloudflared/config.yml must be shadowed: {log}"
         );
         assert!(log.contains("--no-autoupdate"), "{log}");
-        assert!(log.contains("--output default"), "{log}");
+        assert!(
+            log.contains("--output json"),
+            "the machine-readable log is what the URL is parsed from: {log}"
+        );
     }
 
     #[test]

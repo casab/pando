@@ -6154,6 +6154,65 @@ time.sleep(300)
         assert!(fx.state().worktrees[&name].share.is_none());
     }
 
+    // Finding 2 end to end: a cloudflared that cannot even *reach*
+    // Cloudflare logs the quick-tunnel API's own URL, and used to be
+    // reported as a successful share at `https://api.trycloudflare.com`,
+    // with a proxy left running behind a tunnel that was already dead.
+    #[test]
+    fn a_provider_that_cannot_reach_cloudflare_fails_the_share_and_leaves_no_proxy() {
+        let Some((fx, name, _guards, _)) = shared_fixture() else {
+            return;
+        };
+        crate::testutil::fake_cloudflared_api_error(&fx.paths.home);
+        let mut config = fx.config.clone();
+        config.share.auth_cmd = Some("printf 'session=abc'".to_string());
+
+        let spawned: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+        let watched = |paths: &PandoPaths,
+                       name: &str,
+                       listen: u16,
+                       upstream: u16,
+                       cookie: &str|
+         -> Result<share_proxy::ProxySpawn> {
+            let spawn = stub_proxy(paths, name, listen, upstream, cookie)?;
+            spawned.lock().unwrap().push(spawn.pid);
+            Ok(spawn)
+        };
+        let provider = tunnel::provider_for(None).unwrap();
+
+        let err = share_with(
+            &fx.paths,
+            &config,
+            &name,
+            provider.as_ref(),
+            &watched,
+            &noop,
+        )
+        .unwrap_err();
+
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("before publishing a URL"),
+            "a request that failed is not a published URL: {message}"
+        );
+        assert!(
+            message.contains("failed to request quick Tunnel"),
+            "and the provider's own complaint is the diagnosis: {message}"
+        );
+        assert!(
+            fx.state().worktrees[&name].share.is_none(),
+            "nothing may be recorded for a share that never published"
+        );
+        let pids = spawned.into_inner().unwrap();
+        assert_eq!(pids.len(), 1, "a proxy was started before the tunnel");
+        assert!(
+            wait_until(Duration::from_secs(5), || !crate::process::is_alive(
+                pids[0]
+            )),
+            "a proxy was left behind a tunnel that never opened"
+        );
+    }
+
     // The Phase 3 critical, at this level: sharing must never move a port
     // the running application is being reached on.
     #[test]

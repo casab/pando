@@ -172,6 +172,37 @@ pub fn fake_cloudflared_publishing(home: &Path) {
     );
 }
 
+/// A fake that publishes the same URL the way `--output json` logs it: one
+/// JSON object per line, with the bordered banner inside `message`, which
+/// is where cloudflared 2025.11.1 really puts it.
+pub fn fake_cloudflared_json_publishing(home: &Path) {
+    fake_cloudflared(
+        home,
+        &format!(
+            "echo '{{\"level\":\"info\",\"message\":\"Requesting new quick Tunnel on \
+             trycloudflare.com...\"}}'\n\
+             echo '{{\"level\":\"info\",\"message\":\"+---------------------+\"}}'\n\
+             echo '{{\"level\":\"info\",\"message\":\"|  {FAKE_TUNNEL_URL}  |\"}}'\n\
+             echo '{{\"level\":\"info\",\"message\":\"+---------------------+\"}}'\n\
+             exec sleep 300\n"
+        ),
+    );
+}
+
+/// A fake that fails the way an offline or rate-limited cloudflared does:
+/// a Go `*url.Error` naming the quick-tunnel API host, and then a shutdown
+/// that is not instantaneous, because a real binary's is not either.
+pub fn fake_cloudflared_api_error(home: &Path) {
+    fake_cloudflared(
+        home,
+        "echo 'INF Requesting new quick Tunnel on trycloudflare.com...'\n\
+         echo 'ERR failed to request quick Tunnel: Post \
+         \"https://api.trycloudflare.com/tunnel\": dial tcp: lookup api.trycloudflare.com: \
+         no such host' >&2\n\
+         sleep 0.4\nexit 1\n",
+    );
+}
+
 /// A fake that starts, says so, and never publishes anything.
 pub fn fake_cloudflared_silent(home: &Path) {
     fake_cloudflared(
