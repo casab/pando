@@ -6213,6 +6213,49 @@ time.sleep(300)
         );
     }
 
+    // Finding 4 through the wiring rather than the primitive: an auth
+    // command that backgrounds a helper — an ordinary thing for a session
+    // minting script to do — left its stdout open after the shell exited,
+    // and `share` waited for that helper rather than for its own timeout.
+    // `sleep 45 &` cost 47s; `sleep 3600 &` cost an hour, in the TUI as a
+    // pending slot nothing could clear.
+    #[test]
+    fn an_auth_command_that_backgrounds_a_helper_is_bounded_by_its_own_timeout() {
+        let Some((fx, name, _guards, _)) = shared_fixture() else {
+            return;
+        };
+        let pidfile = fx.paths.home.join("auth-child.pid");
+        let mut config = fx.config.clone();
+        config.share.auth_cmd = Some(format!(
+            "printf 'session=abc'; sleep 45 & echo $! > {}",
+            pidfile.display()
+        ));
+
+        let started = std::time::Instant::now();
+        let outcome = share_stubbed(&fx, &config, &name).unwrap();
+        let elapsed = started.elapsed();
+        let _share = share_guard(&fx, &name);
+
+        assert!(
+            elapsed < AUTH_CMD_TIMEOUT + Duration::from_secs(10),
+            "the share waited for a helper the script backgrounded: {elapsed:?}"
+        );
+        assert!(
+            outcome.pre_authed,
+            "the cookie it printed is still the cookie"
+        );
+
+        let child: u32 = std::fs::read_to_string(&pidfile)
+            .expect("the script wrote its child's pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        assert!(
+            wait_until(Duration::from_secs(5), || !crate::process::is_alive(child)),
+            "the helper outlived the auth command that started it"
+        );
+    }
+
     // The Phase 3 critical, at this level: sharing must never move a port
     // the running application is being reached on.
     #[test]

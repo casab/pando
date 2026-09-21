@@ -7,6 +7,7 @@ use std::fs::OpenOptions;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub struct SpawnOptions<'a> {
@@ -143,7 +144,12 @@ impl Captured {
 ///   in the TUI that is a slot nothing can clear.
 ///
 /// The pipes are drained on their own threads, so a command that prints
-/// more than a pipe buffer holds does not deadlock against the wait.
+/// more than a pipe buffer holds does not deadlock against the wait — and
+/// the deadline covers the drain as well as the wait, because anything the
+/// shell backgrounded inherited its stdout and can hold the pipe open long
+/// after the shell itself has exited. When that happens the group is
+/// killed, which closes the pipes, and whatever was read by then is what
+/// the caller gets.
 pub fn run_captured(
     shell_cmd: &str,
     cwd: &Path,
@@ -174,10 +180,21 @@ pub fn run_captured(
     // After `setsid` the child leads a group whose id is its pid.
     let pgid = child.id() as i32;
 
-    let mut out_pipe = child.stdout.take();
-    let mut err_pipe = child.stderr.take();
-    let out_reader = std::thread::spawn(move || drain(out_pipe.as_mut()));
-    let err_reader = std::thread::spawn(move || drain(err_pipe.as_mut()));
+    // Shared rather than returned by the threads: when the deadline passes
+    // with a pipe still open, what was read so far is still the answer, and
+    // a `join` would be the very wait this is here to bound.
+    let out_buf = Arc::new(Mutex::new(Vec::new()));
+    let err_buf = Arc::new(Mutex::new(Vec::new()));
+    let out_pipe = child.stdout.take();
+    let err_pipe = child.stderr.take();
+    let out_reader = {
+        let into = Arc::clone(&out_buf);
+        std::thread::spawn(move || drain_into(out_pipe, &into))
+    };
+    let err_reader = {
+        let into = Arc::clone(&err_buf);
+        std::thread::spawn(move || drain_into(err_pipe, &into))
+    };
 
     let deadline = Instant::now() + timeout;
     let code = loop {
@@ -188,7 +205,10 @@ pub fn run_captured(
                 // something that is the actual reason this is still here.
                 let _ = stop(pgid, Duration::from_secs(1));
                 let _ = child.wait();
-                let stderr = err_reader.join().unwrap_or_default();
+                // The group is gone, so the pipes are closing; give the
+                // readers that long and no longer.
+                wait_until(&out_reader, &err_reader, Instant::now() + DRAIN_SETTLE);
+                let stderr = text_of(&err_buf);
                 bail!(
                     "{shell_cmd:?} was still running after {}s{}",
                     timeout.as_secs(),
@@ -201,20 +221,65 @@ pub fn run_captured(
             None => std::thread::sleep(Duration::from_millis(20)),
         }
     };
+    // The shell has exited, which is not the same as its pipes being
+    // closed: anything it backgrounded inherited them. It gets the rest of
+    // the budget, then the group goes the way a timed-out one does.
+    if !wait_until(&out_reader, &err_reader, deadline) {
+        let _ = stop(pgid, Duration::from_secs(1));
+        wait_until(&out_reader, &err_reader, Instant::now() + DRAIN_SETTLE);
+    }
     Ok(Captured {
         code,
-        stdout: out_reader.join().unwrap_or_default(),
-        stderr: err_reader.join().unwrap_or_default(),
+        stdout: text_of(&out_buf),
+        stderr: text_of(&err_buf),
     })
 }
 
-fn drain(pipe: Option<&mut impl std::io::Read>) -> String {
-    let Some(pipe) = pipe else {
-        return String::new();
+/// How long the readers are given once the group they were reading from
+/// has been killed. Closing a pipe is not instantaneous, and the bytes
+/// already in it are the diagnosis.
+const DRAIN_SETTLE: Duration = Duration::from_millis(500);
+
+/// Whether both readers finished before `deadline`.
+fn wait_until(
+    out: &std::thread::JoinHandle<()>,
+    err: &std::thread::JoinHandle<()>,
+    deadline: Instant,
+) -> bool {
+    loop {
+        if out.is_finished() && err.is_finished() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Reads a pipe to its end, publishing as it goes so a caller that gives up
+/// waiting still has everything that arrived.
+fn drain_into(pipe: Option<impl std::io::Read>, into: &Mutex<Vec<u8>>) {
+    let Some(mut pipe) = pipe else {
+        return;
     };
-    let mut buf = Vec::new();
-    let _ = pipe.read_to_end(&mut buf);
-    String::from_utf8_lossy(&buf).into_owned()
+    let mut chunk = [0u8; 4096];
+    loop {
+        match pipe.read(&mut chunk) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => held(into).extend_from_slice(&chunk[..n]),
+        }
+    }
+}
+
+fn text_of(buf: &Mutex<Vec<u8>>) -> String {
+    String::from_utf8_lossy(&held(buf)).into_owned()
+}
+
+/// The buffer, whether or not a thread panicked while holding it. A partial
+/// read is still worth more than a panic in the caller.
+fn held(buf: &Mutex<Vec<u8>>) -> std::sync::MutexGuard<'_, Vec<u8>> {
+    buf.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Single-quotes one word of a `bash -lc` command line, with any single
@@ -411,6 +476,55 @@ mod tests {
         assert!(
             !is_alive(child),
             "the grandchild outlived the command that started it"
+        );
+    }
+
+    // Finding 4. The deadline wrapped the wait and not the drain, so a
+    // script that backgrounded anything — an ordinary thing for a session
+    // minting script to do — held its stdout open after the shell exited
+    // and blocked the caller for as long as that child lived: 45 s here,
+    // an hour for `sleep 3600 &`, whatever the timeout said.
+    #[test]
+    fn a_captured_command_is_bounded_when_a_background_child_holds_its_pipe() {
+        let dir = tempdir().unwrap();
+        let pidfile = dir.path().join("child.pid");
+        let timeout = Duration::from_secs(2);
+        let started = Instant::now();
+        let captured = run_captured(
+            &format!(
+                "printf 'session=abc'; sleep 45 & echo $! > {}",
+                pidfile.display()
+            ),
+            dir.path(),
+            &[],
+            timeout,
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "a backgrounded child held the pipe and the caller waited for it: {elapsed:?}"
+        );
+        assert!(captured.success(), "{captured:?}");
+        assert_eq!(
+            captured.stdout.trim(),
+            "session=abc",
+            "what was read before the deadline is still what the caller asked for"
+        );
+
+        let child: u32 = std::fs::read_to_string(&pidfile)
+            .expect("the script wrote its child's pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while is_alive(child) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            !is_alive(child),
+            "the group that outlasted the deadline was not killed with it"
         );
     }
 
