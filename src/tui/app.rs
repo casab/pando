@@ -290,6 +290,12 @@ pub enum Modal {
         /// Whether pando created it; drives the extra warning line.
         created_by_pando: bool,
     },
+    /// Confirming that a public URL goes away. Somebody may be looking at
+    /// it right now, so it is not a bare keypress.
+    Unshare {
+        name: String,
+        url: String,
+    },
     /// Something pando needs to know before it can start. A worker thread is
     /// waiting on `reply`; closing this modal without answering has to send
     /// something, or that thread waits forever.
@@ -388,6 +394,8 @@ pub enum PendingKind {
     Start,
     Stop,
     Restart,
+    Share,
+    Unshare,
 }
 
 impl PendingKind {
@@ -398,6 +406,8 @@ impl PendingKind {
             PendingKind::Start => "starting",
             PendingKind::Stop => "stopping",
             PendingKind::Restart => "restarting",
+            PendingKind::Share => "sharing",
+            PendingKind::Unshare => "unsharing",
         }
     }
 }
@@ -407,6 +417,10 @@ pub enum PendingOutcome {
     Removed(String),
     Started(String, Option<String>),
     Stopped(String),
+    /// The worktree, its public URL, and whether a proxy is injecting a
+    /// header in front of it.
+    Shared(String, String, bool),
+    Unshared(String),
 }
 
 /// A bounded set of open log tails, evicted by least-recent use.
@@ -750,6 +764,16 @@ impl App {
                 self.handle_create_key(key, input, branches, selected);
                 return;
             }
+            Some(Modal::Unshare { name, url }) => {
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Enter => self.unshare_selected(name),
+                    // Anything else leaves it up, and the modal with it
+                    // closed — the same shape the remove confirmation has.
+                    KeyCode::Esc | KeyCode::Char('n') => {}
+                    _ => self.modal = Some(Modal::Unshare { name, url }),
+                }
+                return;
+            }
             Some(Modal::Question {
                 question,
                 selected,
@@ -792,6 +816,10 @@ impl App {
             KeyCode::Char('x') => self.stop_selected(),
             KeyCode::Char('r') => self.restart_selected(),
             KeyCode::Char('o') => self.open_selected_url(),
+            // Shift-O, because the public one is the URL you give away and
+            // `o` is the one you open fifty times a day.
+            KeyCode::Char('O') => self.open_selected_public_url(),
+            KeyCode::Char('t') => self.toggle_share(),
             KeyCode::Char('l') | KeyCode::Char('L') => self.open_log_viewer(),
             // PgUp is older, PgDn is newer — j/k stay on the list.
             KeyCode::PageUp => self.scroll_tail(-(self.tail_rows.max(1) as isize)),
@@ -1066,6 +1094,68 @@ impl App {
         });
     }
 
+    /// The public URL of a worktree, when it has one.
+    pub fn public_url_of(&self, name: &str) -> Option<String> {
+        Some(self.record_for(name)?.share.as_ref()?.public_url.clone())
+    }
+
+    fn open_selected_public_url(&mut self) {
+        let Some(name) = self.selected_name() else {
+            return;
+        };
+        let Some(url) = self.public_url_of(&name) else {
+            self.set_error(format!("{name} is not shared — t shares it"));
+            return;
+        };
+        self.open_url(&url);
+        self.set_status(format!("opened {url}"));
+    }
+
+    /// One key for both directions. Sharing is a plain action; unsharing
+    /// asks first, because somebody may be looking at that URL right now.
+    fn toggle_share(&mut self) {
+        let Some(name) = self.selected_name() else {
+            return;
+        };
+        match self.public_url_of(&name) {
+            Some(url) => self.modal = Some(Modal::Unshare { name, url }),
+            None => self.share_selected(name),
+        }
+    }
+
+    fn share_selected(&mut self, name: String) {
+        let paths = self.paths.clone();
+        let config = self.config.clone();
+        let worker_name = name.clone();
+        let (ptx, prx) = mpsc::channel::<String>();
+        // A tunnel takes up to thirty seconds to publish, and an auth
+        // command as long as it takes: all of it on the worker, with the
+        // sub-steps coming back as progress.
+        let started = self.spawn_pending(name, PendingKind::Share, move || {
+            let progress = |msg: &str| {
+                let _ = ptx.send(msg.to_string());
+            };
+            actions::share(&paths, &config, &worker_name, &progress)
+                .map(|outcome| {
+                    PendingOutcome::Shared(outcome.name, outcome.public_url, outcome.pre_authed)
+                })
+                .map_err(|e| format!("{e:#}"))
+        });
+        if started && let Some(p) = self.pending.as_mut() {
+            p.progress_rx = Some(prx);
+        }
+    }
+
+    fn unshare_selected(&mut self, name: String) {
+        let paths = self.paths.clone();
+        let worker_name = name.clone();
+        self.spawn_pending(name, PendingKind::Unshare, move || {
+            actions::unshare(&paths, &worker_name)
+                .map(|()| PendingOutcome::Unshared(worker_name))
+                .map_err(|e| format!("{e:#}"))
+        });
+    }
+
     fn restart_selected(&mut self) {
         let Some(name) = self.selected_name() else {
             return;
@@ -1171,6 +1261,11 @@ impl App {
         let mut known: Vec<String> = self.config.processes.keys().cloned().collect();
         known.push(actions::INSTALL_HOOK.to_string());
         known.extend(self.config.hooks.iter().map(|hook| hook.name.clone()));
+        // Last, and in this order: a share is the newest thing here, and
+        // when it is misbehaving the tunnel's own log is the first place to
+        // look. Without naming them they would sort in among the rest.
+        known.push(crate::tunnel::TUNNEL_LOG.to_string());
+        known.push(crate::share_proxy::PROXY_LOG.to_string());
         known
     }
 
@@ -2247,6 +2342,15 @@ impl App {
                         self.set_status(format!("stopped {name}"));
                         self.spawn_refresh();
                     }
+                    PendingOutcome::Shared(name, url, pre_authed) => {
+                        let how = if pre_authed { " (pre-authed)" } else { "" };
+                        self.set_status(format!("{name} is at {url}{how} — O opens it"));
+                        self.spawn_refresh();
+                    }
+                    PendingOutcome::Unshared(name) => {
+                        self.set_status(format!("{name} is no longer public"));
+                        self.spawn_refresh();
+                    }
                 }
             }
             Ok(Err(e)) => {
@@ -2735,6 +2839,27 @@ pub mod tests {
                 phase,
             },
         );
+    }
+
+    /// Gives a worktree a live share, as a `share` would have.
+    pub fn with_share(app: &mut App, name: &str, proxy_port: Option<u16>) {
+        let record = app
+            .state
+            .worktrees
+            .get_mut(name)
+            .expect("the worktree has a record");
+        record.share_port = proxy_port;
+        record.share = Some(crate::state::ShareRecord {
+            tunnel_pid: 5151,
+            tunnel_pgid: 5151,
+            public_url: "https://fake-host.trycloudflare.com".to_string(),
+            local_port: 17_342,
+            started_at: Utc::now(),
+            log_path: PathBuf::from("/does/not/exist/tunnel.log"),
+            proxy_pid: proxy_port.map(|_| 5252),
+            proxy_pgid: proxy_port.map(|_| 5252),
+            proxy_port,
+        });
     }
 
     pub fn running_phase() -> Phase {
@@ -3428,6 +3553,120 @@ pub mod tests {
         with_process(&mut app, "feat+one", running_phase());
         press(&mut app, KeyCode::Char('o'));
         assert_eq!(app.opened.as_deref(), Some("http://localhost:17342"));
+    }
+
+    // ---- share -----------------------------------------------------------
+
+    #[test]
+    fn t_on_a_worktree_that_is_not_shared_starts_a_share() {
+        let mut app = test_app(&["feat+one"]);
+        with_process(&mut app, "feat+one", running_phase());
+
+        press(&mut app, KeyCode::Char('t'));
+
+        let pending = app.pending.as_ref().expect("a share is in flight");
+        assert_eq!(pending.kind, PendingKind::Share);
+        assert_eq!(pending.name, "feat+one");
+        assert!(app.modal.is_none(), "sharing asks nothing");
+    }
+
+    #[test]
+    fn t_on_a_shared_worktree_asks_before_taking_the_url_away() {
+        let mut app = test_app(&["feat+one"]);
+        with_process(&mut app, "feat+one", running_phase());
+        with_share(&mut app, "feat+one", None);
+
+        press(&mut app, KeyCode::Char('t'));
+        match &app.modal {
+            Some(Modal::Unshare { name, url }) => {
+                assert_eq!(name, "feat+one");
+                assert_eq!(url, "https://fake-host.trycloudflare.com");
+            }
+            other => panic!("expected the unshare confirmation, got {other:?}"),
+        }
+        assert!(
+            app.pending.is_none(),
+            "nothing happens until it is confirmed"
+        );
+    }
+
+    #[test]
+    fn the_unshare_confirmation_takes_the_url_down_on_y_and_keeps_it_otherwise() {
+        let mut app = test_app(&["feat+one"]);
+        with_process(&mut app, "feat+one", running_phase());
+        with_share(&mut app, "feat+one", None);
+
+        press(&mut app, KeyCode::Char('t'));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.modal.is_none());
+        assert!(app.pending.is_none(), "escape keeps the URL up");
+
+        press(&mut app, KeyCode::Char('t'));
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.pending.is_none(), "so does n");
+
+        press(&mut app, KeyCode::Char('t'));
+        press(&mut app, KeyCode::Char('y'));
+        let pending = app.pending.as_ref().expect("an unshare is in flight");
+        assert_eq!(pending.kind, PendingKind::Unshare);
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn shift_o_opens_the_public_url_and_says_so_when_there_is_none() {
+        let mut app = test_app(&["feat+one"]);
+        with_process(&mut app, "feat+one", running_phase());
+
+        press(&mut app, KeyCode::Char('O'));
+        assert_eq!(app.opened, None);
+        let (message, is_error) = app.active_status().unwrap();
+        assert!(message.contains("not shared"), "{message}");
+        assert!(is_error);
+
+        with_share(&mut app, "feat+one", None);
+        press(&mut app, KeyCode::Char('O'));
+        assert_eq!(
+            app.opened.as_deref(),
+            Some("https://fake-host.trycloudflare.com")
+        );
+    }
+
+    // `o` is the local one and `O` is the public one: two keys, two URLs,
+    // and neither may quietly become the other.
+    #[test]
+    fn the_two_open_keys_hand_out_different_urls() {
+        let mut app = test_app(&["feat+one"]);
+        with_process(&mut app, "feat+one", running_phase());
+        with_share(&mut app, "feat+one", None);
+
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.opened.as_deref(), Some("http://localhost:17342"));
+        press(&mut app, KeyCode::Char('O'));
+        assert_eq!(
+            app.opened.as_deref(),
+            Some("https://fake-host.trycloudflare.com")
+        );
+    }
+
+    #[test]
+    fn the_tunnel_and_proxy_logs_come_last_in_tab_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&["feat+one"]);
+        app.paths = PandoPaths::new(dir.path(), app.paths.project.clone());
+        app.config
+            .processes
+            .insert("dev".to_string(), crate::config::ProcessConfig::default());
+        let logs = app.paths.logs_dir("feat+one");
+        std::fs::create_dir_all(&logs).unwrap();
+        for source in ["proxy", "tunnel", "dev", "install"] {
+            std::fs::write(logs.join(format!("{source}.log")), "x\n").unwrap();
+        }
+
+        assert_eq!(
+            app.log_sources("feat+one"),
+            vec!["dev", "install", "tunnel", "proxy"],
+            "a share's own logs sort last, and the tunnel before the proxy"
+        );
     }
 
     // Phase 2b review, finding 6. `url_of` was a third implementation of

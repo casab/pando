@@ -29,6 +29,9 @@ const ROW_DOT_WIDTH: usize = 2;
 const ROW_RUN_WIDTH: usize = 2;
 /// `" ▸ "` — the list's own highlight column.
 const ROW_CHROME_WIDTH: usize = 3;
+/// `"◈ "` — the public-URL marker. Reserved list-wide, and only when some
+/// row has one: a column of blanks costs every other column a cell.
+const ROW_SHARE_WIDTH: usize = 2;
 /// Below this a name stops being an identifier, so a column is dropped to
 /// buy it back.
 const ROW_NAME_MIN: usize = 12;
@@ -276,6 +279,21 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
                 vec![Span::styled(
                     truncate(&url, width.saturating_sub(9)),
                     Style::new().fg(cyan()).add_modifier(Modifier::UNDERLINED),
+                )],
+            ),
+        ));
+    }
+    // Right under the local URL, and kept at the same priority: when a
+    // worktree is shared, the public URL is the line somebody is here to
+    // read.
+    if let Some(public) = app.public_url_of(&name) {
+        rows.push((
+            KEEP_URL,
+            detail_row(
+                "public",
+                vec![Span::styled(
+                    truncate(&public, width.saturating_sub(9)),
+                    Style::new().fg(green()).add_modifier(Modifier::UNDERLINED),
                 )],
             ),
         ));
@@ -1599,6 +1617,7 @@ fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
     let mut branch_width = 0usize;
     let mut signal_width = 0usize;
     let mut pr_width = 0usize;
+    let mut any_shared = false;
     for &idx in &app.filtered_indices {
         let wt = &app.worktrees[idx];
         branch_width = branch_width.max(branch_text(wt).chars().count().min(ROW_BRANCH_MAX));
@@ -1606,13 +1625,18 @@ fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
         if let Some(pr) = app.pr_for(wt) {
             pr_width = pr_width.max(pr_chip(pr).chars().count());
         }
+        any_shared |= app.public_url_of(&wt.name).is_some();
     }
+    // One cell, list-wide, and only when something is shared: a marker
+    // every row pays for when no row has one is a column of blanks.
+    let share_width = if any_shared { ROW_SHARE_WIDTH } else { 0 };
     let width = list_area.width as usize;
     let cols = list_columns(width, branch_width, signal_width, pr_width);
     let name_width = width.saturating_sub(
         ROW_DOT_WIDTH
             + ROW_RUN_WIDTH
             + ROW_CHROME_WIDTH
+            + share_width
             + column(cols.branch, branch_width)
             + column(cols.signals, signal_width)
             + column(cols.pr, pr_width),
@@ -1631,11 +1655,18 @@ fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
                     Style::new().fg(if ours { green() } else { text_muted() }),
                 ),
                 Span::styled(run_glyph, Style::new().fg(run_color)),
-                Span::styled(
-                    pad(&truncate(&wt.name, name_width), name_width),
-                    Style::new().fg(text()),
-                ),
             ];
+            if share_width > 0 {
+                let shared = app.public_url_of(&wt.name).is_some();
+                spans.push(Span::styled(
+                    if shared { "◈ " } else { "  " },
+                    Style::new().fg(green()),
+                ));
+            }
+            spans.push(Span::styled(
+                pad(&truncate(&wt.name, name_width), name_width),
+                Style::new().fg(text()),
+            ));
             if cols.branch && branch_width > 0 {
                 spans.push(Span::styled(
                     format!(
@@ -2066,6 +2097,9 @@ mod tests {
                 ],
             )]),
         };
+        // And a public URL, which adds a marker to every list row and a
+        // line to a detail pane that may have room for neither.
+        crate::tui::app::tests::with_share(&mut app, "feat+one", Some(17_009));
 
         for width in 1..=120u16 {
             for height in [1u16, 2, 3, 5, 12, 40] {
@@ -2099,6 +2133,10 @@ mod tests {
                 name: "feat+one".into(),
                 blocker: Some(RemoveBlocker::Locked(Some("benchmarking".into()))),
                 created_by_pando: false,
+            },
+            Modal::Unshare {
+                name: "feat+one".into(),
+                url: "https://a-rather-long-quick-tunnel-hostname.trycloudflare.com".into(),
             },
             Modal::Question {
                 question: crate::actions::Question {
@@ -2411,6 +2449,50 @@ mod tests {
         // A run marker sits between the ownership dot and the name now.
         assert!(rendered.contains("●   mine"), "{rendered}");
         assert!(rendered.contains("○   theirs"), "{rendered}");
+    }
+
+    #[test]
+    fn a_shared_worktree_is_marked_in_the_list_and_only_then() {
+        let mut app = test_app(&["feat+one", "feat+two"]);
+        let plain = text_of(&draw(&mut app, 100, 10));
+        assert!(
+            !plain.contains('◈'),
+            "no row is shared, so no row pays for the column:\n{plain}"
+        );
+
+        crate::tui::app::tests::with_process(
+            &mut app,
+            "feat+one",
+            crate::tui::app::tests::running_phase(),
+        );
+        crate::tui::app::tests::with_share(&mut app, "feat+one", None);
+        let shared = text_of(&draw(&mut app, 100, 10));
+        assert!(shared.contains("◈ feat+one"), "{shared}");
+        assert!(
+            shared.contains("  feat+two"),
+            "the column is reserved list-wide, so unshared rows keep the edge:\n{shared}"
+        );
+    }
+
+    #[test]
+    fn the_detail_pane_shows_the_public_url_under_the_local_one() {
+        let mut app = test_app(&["feat+one"]);
+        crate::tui::app::tests::with_process(
+            &mut app,
+            "feat+one",
+            crate::tui::app::tests::running_phase(),
+        );
+        crate::tui::app::tests::with_share(&mut app, "feat+one", Some(17_009));
+
+        let rendered = text_of(&draw(&mut app, 120, 24));
+        assert!(rendered.contains("public"), "{rendered}");
+        assert!(
+            rendered.contains("https://fake-host.trycloudflare.com"),
+            "{rendered}"
+        );
+        let local = rendered.find("http://localhost").expect("a local url");
+        let public = rendered.find("https://fake-host").expect("a public url");
+        assert!(local < public, "the public URL goes under the local one");
     }
 
     #[test]

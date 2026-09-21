@@ -29,6 +29,7 @@ pub fn render_modal(f: &mut Frame, area: Rect, modal: &Modal, app: &App) {
             blocker,
             created_by_pando,
         } => render_remove(f, area, name, blocker.as_ref(), *created_by_pando),
+        Modal::Unshare { name, url } => render_unshare(f, area, name, url),
         Modal::Question {
             question,
             selected,
@@ -309,6 +310,40 @@ fn render_create(
     f.render_widget(List::new(items), list_area);
 }
 
+/// Confirming that a public URL goes away.
+///
+/// The URL is shown in full, because the thing being taken away is exactly
+/// the thing somebody may have open in another window.
+fn render_unshare(f: &mut Frame, area: Rect, name: &str, url: &str) {
+    let Some(inner) = popup(f, area, "stop sharing", 8, 60) else {
+        return;
+    };
+    let width = inner.width as usize;
+    let lines = vec![
+        Line::styled(
+            truncate(&format!("stop sharing {name}?"), width),
+            Style::new().fg(text()).add_modifier(Modifier::BOLD),
+        ),
+        Line::styled(truncate(url, width), Style::new().fg(text_muted())),
+        Line::raw(""),
+        Line::styled(
+            truncate("anyone with that link loses it at once", width),
+            Style::new().fg(yellow()),
+        ),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("y", Style::new().fg(orange()).add_modifier(Modifier::BOLD)),
+            Span::styled(" stop sharing   ", Style::new().fg(text_muted())),
+            Span::styled(
+                "esc",
+                Style::new().fg(orange()).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" keep it", Style::new().fg(text_muted())),
+        ]),
+    ];
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 fn render_remove(
     f: &mut Frame,
     area: Rect,
@@ -371,7 +406,7 @@ fn render_remove(
 
 /// Every key the list view answers to. Scrollable, because a tmux split is
 /// often shorter than the keymap.
-const HELP: [(&str, &str); 19] = [
+const HELP: [(&str, &str); 21] = [
     ("j / ↓", "move down"),
     ("k / ↑", "move up"),
     ("g / G", "first / last"),
@@ -381,6 +416,8 @@ const HELP: [(&str, &str); 19] = [
     ("x", "stop it"),
     ("r", "restart it"),
     ("o", "open its URL"),
+    ("t", "share it publicly, or stop sharing"),
+    ("O", "open its public URL"),
     ("l", "open the log viewer"),
     ("PgUp/PgDn", "scroll the log tail"),
     ("tab", "switch the log to the next process"),
