@@ -309,6 +309,119 @@ mod tests {
     }
 
     #[test]
+    fn a_captured_command_reports_what_it_printed_and_how_it_ended() {
+        let dir = tempdir().unwrap();
+        let captured = run_captured(
+            "echo out; echo err >&2",
+            dir.path(),
+            &[],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(captured.success());
+        assert_eq!(captured.code, Some(0));
+        assert_eq!(captured.stdout.trim(), "out");
+        assert_eq!(captured.stderr.trim(), "err");
+    }
+
+    #[test]
+    fn a_captured_command_that_fails_keeps_its_code_and_last_complaint() {
+        let dir = tempdir().unwrap();
+        let captured = run_captured(
+            "echo noise >&2; echo 'the real reason' >&2; exit 7",
+            dir.path(),
+            &[],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(!captured.success());
+        assert_eq!(captured.code, Some(7));
+        assert_eq!(captured.last_stderr_line(), Some("the real reason"));
+    }
+
+    #[test]
+    fn a_captured_command_runs_where_it_was_told_with_the_environment_it_was_given() {
+        let dir = tempdir().unwrap();
+        let captured = run_captured(
+            "pwd; printf 'SECRET=%s\\n' \"$SECRET\"",
+            dir.path(),
+            &[("SECRET".to_string(), "abc".to_string())],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        assert!(
+            captured.stdout.contains(&canonical.display().to_string()),
+            "{}",
+            captured.stdout
+        );
+        assert!(
+            captured.stdout.contains("SECRET=abc"),
+            "{}",
+            captured.stdout
+        );
+    }
+
+    // More than a pipe buffer holds. A wait that does not drain the pipes
+    // deadlocks here rather than returning.
+    #[test]
+    fn a_captured_command_that_prints_a_lot_does_not_deadlock() {
+        let dir = tempdir().unwrap();
+        let captured = run_captured(
+            "for i in $(seq 1 5000); do echo 'a line of output that is not especially short'; done",
+            dir.path(),
+            &[],
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        assert!(captured.success());
+        assert_eq!(captured.stdout.lines().count(), 5000);
+    }
+
+    // The whole reason this is not `Command::output()`: a script that hangs
+    // must not hang the share that asked it a question — and killing the
+    // shell alone would leave whatever it started behind.
+    #[test]
+    fn a_captured_command_that_hangs_is_killed_with_everything_it_started() {
+        let dir = tempdir().unwrap();
+        let pidfile = dir.path().join("child.pid");
+        // Generous, because `bash -lc` sources a login profile first: a
+        // command killed before it ran anything at all would prove nothing.
+        let err = run_captured(
+            &format!("sleep 300 & echo $! > {}; wait", pidfile.display()),
+            dir.path(),
+            &[],
+            Duration::from_secs(3),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("still running after"),
+            "{err:#}"
+        );
+
+        let child: u32 = std::fs::read_to_string(&pidfile)
+            .expect("the script wrote its child's pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while is_alive(child) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            !is_alive(child),
+            "the grandchild outlived the command that started it"
+        );
+    }
+
+    #[test]
+    fn shell_quote_survives_spaces_and_quotes() {
+        assert_eq!(shell_quote("plain"), "'plain'");
+        assert_eq!(shell_quote("/tmp/x y/pando"), "'/tmp/x y/pando'");
+        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
     fn stop_is_idempotent_when_group_already_gone() {
         stop(999_999, Duration::from_millis(100)).unwrap();
         assert!(!group_alive(999_999));

@@ -615,6 +615,18 @@ fn url_suffix(url: Option<&str>) -> String {
     }
 }
 
+/// What a refresh found and what it had to do about it — a share whose
+/// tunnel died, most often. Always stderr: `--json`'s stdout has to stay
+/// parseable, and none of this is part of the documented shape.
+fn report_refresh(refreshed: &actions::Refreshed) {
+    if let Some(warning) = &refreshed.warning {
+        eprintln!("pando: {warning}");
+    }
+    for notice in &refreshed.notices {
+        eprintln!("pando: {notice}");
+    }
+}
+
 /// Always stderr, never the listing: `ls --json`'s stdout has to stay
 /// parseable, and this is not part of the documented shape.
 fn warn_about(owned: &actions::Ownership) {
@@ -721,9 +733,7 @@ fn terminal_width() -> usize {
 pub fn ls_text_at<W: Write>(paths: &PandoPaths, out: &mut W, width: usize) -> Result<()> {
     let worktrees = actions::ls(paths)?;
     let refreshed = actions::refresh(paths);
-    if let Some(warning) = &refreshed.warning {
-        eprintln!("pando: {warning}");
-    }
+    report_refresh(&refreshed);
     let owned = actions::ownership(&refreshed.state, &worktrees);
     if worktrees.is_empty() {
         writeln!(out, "no worktrees — `pando new <branch>` creates one")?;
@@ -1017,9 +1027,7 @@ fn phase_reason(phase: &Phase) -> Option<String> {
 
 pub fn status_json<W: Write>(paths: &PandoPaths, only: Option<&str>, out: &mut W) -> Result<()> {
     let refreshed = actions::refresh(paths);
-    if let Some(warning) = &refreshed.warning {
-        eprintln!("pando: {warning}");
-    }
+    report_refresh(&refreshed);
     let worktrees = actions::ls(paths)?;
     let output = StatusOutput {
         version: JSON_VERSION,
@@ -1111,9 +1119,7 @@ pub fn status_text_at<W: Write>(
     width: usize,
 ) -> Result<()> {
     let refreshed = actions::refresh(paths);
-    if let Some(warning) = &refreshed.warning {
-        eprintln!("pando: {warning}");
-    }
+    report_refresh(&refreshed);
     let worktrees = actions::ls(paths)?;
     let shown: Vec<&Worktree> = worktrees
         .iter()

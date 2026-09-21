@@ -88,6 +88,9 @@ pub struct Snapshot {
     /// and `rm` refuses with, so the TUI never shows "adopted" about a
     /// state file it could not read without saying so.
     pub warning: Option<String>,
+    /// What the refresh itself had to do — a share whose tunnel died, most
+    /// often. Shown once, as a status line.
+    pub notices: Vec<String>,
     pub default_base: Option<String>,
 }
 
@@ -1992,6 +1995,11 @@ impl App {
             }
             self.state_warning = snapshot.warning;
         }
+        // A share that died since the last tick. One line, once: the
+        // record is already gone, so the next tick has nothing to repeat.
+        if let Some(notice) = snapshot.notices.first() {
+            self.set_error(notice.clone());
+        }
         self.refilter_keeping(keep);
         fresh
     }
@@ -2594,6 +2602,7 @@ pub fn snapshot(paths: &PandoPaths) -> Result<Snapshot> {
         worktrees: discovery.worktrees,
         state: refreshed.state,
         warning: refreshed.warning,
+        notices: refreshed.notices,
         default_base: worktree::resolve_base_branch(paths.root()),
     })
 }
@@ -3205,6 +3214,7 @@ pub mod tests {
             created_by_pando: BTreeMap::new(),
             state: State::new(),
             warning: None,
+            notices: Vec::new(),
             default_base: Some("main".into()),
         });
 
@@ -3228,6 +3238,7 @@ pub mod tests {
             created_by_pando: BTreeMap::new(),
             state: State::new(),
             warning: None,
+            notices: Vec::new(),
             default_base: None,
         });
         assert_eq!(fresh, vec!["feat+one"]);
@@ -3245,6 +3256,7 @@ pub mod tests {
             created_by_pando: BTreeMap::new(),
             state: State::new(),
             warning: warning.map(str::to_string),
+            notices: Vec::new(),
             default_base: None,
         };
 
@@ -3277,6 +3289,7 @@ pub mod tests {
             created_by_pando: BTreeMap::new(),
             state: State::new(),
             warning: None,
+            notices: Vec::new(),
             default_base: None,
         });
         assert_eq!(

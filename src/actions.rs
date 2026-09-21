@@ -781,8 +781,8 @@ pub fn rm(paths: &PandoPaths, name: &str, yes: bool, force: bool) -> Result<()> 
         let reason = git_failure_reason(&out);
         if matches!(stopped, StopOutcome::Stopped(_)) {
             bail!(
-                "git worktree remove failed: {reason} — the dev server was stopped; the \
-                 worktree was kept"
+                "git worktree remove failed: {reason} — what was running was stopped, and any \
+                 public URL closed; the worktree was kept"
             );
         }
         bail!("git worktree remove failed: {reason}");
@@ -1954,12 +1954,16 @@ fn stop_recorded_with(
         if only.is_some() {
             return missing_only(name, only, missing, record);
         }
-        let failures = stop_service_pumps(record, &stop);
+        let mut failures = stop_service_pumps(record, &stop);
+        // A worktree whose every process crashed can still be shared: the
+        // tunnel outlives them, and a public URL onto nothing is the worst
+        // of both worlds.
+        let was_shared = take_share_down(record, &stop, &mut failures);
         let projects = compose_projects(record);
         if !failures.is_empty() {
             bail!("{name}: {}", failures.join("; "));
         }
-        if projects.is_empty() {
+        if projects.is_empty() && !was_shared {
             return Ok(StopOutcome::NotRunning);
         }
         services_to_stop.extend(projects);
@@ -1996,10 +2000,50 @@ fn stop_recorded_with(
         failures.extend(stop_service_pumps(record, &stop));
         services_to_stop.extend(compose_projects(record));
     }
+    // And the public URL, once nothing is left for it to point at. A
+    // `--only` stop of one process of several leaves the share up, because
+    // its siblings are still serving; a `--only` stop of the last one does
+    // not, because a tunnel onto nothing is worse than no tunnel.
+    let still_serving = record
+        .processes
+        .values()
+        .any(|p| matches!(p.phase, Phase::Starting { .. } | Phase::Running { .. }));
+    if only.is_none() || !still_serving {
+        take_share_down(record, &stop, &mut failures);
+    }
     if !failures.is_empty() {
         bail!("{name}: {}", failures.join("; "));
     }
     Ok(StopOutcome::Stopped(stopped))
+}
+
+/// Signals both halves of a worktree's share and drops the record, as part
+/// of stopping it. Returns whether there was one.
+///
+/// Signal first, drop second, exactly as the process records are handled: a
+/// share record cleared for a tunnel that was never signalled is a
+/// cloudflared nothing can find again.
+fn take_share_down(
+    record: &mut WorktreeRecord,
+    stop: &impl Fn(i32) -> Result<()>,
+    failures: &mut Vec<String>,
+) -> bool {
+    let Some(share) = record.share.clone() else {
+        return false;
+    };
+    match tunnel::stop_share_with(&share, stop) {
+        Ok(()) => {
+            record.share = None;
+            true
+        }
+        Err(e) => {
+            failures.push(format!(
+                "its share (tunnel group {}): {e:#}",
+                share.tunnel_pgid
+            ));
+            true
+        }
+    }
 }
 
 /// Signals every process group in the project whose leader is dead, so that
@@ -3282,6 +3326,11 @@ const FAILURE_TAIL_LINES: usize = 40;
 pub struct Refreshed {
     pub state: state::State,
     pub warning: Option<String>,
+    /// What the refresh itself did, one line each. A share whose tunnel
+    /// died is closed here rather than in silence: the URL a developer had
+    /// open stops working, and they should be told once rather than
+    /// discover it from a browser.
+    pub notices: Vec<String>,
 }
 
 pub fn refresh(paths: &PandoPaths) -> Refreshed {
@@ -3294,6 +3343,7 @@ pub fn refresh(paths: &PandoPaths) -> Refreshed {
         return Refreshed {
             state: state::State::new(),
             warning: Some(format!("{e:#}")),
+            notices: Vec::new(),
         };
     }
     let _lock = match state::lock(&paths.lock_file()) {
@@ -3302,6 +3352,7 @@ pub fn refresh(paths: &PandoPaths) -> Refreshed {
             return Refreshed {
                 state: state::State::new(),
                 warning: Some(format!("{e:#}")),
+                notices: Vec::new(),
             };
         }
     };
@@ -3311,15 +3362,24 @@ pub fn refresh(paths: &PandoPaths) -> Refreshed {
             return Refreshed {
                 state: state::State::new(),
                 warning: Some(format!("{e:#}")),
+                notices: Vec::new(),
             };
         }
     };
+
+    // Before anything advances or reconciles: both of those drop a share
+    // whose tunnel has died, and neither can signal what is left of it.
+    // Signalling is not spawning — a read path must not start a process,
+    // but a tunnel nothing can reach again is exactly what it must not
+    // leave behind either.
+    let notices = sweep_dead_shares(&mut store);
 
     // One scan of every live group, used for both questions this pass
     // answers: whether a starting process has opened its port yet, and what
     // every group is really listening on.
     let scans = scan_groups(&store);
-    let mut changed = advance_with(&mut store, &scans);
+    let mut changed = !notices.is_empty();
+    changed |= advance_with(&mut store, &scans);
     changed |= capture_observed_ports(&mut store, &scans);
     if changed {
         // A read path that cannot write is still a read path: the phases are
@@ -3329,12 +3389,14 @@ pub fn refresh(paths: &PandoPaths) -> Refreshed {
             return Refreshed {
                 state: store,
                 warning: Some(format!("{e:#}")),
+                notices,
             };
         }
     }
     Refreshed {
         state: store,
         warning: None,
+        notices,
     }
 }
 
@@ -6061,6 +6123,293 @@ time.sleep(300)
             "and neither must the start after it"
         );
         assert!(!again.reassigned);
+    }
+
+    // ---- a share that outlives what it points at -------------------------
+
+    /// A share record whose two halves have the given pids.
+    fn share_record_of(tunnel_pid: u32, proxy_pid: Option<u32>) -> ShareRecord {
+        ShareRecord {
+            tunnel_pid,
+            tunnel_pgid: tunnel_pid as i32,
+            public_url: "https://x.trycloudflare.com".into(),
+            local_port: 17000,
+            started_at: Utc::now(),
+            log_path: PathBuf::from("tunnel.log"),
+            proxy_pid,
+            proxy_pgid: proxy_pid.map(|p| p as i32),
+            proxy_port: proxy_pid.map(|_| 17005),
+        }
+    }
+
+    fn state_with_share(share: ShareRecord) -> state::State {
+        let mut store = state::State::new();
+        let mut record = WorktreeRecord::new("/tmp/feat+one", true);
+        record.share = Some(share);
+        store.worktrees.insert("feat+one".to_string(), record);
+        store
+    }
+
+    #[test]
+    fn a_dead_tunnel_closes_the_share_and_signals_the_proxy_that_is_left() {
+        let mut store = state_with_share(share_record_of(4242, Some(8484)));
+        let signalled = std::sync::Mutex::new(Vec::new());
+
+        let notices = sweep_dead_shares_with(
+            &mut store,
+            // The tunnel died; the proxy is still up.
+            |pid| pid == 8484,
+            |pgid| {
+                signalled.lock().unwrap().push(pgid);
+                Ok(())
+            },
+        );
+
+        assert_eq!(
+            signalled.into_inner().unwrap(),
+            vec![4242, 8484],
+            "both groups are signalled before the record that names them is dropped"
+        );
+        assert!(store.worktrees["feat+one"].share.is_none());
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("tunnel"), "{:?}", notices[0]);
+        assert!(notices[0].contains("feat+one"), "{:?}", notices[0]);
+    }
+
+    #[test]
+    fn a_dead_proxy_takes_the_tunnel_in_front_of_it_down() {
+        let mut store = state_with_share(share_record_of(4242, Some(8484)));
+        let signalled = std::sync::Mutex::new(Vec::new());
+
+        let notices = sweep_dead_shares_with(
+            &mut store,
+            // The proxy died; the tunnel is still up, serving the login
+            // screen the proxy existed to skip.
+            |pid| pid == 4242,
+            |pgid| {
+                signalled.lock().unwrap().push(pgid);
+                Ok(())
+            },
+        );
+
+        assert_eq!(signalled.into_inner().unwrap(), vec![4242, 8484]);
+        assert!(store.worktrees["feat+one"].share.is_none());
+        assert!(notices[0].contains("proxy"), "{:?}", notices[0]);
+    }
+
+    #[test]
+    fn a_live_share_is_left_alone() {
+        let mut store = state_with_share(share_record_of(4242, Some(8484)));
+        let signalled = std::sync::Mutex::new(Vec::new());
+        let notices = sweep_dead_shares_with(
+            &mut store,
+            |_| true,
+            |pgid| {
+                signalled.lock().unwrap().push(pgid);
+                Ok(())
+            },
+        );
+        assert!(signalled.into_inner().unwrap().is_empty());
+        assert!(notices.is_empty());
+        assert!(store.worktrees["feat+one"].share.is_some());
+    }
+
+    // The record holds the only pgid anything can use to try again, so a
+    // half that will not die keeps it.
+    #[test]
+    fn a_share_that_will_not_die_keeps_its_record_and_says_so() {
+        let mut store = state_with_share(share_record_of(4242, Some(8484)));
+        let notices =
+            sweep_dead_shares_with(&mut store, |pid| pid == 8484, |_| bail!("would not stop"));
+
+        assert!(
+            store.worktrees["feat+one"].share.is_some(),
+            "dropping it would leave a tunnel nothing can name"
+        );
+        assert!(notices[0].contains("unshare"), "{:?}", notices[0]);
+    }
+
+    #[test]
+    fn a_share_without_a_proxy_is_swept_on_its_tunnel_alone() {
+        let mut store = state_with_share(share_record_of(4242, None));
+        let signalled = std::sync::Mutex::new(Vec::new());
+        sweep_dead_shares_with(
+            &mut store,
+            |_| false,
+            |pgid| {
+                signalled.lock().unwrap().push(pgid);
+                Ok(())
+            },
+        );
+        assert_eq!(signalled.into_inner().unwrap(), vec![4242]);
+        assert!(store.worktrees["feat+one"].share.is_none());
+    }
+
+    #[test]
+    fn refresh_closes_a_share_whose_tunnel_died_and_says_so_once() {
+        let Some((fx, name, _guards, _)) = shared_fixture() else {
+            return;
+        };
+        share(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let record = fx.state().worktrees[&name].share.clone().unwrap();
+        crate::process::stop(record.tunnel_pgid, Duration::from_secs(5)).unwrap();
+
+        let refreshed = refresh(&fx.paths);
+        assert!(refreshed.state.worktrees[&name].share.is_none());
+        assert_eq!(refreshed.notices.len(), 1, "{:?}", refreshed.notices);
+        assert!(refreshed.notices[0].contains("public URL is closed"));
+
+        // And the record is gone from disk, so the next refresh has
+        // nothing to repeat.
+        assert!(refresh(&fx.paths).notices.is_empty());
+    }
+
+    #[test]
+    fn stop_takes_the_public_url_down_with_the_worktree() {
+        let Some((fx, name, guards, _)) = shared_fixture() else {
+            return;
+        };
+        share(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let record = fx.state().worktrees[&name].share.clone().unwrap();
+
+        drop(guards);
+        stop(&fx.paths, &name, None).unwrap();
+
+        assert!(
+            fx.state().worktrees[&name].share.is_none(),
+            "a stopped worktree never keeps a public URL"
+        );
+        assert!(wait_until(Duration::from_secs(5), || {
+            !crate::process::is_alive(record.tunnel_pid)
+        }));
+    }
+
+    #[test]
+    fn rm_takes_the_public_url_down_with_the_worktree() {
+        let Some((fx, name, guards, _)) = shared_fixture() else {
+            return;
+        };
+        share(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let record = fx.state().worktrees[&name].share.clone().unwrap();
+
+        drop(guards);
+        rm(&fx.paths, &name, false, true).unwrap();
+
+        assert!(!fx.state().worktrees.contains_key(&name));
+        assert!(wait_until(Duration::from_secs(5), || {
+            !crate::process::is_alive(record.tunnel_pid)
+        }));
+    }
+
+    // `--only` is about one process. Its siblings are still serving, so the
+    // URL still points at something.
+    #[test]
+    fn stopping_one_process_of_several_leaves_the_share_up() {
+        let mut store = state::State::new();
+        let mut record = WorktreeRecord::new("/tmp/feat+one", true);
+        record.processes.insert("web".into(), fake_record(100));
+        record.processes.insert("api".into(), fake_record(200));
+        record.share = Some(share_record_of(4242, None));
+        store.worktrees.insert("feat+one".into(), record);
+
+        let mut projects = Vec::new();
+        stop_recorded_with(
+            &mut store,
+            "feat+one",
+            Some("api"),
+            MissingOnly::IsAnError,
+            |_| Ok(()),
+            &mut projects,
+        )
+        .unwrap();
+
+        assert!(
+            store.worktrees["feat+one"].share.is_some(),
+            "the web process is still serving what the URL points at"
+        );
+    }
+
+    // …and a `--only` stop of the last one does take it down: a tunnel onto
+    // nothing is worse than no tunnel.
+    #[test]
+    fn stopping_the_last_process_takes_the_share_down_even_with_only() {
+        let mut store = state::State::new();
+        let mut record = WorktreeRecord::new("/tmp/feat+one", true);
+        record.processes.insert("web".into(), fake_record(100));
+        record.share = Some(share_record_of(4242, Some(8484)));
+        store.worktrees.insert("feat+one".into(), record);
+
+        let signalled = std::sync::Mutex::new(Vec::new());
+        let mut projects = Vec::new();
+        stop_recorded_with(
+            &mut store,
+            "feat+one",
+            Some("web"),
+            MissingOnly::IsAnError,
+            |pgid| {
+                signalled.lock().unwrap().push(pgid);
+                Ok(())
+            },
+            &mut projects,
+        )
+        .unwrap();
+
+        assert!(store.worktrees["feat+one"].share.is_none());
+        let signalled = signalled.into_inner().unwrap();
+        assert!(
+            signalled.contains(&4242) && signalled.contains(&8484),
+            "{signalled:?}"
+        );
+    }
+
+    // A worktree whose every process crashed still has a tunnel up.
+    #[test]
+    fn stopping_a_worktree_with_nothing_running_still_closes_its_share() {
+        let mut store = state::State::new();
+        let mut record = WorktreeRecord::new("/tmp/feat+one", true);
+        record.share = Some(share_record_of(4242, None));
+        store.worktrees.insert("feat+one".into(), record);
+
+        let signalled = std::sync::Mutex::new(Vec::new());
+        let mut projects = Vec::new();
+        let outcome = stop_recorded_with(
+            &mut store,
+            "feat+one",
+            None,
+            MissingOnly::IsAnError,
+            |pgid| {
+                signalled.lock().unwrap().push(pgid);
+                Ok(())
+            },
+            &mut projects,
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, StopOutcome::Stopped(_)), "{outcome:?}");
+        assert_eq!(signalled.into_inner().unwrap(), vec![4242]);
+        assert!(store.worktrees["feat+one"].share.is_none());
+    }
+
+    #[test]
+    fn a_share_that_will_not_stop_fails_the_stop_and_keeps_its_record() {
+        let mut store = state::State::new();
+        let mut record = WorktreeRecord::new("/tmp/feat+one", true);
+        record.share = Some(share_record_of(4242, None));
+        store.worktrees.insert("feat+one".into(), record);
+
+        let mut projects = Vec::new();
+        let err = stop_recorded_with(
+            &mut store,
+            "feat+one",
+            None,
+            MissingOnly::IsAnError,
+            |_| bail!("would not stop"),
+            &mut projects,
+        )
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("share"), "{err:#}");
+        assert!(store.worktrees["feat+one"].share.is_some());
     }
 
     // ---- restart ---------------------------------------------------------
