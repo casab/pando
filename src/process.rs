@@ -209,8 +209,12 @@ pub fn run_captured(
                 // readers that long and no longer.
                 wait_until(&out_reader, &err_reader, Instant::now() + DRAIN_SETTLE);
                 let stderr = text_of(&err_buf);
+                // Not the command itself: a project's `auth_cmd` may hold a
+                // literal credential, and a timeout must not be how it
+                // reaches a terminal and a TUI status line. The caller adds
+                // the context that names which command this was.
                 bail!(
-                    "{shell_cmd:?} was still running after {}s{}",
+                    "the command was still running after {}s{}",
                     timeout.as_secs(),
                     match stderr.lines().map(str::trim).rev().find(|l| !l.is_empty()) {
                         Some(line) => format!(" — its last output was: {line}"),
@@ -526,6 +530,28 @@ mod tests {
             !is_alive(child),
             "the group that outlasted the deadline was not killed with it"
         );
+    }
+
+    // A `[share].auth_cmd` may hold a literal credential — printing one is
+    // the shape of the simplest possible auth command — and a timeout must
+    // not be how it reaches a terminal, a log, or a TUI status line.
+    #[test]
+    fn a_timed_out_command_is_not_quoted_back_in_the_message() {
+        let dir = tempdir().unwrap();
+        let err = run_captured(
+            "printf 'session=a-literal-credential'; sleep 60",
+            dir.path(),
+            &[],
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+
+        let message = format!("{err:#}");
+        assert!(
+            !message.contains("a-literal-credential"),
+            "the command text carried a credential into an error message: {message}"
+        );
+        assert!(message.contains("still running after"), "{message}");
     }
 
     #[test]

@@ -208,14 +208,16 @@ fn read_until_headers_end(client: &mut TcpStream) -> Result<(String, Vec<u8>)> {
     let mut buf: Vec<u8> = Vec::with_capacity(2048);
     let mut chunk = [0u8; 1024];
     loop {
-        if buf.len() > MAX_HEADER_BYTES {
-            bail!("the request headers were longer than {MAX_HEADER_BYTES} bytes");
-        }
         let n = client.read(&mut chunk).context("read from the client")?;
         if n == 0 {
             bail!("the client closed before finishing its headers");
         }
         buf.extend_from_slice(&chunk[..n]);
+        // After the read, not before it: checked first, the buffer could
+        // reach the limit plus one chunk before anything objected.
+        if buf.len() > MAX_HEADER_BYTES {
+            bail!("the request headers were longer than {MAX_HEADER_BYTES} bytes");
+        }
         if let Some((end_head, start_body)) = find_headers_end(&buf) {
             let head = String::from_utf8(buf[..end_head].to_vec())
                 .context("the request headers were not valid UTF-8")?;
@@ -228,18 +230,19 @@ fn read_until_headers_end(client: &mut TcpStream) -> Result<(String, Vec<u8>)> {
 /// The header block keeps the last header's own `\r\n` and excludes the
 /// blank line. `\n\n` is accepted as well as `\r\n\r\n`, for tolerance with
 /// hand-written traffic.
+///
+/// Whichever spelling comes *first*, not whichever is looked for first: a
+/// request written with bare newlines whose body happens to contain
+/// `\r\n\r\n` would otherwise be split at the body.
 fn find_headers_end(buf: &[u8]) -> Option<(usize, usize)> {
-    for i in 0..buf.len().saturating_sub(3) {
-        if &buf[i..i + 4] == b"\r\n\r\n" {
-            return Some((i + 2, i + 4));
-        }
+    let crlf = (0..buf.len().saturating_sub(3)).find(|&i| &buf[i..i + 4] == b"\r\n\r\n");
+    let lf = (0..buf.len().saturating_sub(1)).find(|&i| &buf[i..i + 2] == b"\n\n");
+    match (crlf, lf) {
+        (Some(c), Some(l)) if l < c => Some((l + 1, l + 2)),
+        (Some(c), _) => Some((c + 2, c + 4)),
+        (None, Some(l)) => Some((l + 1, l + 2)),
+        (None, None) => None,
     }
-    for i in 0..buf.len().saturating_sub(1) {
-        if &buf[i..i + 2] == b"\n\n" {
-            return Some((i + 1, i + 2));
-        }
-    }
-    None
 }
 
 /// Replaces the `Cookie` header with the one the auth command produced, and

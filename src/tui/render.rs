@@ -1780,7 +1780,7 @@ fn pr_color(pr: &PrInfo) -> ratatui::style::Color {
 }
 
 /// Key hints, most valuable first. The essential ones are never dropped.
-const HINTS: [(&str, &str, bool); 12] = [
+const HINTS: [(&str, &str, bool); 14] = [
     ("j/k", "move", true),
     ("s", "start", true),
     ("x", "stop", true),
@@ -1788,6 +1788,8 @@ const HINTS: [(&str, &str, bool); 12] = [
     ("l", "logs", true),
     ("tab", "log", false),
     ("o", "open", false),
+    ("t", "share", false),
+    ("O", "public", false),
     ("n", "new", false),
     ("d", "remove", false),
     ("/", "filter", false),
@@ -2811,6 +2813,30 @@ mod tests {
         assert!(rendered.contains("s start"), "{rendered}");
         assert!(rendered.contains("x stop"), "{rendered}");
         assert!(rendered.contains("l logs"), "{rendered}");
+    }
+
+    // Finding 9. Sharing is this phase's whole feature and neither of its
+    // keys was in the footer at any width, while `o open` was.
+    #[test]
+    fn the_footer_offers_the_share_keys_on_a_wide_terminal() {
+        let mut app = test_app(&["feat+one"]);
+        let rendered = text_of(&draw(&mut app, 160, 20));
+        assert!(rendered.contains("t share"), "{rendered}");
+        assert!(rendered.contains("O public"), "{rendered}");
+    }
+
+    // …and they are optional, so a narrow terminal sheds them rather than
+    // anything essential, and nothing clips.
+    #[test]
+    fn the_share_keys_go_before_anything_essential_when_the_footer_will_not_fit() {
+        let mut app = test_app(&["feat+one"]);
+        let rendered = text_of(&draw(&mut app, 60, 20));
+        for essential in ["j/k move", "s start", "x stop", "q quit"] {
+            assert!(rendered.contains(essential), "{essential}: {rendered}");
+        }
+        for line in rendered.lines() {
+            assert!(line.chars().count() <= 60, "{line:?}");
+        }
     }
 
     // ---- the log viewer --------------------------------------------------

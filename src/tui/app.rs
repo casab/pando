@@ -2100,10 +2100,13 @@ impl App {
             }
             self.state_warning = snapshot.warning;
         }
-        // A share that died since the last tick. One line, once: the
-        // record is already gone, so the next tick has nothing to repeat.
-        if let Some(notice) = snapshot.notices.first() {
-            self.set_error(notice.clone());
+        // Shares that died since the last tick. Every one of them, once:
+        // the records are already gone, so the next tick has nothing to
+        // repeat, and showing only the first means the second worktree's
+        // public URL closed in silence. The status line truncates rather
+        // than wraps, like every other row.
+        if !snapshot.notices.is_empty() {
+            self.set_error(snapshot.notices.join(" · "));
         }
         self.refilter_keeping(keep);
         fresh
@@ -3415,6 +3418,33 @@ pub mod tests {
 
         app.apply_snapshot(snapshot(None));
         assert_eq!(app.state_warning, None);
+    }
+
+    // Finding 10. A share that dies is announced once, because the record
+    // is gone by the next tick — so when two die together, showing only
+    // the first means the second worktree's URL closed in silence.
+    #[test]
+    fn every_refresh_notice_reaches_the_status_line_not_only_the_first() {
+        let mut app = test_app(&["feat+one", "feat+two"]);
+        app.apply_snapshot(Snapshot {
+            main: wt("acme-shop"),
+            worktrees: vec![wt("feat+one"), wt("feat+two")],
+            created_by_pando: BTreeMap::new(),
+            state: State::new(),
+            warning: None,
+            notices: vec![
+                "feat+one: the share's tunnel exited, so the public URL is closed".to_string(),
+                "feat+two: the share's proxy exited, so the public URL is closed".to_string(),
+            ],
+            default_base: None,
+        });
+
+        let (message, _) = app.active_status().expect("a notice");
+        assert!(message.contains("feat+one"), "{message}");
+        assert!(
+            message.contains("feat+two"),
+            "the second share closed in silence: {message}"
+        );
     }
 
     // The cursor follows the worktree, not the row it happened to be on:
