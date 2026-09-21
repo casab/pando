@@ -5,7 +5,8 @@
 //!
 //! ```text
 //! paths → project · config · ports · process · state · template
-//!       → detect · hooks · worktree · cache · log_tail · observe
+//!       → compose · detect · hooks · worktree · cache · log_tail · observe
+//!       → services
 //!       → actions
 //!       → cli · tui
 //! ```
@@ -13,6 +14,7 @@
 pub mod actions;
 pub mod cache;
 pub mod cli;
+pub mod compose;
 pub mod config;
 pub mod detect;
 pub mod hooks;
