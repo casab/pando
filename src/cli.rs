@@ -1683,8 +1683,12 @@ pub fn adopt_project<W: Write>(
         if !plan.worktrees.is_empty() {
             writeln!(
                 err,
-                "       {} move with it: {}",
+                "       {} {} with it: {}",
                 plan.worktrees.len(),
+                match plan.worktrees.len() {
+                    1 => "worktree moves",
+                    _ => "worktrees move",
+                },
                 plan.worktrees.join(", ")
             )?;
         }

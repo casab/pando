@@ -484,8 +484,19 @@ fn plural(n: usize, word: &str) -> String {
 }
 
 /// A fact row: a label, padded, and its value.
+///
+/// A label longer than the column — a project id is — still gets two
+/// spaces after it rather than running into what it is labelling.
 fn row(out: &mut String, label: &str, value: &str) {
-    let _ = writeln!(out, "  {label:<14}{value}");
+    const COLUMN: usize = 14;
+    match label.chars().count() < COLUMN {
+        true => {
+            let _ = writeln!(out, "  {label:<COLUMN$}{value}");
+        }
+        false => {
+            let _ = writeln!(out, "  {label}  {value}");
+        }
+    }
 }
 
 fn render_project(out: &mut String, project: &ProjectReport) {
@@ -821,7 +832,8 @@ fn render_adoption(out: &mut String, adoption: &[Adoptable]) {
                 out,
                 "",
                 &format!(
-                    "{} still in it: {}",
+                    "{} {} still in it: {}",
+                    entry.worktrees.len(),
                     plural(entry.worktrees.len(), "worktree"),
                     entry.worktrees.join(", ")
                 ),
@@ -880,9 +892,12 @@ pub fn run_on(paths: &PandoPaths, machine: &Machine<'_>) -> Report {
     let project = project_report(paths, &config, &mut findings);
     let runtime = runtime_report(paths, &config, machine, &mut findings);
     let tools = tools_report(paths, &config, machine, &mut findings);
-    let worktrees = worktrees_report(paths, &config, &mut findings);
+    // Once, and shared: every group's listening sockets are scanned to
+    // advance a phase, and that is a real cost to pay twice.
+    let view = actions::inspect(paths);
+    let worktrees = worktrees_report(paths, &config, &view, &mut findings);
     let services = services_report(paths, &config, &mut findings);
-    let hooks = hooks_report(paths, &config, &worktrees, &mut findings);
+    let hooks = hooks_report(paths, &config, &view, &worktrees, &mut findings);
     let adoption = adoption_report(paths, &mut findings);
 
     Report {
@@ -935,12 +950,9 @@ const FAILURE_TAIL_LINES: usize = 40;
 fn worktrees_report(
     paths: &PandoPaths,
     config: &Config,
+    view: &actions::Refreshed,
     findings: &mut Vec<Finding>,
 ) -> Vec<WorktreeReport> {
-    // `inspect`, never `refresh`: the read path every other command uses
-    // takes the lock, saves, and signals the surviving half of a dead
-    // share. doctor reports.
-    let view = actions::inspect(paths);
     if let Some(warning) = &view.warning {
         findings.push(Finding::problem(
             Section::Worktrees,
@@ -1322,11 +1334,11 @@ fn name_collisions(paths: &PandoPaths, config: &Config, findings: &mut Vec<Findi
 fn hooks_report(
     paths: &PandoPaths,
     config: &Config,
+    view: &actions::Refreshed,
     worktrees: &[WorktreeReport],
     findings: &mut Vec<Finding>,
 ) -> Vec<HookReport> {
     schema_slot_finding(paths, config, findings);
-    let view = actions::inspect(paths);
     let mut out = Vec::new();
     for hook in &config.hooks {
         let matches = (!hook.fingerprint.is_empty())
@@ -2323,8 +2335,20 @@ pub fn adopt(
     std::fs::rename(&from, &to)
         .with_context(|| format!("move {} to {}", from.display(), to.display()))?;
 
+    // Past this point the folder has moved, which is the part that
+    // cannot be done by hand. Everything left is reconnecting, and a
+    // failure in it is reported rather than raised: an error after a
+    // successful move would read as "it did not happen".
     let mut notices = Vec::new();
-    let rewritten = rewrite_recorded_paths(paths, &from, &to)?;
+    let rewritten = match rewrite_recorded_paths(paths, &from, &to) {
+        Ok(rewritten) => rewritten,
+        Err(e) => {
+            notices.push(format!(
+                "the folder moved, and pando's own records still point inside the old one:                  {e:#} — `pando rm` and `pando start` will not find those worktrees until the                  state file is fixed or moved aside"
+            ));
+            0
+        }
+    };
     notices.extend(repair_worktrees(paths, &to));
     Ok(Adoption {
         from,
