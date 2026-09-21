@@ -1753,6 +1753,31 @@ fn stop_recorded(
     )
 }
 
+/// What `--only <name>` gets when the worktree is not running that
+/// process: an error naming what it *is* running, because "not running"
+/// would read as "nothing to do" for a typo — and a typo must never be
+/// answered by taking the database down.
+fn missing_only(
+    name: &str,
+    only: Option<&str>,
+    missing: MissingOnly,
+    record: &WorktreeRecord,
+) -> Result<StopOutcome> {
+    if missing == MissingOnly::IsNothingToDo {
+        return Ok(StopOutcome::NotRunning);
+    }
+    let running: Vec<&str> = record.processes.keys().map(String::as_str).collect();
+    bail!(
+        "{name} is not running a process named {:?} — it is running: {}",
+        only.unwrap_or_default(),
+        if running.is_empty() {
+            "nothing".to_string()
+        } else {
+            running.join(", ")
+        }
+    )
+}
+
 fn stop_recorded_with(
     store: &mut state::State,
     name: &str,
@@ -1766,8 +1791,15 @@ fn stop_recorded_with(
     };
     // A worktree whose processes are all down may still have containers
     // up: it was started isolated and then every process crashed. `stop`
-    // is how you make sure, so the services are taken down either way.
+    // is how you make sure, so the services are taken down either way —
+    // but only when nothing asked for a subset. `--only dev` is about one
+    // process, and the database its siblings use is not that process; a
+    // name the worktree is not running is the same error it is when
+    // something *is* running, not a silent whole-worktree stop.
     if record.processes.is_empty() {
+        if only.is_some() {
+            return missing_only(name, only, missing, record);
+        }
         let failures = stop_service_pumps(record, &stop);
         let projects = compose_projects(record);
         if !failures.is_empty() {
@@ -1786,18 +1818,7 @@ fn stop_recorded_with(
         .map(|(process, p)| (process.clone(), p.pgid))
         .collect();
     if groups.is_empty() {
-        if missing == MissingOnly::IsNothingToDo {
-            return Ok(StopOutcome::NotRunning);
-        }
-        // Only reachable with `--only`: the worktree is running something,
-        // just not that. Naming what it *is* running beats "not running",
-        // which would read as "nothing to do" for a typo.
-        let running: Vec<&str> = record.processes.keys().map(String::as_str).collect();
-        bail!(
-            "{name} is not running a process named {:?} — it is running: {}",
-            only.unwrap_or_default(),
-            running.join(", ")
-        );
+        return missing_only(name, only, missing, record);
     }
     let mut stopped = Vec::new();
     let mut failures = Vec::new();
@@ -2192,9 +2213,15 @@ fn bring_up_services(
     // A service that never comes up leaves nothing running: the ones that
     // did are stopped again, so a failed start does not leave half an
     // environment holding ports.
+    //
+    // By project, not by files. `up -d <name>` enables that service's
+    // profile implicitly; a `stop` with the same `-f` files does not, and
+    // leaves a profiled container running on the port it was allocated.
+    // Compose finds every container it created by label, which is why
+    // `stop` and `rm` use this form too.
     if let Err(e) = services::wait_ready(&compose, &wanted, Duration::from_secs(timeout), progress)
     {
-        let _ = compose.stop();
+        let _ = services::Compose::by_project(services::docker_program(paths), &project).stop();
         return Err(e);
     }
 

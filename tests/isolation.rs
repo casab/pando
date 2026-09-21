@@ -305,6 +305,69 @@ fn stop_takes_the_processes_and_the_services_down_together() {
     assert!(record.isolated, "and the worktree is still an isolated one");
 }
 
+// `--only dev` and then `--only dev` again — keep the database, restart
+// the app — is exactly the workflow `--only` exists for. Once the process
+// records were empty the name was ignored entirely, so the second call
+// took the database down and reported success; a typo did the same.
+#[test]
+fn stop_only_a_process_that_is_not_running_leaves_the_services_alone() {
+    if skip_without_python() {
+        return;
+    }
+    let f = iso();
+    let name = new_worktree(&f, "feat/one");
+    start_isolated(&f, &name);
+    let up = docker::services_up(&f.home, &f.project(&name));
+    assert_eq!(up.len(), 2);
+
+    // Correct today: one process down, the services left serving.
+    actions::stop(&f.paths, &name, Some("dev")).unwrap();
+    assert_eq!(docker::services_up(&f.home, &f.project(&name)), up);
+
+    // And a name the worktree is not running is an error, not a silent
+    // whole-worktree stop.
+    let err = format!(
+        "{:#}",
+        actions::stop(&f.paths, &name, Some("nosuchprocess")).unwrap_err()
+    );
+    assert!(err.contains("nosuchprocess"), "{err}");
+    assert_eq!(
+        docker::services_up(&f.home, &f.project(&name)),
+        up,
+        "a typo must not take the database down"
+    );
+
+    // The whole-worktree form still does take them down.
+    actions::stop(&f.paths, &name, None).unwrap();
+    assert!(docker::services_up(&f.home, &f.project(&name)).is_empty());
+}
+
+// `up -d <name>` enables a service's profile implicitly; `stop` with the
+// same files does not, so the with-files form leaves a profiled container
+// running and holding its port. The by-project form finds every container
+// by label, which is what `stop` and `rm` already use.
+#[test]
+fn the_readiness_failure_cleanup_stops_the_project_rather_than_the_files() {
+    if skip_without_python() {
+        return;
+    }
+    let f = iso_with(&config_toml("sleep 30").replace(
+        "env = { DATABASE_URL = \"postgres\", REDIS_URL = \"redis\" }",
+        "env = { DATABASE_URL = \"postgres\", REDIS_URL = \"redis\" }\nready_timeout_s = 1",
+    ));
+    let name = new_worktree(&f, "feat/one");
+    let project = f.project(&name);
+    docker::never_ready(&f.home, &project);
+
+    actions::start(&f.paths, &f.config, &name, None, true, &|_| {}).unwrap_err();
+    let seen = docker::invocations_for(&f.home, &project);
+    assert!(
+        seen.iter()
+            .any(|line| line == &format!("compose -p {project} stop")),
+        "the by-project form, so a service a profile started is stopped too: {seen:?}"
+    );
+}
+
 #[test]
 fn rm_takes_the_compose_project_down_with_its_volumes() {
     if skip_without_python() {

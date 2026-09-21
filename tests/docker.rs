@@ -423,6 +423,53 @@ fn a_container_that_publishes_a_port_and_never_listens_is_never_ready() {
     );
 }
 
+/// `up -d <name>` enables that service's profile implicitly; a `stop` with
+/// the same `-f` files does not. Only a real compose has profiles, so only
+/// a real compose can prove the cleanup reaches one.
+#[test]
+fn a_profiled_service_is_stopped_too_when_readiness_fails() {
+    if !enabled() {
+        eprintln!("skipping: set PANDO_TEST_DOCKER=1 to run against the real Docker");
+        return;
+    }
+    let mut f = real_tuned(&listener_on_port_env(), 6);
+    // `postgres` never listens, so readiness fails; `redis` comes up and
+    // is behind a profile.
+    std::fs::write(
+        f.paths.root().join("docker-compose.yml"),
+        "services:\n  postgres:\n    image: alpine:latest\n    \
+         command: [\"sleep\", \"300\"]\n    ports: [\"5432:5432\"]\n  \
+         redis:\n    image: redis:7\n    profiles: [\"extra\"]\n    \
+         ports: [\"6379:6379\"]\n",
+    )
+    .unwrap();
+    common::git(f.paths.root(), &["add", "."]);
+    common::git(f.paths.root(), &["commit", "--quiet", "-m", "a profile"]);
+    let name = actions::new(&f.paths, &f.config, "feat/profile", None, &|_| {}).unwrap();
+    let project = compose::project_name(f.paths.project_id(), &name);
+    f.projects.push(project.clone());
+
+    let err = format!(
+        "{:#}",
+        actions::start(&f.paths, &f.config, &name, None, true, &|m| {
+            eprintln!("profile: {m}")
+        })
+        .unwrap_err()
+    );
+    assert!(err.contains("did not become ready"), "{err}");
+
+    let running = docker(&["ps", "--format", "{{.Names}}"]);
+    let left: Vec<&str> = running
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with(&project))
+        .collect();
+    assert!(
+        left.is_empty(),
+        "a failed start leaves nothing running, profiles included: {left:?}"
+    );
+}
+
 /// The whole reason finding 3 matters: the detected `migrate` hook runs at
 /// the `services` point, right after readiness, and a postgres that has
 /// only just been created spends a second or two running `initdb` with
