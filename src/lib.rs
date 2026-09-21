@@ -6,6 +6,7 @@
 //! ```text
 //! paths → compose → project · config · ports · process · state · template
 //!       → detect · hooks · worktree · cache · log_tail · observe · services
+//!       → tunnel · share_proxy
 //!       → actions
 //!       → cli · tui
 //! ```
@@ -30,4 +31,5 @@ pub mod template;
 pub(crate) mod testutil;
 pub mod theme;
 pub mod tui;
+pub mod tunnel;
 pub mod worktree;
