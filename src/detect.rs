@@ -31,7 +31,17 @@ pub struct Signals {
     /// Lockfiles present at the root, in the order pando checks them.
     pub lockfiles: Vec<String>,
     pub workspace_markers: Vec<String>,
+    /// Which files that pin a runtime exist. What they *say* is
+    /// `runtime_requirements`; this stays the list `doctor` shows.
     pub version_files: Vec<String>,
+    /// What those files, `.tool-versions`, `mise.toml` and `engines` in
+    /// `package.json` actually ask for: one entry per (language, spec,
+    /// source), a pin before a range.
+    ///
+    /// Defaulted rather than required, so a dump written by an older pando
+    /// still deserialises.
+    #[serde(default)]
+    pub runtime_requirements: Vec<crate::runtime::Requirement>,
     /// `.env.example` entries, in file order. The values matter as well as
     /// the keys: a value that is a localhost URL is how one app says where
     /// another one listens.
@@ -108,6 +118,7 @@ pub fn signals(root: &Path) -> Signals {
         lockfiles: present(root, &LOCKFILES),
         workspace_markers: present(root, &WORKSPACE_MARKERS),
         version_files: present(root, &VERSION_FILES),
+        runtime_requirements: crate::runtime::requirements(root),
         env_example: env_example(root),
         markers: present(root, &MARKER_FILES),
         compose_files: present(root, &COMPOSE_FILES),

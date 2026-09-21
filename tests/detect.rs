@@ -359,3 +359,34 @@ fn every_fixture_kind_detects_what_its_notes_say_it_should() {
         );
     }
 }
+
+// Signals carry what a version file *says*, not only that it exists: that
+// is the fact `signals --json` publishes and the one the runtime check
+// compares a machine against.
+#[test]
+fn signals_carry_the_runtime_a_fixture_asks_for() {
+    for (kind, language, spec, source) in [
+        (Kind::NextPnpmCompose, "node", "22", ".nvmrc"),
+        (Kind::DjangoUvPostgres, "python", "3.12", ".python-version"),
+    ] {
+        let (_dir, root) = fixture(kind);
+        let signals = detect::signals(&root);
+        let requirement = pando::runtime::for_language(&signals.runtime_requirements, language)
+            .unwrap_or_else(|| panic!("{kind:?} pins {language}: {signals:?}"));
+        assert_eq!(requirement.spec, spec, "{kind:?}");
+        assert_eq!(requirement.source, source, "{kind:?}");
+        assert!(requirement.pinned, "{kind:?} states a pin");
+        assert_eq!(
+            signals.version_files,
+            vec![source.to_string()],
+            "the file list still says which files exist"
+        );
+    }
+
+    // And a fixture that pins nothing asks for nothing.
+    let (_dir, root) = fixture(Kind::GoService);
+    assert!(
+        detect::signals(&root).runtime_requirements.is_empty(),
+        "a Go service with no version file states no requirement"
+    );
+}
