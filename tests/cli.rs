@@ -1344,13 +1344,14 @@ fn stopping_one_process_leaves_the_others_crash_visible() {
     let out = e.pando(&["start", "feat+one"]);
     assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
 
-    // The api exits on its own; a read is what notices.
-    std::thread::sleep(std::time::Duration::from_secs(2));
-    let out = e.pando(&["status", "feat+one"]);
+    // The api exits on its own, and a read is what notices — but *when* it
+    // exits is a fact about how quickly the machine got round to spawning
+    // it, not about pando. A fixed sleep asserted that fact and failed on a
+    // loaded runner; this waits for the state the test is really about.
     assert!(
-        stdout(&out).contains("failed"),
+        poll_until(|| stdout(&e.pando(&["status", "feat+one"])).contains("failed")),
         "the api should have failed by now: {}",
-        stdout(&out)
+        stdout(&e.pando(&["status", "feat+one"]))
     );
 
     let out = e.pando(&["stop", "feat+one", "--only", "web"]);
