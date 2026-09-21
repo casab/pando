@@ -1369,3 +1369,45 @@ fn init_and_signals_never_write_into_the_repository() {
     assert!(written.contains("# answered: a program,"), "{written}");
     assert!(written.contains(r#"cmd = "pnpm dev:web""#), "{written}");
 }
+
+// doctor is the command a developer runs when something is already wrong,
+// so it is the one that must not change anything on the way past. Not the
+// repository, and not pando's own home either: it reads three config
+// layers, loads the state, probes a login shell and walks every project
+// folder, and every one of those has a write next to it that would have
+// been easy to reach for.
+#[test]
+fn doctor_writes_nothing_anywhere() {
+    let h = harness_of(Kind::NextMessy, "");
+    // The one answer that is about this machine rather than the fixture.
+    std::fs::write(h.home.join("config.toml"), "[runtime]\nprelude = \"\"\n").unwrap();
+    let name = actions::new(&h.paths, &h.config, "feat/one", None, &|_| {}).unwrap();
+    let worktree = h.config.worktrees_dir(&h.paths).join(&name);
+    h.assert_untouched("new", Some(&worktree));
+
+    let home_before = tree(&h.home);
+    for args in [
+        vec!["doctor"],
+        vec!["doctor", "--json"],
+        // Twice, because a cache written on the first run would only show
+        // up as a difference on the second.
+        vec!["doctor"],
+    ] {
+        let out = pando(&h, &args);
+        // 0 or 1: this fixture pins a runtime, and whether this machine
+        // resolves it is a fact about the machine. Anything else would be
+        // a crash.
+        assert!(
+            matches!(out.status.code(), Some(0) | Some(1)),
+            "{args:?} exited {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        h.assert_untouched(&args.join(" "), Some(&worktree));
+        assert_eq!(
+            tree(&h.home),
+            home_before,
+            "after {args:?}: pando's own home changed — doctor reports, it does not write"
+        );
+    }
+}

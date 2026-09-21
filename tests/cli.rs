@@ -2499,3 +2499,69 @@ fn doctor_adopts_the_project_folder_of_a_repository_that_moved() {
     );
     assert_eq!(status_porcelain(&moved), "");
 }
+
+#[test]
+fn doctor_json_is_versioned_and_carries_every_section() {
+    let e = env();
+    let out = e.pando(&["doctor", "--json"]);
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout(&out)).expect("doctor --json parses as JSON");
+    assert_eq!(json["version"], serde_json::json!(1));
+    assert_eq!(
+        json["ok"],
+        serde_json::json!(code(&out) == EXIT_OK),
+        "`ok` is the exit code as a value: {json}"
+    );
+    for section in [
+        "project",
+        "config",
+        "runtime",
+        "tools",
+        "worktrees",
+        "services",
+        "hooks",
+        "adoption",
+        "findings",
+    ] {
+        assert!(!json[section].is_null(), "{section} is missing from {json}");
+    }
+    assert_eq!(
+        json["project"]["id"],
+        e.project_dir().file_name().unwrap().to_str().unwrap()
+    );
+    assert!(
+        json["config"]["layers"].as_array().unwrap().len() == 3,
+        "{json}"
+    );
+    assert_eq!(json["config"]["layers"][1]["layer"], "user");
+    // The one key the harness wrote, with the file it is in.
+    assert_eq!(
+        json["config"]["layers"][1]["keys"][0]["key"],
+        "runtime.prelude"
+    );
+}
+
+#[test]
+fn doctor_json_says_the_same_thing_the_text_does() {
+    let e = env();
+    e.write_config("[project]\ninstall = \"npm install\"\n");
+    let text = e.pando(&["doctor"]);
+    let json = e.pando(&["doctor", "--json"]);
+    assert_eq!(code(&text), EXIT_ERROR);
+    assert_eq!(code(&json), EXIT_ERROR, "the same exit code either way");
+    let parsed: serde_json::Value = serde_json::from_str(&stdout(&json)).unwrap();
+    assert_eq!(parsed["ok"], serde_json::json!(false));
+    let problems: Vec<&serde_json::Value> = parsed["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["severity"] == "problem")
+        .collect();
+    assert_eq!(problems.len(), 1, "{parsed}");
+    assert_eq!(problems[0]["section"], "config");
+    assert!(
+        stdout(&text).contains(problems[0]["message"].as_str().unwrap()),
+        "the text prints what the JSON reports"
+    );
+    assert_eq!(problems[0]["fix"], serde_json::json!("use `npm ci`"));
+}

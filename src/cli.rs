@@ -141,6 +141,10 @@ pub enum Command {
         /// Do not ask before adopting.
         #[arg(long, requires = "adopt")]
         yes: bool,
+        /// The whole report as one JSON object, versioned like the other
+        /// machine-readable shapes. The exit code is the same either way.
+        #[arg(long, conflicts_with = "adopt")]
+        json: bool,
     },
     /// Stop a worktree's processes, or every worktree's when given no name.
     Stop {
@@ -325,9 +329,9 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
         // Deliberately not given the config `main` loaded: the one thing
         // worth reporting about a project layer pando cannot read is the
         // error, and `main` keeps that to itself.
-        Command::Doctor { adopt, yes } => match adopt {
+        Command::Doctor { adopt, yes, json } => match adopt {
             Some(old_id) => adopt_project(paths, &old_id, yes, &mut out),
-            None => doctor(paths, &mut out),
+            None => doctor(paths, json, &mut out),
         },
         Command::Stop { name, only } => match name {
             Some(name) => {
@@ -1711,10 +1715,34 @@ pub fn adopt_project<W: Write>(
     Ok(())
 }
 
-pub fn doctor<W: Write>(paths: &PandoPaths, out: &mut W) -> Result<()> {
+/// The whole report, versioned like `ls --json` and `status --json` are.
+///
+/// `ok` is the exit code as a value: an agent reading this should not have
+/// to count severities to learn what the shell already told it.
+#[derive(Serialize)]
+struct DoctorOutput<'a> {
+    version: u32,
+    ok: bool,
+    #[serde(flatten)]
+    report: &'a crate::doctor::Report,
+}
+
+pub fn doctor<W: Write>(paths: &PandoPaths, json: bool, out: &mut W) -> Result<()> {
     let report = crate::doctor::run(paths);
-    write!(out, "{}", report.render())?;
-    match report.healthy() {
+    let healthy = report.healthy();
+    match json {
+        true => writeln!(
+            out,
+            "{}",
+            serde_json::to_string_pretty(&DoctorOutput {
+                version: JSON_VERSION,
+                ok: healthy,
+                report: &report,
+            })?
+        )?,
+        false => write!(out, "{}", report.render())?,
+    }
+    match healthy {
         true => Ok(()),
         false => Err(crate::doctor::Unhealthy.into()),
     }
