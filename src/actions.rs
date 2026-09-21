@@ -1226,6 +1226,14 @@ pub fn resolve_on(
                 // "nobody has said yet", or the question returns on every
                 // run with nowhere to put the answer but the TOML by hand.
                 Answer::None if matches!(*slot, Slot::PortEnv | Slot::Provision) => {
+                    // Through the same gate every other answer goes
+                    // through. Nothing `validate` knows about refuses an
+                    // empty list today; the guarantee is that no answer
+                    // is written without being read back, and an
+                    // exception to it is one the next rule walks into.
+                    let mut proposed = config.clone();
+                    apply_empty(*slot, &mut proposed);
+                    refuse_unloadable(paths, *slot, "none of them", &proposed)?;
                     let (table, key) = slot.key().expect("both of these write one key");
                     config::set_detected(
                         paths,
@@ -1235,16 +1243,7 @@ pub fn resolve_on(
                         toml_edit::Value::Array(toml_edit::Array::new()),
                         by.note(config::Note::Answered),
                     )?;
-                    match slot {
-                        Slot::PortEnv => {
-                            config
-                                .processes
-                                .entry(detect::DEV.to_string())
-                                .or_default()
-                                .ports = Some(config::PortsSpec::List(Vec::new()));
-                        }
-                        _ => config.project.provision = Some(Vec::new()),
-                    }
+                    apply_empty(*slot, &mut config);
                     continue;
                 }
                 Answer::None => bail!("{} has no \"none\" answer", slot_label(*slot)),
@@ -1330,6 +1329,24 @@ fn apply_service_answer(
     config::set_detected_array_entry(paths, Slot::Services.layer(), array, entries, note)?;
     detect::apply_services(&file, &refs, config);
     Ok(())
+}
+
+/// "None of them", written as the empty form of the slot's own value.
+///
+/// The shape that makes a negative answer recordable: `ports = []` is a
+/// process with no ports, `provision = []` is a worktree that needs no
+/// local file of anyone's, and either is tellable from "nobody has said".
+fn apply_empty(slot: Slot, config: &mut Config) {
+    match slot {
+        Slot::PortEnv => {
+            config
+                .processes
+                .entry(detect::DEV.to_string())
+                .or_default()
+                .ports = Some(config::PortsSpec::List(Vec::new()));
+        }
+        _ => config.project.provision = Some(Vec::new()),
+    }
 }
 
 /// An answer pando could not load back is not an answer.

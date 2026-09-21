@@ -2238,8 +2238,13 @@ fn recorded_root(project_dir: &Path) -> Option<PathBuf> {
         };
         let gitdir = PathBuf::from(gitdir.trim());
         // `<root>/.git/worktrees/<name>` — three components back to the
-        // checkout it was linked from.
-        if let Some(root) = gitdir.ancestors().nth(3) {
+        // checkout it was linked from. Absolute, because git writes it
+        // absolute and a relative one climbing out of three components
+        // leaves an empty path that would read as "its repository was at
+        // , and is not there now".
+        if let Some(root) = gitdir.ancestors().nth(3)
+            && root.is_absolute()
+        {
             return Some(root.to_path_buf());
         }
     }
@@ -2283,7 +2288,13 @@ pub fn adopt(
     if old_id == paths.project_id() {
         anyhow::bail!("{old_id} is this repository's own project folder");
     }
-    if old_id.is_empty() || Path::new(old_id).components().count() != 1 {
+    // Exactly one ordinary directory name. `.` and `..` are each one
+    // component too, and either of them would make the destination a
+    // subdirectory of the source.
+    let mut parts = Path::new(old_id).components();
+    let one_plain_name =
+        matches!(parts.next(), Some(std::path::Component::Normal(_))) && parts.next().is_none();
+    if old_id.is_empty() || !one_plain_name {
         anyhow::bail!("{old_id:?} is not a project id — it is one directory name under projects/");
     }
     let from = paths.projects_dir().join(old_id);
@@ -2310,6 +2321,19 @@ pub fn adopt(
             "{old_id} belongs to the repository at {} — it is still there, so this is not a \
              repository that moved",
             root.display()
+        );
+    }
+    // Before anything moves, because everything after the rename is
+    // reconnecting and none of it can be retried: `--adopt` looks for the
+    // folder by its old id, and after the move there is no folder by that
+    // name to look for. A state file this build cannot read is exactly
+    // the shape an *old* folder has — it is by construction from before
+    // the move — and it is the one thing that would leave every recorded
+    // path pointing at a directory that is no longer there.
+    if let Err(e) = state::load(&from.join("state.json")) {
+        anyhow::bail!(
+            "{e:#} — that file has to be readable before the folder moves, because the paths in \
+             it all name the folder it is in; fix it, or move it aside and adopt again"
         );
     }
     let plan = AdoptPlan {
@@ -2598,32 +2622,85 @@ fn check_install(config: &Config, findings: &mut Vec<Finding>) {
 fn check_templates(config: &Config, findings: &mut Vec<Finding>) {
     let roles = declared_roles(config);
     for (name, process) in &config.processes {
+        // What a bare `{port}` means for this process, exactly as `start`
+        // resolves it: the role it owns.
         let own = process.roles();
+        let default_role = own.first().map(String::as_str);
         let mut texts: Vec<(String, String)> = vec![("cmd".to_string(), process.cmd.clone())];
+        if let Some(cwd) = &process.cwd {
+            texts.push(("cwd".to_string(), cwd.clone()));
+        }
         for (key, value) in process.env.iter().chain(process.port_env().iter()) {
             texts.push((format!("env.{key}"), value.clone()));
         }
         for (what, text) in texts {
-            let ctx = template::Context {
-                name: "a-worktree",
-                branch: Some("a-branch"),
-                worktree: Path::new("/worktree"),
-                root: Path::new("/root"),
-                project: "project",
-                ports: &roles,
-                default_role: own.first().map(String::as_str),
-                log: Some(Path::new("/log")),
-            };
-            if let Err(e) = template::render(&text, &ctx) {
-                findings.push(Finding::problem(
-                    Section::Config,
-                    format!("process {name:?}: {what} cannot be resolved — {e:#}"),
-                    format!(
-                        "name a role something owns, or give {name:?} that role in its `ports`"
-                    ),
-                ));
-            }
+            check_template(
+                &roles,
+                default_role,
+                &format!("process {name:?}"),
+                &what,
+                &text,
+                &format!("name a role something owns, or give {name:?} that role in its `ports`"),
+                findings,
+            );
         }
+    }
+    // A hook owns no role, so a bare `{port}` in one is an error naming
+    // the roles it could have used — which is what `run_hook` passes too.
+    for hook in &config.hooks {
+        let mut texts: Vec<(String, String)> = vec![("cmd".to_string(), hook.cmd.clone())];
+        if let Some(cwd) = &hook.cwd {
+            texts.push(("cwd".to_string(), cwd.clone()));
+        }
+        if let Some(fallback) = &hook.fallback {
+            texts.push(("fallback".to_string(), fallback.clone()));
+        }
+        for (what, text) in texts {
+            check_template(
+                &roles,
+                None,
+                &format!("hook {:?}", hook.name),
+                &what,
+                &text,
+                "name a role something owns — a hook owns none of its own, so `{port:<role>}` \
+                 has to say which",
+                findings,
+            );
+        }
+    }
+}
+
+/// One template, rendered against a worktree that could exist.
+///
+/// The paths are stand-ins: what is being checked is whether every
+/// placeholder *resolves*, and the only ones that can fail are the ones
+/// naming a role.
+#[allow(clippy::too_many_arguments)]
+fn check_template(
+    roles: &BTreeMap<String, u16>,
+    default_role: Option<&str>,
+    owner: &str,
+    what: &str,
+    text: &str,
+    fix: &str,
+    findings: &mut Vec<Finding>,
+) {
+    let ctx = template::Context {
+        name: "a-worktree",
+        branch: Some("a-branch"),
+        worktree: Path::new("/worktree"),
+        root: Path::new("/root"),
+        project: "project",
+        ports: roles,
+        default_role,
+        log: Some(Path::new("/log")),
+    };
+    if let Err(e) = template::render(text, &ctx) {
+        findings.push(Finding::problem(
+            Section::Config,
+            format!("{owner}: {what} cannot be resolved — {e:#}"),
+            fix,
+        ));
     }
 }
 
@@ -3057,6 +3134,40 @@ mod tests {
         assert!(!report.healthy(), "{:?}", report.findings);
         assert!(mentions(&report, "env.API"), "{:?}", messages(&report));
         assert!(mentions(&report, "{port:api}"), "{:?}", messages(&report));
+    }
+
+    #[test]
+    fn a_hooks_command_is_checked_too_and_a_hook_owns_no_role_of_its_own() {
+        let fx = fixture();
+        write_project_config(
+            &fx,
+            "[processes.dev]\ncmd = \"serve\"\nports = [\"web\"]\n\n\
+             [[hooks]]\nname = \"migrate\"\nafter = \"services\"\n\
+             cmd = \"migrate --at {port:db}\"\n",
+        );
+        let report = report(&fx);
+        assert!(!report.healthy(), "{:?}", report.findings);
+        assert!(
+            mentions(&report, "hook \"migrate\": cmd cannot be resolved"),
+            "{:?}",
+            messages(&report)
+        );
+    }
+
+    #[test]
+    fn a_process_cwd_that_cannot_be_resolved_is_caught_with_its_command() {
+        let fx = fixture();
+        write_project_config(
+            &fx,
+            "[processes.dev]\ncmd = \"serve\"\nports = [\"web\"]\ncwd = \"apps/{nope}\"\n",
+        );
+        let report = report(&fx);
+        assert!(!report.healthy(), "{:?}", report.findings);
+        assert!(
+            mentions(&report, "cwd cannot be resolved"),
+            "{:?}",
+            messages(&report)
+        );
     }
 
     #[test]
@@ -3881,6 +3992,29 @@ mod tests {
     }
 
     #[test]
+    fn a_git_marker_that_does_not_name_an_absolute_repository_says_it_does_not_know() {
+        let fx = fixture();
+        let old_id = format!("{}-deadbeef", fx.paths.project.display_name);
+        let dir = fx.home.join("projects").join(&old_id);
+        let wt = dir.join("worktrees/feat+one");
+        std::fs::create_dir_all(&wt).expect("worktree dir");
+        std::fs::write(wt.join(".git"), "gitdir: .git/worktrees/feat+one\n").expect("marker");
+        let report = report(&fx);
+        assert_eq!(report.adoption.len(), 1);
+        assert_eq!(
+            report.adoption[0].old_root, None,
+            "an empty path is not a repository it can name"
+        );
+        assert!(
+            report
+                .render()
+                .contains("nothing in it says which repository it belonged to"),
+            "{}",
+            report.render()
+        );
+    }
+
+    #[test]
     fn a_folder_for_a_differently_named_repository_is_not_this_one_moved() {
         let fx = fixture();
         let gone = fx.root.parent().expect("a parent").join("somewhere-else");
@@ -3966,16 +4100,48 @@ mod tests {
     }
 
     #[test]
+    fn a_state_file_this_build_cannot_read_stops_the_move_before_it_happens() {
+        let fx = fixture();
+        let old_id = format!("{}-deadbeef", fx.paths.project.display_name);
+        let gone = fx.root.parent().expect("a parent").join("somewhere-else");
+        let from = stale_project_folder(&fx, &old_id, &gone, "feat+one");
+        // The shape an *old* folder really has: a state file from before
+        // a version bump. Every path in it names the folder it is in, so
+        // a move that could not rewrite them would leave every worktree
+        // pointing at a directory that is no longer there — and `--adopt`
+        // finds a folder by its old id, so there is nothing to retry.
+        std::fs::write(
+            from.join("state.json"),
+            "{\"version\": 99, \"worktrees\": {}}",
+        )
+        .expect("state");
+
+        let err = adopt(&fx.paths, &old_id, &yes).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("before the folder moves"), "{text}");
+        assert!(from.is_dir(), "and nothing moved");
+        assert!(!fx.paths.project_dir().exists());
+    }
+
+    #[test]
     fn adopting_something_that_is_not_a_project_folder_says_so() {
         let fx = fixture();
-        for id in ["", "..", "a/b", "no-such-project-0badc0de"] {
+        // `projects/` exists, so a name that is not one directory name is
+        // caught by the check that is about that rather than by an
+        // accident of the fixture: `..` and `.` are each exactly one
+        // component, and either would make the destination a
+        // subdirectory of the source.
+        std::fs::create_dir_all(fx.paths.projects_dir()).expect("projects dir");
+        for id in ["", ".", "..", "a/b", "./x"] {
             let err = adopt(&fx.paths, id, &yes).unwrap_err();
             let text = format!("{err:#}");
-            assert!(
-                text.contains("not a project id") || text.contains("there is no project folder"),
-                "{id:?}: {text}"
-            );
+            assert!(text.contains("not a project id"), "{id:?}: {text}");
         }
+        let err = adopt(&fx.paths, "no-such-project-0badc0de", &yes).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("there is no project folder"),
+            "{err:#}"
+        );
         let err = adopt(&fx.paths, fx.paths.project_id(), &yes).unwrap_err();
         assert!(format!("{err:#}").contains("own project folder"), "{err:#}");
     }
