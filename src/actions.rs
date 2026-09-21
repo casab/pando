@@ -8162,6 +8162,54 @@ time.sleep(300)
         assert!(again.processes["dev"].roles().is_empty());
     }
 
+    // A project whose env example names its ports by role gets them as
+    // roles, all of them, in one answer — and the framework convention
+    // underneath is still on offer rather than thrown away.
+    #[test]
+    fn the_env_examples_own_port_variables_become_this_projects_roles() {
+        let fx = detectable_fixture(
+            r#"{ "dev": "next dev" }"#,
+            "WEB_PORT=5173\nAPI_PORT=4000\nDATABASE_PORT=5432\n",
+        );
+        let (ask, asked) = scripted(vec![Answer::Auto(0)]);
+        let config = resolve_process(&fx.paths, &fx.config, &ask, &noop).unwrap();
+
+        let questions = asked.borrow();
+        assert_eq!(
+            questions.iter().map(|q| q.slot).collect::<Vec<_>>(),
+            vec![Slot::PortEnv],
+            "the dev command resolves on its own; only the port is a question"
+        );
+        assert_eq!(
+            questions[0]
+                .options
+                .iter()
+                .map(|(value, _)| value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["WEB_PORT, API_PORT", "PORT", "WEB_PORT", "API_PORT"],
+            "the project's own declaration leads; Next.js's PORT is still offered"
+        );
+        assert_eq!(
+            config.processes["dev"].roles(),
+            vec!["api", "web"],
+            "two variables named by role are two roles, not two guesses at one"
+        );
+        assert_eq!(config.processes["dev"].port_env()["WEB_PORT"], "{port:web}");
+        assert_eq!(config.processes["dev"].port_env()["API_PORT"], "{port:api}");
+
+        let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+        assert!(
+            written.contains(r#"ports = { API_PORT = "api", WEB_PORT = "web" }"#),
+            "{written}"
+        );
+        // The file pando wrote has to load, and to have answered the slot:
+        // a second start must not ask again.
+        let loaded = crate::config::load(&fx.paths).unwrap();
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        let again = resolve_process(&fx.paths, &loaded.config, &refuse, &noop).unwrap();
+        assert_eq!(again.processes["dev"].roles(), vec!["api", "web"]);
+    }
+
     // ---- the services slot -----------------------------------------------
 
     /// [`detectable_fixture`] with a compose file, which is what the

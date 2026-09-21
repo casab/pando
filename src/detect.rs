@@ -528,7 +528,9 @@ impl Slot {
             }
             Slot::Processes => "Run these as separate processes?",
             Slot::DevCmd => "Which command starts the local development server?",
-            Slot::PortEnv => "Which environment variable sets the web server's port?",
+            // Plural: a project whose env example names its ports by role
+            // answers this with all of them at once, each owning a role.
+            Slot::PortEnv => "Which environment variables carry this project's ports?",
             Slot::Services => "Run private copies of these services for each worktree?",
             Slot::SchemaHook => "Which command brings a fresh database up to the schema?",
             Slot::Provision => "Which local files should each worktree get a copy of?",
@@ -902,20 +904,89 @@ fn target_candidates(signals: &Signals) -> Vec<Candidate> {
     out
 }
 
-/// Suffixes that name a service's port, never the web server's.
-const PORT_DENYLIST: [&str; 8] = [
-    "DB_PORT",
-    "SMTP_PORT",
-    "REDIS_PORT",
-    "MAIL_PORT",
-    "PG_PORT",
-    "MYSQL_PORT",
-    "POSTGRES_PORT",
-    "DATABASE_PORT",
+/// The service families a `*PORT*` key can belong to, matched on the key's
+/// stem — everything before the trailing `PORT`.
+///
+/// A key in one of these names a *service's* port, never one of the
+/// application's own. It is the services slot that gives it a meaning: an
+/// entry in `[[services]] env` pointing the key at the compose service it
+/// addresses, which is where `DATABASE_PORT` and `REDIS_PORT` end up. Here
+/// they only have to be kept out of the app's roles, because a role pando
+/// allocated for `DATABASE_PORT` would hand the app a port with no database
+/// behind it.
+///
+/// Matched as the whole stem (`DB_PORT`), as a prefix of it
+/// (`DATABASE_REPLICA_PORT`), or as its last word (`READ_DB_PORT`), which is
+/// what the suffix list this replaced did. `REPLICA` earns its own entry for
+/// the bare `REPLICA_PORT` a project with a read replica writes; the
+/// `<FAMILY>_REPLICA_PORT` spelling is already caught by its family.
+const SERVICE_PORT_FAMILIES: [&str; 13] = [
+    "DATABASE",
+    "DB",
+    "POSTGRESQL",
+    "POSTGRES",
+    "PG",
+    "MYSQL",
+    "MARIADB",
+    "REDIS",
+    "MONGODB",
+    "MONGO",
+    "REPLICA",
+    "SMTP",
+    "MAIL",
 ];
 
+/// Whether a key is port-shaped at all: exactly `PORT`, or `<SOMETHING>_PORT`.
+///
+/// A substring test also matches `SUPPORT_EMAIL`, `REPORT_URL`,
+/// `IMPORT_PATH` and `PASSPORT_SECRET`, which is not only nonsense to offer:
+/// it turns a slot that resolved silently into a question, and a
+/// non-interactive `start` that exited 0 into an exit 3.
+fn port_stem(key: &str) -> Option<&str> {
+    if key == "PORT" {
+        return Some("");
+    }
+    key.strip_suffix("_PORT")
+}
+
 fn is_service_port(key: &str) -> bool {
-    PORT_DENYLIST.iter().any(|deny| key.ends_with(deny))
+    let Some(stem) = port_stem(key) else {
+        return false;
+    };
+    SERVICE_PORT_FAMILIES.iter().any(|family| {
+        stem.strip_prefix(family)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('_'))
+            || stem.strip_suffix(family).is_some_and(|rest| {
+                // Not `is_empty()`: that is the prefix case above, and
+                // leaving it here would make `DBX_PORT` a service's.
+                rest.ends_with('_')
+            })
+    })
+}
+
+/// The role a port variable owns. `WEB_PORT` owns `web`; a bare `PORT` owns
+/// `web` too, which is the role `share` and the browser key default to.
+///
+/// `None` for a stem that would not survive as a template argument, since
+/// the role has to come back out of `{port:<role>}`.
+fn port_role(key: &str) -> Option<String> {
+    let stem = port_stem(key)?;
+    if stem.is_empty() {
+        return Some(crate::config::WEB_ROLE.to_string());
+    }
+    let role = stem.to_ascii_lowercase();
+    role.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        .then_some(role)
+}
+
+/// `a`, `a and b`, `a, b and c` — a list in a sentence.
+fn listed(names: &[&str]) -> String {
+    match names.split_last() {
+        None => String::new(),
+        Some((last, [])) => (*last).to_string(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+    }
 }
 
 fn port_proposal(signals: &Signals, rule: Option<&'static FrameworkRule>) -> Option<Proposal> {
@@ -923,6 +994,15 @@ fn port_proposal(signals: &Signals, rule: Option<&'static FrameworkRule>) -> Opt
         PortMechanism::Env(name) => Some((name, r.name)),
         _ => None,
     });
+
+    // The project's own port variables, in file order: port-shaped keys of
+    // the env example that are not a service's.
+    let mut declared: Vec<&str> = Vec::new();
+    for key in signals.env_keys() {
+        if port_stem(key).is_some() && !is_service_port(key) && !declared.contains(&key) {
+            declared.push(key);
+        }
+    }
 
     let mut candidates: Vec<Candidate> = Vec::new();
     // The framework's own mechanism first: it is a rule, not a guess.
@@ -934,22 +1014,13 @@ fn port_proposal(signals: &Signals, rule: Option<&'static FrameworkRule>) -> Opt
         });
     }
     // Then `PORT`, then anything else port-shaped that is not a service's.
-    let keys = signals.env_keys();
     let mut others: Vec<&str> = Vec::new();
-    for key in keys {
-        // Exactly `PORT`, or a `<SOMETHING>_PORT`. A substring test also
-        // matches `SUPPORT_EMAIL`, `REPORT_URL`, `IMPORT_PATH` and
-        // `PASSPORT_SECRET`, which is not only nonsense to offer: it turns
-        // a slot that resolved silently into a question, and a
-        // non-interactive `start` that exited 0 into an exit 3.
-        if !(key == "PORT" || key.ends_with("_PORT")) || is_service_port(key) {
-            continue;
-        }
-        if key == "PORT" {
+    for key in &declared {
+        if *key == "PORT" {
             candidates.insert(
                 framework_env.is_some().into(),
                 Candidate {
-                    value: key.to_string(),
+                    value: (*key).to_string(),
                     why: "PORT in the env example".to_string(),
                     ..Candidate::default()
                 },
@@ -964,6 +1035,16 @@ fn port_proposal(signals: &Signals, rule: Option<&'static FrameworkRule>) -> Opt
         ..Candidate::default()
     }));
     dedup_by_value(&mut candidates);
+    // A project that names two or more ports by role, and no bare `PORT` to
+    // say which of them is the web server's, has declared several roles
+    // rather than offered several guesses at one. That reading leads,
+    // because it is the project's own statement about itself and the
+    // framework rule underneath it is a convention pando brought with it —
+    // but the single keys stay on offer below, since pando cannot know that
+    // one process really owns them all.
+    if let Some(candidate) = roles_from_env(&declared, framework_env.map(|(_, name)| name)) {
+        candidates.insert(0, candidate);
+    }
     if candidates.is_empty() {
         return None;
     }
@@ -972,6 +1053,31 @@ fn port_proposal(signals: &Signals, rule: Option<&'static FrameworkRule>) -> Opt
         slot: Slot::PortEnv,
         candidates,
         decided,
+    })
+}
+
+/// The one candidate that answers the port slot with a whole `ports` map:
+/// every port variable the project declared, each owning a role named after
+/// it.
+fn roles_from_env(declared: &[&str], framework: Option<&str>) -> Option<Candidate> {
+    if declared.len() < 2 || declared.contains(&"PORT") {
+        return None;
+    }
+    let mut map: BTreeMap<String, String> = BTreeMap::new();
+    for key in declared {
+        map.insert((*key).to_string(), port_role(key)?);
+    }
+    let names = listed(declared);
+    Some(Candidate {
+        value: declared.join(", "),
+        why: match framework {
+            Some(framework) => {
+                format!("{names} in the env example, over the {framework} convention")
+            }
+            None => format!("{names} in the env example"),
+        },
+        ports: Some(PortsSpec::Map(map)),
+        ..Candidate::default()
     })
 }
 
@@ -1806,6 +1912,18 @@ pub fn custom(slot: Slot, value: &str) -> Candidate {
     }
 }
 
+/// The `ports` an answer to the port slot writes: the whole map a candidate
+/// carries, when a rule read several roles out of the project's own env
+/// example, else the single variable the candidate named owning `web`.
+fn port_spec(candidate: &Candidate) -> PortsSpec {
+    candidate.ports.clone().unwrap_or_else(|| {
+        PortsSpec::Map(BTreeMap::from([(
+            candidate.value.clone(),
+            crate::config::WEB_ROLE.to_string(),
+        )]))
+    })
+}
+
 /// Writes a chosen candidate into a config. The one place that knows what
 /// each slot means, shared by the resolver and the tests.
 pub fn apply(slot: Slot, candidate: &Candidate, config: &mut Config) {
@@ -1833,10 +1951,7 @@ pub fn apply(slot: Slot, candidate: &Candidate, config: &mut Config) {
         }
         Slot::PortEnv => {
             let process = config.processes.entry(DEV.to_string()).or_default();
-            process.ports = Some(PortsSpec::Map(BTreeMap::from([(
-                candidate.value.clone(),
-                crate::config::WEB_ROLE.to_string(),
-            )])));
+            process.ports = Some(port_spec(candidate));
         }
         Slot::SchemaHook => {
             if let Some(hook) = &candidate.hook {
@@ -1979,9 +2094,19 @@ pub fn edits(slot: Slot, candidate: &Candidate) -> Vec<Edit> {
         }
         Slot::PortEnv => {
             let (table, key) = keyed.expect("this slot writes one key");
-            let mut inline = toml_edit::InlineTable::new();
-            inline.insert(&candidate.value, crate::config::WEB_ROLE.into());
-            vec![single(table, key, toml_edit::Value::InlineTable(inline))]
+            let value = match port_spec(candidate) {
+                PortsSpec::Map(map) => {
+                    let mut inline = toml_edit::InlineTable::new();
+                    for (var, role) in &map {
+                        inline.insert(var, role.as_str().into());
+                    }
+                    toml_edit::Value::InlineTable(inline)
+                }
+                PortsSpec::List(roles) => {
+                    toml_edit::Value::Array(toml_edit::Array::from_iter(roles.iter().cloned()))
+                }
+            };
+            vec![single(table, key, value)]
         }
         Slot::Processes => process_edits(candidate),
         // Both of these append a whole `[[table]]` entry; [`array_edits`]
@@ -2340,6 +2465,128 @@ mod tests {
         let proposal = port_proposal(&Signals::default(), Some(go)).unwrap();
         assert_eq!(values(&proposal), vec!["PORT"]);
         assert!(proposal.decided);
+    }
+
+    // The monorepo shape this was built for: the project names its ports by
+    // role in its own env example, and there is no `PORT` to say which of
+    // them is *the* one. Two variables are two roles, not two guesses at a
+    // single answer.
+    #[test]
+    fn port_variables_named_by_role_become_several_roles() {
+        let signals = Signals {
+            env_example: env_pairs(&["WEB_PORT", "API_PORT", "DATABASE_PORT"]),
+            ..Default::default()
+        };
+        let proposal = port_proposal(&signals, None).unwrap();
+        let first = proposal.preferred().unwrap();
+        assert_eq!(first.value, "WEB_PORT, API_PORT");
+        assert_eq!(first.why, "WEB_PORT and API_PORT in the env example");
+        assert_eq!(
+            first.ports,
+            Some(PortsSpec::Map(BTreeMap::from([
+                ("WEB_PORT".to_string(), "web".to_string()),
+                ("API_PORT".to_string(), "api".to_string()),
+            ]))),
+            "the database's port belongs to the services slot, never to a role"
+        );
+        assert_eq!(
+            values(&proposal),
+            vec!["WEB_PORT, API_PORT", "WEB_PORT", "API_PORT"],
+            "the single keys stay on offer: pando cannot know one process owns them all"
+        );
+
+        let mut config = Config::default();
+        apply(Slot::PortEnv, first, &mut config);
+        assert_eq!(config.processes[DEV].roles(), vec!["api", "web"]);
+        assert_eq!(
+            config.processes[DEV].port_env()["WEB_PORT"],
+            "{port:web}",
+            "the map form is sugar for the env the app really reads"
+        );
+    }
+
+    // The project's own declaration beats the convention pando brought with
+    // it — and says so, because the note in the file is the only place a
+    // developer sees which of the two won.
+    #[test]
+    fn the_projects_own_port_variables_beat_the_framework_guess() {
+        let next = RULES.iter().find(|r| r.name == "Next.js").unwrap();
+        let signals = Signals {
+            env_example: env_pairs(&["WEB_PORT", "API_PORT"]),
+            ..Default::default()
+        };
+        let proposal = port_proposal(&signals, Some(next)).unwrap();
+        assert_eq!(
+            values(&proposal),
+            vec!["WEB_PORT, API_PORT", "PORT", "WEB_PORT", "API_PORT"],
+            "the framework's PORT is still an option, just not the first one"
+        );
+        assert_eq!(
+            proposal.preferred().unwrap().why,
+            "WEB_PORT and API_PORT in the env example, over the Next.js convention"
+        );
+        assert!(!proposal.decided);
+    }
+
+    // A project that writes `PORT` has said where its web server's port
+    // comes from. The role reading is for a project that named its ports
+    // instead, so this one keeps the question it always had.
+    #[test]
+    fn a_project_that_names_port_keeps_the_single_answer() {
+        let signals = Signals {
+            env_example: env_pairs(&["PORT", "API_PORT"]),
+            ..Default::default()
+        };
+        let proposal = port_proposal(&signals, None).unwrap();
+        assert_eq!(values(&proposal), vec!["PORT", "API_PORT"]);
+        assert!(
+            proposal.candidates.iter().all(|c| c.ports.is_none()),
+            "no candidate here answers with a whole map"
+        );
+    }
+
+    // Every spelling of a service's port a real project uses. One of these
+    // becoming a role would hand the app a port with no database behind it.
+    #[test]
+    fn a_service_family_port_is_never_one_of_the_apps_roles() {
+        for key in [
+            "DATABASE_PORT",
+            "DATABASE_REPLICA_PORT",
+            "DB_PORT",
+            "READ_DB_PORT",
+            "REPLICA_PORT",
+            "REDIS_PORT",
+            "MONGO_PORT",
+            "MONGODB_PORT",
+            "POSTGRES_PORT",
+            "PG_PORT",
+            "MYSQL_PORT",
+            "MARIADB_PORT",
+            "SMTP_PORT",
+            "MAIL_PORT",
+        ] {
+            assert!(is_service_port(key), "{key} is a service's port");
+        }
+        for key in ["PORT", "WEB_PORT", "API_PORT", "ADMIN_PORT", "DBX_PORT"] {
+            assert!(!is_service_port(key), "{key} is the application's own");
+        }
+    }
+
+    #[test]
+    fn a_multi_role_answer_is_written_as_one_inline_table() {
+        let signals = Signals {
+            env_example: env_pairs(&["WEB_PORT", "API_PORT"]),
+            ..Default::default()
+        };
+        let proposal = port_proposal(&signals, None).unwrap();
+        let edits = edits(Slot::PortEnv, proposal.preferred().unwrap());
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].table, vec!["dev"]);
+        assert_eq!(edits[0].key, "ports");
+        assert_eq!(
+            edits[0].value.to_string().trim(),
+            r#"{ API_PORT = "api", WEB_PORT = "web" }"#
+        );
     }
 
     #[test]
