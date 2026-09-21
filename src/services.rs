@@ -31,6 +31,12 @@ pub const DEFAULT_READY_TIMEOUT_S: u64 = 60;
 /// up in half a second is not waited on for two.
 const POLL: Duration = Duration::from_millis(250);
 
+/// How many poll rounds between `docker compose ps` calls when nothing is
+/// healthchecked. Every round would be a process spawn four times a
+/// second for a whole minute; this is often enough to notice a container
+/// that died without making the wait itself expensive.
+const CHECK_EVERY: u32 = 8;
+
 /// The docker executable pando runs.
 ///
 /// `<home>/bin/docker` when it is there and executable, else whatever
@@ -472,10 +478,22 @@ pub fn wait_ready(
     for service in &pending {
         progress(&format!("waiting for {}", service.service));
     }
+    let mut round = 0u32;
     loop {
         // One `ps` per round, not one per service: it is a process spawn,
         // and it answers for every container of the project at once.
-        let statuses = if watched { compose.ps()? } else { Vec::new() };
+        //
+        // Every round when a healthcheck is the answer; otherwise on a
+        // slower beat, purely so a container that *exited* is noticed at
+        // once. A postgres that refuses to start without a password dies
+        // in a second, and waiting the whole minute to say "did not
+        // become ready" hides the one line that explains it.
+        let statuses = if watched || round.is_multiple_of(CHECK_EVERY) {
+            compose.ps()?
+        } else {
+            Vec::new()
+        };
+        round += 1;
         pending.retain(|want| !is_ready(want, &statuses));
         if pending.is_empty() {
             return Ok(());
@@ -701,6 +719,34 @@ mod tests {
         );
         assert!(err.contains("\"db\""), "{err}");
         assert!(err.contains("exited"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "it did not wait"
+        );
+    }
+
+    // Without a healthcheck the answer is a connect, and a connect to a
+    // container that died looks exactly like one to a container still
+    // starting. Docker is asked on a slow beat so the difference is
+    // noticed in a second rather than at the end of the timeout.
+    #[test]
+    fn a_service_with_no_healthcheck_that_exits_is_noticed_without_waiting() {
+        let (_dir, paths) = home_with_shim(
+            "#!/bin/sh\necho '{\"Service\":\"db\",\"State\":\"exited\",\"Health\":\"\"}'\n",
+        );
+        let compose = Compose::by_project(docker_program(&paths), "pando-x-y");
+        let wanted = vec![Wanted {
+            service: "db".into(),
+            port: 1,
+            healthcheck: false,
+        }];
+        let started = Instant::now();
+        let err = format!(
+            "{:#}",
+            wait_ready(&compose, &wanted, Duration::from_secs(30), &|_| {}).unwrap_err()
+        );
+        assert!(err.contains("exited before it was ready"), "{err}");
+        assert!(err.contains("logs db"), "and where to read why: {err}");
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "it did not wait"

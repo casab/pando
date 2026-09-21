@@ -183,8 +183,14 @@ fn up_wait_pump_stop_and_down_make_exactly_the_invocations_they_should() {
     assert!(docker::was_downed(&h.home, PROJECT));
 
     let seen = docker::invocations_for(&h.home, PROJECT);
+    // `ps` is the one invocation whose count depends on how fast the
+    // containers came up, so it is asserted separately; everything else is
+    // exact, because the difference between `down` and `down -v` is a
+    // database somebody wanted kept.
+    let (checks, acted): (Vec<String>, Vec<String>) =
+        seen.iter().cloned().partition(|line| line.contains(" ps "));
     assert_eq!(
-        seen,
+        acted,
         vec![
             format!(
                 "compose -p {PROJECT} -f docker-compose.yml -f feat+one.override.yml up -d postgres redis"
@@ -195,7 +201,11 @@ fn up_wait_pump_stop_and_down_make_exactly_the_invocations_they_should() {
             format!("compose -p {PROJECT} -f docker-compose.yml -f feat+one.override.yml stop"),
             format!("compose -p {PROJECT} -f docker-compose.yml -f feat+one.override.yml down -v"),
         ],
-        "readiness by connect must ask docker nothing at all"
+    );
+    assert!(
+        !checks.is_empty(),
+        "even a connect-based wait asks `ps` on a slow beat, so a container \
+         that died is noticed rather than waited out: {seen:?}"
     );
 }
 

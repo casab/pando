@@ -391,9 +391,15 @@ fn files_for(kind: Kind) -> Vec<(&'static str, &'static str)> {
             ),
             (
                 "docker-compose.yml",
+                // The password is what makes this file one docker can
+                // really bring up: the official postgres image refuses to
+                // initialise without one, so a fixture that leaves it out
+                // cannot be started by hand or by the demo.
                 r#"services:
   postgres:
     image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: acme
     ports: ["5432:5432"]
   redis:
     image: redis:7
