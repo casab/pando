@@ -1808,13 +1808,16 @@ fn services_proposal(
             );
         }
     }
-    // Every service in the file is this project's own. There is nothing to
-    // ask — a question whose only answer is wrong is worse than silence —
-    // but the *answer* still has to be written down, or the next start
-    // works it out again and a developer reading the file never learns
-    // that pando looked. It is the same empty answer a developer gives by
-    // declining the question, recorded the same way: an entry naming the
-    // file with an empty `include`.
+    // Nothing to offer, for one of two reasons: every service in the file
+    // is this project's own, or nothing in the env example addresses any
+    // of them and none of their images is one an app talks to. Either way
+    // there is nothing to ask — a question whose only answer is wrong is
+    // worse than silence — and either way the *answer* still has to be
+    // written down, or the next start works it out again and a developer
+    // reading the file never learns that pando looked. It is the same
+    // empty answer a developer gives by declining the question, recorded
+    // the same way: an entry naming the file with an empty `include`. One
+    // shape for "none", not two.
     //
     // Unless pando could not read the file whole. "Half a file read is not
     // a proposal" applies hardest here: a top-level `include:` brings in
@@ -1822,22 +1825,33 @@ fn services_proposal(
     // a file pando has not finished reading would answer the slot for good
     // — silencing, permanently, whatever the next run with Docker present
     // would have found. Nothing is written, and it is asked again.
-    if candidates.is_empty() {
+    // `resolved` is already false when a key went unfollowed, so the
+    // empty-candidates case is spelled out rather than folded in: a file
+    // whose every service is built here *and* carries an `extends:` must
+    // still reach the refusal below, not fall through to a proposal with
+    // nothing in it.
+    if candidates.is_empty() || (candidates.iter().all(|c| !c.preselected) && resolved) {
         if parsed.unresolved.any() {
             return None;
         }
+        let built = listed(&built_here.iter().map(String::as_str).collect::<Vec<_>>());
+        let unaddressed = listed(
+            &candidates
+                .iter()
+                .map(|c| c.value.as_str())
+                .collect::<Vec<_>>(),
+        );
         let mut proposal = Proposal::of(Slot::Services, Vec::new(), true);
-        proposal.none_because = Some(format!(
-            "{file} declares only {}, built from this repository",
-            listed(&built_here.iter().map(String::as_str).collect::<Vec<_>>())
-        ));
+        proposal.none_because = Some(match (candidates.is_empty(), built_here.is_empty()) {
+            (true, _) => format!("{file} declares only {built}, built from this repository"),
+            (false, true) => format!("nothing in the env example addresses {unaddressed}"),
+            (false, false) => format!(
+                "nothing in the env example addresses {unaddressed}, and {built} is built \
+                 from this repository"
+            ),
+        });
         proposal.file = Some(file);
         return Some(proposal);
-    }
-    // Nothing to propose when no service resolved at all: a compose file
-    // full of things pando cannot address is not an isolation offer.
-    if candidates.iter().all(|c| !c.preselected) && resolved {
-        return None;
     }
     Some(Proposal::of(Slot::Services, candidates, resolved))
 }
@@ -3338,6 +3352,37 @@ services:
             .expect("a reason for the empty answer");
         assert!(why.contains("web and worker"), "{why}");
         assert!(why.contains("built from this repository"), "{why}");
+    }
+
+    // The other way a compose file has nothing to offer: pando can address
+    // none of what is in it. That used to propose nothing and record
+    // nothing, so it was worked out again on every start — the same
+    // re-ask-forever shape a filtered-out app had. One shape for "none".
+    #[test]
+    fn a_file_of_services_nothing_addresses_is_answered_without_being_asked() {
+        let (dir, signals) = compose_fixture(
+            r#"
+services:
+  mailpit:
+    image: axllent/mailpit
+    ports: ["1025:1025"]
+  dashboard:
+    image: grafana/grafana
+"#,
+            &[("PORT", "3000")],
+        );
+        let proposal = services_proposal(dir.path(), &signals, None).unwrap();
+        assert!(proposal.candidates.is_empty());
+        assert!(proposal.decided);
+        assert_eq!(proposal.service_file(), Some("docker-compose.yml"));
+        let why = proposal
+            .none_because
+            .expect("a reason for the empty answer");
+        assert!(why.contains("dashboard and mailpit"), "{why}");
+        assert!(
+            why.contains("nothing in the env example addresses"),
+            "{why}"
+        );
     }
 
     // The empty answer is permanent — `already_answered` is true from then
