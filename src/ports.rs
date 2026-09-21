@@ -486,7 +486,15 @@ mod tests {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
-        assert!(is_port_free(port));
+        // Bounded, not instant, for the reason the test above gives: this
+        // is an ephemeral port, every other test in the binary is taking
+        // and releasing those, and another thread's probe binds three
+        // addresses at a time. What is being pinned is that a released
+        // port reads as free, not how many microseconds that takes.
+        assert!(
+            crate::testutil::wait_until(std::time::Duration::from_secs(10), || is_port_free(port)),
+            "a released port on a machine without IPv6 must still read as free"
+        );
     }
 
     #[test]
