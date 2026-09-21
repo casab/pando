@@ -38,8 +38,17 @@ fn detected(root: &Path) -> (Config, Vec<Proposal>) {
             if !proposal.decided {
                 asked.push(proposal.clone());
             }
-            if let Some(file) = proposal.service_file() {
-                detect::apply_services(file, &proposal.preferred_set(), &mut config);
+            let chosen = proposal.preferred_set();
+            match proposal.mechanism {
+                // A native answer is one entry per service; a compose
+                // answer is one entry naming the file, which is why the
+                // empty set still writes something there and nothing here.
+                Some("native") => detect::apply_native_services(&chosen, &mut config),
+                _ => {
+                    if let Some(file) = proposal.service_file() {
+                        detect::apply_services(file, &chosen, &mut config);
+                    }
+                }
             }
             continue;
         }
@@ -389,4 +398,127 @@ fn signals_carry_the_runtime_a_fixture_asks_for() {
         detect::signals(&root).runtime_requirements.is_empty(),
         "a Go service with no version file states no requirement"
     );
+}
+
+// ---- the hard shapes -----------------------------------------------------
+//
+// The corpus *is* pando's validation: real repositories are off limits
+// without exception, and a corpus of tidy shapes validates nothing,
+// because tidy is not what a first run meets. What `expected_config`
+// cannot express is the other half of an answer — which slots these
+// shapes leave as a *question* — so it is asserted here.
+
+#[test]
+fn each_hard_shape_asks_exactly_what_it_should() {
+    for (kind, expected) in [
+        // Several apps and no workspace file: whether this is one
+        // process or one per app is the developer's call, not a rule's.
+        (Kind::WorkspaceNoLock, vec![Slot::Processes]),
+        // Two app ports named in the env example, and a dev script
+        // that takes neither on the command line. Which of them the one
+        // process serves on — or whether it serves on both — is a
+        // question, and the pre-ticked answer is both.
+        (Kind::EnvPorts, vec![Slot::PortEnv]),
+        // One compose service, built from this repository. There is
+        // nothing to offer and nothing to ask.
+        (Kind::ComposeAppOnly, vec![]),
+        (Kind::PinnedRuntime, vec![]),
+        // The addresses name the engines, so the recipes are decided.
+        (Kind::ServicesNoManifest, vec![]),
+        // Seeding a worktree's `.env` from an example is a copy of a
+        // tracked file into a worktree, which is a write nobody has
+        // authorised yet — so it is asked rather than taken, and `--yes`
+        // declines it.
+        (Kind::EnvNeverArrived, vec![Slot::Provision]),
+    ] {
+        let (_dir, root) = fixture(kind);
+        let (_, asked) = detected(&root);
+        let slots: Vec<Slot> = asked.iter().map(|p| p.slot).collect();
+        assert_eq!(slots, expected, "{} asked the wrong slots", kind.dir_name());
+    }
+}
+
+// A project with no lockfile has no frozen install to propose, and pando
+// never proposes a non-frozen one. Silence is the answer, not a guess.
+#[test]
+fn a_workspace_with_no_lockfile_proposes_no_install_at_all() {
+    let (_dir, root) = fixture(Kind::WorkspaceNoLock);
+    let signals = detect::signals(&root);
+    assert!(signals.lockfiles.is_empty(), "{:?}", signals.lockfiles);
+    let (config, _) = detected(&root);
+    assert_eq!(config.project.install, None);
+    assert!(
+        detect::propose(&root, &signals)
+            .iter()
+            .all(|p| p.slot != Slot::Install),
+        "an install was proposed with no lockfile to freeze"
+    );
+}
+
+// The build-from-this-repository filter, at the only shape where it is
+// the whole answer: a compose file that packages the application and
+// nothing else. The negative is recorded so the question does not come
+// back on every isolated start.
+#[test]
+fn a_compose_file_that_only_packages_the_app_records_the_negative() {
+    let (_dir, root) = fixture(Kind::ComposeAppOnly);
+    let signals = detect::signals(&root);
+    let services = detect::propose(&root, &signals)
+        .into_iter()
+        .find(|p| p.slot == Slot::Services)
+        .expect("a services proposal");
+    assert!(services.decided, "there is nothing here to ask about");
+    assert!(services.candidates.is_empty());
+    assert_eq!(services.service_file(), Some("docker-compose.yml"));
+    assert!(
+        services
+            .none_because
+            .as_deref()
+            .unwrap_or_default()
+            .contains("built from this repository"),
+        "{:?}",
+        services.none_because
+    );
+}
+
+// The shape Phase 6 exists for. No compose file means there is no
+// container option to weigh, so the preference never comes into it and
+// the engines come from what the app's own addresses say.
+#[test]
+fn a_project_that_needs_services_with_no_manifest_gets_recipes() {
+    let (_dir, root) = fixture(Kind::ServicesNoManifest);
+    let signals = detect::signals(&root);
+    let services = detect::propose(&root, &signals)
+        .into_iter()
+        .find(|p| p.slot == Slot::Services)
+        .expect("a services proposal");
+    assert_eq!(services.mechanism, Some("native"));
+    let names: Vec<&str> = services
+        .candidates
+        .iter()
+        .map(|c| c.value.as_str())
+        .collect();
+    assert_eq!(names, vec!["postgres", "redis"]);
+    let evidence = services.evidence.join(" | ");
+    assert!(evidence.contains("no compose file"), "{evidence}");
+    assert!(evidence.contains("postgres and redis"), "{evidence}");
+}
+
+// A pin no machine resolves, and an `engines` range that disagrees with
+// it. Both are recorded, the pin first, which is what "a pinned file
+// beats a range" means where it matters.
+#[test]
+fn a_pinned_runtime_and_a_range_that_disagrees_are_both_recorded() {
+    let (_dir, root) = fixture(Kind::PinnedRuntime);
+    let signals = detect::signals(&root);
+    let node: Vec<&pando::runtime::Requirement> = signals
+        .runtime_requirements
+        .iter()
+        .filter(|r| r.language == "node")
+        .collect();
+    assert_eq!(node.len(), 2, "{node:?}");
+    assert_eq!(node[0].spec, "99.0.0", "the pin sorts first");
+    assert!(node[0].pinned);
+    assert_eq!(node[1].spec, ">=18 <21");
+    assert!(!node[1].pinned);
 }

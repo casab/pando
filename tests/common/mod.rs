@@ -9,6 +9,7 @@
 pub mod docker;
 pub mod postgres;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -87,6 +88,34 @@ pub enum Kind {
     /// The Next fixture with deliberate ambiguity in scripts, ports, and
     /// service names.
     NextMessy,
+
+    // The hard shapes. Every one of them is a real pattern described
+    // generically — a shape, never a project. They exist because the
+    // corpus *is* pando's validation: real repositories are off limits,
+    // and a corpus of tidy shapes validates nothing, since tidy is not
+    // what a first run meets.
+    /// Several apps under `apps/`, workspaces declared with
+    /// `package.json`'s own `workspaces` key rather than a workspace
+    /// file, and no lockfile at all.
+    WorkspaceNoLock,
+    /// Ports declared only in the env example — two the app serves on,
+    /// two its services listen on — with a dev script that reads them
+    /// from the environment rather than taking a flag.
+    EnvPorts,
+    /// A compose file that packages only the application: one service
+    /// built from this repository, with a bind mount and a healthcheck,
+    /// and every database entry commented out.
+    ComposeAppOnly,
+    /// A version file pinning a runtime no machine will have, and an
+    /// `engines` range that disagrees with it.
+    PinnedRuntime,
+    /// A project that needs services with no manifest describing them:
+    /// the env example names a database and a cache, and nothing in the
+    /// repository says how to run either.
+    ServicesNoManifest,
+    /// A gitignored env file that never arrived, with the example beside
+    /// it.
+    EnvNeverArrived,
 }
 
 impl Kind {
@@ -99,6 +128,12 @@ impl Kind {
             "rust-lib" => Kind::RustLib,
             "mono-web-api" => Kind::MonoWebApi,
             "next-messy" => Kind::NextMessy,
+            "workspace-no-lock" => Kind::WorkspaceNoLock,
+            "env-ports" => Kind::EnvPorts,
+            "compose-app-only" => Kind::ComposeAppOnly,
+            "pinned-runtime" => Kind::PinnedRuntime,
+            "services-no-manifest" => Kind::ServicesNoManifest,
+            "env-never-arrived" => Kind::EnvNeverArrived,
             _ => return None,
         })
     }
@@ -112,6 +147,12 @@ impl Kind {
             Kind::RustLib => "rust-lib",
             Kind::MonoWebApi => "mono-web-api",
             Kind::NextMessy => "next-messy",
+            Kind::WorkspaceNoLock => "workspace-no-lock",
+            Kind::EnvPorts => "env-ports",
+            Kind::ComposeAppOnly => "compose-app-only",
+            Kind::PinnedRuntime => "pinned-runtime",
+            Kind::ServicesNoManifest => "services-no-manifest",
+            Kind::EnvNeverArrived => "env-never-arrived",
         }
     }
 
@@ -201,6 +242,131 @@ impl Kind {
             // Level zero: a library has nothing to serve, so detection
             // proposes nothing and asks nothing.
             Kind::RustLib => {}
+            // A workspace declared with `package.json`'s own
+            // `workspaces` key, and no lockfile anywhere. Two facts:
+            // `apps/*` is found and becomes a process per app — which is
+            // a question, not a decision, so the shape is asked about —
+            // and with no lockfile there is no frozen install to
+            // propose, so the slot stays silent rather than guessing.
+            Kind::WorkspaceNoLock => {
+                config.project.provision = Some(strings(&[".env"]));
+                for app in ["api", "web"] {
+                    config.processes.insert(
+                        app.to_string(),
+                        ProcessConfig {
+                            cmd: "npm run dev".to_string(),
+                            ports: Some(PortsSpec::List(strings(&[app]))),
+                            cwd: Some(format!("apps/{app}")),
+                            env: BTreeMap::from([("PORT".to_string(), format!("{{port:{app}}}"))]),
+                            ready: Some(ReadySpec {
+                                role: Some(app.to_string()),
+                                timeout_s: None,
+                            }),
+                        },
+                    );
+                }
+            }
+            // Ports declared only in the env example: two the app serves
+            // on and two its services listen on. The env example beats
+            // the framework guess, one project gives two app roles, and
+            // the two service addresses become native recipes because
+            // nothing in the repository says how to run them.
+            Kind::EnvPorts => {
+                config.project.install = Some("npm ci".to_string());
+                config.project.provision = Some(strings(&[".env"]));
+                config.processes.insert(
+                    "dev".to_string(),
+                    ProcessConfig {
+                        cmd: "npm run dev".to_string(),
+                        ports: Some(PortsSpec::Map(BTreeMap::from([
+                            ("ADMIN_PORT".to_string(), "admin".to_string()),
+                            ("WEB_PORT".to_string(), "web".to_string()),
+                        ]))),
+                        ..Default::default()
+                    },
+                );
+                config
+                    .services
+                    .push(native_service("postgres", "DATABASE_URL"));
+                config.services.push(native_service("redis", "CACHE_URL"));
+            }
+            // A compose file that packages only the application. The
+            // build-from-this-repository filter leaves nothing to offer,
+            // and the recorded negative — an entry naming the file with
+            // an empty `include` — is what stops the question coming
+            // back on every isolated start.
+            Kind::ComposeAppOnly => {
+                config.project.install = Some("npm ci".to_string());
+                config.project.provision = Some(strings(&[".env"]));
+                config.processes.insert(
+                    "dev".to_string(),
+                    ProcessConfig {
+                        cmd: "npm run dev".to_string(),
+                        ports: Some(port_env("PORT")),
+                        ..Default::default()
+                    },
+                );
+                config.services.push(ServiceConfig::Compose {
+                    file: "docker-compose.yml".to_string(),
+                    include: Vec::new(),
+                    env: BTreeMap::new(),
+                    ready_timeout_s: None,
+                });
+            }
+            // A pinned runtime no machine resolves, and an `engines`
+            // range that disagrees with it. Detection records which file
+            // pins it; the disagreement is the runtime check's business,
+            // and the refusal happens before the first spawn.
+            Kind::PinnedRuntime => {
+                config.project.install = Some("npm ci".to_string());
+                config.project.provision = Some(strings(&[".env"]));
+                config.runtime.version_files = strings(&[".nvmrc"]);
+                config.processes.insert(
+                    "dev".to_string(),
+                    ProcessConfig {
+                        cmd: "npm run dev".to_string(),
+                        ports: Some(port_env("PORT")),
+                        ..Default::default()
+                    },
+                );
+            }
+            // The shape Phase 6 exists for: a database and a cache the
+            // app plainly talks to, and not one file saying how either
+            // is run. No compose file means no container option at all,
+            // so the recipes are proposed without a preference being
+            // needed to break any tie.
+            Kind::ServicesNoManifest => {
+                config.project.install = Some("npm ci".to_string());
+                config.project.provision = Some(strings(&[".env"]));
+                config.processes.insert(
+                    "dev".to_string(),
+                    ProcessConfig {
+                        cmd: "npm run dev".to_string(),
+                        ports: Some(port_env("PORT")),
+                        ..Default::default()
+                    },
+                );
+                config
+                    .services
+                    .push(native_service("postgres", "DATABASE_URL"));
+                config.services.push(native_service("redis", "CACHE_URL"));
+            }
+            // A gitignored env that never arrived. There is no manifest
+            // and no script, so the dev command stays empty and is
+            // asked about; what the shape is really for is the seed —
+            // `.env` from `.env.example`, recorded as a copy.
+            Kind::EnvNeverArrived => {
+                config.project.provision = Some(strings(&[".env"]));
+                config.project.provision_from =
+                    BTreeMap::from([(".env".to_string(), ".env.example".to_string())]);
+                config.processes.insert(
+                    "dev".to_string(),
+                    ProcessConfig {
+                        ports: Some(port_env("PORT")),
+                        ..Default::default()
+                    },
+                );
+            }
             Kind::MonoWebApi => {
                 config.project.install = Some("pnpm install --frozen-lockfile".to_string());
                 config.project.provision = Some(strings(&[".env"]));
@@ -254,7 +420,7 @@ impl Kind {
         config
     }
 
-    pub const ALL: [Kind; 7] = [
+    pub const ALL: [Kind; 13] = [
         Kind::Plain,
         Kind::NextPnpmCompose,
         Kind::DjangoUvPostgres,
@@ -262,6 +428,12 @@ impl Kind {
         Kind::RustLib,
         Kind::MonoWebApi,
         Kind::NextMessy,
+        Kind::WorkspaceNoLock,
+        Kind::EnvPorts,
+        Kind::ComposeAppOnly,
+        Kind::PinnedRuntime,
+        Kind::ServicesNoManifest,
+        Kind::EnvNeverArrived,
     ];
 }
 
@@ -377,6 +549,21 @@ const PNPM_LOCK_WORKSPACE: &str = "lockfileVersion: '9.0'\n\nsettings:\n  autoIn
      apps/web: {}\n";
 
 /// Tracked files, written before the initial commit.
+/// The `[[services]] kind = "native"` entry a detected address writes:
+/// the recipe is implied by the name, and the env key points at it.
+fn native_service(name: &str, env_key: &str) -> ServiceConfig {
+    ServiceConfig::Native {
+        name: name.to_string(),
+        preset: None,
+        port_env: None,
+        init: None,
+        cmd: None,
+        ready: None,
+        ready_timeout_s: None,
+        env: BTreeMap::from([(env_key.to_string(), name.to_string())]),
+    }
+}
+
 fn files_for(kind: Kind) -> Vec<(&'static str, &'static str)> {
     match kind {
         Kind::Plain => vec![
@@ -541,6 +728,132 @@ func main() {
             ),
             (".gitignore", ".env\nnode_modules/\ndist/\n"),
         ],
+        Kind::WorkspaceNoLock => vec![
+            (".gitignore", ".env\nnode_modules/\n"),
+            (
+                "package.json",
+                r#"{
+  "name": "workspace-no-lock",
+  "private": true,
+  "workspaces": ["apps/*"],
+  "scripts": {
+    "dev": "npm run dev --workspaces"
+  }
+}
+"#,
+            ),
+            (
+                "apps/web/package.json",
+                "{\n  \"name\": \"web\",\n  \"scripts\": { \"dev\": \"node server.js\" }\n}\n",
+            ),
+            (
+                "apps/api/package.json",
+                "{\n  \"name\": \"api\",\n  \"scripts\": { \"dev\": \"node server.js\" }\n}\n",
+            ),
+            ("apps/web/server.js", "// a server\n"),
+            ("apps/api/server.js", "// a server\n"),
+            (".env.example", "WEB_PORT=3000\nAPI_PORT=3001\n"),
+        ],
+        Kind::EnvPorts => vec![
+            (".gitignore", ".env\nnode_modules/\n"),
+            (
+                "package.json",
+                r#"{
+  "name": "env-ports",
+  "scripts": {
+    "dev": "node server.js"
+  }
+}
+"#,
+            ),
+            ("package-lock.json", "{\n  \"lockfileVersion\": 3\n}\n"),
+            (
+                "server.js",
+                "// reads WEB_PORT and ADMIN_PORT from the environment\n",
+            ),
+            (
+                ".env.example",
+                "WEB_PORT=3000\nADMIN_PORT=3001\n\
+                 DATABASE_URL=postgres://user:pass@localhost:5432/appdb\n\
+                 CACHE_URL=redis://localhost:6379\n",
+            ),
+        ],
+        Kind::ComposeAppOnly => vec![
+            (".gitignore", ".env\nnode_modules/\n"),
+            (
+                "package.json",
+                "{\n  \"name\": \"compose-app-only\",\n  \
+                 \"scripts\": { \"dev\": \"node server.js\" }\n}\n",
+            ),
+            ("package-lock.json", "{\n  \"lockfileVersion\": 3\n}\n"),
+            ("server.js", "// a server\n"),
+            ("Dockerfile", "FROM scratch\n"),
+            (
+                "docker-compose.yml",
+                r#"services:
+  app:
+    build: .
+    volumes:
+      - .:/srv
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD", "true"]
+      interval: 5s
+  # db:
+  #   image: postgres:16
+  # cache:
+  #   image: redis:7
+"#,
+            ),
+            (".env.example", "PORT=3000\n"),
+        ],
+        Kind::PinnedRuntime => vec![
+            (".gitignore", ".env\nnode_modules/\n"),
+            // A version nothing will ever resolve, so the refusal path is
+            // exercised without depending on what the host has installed.
+            (".nvmrc", "99.0.0\n"),
+            (
+                "package.json",
+                r#"{
+  "name": "pinned-runtime",
+  "engines": { "node": ">=18 <21" },
+  "scripts": {
+    "dev": "node server.js"
+  }
+}
+"#,
+            ),
+            ("package-lock.json", "{\n  \"lockfileVersion\": 3\n}\n"),
+            ("server.js", "// a server\n"),
+            (".env.example", "PORT=3000\n"),
+        ],
+        Kind::ServicesNoManifest => vec![
+            (".gitignore", ".env\nnode_modules/\n"),
+            (
+                "package.json",
+                "{\n  \"name\": \"services-no-manifest\",\n  \
+                 \"scripts\": { \"dev\": \"node server.js\" }\n}\n",
+            ),
+            ("package-lock.json", "{\n  \"lockfileVersion\": 3\n}\n"),
+            ("server.js", "// a server\n"),
+            // A database and a cache the app plainly talks to, and not one
+            // file in the repository saying how either of them is run.
+            (
+                ".env.example",
+                "PORT=3000\n\
+                 DATABASE_URL=postgres://user:pass@localhost:5432/appdb\n\
+                 CACHE_URL=redis://localhost:6379\n",
+            ),
+        ],
+        Kind::EnvNeverArrived => vec![
+            (".gitignore", ".env\n"),
+            (
+                "README.md",
+                "# a repository whose .env never arrives with a clone\n",
+            ),
+            (".env.example", "PORT=3000\nSECRET=replace-me\n"),
+        ],
         Kind::NextMessy => vec![
             (
                 "package.json",
@@ -608,6 +921,21 @@ fn ignored_files_for(kind: Kind) -> Vec<(&'static str, &'static str)> {
             ".env",
             "WEB_PORT=5173\nAPI_PORT=4000\nVITE_API_URL=http://localhost:4000\n",
         )],
+        Kind::WorkspaceNoLock => vec![(".env", "WEB_PORT=3000\nAPI_PORT=3001\n")],
+        Kind::EnvPorts => vec![(
+            ".env",
+            "WEB_PORT=3000\nADMIN_PORT=3001\n\
+             DATABASE_URL=postgres://user:pass@localhost:5432/appdb\n\
+             CACHE_URL=redis://localhost:6379\n",
+        )],
+        Kind::ComposeAppOnly | Kind::PinnedRuntime => vec![(".env", "PORT=3000\n")],
+        Kind::ServicesNoManifest => vec![(
+            ".env",
+            "PORT=3000\nDATABASE_URL=postgres://user:pass@localhost:5432/appdb\n\
+             CACHE_URL=redis://localhost:6379\n",
+        )],
+        // The whole point of this one: the ignored file never arrived.
+        Kind::EnvNeverArrived => vec![],
         Kind::GoService | Kind::RustLib => vec![],
     }
 }
