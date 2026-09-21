@@ -368,8 +368,23 @@ fn render_log_viewer(f: &mut Frame, area: Rect, app: &mut App) {
     let status = app.active_status().map(|(m, e)| (m.to_string(), e));
     let Some(view) = app.log_view() else { return };
 
+    // The tab list is read here, every frame, so a hook that has just run
+    // gets a tab and one that never ran never does. It is a `read_dir` of
+    // pando's own log directory: no git, no network, nothing forked.
+    let mut sources = app.log_sources(&view.name);
+    // The file behind the current tab can go away while the viewer is on
+    // it — a `rm`, a `start` that has not written yet, a stray `rm -rf`.
+    // The source stays in the list either way, because that list is what
+    // `tab` walks: drop it and, with one source left, `tab` is a no-op and
+    // nothing can leave the dead tab but closing the viewer.
+    let gone = !view.missing && !sources.contains(&view.source);
+    if !sources.contains(&view.source) {
+        sources.push(view.source.clone());
+    }
+
     let suffix = match app.phase_of(&view.name).map(|p| p.word()) {
         _ if view.missing => " (no log yet)",
+        _ if gone => " (log deleted)",
         Some("running") => "",
         Some(_) => " (not running)",
         None => " (not running)",
@@ -389,10 +404,6 @@ fn render_log_viewer(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    // The tab list is read here, every frame, so a hook that has just run
-    // gets a tab and one that never ran never does. It is a `read_dir` of
-    // pando's own log directory: no git, no network, nothing forked.
-    let sources = app.log_sources(&view.name);
     let has_tabs = sources.len() > 1;
     let (tab_area, content) = if has_tabs {
         let [tabs, rest] =
@@ -597,7 +608,15 @@ fn viewer_rows(
     // An empty body looks the same whether there is no output, the filter
     // hid everything, or the paint is broken. Say which.
     if rows.is_empty() {
-        let placeholder = if view.tail.lines().is_empty() {
+        // The collapse is checked first: with a query that matches
+        // nothing, the level filter is not what emptied the body and `f`
+        // cannot bring anything back.
+        let placeholder = if view.collapsed() {
+            format!(
+                "  no line matches `{}` — & expands, esc clears",
+                view.search.query
+            )
+        } else if view.tail.lines().is_empty() {
             "  waiting for output…".to_string()
         } else {
             format!(
@@ -1049,6 +1068,13 @@ fn viewer_footer(
         SearchMode::Inactive => {}
     }
 
+    // `new_below` counts the lines that arrived below a scrolled-back
+    // viewport, and nothing reduces it when the ring buffer evicts those
+    // very lines — so the badge could offer a jump to more lines than the
+    // buffer holds. What it may claim is what is under the cursor now.
+    let new_below = view
+        .new_below
+        .min(counts.visible.saturating_sub(cursor + 1));
     let (badge, badge_style) = if let Some(count) = view.count_prefix {
         (
             count.to_string(),
@@ -1059,9 +1085,9 @@ fn viewer_footer(
             "FOLLOW ●".to_string(),
             Style::new().fg(green()).add_modifier(Modifier::BOLD),
         )
-    } else if view.new_below > 0 {
+    } else if new_below > 0 {
         (
-            format!("↓ {} new (G)", view.new_below),
+            format!("↓ {new_below} new (G)"),
             Style::new().fg(orange()).add_modifier(Modifier::BOLD),
         )
     } else if counts.visible == 0 {
@@ -2707,6 +2733,94 @@ mod tests {
         let painted = text_of(&draw(&mut app, 80, 12));
         assert!(!painted.contains("copied"), "{painted}");
         assert!(painted.contains("j/k move"), "{painted}");
+    }
+
+    // Phase 2c review, finding 4. The tab list is rebuilt from disk every
+    // paint, so a deleted file drops out of it — and the viewer was left
+    // on a tab that no longer existed, with `tab` a no-op because only one
+    // source was left. The only way out was to close the viewer.
+    #[test]
+    fn a_source_whose_file_is_deleted_keeps_its_tab_and_says_the_file_is_gone() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["one"]);
+        write_log(&app, "feat+one", "install", &["two"]);
+        app.open_log_viewer();
+        draw(&mut app, 80, 12);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        draw(&mut app, 80, 12);
+        assert_eq!(
+            app.log_view().expect("the viewer is open").source,
+            "install"
+        );
+
+        std::fs::remove_file(app.paths.log_file("feat+one", "install")).unwrap();
+        let painted = text_of(&draw(&mut app, 80, 12));
+        assert!(
+            painted.contains("log deleted"),
+            "the title has to say the file is gone:\n{painted}"
+        );
+        assert!(
+            painted.contains("2:install"),
+            "and the tab has to stay, or nothing can leave it:\n{painted}"
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        draw(&mut app, 80, 12);
+        assert_eq!(
+            app.log_view().expect("the viewer is open").source,
+            "dev",
+            "tab leaves the dead source"
+        );
+    }
+
+    // Phase 2c review, finding 6. `&` collapses to the search matches; with
+    // none, the empty body blamed the level filter — while the filter was
+    // `all` and `f` could not have helped.
+    #[test]
+    fn a_grep_collapse_with_no_matches_says_the_query_matched_nothing() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["one", "two"]);
+        app.open_log_viewer();
+        draw(&mut app, 80, 12);
+        for key in ['/', 'z', 'z', 'z', 'z'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('&'), KeyModifiers::NONE));
+
+        let painted = text_of(&draw(&mut app, 80, 12));
+        assert!(
+            painted.contains("no line matches"),
+            "the query is what hid them:\n{painted}"
+        );
+        assert!(
+            !painted.contains("press f to change the filter"),
+            "the level filter is `all`, so `f` cannot help:\n{painted}"
+        );
+    }
+
+    // Phase 2c review, finding 7. `new_below` counts arrivals and is never
+    // reduced when the ring evicts the very lines it counted, so the badge
+    // offered to jump to more lines than the buffer holds.
+    #[test]
+    fn the_new_below_badge_counts_no_more_than_the_lines_under_the_cursor() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        write_log(&app, "feat+one", "dev", &["a", "b", "c", "d", "e"]);
+        app.open_log_viewer();
+        draw(&mut app, 80, 12);
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        // What twenty ticks of appends into a full ring buffer leave
+        // behind: a count of arrivals with nothing like that many lines
+        // below the cursor any more.
+        app.log_view_mut().expect("the viewer is open").new_below = 999;
+
+        let painted = text_of(&draw(&mut app, 80, 12));
+        assert!(
+            painted.contains("↓ 3 new"),
+            "three lines are below the cursor:\n{painted}"
+        );
+        assert!(!painted.contains("999"), "{painted}");
     }
 
     #[test]

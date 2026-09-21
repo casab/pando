@@ -1588,8 +1588,17 @@ impl App {
         let Some(view) = self.log_view_mut() else {
             return false;
         };
+        // The viewer is most often opened on a source whose file does not
+        // exist yet — before `start`, or while it is still installing. One
+        // `exists` per tick is what turns that into a live tail the moment
+        // the process writes its first line, instead of a pane that says
+        // `no log file for this source yet` until it is reopened.
         if view.missing {
-            return false;
+            if !view.tail.path().exists() {
+                return false;
+            }
+            view.missing = false;
+            view.follow = true;
         }
         let before = view.tail.lines().len();
         let grew = view.tail.poll().unwrap_or(false);
@@ -3594,8 +3603,32 @@ pub mod tests {
         open_viewer(&mut app, 80, 20);
         let view = viewer(&app);
         assert!(view.missing);
-        assert!(view.available.is_empty());
+        assert_eq!(
+            view.available,
+            vec!["dev".to_string()],
+            "the source on screen is always in the tab list, file or no file, \
+             so `tab` can leave it"
+        );
         assert!(!view.follow, "nothing to follow");
+    }
+
+    // Phase 2c review, finding 5. `poll_viewer` returned early while
+    // `missing`, so a viewer opened before `start` had written anything —
+    // the common case — stayed on `no log file for this source yet` for as
+    // long as it was open.
+    #[test]
+    fn a_log_that_appears_after_the_viewer_opened_is_picked_up_on_the_next_tick() {
+        let (_dir, mut app) = app_with_logs(&["feat+one"]);
+        open_viewer(&mut app, 80, 20);
+        assert!(viewer(&app).missing);
+
+        write_log(&app, "feat+one", "dev", &["listening on 17342"]);
+        app.handle_event(AppEvent::Tick);
+
+        let view = viewer(&app);
+        assert!(!view.missing, "the file is there now");
+        assert!(view.follow, "and a viewer that has nothing yet follows it");
+        assert_eq!(view.tail.lines().len(), 1, "read on the same tick");
     }
 
     #[test]
