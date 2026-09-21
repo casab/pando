@@ -49,10 +49,10 @@ impl Iso {
 /// Nothing this test started outlives it, containers included.
 impl Drop for Iso {
     fn drop(&mut self) {
-        let _ = actions::stop_all(&self.paths);
+        let _ = actions::stop_all(&self.paths, &|_| {});
         if let Ok(store) = state::load(&self.paths.state_file()) {
             for name in store.worktrees.keys() {
-                let _ = actions::rm(&self.paths, name, true, true);
+                let _ = actions::rm(&self.paths, name, true, true, &|_| {});
             }
         }
     }
@@ -213,7 +213,7 @@ fn a_later_plain_start_keeps_the_services_and_the_mode() {
     let first = start_isolated(&f, &name);
     let up = docker::services_up(&f.home, &f.project(&name));
 
-    actions::stop(&f.paths, &name, None).unwrap();
+    actions::stop(&f.paths, &name, None, &|_| {}).unwrap();
     // A plain start, with no flag at all: the worktree remembers.
     let second = actions::start(&f.paths, &f.config, &name, None, false, &|_| {}).unwrap();
     assert_eq!(second.ports, first.ports, "the ports do not move");
@@ -288,7 +288,7 @@ fn stop_takes_the_processes_and_the_services_down_together() {
     start_isolated(&f, &name);
     let pump = f.service(&name, "postgres").pid.unwrap();
 
-    actions::stop(&f.paths, &name, None).unwrap();
+    actions::stop(&f.paths, &name, None, &|_| {}).unwrap();
     let record = f.record(&name);
     assert!(record.processes.is_empty(), "the dev process is gone");
     assert!(
@@ -321,14 +321,14 @@ fn stop_only_a_process_that_is_not_running_leaves_the_services_alone() {
     assert_eq!(up.len(), 2);
 
     // Correct today: one process down, the services left serving.
-    actions::stop(&f.paths, &name, Some("dev")).unwrap();
+    actions::stop(&f.paths, &name, Some("dev"), &|_| {}).unwrap();
     assert_eq!(docker::services_up(&f.home, &f.project(&name)), up);
 
     // And a name the worktree is not running is an error, not a silent
     // whole-worktree stop.
     let err = format!(
         "{:#}",
-        actions::stop(&f.paths, &name, Some("nosuchprocess")).unwrap_err()
+        actions::stop(&f.paths, &name, Some("nosuchprocess"), &|_| {}).unwrap_err()
     );
     assert!(err.contains("nosuchprocess"), "{err}");
     assert_eq!(
@@ -338,7 +338,7 @@ fn stop_only_a_process_that_is_not_running_leaves_the_services_alone() {
     );
 
     // The whole-worktree form still does take them down.
-    actions::stop(&f.paths, &name, None).unwrap();
+    actions::stop(&f.paths, &name, None, &|_| {}).unwrap();
     assert!(docker::services_up(&f.home, &f.project(&name)).is_empty());
 }
 
@@ -378,7 +378,7 @@ fn rm_takes_the_compose_project_down_with_its_volumes() {
     start_isolated(&f, &name);
     let project = f.project(&name);
 
-    actions::rm(&f.paths, &name, false, true).unwrap();
+    actions::rm(&f.paths, &name, false, true, &|_| {}).unwrap();
     assert!(
         docker::was_downed(&f.home, &project),
         "rm is the one that wipes the data"
@@ -415,7 +415,7 @@ fn the_orphan_sweep_covers_a_log_pump_whose_leader_died() {
 
     // Any mutation sweeps; `refresh` is the read path that notices.
     actions::refresh(&f.paths);
-    actions::stop(&f.paths, &name, None).unwrap();
+    actions::stop(&f.paths, &name, None, &|_| {}).unwrap();
     let after = f.service(&name, "postgres");
     assert_eq!(after.pid, None, "the dead pump is forgotten");
     assert_eq!(after.pgid, None);
@@ -563,7 +563,7 @@ fn a_start_that_fails_before_any_container_leaves_the_worktree_startable() {
     let report = actions::start(&f.paths, &f.config, &name, None, false, &|_| {}).unwrap();
     assert!(report.ports.contains_key("web"));
     assert!(!f.record(&name).isolated);
-    actions::stop(&f.paths, &name, None).unwrap();
+    actions::stop(&f.paths, &name, None, &|_| {}).unwrap();
 }
 
 // The binary is there and the daemon is not. The friendly sentence was
@@ -600,7 +600,7 @@ fn a_service_config_no_longer_includes_keeps_its_name_but_not_its_port() {
     let name = new_worktree(&f, "feat/one");
     let first = start_isolated(&f, &name);
     assert_eq!(f.record(&name).services.len(), 2);
-    actions::stop(&f.paths, &name, None).unwrap();
+    actions::stop(&f.paths, &name, None, &|_| {}).unwrap();
 
     // The include list changed under the worktree: only redis now, so the
     // window is two ports and redis lands on the number postgres had.
@@ -643,7 +643,7 @@ fn a_service_config_no_longer_includes_keeps_its_name_but_not_its_port() {
         before,
         "no two services on one port: {statuses:?}"
     );
-    actions::stop(&f.paths, &name, None).unwrap();
+    actions::stop(&f.paths, &name, None, &|_| {}).unwrap();
 }
 
 #[test]
@@ -697,7 +697,7 @@ fn a_project_with_no_services_runs_shared_and_says_so() {
         docker::invocations(&home).is_empty(),
         "docker is never even asked"
     );
-    let _ = actions::stop_all(&paths);
+    let _ = actions::stop_all(&paths, &|_| {});
 }
 
 // The override pando generates is what compose is handed, so it is worth

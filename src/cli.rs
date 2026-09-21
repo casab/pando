@@ -207,7 +207,7 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             }
         }
         Command::Rm { name, yes, force } => {
-            actions::rm(paths, &name, yes, force)?;
+            actions::rm(paths, &name, yes, force, &notice)?;
             writeln!(out, "removed {name}")?;
             Ok(())
         }
@@ -236,7 +236,7 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
         }
         Command::Stop { name, only } => match name {
             Some(name) => {
-                match actions::stop(paths, &name, only.as_deref())? {
+                match actions::stop(paths, &name, only.as_deref(), &notice)? {
                     actions::StopOutcome::Stopped(processes) => {
                         // Empty when the worktree had only its services
                         // left up, which is a real thing to stop and a
@@ -251,7 +251,7 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
                 Ok(())
             }
             None => {
-                let stopped = actions::stop_all(paths)?;
+                let stopped = actions::stop_all(paths, &notice)?;
                 if stopped.is_empty() {
                     writeln!(out, "nothing was running")?;
                 } else {

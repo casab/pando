@@ -25,7 +25,7 @@ struct Hx {
 
 impl Drop for Hx {
     fn drop(&mut self) {
-        let _ = actions::stop_all(&self.paths);
+        let _ = actions::stop_all(&self.paths, &|_| {});
     }
 }
 
@@ -160,7 +160,7 @@ fn a_fingerprinted_hook_runs_again_only_when_its_inputs_change() {
     start(&f, &name);
     assert_eq!(f.ran(), vec!["ran"], "the first start runs it");
 
-    actions::stop(&f.paths, &name, None).unwrap();
+    actions::stop(&f.paths, &name, None, &|_| {}).unwrap();
     start(&f, &name);
     assert_eq!(
         f.ran(),
@@ -169,7 +169,7 @@ fn a_fingerprinted_hook_runs_again_only_when_its_inputs_change() {
     );
 
     std::fs::write(worktree.join("seed.sql"), "two\n").unwrap();
-    actions::stop(&f.paths, &name, None).unwrap();
+    actions::stop(&f.paths, &name, None, &|_| {}).unwrap();
     start(&f, &name);
     assert_eq!(
         f.ran(),
@@ -180,7 +180,7 @@ fn a_fingerprinted_hook_runs_again_only_when_its_inputs_change() {
     // And so is a changed command — the Phase 2 gap this closes.
     let sink = f.sink.clone();
     f.rewrite_config(&gated(&sink, "echo ran-again"));
-    actions::stop(&f.paths, &name, None).unwrap();
+    actions::stop(&f.paths, &name, None, &|_| {}).unwrap();
     start(&f, &name);
     assert_eq!(
         f.ran(),
@@ -206,7 +206,7 @@ fn a_hook_with_nothing_to_watch_runs_on_every_start() {
     });
     let name = new_worktree(&f, "feat/one");
     start(&f, &name);
-    actions::stop(&f.paths, &name, None).unwrap();
+    actions::stop(&f.paths, &name, None, &|_| {}).unwrap();
     start(&f, &name);
     assert_eq!(f.ran(), vec!["ran", "ran"]);
 }
@@ -280,7 +280,7 @@ fn a_services_hook_is_told_where_this_worktrees_services_are() {
         )),
         "{log}"
     );
-    let _ = actions::rm(&f.paths, &name, true, true);
+    let _ = actions::rm(&f.paths, &name, true, true, &|_| {});
 }
 
 // A hook's `cwd` is held to a process's rules: outside the worktree is a
@@ -438,7 +438,7 @@ fn a_hook_that_leaves_an_untracked_file_in_the_worktree_names_it() {
         common::status_porcelain(&worktree).contains("generated-by-a-hook.txt"),
         "and it really is there"
     );
-    let _ = actions::stop(&f.paths, &name, None);
+    let _ = actions::stop(&f.paths, &name, None, &|_| {});
 }
 
 // A hook pando invented — the detected `migrate` this phase adds is the one
@@ -508,7 +508,7 @@ fn a_fingerprint_that_matches_nothing_is_said_out_loud() {
         about("keyed").is_empty(),
         "a fingerprint that matched says nothing: {said:?}"
     );
-    let _ = actions::stop(&f.paths, &name, None);
+    let _ = actions::stop(&f.paths, &name, None, &|_| {});
 }
 
 // A hook and a service both write `logs/<worktree>/<name>.log`: the pump

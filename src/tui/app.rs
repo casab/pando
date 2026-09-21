@@ -1087,11 +1087,21 @@ impl App {
         };
         let paths = self.paths.clone();
         let worker_name = name.clone();
-        self.spawn_pending(name, PendingKind::Stop, move || {
-            actions::stop(&paths, &worker_name, None)
+        // A stop reaches the sweep that closes a *sibling's* half-dead
+        // share, and that notice is the only warning its public URL has
+        // gone — so `stop` narrates like `start` does.
+        let (ptx, prx) = mpsc::channel::<String>();
+        let started = self.spawn_pending(name, PendingKind::Stop, move || {
+            let progress = |msg: &str| {
+                let _ = ptx.send(msg.to_string());
+            };
+            actions::stop(&paths, &worker_name, None, &progress)
                 .map(|_| PendingOutcome::Stopped(worker_name))
                 .map_err(|e| format!("{e:#}"))
         });
+        if started && let Some(p) = self.pending.as_mut() {
+            p.progress_rx = Some(prx);
+        }
     }
 
     /// The public URL of a worktree, when it has one.
@@ -2267,11 +2277,19 @@ impl App {
     fn spawn_remove(&mut self, name: String, yes: bool, force: bool) -> bool {
         let paths = self.paths.clone();
         let worker_name = name.clone();
-        self.spawn_pending(name, PendingKind::Remove, move || {
-            actions::rm(&paths, &worker_name, yes, force)
+        let (ptx, prx) = mpsc::channel::<String>();
+        let started = self.spawn_pending(name, PendingKind::Remove, move || {
+            let progress = |msg: &str| {
+                let _ = ptx.send(msg.to_string());
+            };
+            actions::rm(&paths, &worker_name, yes, force, &progress)
                 .map(|()| PendingOutcome::Removed(worker_name))
                 .map_err(|e| format!("{e:#}"))
-        })
+        });
+        if started && let Some(p) = self.pending.as_mut() {
+            p.progress_rx = Some(prx);
+        }
+        started
     }
 
     /// Runs `work` on a worker thread and parks the receiver. Single slot:

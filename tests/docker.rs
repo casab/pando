@@ -84,7 +84,7 @@ struct RealDocker {
 
 impl Drop for RealDocker {
     fn drop(&mut self) {
-        let _ = actions::stop_all(&self.paths);
+        let _ = actions::stop_all(&self.paths, &|_| {});
         for project in &self.projects {
             // The one guard that matters: a name that is not pando's is
             // never passed to `down -v`.
@@ -317,7 +317,7 @@ fn two_worktrees_get_private_services_on_their_own_ports_and_volumes() {
     );
 
     // Stopping one leaves the other serving.
-    actions::stop(&f.paths, &one, None).unwrap();
+    actions::stop(&f.paths, &one, None, &|_| {}).unwrap();
     assert!(
         pando::ports::something_is_listening(b.ports["postgres"]),
         "stopping one worktree must not touch another's services"
@@ -325,8 +325,8 @@ fn two_worktrees_get_private_services_on_their_own_ports_and_volumes() {
     assert!(!pando::ports::something_is_listening(a.ports["postgres"]));
 
     // And `rm` takes the containers, the network and the volumes with it.
-    actions::rm(&f.paths, &one, false, true).unwrap();
-    actions::rm(&f.paths, &two, false, true).unwrap();
+    actions::rm(&f.paths, &one, false, true, &|_| {}).unwrap();
+    actions::rm(&f.paths, &two, false, true, &|_| {}).unwrap();
     for kind in ["container", "volume", "network"] {
         let left = items_of(kind, &f.projects);
         assert!(left.is_empty(), "{kind}s left behind: {left:?}");

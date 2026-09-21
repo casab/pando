@@ -97,7 +97,9 @@ pub fn new(
     // Under the lock, so the porcelain read cannot race a concurrent `new`
     // whose record is already saved but whose worktree this process has not
     // seen yet. Every record it may drop is signalled first.
-    sweep_orphaned_groups(&mut store)?;
+    for notice in sweep_orphaned_groups(&mut store)? {
+        progress(&notice);
+    }
     drop_stale_worktree_records(&mut store, &root);
 
     std::fs::create_dir_all(&worktrees_dir)
@@ -679,7 +681,13 @@ fn git_succeeds(root: &Path, args: &[&str]) -> bool {
 
 /// Removes a worktree, its logs, and its data directory. The branch is kept;
 /// deleting it is a separate decision.
-pub fn rm(paths: &PandoPaths, name: &str, yes: bool, force: bool) -> Result<()> {
+pub fn rm(
+    paths: &PandoPaths,
+    name: &str,
+    yes: bool,
+    force: bool,
+    progress: &dyn Fn(&str),
+) -> Result<()> {
     let discovery = worktree::discover_all(&paths.project)?;
     if discovery.main.name == name {
         bail!("{name:?} is the main checkout — pando never removes it");
@@ -706,7 +714,9 @@ pub fn rm(paths: &PandoPaths, name: &str, yes: bool, force: bool) -> Result<()> 
     let _lock = state::lock(&paths.lock_file())?;
     let mut store = state::load(&paths.state_file())?;
     // Before any record is dropped, whichever worktree it belongs to.
-    sweep_orphaned_groups(&mut store)?;
+    for notice in sweep_orphaned_groups(&mut store)? {
+        progress(&notice);
+    }
     drop_stale_worktree_records(&mut store, paths.root());
     let created_by_pando = store
         .worktrees
@@ -1448,8 +1458,10 @@ pub fn start(
         }
     }
     // And every *other* worktree's dead-leader group, because `reconcile`
-    // drops those records too.
-    sweep_orphaned_groups(&mut store)?;
+    // drops those records too — a half-dead share among them.
+    for notice in sweep_orphaned_groups(&mut store)? {
+        progress(&notice);
+    }
     advance_before_reconcile(&mut store);
     state::reconcile(&mut store, proc::is_alive);
 
@@ -1759,8 +1771,13 @@ enum MissingOnly {
 
 /// Stops a worktree's processes — every one it is running, or the one
 /// `only` names. The worktree, its ports, and its logs survive.
-pub fn stop(paths: &PandoPaths, name: &str, only: Option<&str>) -> Result<StopOutcome> {
-    stop_missing(paths, name, only, MissingOnly::IsAnError)
+pub fn stop(
+    paths: &PandoPaths,
+    name: &str,
+    only: Option<&str>,
+    progress: &dyn Fn(&str),
+) -> Result<StopOutcome> {
+    stop_missing(paths, name, only, MissingOnly::IsAnError, progress)
 }
 
 fn stop_missing(
@@ -1768,6 +1785,7 @@ fn stop_missing(
     name: &str,
     only: Option<&str>,
     missing: MissingOnly,
+    progress: &dyn Fn(&str),
 ) -> Result<StopOutcome> {
     paths.ensure_home()?;
     let mut projects: Vec<String> = Vec::new();
@@ -1776,8 +1794,11 @@ fn stop_missing(
         let mut store = state::load(&paths.state_file())?;
         let outcome = stop_recorded(&mut store, name, only, missing, &mut projects)?;
         // `reconcile` drops dead-leader records for every worktree in the
-        // project, not only this one, so every one is signalled first.
-        sweep_orphaned_groups(&mut store)?;
+        // project, not only this one, so every one is signalled first — and
+        // a sibling's half-dead share along with them.
+        for notice in sweep_orphaned_groups(&mut store)? {
+            progress(&notice);
+        }
         advance_before_reconcile(&mut store);
         state::reconcile(&mut store, proc::is_alive);
         state::save(&paths.state_file(), &store)?;
@@ -1816,13 +1837,17 @@ fn stop_compose_projects(
 }
 
 /// Stops every worktree pando has a process for, returning their names.
-pub fn stop_all(paths: &PandoPaths) -> Result<Vec<String>> {
-    stop_all_with(paths, |pgid| proc::stop(pgid, STOP_GRACE))
+pub fn stop_all(paths: &PandoPaths, progress: &dyn Fn(&str)) -> Result<Vec<String>> {
+    stop_all_with(paths, |pgid| proc::stop(pgid, STOP_GRACE), progress)
 }
 
 /// [`stop_all`] with the signal injected, so a test can drive the path
 /// where a group refuses to die without needing one that really does.
-pub fn stop_all_with(paths: &PandoPaths, stop: impl Fn(i32) -> Result<()>) -> Result<Vec<String>> {
+pub fn stop_all_with(
+    paths: &PandoPaths,
+    stop: impl Fn(i32) -> Result<()>,
+    progress: &dyn Fn(&str),
+) -> Result<Vec<String>> {
     paths.ensure_home()?;
     let _lock = state::lock(&paths.lock_file())?;
     let mut store = state::load(&paths.state_file())?;
@@ -1860,7 +1885,10 @@ pub fn stop_all_with(paths: &PandoPaths, stop: impl Fn(i32) -> Result<()>) -> Re
     let mut sweep_failed = None;
     if failures.is_empty() {
         match sweep_orphaned_groups_with(&mut store, &stop) {
-            Ok(()) => {
+            Ok(notices) => {
+                for notice in notices {
+                    progress(&notice);
+                }
                 advance_before_reconcile(&mut store);
                 state::reconcile(&mut store, proc::is_alive);
             }
@@ -2056,10 +2084,16 @@ fn take_share_down(
 /// process nothing can find again. So the sweep is global, and runs before
 /// anything that drops records.
 ///
+/// A half-dead share is the same failure with a public URL attached, so it
+/// is swept here too: [`sweep_dead_shares`] is the only thing that can
+/// signal one, and `reconcile` would otherwise drop the record holding the
+/// surviving half's pgid. Its notices come back to the caller, which is the
+/// only place that knows where to print them.
+///
 /// One group that will not die does not stop the sweep: the rest are still
 /// signalled and the failures are reported together. A caller that gets an
 /// error must not go on to drop records.
-fn sweep_orphaned_groups(store: &mut state::State) -> Result<()> {
+fn sweep_orphaned_groups(store: &mut state::State) -> Result<Vec<String>> {
     sweep_orphaned_groups_with(store, |pgid| proc::stop(pgid, STOP_GRACE))
 }
 
@@ -2068,7 +2102,11 @@ fn sweep_orphaned_groups(store: &mut state::State) -> Result<()> {
 fn sweep_orphaned_groups_with(
     store: &mut state::State,
     stop: impl Fn(i32) -> Result<()>,
-) -> Result<()> {
+) -> Result<Vec<String>> {
+    // First, because a share is the one record whose survivor is a public
+    // door: a tunnel nobody can name again is worse than a dev server
+    // nobody can name again.
+    let notices = sweep_dead_shares_with(store, proc::is_alive, &stop);
     let mut failures = Vec::new();
     for (name, record) in &mut store.worktrees {
         for (process, p) in &mut record.processes {
@@ -2116,7 +2154,7 @@ fn sweep_orphaned_groups_with(
         }
     }
     if failures.is_empty() {
-        return Ok(());
+        return Ok(notices);
     }
     bail!(
         "could not signal {} process group(s) before dropping their records: {}",
@@ -2200,10 +2238,9 @@ pub fn share_with(
     let (target_port, share_port) = {
         let _lock = state::lock(&paths.lock_file())?;
         let mut store = state::load(&paths.state_file())?;
-        for notice in sweep_dead_shares(&mut store) {
+        for notice in sweep_orphaned_groups(&mut store)? {
             progress(&notice);
         }
-        sweep_orphaned_groups(&mut store)?;
         advance_before_reconcile(&mut store);
         state::reconcile(&mut store, proc::is_alive);
 
@@ -2519,7 +2556,7 @@ pub fn restart(
     // is the one thing `restart --only` exists for, and it used to be the
     // one thing it could not do — but only while a sibling was still
     // running, which made the failure look random.
-    stop_missing(paths, name, only, MissingOnly::IsNothingToDo)?;
+    stop_missing(paths, name, only, MissingOnly::IsNothingToDo, progress)?;
     start(paths, config, name, only, isolated, progress)
 }
 
@@ -3856,6 +3893,27 @@ mod tests {
         progress: &dyn Fn(&str),
     ) -> Result<StartReport> {
         super::restart(paths, config, name, only, false, progress)
+    }
+
+    /// `stop`, `stop_all` and `rm` as every test written before the sweep
+    /// narrated anything means them: with nobody listening. Shadowing them
+    /// keeps those tests reading as they did — the notices a sweep returns
+    /// are a separate question, asked by the tests that ask it, which call
+    /// `super::` directly.
+    fn stop(paths: &PandoPaths, name: &str, only: Option<&str>) -> Result<StopOutcome> {
+        super::stop(paths, name, only, &noop)
+    }
+
+    fn stop_all(paths: &PandoPaths) -> Result<Vec<String>> {
+        super::stop_all(paths, &noop)
+    }
+
+    fn stop_all_with(paths: &PandoPaths, stop: impl Fn(i32) -> Result<()>) -> Result<Vec<String>> {
+        super::stop_all_with(paths, stop, &noop)
+    }
+
+    fn rm(paths: &PandoPaths, name: &str, yes: bool, force: bool) -> Result<()> {
+        super::rm(paths, name, yes, force, &noop)
     }
 
     /// Detection for a shared-mode start, which is what every test written
@@ -6264,6 +6322,159 @@ time.sleep(300)
         assert!(refresh(&fx.paths).notices.is_empty());
     }
 
+    // ---- a dead half of a share, on every path that drops records --------
+    //
+    // `reconcile` drops the record that holds the surviving half's pgid, and
+    // it cannot signal anything. So every path that reaches it has to signal
+    // first. `refresh` and `share` did; `start`, `stop <name>` and `stop`
+    // did not, and a live cloudflared with a public URL — or a live proxy
+    // holding the injected cookie in its environment — was left running with
+    // nothing in pando able to name it again.
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum DeadHalf {
+        Tunnel,
+        Proxy,
+    }
+
+    /// Shares `name` with a proxy in front of it, then kills `dead` outright,
+    /// leaving the other half running and only the record naming it.
+    fn share_with_a_dead_half(fx: &Fx, name: &str, dead: DeadHalf) -> ShareRecord {
+        let mut config = fx.config.clone();
+        config.share.auth_cmd = Some("printf 'session=abc'".to_string());
+        share_stubbed(fx, &config, name).unwrap();
+        let record = fx.state().worktrees[name].share.clone().unwrap();
+        let (pid, pgid) = match dead {
+            DeadHalf::Tunnel => (record.tunnel_pid, record.tunnel_pgid),
+            DeadHalf::Proxy => (record.proxy_pid.unwrap(), record.proxy_pgid.unwrap()),
+        };
+        crate::process::stop(pgid, Duration::from_secs(5)).unwrap();
+        assert!(
+            !crate::process::is_alive(pid),
+            "the {dead:?} half should be dead"
+        );
+        assert!(
+            crate::process::group_alive(surviving_pgid(&record, dead)),
+            "the other half has to still be running, or this test proves nothing"
+        );
+        record
+    }
+
+    fn surviving_pgid(record: &ShareRecord, dead: DeadHalf) -> i32 {
+        match dead {
+            DeadHalf::Tunnel => record.proxy_pgid.unwrap(),
+            DeadHalf::Proxy => record.tunnel_pgid,
+        }
+    }
+
+    fn assert_nothing_of_the_share_is_left(record: &ShareRecord, dead: DeadHalf) {
+        let pgid = surviving_pgid(record, dead);
+        assert!(
+            wait_until(Duration::from_secs(5), || !crate::process::group_alive(
+                pgid
+            )),
+            "the {dead:?} half died and the other one was left running in group {pgid}, \
+             with the record that named it dropped"
+        );
+    }
+
+    fn assert_the_caller_was_told(notices: &[String], name: &str) {
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.contains(name) && n.contains("public URL is closed")),
+            "the caller must be told the URL it had is gone: {notices:?}"
+        );
+    }
+
+    #[test]
+    fn a_start_of_another_worktree_signals_the_survivor_of_a_dead_tunnel() {
+        a_start_of_another_worktree_signals_the_survivor(DeadHalf::Tunnel);
+    }
+
+    #[test]
+    fn a_start_of_another_worktree_signals_the_survivor_of_a_dead_proxy() {
+        a_start_of_another_worktree_signals_the_survivor(DeadHalf::Proxy);
+    }
+
+    fn a_start_of_another_worktree_signals_the_survivor(dead: DeadHalf) {
+        let Some((fx, name, _guards, _)) = shared_fixture() else {
+            return;
+        };
+        // Created before the share dies: `new` reaches the same chokepoint,
+        // and this test is about what `start` does.
+        let other = worktree_named(&fx, "feat/two");
+        let record = share_with_a_dead_half(&fx, &name, dead);
+        let _cleanup = ShareGuard(Some(record.clone()));
+
+        let said = std::sync::Mutex::new(Vec::<String>::new());
+        let report = start(&fx.paths, &fx.config, &other, None, &|line| {
+            said.lock().unwrap().push(line.to_string())
+        })
+        .unwrap();
+        let _others = guard(&report);
+
+        assert!(fx.state().worktrees[&name].share.is_none());
+        assert_nothing_of_the_share_is_left(&record, dead);
+        assert_the_caller_was_told(&said.into_inner().unwrap(), &name);
+    }
+
+    #[test]
+    fn a_stop_of_another_worktree_signals_the_survivor_of_a_dead_tunnel() {
+        a_stop_of_another_worktree_signals_the_survivor(DeadHalf::Tunnel);
+    }
+
+    #[test]
+    fn a_stop_of_another_worktree_signals_the_survivor_of_a_dead_proxy() {
+        a_stop_of_another_worktree_signals_the_survivor(DeadHalf::Proxy);
+    }
+
+    fn a_stop_of_another_worktree_signals_the_survivor(dead: DeadHalf) {
+        let Some((fx, name, _guards, _)) = shared_fixture() else {
+            return;
+        };
+        let other = worktree_named(&fx, "feat/two");
+        let record = share_with_a_dead_half(&fx, &name, dead);
+        let _cleanup = ShareGuard(Some(record.clone()));
+
+        let said = std::sync::Mutex::new(Vec::<String>::new());
+        super::stop(&fx.paths, &other, None, &|line| {
+            said.lock().unwrap().push(line.to_string())
+        })
+        .unwrap();
+
+        assert!(fx.state().worktrees[&name].share.is_none());
+        assert_nothing_of_the_share_is_left(&record, dead);
+        assert_the_caller_was_told(&said.into_inner().unwrap(), &name);
+    }
+
+    #[test]
+    fn a_bare_stop_signals_the_survivor_of_a_dead_tunnel() {
+        a_bare_stop_signals_the_survivor(DeadHalf::Tunnel);
+    }
+
+    #[test]
+    fn a_bare_stop_signals_the_survivor_of_a_dead_proxy() {
+        a_bare_stop_signals_the_survivor(DeadHalf::Proxy);
+    }
+
+    // No notice is asserted here: a bare `stop` stops the shared worktree
+    // itself, so its share comes down as part of stopping it — which is the
+    // documented behaviour and not news. What has to hold either way is
+    // that neither half is left running.
+    fn a_bare_stop_signals_the_survivor(dead: DeadHalf) {
+        let Some((fx, name, _guards, _)) = shared_fixture() else {
+            return;
+        };
+        let record = share_with_a_dead_half(&fx, &name, dead);
+        let _cleanup = ShareGuard(Some(record.clone()));
+
+        stop_all(&fx.paths).unwrap();
+
+        assert!(fx.state().worktrees[&name].share.is_none());
+        assert_nothing_of_the_share_is_left(&record, dead);
+    }
+
     #[test]
     fn stop_takes_the_public_url_down_with_the_worktree() {
         let Some((fx, name, guards, _)) = shared_fixture() else {
@@ -7327,7 +7538,7 @@ time.sleep(300)
         let name = super::new(&fx.paths, &config, "feat/h", None, &noop).unwrap();
         let report = start(&fx.paths, &config, &name, None, &noop).unwrap();
         assert!(report.ports.contains_key("web"));
-        let _ = super::stop(&fx.paths, &name, None);
+        let _ = stop(&fx.paths, &name, None);
     }
 
     #[test]

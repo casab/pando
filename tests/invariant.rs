@@ -113,7 +113,7 @@ impl Harness {
 /// Nothing a test started outlives it, even when an assertion panics.
 impl Drop for Harness {
     fn drop(&mut self) {
-        let _ = actions::stop_all(&self.paths);
+        let _ = actions::stop_all(&self.paths, &|_| {});
     }
 }
 
@@ -212,7 +212,7 @@ fn every_command_leaves_the_repository_untouched() {
     actions::created_by_pando(&h.paths, &actions::ls(&h.paths).unwrap());
     h.assert_untouched("created_by_pando", Some(&worktree));
 
-    actions::rm(&h.paths, &name, false, false).unwrap();
+    actions::rm(&h.paths, &name, false, false, &|_| {}).unwrap();
     h.assert_untouched("rm", None);
     assert!(!worktree.exists());
 }
@@ -229,7 +229,7 @@ fn a_refused_command_leaves_the_repository_untouched() {
     );
     h.assert_untouched("a refused new", None);
 
-    assert!(actions::rm(&h.paths, "nope", true, true).is_err());
+    assert!(actions::rm(&h.paths, "nope", true, true, &|_| {}).is_err());
     h.assert_untouched("a refused rm", None);
 
     assert!(actions::path(&h.paths, "nope").is_err());
@@ -289,10 +289,10 @@ fn adopting_and_removing_a_worktree_elsewhere_leaves_the_repository_untouched() 
     assert_eq!(tree(&h.root), h.baseline, "ls must not write anything");
 
     assert!(
-        actions::rm(&h.paths, "adopted-elsewhere", false, false).is_err(),
+        actions::rm(&h.paths, "adopted-elsewhere", false, false, &|_| {}).is_err(),
         "an adopted worktree needs --yes"
     );
-    actions::rm(&h.paths, "adopted-elsewhere", true, false).unwrap();
+    actions::rm(&h.paths, "adopted-elsewhere", true, false, &|_| {}).unwrap();
     assert_eq!(status_porcelain(&h.root), "");
     assert_eq!(tree(&h.root), h.baseline);
 }
@@ -507,7 +507,7 @@ fn starting_and_stopping_never_writes_into_the_repository() {
     h.assert_untouched("ls", Some(&worktree));
 
     assert_eq!(
-        actions::stop(&h.paths, &name, None).unwrap(),
+        actions::stop(&h.paths, &name, None, &|_| {}).unwrap(),
         actions::StopOutcome::Stopped(vec!["dev".to_string()])
     );
     h.assert_untouched("stop", Some(&worktree));
@@ -519,10 +519,10 @@ fn starting_and_stopping_never_writes_into_the_repository() {
     );
     h.assert_untouched("restart", Some(&worktree));
 
-    actions::stop(&h.paths, &name, None).unwrap();
+    actions::stop(&h.paths, &name, None, &|_| {}).unwrap();
     h.assert_untouched("stop again", Some(&worktree));
 
-    actions::rm(&h.paths, &name, false, false).unwrap();
+    actions::rm(&h.paths, &name, false, false, &|_| {}).unwrap();
     h.assert_untouched("rm", None);
     assert!(!worktree.exists());
     assert!(
@@ -697,7 +697,7 @@ fn two_processes_never_write_into_the_repository() {
         .record
         .pgid;
     assert_eq!(
-        actions::stop(&h.paths, &name, Some("web")).unwrap(),
+        actions::stop(&h.paths, &name, Some("web"), &|_| {}).unwrap(),
         actions::StopOutcome::Stopped(vec!["web".to_string()])
     );
     assert!(!pando::process::group_alive(web_pgid));
@@ -735,7 +735,7 @@ fn two_processes_never_write_into_the_repository() {
     assert_eq!(again.ports, report.ports, "and on the ports it already had");
     h.assert_untouched("start again", Some(&worktree));
 
-    actions::stop(&h.paths, &name, None).unwrap();
+    actions::stop(&h.paths, &name, None, &|_| {}).unwrap();
     h.assert_untouched("stop", Some(&worktree));
 
     // Every log the pair wrote lives under pando's home.
@@ -749,7 +749,7 @@ fn two_processes_never_write_into_the_repository() {
         );
     }
 
-    actions::rm(&h.paths, &name, false, false).unwrap();
+    actions::rm(&h.paths, &name, false, false, &|_| {}).unwrap();
     h.assert_untouched("rm", None);
     assert!(!worktree.exists());
     assert!(
@@ -785,7 +785,7 @@ fn every_file_the_lifecycle_writes_is_under_pandos_home() {
     assert!(record.hooks.contains_key("install"));
     assert_eq!(record.processes["dev"].pid, outcome.started[0].record.pid);
 
-    actions::stop(&h.paths, &name, None).unwrap();
+    actions::stop(&h.paths, &name, None, &|_| {}).unwrap();
     h.assert_untouched("the whole lifecycle", None);
 }
 
@@ -887,7 +887,7 @@ fn sharing_never_writes_into_the_repository() {
     assert_eq!(again.public_url, common::FAKE_TUNNEL_URL);
     h.assert_untouched("share again", Some(&worktree));
 
-    actions::stop(&h.paths, &name, None).unwrap();
+    actions::stop(&h.paths, &name, None, &|_| {}).unwrap();
     assert!(
         state::load(&h.paths.state_file()).unwrap().worktrees[&name]
             .share
@@ -896,7 +896,7 @@ fn sharing_never_writes_into_the_repository() {
     );
     h.assert_untouched("stop", Some(&worktree));
 
-    actions::rm(&h.paths, &name, false, false).unwrap();
+    actions::rm(&h.paths, &name, false, false, &|_| {}).unwrap();
     h.assert_untouched("rm", None);
     assert!(
         !h.paths.logs_dir(&name).exists(),
@@ -1013,7 +1013,7 @@ fn an_isolated_lifecycle_never_writes_into_the_repository() {
     }
     h.assert_untouched("logs", Some(&worktree));
 
-    actions::stop(&h.paths, &name, None).unwrap();
+    actions::stop(&h.paths, &name, None, &|_| {}).unwrap();
     h.assert_untouched("stop", Some(&worktree));
 
     // A plain start after a stop: the worktree remembers it is isolated,
@@ -1022,7 +1022,7 @@ fn an_isolated_lifecycle_never_writes_into_the_repository() {
     assert!(state::load(&h.paths.state_file()).unwrap().worktrees[&name].isolated);
     h.assert_untouched("start", Some(&worktree));
 
-    actions::rm(&h.paths, &name, false, false).unwrap();
+    actions::rm(&h.paths, &name, false, false, &|_| {}).unwrap();
     h.assert_untouched("rm", None);
     assert!(
         !override_file.exists(),
