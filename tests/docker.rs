@@ -9,6 +9,14 @@
 //! It only ever creates, inspects or removes compose projects whose name
 //! starts with `pando-`, and it takes its own down on the way out even
 //! when an assertion panicked.
+//!
+//! Every assertion about what docker holds is scoped to the *compose
+//! projects the test itself made*, never to the `pando-` prefix. These
+//! tests run on parallel threads, each with containers, volumes and
+//! networks of its own up at the same moment, so "how many `pando-`
+//! containers are there" is a question about the whole run rather than
+//! about the test asking it. Scoping is the fix; serialising them would
+//! hide the coupling rather than remove it.
 
 mod common;
 
@@ -44,8 +52,14 @@ fn docker(args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-/// Names of everything docker has that belongs to pando, by kind.
-fn pando_items(kind: &str) -> Vec<String> {
+/// Names of everything docker has for these compose projects, by kind.
+///
+/// Scoped to the projects the calling test made, never to the bare
+/// `pando-` prefix. These tests run on parallel threads and every one of
+/// them has `pando-` containers, volumes and networks of its own up at the
+/// same moment, so a global count is not a fact about the test making it —
+/// it is a fact about whichever sibling happened to be mid-run.
+fn items_of(kind: &str, projects: &[String]) -> Vec<String> {
     let args: Vec<&str> = match kind {
         "container" => vec!["ps", "-a", "--format", "{{.Names}}"],
         "volume" => vec!["volume", "ls", "--format", "{{.Name}}"],
@@ -54,7 +68,7 @@ fn pando_items(kind: &str) -> Vec<String> {
     docker(&args)
         .lines()
         .map(str::trim)
-        .filter(|line| line.starts_with(PREFIX))
+        .filter(|name| projects.iter().any(|project| name.starts_with(project)))
         .map(str::to_string)
         .collect()
 }
@@ -142,13 +156,15 @@ fn worktree_of(f: &RealDocker, name: &str) -> PathBuf {
     f.config.worktrees_dir(&f.paths).join(name)
 }
 
-/// `<container> <ports>` for one compose project, sorted, so two samples
-/// compare as one value.
-fn published_ports(project: &str) -> Vec<String> {
+/// `<container> <ports>` for the containers of these compose projects that
+/// are *running*, sorted so two samples compare as one value.
+///
+/// Scoped like [`items_of`], and for the same reason.
+fn published_ports(projects: &[String]) -> Vec<String> {
     let mut out: Vec<String> = docker(&["ps", "--format", "{{.Names}} {{.Ports}}"])
         .lines()
         .map(str::trim)
-        .filter(|line| line.starts_with(project))
+        .filter(|line| projects.iter().any(|project| line.starts_with(project)))
         .map(str::to_string)
         .collect();
     out.sort();
@@ -174,7 +190,7 @@ fn a_second_isolated_start_keeps_the_containers_and_the_ports_they_were_given() 
         eprintln!("first: {m}")
     })
     .unwrap();
-    let before = published_ports(&f.projects[0]);
+    let before = published_ports(&f.projects);
     assert_eq!(before.len(), 2, "postgres and redis are up: {before:?}");
 
     let second = actions::start(&f.paths, &f.config, &one, None, true, &|m| {
@@ -184,7 +200,7 @@ fn a_second_isolated_start_keeps_the_containers_and_the_ports_they_were_given() 
     assert_eq!(second.ports, first.ports, "every port stays where it was");
     assert!(!second.reassigned, "and nothing is reported as moved");
     assert_eq!(
-        published_ports(&f.projects[0]),
+        published_ports(&f.projects),
         before,
         "the containers keep the ports they were published on"
     );
@@ -222,7 +238,6 @@ fn two_worktrees_get_private_services_on_their_own_ports_and_volumes() {
         eprintln!("skipping: set PANDO_TEST_DOCKER=1 to run against the real Docker");
         return;
     }
-    let before = pando_items("volume");
     let mut f = real();
     let one = actions::new(&f.paths, &f.config, "feat/one", None, &|_| {}).unwrap();
     let two = actions::new(&f.paths, &f.config, "feat/two", None, &|_| {}).unwrap();
@@ -230,6 +245,14 @@ fn two_worktrees_get_private_services_on_their_own_ports_and_volumes() {
         .push(compose::project_name(f.paths.project_id(), &one));
     f.projects
         .push(compose::project_name(f.paths.project_id(), &two));
+    // Two project names carrying this fixture's own id, so nothing
+    // anywhere belongs to them yet. Whatever belongs to them at the end is
+    // something this test leaked.
+    let before = items_of("volume", &f.projects);
+    assert!(
+        before.is_empty(),
+        "a fresh fixture owns no volumes: {before:?}"
+    );
 
     let a = actions::start(&f.paths, &f.config, &one, None, true, &|m| {
         eprintln!("one: {m}")
@@ -261,11 +284,7 @@ fn two_worktrees_get_private_services_on_their_own_ports_and_volumes() {
     // `!override` replaced the project's hardcoded 5432, rather than
     // being merged beside it: two worktrees on one machine could not both
     // have published it.
-    let published = docker(&["ps", "--format", "{{.Names}} {{.Ports}}"]);
-    let mine: Vec<&str> = published
-        .lines()
-        .filter(|line| line.starts_with(PREFIX))
-        .collect();
+    let mine = published_ports(&f.projects);
     assert_eq!(mine.len(), 4, "four containers, two per worktree: {mine:?}");
     assert!(
         !mine.iter().any(|line| line.contains(":5432->")),
@@ -274,7 +293,7 @@ fn two_worktrees_get_private_services_on_their_own_ports_and_volumes() {
 
     // And each worktree's data is its own: the project name prefixes the
     // named volumes, so there are two distinct sets.
-    let volumes = pando_items("volume");
+    let volumes = items_of("volume", &f.projects);
     let a_volumes: Vec<&String> = volumes
         .iter()
         .filter(|v| v.starts_with(&f.projects[0]))
@@ -309,19 +328,13 @@ fn two_worktrees_get_private_services_on_their_own_ports_and_volumes() {
     actions::rm(&f.paths, &one, false, true).unwrap();
     actions::rm(&f.paths, &two, false, true).unwrap();
     for kind in ["container", "volume", "network"] {
-        let left: Vec<String> = pando_items(kind)
-            .into_iter()
-            .filter(|name| f.projects.iter().any(|p| name.starts_with(p)))
-            .collect();
+        let left = items_of(kind, &f.projects);
         assert!(left.is_empty(), "{kind}s left behind: {left:?}");
     }
     assert_eq!(
-        pando_items("volume")
-            .into_iter()
-            .filter(|v| !before.contains(v))
-            .collect::<Vec<_>>(),
-        Vec::<String>::new(),
-        "no volume of pando's outlived the test"
+        items_of("volume", &f.projects),
+        before,
+        "no volume of this test's outlived it"
     );
     // Nothing of pando's is running, so the guard has nothing left to do.
     f.projects.clear();
@@ -354,11 +367,10 @@ fn a_service_a_worktree_cannot_isolate_is_refused_before_docker_is_asked() {
     assert!(err.contains("./pgdata"), "{err}");
     assert!(err.contains("named volume"), "{err}");
     let project = compose::project_name(f.paths.project_id(), &name);
+    let made = items_of("container", std::slice::from_ref(&project));
     assert!(
-        !pando_items("container")
-            .iter()
-            .any(|c| c.starts_with(&project)),
-        "nothing was started for a worktree pando refused"
+        made.is_empty(),
+        "nothing was started for a worktree pando refused: {made:?}"
     );
     assert!(worktree_of(&f, &name).is_dir());
     let _ = state::load(&f.paths.state_file());
@@ -409,12 +421,10 @@ fn a_container_that_publishes_a_port_and_never_listens_is_never_ready() {
 
     // What did come up is stopped again, so a failed start leaves nothing
     // holding a port.
-    let running = docker(&["ps", "--format", "{{.Names}}"]);
+    let running = published_ports(&f.projects);
     assert!(
-        !running
-            .lines()
-            .any(|line| line.trim().starts_with(&project)),
-        "the services were left running: {running}"
+        running.is_empty(),
+        "the services were left running: {running:?}"
     );
     let store = state::load(&f.paths.state_file()).unwrap();
     assert!(
@@ -479,12 +489,7 @@ fn a_compose_file_that_extends_another_is_resolved_by_compose_itself() {
     }
     // The `include:` brought `extra` into the file, and it is not in
     // `include = [...]`, so nothing started it.
-    let running = docker(&["ps", "--format", "{{.Names}}"]);
-    let mine: Vec<&str> = running
-        .lines()
-        .map(str::trim)
-        .filter(|line| line.starts_with(&project))
-        .collect();
+    let mine = published_ports(&f.projects);
     assert_eq!(mine.len(), 2, "only what `include` asked for: {mine:?}");
 }
 
@@ -523,12 +528,7 @@ fn a_profiled_service_is_stopped_too_when_readiness_fails() {
     );
     assert!(err.contains("did not become ready"), "{err}");
 
-    let running = docker(&["ps", "--format", "{{.Names}}"]);
-    let left: Vec<&str> = running
-        .lines()
-        .map(str::trim)
-        .filter(|line| line.starts_with(&project))
-        .collect();
+    let left = published_ports(&f.projects);
     assert!(
         left.is_empty(),
         "a failed start leaves nothing running, profiles included: {left:?}"
@@ -621,12 +621,10 @@ fn an_absolute_bind_mount_into_the_checkout_is_refused_and_writes_nothing() {
         "it says what to change: {err}"
     );
 
-    let project = compose::project_name(f.paths.project_id(), &name);
+    let made = items_of("container", &f.projects);
     assert!(
-        !pando_items("container")
-            .iter()
-            .any(|c| c.starts_with(&project)),
-        "nothing was started for a worktree pando refused"
+        made.is_empty(),
+        "nothing was started for a worktree pando refused: {made:?}"
     );
     assert!(
         !inside.join("pando-wrote-into-your-repo").exists(),
