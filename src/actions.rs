@@ -4145,6 +4145,16 @@ fn bring_up_native_services(
         if !missing.is_empty() {
             return Err(service.missing_binaries_error(&missing));
         }
+        // Said before it is started, not after it fails: a recipe nobody
+        // has run against a real server is the first thing to suspect,
+        // and a developer cannot guess that from a timeout.
+        if service.recipe.untested {
+            progress(&format!(
+                "{}: the {:?} recipe has never been run against a real server — if this does \
+                 not work, the recipe is the first thing to suspect",
+                entry.name, service.recipe.name
+            ));
+        }
         planned.push(service);
     }
 
@@ -4176,7 +4186,7 @@ fn bring_up_native_services(
         };
         let waited = service
             .wait_ready(pid, service.ready_timeout(), progress)
-            .and_then(|()| service.create());
+            .and_then(|()| service.create(progress));
         if let Err(e) = waited {
             stop_native_services(paths, name, &started);
             return Err(e);

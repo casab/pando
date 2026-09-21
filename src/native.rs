@@ -219,6 +219,7 @@ pub fn resolve(recipes: &crate::recipes::Recipes, entry: &Entry<'_>) -> Result<R
                 version_flag: None,
                 install: None,
                 notes: None,
+                untested: false,
                 body: crate::recipes::Body::Service(crate::recipes::ServiceRecipe::default()),
             },
             Source::Inline,
@@ -652,11 +653,25 @@ impl Native {
     /// URL names and that can change without the data directory changing:
     /// a data directory initialised last week has the database the URL
     /// named last week.
-    pub fn create(&self) -> Result<()> {
+    pub fn create(&self, progress: &dyn Fn(&str)) -> Result<()> {
         let service = self.service_recipe()?;
         let Some(create) = &service.create else {
             return Ok(());
         };
+        // A `create` that asks for the app's database is about the app's
+        // database. A service nothing addresses — no `env` map, no
+        // `port_env`, no such key in the worktree — has none, and there
+        // is nothing to make. Checked rather than discovered by letting
+        // the render fail: a skip that happens because an error looked
+        // right is a skip nobody can reason about.
+        let wants_identity = create.contains("{db_name}") || create.contains("{db_user}");
+        if wants_identity && self.db_name.is_none() && self.db_user.is_none() {
+            progress(&format!(
+                "{}: nothing in this project addresses it, so there is no database to create",
+                self.service
+            ));
+            return Ok(());
+        }
         let script = self.shell_cmd(create)?;
         let captured = proc::run_captured(&script, &self.datadir, &[], CREATE_TIMEOUT)
             .with_context(|| format!("prepare the service {:?}", self.service))?;
@@ -1289,7 +1304,7 @@ mod tests {
             17_400,
         );
         native.ensure_init(QUIET).unwrap();
-        native.create().unwrap();
+        native.create(QUIET).unwrap();
         // What the app's own URL named, not what the data directory was
         // initialised with.
         assert_eq!(
@@ -1304,7 +1319,7 @@ mod tests {
             "fake-create",
             "echo 'createdb: error: no such role' >&2\nexit 1\n",
         );
-        let e = format!("{:#}", native.create().unwrap_err());
+        let e = format!("{:#}", native.create(QUIET).unwrap_err());
         assert!(e.contains("no such role"), "{e}");
         assert!(e.contains("\"db\""), "{e}");
     }
@@ -1317,7 +1332,7 @@ mod tests {
             "kind = \"service\"\nname = \"r\"\n\n[service]\ncmd = \"x\"\n",
             17_400,
         );
-        native.create().unwrap();
+        native.create(QUIET).unwrap();
     }
 
     // ---- a language recipe is not a service ------------------------------
@@ -1340,7 +1355,60 @@ mod tests {
     }
 
     #[test]
-    fn the_built_in_postgres_recipe_renders_into_a_command_with_no_placeholders_left() {
+    fn every_built_in_recipe_renders_into_commands_with_no_placeholders_left() {
+        let fx = fixture();
+        // The trap this catches: `{ping: 1}` in a mongosh `--eval` is a
+        // *placeholder* to pando's own lexer, so a recipe that writes it
+        // unescaped fails at the readiness check of an engine nobody
+        // here can run — which is to say, in front of a user.
+        for (name, _) in Recipes::built_in().entries() {
+            let recipe = Recipes::built_in().get(name).unwrap().recipe.clone();
+            let native = Native::plan(
+                &fx.paths,
+                "feat+one",
+                name,
+                recipe,
+                17_402,
+                Some("scheme://app:secret@localhost:17402/acme_dev"),
+            )
+            .unwrap();
+            let service = native.recipe.service().unwrap().clone();
+            for command in [
+                Some(service.cmd.clone()),
+                service.init.clone(),
+                service.ready.clone(),
+                service.create.clone(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                // Rendering at all is most of the claim: the lexer
+                // refuses a placeholder it does not know, so a recipe
+                // that writes `{ping:1}` in a mongosh `--eval` fails
+                // here rather than in front of whoever has mongod.
+                let rendered = native
+                    .shell_cmd(&command)
+                    .unwrap_or_else(|e| panic!("{name}: {command}: {e:#}"));
+                for known in KNOWN {
+                    assert!(
+                        !rendered.contains(&format!("{{{known}}}")),
+                        "{name} left {{{known}}} unresolved: {rendered}"
+                    );
+                }
+                // Braces that survive are the escaped kind — `{{` and
+                // `}}` render to one brace, which is how a recipe writes
+                // a JSON literal — so they are not asserted away.
+            }
+            // The one placeholder every engine's own command must carry:
+            // a server started on a port pando did not allocate is a
+            // worktree sharing a database with its neighbour.
+            let cmd = native.shell_cmd(&service.cmd).unwrap();
+            assert!(cmd.contains("17402"), "{name} ignores its port: {cmd}");
+        }
+    }
+
+    #[test]
+    fn the_built_in_postgres_recipe_renders_the_port_the_socket_and_the_app_database() {
         let fx = fixture();
         let postgres = Recipes::built_in().get("postgres").unwrap().recipe.clone();
         let native = Native::plan(
@@ -1353,16 +1421,6 @@ mod tests {
         )
         .unwrap();
         let service = native.recipe.service().unwrap().clone();
-        for command in [
-            service.cmd.clone(),
-            service.init.clone().unwrap(),
-            service.ready.clone().unwrap(),
-            service.create.clone().unwrap(),
-        ] {
-            let rendered = native.shell_cmd(&command).unwrap();
-            assert!(!rendered.contains('{'), "{rendered}");
-            assert!(!rendered.contains('}'), "{rendered}");
-        }
         let cmd = native.shell_cmd(&service.cmd).unwrap();
         assert!(cmd.contains("-p 17402"), "{cmd}");
         assert!(cmd.contains("listen_addresses=127.0.0.1"), "{cmd}");
@@ -1373,5 +1431,45 @@ mod tests {
         let create = native.shell_cmd(service.create.as_ref().unwrap()).unwrap();
         assert!(create.contains("acme_dev"), "{create}");
         assert!(create.contains("app"), "{create}");
+    }
+
+    #[test]
+    fn a_create_step_is_skipped_for_a_service_nothing_in_the_project_addresses() {
+        let fx = fixture();
+        let asked = fx.paths.home.join("asked");
+        shim(
+            &fx.paths,
+            "fake-create",
+            &format!(
+                "echo ran >> {}\n",
+                shell_quote(&asked.display().to_string())
+            ),
+        );
+        // MariaDB's shape: a `create` that needs the app's database name,
+        // and a recipe with no default for it.
+        let native = Native::plan(
+            &fx.paths,
+            "feat+one",
+            "db",
+            recipe(
+                "kind = \"service\"\nname = \"r\"\n\n[service]\ncmd = \"x\"\n\
+                 create = \"fake-create {db_name}\"\n",
+            ),
+            17_400,
+            None,
+        )
+        .unwrap();
+        native.ensure_init(QUIET).unwrap();
+        let said = std::cell::RefCell::new(Vec::<String>::new());
+        native
+            .create(&|line: &str| said.borrow_mut().push(line.to_string()))
+            .unwrap();
+        assert!(!asked.exists(), "it made a database for nobody");
+        let said = said.into_inner();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].contains("nothing in this project addresses it"),
+            "{said:?}"
+        );
     }
 }

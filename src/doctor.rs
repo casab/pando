@@ -371,6 +371,8 @@ pub struct NativeServiceReport {
     /// Something the recipe says about itself that is worth knowing —
     /// Postgres's trust authentication, for one.
     pub notes: Option<String>,
+    /// Whether this recipe has ever been run against a real server.
+    pub untested: bool,
     /// The worktrees that already have data for this service.
     pub instances: Vec<NativeInstance>,
     /// Why the recipe could not be resolved, when it could not.
@@ -863,6 +865,13 @@ fn render_services(out: &mut String, services: &ServicesReport) {
         match &native.env_key {
             Some(key) => row(out, "", &format!("addressed by {key}")),
             None => row(out, "", "nothing in the env points at it"),
+        }
+        if native.untested {
+            row(
+                out,
+                "",
+                "this recipe has never been run against a real server",
+            );
         }
         if let Some(notes) = &native.notes {
             row(out, "", notes);
@@ -1439,6 +1448,7 @@ fn native_report(
             install: None,
             env_key: None,
             notes: None,
+            untested: false,
             instances: native_instances(paths, entry.name),
             error: None,
         };
@@ -1464,6 +1474,30 @@ fn native_report(
         report.overrides = resolved.overrides.iter().map(|o| o.to_string()).collect();
         report.install = resolved.recipe.install.clone();
         report.notes = resolved.recipe.notes.clone();
+        report.untested = resolved.recipe.untested;
+        if resolved.recipe.untested {
+            // A note, because nothing is wrong: the recipe may work
+            // perfectly. What a developer needs to know is which thing
+            // to suspect first when it does not, and that is not
+            // guessable from a failure.
+            findings.push(
+                Finding::note(
+                    Section::Services,
+                    format!(
+                        "the {:?} recipe has never been run against a real server — pando \
+                         ships it so a developer who has the engine can try it, not because \
+                         it is proven",
+                        resolved.recipe.name
+                    ),
+                )
+                .with_fix(format!(
+                    "if it does not work, the recipe is the first thing to suspect: copy it \
+                     into {}/{}.toml and fix it there",
+                    paths.recipes_dir().display(),
+                    resolved.recipe.name
+                )),
+            );
+        }
         let (mapping, _) = entry.env_map(Some(&resolved.recipe));
         report.env_key = mapping.keys().next().cloned();
         let (engine, version) = probe_engine(machine, &bin_dir, &resolved.recipe);

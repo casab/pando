@@ -138,6 +138,14 @@ pub struct Recipe {
     /// Something true about this recipe that a developer should know
     /// without reading it: Postgres's trust authentication, for one.
     pub notes: Option<String>,
+    /// Whether this recipe has ever been run against a real server.
+    ///
+    /// pando ships recipes for engines nobody on the project had
+    /// installed. Shipping one and implying it is proven would be worse
+    /// than not shipping it: the whole point of a recipe is that a
+    /// developer can fix it, and they can only do that if they know which
+    /// one to suspect.
+    pub untested: bool,
     pub body: Body,
 }
 
@@ -446,6 +454,7 @@ pub fn parse(text: &str) -> Result<Recipe> {
         version_flag: raw.version_flag,
         install: raw.install,
         notes: raw.notes,
+        untested: raw.untested,
         body,
     })
 }
@@ -468,6 +477,8 @@ struct RawRecipe {
     #[serde(default)]
     notes: Option<String>,
     #[serde(default)]
+    untested: bool,
+    #[serde(default)]
     service: Option<ServiceRecipe>,
     #[serde(default)]
     language: Option<LanguageRecipe>,
@@ -475,9 +486,15 @@ struct RawRecipe {
 
 /// The recipes this build ships, as `(file name, TOML text)`.
 ///
-/// One engine for now, and deliberately: a path proven end to end with a
-/// real server is worth more than four recipes nothing has run.
-pub const BUILT_IN: [(&str, &str); 1] = [("postgres", POSTGRES)];
+/// Three of the four were run against a real server while they were
+/// written; MongoDB was not, because no machine here has `mongod`, and
+/// it says so in its own `untested` field rather than in a comment.
+pub const BUILT_IN: [(&str, &str); 4] = [
+    ("mariadb", MARIADB),
+    ("mongodb", MONGODB),
+    ("postgres", POSTGRES),
+    ("redis", REDIS),
+];
 
 /// PostgreSQL.
 ///
@@ -537,6 +554,117 @@ psql -h 127.0.0.1 -p {port} -U postgres -d postgres -v ON_ERROR_STOP=1 -tAc "SEL
 '''
 "#;
 
+/// Redis.
+///
+/// No initialisation: redis makes its own data directory and writes
+/// `dump.rdb` into it, so the whole of "one instance's data" is the
+/// directory pando gives it. No Unix socket either — redis creates one
+/// only when asked — so nothing here needs `{socket_dir}`.
+///
+/// Persistence is left at redis's own defaults rather than turned off: a
+/// worktree that is stopped and started again should find what it had,
+/// which is the same promise the Postgres recipe makes. SIGTERM makes
+/// redis save before it exits, and `stop` sends exactly that.
+const REDIS: &str = r#"
+kind = "service"
+name = "redis"
+aliases = ["valkey", "cache"]
+summary = "Redis: one instance of this worktree's own, on a port pando allocated"
+binaries = ["redis-server", "redis-cli"]
+version_flag = "--version"
+install = "brew install redis   (or your distribution's redis-server package)"
+notes = "no password, bound to 127.0.0.1 — nothing off this machine can reach it"
+
+[service]
+port_env = "REDIS_URL"
+ready_timeout_s = 30
+
+cmd = "exec redis-server --port {port} --bind 127.0.0.1 --dir {datadir} --daemonize no"
+ready = "redis-cli -h 127.0.0.1 -p {port} ping"
+"#;
+
+/// MariaDB, which is also what `mysql` usually means on a developer's
+/// machine.
+///
+/// Three things here are deliberate:
+///
+/// - **`--socket {socket_dir}/mysql.sock`.** MariaDB's compiled-in socket
+///   path is relative to nothing useful and its default lands beside the
+///   data directory; `sun_path` is 104 bytes, and pando's data directory
+///   path is most of that already. Clients here connect over TCP with
+///   `--protocol=tcp`, which is not the default when a host is given.
+/// - **`--skip-grant-tables`, said out loud.** MariaDB enforces passwords
+///   and a development URL carries one pando has no safe way to set — it
+///   would be spliced into a `CREATE USER … IDENTIFIED BY` statement. So
+///   the grant tables are skipped, which accepts any user and any
+///   password on loopback. The origin tool did this silently; this recipe
+///   says it in `notes`, `doctor` prints it, and anyone who wants real
+///   accounts drops in their own `mariadb.toml`. Unlike MySQL's,
+///   MariaDB's `--skip-grant-tables` does not imply `--skip-networking`,
+///   which is why the binaries below are MariaDB's own by name: the same
+///   flag on `mysqld` would leave nothing to connect to.
+/// - **`create` makes the database and nothing else.** With the grant
+///   tables skipped there is no user to create, and `IF NOT EXISTS` is
+///   what makes it safe to run on every start.
+const MARIADB: &str = r#"
+kind = "service"
+name = "mariadb"
+aliases = ["mysql"]
+summary = "MariaDB: a server of this worktree's own, on a port pando allocated"
+binaries = ["mariadbd", "mariadb", "mariadb-install-db"]
+version_flag = "--version"
+install = "brew install mariadb   (or your distribution's mariadb-server package)"
+notes = "the grant tables are skipped, so any user and any password are accepted on 127.0.0.1 — a development server, and nothing off this machine can reach it"
+
+[service]
+port_env = "DATABASE_URL"
+ready_timeout_s = 60
+
+init = "mariadb-install-db --datadir={datadir} --auth-root-authentication-method=normal"
+
+cmd = "exec mariadbd --datadir={datadir} --port={port} --bind-address=127.0.0.1 --socket={socket_dir}/mysql.sock --skip-grant-tables --skip-name-resolve --pid-file={datadir}/pando.pid"
+
+ready = "mariadb --protocol=tcp -h 127.0.0.1 -P {port} -u root -e 'SELECT 1'"
+
+create = "mariadb --protocol=tcp -h 127.0.0.1 -P {port} -u root -e 'CREATE DATABASE IF NOT EXISTS `{db_name}`'"
+"#;
+
+/// MongoDB.
+///
+/// **Untested against a real server.** No machine this was written on had
+/// `mongod`, so every line here is from the documentation rather than
+/// from a run. `untested = true` is what says so: `doctor` reports it,
+/// `start` says it once, and the note below repeats it. That is more
+/// honest than not shipping a recipe at all — a developer who has mongod
+/// can try it and fix one file — and much more honest than shipping one
+/// that looks as proven as the others.
+///
+/// `--nounixsocket` rather than a socket directory: mongo does not need
+/// one, and not creating it is simpler than keeping it short. Nothing is
+/// created either: mongo makes a database on its first write, so there is
+/// no `create` step to be idempotent about.
+const MONGODB: &str = r#"
+kind = "service"
+name = "mongodb"
+aliases = ["mongo"]
+summary = "MongoDB: a server of this worktree's own, on a port pando allocated"
+binaries = ["mongod", "mongosh"]
+version_flag = "--version"
+install = "brew install mongodb-community   (from the mongodb/brew tap)"
+notes = "no authentication, bound to 127.0.0.1 — and this recipe has never been run against a real mongod, so treat a failure here as the recipe's fault before your own"
+untested = true
+
+[service]
+port_env = "MONGODB_URI"
+ready_timeout_s = 60
+
+cmd = "exec mongod --dbpath {datadir} --port {port} --bind_ip 127.0.0.1 --nounixsocket"
+
+# `{{ping:1}}` renders to `{ping:1}`: a bare `{ping:1}` is a placeholder
+# to pando's own substitution language, and would be refused as unknown.
+ready = "mongosh --host 127.0.0.1 --port {port} --quiet --eval 'db.adminCommand({{ping: 1}}).ok'"
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,8 +686,83 @@ mod tests {
             );
         }
         let recipes = Recipes::built_in();
-        assert_eq!(recipes.names(), vec!["postgres"]);
-        assert_eq!(recipes.service_names(), vec!["postgres"]);
+        let names = recipes.names();
+        for expected in ["mariadb", "mongodb", "postgres", "redis"] {
+            assert!(names.contains(&expected), "{names:?} has no {expected}");
+        }
+        // Every one of them starts a server; a language recipe that got
+        // into this list would be a build that ships something no
+        // `[[services]]` entry could ever run.
+        assert_eq!(recipes.service_names(), names);
+    }
+
+    /// Rules every shipped service recipe is held to, whichever engine it
+    /// is for. Written as one test over the table rather than four
+    /// near-copies: the next recipe anyone adds is held to them for free,
+    /// which is the whole reason recipes are data.
+    #[test]
+    fn every_built_in_service_recipe_is_private_to_this_machine() {
+        for (name, text) in BUILT_IN {
+            let recipe = parse(text).unwrap();
+            let service = recipe
+                .service()
+                .unwrap_or_else(|| panic!("{name} is not a service"));
+            let cmd = &service.cmd;
+            // Loopback, spelled out. A default is not good enough: most
+            // engines default to every interface, and one that does not
+            // may still resolve `localhost` to `::1` as well.
+            assert!(
+                cmd.contains("127.0.0.1"),
+                "{name} does not bind loopback explicitly: {cmd}"
+            );
+            assert!(
+                !cmd.contains("0.0.0.0"),
+                "{name} binds every interface: {cmd}"
+            );
+            // The server pando records the pid of has to be the server.
+            assert!(cmd.starts_with("exec "), "{name} does not exec: {cmd}");
+            // The socket trap, for every engine rather than only the one
+            // it was found on: a Unix socket inside the data directory is
+            // a path that will not fit in `sun_path`.
+            assert!(
+                !cmd.contains("{datadir}/mysql.sock") && !cmd.contains("-k {datadir}"),
+                "{name} puts its socket in the data directory: {cmd}"
+            );
+            // Every recipe says what it needs and how to get it, because
+            // a missing engine is a sentence naming what to install.
+            assert!(!recipe.binaries.is_empty(), "{name} names no binaries");
+            assert!(recipe.install.is_some(), "{name} has no install hint");
+            assert!(recipe.notes.is_some(), "{name} says nothing about its auth");
+            assert!(recipe.version_cmd().is_some(), "{name} cannot be versioned");
+        }
+    }
+
+    /// An engine nobody here could run says so in the one place that is
+    /// data rather than prose.
+    #[test]
+    fn a_recipe_no_one_has_run_against_a_real_server_says_so() {
+        let recipes = Recipes::built_in();
+        let untested: Vec<&str> = recipes
+            .entries()
+            .filter(|(_, loaded)| loaded.recipe.untested)
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            untested,
+            vec!["mongodb"],
+            "which recipes are unproven changed"
+        );
+        let mongo = recipes.get("mongodb").unwrap();
+        assert!(
+            mongo
+                .recipe
+                .notes
+                .as_deref()
+                .unwrap()
+                .contains("never been run"),
+            "and the note has to say it too: {:?}",
+            mongo.recipe.notes
+        );
     }
 
     #[test]
@@ -621,7 +824,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "tiny.toml", MINIMAL);
         let recipes = Recipes::load(dir.path());
-        assert_eq!(recipes.names(), vec!["postgres", "tiny"]);
+        assert!(recipes.names().contains(&"tiny"));
+        assert!(recipes.names().contains(&"postgres"));
         assert!(!recipes.get("tiny").unwrap().replaces_built_in);
     }
 
@@ -652,9 +856,11 @@ mod tests {
     #[test]
     fn an_unknown_recipe_names_the_ones_there_are() {
         let recipes = Recipes::built_in();
-        let e = format!("{:#}", recipes.get("mysql").unwrap_err());
-        assert!(e.contains("no recipe named \"mysql\""), "{e}");
+        let e = format!("{:#}", recipes.get("cassandra").unwrap_err());
+        assert!(e.contains("no recipe named \"cassandra\""), "{e}");
         assert!(e.contains("postgres"), "{e}");
+        // `mysql` is not unknown: it is what MariaDB is usually called.
+        assert_eq!(recipes.get("mysql").unwrap().recipe.name, "mariadb");
     }
 
     #[test]
@@ -779,6 +985,7 @@ files = [{ file = "rust-toolchain.toml", toml_key = ["toolchain", "channel"] }]
             version_flag: Some(entry.version_flag.to_string()),
             install: None,
             notes: None,
+            untested: false,
             body: Body::Language(LanguageRecipe {
                 files: entry
                     .files
@@ -814,10 +1021,11 @@ files = [{ file = "rust-toolchain.toml", toml_key = ["toolchain", "channel"] }]
         write(dir.path(), "node.toml", language_toml("node"));
         write(dir.path(), "tiny.toml", MINIMAL);
         let recipes = Recipes::load(dir.path());
-        assert_eq!(recipes.names(), vec!["node", "postgres", "tiny"]);
+        assert!(recipes.names().contains(&"node"));
         // One loader, two kinds: the service list is not polluted by the
         // language, and the language keeps its own body.
-        assert_eq!(recipes.service_names(), vec!["postgres", "tiny"]);
+        assert!(!recipes.service_names().contains(&"node"));
+        assert!(recipes.service_names().contains(&"tiny"));
         let node = recipes.get("node").unwrap();
         assert_eq!(node.recipe.kind, Kind::Language);
         assert_eq!(
