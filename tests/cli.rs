@@ -60,7 +60,10 @@ fn env_built(kind: Kind, local_files: bool) -> Env {
 /// fields, so the fixture is still on disk when this runs.
 impl Drop for Env {
     fn drop(&mut self) {
-        if self.home.exists() {
+        // The root too, not only the home: one test moves the repository
+        // to somewhere else, and spawning a command in a directory that is
+        // not there panics inside a destructor.
+        if self.home.exists() && self.root.exists() {
             let _ = self.pando(&["stop"]);
         }
     }
@@ -2416,4 +2419,83 @@ fn doctor_reports_a_hook_and_the_worktrees_it_has_run_in() {
         "the globs it is keyed on:\n{text}"
     );
     assert_eq!(code(&e.pando(&["rm", "feat+one", "--force"])), EXIT_OK);
+}
+
+#[test]
+fn doctor_adopts_the_project_folder_of_a_repository_that_moved() {
+    let e = env();
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+    let old_id = pando::project::ProjectRef::from_root(&e.root).unwrap().id;
+    assert!(e.home.join("projects").join(&old_id).is_dir());
+
+    // Move the repository, keeping its directory name — the id is that
+    // name plus a hash of the path, so this is exactly what a move looks
+    // like from pando's side.
+    let elsewhere = e.root.parent().unwrap().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let moved = elsewhere.join(e.root.file_name().unwrap());
+    std::fs::rename(&e.root, &moved).unwrap();
+    let new_id = pando::project::ProjectRef::from_root(&moved).unwrap().id;
+    assert_ne!(new_id, old_id);
+
+    // doctor offers it, naming the folder and the repository it came from.
+    let out = e.pando_in(&moved, &["doctor"]);
+    let text = stdout(&out);
+    assert!(text.lines().any(|l| l == "adoption"), "{text}");
+    assert!(text.contains(&old_id), "{text}");
+    assert!(text.contains("feat+one"), "{text}");
+
+    // Without --yes and with no terminal to ask, nothing moves.
+    let refused = e.pando_in(&moved, &["doctor", "--adopt", &old_id]);
+    assert_eq!(code(&refused), EXIT_ERROR);
+    assert!(
+        stderr(&refused).contains("nothing was moved"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(e.home.join("projects").join(&old_id).is_dir());
+
+    let out = e.pando_in(&moved, &["doctor", "--adopt", &old_id, "--yes"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains(&format!("adopted {old_id} as {new_id}")),
+        "{}",
+        stdout(&out)
+    );
+    assert!(!e.home.join("projects").join(&old_id).exists());
+
+    // Config, state and worktrees all came with it.
+    let project = e.home.join("projects").join(&new_id);
+    assert!(project.join("pando.toml").is_file(), "the config");
+    assert!(project.join("worktrees/feat+one").is_dir(), "the worktree");
+    let store = pando::state::load(&project.join("state.json")).unwrap();
+    assert_eq!(
+        store.worktrees["feat+one"].path,
+        std::fs::canonicalize(project.join("worktrees/feat+one")).unwrap(),
+        "the recorded path moved with the folder"
+    );
+
+    // And pando finds it again from the repository's new home.
+    let ls = e.pando_in(&moved, &["ls"]);
+    assert_eq!(code(&ls), EXIT_OK, "stderr: {}", stderr(&ls));
+    assert!(stdout(&ls).contains("feat+one"), "{}", stdout(&ls));
+    let path = e.pando_in(&moved, &["path", "feat+one"]);
+    assert_eq!(code(&path), EXIT_OK, "stderr: {}", stderr(&path));
+    assert!(stdout(&path).contains(&new_id), "{}", stdout(&path));
+
+    // git agrees, which is what `git worktree repair` was for.
+    let listed = common::git_raw(&moved, &["worktree", "list", "--porcelain"]);
+    let listed = String::from_utf8_lossy(&listed.stdout).into_owned();
+    assert!(listed.contains(&new_id), "{listed}");
+    assert!(!listed.contains("prunable"), "{listed}");
+
+    // Nothing left to adopt, and nothing to report about the move.
+    let after = stdout(&e.pando_in(&moved, &["doctor"]));
+    assert!(after.contains("nothing to adopt"), "{after}");
+
+    assert_eq!(
+        code(&e.pando_in(&moved, &["rm", "feat+one", "--force"])),
+        EXIT_OK
+    );
+    assert_eq!(status_porcelain(&moved), "");
 }

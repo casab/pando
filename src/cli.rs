@@ -131,7 +131,17 @@ pub enum Command {
     /// Read-only. Exits 0 when nothing found will break a command and 1
     /// when something will — and everything it exits 1 for is printed
     /// above, with what to do about it.
-    Doctor,
+    Doctor {
+        /// Move a project folder whose repository has moved under this
+        /// repository's current id, keeping its config, its state and its
+        /// worktrees. The one thing doctor does rather than reports, and
+        /// it asks first.
+        #[arg(long, value_name = "OLD-ID")]
+        adopt: Option<String>,
+        /// Do not ask before adopting.
+        #[arg(long, requires = "adopt")]
+        yes: bool,
+    },
     /// Stop a worktree's processes, or every worktree's when given no name.
     Stop {
         name: Option<String>,
@@ -315,7 +325,10 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
         // Deliberately not given the config `main` loaded: the one thing
         // worth reporting about a project layer pando cannot read is the
         // error, and `main` keeps that to itself.
-        Command::Doctor => doctor(paths, &mut out),
+        Command::Doctor { adopt, yes } => match adopt {
+            Some(old_id) => adopt_project(paths, &old_id, yes, &mut out),
+            None => doctor(paths, &mut out),
+        },
         Command::Stop { name, only } => match name {
             Some(name) => {
                 match actions::stop(paths, &name, only.as_deref(), &notice)? {
@@ -1641,6 +1654,63 @@ fn proposal_out(proposal: &crate::detect::Proposal) -> ProposalOut {
 /// The failing case carries no message of its own: every problem is
 /// already on stdout with its fix, and `pando: <something>` beneath the
 /// report would be a reason the command did not give.
+pub fn adopt_project<W: Write>(
+    paths: &PandoPaths,
+    old_id: &str,
+    yes: bool,
+    out: &mut W,
+) -> Result<()> {
+    let adoption = crate::doctor::adopt(paths, old_id, &|plan| {
+        if yes {
+            return Ok(true);
+        }
+        // On stderr, like every other thing pando narrates, so a piped
+        // stdout is still only what the command was asked for.
+        let mut err = std::io::stderr();
+        writeln!(err, "pando: move {}", plan.from.display())?;
+        writeln!(err, "           to {}", plan.to.display())?;
+        if let Some(root) = &plan.old_root {
+            writeln!(
+                err,
+                "       its repository was at {}, and is not there now",
+                root.display()
+            )?;
+        }
+        if !plan.worktrees.is_empty() {
+            writeln!(
+                err,
+                "       {} move with it: {}",
+                plan.worktrees.len(),
+                plan.worktrees.join(", ")
+            )?;
+        }
+        write!(err, "pando: go ahead? [y/N] ")?;
+        err.flush()?;
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line)? == 0 {
+            // No terminal to ask. `--yes` is the way to say yes without
+            // one, and taking silence for consent is not.
+            return Ok(false);
+        }
+        Ok(matches!(line.trim(), "y" | "Y" | "yes"))
+    })?;
+    for line in &adoption.notices {
+        notice(line);
+    }
+    if adoption.rewritten > 0 {
+        notice(&format!(
+            "{} recorded {} moved with it",
+            adoption.rewritten,
+            match adoption.rewritten {
+                1 => "path",
+                _ => "paths",
+            }
+        ));
+    }
+    writeln!(out, "adopted {} as {}", old_id, paths.project_id())?;
+    Ok(())
+}
+
 pub fn doctor<W: Write>(paths: &PandoPaths, out: &mut W) -> Result<()> {
     let report = crate::doctor::run(paths);
     write!(out, "{}", report.render())?;
