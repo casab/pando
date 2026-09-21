@@ -823,6 +823,17 @@ fn validate_services(config: &Config) -> Result<()> {
         crate::compose::file_in(Path::new("/"), file)?;
         for name in include {
             crate::paths::validate_owned_log_source("service name", name)?;
+            // A service is a log source, and so is a hook. Two of them with
+            // one name both write `logs/<worktree>/<name>.log`: the
+            // service's pump truncates it, the hook appends to it, and
+            // `logs --source <name>` shows a mixture of the two.
+            if config.hooks.iter().any(|hook| &hook.name == name) {
+                bail!(
+                    "the hook {name:?} and the service {name:?} have the same name — both \
+                     write the log logs/<worktree>/{name}.log, so the service's log pump \
+                     would truncate what the hook appended; rename one of them"
+                );
+            }
             if let Some(owner) = role_owner.get(name) {
                 bail!(
                     "the service {name:?} and {owner} both claim the role {name:?} — a role is \

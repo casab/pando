@@ -393,6 +393,150 @@ fn a_probe_runs_in_the_worktree_with_the_process_environment() {
     assert_eq!(ran[1], format!("name={name}"));
 }
 
+// ---- what a hook leaves behind, and where it came from --------------------
+
+fn worktree_of(f: &Hx, name: &str) -> PathBuf {
+    f.config.worktrees_dir(&f.paths).join(name)
+}
+
+/// Runs a start, collecting every notice it printed.
+fn start_saying(f: &Hx, name: &str) -> Vec<String> {
+    let said = std::sync::Mutex::new(Vec::<String>::new());
+    {
+        let notice = |m: &str| said.lock().unwrap().push(m.to_string());
+        actions::start(&f.paths, &f.config, name, None, false, &notice).unwrap();
+    }
+    said.into_inner().unwrap()
+}
+
+// `docs/02-principles.md`: a hook that writes a new file into the worktree
+// is misconfigured. The comparison only ever saw the files the hook was
+// keyed on, so anything it created outside them was invisible.
+#[test]
+fn a_hook_that_leaves_an_untracked_file_in_the_worktree_names_it() {
+    let f = hx(Kind::Plain, |_| {
+        "[project]\ninstall = \"true\"\n\n\
+         [dev]\ncmd = \"sleep 30\"\nports = []\n\n\
+         [[hooks]]\nname = \"writer\"\nafter = \"install\"\n\
+         fingerprint = [\"README.md\"]\n\
+         cmd = \"touch generated-by-a-hook.txt\"\n"
+            .to_string()
+    });
+    let name = new_worktree(&f, "feat/one");
+    let worktree = worktree_of(&f, &name);
+    assert_eq!(common::status_porcelain(&worktree), "");
+
+    let said = start_saying(&f, &name);
+    // A warning, not merely the "writer: touch …" line every hook prints.
+    assert!(
+        said.iter().any(|m| m.starts_with("warning:")
+            && m.contains("writer")
+            && m.contains("generated-by-a-hook.txt")),
+        "the hook and the path it left: {said:?}"
+    );
+    assert!(
+        common::status_porcelain(&worktree).contains("generated-by-a-hook.txt"),
+        "and it really is there"
+    );
+    let _ = actions::stop(&f.paths, &name, None);
+}
+
+// A hook pando invented — the detected `migrate` this phase adds is the one
+// that matters — failed with a message naming the hook but never saying
+// pando wrote it, nor where the one edit lives.
+#[test]
+fn a_failing_hook_names_the_entry_it_came_from_and_says_it_can_be_deleted() {
+    let f = hx(Kind::Plain, |_| {
+        "[project]\ninstall = \"true\"\n\n\
+         [dev]\ncmd = \"sleep 30\"\nports = []\n\n\
+         [[hooks]]\nname = \"migrate\"\nafter = \"install\"\n\
+         cmd = \"echo boom >&2 && exit 7\"\n"
+            .to_string()
+    });
+    let name = new_worktree(&f, "feat/one");
+    let err = format!(
+        "{:#}",
+        actions::start(&f.paths, &f.config, &name, None, false, &|_| {}).unwrap_err()
+    );
+    assert!(err.contains("the migrate hook failed"), "{err}");
+    assert!(err.contains("[[hooks]]"), "{err}");
+    assert!(
+        err.contains(&f.paths.config_file().display().to_string()),
+        "it names the file the one edit lives in: {err}"
+    );
+    assert!(err.contains("delete it"), "{err}");
+}
+
+// `fingerprint = ["prisma/migrations"]` instead of `["prisma/migrations/**"]`
+// is the natural typo, and it costs a full migration on every start. So
+// does a glob that matches nothing. Every guess is visible; so is this.
+#[test]
+fn a_fingerprint_that_matches_nothing_is_said_out_loud() {
+    let f = hx(Kind::NextPnpmCompose, |_| {
+        "[project]\nprovision = [\".env\"]\ninstall = \"true\"\n\n\
+         [dev]\ncmd = \"sleep 30\"\nports = []\n\n\
+         [[hooks]]\nname = \"migrate\"\nafter = \"install\"\n\
+         fingerprint = [\"prisma/migrations\"]\ncmd = \"true\"\n\n\
+         [[hooks]]\nname = \"absent\"\nafter = \"install\"\n\
+         fingerprint = [\"nothing-*.zzz\"]\ncmd = \"true\"\n\n\
+         [[hooks]]\nname = \"keyed\"\nafter = \"install\"\n\
+         fingerprint = [\"package.json\"]\ncmd = \"true\"\n"
+            .to_string()
+    });
+    let name = new_worktree(&f, "feat/one");
+    let said = start_saying(&f, &name);
+
+    let about = |hook: &str| -> Vec<&String> {
+        let subject = format!("the {hook} hook");
+        said.iter()
+            .filter(|m| m.starts_with("warning:") && m.contains(&subject))
+            .collect()
+    };
+    let migrate = about("migrate");
+    assert_eq!(migrate.len(), 1, "one notice, not one per glob: {said:?}");
+    assert!(migrate[0].contains("prisma/migrations"), "{migrate:?}");
+    assert!(
+        migrate[0].contains("prisma/migrations/**"),
+        "a literal that is a directory gets the fix suggested: {migrate:?}"
+    );
+
+    let absent = about("absent");
+    assert_eq!(absent.len(), 1, "{said:?}");
+    assert!(absent[0].contains("nothing-*.zzz"), "{absent:?}");
+
+    assert!(
+        about("keyed").is_empty(),
+        "a fingerprint that matched says nothing: {said:?}"
+    );
+    let _ = actions::stop(&f.paths, &name, None);
+}
+
+// A hook and a service both write `logs/<worktree>/<name>.log`: the pump
+// truncates it, the hook appends to it, and `logs --source db` shows a
+// mixture. A service name already may not collide with a process's role.
+#[test]
+fn a_hook_named_after_a_service_is_refused_at_load() {
+    let dir = TempDir::new().unwrap();
+    let root = build(Kind::NextPnpmCompose, dir.path()).root;
+    let paths = paths_for(&dir.path().join("pando-home"), &root);
+    std::fs::create_dir_all(paths.project_dir()).unwrap();
+    std::fs::write(
+        paths.config_file(),
+        "[dev]\ncmd = \"true\"\n\n\
+         [[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
+         include = [\"postgres\"]\n\n\
+         [[hooks]]\nname = \"postgres\"\nafter = \"services\"\ncmd = \"true\"\n",
+    )
+    .unwrap();
+    let err = format!("{:#}", config::load(&paths).unwrap_err());
+    assert!(err.contains("\"postgres\""), "{err}");
+    assert!(err.contains("hook"), "{err}");
+    assert!(
+        err.contains("log"),
+        "it says what they would collide over: {err}"
+    );
+}
+
 #[test]
 fn a_hook_name_that_would_escape_the_log_directory_is_refused_at_load() {
     let dir = TempDir::new().unwrap();

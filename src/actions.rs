@@ -313,10 +313,20 @@ fn run_hook(
     if current.is_some() && current == recorded {
         return Ok(());
     }
+    // …and a hook that *has* globs and matched nothing with them is the
+    // same thing by accident: `fingerprint = ["prisma/migrations"]` instead
+    // of `["prisma/migrations/**"]` is the natural typo and costs a full
+    // migration on every start. Every guess is visible; so is this.
+    if !hook.fingerprint.is_empty() && current.is_none() {
+        progress(&matched_nothing(ctx.worktree, hook));
+    }
 
     progress(&format!("{}: {cmd}", hook.name));
     let mut env = pando_env(paths, ctx.name, ctx.branch, ctx.worktree);
     env.extend(ctx.service_env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    // What the worktree looked like before, so anything the hook leaves
+    // behind can be named rather than merely counted.
+    let before = porcelain_status(ctx.worktree);
     hooks::run_with_fallback(
         &log_file,
         &with_prelude(config, &cmd),
@@ -327,7 +337,7 @@ fn run_hook(
         &cwd,
         &env,
     )
-    .with_context(|| format!("the {} hook failed", hook.name))?;
+    .with_context(|| hook_failed(paths, config, hook))?;
 
     // A hook that rewrites one of its own inputs — a "frozen" install that
     // normalises a lockfile is the classic — has to be reported, because a
@@ -337,6 +347,19 @@ fn run_hook(
     let after = hooks::fingerprint(ctx.worktree, &hook.fingerprint, &cmd);
     if after != current {
         progress(&changed_its_inputs(&hook.name, &cmd));
+    }
+    // And anything it wrote *outside* what it is keyed on, which the
+    // fingerprint can say nothing about. `docs/02-principles.md`: a hook
+    // that writes a new file into the worktree is misconfigured, and the
+    // developer can only know that if pando says which file.
+    let appeared = newly_dirty(&before, &porcelain_status(ctx.worktree));
+    if !appeared.is_empty() {
+        progress(&format!(
+            "warning: the {} hook changed this worktree: {} — `git status` there will show \
+             that, and pando never writes into your repository",
+            hook.name,
+            appeared.join(", ")
+        ));
     }
 
     let _lock = state::lock(&paths.lock_file())?;
@@ -420,6 +443,120 @@ fn run_probes(
         );
     }
     Ok(())
+}
+
+/// `git status --porcelain --untracked-files=all` inside a worktree, one
+/// entry per line.
+///
+/// Empty when git cannot answer. A hook that ran is not failed because the
+/// check after it could not be made — the check is a warning, not a gate.
+fn porcelain_status(worktree: &Path) -> Vec<String> {
+    let Ok(out) = std::process::Command::new("git")
+        .current_dir(worktree)
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The paths in `after` that were not dirty in `before`, without their
+/// two-letter status prefix.
+fn newly_dirty(before: &[String], after: &[String]) -> Vec<String> {
+    after
+        .iter()
+        .filter(|line| !before.contains(line))
+        .map(|line| line.get(3..).unwrap_or(line.as_str()).trim().to_string())
+        .collect()
+}
+
+/// The context a failing hook carries: which entry it is, and where the one
+/// edit that removes it lives.
+///
+/// For a hook the developer wrote, naming the file is a courtesy. For one
+/// *pando* invented — the detected `migrate` this phase adds automatically
+/// — it is the difference between "a wrong guess costs one edit" and a
+/// mysterious failure at start time.
+fn hook_failed(paths: &PandoPaths, config: &Config, hook: &config::HookConfig) -> String {
+    let base = format!("the {} hook failed", hook.name);
+    // The install step is synthesised from `[project].install`; there is no
+    // `[[hooks]]` entry to point at.
+    if hook.name == INSTALL_HOOK || !config.hooks.iter().any(|h| h.name == hook.name) {
+        return base;
+    }
+    format!(
+        "{base} — this is the [[hooks]] entry named {:?} in {}; delete it if it is wrong",
+        hook.name,
+        hook_source_file(paths, &hook.name).display()
+    )
+}
+
+/// Which config file declares a `[[hooks]]` entry by that name. pando's own
+/// first, because that is the layer that wins and the one detection writes.
+fn hook_source_file(paths: &PandoPaths, name: &str) -> PathBuf {
+    let home = paths.config_file();
+    if declares_hook(&home, name) {
+        return home;
+    }
+    let committed = paths.root().join("pando.toml");
+    if declares_hook(&committed, name) {
+        return committed;
+    }
+    home
+}
+
+fn declares_hook(path: &Path, name: &str) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
+        return false;
+    };
+    doc.get("hooks")
+        .and_then(|item| item.as_array_of_tables())
+        .is_some_and(|tables| {
+            tables
+                .iter()
+                .any(|table| table.get("name").and_then(|v| v.as_str()) == Some(name))
+        })
+}
+
+/// One notice for a hook whose globs match nothing at all.
+fn matched_nothing(worktree: &Path, hook: &config::HookConfig) -> String {
+    let globs: Vec<String> = hook
+        .fingerprint
+        .iter()
+        .map(|glob| format!("{glob:?}"))
+        .collect();
+    let mut message = format!(
+        "warning: the {} hook is keyed on {}, which matches nothing in this worktree, so it \
+         runs on every start",
+        hook.name,
+        globs.join(", ")
+    );
+    // The common shape of the mistake: a literal that names a directory.
+    // A glob matches files, so it needs `/**` to reach into one.
+    let directories: Vec<String> = hook
+        .fingerprint
+        .iter()
+        .filter(|glob| !glob.contains(['*', '?']) && worktree.join(glob).is_dir())
+        .map(|glob| format!("{glob}/**"))
+        .collect();
+    if !directories.is_empty() {
+        message.push_str(&format!(
+            " — that is a directory, and a fingerprint matches files; try {}",
+            directories.join(", ")
+        ));
+    }
+    message
 }
 
 fn changed_its_inputs(hook: &str, cmd: &str) -> String {
