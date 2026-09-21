@@ -97,6 +97,16 @@ pub struct ProcessRecord {
     /// then follows whichever of them nothing claimed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub observed_ports: Vec<u16>,
+    /// Whether the orphan sweep has already signalled this record's
+    /// process group.
+    ///
+    /// A record whose leader is dead is signalled once, because a dead
+    /// leader is not a dead group. A `Failed` record then lives on until
+    /// its own worktree is started, stopped or removed, and re-signalling
+    /// its pgid on every later mutation is how a pid that has since
+    /// wrapped around onto an unrelated session leader gets killed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub swept: bool,
     pub phase: Phase,
 }
 
@@ -503,6 +513,7 @@ mod tests {
             ready_port: Some(17_000),
             ready_timeout_s: None,
             observed_ports: Vec::new(),
+            swept: false,
             phase,
         }
     }

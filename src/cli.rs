@@ -1335,6 +1335,7 @@ mod tests {
                 ready_port: Some(17_342),
                 ready_timeout_s: None,
                 observed_ports: Vec::new(),
+                swept: false,
                 phase: Phase::Running { since: Utc::now() },
             },
         );
@@ -1373,6 +1374,7 @@ mod tests {
             ready_port: None,
             ready_timeout_s: None,
             observed_ports: observed.to_vec(),
+            swept: false,
             phase: Phase::Running { since: Utc::now() },
         }
     }
@@ -1649,6 +1651,7 @@ mod tests {
                 ready_port: Some(17_342),
                 ready_timeout_s: None,
                 observed_ports: Vec::new(),
+                swept: false,
                 phase: Phase::Running { since: Utc::now() },
             },
         );
@@ -1662,6 +1665,7 @@ mod tests {
                 ready_port: None,
                 ready_timeout_s: None,
                 observed_ports: Vec::new(),
+                swept: false,
                 phase: Phase::Failed {
                     at: Utc::now(),
                     reason: "process exited".to_string(),
@@ -1753,6 +1757,7 @@ mod tests {
                 ready_port: Some(17_342),
                 ready_timeout_s: None,
                 observed_ports: Vec::new(),
+                swept: false,
                 phase: Phase::Running { since: Utc::now() },
             },
         );
@@ -1766,6 +1771,7 @@ mod tests {
                 ready_port: Some(17_343),
                 ready_timeout_s: None,
                 observed_ports: Vec::new(),
+                swept: false,
                 phase: api_phase,
             },
         );

@@ -2531,6 +2531,7 @@ pub mod tests {
                 ready_port: Some(17_342),
                 ready_timeout_s: None,
                 observed_ports: Vec::new(),
+                swept: false,
                 phase,
             },
         );
@@ -2559,6 +2560,7 @@ pub mod tests {
                 ready_port: Some(port),
                 ready_timeout_s: None,
                 observed_ports: Vec::new(),
+                swept: false,
                 phase,
             },
         );
@@ -3147,6 +3149,7 @@ pub mod tests {
                 ready_port: Some(19_056),
                 ready_timeout_s: None,
                 observed_ports: vec![3000],
+                swept: false,
                 phase: running_phase(),
             },
         );

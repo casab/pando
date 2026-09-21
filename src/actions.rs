@@ -94,7 +94,7 @@ pub fn new(
     // Under the lock, so the porcelain read cannot race a concurrent `new`
     // whose record is already saved but whose worktree this process has not
     // seen yet. Every record it may drop is signalled first.
-    sweep_orphaned_groups(&store)?;
+    sweep_orphaned_groups(&mut store)?;
     drop_stale_worktree_records(&mut store, &root);
 
     std::fs::create_dir_all(&worktrees_dir)
@@ -369,7 +369,7 @@ pub fn rm(paths: &PandoPaths, name: &str, yes: bool, force: bool) -> Result<()> 
     let _lock = state::lock(&paths.lock_file())?;
     let mut store = state::load(&paths.state_file())?;
     // Before any record is dropped, whichever worktree it belongs to.
-    sweep_orphaned_groups(&store)?;
+    sweep_orphaned_groups(&mut store)?;
     drop_stale_worktree_records(&mut store, paths.root());
     let created_by_pando = store
         .worktrees
@@ -922,7 +922,7 @@ pub fn start(
     }
     // And every *other* worktree's dead-leader group, because `reconcile`
     // drops those records too.
-    sweep_orphaned_groups(&store)?;
+    sweep_orphaned_groups(&mut store)?;
     advance_before_reconcile(&mut store);
     state::reconcile(&mut store, proc::is_alive);
 
@@ -1039,6 +1039,7 @@ pub fn start(
             ready_port: plan.ready_port,
             ready_timeout_s: plan.ready_timeout_s,
             observed_ports: Vec::new(),
+            swept: false,
             phase: Phase::Starting { since: now },
         };
         store
@@ -1134,7 +1135,7 @@ fn stop_missing(
     let outcome = stop_recorded(&mut store, name, only, missing)?;
     // `reconcile` drops dead-leader records for every worktree in the
     // project, not only this one, so every one of them is signalled first.
-    sweep_orphaned_groups(&store)?;
+    sweep_orphaned_groups(&mut store)?;
     advance_before_reconcile(&mut store);
     state::reconcile(&mut store, proc::is_alive);
     state::save(&paths.state_file(), &store)?;
@@ -1174,7 +1175,7 @@ pub fn stop_all_with(paths: &PandoPaths, stop: impl Fn(i32) -> Result<()>) -> Re
     // in that record is the only way back to it.
     let mut sweep_failed = None;
     if failures.is_empty() {
-        match sweep_orphaned_groups(&store) {
+        match sweep_orphaned_groups_with(&mut store, &stop) {
             Ok(()) => {
                 advance_before_reconcile(&mut store);
                 state::reconcile(&mut store, proc::is_alive);
@@ -1282,22 +1283,36 @@ fn stop_recorded_with(
 /// One group that will not die does not stop the sweep: the rest are still
 /// signalled and the failures are reported together. A caller that gets an
 /// error must not go on to drop records.
-fn sweep_orphaned_groups(store: &state::State) -> Result<()> {
+fn sweep_orphaned_groups(store: &mut state::State) -> Result<()> {
+    sweep_orphaned_groups_with(store, |pgid| proc::stop(pgid, STOP_GRACE))
+}
+
+/// [`sweep_orphaned_groups`] with the signal injected, so a test can watch
+/// which groups it decides to signal without needing real ones.
+fn sweep_orphaned_groups_with(
+    store: &mut state::State,
+    stop: impl Fn(i32) -> Result<()>,
+) -> Result<()> {
     let mut failures = Vec::new();
-    for (name, record) in &store.worktrees {
-        for (process, p) in &record.processes {
-            if proc::is_alive(p.pid) {
+    for (name, record) in &mut store.worktrees {
+        for (process, p) in &mut record.processes {
+            // Once, not on every mutation. A dead leader is not a dead
+            // group, so the group is signalled — but a `Failed` record now
+            // survives `reconcile` until its own worktree is started,
+            // stopped or removed (each of which signals and clears it on
+            // its own path), and re-sending SIGTERM/SIGKILL to that pgid
+            // on every later mutation in the project is how a pid that has
+            // since wrapped around onto an unrelated session leader gets
+            // killed. One signal per record bounds that to the window
+            // between the leader dying and the first mutation after it.
+            if p.swept || proc::is_alive(p.pid) {
                 continue;
             }
-            // Unconditional, like every other signal pando sends: a dead
-            // leader is not a dead group. The caveat is pid wraparound — a
-            // sticky Failed record keeps its pgid indefinitely, and after
-            // enough pid churn that number can belong to an unrelated
-            // session leader. Fixing that needs the group's start time
-            // recorded and compared, which is a per-platform lookup; until
-            // then the leak this prevents is by far the likelier harm.
-            if let Err(e) = proc::stop(p.pgid, STOP_GRACE) {
-                failures.push(format!("{name}/{process} (group {}): {e:#}", p.pgid));
+            match stop(p.pgid) {
+                // Recorded only once the signal actually went out: a group
+                // that could not be signalled has to be tried again.
+                Ok(()) => p.swept = true,
+                Err(e) => failures.push(format!("{name}/{process} (group {}): {e:#}", p.pgid)),
             }
         }
     }
@@ -3390,6 +3405,7 @@ time.sleep(300)
                 ready_port: None,
                 ready_timeout_s: None,
                 observed_ports: Vec::new(),
+                swept: false,
                 phase: Phase::Running { since: Utc::now() },
             },
         );
@@ -3705,6 +3721,136 @@ time.sleep(300)
         );
     }
 
+    // Phase 2c review, finding 2. A `Failed` record survives `reconcile`
+    // until its own worktree is acted on, and the sweep used to re-signal
+    // its pgid on every mutation anywhere in the project — which, once
+    // that pid has wrapped around, is an unrelated session leader being
+    // SIGTERMed and then SIGKILLed, over and over.
+    #[test]
+    fn a_dead_groups_pgid_is_signalled_once_and_not_on_every_later_mutation() {
+        let mut store = state::State::new();
+        let mut record = WorktreeRecord::new("/trees/feat+one", true);
+        // Far above `kern.maxproc`, so `is_alive` is certainly false and
+        // no real process can be behind either number.
+        record
+            .processes
+            .insert("dev".to_string(), failed_record(4_000_001));
+        // A process that is still alive is never signalled by the sweep,
+        // swept flag or not.
+        let mut live = fake_record(4_000_002);
+        live.pid = std::process::id();
+        record.processes.insert("web".to_string(), live);
+        store.worktrees.insert("feat+one".to_string(), record);
+
+        let signalled = std::cell::RefCell::new(Vec::new());
+        let watch = |pgid: i32| {
+            signalled.borrow_mut().push(pgid);
+            Ok(())
+        };
+
+        sweep_orphaned_groups_with(&mut store, watch).unwrap();
+        assert_eq!(
+            *signalled.borrow(),
+            vec![4_000_001],
+            "the dead leader's group is signalled, the live one's is not"
+        );
+
+        sweep_orphaned_groups_with(&mut store, watch).unwrap();
+        assert_eq!(
+            *signalled.borrow(),
+            vec![4_000_001],
+            "a second mutation must not signal that pgid again"
+        );
+        assert!(
+            store.worktrees["feat+one"].processes["dev"].swept,
+            "and the record is what remembers it"
+        );
+
+        // A leader that died since is a different matter: it has never
+        // been swept, so its group is signalled on the next mutation.
+        store
+            .worktrees
+            .get_mut("feat+one")
+            .unwrap()
+            .processes
+            .insert("api".to_string(), failed_record(4_000_003));
+        sweep_orphaned_groups_with(&mut store, watch).unwrap();
+        assert_eq!(
+            *signalled.borrow(),
+            vec![4_000_001, 4_000_003],
+            "a freshly dead leader is still signalled"
+        );
+    }
+
+    // A signal that did not go out has to be tried again: the flag records
+    // that the group *was* signalled, not that it was looked at.
+    #[test]
+    fn a_group_that_could_not_be_signalled_is_not_recorded_as_swept() {
+        let mut store = state::State::new();
+        let mut record = WorktreeRecord::new("/trees/feat+one", true);
+        record
+            .processes
+            .insert("dev".to_string(), failed_record(4_000_001));
+        store.worktrees.insert("feat+one".to_string(), record);
+
+        let err = sweep_orphaned_groups_with(&mut store, |_| anyhow::bail!("killpg refused"))
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("feat+one/dev"), "{err:#}");
+        assert!(!store.worktrees["feat+one"].processes["dev"].swept);
+    }
+
+    // The flag lives in the state file, because the mutation that must not
+    // re-signal the group is a later run of pando, not a later line of
+    // this one. A state file written before the flag existed reads as
+    // "never swept", which signals once more and is the safe direction.
+    #[test]
+    fn the_swept_flag_survives_a_real_mutation_and_defaults_to_false() {
+        let fx = fixture();
+        let crashed = worktree_named(&fx, "feat/crashed");
+        let other = worktree_named(&fx, "feat/other");
+        let mut store = state::load(&fx.paths.state_file()).unwrap();
+        store
+            .worktrees
+            .entry(crashed.clone())
+            .or_insert_with(|| WorktreeRecord::new(fx.worktrees_dir().join(&crashed), true))
+            .processes
+            .insert("dev".to_string(), failed_record(4_000_001));
+        state::save(&fx.paths.state_file(), &store).unwrap();
+        let written = std::fs::read_to_string(fx.paths.state_file()).unwrap();
+        assert!(
+            !written.contains("swept"),
+            "a record that was never swept writes nothing: {written}"
+        );
+
+        // A mutation on a *different* worktree: the sweep is what acts on
+        // the crashed record, and the record itself has to survive it.
+        stop(&fx.paths, &other, None).unwrap();
+        let saved = fx.state();
+        let record = &saved.worktrees[&crashed].processes["dev"];
+        assert!(matches!(record.phase, Phase::Failed { .. }), "{record:?}");
+        assert!(
+            record.swept,
+            "without this in the file, the next mutation signals that pgid all \
+             over again — and every one after it"
+        );
+
+        // And a second mutation leaves it exactly as it is.
+        stop(&fx.paths, &other, None).unwrap();
+        assert!(fx.state().worktrees[&crashed].processes["dev"].swept);
+    }
+
+    /// A `Failed` record for a group that does not exist and a pid that
+    /// cannot: the shape the sweep is about.
+    fn failed_record(pgid: i32) -> ProcessRecord {
+        ProcessRecord {
+            phase: Phase::Failed {
+                at: Utc::now(),
+                reason: "process exited".to_string(),
+            },
+            ..fake_record(pgid)
+        }
+    }
+
     /// A process record for a group that does not exist, for tests about
     /// bookkeeping rather than about signals.
     fn fake_record(pgid: i32) -> ProcessRecord {
@@ -3716,6 +3862,7 @@ time.sleep(300)
             ready_port: None,
             ready_timeout_s: None,
             observed_ports: Vec::new(),
+            swept: false,
             phase: Phase::Running { since: Utc::now() },
         }
     }
