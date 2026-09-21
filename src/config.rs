@@ -418,7 +418,10 @@ fn load_layers(paths: &PandoPaths, use_home: bool) -> Result<Loaded> {
     }
 
     match build(merged, &paths.project) {
-        Ok(config) => Ok(Loaded { config, warnings }),
+        Ok(config) => {
+            warnings.extend(services_nothing_can_run(&config));
+            Ok(Loaded { config, warnings })
+        }
         // The project layer is pando's own file, so it still fails hard —
         // but when each layer is fine alone and only the combination is
         // not, no single file explains it and every one of them is named.
@@ -440,6 +443,31 @@ fn load_layers(paths: &PandoPaths, use_home: bool) -> Result<Loaded> {
             bail!("{e:#} — in {}", home_path.display())
         }
     }
+}
+
+/// Every `[[services]]` entry this build has no runner for.
+///
+/// `kind = "native"` is part of the config language: it parses, it
+/// validates, and the start path then quietly drops it — so a developer
+/// reads "no services configured" while looking at a file that configures
+/// one, and nothing anywhere says which of the two is wrong.
+///
+/// A warning rather than an error, because the file is not wrong. The block
+/// is legal, it is kept exactly as written, and a build that knows how to
+/// run it will. What is missing is a runner, and that is pando's news to
+/// break rather than the developer's mistake to fix.
+fn services_nothing_can_run(config: &Config) -> Vec<String> {
+    config
+        .services
+        .iter()
+        .filter_map(|service| match service {
+            ServiceConfig::Native { name, .. } => Some(format!(
+                "[[services]] {name:?} is kind = \"native\", which this build has no runner \
+                 for — the block is kept as written, and nothing starts it"
+            )),
+            ServiceConfig::Compose { .. } => None,
+        })
+        .collect()
 }
 
 /// A layer pando did not write: read it, strip the keys it may not set, and
@@ -2057,6 +2085,63 @@ auth_cmd = "./scripts/dev-cookie.sh"
         let text = toml::to_string_pretty(c).unwrap();
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(normalize(back).unwrap(), *c);
+    }
+
+    // `kind = "native"` parses, validates, and is then dropped by the start
+    // path, so a developer read "no services configured" while looking at a
+    // file that configures one. It is not an error — the block is legal and
+    // kept — but silence about it is.
+    #[test]
+    fn a_service_kind_this_build_cannot_run_warns_by_name() {
+        let f = fixture();
+        write_home(
+            &f,
+            r#"
+[[services]]
+kind = "compose"
+file = "docker-compose.yml"
+include = ["redis"]
+
+[[services]]
+kind = "native"
+name = "postgres"
+preset = "postgres"
+port_env = "DATABASE_PORT"
+"#,
+        );
+        let loaded = load(&f.paths).unwrap();
+        assert_eq!(
+            loaded.config.services.len(),
+            2,
+            "the block is kept exactly as written"
+        );
+        assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
+        let warning = &loaded.warnings[0];
+        assert!(
+            warning.contains("postgres"),
+            "it names the block: {warning}"
+        );
+        assert!(warning.contains("native"), "{warning}");
+        assert!(
+            warning.contains("nothing starts it"),
+            "and says what the consequence is: {warning}"
+        );
+    }
+
+    #[test]
+    fn every_native_block_gets_its_own_warning_and_compose_blocks_get_none() {
+        let f = fixture();
+        write_home(
+            &f,
+            "[[services]]\nkind = \"native\"\nname = \"postgres\"\n\n\
+             [[services]]\nkind = \"native\"\nname = \"redis\"\n\n\
+             [[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n",
+        );
+        let loaded = load(&f.paths).unwrap();
+        let named: Vec<&String> = loaded.warnings.iter().collect();
+        assert_eq!(named.len(), 2, "{named:?}");
+        assert!(named[0].contains("postgres"), "{named:?}");
+        assert!(named[1].contains("redis"), "{named:?}");
     }
 
     #[test]

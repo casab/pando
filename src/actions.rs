@@ -3189,7 +3189,10 @@ fn compose_entries(config: &Config) -> Vec<ComposeEntry<'_>> {
                 env,
                 ready_timeout_s: *ready_timeout_s,
             }),
-            // Native services are Phase 6.
+            // Nothing in this build runs a native service. Dropped here,
+            // but not silently: `config::load` warns once per block, by
+            // name, so "no services configured" is never said about a file
+            // that configures one.
             config::ServiceConfig::Native { .. } => None,
         })
         .collect()
