@@ -4,12 +4,21 @@
 //! consumes `[project]` and `[branches]` — later phases fill fields in
 //! rather than restructure.
 //!
-//! Two layers, highest precedence first:
+//! Three layers, highest precedence first:
 //!
-//! 1. `<pando home>/projects/<id>/pando.toml`, the only file pando writes.
-//! 2. `<root>/pando.toml`, if a team chose to commit one. Read-only, and it
-//!    may not set `project.root` or `project.worktrees_dir`: a file inside
-//!    the repository must never be able to redirect where pando writes.
+//! 1. `<pando home>/projects/<id>/pando.toml`, the project layer, and the
+//!    only file pando writes config to by default.
+//! 2. `<pando home>/config.toml`, the user layer: one file for every project
+//!    on this machine. It holds what is true of the laptop rather than of a
+//!    repository — which version manager this shell has to initialise.
+//! 3. `<root>/pando.toml`, if a team chose to commit one.
+//!
+//! Neither of the lower two may set `project.root` or
+//! `project.worktrees_dir`: a file inside the repository must never be able
+//! to redirect where pando writes, and a file shared by every project cannot
+//! name one project's directories. Neither is written by pando, so a layer
+//! that does not parse, deserialise or validate is dropped with a warning;
+//! only the project layer, which pando wrote itself, fails hard.
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
@@ -26,9 +35,15 @@ use crate::project::ProjectRef;
 /// to. Roles are otherwise free strings.
 pub const WEB_ROLE: &str = "web";
 
-/// Keys the committed layer may not set, because they decide where pando
-/// writes and are machine-specific.
-const COMMITTED_FORBIDDEN: [&str; 2] = ["root", "worktrees_dir"];
+/// Keys only pando's own project layer may set, because they decide where
+/// pando writes for one project on one machine.
+const PROJECT_LAYER_ONLY: [&str; 2] = ["root", "worktrees_dir"];
+
+/// Why a layer beneath the project one may not decide where pando writes.
+/// Each layer says it in its own terms, because the two reasons differ: one
+/// file is inside the repository, the other is shared by every project.
+const COMMITTED_REASON: &str = "a committed config may not decide where pando writes";
+const USER_REASON: &str = "a machine-wide config may not decide where pando writes for one project";
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -373,58 +388,83 @@ pub fn load_without_home(paths: &PandoPaths) -> Loaded {
 fn load_layers(paths: &PandoPaths, use_home: bool) -> Result<Loaded> {
     let mut warnings = Vec::new();
     let committed_path = paths.root().join("pando.toml");
+    let user_path = paths.user_config_file();
     let home_path = paths.config_file();
 
-    let mut committed = read_table(&committed_path, &mut warnings);
-    if let Some(table) = committed.as_mut() {
-        strip_forbidden_committed_keys(table, &committed_path, &mut warnings);
-    }
+    // Lowest precedence first, and both hand-written: a file that does not
+    // parse, deserialise or validate is dropped with a warning rather than
+    // bricking every command. A committed file belongs to the team, and to
+    // whichever pando wrote it — a key this build has never heard of is
+    // what a *newer* pando's config looks like. The user layer is one file
+    // for every project on the machine, so a mistake in it has an even
+    // wider blast radius.
+    let committed = read_lower_layer(paths, &committed_path, COMMITTED_REASON, &mut warnings);
+    let user = read_lower_layer(paths, &user_path, USER_REASON, &mut warnings);
     // Strictly, and only when it is wanted: a file pando wrote and cannot
-    // parse is not one to carry on past the way a committed one is. The
-    // caller decides whether this command can do without it.
+    // parse is not one to carry on past the way the others are. The caller
+    // decides whether this command can do without it.
     let home = if use_home {
         read_home_table(&home_path)?
     } else {
         None
     };
 
-    // A committed file belongs to the team, and to whichever pando wrote
-    // it — a key this build has never heard of is what a *newer* pando's
-    // config looks like. Dropping that layer with a warning is the same
-    // treatment a file that does not even parse already gets; bricking
-    // `pando ls` for everyone who pulled it is not.
-    if let Some(table) = &committed
-        && let Err(e) = build(table.clone(), &paths.project)
-    {
-        warnings.push(format!("ignoring {}: {e:#}", committed_path.display()));
-        committed = None;
-    }
-
     let mut merged = Table::new();
-    if let Some(table) = committed.clone() {
-        merge_tables(&mut merged, table);
-    }
-    if let Some(table) = home.clone() {
+    for table in [committed.clone(), user.clone(), home.clone()]
+        .into_iter()
+        .flatten()
+    {
         merge_tables(&mut merged, table);
     }
 
     match build(merged, &paths.project) {
         Ok(config) => Ok(Loaded { config, warnings }),
-        // The home layer is pando's own file, so it still fails hard — but
-        // when each layer is fine alone and only the merge is not, neither
-        // file explains it and both are named.
+        // The project layer is pando's own file, so it still fails hard —
+        // but when each layer is fine alone and only the combination is
+        // not, no single file explains it and every one of them is named.
         Err(e) => {
-            let layers_conflict = committed.is_some()
-                && home.is_some_and(|table| build(table, &paths.project).is_ok());
-            if layers_conflict {
-                bail!(
-                    "{e:#} — {} and {} cannot both apply",
-                    committed_path.display(),
-                    home_path.display()
-                );
+            let present: Vec<String> = [
+                committed
+                    .as_ref()
+                    .map(|_| committed_path.display().to_string()),
+                user.as_ref().map(|_| user_path.display().to_string()),
+                home.as_ref().map(|_| home_path.display().to_string()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            let home_alone_is_fine = home.is_none_or(|table| build(table, &paths.project).is_ok());
+            if present.len() > 1 && home_alone_is_fine {
+                bail!("{e:#} — {} cannot all apply", listed(&present));
             }
             bail!("{e:#} — in {}", home_path.display())
         }
+    }
+}
+
+/// A layer pando did not write: read it, strip the keys it may not set, and
+/// drop the whole thing with a warning if what is left will not build.
+fn read_lower_layer(
+    paths: &PandoPaths,
+    path: &Path,
+    reason: &str,
+    warnings: &mut Vec<String>,
+) -> Option<Table> {
+    let mut table = read_table(path, warnings)?;
+    strip_keys_only_pando_may_set(&mut table, path, reason, warnings);
+    if let Err(e) = build(table.clone(), &paths.project) {
+        warnings.push(format!("ignoring {}: {e:#}", path.display()));
+        return None;
+    }
+    Some(table)
+}
+
+/// `a`, `a and b`, `a, b and c` — every file a refusal has to name.
+fn listed(names: &[String]) -> String {
+    match names.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
     }
 }
 
@@ -655,18 +695,23 @@ pub fn set_detected_array_entry(
 }
 
 /// Whether a layer other than the one being patched already declares a
-/// process, which for now means the `pando.toml` a team committed.
+/// process: the `pando.toml` a team committed, or the machine-wide file.
 ///
 /// The conflict [`normalize`] refuses is between the *merged* layers, so
 /// looking only at the document being edited misses a `[processes]` table
-/// in the committed file — and that is precisely the shape 2b invites, a
+/// in another file — and that is precisely the shape 2b invites, a
 /// long-form `[processes.dev]` with a `cwd` and no `cmd` for detection to
-/// fill in. Read as a bare table rather than through `load`: this is a
+/// fill in. Read as bare tables rather than through `load`: this is a
 /// question about which *tables* exist, and it has to be answerable even
 /// when the merged config would not validate.
 fn other_layer_declares_processes(paths: &PandoPaths) -> bool {
-    let path = paths.root().join("pando.toml");
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    [paths.root().join("pando.toml"), paths.user_config_file()]
+        .iter()
+        .any(|path| declares_processes(path))
+}
+
+fn declares_processes(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
         return false;
     };
     toml::from_str::<Table>(&text)
@@ -949,14 +994,21 @@ fn read_table(path: &Path, warnings: &mut Vec<String>) -> Option<Table> {
     }
 }
 
-fn strip_forbidden_committed_keys(table: &mut Table, path: &Path, warnings: &mut Vec<String>) {
+/// Removes the keys only pando's own project layer may set, warning by name
+/// for each one, with the reason that layer cannot set it.
+fn strip_keys_only_pando_may_set(
+    table: &mut Table,
+    path: &Path,
+    reason: &str,
+    warnings: &mut Vec<String>,
+) {
     let Some(Value::Table(project)) = table.get_mut("project") else {
         return;
     };
-    for key in COMMITTED_FORBIDDEN {
+    for key in PROJECT_LAYER_ONLY {
         if project.remove(key).is_some() {
             warnings.push(format!(
-                "ignoring project.{key} in {}: a committed config may not decide where pando writes",
+                "ignoring project.{key} in {}: {reason}",
                 path.display()
             ));
         }
@@ -1048,6 +1100,12 @@ mod tests {
     fn write_home(f: &Fixture, text: &str) {
         std::fs::create_dir_all(f.paths.project_dir()).unwrap();
         std::fs::write(f.paths.config_file(), text).unwrap();
+    }
+
+    /// The machine-wide layer: one file for every project on this laptop.
+    fn write_user(f: &Fixture, text: &str) {
+        std::fs::create_dir_all(&f.paths.home).unwrap();
+        std::fs::write(f.paths.user_config_file(), text).unwrap();
     }
 
     fn home_text(f: &Fixture) -> String {
@@ -1343,6 +1401,40 @@ prelude = "nvm use"
     // One question, one note. Ten identical `# answered:` lines for a
     // two-app workspace say the same thing ten times, and the bare
     // `[processes]` header above them is a line no human would write.
+    // And the same for the machine-wide layer: `[dev]` written beside a
+    // `[processes]` table in *any* other layer is a merged config pando's
+    // own loader refuses.
+    #[test]
+    fn a_dev_key_takes_the_long_form_when_the_user_layer_has_processes() {
+        let f = fixture();
+        write_user(&f, "[processes.dev]\nenv = { TZ = \"UTC\" }\n");
+        set_detected(
+            &f.paths,
+            &["dev"],
+            "cmd",
+            "pnpm dev",
+            Note::Detected("package.json scripts.dev".into()),
+        )
+        .unwrap();
+
+        let text = home_text(&f);
+        assert!(
+            !text.contains("[dev]"),
+            "[dev] here and [processes.dev] there cannot both apply: {text}"
+        );
+        assert!(text.contains("[processes.dev]"), "{text}");
+        let loaded = load(&f.paths).expect("the file pando wrote must load");
+        assert_eq!(loaded.config.processes["dev"].cmd, "pnpm dev");
+        assert_eq!(
+            loaded.config.processes["dev"]
+                .env
+                .get("TZ")
+                .map(String::as_str),
+            Some("UTC"),
+            "the user layer's own key still applies"
+        );
+    }
+
     #[test]
     fn a_whole_table_carries_one_note_on_its_header_and_no_bare_parent() {
         let f = fixture();
@@ -1437,6 +1529,145 @@ prelude = "nvm use"
             loaded.config.project.install.as_deref(),
             Some("pnpm install --frozen-lockfile"),
             "keys the home layer does not mention survive the merge"
+        );
+    }
+
+    // Committed < user < project. The middle layer is the machine's: it
+    // beats what the repository ships and loses to what pando decided for
+    // this project.
+    #[test]
+    fn the_user_layer_sits_between_the_committed_and_project_layers() {
+        let f = fixture();
+        write_committed(
+            &f,
+            "[project]\nbase = \"main\"\ninstall = \"pnpm install --frozen-lockfile\"\n\
+             \n[runtime]\nprelude = \"committed\"\n",
+        );
+        write_user(
+            &f,
+            "[project]\nbase = \"user\"\n\n[runtime]\nprelude = \"user\"\n",
+        );
+        write_home(&f, "[project]\nbase = \"project\"\n");
+
+        let loaded = load(&f.paths).unwrap();
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        assert_eq!(
+            loaded.config.project.base.as_deref(),
+            Some("project"),
+            "the project layer wins over both"
+        );
+        assert_eq!(
+            loaded.config.runtime.prelude.as_deref(),
+            Some("user"),
+            "the user layer wins over a committed one"
+        );
+        assert_eq!(
+            loaded.config.project.install.as_deref(),
+            Some("pnpm install --frozen-lockfile"),
+            "keys no higher layer mentions survive the merge"
+        );
+    }
+
+    // The same rule the committed layer lives under, for the same reason:
+    // one file shared by every project on the machine must not be able to
+    // say where pando writes for one of them.
+    #[test]
+    fn a_user_file_cannot_set_root_or_worktrees_dir() {
+        let f = fixture();
+        let inside = f.root.join("worktrees");
+        write_user(
+            &f,
+            &format!(
+                "[project]\nroot = \"/somewhere/else\"\nworktrees_dir = \"{}\"\nbase = \"main\"\n",
+                inside.display()
+            ),
+        );
+
+        let loaded = load(&f.paths).unwrap();
+        assert_eq!(loaded.config.project.root, None);
+        assert_eq!(loaded.config.project.worktrees_dir, None);
+        assert_eq!(
+            loaded.config.project.base.as_deref(),
+            Some("main"),
+            "the rest of the user section still applies"
+        );
+        assert_eq!(
+            loaded.warnings.len(),
+            2,
+            "both keys warn: {:?}",
+            loaded.warnings
+        );
+        assert!(
+            loaded
+                .warnings
+                .iter()
+                .all(|w| w.contains("machine-wide config")
+                    && w.contains(&f.paths.user_config_file().display().to_string())),
+            "{:?}",
+            loaded.warnings
+        );
+    }
+
+    // A file pando did not write, so it is dropped with a warning rather
+    // than taking every command in every project down with it.
+    #[test]
+    fn a_user_file_that_is_broken_or_invalid_is_dropped_with_a_warning() {
+        for bad in [
+            "this is not toml {{{",
+            "[project]\nbase = \"main\"\nnope = 1\n",
+            "[dev]\ncmd = \"x\"\n\n[processes.api]\ncmd = \"y\"\n",
+        ] {
+            let f = fixture();
+            write_user(&f, bad);
+            let loaded = load(&f.paths).unwrap_or_else(|e| panic!("{bad:?} bricked load: {e:#}"));
+            assert_eq!(
+                loaded.config,
+                Config::default(),
+                "the whole layer is dropped: {bad:?}"
+            );
+            assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
+            assert!(
+                loaded.warnings[0].contains("ignoring")
+                    && loaded.warnings[0]
+                        .contains(&f.paths.user_config_file().display().to_string()),
+                "{:?}",
+                loaded.warnings
+            );
+        }
+    }
+
+    // `load_without_home` runs when pando's *own* file is unusable. The
+    // developer's machine-wide file is not implicated by that, and `stop`
+    // and `logs` should still honour what it says.
+    #[test]
+    fn the_user_layer_is_still_read_when_pandos_own_layer_is_skipped() {
+        let f = fixture();
+        write_user(&f, "[runtime]\nprelude = \"user\"\n");
+        write_home(&f, "this is not toml {{{");
+        assert!(
+            load(&f.paths).is_err(),
+            "pando's own layer still fails hard"
+        );
+        let loaded = load_without_home(&f.paths);
+        assert_eq!(loaded.config.runtime.prelude.as_deref(), Some("user"));
+    }
+
+    // Neither file is wrong on its own, so neither is dropped and both are
+    // named — the same treatment a committed and a project layer get.
+    #[test]
+    fn a_conflict_between_the_committed_and_user_layers_names_both() {
+        let f = fixture();
+        write_committed(&f, "[dev]\ncmd = \"pnpm dev\"\n");
+        write_user(&f, "[processes.api]\ncmd = \"node api\"\n");
+        let msg = format!("{:#}", load(&f.paths).unwrap_err());
+        assert!(msg.contains("may not both be set"), "{msg}");
+        assert!(
+            msg.contains(&f.root.join("pando.toml").display().to_string()),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(&f.paths.user_config_file().display().to_string()),
+            "{msg}"
         );
     }
 

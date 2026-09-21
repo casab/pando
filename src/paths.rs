@@ -114,6 +114,16 @@ impl PandoPaths {
         self.home.join("tunnel-config.yml")
     }
 
+    /// The machine-wide config layer: one file for every project on this
+    /// laptop, beneath the project layer and above a committed one.
+    ///
+    /// It sits directly under the home rather than under a project because
+    /// what it holds is a property of the machine — which version manager
+    /// this shell needs initialised — and not of any one repository.
+    pub fn user_config_file(&self) -> PathBuf {
+        self.home.join("config.toml")
+    }
+
     /// Creates the home directory 0700 and the project directory under it.
     /// Idempotent; called before the first write of any run.
     pub fn ensure_home(&self) -> Result<()> {
@@ -322,6 +332,11 @@ mod tests {
             p.tunnel_config_file(),
             PathBuf::from("/tmp/pando-home/tunnel-config.yml")
         );
+        assert_eq!(
+            p.user_config_file(),
+            PathBuf::from("/tmp/pando-home/config.toml"),
+            "the machine-wide layer is one file for every project"
+        );
     }
 
     #[test]
@@ -343,6 +358,7 @@ mod tests {
             p.compose_dir(),
             p.compose_override_file("feat+x"),
             p.tunnel_config_file(),
+            p.user_config_file(),
         ];
         for loc in locations {
             assert!(loc.starts_with(&p.home), "{} escapes home", loc.display());

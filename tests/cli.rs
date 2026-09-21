@@ -632,6 +632,65 @@ fn running_from_a_deleted_directory_says_which_directory() {
 /// prove the lifecycle, and `sleep` is available everywhere.
 const SLEEPER: &str = "[dev]\ncmd = \"echo started-ok && sleep 30\"\nports = { PORT = \"web\" }\n";
 
+/// Polls a log file until it holds `needle`. A spawned process writes when
+/// it gets round to it, which is not when `start` returns.
+fn log_contains(path: &Path, needle: &str) -> bool {
+    for _ in 0..40 {
+        if std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .contains(needle)
+        {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    false
+}
+
+// Committed < user < project, end to end. The machine-wide file answers
+// what nothing else has, and pando's own file for this project beats it.
+#[test]
+fn the_user_layer_is_read_and_the_project_layer_beats_it() {
+    let e = env();
+    std::fs::create_dir_all(&e.home).unwrap();
+    let user = e.home.join("config.toml");
+    std::fs::write(
+        &user,
+        "[dev]\ncmd = \"echo from-the-user-layer && sleep 30\"\nports = []\n",
+    )
+    .unwrap();
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+
+    let out = e.pando(&["start", "feat+one"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    assert!(
+        log_contains(&e.log_file("feat+one", "dev"), "from-the-user-layer"),
+        "the user layer's dev command is the one that ran: {}",
+        std::fs::read_to_string(e.log_file("feat+one", "dev")).unwrap_or_default()
+    );
+
+    // And the project layer, which is the one pando writes, wins over it.
+    e.write_config("[dev]\ncmd = \"echo from-the-project-layer && sleep 30\"\nports = []\n");
+    let out = e.pando(&["restart", "feat+one"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    assert!(
+        log_contains(&e.log_file("feat+one", "dev"), "from-the-project-layer"),
+        "{}",
+        std::fs::read_to_string(e.log_file("feat+one", "dev")).unwrap_or_default()
+    );
+
+    // A machine-wide file pando cannot use is dropped with a warning, not
+    // a failure: it applies to every project on the laptop.
+    std::fs::write(&user, "[project\nbase =\n").unwrap();
+    let out = e.pando(&["ls"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("ignoring") && stderr(&out).contains("config.toml"),
+        "{}",
+        stderr(&out)
+    );
+}
+
 #[test]
 fn start_status_logs_and_stop_work_from_the_cli() {
     let e = env();
