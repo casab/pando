@@ -254,6 +254,19 @@ fn notice(message: &str) {
 fn asker(yes: bool) -> impl Fn(&actions::Question) -> Result<actions::Answer> {
     move |question: &actions::Question| {
         if yes {
+            // A set answer: `--yes` takes the options a rule already
+            // resolved and leaves the rest, which is exactly what the
+            // question pre-ticks.
+            if question.multi {
+                let taken: Vec<&str> = question
+                    .checked
+                    .iter()
+                    .filter_map(|i| question.options.get(*i))
+                    .map(|(value, _)| value.as_str())
+                    .collect();
+                notice(&format!("--yes: taking {}", joined(&taken)));
+                return Ok(actions::Answer::Many(question.checked.clone()));
+            }
             return match question.preselect {
                 Some(index) => {
                     notice(&format!("--yes: taking {:?}", question.options[index].0));
@@ -295,6 +308,100 @@ fn prompt(question: &actions::Question) -> Result<actions::Answer> {
 /// [`prompt`] with its terminal injected. `read` gives the next line, or
 /// `None` when there is no more input.
 fn prompt_with(
+    question: &actions::Question,
+    out: &mut impl Write,
+    read: impl FnMut() -> Result<Option<String>>,
+) -> Result<actions::Answer> {
+    if question.multi {
+        return prompt_many(question, out, read);
+    }
+    prompt_one(question, out, read)
+}
+
+/// `a, b` — the readable form of a set, for a notice.
+fn joined(values: &[&str]) -> String {
+    if values.is_empty() {
+        return "none of them".to_string();
+    }
+    values.join(", ")
+}
+
+/// A question whose answer is a *set*: every option with a checkbox,
+/// toggled by number, confirmed with enter.
+///
+/// Toggling rather than typing a list, because the pre-ticked set is
+/// already the answer for most projects: enter accepts it, and the one
+/// service the rules could not place is one keystroke away.
+fn prompt_many(
+    question: &actions::Question,
+    out: &mut impl Write,
+    mut read: impl FnMut() -> Result<Option<String>>,
+) -> Result<actions::Answer> {
+    let mut checked: Vec<bool> = (0..question.options.len())
+        .map(|i| question.checked.contains(&i))
+        .collect();
+    let width = question
+        .options
+        .iter()
+        .map(|(value, _)| value.chars().count())
+        .max()
+        .unwrap_or(0);
+    writeln!(out, "pando: {}", question.prompt)?;
+    loop {
+        for (i, (value, why)) in question.options.iter().enumerate() {
+            let box_ = if checked[i] { "[x]" } else { "[ ]" };
+            writeln!(out, "  {box_} {}) {value:<width$}  {why}", i + 1)?;
+        }
+        write!(
+            out,
+            "  a number toggles it, ⏎ accepts [{}] > ",
+            joined(
+                &question
+                    .options
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| checked[*i])
+                    .map(|(_, (value, _))| value.as_str())
+                    .collect::<Vec<_>>()
+            )
+        )?;
+        out.flush()?;
+        let Some(line) = read()? else {
+            return Err(needs_answer(question));
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            let chosen: Vec<usize> = checked
+                .iter()
+                .enumerate()
+                .filter(|(_, on)| **on)
+                .map(|(i, _)| i)
+                .collect();
+            return Ok(if chosen.is_empty() {
+                actions::Answer::None
+            } else {
+                actions::Answer::Many(chosen)
+            });
+        }
+        if question.allow_none && (line == "n" || line == "N") {
+            return Ok(actions::Answer::None);
+        }
+        match line
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n >= 1 && *n <= checked.len())
+        {
+            Some(n) => checked[n - 1] = !checked[n - 1],
+            None => writeln!(
+                out,
+                "pando: a number between 1 and {} toggles one, n takes none, ⏎ accepts",
+                checked.len()
+            )?,
+        }
+    }
+}
+
+fn prompt_one(
     question: &actions::Question,
     out: &mut impl Write,
     mut read: impl FnMut() -> Result<Option<String>>,
@@ -391,11 +498,26 @@ pub fn render_needs_answer(needs: &actions::NeedsAnswer) -> String {
         needs.question.prompt
     );
     for (i, (value, why)) in needs.question.options.iter().enumerate() {
+        // A set question shows what it would take, because that is what
+        // `--yes` would accept and the thing an agent has to decide about.
+        let prefix = match needs.question.multi {
+            true if needs.question.checked.contains(&i) => "[x] ".to_string(),
+            true => "[ ] ".to_string(),
+            false => String::new(),
+        };
         out.push_str(&format!(
-            "  {}) {value}  ({why})
+            "  {prefix}{}) {value}  ({why})
 ",
             i + 1
         ));
+    }
+    if needs.question.multi {
+        out.push_str(
+            "pando: answer it in pando.toml with a [[services]] table, or rerun with --yes to \
+             take the ticked ones
+",
+        );
+        return out;
     }
     if needs.question.options.is_empty() {
         // `--yes` takes the first option, and there is no first option, so
@@ -1549,6 +1671,24 @@ mod tests {
         }
     }
 
+    /// The services question of fixture 6: two ticked by a rule, two the
+    /// rules could not place.
+    fn services_question() -> actions::Question {
+        actions::Question {
+            slot: crate::detect::Slot::Services,
+            prompt: "Run private copies of these services for each worktree?".to_string(),
+            options: ["cache", "db", "mail", "queue"]
+                .iter()
+                .map(|v| (v.to_string(), "docker-compose.yml".to_string()))
+                .collect(),
+            preselect: Some(0),
+            allow_custom: false,
+            allow_none: true,
+            multi: true,
+            checked: vec![1, 2],
+        }
+    }
+
     /// The prompt driven by a script of typed lines, as a terminal would.
     fn answer_with(
         question: &actions::Question,
@@ -1558,6 +1698,76 @@ mod tests {
         let mut out = Vec::new();
         let answer = prompt_with(question, &mut out, || Ok(typed.next()));
         (answer, String::from_utf8(out).unwrap())
+    }
+
+    // ---- the multi-select question ---------------------------------------
+
+    #[test]
+    fn a_set_question_starts_from_what_the_rules_resolved() {
+        let question = services_question();
+        let (answer, printed) = answer_with(&question, &[""]);
+        assert_eq!(answer.unwrap(), actions::Answer::Many(vec![1, 2]));
+        assert!(printed.contains("[ ] 1) cache"), "{printed}");
+        assert!(printed.contains("[x] 2) db"), "{printed}");
+        assert!(printed.contains("[x] 3) mail"), "{printed}");
+        assert!(printed.contains("[ ] 4) queue"), "{printed}");
+        assert!(printed.contains("accepts [db, mail]"), "{printed}");
+    }
+
+    #[test]
+    fn a_number_toggles_one_option_and_enter_takes_the_rest() {
+        let question = services_question();
+        // Tick `cache`, untick `mail`, accept.
+        let (answer, _) = answer_with(&question, &["1", "3", ""]);
+        assert_eq!(answer.unwrap(), actions::Answer::Many(vec![0, 1]));
+    }
+
+    #[test]
+    fn unticking_everything_is_the_answer_none() {
+        let question = services_question();
+        let (answer, _) = answer_with(&question, &["2", "3", ""]);
+        assert_eq!(answer.unwrap(), actions::Answer::None);
+        // And so is saying so outright.
+        let (answer, _) = answer_with(&services_question(), &["n"]);
+        assert_eq!(answer.unwrap(), actions::Answer::None);
+    }
+
+    #[test]
+    fn a_number_out_of_range_reprints_the_range_and_ticks_nothing() {
+        let question = services_question();
+        let (answer, printed) = answer_with(&question, &["9", "not-a-number", ""]);
+        assert_eq!(answer.unwrap(), actions::Answer::Many(vec![1, 2]));
+        assert_eq!(
+            printed
+                .matches("a number between 1 and 4 toggles one")
+                .count(),
+            2,
+            "{printed}"
+        );
+    }
+
+    #[test]
+    fn yes_takes_the_ticked_set_of_a_question_it_cannot_ask() {
+        let question = services_question();
+        assert_eq!(
+            asker(true)(&question).unwrap(),
+            actions::Answer::Many(vec![1, 2])
+        );
+    }
+
+    #[test]
+    fn exit_three_shows_a_set_question_with_its_boxes() {
+        let needs = actions::NeedsAnswer {
+            question: services_question(),
+        };
+        let text = render_needs_answer(&needs);
+        assert!(text.contains("[ ] 1) cache"), "{text}");
+        assert!(text.contains("[x] 2) db"), "{text}");
+        assert!(text.contains("[[services]]"), "{text}");
+        assert!(
+            text.contains("--yes to take the ticked ones"),
+            "an agent has to be told what --yes would do: {text}"
+        );
     }
 
     // A fat-fingered number used to fall through to "it must be a command",
