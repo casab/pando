@@ -162,6 +162,178 @@ pub fn find(root: &Path) -> Option<String> {
         .map(|name| (*name).to_string())
 }
 
+// ---- the per-worktree override -------------------------------------------
+
+/// The compose project name for one worktree: what isolates its
+/// containers, its network, and — because compose prefixes named volumes
+/// with it — its data.
+///
+/// Compose allows `[a-z0-9][a-z0-9_-]*`, and a worktree directory is named
+/// after a branch, so `feat+checkout` has to be folded. Folding can
+/// collide: `feat+one` and `feat-one` are two worktrees and would become
+/// one set of containers and one database. So a name that had to change
+/// carries four hex characters of its own hash, and a name that did not is
+/// left readable.
+pub fn project_name(project_id: &str, worktree: &str) -> String {
+    let project = fold(project_id);
+    let name = fold(worktree);
+    if name == worktree {
+        return format!("pando-{project}-{name}");
+    }
+    let digest = format!("{:x}", md5::compute(worktree.as_bytes()));
+    format!("pando-{project}-{name}-{}", &digest[..4])
+}
+
+fn fold(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            'a'..='z' | '0'..='9' | '_' | '-' => c,
+            'A'..='Z' => c.to_ascii_lowercase(),
+            _ => '-',
+        })
+        .collect()
+}
+
+/// One included service, resolved: the port inside the container, and the
+/// port on the host pando allocated for this worktree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Published {
+    pub service: String,
+    pub container: u16,
+    pub host: u16,
+}
+
+/// The container port of every included service, or the reason this
+/// worktree cannot be isolated.
+///
+/// Every refusal names the service and says what to change in the
+/// project's own file, because that is the only place it can be fixed:
+/// Invariant 1 forbids pando to edit a compose file, and rewriting a bind
+/// mount underneath the developer would put the isolated database
+/// somewhere they did not ask for.
+pub fn resolve_included(file: &ComposeFile, include: &[String]) -> Result<Vec<(String, u16)>> {
+    let mut out = Vec::new();
+    for name in include {
+        let service = file.services.get(name).with_context(|| {
+            let known: Vec<&str> = file.services.keys().map(String::as_str).collect();
+            format!(
+                "the compose file has no service named {name:?} — it declares: {}",
+                if known.is_empty() {
+                    "none".to_string()
+                } else {
+                    known.join(", ")
+                }
+            )
+        })?;
+        check_mounts(name, service, file)?;
+        check_depends_on(name, service, include)?;
+        let port = service.container_port().with_context(|| {
+            format!(
+                "service {name:?} publishes no port and its image ({}) is not one pando knows a \
+                 port for — add a `ports:` entry to it in the compose file, or drop it from \
+                 `include`",
+                service.image.as_deref().unwrap_or("none")
+            )
+        })?;
+        out.push((name.clone(), port));
+    }
+    Ok(out)
+}
+
+/// A bind mount relative to the compose file lands inside the worktree,
+/// and a named volume the project pins by name or borrows from outside is
+/// one every worktree would share.
+fn check_mounts(name: &str, service: &Service, file: &ComposeFile) -> Result<()> {
+    for mount in &service.volumes {
+        match mount {
+            Mount::Bind(source) if source.starts_with('/') || source.starts_with('~') => {}
+            Mount::Bind(source) if source.starts_with('$') => bail!(
+                "service {name:?} mounts {source:?}, and pando cannot tell whether that is \
+                 inside the repository — isolating it could write into your worktree. Use a \
+                 named volume for it, or drop {name:?} from `include`"
+            ),
+            Mount::Bind(source) => bail!(
+                "service {name:?} mounts {source:?}, which is inside the repository — an \
+                 isolated copy would write its data into your worktree, which pando never \
+                 does. Change it to a named volume in the compose file, or drop {name:?} \
+                 from `include`"
+            ),
+            Mount::Named(volume) => {
+                let Some(declared) = file.volumes.get(volume) else {
+                    continue;
+                };
+                if declared.external {
+                    bail!(
+                        "service {name:?} uses the volume {volume:?}, which is declared \
+                         `external: true` — compose does not prefix it with the project name, \
+                         so every worktree would share one copy of that data"
+                    );
+                }
+                if let Some(literal) = &declared.name {
+                    bail!(
+                        "service {name:?} uses the volume {volume:?}, which pins its name to \
+                         {literal:?} — compose does not prefix a pinned name with the project \
+                         name, so every worktree would share one copy of that data"
+                    );
+                }
+            }
+            Mount::Anonymous => {}
+        }
+    }
+    Ok(())
+}
+
+/// `up -d <included>` starts anything an included service depends on, and
+/// those come up on the ports the project hardcoded — which the second
+/// worktree then collides with. Refusing is honest; `--no-deps` would
+/// start a service whose dependency is missing.
+fn check_depends_on(name: &str, service: &Service, include: &[String]) -> Result<()> {
+    for needed in &service.depends_on {
+        if !include.iter().any(|included| included == needed) {
+            bail!(
+                "service {name:?} depends_on {needed:?}, which is not in `include` — compose \
+                 would start {needed:?} too, on the port the project hardcoded, and the second \
+                 worktree would collide with the first. Add {needed:?} to `include`, or drop \
+                 {name:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The override file for one worktree: the published ports replaced, not
+/// appended to, and any `container_name` removed.
+///
+/// `!override` because compose *merges* `ports` lists across files, which
+/// would keep the project's own hardcoded port beside the allocated one
+/// and collide across worktrees the moment a second one started.
+/// `container_name: !reset` because a fixed container name is unique per
+/// daemon, so the second worktree's `up` would fail on it.
+pub fn render_override(worktree: &str, published: &[Published]) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# generated by pando for the worktree {worktree}\n\
+         # regenerated on every isolated start; edits here are lost\n\
+         # the project's own compose file is never modified\n"
+    ));
+    if published.is_empty() {
+        out.push_str("services: {}\n");
+        return out;
+    }
+    let mut sorted: Vec<&Published> = published.iter().collect();
+    sorted.sort_by(|a, b| a.service.cmp(&b.service));
+    out.push_str("services:\n");
+    for entry in sorted {
+        out.push_str(&format!("  {}:\n", entry.service));
+        out.push_str(&format!(
+            "    ports: !override [\"127.0.0.1:{}:{}\"]\n",
+            entry.host, entry.container
+        ));
+        out.push_str("    container_name: !reset\n");
+    }
+    out
+}
+
 /// Reads and parses a compose file, naming the file in any error.
 pub fn read(path: &Path) -> Result<ComposeFile> {
     let text = std::fs::read_to_string(path)
@@ -940,6 +1112,188 @@ services:
                 "{bad:?}: {err}"
             );
         }
+    }
+
+    // ---- the override ----------------------------------------------------
+
+    #[test]
+    fn a_project_name_is_readable_when_nothing_had_to_be_folded() {
+        assert_eq!(
+            project_name("acme-shop-3f9a2c1d", "main2"),
+            "pando-acme-shop-3f9a2c1d-main2"
+        );
+    }
+
+    #[test]
+    fn a_folded_project_name_carries_a_hash_so_two_branches_cannot_collide() {
+        let plus = project_name("acme-3f9a2c1d", "feat+one");
+        let dash = project_name("acme-3f9a2c1d", "feat-one");
+        assert!(plus.starts_with("pando-acme-3f9a2c1d-feat-one-"), "{plus}");
+        assert_ne!(
+            plus, dash,
+            "two worktrees must never share one set of containers and volumes"
+        );
+        // Every character compose allows, and nothing else.
+        assert!(
+            plus.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_'),
+            "{plus}"
+        );
+        assert_eq!(plus, project_name("acme-3f9a2c1d", "feat+one"), "stable");
+    }
+
+    #[test]
+    fn an_uppercase_branch_name_does_not_fold_onto_its_lowercase_twin() {
+        assert_ne!(
+            project_name("p-1", "Feat+One"),
+            project_name("p-1", "feat+one")
+        );
+    }
+
+    #[test]
+    fn the_override_replaces_ports_and_clears_the_container_name() {
+        let rendered = render_override(
+            "feat+one",
+            &[
+                Published {
+                    service: "redis".into(),
+                    container: 6379,
+                    host: 17_006,
+                },
+                Published {
+                    service: "postgres".into(),
+                    container: 5432,
+                    host: 17_004,
+                },
+            ],
+        );
+        assert_eq!(
+            rendered
+                .lines()
+                .filter(|l| !l.starts_with('#'))
+                .collect::<Vec<_>>(),
+            vec![
+                "services:",
+                "  postgres:",
+                "    ports: !override [\"127.0.0.1:17004:5432\"]",
+                "    container_name: !reset",
+                "  redis:",
+                "    ports: !override [\"127.0.0.1:17006:6379\"]",
+                "    container_name: !reset",
+            ]
+        );
+        assert!(rendered.starts_with("# generated by pando for the worktree feat+one"));
+    }
+
+    #[test]
+    fn an_override_with_nothing_included_is_still_a_valid_file() {
+        assert!(render_override("feat+one", &[]).ends_with("services: {}\n"));
+    }
+
+    #[test]
+    fn included_services_resolve_to_their_container_ports() {
+        let file = parse(FIXTURE_ONE).unwrap();
+        assert_eq!(
+            resolve_included(&file, &["postgres".into(), "redis".into()]).unwrap(),
+            vec![("postgres".to_string(), 5432), ("redis".to_string(), 6379)]
+        );
+    }
+
+    #[test]
+    fn a_service_the_compose_file_does_not_declare_is_refused_by_name() {
+        let file = parse(FIXTURE_ONE).unwrap();
+        let err = format!(
+            "{:#}",
+            resolve_included(&file, &["pgsql".into()]).unwrap_err()
+        );
+        assert!(err.contains("pgsql"), "{err}");
+        assert!(
+            err.contains("postgres, redis"),
+            "it lists what is there: {err}"
+        );
+    }
+
+    #[test]
+    fn a_relative_bind_mount_is_refused_by_name() {
+        let text = "services:\n  db:\n    image: postgres:16\n    volumes:\n      - ./data:/var/lib/postgresql/data\n";
+        let file = parse(text).unwrap();
+        let err = format!("{:#}", resolve_included(&file, &["db".into()]).unwrap_err());
+        assert!(err.contains("\"db\""), "{err}");
+        assert!(err.contains("./data"), "{err}");
+        assert!(
+            err.contains("named volume"),
+            "it says what to change: {err}"
+        );
+    }
+
+    #[test]
+    fn an_absolute_bind_mount_is_allowed_because_it_is_not_in_the_repository() {
+        let text = "services:\n  db:\n    image: postgres:16\n    volumes:\n      - /var/run/docker.sock:/var/run/docker.sock\n      - ~/caches:/caches\n";
+        let file = parse(text).unwrap();
+        assert!(resolve_included(&file, &["db".into()]).is_ok());
+    }
+
+    #[test]
+    fn a_bind_mount_pando_cannot_place_is_refused_rather_than_guessed_at() {
+        let text =
+            "services:\n  db:\n    image: postgres:16\n    volumes:\n      - $PWD/data:/data\n";
+        let file = parse(text).unwrap();
+        let err = format!("{:#}", resolve_included(&file, &["db".into()]).unwrap_err());
+        assert!(err.contains("cannot tell"), "{err}");
+    }
+
+    #[test]
+    fn a_volume_the_project_name_does_not_isolate_is_refused_by_name() {
+        for (tail, needle) in [
+            ("volumes:\n  dbdata:\n    external: true\n", "external"),
+            ("volumes:\n  dbdata:\n    name: shared-db\n", "shared-db"),
+        ] {
+            let text = format!(
+                "services:\n  db:\n    image: postgres:16\n    volumes:\n      - dbdata:/var/lib/postgresql/data\n{tail}"
+            );
+            let file = parse(&text).unwrap();
+            let err = format!("{:#}", resolve_included(&file, &["db".into()]).unwrap_err());
+            assert!(err.contains("dbdata"), "{err}");
+            assert!(err.contains(needle), "{err}");
+            assert!(err.contains("share"), "it says why it matters: {err}");
+        }
+    }
+
+    #[test]
+    fn a_plain_named_volume_is_isolated_by_the_project_name_and_allowed() {
+        let text = "services:\n  db:\n    image: postgres:16\n    volumes:\n      - dbdata:/var/lib/postgresql/data\nvolumes:\n  dbdata:\n";
+        let file = parse(text).unwrap();
+        assert_eq!(
+            resolve_included(&file, &["db".into()]).unwrap(),
+            vec![("db".to_string(), 5432)]
+        );
+    }
+
+    #[test]
+    fn a_dependency_left_out_of_include_is_refused_naming_both() {
+        let text = "services:\n  api:\n    image: node\n    ports: [\"3000:3000\"]\n    depends_on:\n      - db\n  db:\n    image: postgres:16\n";
+        let file = parse(text).unwrap();
+        let err = format!(
+            "{:#}",
+            resolve_included(&file, &["api".into()]).unwrap_err()
+        );
+        assert!(err.contains("\"api\""), "{err}");
+        assert!(err.contains("\"db\""), "{err}");
+        // And it is fine once both are in.
+        assert!(resolve_included(&file, &["api".into(), "db".into()]).is_ok());
+    }
+
+    #[test]
+    fn an_unknown_image_with_no_declared_port_is_refused_by_name() {
+        let text = "services:\n  odd:\n    image: acme/thing:1\n";
+        let file = parse(text).unwrap();
+        let err = format!(
+            "{:#}",
+            resolve_included(&file, &["odd".into()]).unwrap_err()
+        );
+        assert!(err.contains("odd"), "{err}");
+        assert!(err.contains("acme/thing:1"), "it names the image: {err}");
+        assert!(err.contains("ports:"), "it says what to add: {err}");
     }
 
     #[test]
