@@ -264,6 +264,235 @@ fn the_hidden_subcommand_refuses_to_run_without_its_cookie() {
     );
 }
 
+// ---- the whole lifecycle through the binary --------------------------------
+
+/// A fixture with a dev process that really binds a port and a fake
+/// cloudflared in its home, run through the `pando` binary.
+struct Cli {
+    _dir: TempDir,
+    home: PathBuf,
+    root: PathBuf,
+}
+
+impl Drop for Cli {
+    fn drop(&mut self) {
+        // Every share, every process, whatever the test did.
+        if self.home.exists() {
+            let _ = self.run(&["stop"]);
+        }
+    }
+}
+
+impl Cli {
+    fn run(&self, args: &[&str]) -> std::process::Output {
+        Command::new(pando_bin())
+            .env("PANDO_HOME", &self.home)
+            .current_dir(&self.root)
+            .args(args)
+            .output()
+            .expect("run pando")
+    }
+
+    fn state(&self) -> serde_json::Value {
+        let out = self.run(&["status", "--json"]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "status failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).expect("valid json")
+    }
+
+    /// Starts a worktree and waits until its process is really Running.
+    ///
+    /// `start` records `Starting` and returns; the phase advances on the
+    /// next read path, once the listener has actually bound its port. A
+    /// share of something still coming up is refused on purpose, so this is
+    /// what a developer does too — they look at `status`.
+    fn start_and_wait(&self, name: &str) {
+        let out = self.run(&["start", name]);
+        assert_eq!(code(&out), 0, "start failed: {}", stderr_of(&out));
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                self.state()["worktrees"][0]["processes"]["dev"]["phase"] == "running"
+            }),
+            "the dev process never reached running: {}",
+            self.state()
+        );
+    }
+}
+
+fn cli_env() -> Option<Cli> {
+    if !common::python3_available() {
+        eprintln!("skipping: python3 is needed for a process that really holds a port");
+        return None;
+    }
+    let dir = TempDir::new().unwrap();
+    let root = common::build(common::Kind::Plain, dir.path()).root;
+    let home = dir.path().join("pando-home");
+    common::fake_cloudflared(&home);
+    common::write_listener_config(common::Kind::Plain, &home, &root);
+    Some(Cli {
+        home,
+        root,
+        _dir: dir,
+    })
+}
+
+fn code(out: &std::process::Output) -> i32 {
+    out.status.code().expect("pando exited via a signal")
+}
+
+fn stdout_of(out: &std::process::Output) -> String {
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn stderr_of(out: &std::process::Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+#[test]
+fn share_publishes_a_url_and_unshare_takes_it_down() {
+    let Some(cli) = cli_env() else { return };
+    assert_eq!(code(&cli.run(&["new", "feat/one"])), 0);
+    cli.start_and_wait("feat+one");
+
+    let shared = cli.run(&["share", "feat+one"]);
+    assert_eq!(code(&shared), 0, "{}", stderr_of(&shared));
+    assert_eq!(
+        stdout_of(&shared).trim(),
+        common::FAKE_TUNNEL_URL,
+        "stdout is the URL and nothing else, so `open \"$(pando share x)\"` works"
+    );
+
+    let share = cli.state()["worktrees"][0]["share"].clone();
+    assert_eq!(share["url"], common::FAKE_TUNNEL_URL);
+    assert_eq!(share["proxy_port"], serde_json::Value::Null);
+
+    let text = cli.run(&["status", "feat+one"]);
+    assert!(
+        stdout_of(&text).contains(common::FAKE_TUNNEL_URL),
+        "{}",
+        stdout_of(&text)
+    );
+
+    let unshared = cli.run(&["unshare", "feat+one"]);
+    assert_eq!(code(&unshared), 0, "{}", stderr_of(&unshared));
+    assert_eq!(
+        cli.state()["worktrees"][0]["share"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        common::status_porcelain(&cli.root),
+        "",
+        "the fixture must stay clean throughout"
+    );
+}
+
+#[test]
+fn a_second_share_prints_the_url_it_already_has() {
+    let Some(cli) = cli_env() else { return };
+    cli.run(&["new", "feat/one"]);
+    cli.start_and_wait("feat+one");
+    let first = cli.run(&["share", "feat+one"]);
+    assert_eq!(code(&first), 0, "{}", stderr_of(&first));
+
+    let second = cli.run(&["share", "feat+one"]);
+    assert_eq!(code(&second), 0);
+    assert_eq!(stdout_of(&second).trim(), stdout_of(&first).trim());
+    assert!(
+        stderr_of(&second).contains("already shared"),
+        "{}",
+        stderr_of(&second)
+    );
+}
+
+#[test]
+fn sharing_a_worktree_that_is_not_running_exits_one() {
+    let Some(cli) = cli_env() else { return };
+    cli.run(&["new", "feat/one"]);
+    let out = cli.run(&["share", "feat+one"]);
+    assert_eq!(code(&out), 1);
+    assert!(
+        stderr_of(&out).contains("start it first"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert!(stdout_of(&out).is_empty(), "nothing to pipe on a failure");
+}
+
+#[test]
+fn unsharing_something_that_is_not_shared_exits_one() {
+    let Some(cli) = cli_env() else { return };
+    cli.run(&["new", "feat/one"]);
+    let out = cli.run(&["unshare", "feat+one"]);
+    assert_eq!(code(&out), 1);
+    assert!(
+        stderr_of(&out).contains("not shared"),
+        "{}",
+        stderr_of(&out)
+    );
+}
+
+#[test]
+fn stop_closes_the_public_url() {
+    let Some(cli) = cli_env() else { return };
+    cli.run(&["new", "feat/one"]);
+    cli.start_and_wait("feat+one");
+    cli.run(&["share", "feat+one"]);
+    assert_ne!(
+        cli.state()["worktrees"][0]["share"],
+        serde_json::Value::Null
+    );
+
+    assert_eq!(code(&cli.run(&["stop", "feat+one"])), 0);
+    assert_eq!(
+        cli.state()["worktrees"][0]["share"],
+        serde_json::Value::Null,
+        "a stopped worktree never keeps a public URL"
+    );
+}
+
+#[test]
+fn rm_closes_the_public_url_and_removes_the_worktree() {
+    let Some(cli) = cli_env() else { return };
+    cli.run(&["new", "feat/one"]);
+    cli.start_and_wait("feat+one");
+    cli.run(&["share", "feat+one"]);
+
+    let removed = cli.run(&["rm", "feat+one", "--force"]);
+    assert_eq!(code(&removed), 0, "{}", stderr_of(&removed));
+    assert_eq!(
+        cli.state()["worktrees"].as_array().unwrap().len(),
+        0,
+        "the worktree is gone, and so is anything it was running"
+    );
+    assert_eq!(common::status_porcelain(&cli.root), "");
+}
+
+// `unshare` is one of the commands you need most when `pando.toml` is
+// broken: the record holds both pgids, and taking a URL down needs nothing
+// else.
+#[test]
+fn unshare_works_when_the_config_is_unreadable() {
+    let Some(cli) = cli_env() else { return };
+    cli.run(&["new", "feat/one"]);
+    cli.start_and_wait("feat+one");
+    cli.run(&["share", "feat+one"]);
+
+    let project = pando::project::ProjectRef::from_root(&cli.root).unwrap();
+    let config = cli
+        .home
+        .join("projects")
+        .join(&project.id)
+        .join("pando.toml");
+    std::fs::write(&config, "this is not toml {{{").unwrap();
+
+    let out = cli.run(&["unshare", "feat+one"]);
+    assert_eq!(code(&out), 0, "{}", stderr_of(&out));
+}
+
 // It is hidden, not secret: it must not appear in `--help`, because nobody
 // should ever type it.
 #[test]

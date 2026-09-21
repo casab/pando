@@ -127,6 +127,10 @@ pub enum Command {
         #[arg(long, requires = "name", conflicts_with = "json")]
         env: bool,
     },
+    /// Publish a running worktree at a public URL.
+    Share { name: String },
+    /// Take a worktree's public URL down.
+    Unshare { name: String },
     /// Print a worktree's log.
     Logs {
         name: String,
@@ -166,6 +170,11 @@ impl Command {
             Command::New { .. }
                 | Command::Start { .. }
                 | Command::Restart { .. }
+                // `[share]` says which provider to use and whether there is
+                // an auth command. `unshare` needs none of that: the record
+                // holds both pgids, and taking a URL down is something you
+                // want most when the config is broken.
+                | Command::Share { .. }
                 // `--env` renders templates, which only config holds. Plain
                 // `status` still runs on whatever is left.
                 | Command::Status { env: true, .. }
@@ -278,6 +287,23 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             } else {
                 status_text(paths, name.as_deref(), &mut out)
             }
+        }
+        Command::Share { name } => {
+            let outcome = actions::share(paths, config, &name, &notice)?;
+            if outcome.already {
+                notice(&format!("{name} was already shared"));
+            }
+            if outcome.pre_authed {
+                notice("a proxy in front of it is injecting the Cookie header from auth_cmd");
+            }
+            // The URL alone on stdout, so `open "$(pando share x)"` works.
+            writeln!(out, "{}", outcome.public_url)?;
+            Ok(())
+        }
+        Command::Unshare { name } => {
+            actions::unshare(paths, &name)?;
+            writeln!(out, "unshared {name}")?;
+            Ok(())
         }
         Command::Logs {
             name,
@@ -979,6 +1005,21 @@ struct ServiceOut {
     project: Option<String>,
 }
 
+/// A worktree's public URL, when it has one.
+///
+/// No cookie, ever: the value `auth_cmd` produced lives in the proxy's
+/// environment and nowhere else, and this shape is printed, logged, and
+/// piped into things.
+#[derive(Serialize)]
+struct ShareOut {
+    url: String,
+    /// The port being published — the application's own.
+    local_port: u16,
+    /// The proxy in front of it, when `auth_cmd` put one there.
+    proxy_port: Option<u16>,
+    since: DateTime<Utc>,
+}
+
 #[derive(Serialize)]
 struct StatusWorktreeOut {
     name: String,
@@ -991,6 +1032,8 @@ struct StatusWorktreeOut {
     /// Whether this worktree runs private copies of the project's
     /// services.
     isolated: bool,
+    /// `null` when the worktree is not shared.
+    share: Option<ShareOut>,
     processes: BTreeMap<String, ProcessOut>,
     services: BTreeMap<String, ServiceOut>,
     hooks: BTreeMap<String, HookOut>,
@@ -1051,6 +1094,12 @@ pub fn status_json<W: Write>(paths: &PandoPaths, only: Option<&str>, out: &mut W
                     observed_ports: record.observed_ports.clone(),
                     url: worktree_url(record),
                     isolated: record.isolated,
+                    share: record.share.as_ref().map(|share| ShareOut {
+                        url: share.public_url.clone(),
+                        local_port: share.local_port,
+                        proxy_port: share.proxy_port,
+                        since: share.started_at,
+                    }),
                     services: actions::service_statuses(record)
                         .into_iter()
                         .map(|status| {
@@ -1184,6 +1233,19 @@ pub fn status_text_at<W: Write>(
                 "  {:<service_width$}  {:<PHASE_CELL$}  service on {port}",
                 service.name,
                 if service.up { "up" } else { "down" },
+            );
+            writeln!(out, "{}", ellipsize(&row, width))?;
+        }
+        // And the public URL, last, because it is the line somebody is
+        // most often here to copy.
+        if let Some(share) = &record.share {
+            let through = match share.proxy_port {
+                Some(port) => format!(" through a proxy on {port}"),
+                None => String::new(),
+            };
+            let row = format!(
+                "  {:<service_width$}  {:<PHASE_CELL$}  {}{through}",
+                "share", "public", share.public_url,
             );
             writeln!(out, "{}", ellipsize(&row, width))?;
         }
@@ -2049,6 +2111,103 @@ mod tests {
         assert_eq!(worker["phase"], "failed");
         assert_eq!(worker["reason"], "process exited");
         assert_eq!(wt["hooks"]["install"]["fingerprint"], "md5:abc");
+    }
+
+    /// A worktree with a live share recorded, so the status shapes can be
+    /// asserted without a tunnel. The pid is this process: alive, so the
+    /// refresh leaves the record alone.
+    fn with_share(fx: &Fx, name: &str, proxy: Option<u16>) {
+        let mut store = crate::state::load(&fx.paths.state_file()).unwrap();
+        let record = store.worktrees.get_mut(name).unwrap();
+        record.ports.insert("web".to_string(), 17_342);
+        record.share_port = proxy;
+        record.share = Some(crate::state::ShareRecord {
+            tunnel_pid: std::process::id(),
+            tunnel_pgid: 999_998,
+            public_url: "https://fake-host.trycloudflare.com".to_string(),
+            local_port: 17_342,
+            started_at: Utc::now(),
+            log_path: fx.paths.log_file(name, "tunnel"),
+            proxy_pid: proxy.map(|_| std::process::id()),
+            proxy_pgid: proxy.map(|_| 999_997),
+            proxy_port: proxy,
+        });
+        crate::state::save(&fx.paths.state_file(), &store).unwrap();
+    }
+
+    #[test]
+    fn status_json_carries_the_public_url_and_never_a_cookie() {
+        let fx = fixture();
+        let name = actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
+        with_share(&fx, &name, Some(17_349));
+
+        let text = capture(|b| status_json(&fx.paths, None, b));
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let share = &v["worktrees"][0]["share"];
+        assert_eq!(share["url"], "https://fake-host.trycloudflare.com");
+        assert_eq!(share["local_port"], 17_342);
+        assert_eq!(share["proxy_port"], 17_349);
+        assert!(share["since"].is_string());
+        assert!(
+            !text.to_lowercase().contains("cookie"),
+            "a credential must never reach a shape that gets piped into things:\n{text}"
+        );
+    }
+
+    #[test]
+    fn status_json_says_null_for_a_worktree_that_is_not_shared() {
+        let fx = fixture();
+        actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
+        let text = capture(|b| status_json(&fx.paths, None, b));
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["worktrees"][0]["share"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn status_json_reports_a_share_with_no_proxy_in_front_of_it() {
+        let fx = fixture();
+        let name = actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
+        with_share(&fx, &name, None);
+        let text = capture(|b| status_json(&fx.paths, None, b));
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            v["worktrees"][0]["share"]["proxy_port"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn status_text_prints_the_public_url_under_its_worktree() {
+        let fx = fixture();
+        let name = actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
+        with_share(&fx, &name, Some(17_349));
+
+        let text = capture(|b| status_text_at(&fx.paths, None, b, 120));
+        assert!(text.contains("share"), "{text}");
+        assert!(
+            text.contains("https://fake-host.trycloudflare.com"),
+            "{text}"
+        );
+        assert!(
+            text.contains("through a proxy on 17349"),
+            "the proxy is worth saying: a visitor arrives authenticated: {text}"
+        );
+    }
+
+    // The same degradation every other row has: truncated, never wrapped.
+    #[test]
+    fn the_share_row_truncates_on_a_narrow_terminal() {
+        let fx = fixture();
+        let name = actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
+        with_share(&fx, &name, Some(17_349));
+
+        let text = capture(|b| status_text_at(&fx.paths, None, b, 40));
+        for line in text.lines() {
+            assert!(
+                line.chars().count() <= 40,
+                "a row wider than the terminal: {line:?}"
+            );
+        }
     }
 
     #[test]

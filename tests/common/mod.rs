@@ -731,6 +731,36 @@ pub fn listener_config() -> String {
     out
 }
 
+/// The quick-tunnel URL the fake provider publishes.
+pub const FAKE_TUNNEL_URL: &str = "https://fake-tunnel-for-tests.trycloudflare.com";
+
+/// Installs a fake `cloudflared` at `<home>/bin/cloudflared` — the hook
+/// `tunnel::cloudflared_program` looks at first, and the same one a
+/// developer would use for a real shim. No test touches PATH.
+///
+/// It echoes its own arguments, publishes a URL in cloudflared's bordered
+/// format, and then stays up as a tunnel does.
+pub fn fake_cloudflared(home: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let path = bin.join("cloudflared");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\n\
+             echo \"ARGS: $*\"\n\
+             echo 'INF Requesting new quick Tunnel on trycloudflare.com...'\n\
+             echo 'INF +---------------------------------------------------+'\n\
+             echo 'INF |  {FAKE_TUNNEL_URL}  |'\n\
+             echo 'INF +---------------------------------------------------+'\n\
+             exec sleep 300\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 /// Writes the fixture's listener config into an injected pando home.
 pub fn write_listener_config(kind: Kind, home: &Path, root: &Path) -> PathBuf {
     let project = ProjectRef::from_root(root).unwrap();
