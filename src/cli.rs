@@ -3605,6 +3605,129 @@ mod tests {
         );
     }
 
+    /// Every `pando …` an agent-facing document tells a reader to run,
+    /// from its fenced blocks and its inline code spans.
+    fn commands_named_in(text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut fenced = false;
+        for line in text.lines() {
+            if line.trim_start().starts_with("```") {
+                fenced = !fenced;
+                continue;
+            }
+            if fenced {
+                let line = line.trim().split('#').next().unwrap_or("").trim();
+                if let Some(rest) = line.strip_prefix("pando ") {
+                    out.push(rest.trim().to_string());
+                }
+                continue;
+            }
+            // Inline: `pando doctor --json` in the middle of a sentence.
+            for span in line.split('`').skip(1).step_by(2) {
+                if let Some(rest) = span.strip_prefix("pando ") {
+                    out.push(rest.trim().to_string());
+                }
+            }
+        }
+        out
+    }
+
+    /// Holds a document's commands to what the binary really takes.
+    ///
+    /// Instructions for a language model are the one kind of code that
+    /// fails silently and plausibly: a flag renamed in `cli.rs` leaves a
+    /// document that still reads perfectly and no longer works. clap is
+    /// asked rather than a list kept beside it, so there is nothing to
+    /// keep in step.
+    fn assert_every_documented_command_is_real(file: &str) {
+        use clap::CommandFactory;
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let cli = Cli::command();
+        let mut checked = 0;
+        for command in commands_named_in(&text) {
+            let mut tokens = command.split_whitespace();
+            let Some(verb) = tokens.next() else { continue };
+            // A bare `pando` with a flag of its own, like --version.
+            if verb.starts_with('-') {
+                continue;
+            }
+            let sub = cli
+                .get_subcommands()
+                .find(|c| c.get_name() == verb)
+                .unwrap_or_else(|| {
+                    panic!("{file} says `pando {command}`, and pando has no {verb:?} command")
+                });
+            for token in tokens {
+                let Some(flag) = token.strip_prefix("--") else {
+                    continue;
+                };
+                // `--answers answers.json` — the value is the next token
+                // and is not a flag; nothing here needs to know that.
+                assert!(
+                    sub.get_arguments().any(|a| a.get_long() == Some(flag)),
+                    "{file} says `pando {command}`, and `pando {verb}` has no --{flag}"
+                );
+            }
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "{file} names no commands at all — did the format change?"
+        );
+    }
+
+    #[test]
+    fn the_contract_only_names_commands_pando_has() {
+        assert_every_documented_command_is_real("agent/json.md");
+    }
+
+    // The brief is a procedure written for a language model, which is the
+    // one kind of reader that will follow a command that does not exist
+    // and report that it worked.
+    #[test]
+    fn the_brief_only_names_commands_pando_has() {
+        assert_every_documented_command_is_real("agent/brief.md");
+    }
+
+    /// The brief is the only place the reasoning lives, so the things it
+    /// has to teach are worth failing over if somebody trims it.
+    ///
+    /// Phrases, not sentences: this is a guard against a section being
+    /// deleted, not a style checker.
+    #[test]
+    fn the_brief_teaches_the_things_only_it_teaches() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("agent/brief.md");
+        let text = std::fs::read_to_string(&path).expect("the brief");
+        // Collapsed, because the document is hard-wrapped and a phrase it
+        // makes is as likely as not to straddle two lines.
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        for (phrase, why) in [
+            ("init --answers", "the one write path"),
+            ("never edit", "and that nothing else is"),
+            ("by value", "how an option is named"),
+            ("non-frozen", "the install guardrail"),
+            (
+                "built from the repository",
+                "a compose file that only packages the app",
+            ),
+            ("[isolation] prefer", "the preference an agent cannot write"),
+            ("decisions.jsonl", "what pando records about the answerer"),
+            ("exit 3", "the code that means a question is open"),
+            ("--json", "never parse human-readable output"),
+        ] {
+            assert!(
+                text.to_lowercase().contains(&phrase.to_lowercase()),
+                "the brief no longer teaches {why}: it never says {phrase:?}"
+            );
+        }
+        // And every question it tells a reader to answer.
+        for name in slot_names() {
+            assert!(text.contains(&name), "the brief never mentions {name}");
+        }
+    }
+
     /// The contract file says the same names, in the same order.
     ///
     /// A document is the one part of a contract nothing compiles, so it is
