@@ -64,6 +64,18 @@ pub struct WorktreeRecord {
     pub isolated: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub hooks: BTreeMap<String, HookRecord>,
+    /// The port this worktree's share proxy listens on, once it has needed
+    /// one. Kept beside `ports` rather than in it, and it survives an
+    /// unshare exactly as they do, so the number is stable.
+    ///
+    /// Not a role in `ports`, deliberately. `ports::assign` reuses a
+    /// worktree's window only when the recorded roles are exactly the ones
+    /// being asked for, so a `share` key would make every later start
+    /// decide the window had changed and move every port — under a live
+    /// application. It is excluded from the URL rule for the same reason:
+    /// no process owns it, and a proxy is not what a worktree serves on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share_port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub share: Option<ShareRecord>,
 }
@@ -81,6 +93,7 @@ impl WorktreeRecord {
             services: Vec::new(),
             isolated: false,
             hooks: BTreeMap::new(),
+            share_port: None,
             share: None,
         }
     }

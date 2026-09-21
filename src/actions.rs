@@ -19,8 +19,10 @@ use crate::paths::PandoPaths;
 use crate::ports;
 use crate::process::{self as proc, SpawnOptions};
 use crate::services;
-use crate::state::{self, Phase, ProcessRecord, WorktreeRecord};
+use crate::share_proxy;
+use crate::state::{self, Phase, ProcessRecord, ShareRecord, WorktreeRecord};
 use crate::template;
+use crate::tunnel;
 use crate::worktree::{self, Worktree};
 
 /// Directory name for a branch: `feat/checkout` becomes `feat+checkout`.
@@ -2077,6 +2079,378 @@ fn sweep_orphaned_groups_with(
         failures.len(),
         failures.join("; ")
     )
+}
+
+// ---- share ----------------------------------------------------------------
+
+/// How long `[share].auth_cmd` may take before the share gives up on it.
+///
+/// A script that waits on something that never comes would otherwise hold
+/// a share open forever, and in the TUI that is a pending slot nothing can
+/// clear.
+const AUTH_CMD_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How `auth_cmd` is told which port the proxy will listen on, in case it
+/// wants to mint a session scoped to it.
+pub const ENV_SHARE_PORT: &str = "PANDO_SHARE_PORT";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareOutcome {
+    pub name: String,
+    pub public_url: String,
+    /// Whether a proxy is injecting a header in front of the application.
+    pub pre_authed: bool,
+    /// Whether the worktree was already shared when this was asked. A
+    /// second `share` prints the URL rather than opening a second tunnel.
+    pub already: bool,
+}
+
+/// Publishes a running worktree at a public URL.
+///
+/// The lock is held for the refusals and for recording the result, and
+/// dropped for everything slow in between — the auth command, the proxy,
+/// and a tunnel that takes up to thirty seconds to publish. That window is
+/// why the second half re-checks: a `stop` in the meantime must not leave a
+/// tunnel open onto nothing with no record of it.
+pub fn share(
+    paths: &PandoPaths,
+    config: &Config,
+    name: &str,
+    progress: &dyn Fn(&str),
+) -> Result<ShareOutcome> {
+    let provider = tunnel::provider_for(config.share.provider.as_deref())?;
+    share_with(
+        paths,
+        config,
+        name,
+        provider.as_ref(),
+        &|paths, name, listen, upstream, cookie| {
+            share_proxy::spawn(paths, name, listen, upstream, cookie)
+        },
+        progress,
+    )
+}
+
+/// How a proxy is started. Injected so a test can drive the path where a
+/// tunnel fails with a proxy already running: the real one re-execs the
+/// running binary, which inside a library test is the test harness.
+pub type SpawnProxy<'a> =
+    &'a dyn Fn(&PandoPaths, &str, u16, u16, &str) -> Result<share_proxy::ProxySpawn>;
+
+/// [`share`] with the provider and the proxy injected, so a test can drive
+/// a provider that is missing, and one whose tunnel fails after a proxy is
+/// already running.
+pub fn share_with(
+    paths: &PandoPaths,
+    config: &Config,
+    name: &str,
+    provider: &dyn tunnel::Provider,
+    spawn_proxy: SpawnProxy<'_>,
+    progress: &dyn Fn(&str),
+) -> Result<ShareOutcome> {
+    paths.ensure_home()?;
+    let worktree = find_worktree(paths, name)?;
+    let canonical = std::fs::canonicalize(&worktree.path).unwrap_or_else(|_| worktree.path.clone());
+
+    // Every refusal first, and the proxy's port, under the lock.
+    let (target_port, share_port) = {
+        let _lock = state::lock(&paths.lock_file())?;
+        let mut store = state::load(&paths.state_file())?;
+        for notice in sweep_dead_shares(&mut store) {
+            progress(&notice);
+        }
+        sweep_orphaned_groups(&mut store)?;
+        advance_before_reconcile(&mut store);
+        state::reconcile(&mut store, proc::is_alive);
+
+        let record = store
+            .worktrees
+            .get(name)
+            .with_context(|| format!("pando has no record of {name} — start it first"))?;
+        if let Some(existing) = &record.share {
+            return Ok(ShareOutcome {
+                name: name.to_string(),
+                public_url: existing.public_url.clone(),
+                pre_authed: existing.proxy_pid.is_some(),
+                already: true,
+            });
+        }
+        let target_port = share_target_port(name, record)?;
+        // Only when something will actually listen on it. A worktree that
+        // is shared without an auth command needs no proxy and no port.
+        let share_port = match config.share.auth_cmd {
+            Some(_) => Some(ports::assign_share_port(paths, &mut store, name)?),
+            None => None,
+        };
+        state::save(&paths.state_file(), &store)?;
+        (target_port, share_port)
+    };
+
+    // Only now: a worktree that was never going to be shared must not be
+    // told to install anything.
+    provider.ensure_present(paths)?;
+
+    // The cookie before anything is spawned, so a script that fails leaves
+    // nothing behind to clean up.
+    let cookie = match config.share.auth_cmd.as_deref() {
+        Some(cmd) => {
+            progress("running the auth command");
+            Some(run_auth_cmd(
+                paths,
+                config,
+                name,
+                &worktree,
+                &canonical,
+                cmd,
+                share_port.unwrap_or(target_port),
+            )?)
+        }
+        None => None,
+    };
+
+    let proxy = match (&cookie, share_port) {
+        (Some(cookie), Some(port)) => {
+            progress("starting the share proxy");
+            Some(spawn_proxy(paths, name, port, target_port, cookie)?)
+        }
+        _ => None,
+    };
+    let upstream = proxy.as_ref().map_or(target_port, |p| p.listen_port);
+
+    progress(&format!("opening a {} tunnel", provider.name()));
+    let spawn = match provider.start(paths, name, upstream) {
+        Ok(spawn) => spawn,
+        Err(e) => {
+            // Nothing has recorded the proxy yet, so this is the last
+            // moment anything knows its process group.
+            if let Some(proxy) = &proxy {
+                let _ = proc::stop(proxy.pgid, STOP_GRACE);
+            }
+            return Err(e);
+        }
+    };
+
+    let record = ShareRecord {
+        tunnel_pid: spawn.pid,
+        tunnel_pgid: spawn.pgid,
+        public_url: spawn.public_url.clone(),
+        local_port: target_port,
+        started_at: Utc::now(),
+        log_path: spawn.log_path,
+        proxy_pid: proxy.as_ref().map(|p| p.pid),
+        proxy_pgid: proxy.as_ref().map(|p| p.pgid),
+        proxy_port: proxy.as_ref().map(|p| p.listen_port),
+    };
+
+    // The worktree may have been stopped, removed, or shared by somebody
+    // else while the tunnel was coming up. Anything that was spawned goes
+    // down here rather than becoming a process with no record.
+    let _lock = state::lock(&paths.lock_file())?;
+    let mut store = state::load(&paths.state_file())?;
+    let Some(existing_record) = store.worktrees.get(name) else {
+        let _ = tunnel::stop_share(&record);
+        bail!("{name} was removed while its tunnel was starting; the tunnel was closed again");
+    };
+    if let Some(won) = &existing_record.share {
+        let public_url = won.public_url.clone();
+        let pre_authed = won.proxy_pid.is_some();
+        let _ = tunnel::stop_share(&record);
+        return Ok(ShareOutcome {
+            name: name.to_string(),
+            public_url,
+            pre_authed,
+            already: true,
+        });
+    }
+    if let Err(e) = share_target_port(name, existing_record) {
+        let _ = tunnel::stop_share(&record);
+        return Err(e.context(format!(
+            "{name} stopped while its tunnel was starting; the tunnel was closed again"
+        )));
+    }
+    store.worktrees.get_mut(name).expect("just read").share = Some(record.clone());
+    if let Err(e) = state::save(&paths.state_file(), &store) {
+        // A tunnel nothing has a record of is a tunnel nothing can close.
+        let _ = tunnel::stop_share(&record);
+        return Err(e);
+    }
+    Ok(ShareOutcome {
+        name: name.to_string(),
+        public_url: record.public_url,
+        pre_authed: proxy.is_some(),
+        already: false,
+    })
+}
+
+/// Takes a worktree's public URL down.
+pub fn unshare(paths: &PandoPaths, name: &str) -> Result<()> {
+    paths.ensure_home()?;
+    let _lock = state::lock(&paths.lock_file())?;
+    let mut store = state::load(&paths.state_file())?;
+    let record = store
+        .worktrees
+        .get_mut(name)
+        .with_context(|| format!("pando has no record of {name}"))?;
+    let Some(share) = record.share.take() else {
+        bail!("{name} is not shared");
+    };
+    if let Err(e) = tunnel::stop_share(&share) {
+        // Still alive, so the record goes back: state has to match what is
+        // really running, or a retry has no pgid to signal.
+        record.share = Some(share);
+        state::save(&paths.state_file(), &store)?;
+        return Err(e.context(format!("could not take {name}'s share down")));
+    }
+    state::save(&paths.state_file(), &store)?;
+    Ok(())
+}
+
+/// Clears a share whose tunnel or proxy has died, signalling whatever is
+/// left of it *before* the record that names it is dropped.
+///
+/// The only place that signals. `state::reconcile` and
+/// `state::advance_phases` also drop a dead share, and neither can signal
+/// anything — `state` knows nothing about processes — so this runs first on
+/// every path that reaches them, and they find the record already gone.
+///
+/// A share is only useful while both halves live: a tunnel whose proxy died
+/// serves the wrong thing, and a proxy whose tunnel died is unreachable.
+/// Either way both groups are signalled, because a dead leader is not a
+/// dead group.
+fn sweep_dead_shares(store: &mut state::State) -> Vec<String> {
+    sweep_dead_shares_with(store, proc::is_alive, |pgid| proc::stop(pgid, STOP_GRACE))
+}
+
+/// [`sweep_dead_shares`] with liveness and the signal injected, so a test
+/// can drive it without real process groups.
+fn sweep_dead_shares_with(
+    store: &mut state::State,
+    is_alive: impl Fn(u32) -> bool,
+    stop: impl Fn(i32) -> Result<()>,
+) -> Vec<String> {
+    let mut notices = Vec::new();
+    for (name, record) in store.worktrees.iter_mut() {
+        let Some(share) = record.share.clone() else {
+            continue;
+        };
+        let tunnel_dead = !is_alive(share.tunnel_pid);
+        let proxy_dead = share.proxy_pid.is_some_and(|pid| !is_alive(pid));
+        if !tunnel_dead && !proxy_dead {
+            continue;
+        }
+        let half = if tunnel_dead { "tunnel" } else { "proxy" };
+        match tunnel::stop_share_with(&share, &stop) {
+            Ok(()) => {
+                record.share = None;
+                notices.push(format!(
+                    "{name}: the share's {half} exited, so the public URL is closed"
+                ));
+            }
+            // Not cleared: the record holds the only pgid anything can use
+            // to try again.
+            Err(e) => notices.push(format!(
+                "{name}: the share's {half} exited and the rest of it would not stop ({e:#}) — \
+                 `pando unshare {name}` to try again"
+            )),
+        }
+    }
+    notices
+}
+
+/// The port a share points at: the one the worktree's own URL uses, and
+/// only while the process that owns it is running.
+///
+/// The same rule and the same words as the TUI's open key, because
+/// "shareable" and "openable" have to mean the same thing.
+fn share_target_port(name: &str, record: &WorktreeRecord) -> Result<u16> {
+    let Some(role) = url_role(record) else {
+        bail!("{name} has no port yet — start it first");
+    };
+    let Some(assigned) = record.ports.get(&role).copied() else {
+        bail!("{name} has no port yet — start it first");
+    };
+    let owner = record
+        .roles
+        .iter()
+        .find(|(_, roles)| roles.contains(&role))
+        .map(|(process, _)| process.clone());
+    let running = match &owner {
+        Some(process) => record
+            .processes
+            .get(process)
+            .is_some_and(|p| matches!(p.phase, Phase::Running { .. })),
+        // A record written before pando tracked who owns what: anything up
+        // is as much as it can say.
+        None => record
+            .processes
+            .values()
+            .any(|p| matches!(p.phase, Phase::Running { .. })),
+    };
+    if !running {
+        bail!("{name} is not running — start it first, then share it");
+    }
+    // What is really serving, not what pando asked for.
+    Ok(observed_port_for_role(record, &role).unwrap_or(assigned))
+}
+
+/// Runs `[share].auth_cmd` and returns the `Cookie` header value it printed.
+///
+/// It runs in the worktree, with the same environment the processes get
+/// plus the proxy's port, so a script can mint a session against the very
+/// database the application is using.
+fn run_auth_cmd(
+    paths: &PandoPaths,
+    config: &Config,
+    name: &str,
+    worktree: &Worktree,
+    canonical: &Path,
+    cmd: &str,
+    share_port: u16,
+) -> Result<String> {
+    let mut env = pando_env(paths, name, worktree.branch.as_deref(), canonical);
+    // Best effort: a worktree with no ports never reaches here, and a
+    // template that will not render is not a reason to refuse a share the
+    // script may not even need it for.
+    if let Ok(resolved) = resolved_env(paths, config, name) {
+        env.extend(resolved);
+    }
+    env.push((ENV_SHARE_PORT.to_string(), share_port.to_string()));
+
+    let captured = proc::run_captured(
+        &with_prelude(config, cmd),
+        canonical,
+        &env,
+        AUTH_CMD_TIMEOUT,
+    )
+    .with_context(|| format!("the [share].auth_cmd of {name}"))?;
+    if !captured.success() {
+        let reason = match captured.last_stderr_line() {
+            Some(line) => format!(" — {line}"),
+            None => String::new(),
+        };
+        bail!(
+            "[share].auth_cmd exited {}{reason} — it runs in {}, and its stdout is the Cookie \
+             header pando injects",
+            captured.code.unwrap_or(-1),
+            canonical.display()
+        );
+    }
+    let cookie = captured.stdout.trim().to_string();
+    if cookie.is_empty() {
+        bail!(
+            "[share].auth_cmd printed nothing — its stdout is the Cookie header value pando \
+             injects, so an empty one has nothing to inject"
+        );
+    }
+    // A header is one line. A value carrying a newline would let a script
+    // append headers of its own to every proxied request.
+    if cookie.contains(|c: char| c.is_control()) {
+        bail!(
+            "[share].auth_cmd printed a value with a control character in it — a Cookie header \
+             is a single line"
+        );
+    }
+    Ok(cookie)
 }
 
 /// Stop, then start. The ports come back from the record `stop` left
@@ -5217,6 +5591,476 @@ time.sleep(300)
         // the same one.
         stop(&fx.paths, &name, None).unwrap();
         assert_eq!(worktree_url(&fx.state().worktrees[&name]), report.url);
+    }
+
+    // ---- share -----------------------------------------------------------
+
+    use crate::testutil::{FAKE_TUNNEL_URL, fake_cloudflared_failing, fake_cloudflared_publishing};
+
+    /// Stops whatever a share started, even when an assertion panics first.
+    struct ShareGuard(Option<ShareRecord>);
+
+    impl Drop for ShareGuard {
+        fn drop(&mut self) {
+            if let Some(record) = &self.0 {
+                let _ = tunnel::stop_share(record);
+            }
+        }
+    }
+
+    fn share_guard(fx: &Fx, name: &str) -> ShareGuard {
+        ShareGuard(fx.state().worktrees.get(name).and_then(|r| r.share.clone()))
+    }
+
+    /// A worktree running a real listener on its `web` port, with a fake
+    /// provider installed — the state every share test starts from.
+    fn shared_fixture() -> Option<(Fx, String, Vec<Detached>, StartReport)> {
+        if !python3_available() {
+            eprintln!("skipping: python3 is needed for a process that really holds a port");
+            return None;
+        }
+        let mut fx = fixture();
+        with_dev(
+            &mut fx,
+            ProcessConfig {
+                cmd: python_listener_template(),
+                ports: Some(PortsSpec::List(vec!["web".to_string()])),
+                ready: Some(ReadySpec {
+                    role: Some("web".to_string()),
+                    timeout_s: None,
+                }),
+                ..Default::default()
+            },
+        );
+        fake_cloudflared_publishing(&fx.paths.home);
+        let name = worktree_named(&fx, "feat/one");
+        let report = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+        let guards = guard(&report);
+        let port = report.ports["web"];
+        assert!(
+            wait_until(Duration::from_secs(20), || {
+                refresh(&fx.paths);
+                crate::ports::something_is_listening(port)
+            }),
+            "the listener never bound {port}"
+        );
+        // One refresh so the process is Running rather than Starting: a
+        // share of something still coming up is refused on purpose.
+        refresh(&fx.paths);
+        Some((fx, name, guards, report))
+    }
+
+    /// A stand-in for the real proxy, which re-execs the running binary —
+    /// inside a library test that is the test harness, which exits at once.
+    /// This one is a detached process group with a pid, which is all the
+    /// assertions here are about: that it is started, recorded, and taken
+    /// down again when the share it belongs to fails.
+    fn stub_proxy(
+        paths: &PandoPaths,
+        name: &str,
+        listen: u16,
+        _upstream: u16,
+        _cookie: &str,
+    ) -> Result<share_proxy::ProxySpawn> {
+        let log_path = paths.log_file(name, share_proxy::PROXY_LOG);
+        let spawn = proc::spawn_detached(SpawnOptions {
+            shell_cmd: "exec sleep 300",
+            cwd: &std::env::temp_dir(),
+            log_file: &log_path,
+            env: &[],
+        })?;
+        Ok(share_proxy::ProxySpawn {
+            pid: spawn.pid,
+            pgid: spawn.pgid,
+            listen_port: listen,
+            log_path,
+        })
+    }
+
+    /// `share` as the CLI calls it, but with the proxy stubbed.
+    fn share_stubbed(fx: &Fx, config: &Config, name: &str) -> Result<ShareOutcome> {
+        let provider = tunnel::provider_for(config.share.provider.as_deref())?;
+        share_with(
+            &fx.paths,
+            config,
+            name,
+            provider.as_ref(),
+            &stub_proxy,
+            &noop,
+        )
+    }
+
+    /// A provider that is not installed.
+    struct MissingProvider;
+
+    impl tunnel::Provider for MissingProvider {
+        fn name(&self) -> &'static str {
+            "cloudflared"
+        }
+        fn ensure_present(&self, _: &PandoPaths) -> Result<()> {
+            bail!("cloudflared is not installed — `brew install cloudflared`")
+        }
+        fn start(&self, _: &PandoPaths, _: &str, _: u16) -> Result<tunnel::TunnelSpawn> {
+            panic!("a missing provider must never be asked to start anything")
+        }
+    }
+
+    /// A provider that is installed and whose tunnel fails anyway, the way a
+    /// rate-limited quick tunnel does.
+    struct FailingProvider;
+
+    impl tunnel::Provider for FailingProvider {
+        fn name(&self) -> &'static str {
+            "cloudflared"
+        }
+        fn ensure_present(&self, _: &PandoPaths) -> Result<()> {
+            Ok(())
+        }
+        fn start(&self, _: &PandoPaths, _: &str, _: u16) -> Result<tunnel::TunnelSpawn> {
+            bail!("cloudflared published no URL within 30s — tail: 429 Too Many Requests")
+        }
+    }
+
+    #[test]
+    fn share_refuses_a_worktree_that_is_not_running() {
+        let fx = fixture();
+        fake_cloudflared_publishing(&fx.paths.home);
+        let name = worktree_named(&fx, "feat/one");
+
+        let err = share(&fx.paths, &fx.config, &name, &noop).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("start it first"), "{message}");
+        assert!(
+            fx.state()
+                .worktrees
+                .get(&name)
+                .is_none_or(|r| r.share.is_none()),
+            "nothing may be recorded for a refused share"
+        );
+    }
+
+    #[test]
+    fn share_refuses_a_worktree_whose_process_has_stopped() {
+        let Some((fx, name, guards, _)) = shared_fixture() else {
+            return;
+        };
+        drop(guards);
+        stop(&fx.paths, &name, None).unwrap();
+
+        let err = share(&fx.paths, &fx.config, &name, &noop).unwrap_err();
+        assert!(format!("{err:#}").contains("not running"), "{err:#}");
+    }
+
+    #[test]
+    fn share_without_an_auth_command_tunnels_straight_to_the_web_port() {
+        let Some((fx, name, _guards, report)) = shared_fixture() else {
+            return;
+        };
+        let outcome = share(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let _share = share_guard(&fx, &name);
+
+        assert_eq!(outcome.public_url, FAKE_TUNNEL_URL);
+        assert!(!outcome.pre_authed);
+        assert!(!outcome.already);
+
+        let record = fx.state().worktrees[&name].share.clone().unwrap();
+        assert!(record.proxy_pid.is_none(), "no auth command, no proxy");
+        assert!(record.proxy_port.is_none());
+        assert_eq!(record.local_port, report.ports["web"]);
+        assert!(crate::process::is_alive(record.tunnel_pid));
+        assert_eq!(record.log_path, fx.paths.log_file(&name, "tunnel"));
+
+        let log = std::fs::read_to_string(fx.paths.log_file(&name, "tunnel")).unwrap();
+        assert!(
+            log.contains(&format!("--url http://127.0.0.1:{}", report.ports["web"])),
+            "the tunnel must point at the application itself: {log}"
+        );
+    }
+
+    #[test]
+    fn share_with_an_auth_command_runs_it_and_puts_a_proxy_in_front() {
+        let Some((fx, name, _guards, report)) = shared_fixture() else {
+            return;
+        };
+        // Written outside the worktree: a share must never make the
+        // repository dirty, not even from a test's own script.
+        let seen = fx.paths.home.join("auth-env.txt");
+        let mut config = fx.config.clone();
+        // Something only the process environment carries, so "it runs with
+        // the process env" is a claim this test can really check.
+        config.processes.get_mut("dev").unwrap().env =
+            BTreeMap::from([("APP_SECRET".to_string(), "from-the-process-env".to_string())]);
+        config.share.auth_cmd = Some(format!("env > {}; printf 'session=abc123'", seen.display()));
+
+        let outcome = share_stubbed(&fx, &config, &name).unwrap();
+        let _share = share_guard(&fx, &name);
+        assert!(outcome.pre_authed);
+
+        let record = fx.state().worktrees[&name].share.clone().unwrap();
+        let proxy_port = record.proxy_port.expect("a proxy port");
+        assert_eq!(
+            fx.state().worktrees[&name].share_port,
+            Some(proxy_port),
+            "the proxy's port is remembered, so a later share reuses it"
+        );
+        assert!(crate::process::is_alive(record.proxy_pid.unwrap()));
+        assert_eq!(
+            record.local_port, report.ports["web"],
+            "the record still says what is being shared, not what is in front of it"
+        );
+
+        let log = std::fs::read_to_string(fx.paths.log_file(&name, "tunnel")).unwrap();
+        assert!(
+            log.contains(&format!("--url http://127.0.0.1:{proxy_port}")),
+            "the tunnel must point at the proxy, not the application: {log}"
+        );
+
+        // The process environment, plus the port.
+        let env = std::fs::read_to_string(&seen).unwrap();
+        assert!(
+            env.contains(&format!("{ENV_SHARE_PORT}={proxy_port}")),
+            "the auth command must be told the proxy's port: {env}"
+        );
+        assert!(env.contains(&format!("PANDO_NAME={name}")), "{env}");
+        assert!(
+            env.contains("APP_SECRET=from-the-process-env"),
+            "the auth command runs with the same environment the process got: {env}"
+        );
+        assert_eq!(
+            porcelain_status(&fx.worktrees_dir().join(&name)),
+            Vec::<String>::new(),
+            "the auth command must leave the worktree clean"
+        );
+    }
+
+    #[test]
+    fn a_failing_auth_command_fails_the_share_with_its_own_complaint() {
+        let Some((fx, name, _guards, _)) = shared_fixture() else {
+            return;
+        };
+        let mut config = fx.config.clone();
+        config.share.auth_cmd = Some("echo 'no session for you' >&2; exit 3".to_string());
+
+        let err = share_stubbed(&fx, &config, &name).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("exited 3"), "{message}");
+        assert!(message.contains("no session for you"), "{message}");
+        assert!(
+            fx.state().worktrees[&name].share.is_none(),
+            "a share that failed before it started anything records nothing"
+        );
+        assert!(
+            !fx.paths.log_file(&name, "tunnel").exists(),
+            "nothing may have been spawned"
+        );
+    }
+
+    #[test]
+    fn an_auth_command_that_prints_nothing_usable_is_refused() {
+        let Some((fx, name, _guards, _)) = shared_fixture() else {
+            return;
+        };
+        for (cmd, expected) in [
+            ("true", "printed nothing"),
+            ("printf 'a\\nb'", "control character"),
+        ] {
+            let mut config = fx.config.clone();
+            config.share.auth_cmd = Some(cmd.to_string());
+            let err = share_stubbed(&fx, &config, &name).unwrap_err();
+            assert!(
+                format!("{err:#}").contains(expected),
+                "{cmd:?} should be refused with {expected:?}: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_second_share_hands_back_the_url_it_already_has() {
+        let Some((fx, name, _guards, _)) = shared_fixture() else {
+            return;
+        };
+        let first = share(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let _share = share_guard(&fx, &name);
+        let pid = fx.state().worktrees[&name]
+            .share
+            .clone()
+            .unwrap()
+            .tunnel_pid;
+
+        let second = share(&fx.paths, &fx.config, &name, &noop).unwrap();
+        assert_eq!(second.public_url, first.public_url);
+        assert!(second.already, "the second call opened nothing");
+        assert_eq!(
+            fx.state().worktrees[&name]
+                .share
+                .clone()
+                .unwrap()
+                .tunnel_pid,
+            pid,
+            "and the tunnel is the same one"
+        );
+    }
+
+    #[test]
+    fn unshare_stops_both_halves_and_clears_the_record() {
+        let Some((fx, name, _guards, _)) = shared_fixture() else {
+            return;
+        };
+        let mut config = fx.config.clone();
+        config.share.auth_cmd = Some("printf 'session=abc'".to_string());
+        share_stubbed(&fx, &config, &name).unwrap();
+        let record = fx.state().worktrees[&name].share.clone().unwrap();
+        let (tunnel_pid, proxy_pid) = (record.tunnel_pid, record.proxy_pid.unwrap());
+
+        unshare(&fx.paths, &name).unwrap();
+
+        assert!(fx.state().worktrees[&name].share.is_none());
+        assert!(wait_until(Duration::from_secs(5), || {
+            !crate::process::is_alive(tunnel_pid) && !crate::process::is_alive(proxy_pid)
+        }));
+        assert!(
+            fx.state().worktrees[&name].share_port.is_some(),
+            "the proxy's port is kept, so the next share reuses it"
+        );
+    }
+
+    #[test]
+    fn unshare_refuses_a_worktree_that_is_not_shared() {
+        let fx = fixture();
+        let name = worktree_named(&fx, "feat/one");
+        let err = unshare(&fx.paths, &name).unwrap_err();
+        assert!(format!("{err:#}").contains("not shared"), "{err:#}");
+    }
+
+    // A tunnel whose process is already gone must still unshare: the record
+    // is the only thing holding a URL nobody can reach.
+    #[test]
+    fn unshare_clears_a_share_whose_tunnel_already_died() {
+        let Some((fx, name, _guards, _)) = shared_fixture() else {
+            return;
+        };
+        share(&fx.paths, &fx.config, &name, &noop).unwrap();
+        let record = fx.state().worktrees[&name].share.clone().unwrap();
+        crate::process::stop(record.tunnel_pgid, Duration::from_secs(5)).unwrap();
+
+        unshare(&fx.paths, &name).unwrap();
+        assert!(fx.state().worktrees[&name].share.is_none());
+    }
+
+    #[test]
+    fn share_refuses_with_the_install_hint_when_the_provider_is_missing() {
+        let Some((fx, name, _guards, _)) = shared_fixture() else {
+            return;
+        };
+        let err = share_with(
+            &fx.paths,
+            &fx.config,
+            &name,
+            &MissingProvider,
+            &stub_proxy,
+            &noop,
+        )
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("not installed"), "{message}");
+        assert!(message.contains("brew install cloudflared"), "{message}");
+        assert!(fx.state().worktrees[&name].share.is_none());
+    }
+
+    #[test]
+    fn share_refuses_a_provider_pando_does_not_speak() {
+        let Some((fx, name, _guards, _)) = shared_fixture() else {
+            return;
+        };
+        let mut config = fx.config.clone();
+        config.share.provider = Some("ngrok".to_string());
+        let err = share(&fx.paths, &config, &name, &noop).unwrap_err();
+        assert!(format!("{err:#}").contains("ngrok"), "{err:#}");
+    }
+
+    // The leak this guards: the proxy is spawned before the tunnel, and a
+    // tunnel that never comes up leaves nothing recorded that could ever
+    // find it again.
+    #[test]
+    fn a_tunnel_that_never_opens_takes_the_proxy_down_with_it() {
+        let Some((fx, name, _guards, _)) = shared_fixture() else {
+            return;
+        };
+        let mut config = fx.config.clone();
+        config.share.auth_cmd = Some("printf 'session=abc'".to_string());
+
+        // The pid the proxy was given, captured as it is spawned: once the
+        // share has failed, nothing records it, and that is the whole
+        // point of this test.
+        let spawned: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+        let watched = |paths: &PandoPaths,
+                       name: &str,
+                       listen: u16,
+                       upstream: u16,
+                       cookie: &str|
+         -> Result<share_proxy::ProxySpawn> {
+            let spawn = stub_proxy(paths, name, listen, upstream, cookie)?;
+            spawned.lock().unwrap().push(spawn.pid);
+            Ok(spawn)
+        };
+
+        let err =
+            share_with(&fx.paths, &config, &name, &FailingProvider, &watched, &noop).unwrap_err();
+        assert!(format!("{err:#}").contains("no URL"), "{err:#}");
+
+        assert!(fx.state().worktrees[&name].share.is_none());
+        let pids = spawned.into_inner().unwrap();
+        assert_eq!(pids.len(), 1, "a proxy was started before the tunnel");
+        assert!(
+            wait_until(Duration::from_secs(5), || !crate::process::is_alive(
+                pids[0]
+            )),
+            "the proxy outlived the share that spawned it, with nothing left to find it"
+        );
+    }
+
+    // The real cloudflared fails the same way, through the same path.
+    #[test]
+    fn a_provider_that_exits_fails_the_share_and_records_nothing() {
+        let Some((fx, name, _guards, _)) = shared_fixture() else {
+            return;
+        };
+        fake_cloudflared_failing(&fx.paths.home);
+        let err = share(&fx.paths, &fx.config, &name, &noop).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Too Many Requests"),
+            "the provider's own complaint is the diagnosis: {err:#}"
+        );
+        assert!(fx.state().worktrees[&name].share.is_none());
+    }
+
+    // The Phase 3 critical, at this level: sharing must never move a port
+    // the running application is being reached on.
+    #[test]
+    fn sharing_and_restarting_leave_every_port_where_it_was() {
+        let Some((fx, name, guards, report)) = shared_fixture() else {
+            return;
+        };
+        let mut config = fx.config.clone();
+        config.share.auth_cmd = Some("printf 'session=abc'".to_string());
+        share(&fx.paths, &config, &name, &noop).unwrap();
+        let _share = share_guard(&fx, &name);
+
+        assert_eq!(
+            fx.state().worktrees[&name].ports,
+            report.ports,
+            "a share must not touch the application's ports"
+        );
+
+        drop(guards);
+        stop(&fx.paths, &name, None).unwrap();
+        let again = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+        let _again = guard(&again);
+        assert_eq!(
+            again.ports, report.ports,
+            "and neither must the start after it"
+        );
+        assert!(!again.reassigned);
     }
 
     // ---- restart ---------------------------------------------------------

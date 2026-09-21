@@ -334,7 +334,10 @@ fn tail_log(path: &Path) -> String {
 mod tests {
     use super::*;
     use crate::project::ProjectRef;
-    use crate::testutil::wait_until;
+    use crate::testutil::{
+        FAKE_TUNNEL_URL, fake_cloudflared_failing, fake_cloudflared_publishing,
+        fake_cloudflared_silent, wait_until,
+    };
     use chrono::Utc;
     use std::sync::Mutex;
     use tempfile::{TempDir, tempdir};
@@ -354,32 +357,6 @@ mod tests {
         );
         Fx { paths, _dir: dir }
     }
-
-    /// Writes a fake cloudflared at `<home>/bin/cloudflared`, the same hook
-    /// a developer would use for a real shim.
-    fn fake_cloudflared(paths: &PandoPaths, body: &str) {
-        let bin = paths.home.join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        let path = bin.join(DEFAULT_PROVIDER);
-        std::fs::write(&path, body).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-
-    /// Prints the URL in the format cloudflared really uses, then stays
-    /// alive as a tunnel does. `exec` so the pid pando records is the one
-    /// that has to be killed.
-    const FAKE_PUBLISHES: &str = "#!/bin/sh\n\
-         echo \"$(date -u +%Y-%m-%dT%H:%M:%SZ) INF Requesting new quick Tunnel...\"\n\
-         echo \"INF +--------------------------------------------------------+\"\n\
-         echo \"INF |  https://fake-tunnel-for-tests.trycloudflare.com        |\"\n\
-         echo \"INF +--------------------------------------------------------+\"\n\
-         exec sleep 300\n";
-
-    const FAKE_SILENT: &str =
-        "#!/bin/sh\necho 'INF Requesting new quick Tunnel...'\nexec sleep 300\n";
-
-    const FAKE_EXITS: &str = "#!/bin/sh\necho 'ERR failed to request quick Tunnel'\nexit 7\n";
 
     fn share_record(tunnel_pgid: i32, proxy_pgid: Option<i32>) -> ShareRecord {
         ShareRecord {
@@ -501,13 +478,10 @@ mod tests {
     #[test]
     fn a_tunnel_publishes_its_url_and_is_stoppable() {
         let fx = fixture();
-        fake_cloudflared(&fx.paths, FAKE_PUBLISHES);
+        fake_cloudflared_publishing(&fx.paths.home);
 
         let spawn = start_tunnel(&fx.paths, "feat+one", 17000).unwrap();
-        assert_eq!(
-            spawn.public_url,
-            "https://fake-tunnel-for-tests.trycloudflare.com"
-        );
+        assert_eq!(spawn.public_url, FAKE_TUNNEL_URL);
         assert_eq!(spawn.log_path, fx.paths.log_file("feat+one", TUNNEL_LOG));
         assert!(process::is_alive(spawn.pid), "the tunnel must still be up");
 
@@ -520,7 +494,7 @@ mod tests {
     #[test]
     fn the_log_written_is_the_worktrees_own_tunnel_log() {
         let fx = fixture();
-        fake_cloudflared(&fx.paths, FAKE_PUBLISHES);
+        fake_cloudflared_publishing(&fx.paths.home);
         let spawn = start_tunnel(&fx.paths, "feat+one", 17000).unwrap();
         let _ = process::stop(spawn.pgid, STOP_GRACE);
 
@@ -539,7 +513,7 @@ mod tests {
     #[test]
     fn a_provider_that_never_publishes_fails_with_the_log_tail() {
         let fx = fixture();
-        fake_cloudflared(&fx.paths, FAKE_SILENT);
+        fake_cloudflared_silent(&fx.paths.home);
         let log = fx.paths.log_file("feat+one", TUNNEL_LOG);
         truncate_log(&log).unwrap();
 
@@ -575,11 +549,11 @@ mod tests {
     #[test]
     fn a_provider_that_exits_before_publishing_fails_with_the_log_tail() {
         let fx = fixture();
-        fake_cloudflared(&fx.paths, FAKE_EXITS);
+        fake_cloudflared_failing(&fx.paths.home);
         let err = start_tunnel(&fx.paths, "feat+one", 17000).unwrap_err();
         let message = format!("{err:#}");
         assert!(message.contains("exited before publishing"), "{message}");
-        assert!(message.contains("failed to request"), "{message}");
+        assert!(message.contains("Too Many Requests"), "{message}");
     }
 
     #[test]
@@ -626,6 +600,29 @@ mod tests {
         assert_eq!(signalled.into_inner().unwrap(), vec![4242]);
     }
 
+    // The `--config` is the whole reason a quick tunnel answers at all on a
+    // machine whose owner already runs a named tunnel with catch-all
+    // ingress rules.
+    #[test]
+    fn the_tunnel_shadows_the_user_config_and_targets_the_port_it_was_given() {
+        let fx = fixture();
+        fake_cloudflared_publishing(&fx.paths.home);
+        let spawn = start_tunnel(&fx.paths, "feat+one", 17042).unwrap();
+        let _ = process::stop(spawn.pgid, STOP_GRACE);
+
+        let log = std::fs::read_to_string(&spawn.log_path).unwrap();
+        assert!(log.contains("--url http://127.0.0.1:17042"), "{log}");
+        assert!(
+            log.contains(&format!(
+                "--config {}",
+                fx.paths.tunnel_config_file().display()
+            )),
+            "the user's own ~/.cloudflared/config.yml must be shadowed: {log}"
+        );
+        assert!(log.contains("--no-autoupdate"), "{log}");
+        assert!(log.contains("--output default"), "{log}");
+    }
+
     #[test]
     fn the_program_is_the_home_shim_when_there_is_one() {
         let fx = fixture();
@@ -634,7 +631,7 @@ mod tests {
             PathBuf::from(DEFAULT_PROVIDER),
             "with no shim, whatever the shell would run"
         );
-        fake_cloudflared(&fx.paths, FAKE_PUBLISHES);
+        fake_cloudflared_publishing(&fx.paths.home);
         assert_eq!(
             cloudflared_program(&fx.paths),
             fx.paths.home.join("bin").join(DEFAULT_PROVIDER)
@@ -669,7 +666,7 @@ mod tests {
         assert!(!program_is_runnable(&shim), "a file is not a program");
         assert!(ensure_runnable(&shim, &shim).is_err());
 
-        fake_cloudflared(&fx.paths, FAKE_PUBLISHES);
+        fake_cloudflared_publishing(&fx.paths.home);
         Cloudflared.ensure_present(&fx.paths).unwrap();
     }
 

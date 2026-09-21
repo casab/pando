@@ -295,7 +295,16 @@ pub fn assign_with(
         .worktrees
         .iter()
         .filter(|(other, _)| other.as_str() != name)
-        .flat_map(|(_, record)| record.ports.values().copied())
+        .flat_map(|(_, record)| {
+            record
+                .ports
+                .values()
+                .copied()
+                // A share proxy's port is owned as firmly as any role's:
+                // it is not in `ports` only because it must not make this
+                // worktree's window look as though its roles had changed.
+                .chain(record.share_port)
+        })
         .collect();
 
     let record = store
@@ -325,9 +334,10 @@ pub fn assign_with(
     }
 
     let previous = record.ports.clone();
+    let own_share_port = record.share_port;
     let base = derive_base(paths.project_id(), name);
     let window = reserve(base, roles.len(), |port| {
-        is_free(port) && !taken_by_others.contains(&port)
+        is_free(port) && !taken_by_others.contains(&port) && own_share_port != Some(port)
     })
     .with_context(|| {
         format!(
@@ -348,6 +358,76 @@ pub fn assign_with(
         .any(|(role, port)| previous.get(role).is_some_and(|had| had != port));
     record.ports = ports.clone();
     Ok(Assignment { ports, reassigned })
+}
+
+/// Reserves the port a worktree's share proxy listens on, leaving every
+/// port its processes already hold exactly where it is.
+///
+/// Additive on purpose. [`assign_with`] reuses a worktree's window only
+/// when the recorded roles are exactly the ones being asked for, so folding
+/// `share` into the role set would make the next start decide the window
+/// had changed and move every port — including the one a running
+/// application is being reached on. A share must never do that.
+///
+/// The port is remembered on the record, so share → unshare → share gives
+/// the same number. It is looked for inside the worktree's own eight-port
+/// window first, past the roles it already uses, and only walks the base
+/// grid when that window is full.
+pub fn assign_share_port(
+    paths: &crate::paths::PandoPaths,
+    store: &mut crate::state::State,
+    name: &str,
+) -> anyhow::Result<u16> {
+    assign_share_port_with(paths, store, name, is_port_free)
+}
+
+/// [`assign_share_port`] with the host probe injected, for tests.
+pub fn assign_share_port_with(
+    paths: &crate::paths::PandoPaths,
+    store: &mut crate::state::State,
+    name: &str,
+    is_free: impl Fn(u16) -> bool,
+) -> anyhow::Result<u16> {
+    use anyhow::Context as _;
+    use std::collections::HashSet;
+
+    let mut taken: HashSet<u16> = store
+        .worktrees
+        .iter()
+        .filter(|(other, _)| other.as_str() != name)
+        .flat_map(|(_, record)| record.ports.values().copied().chain(record.share_port))
+        .collect();
+    let record = store
+        .worktrees
+        .get_mut(name)
+        .with_context(|| format!("no state record for {name}"))?;
+    // This worktree's own roles are taken too: the proxy sits beside the
+    // application, not on top of it.
+    taken.extend(record.ports.values().copied());
+
+    if let Some(port) = record.share_port
+        && is_free(port)
+        && !taken.contains(&port)
+    {
+        return Ok(port);
+    }
+
+    let base = derive_base(paths.project_id(), name);
+    let used = record.ports.len() as u16;
+    let found = (used..BASE_STEP)
+        .map(|offset| base.saturating_add(offset))
+        .find(|port| *port <= PORT_MAX && is_free(*port) && !taken.contains(port))
+        .or_else(|| {
+            // The worktree's own window is full, so take a whole base of
+            // somebody else's grid rather than fail the share.
+            reserve(base, 1, |port| is_free(port) && !taken.contains(&port))
+                .and_then(|window| window.first().copied())
+        })
+        .with_context(|| {
+            format!("no free port for {name}'s share proxy in {PORT_MIN}..={PORT_MAX}")
+        })?;
+    record.share_port = Some(found);
+    Ok(found)
 }
 
 #[cfg(test)]
@@ -597,6 +677,135 @@ mod tests {
     /// come back is about pando's own rules and not about the machine.
     fn all_free(_: u16) -> bool {
         true
+    }
+
+    #[test]
+    fn a_share_port_is_reserved_beside_the_roles_and_reused() {
+        let (_dir, paths) = assign_fixture();
+        let mut store = crate::state::State::new();
+        with_record(&mut store, "feat+one");
+        let assigned = assign_with(
+            &paths,
+            &mut store,
+            "feat+one",
+            &roles(&["web", "api"]),
+            &[],
+            all_free,
+        )
+        .unwrap();
+
+        let share = assign_share_port_with(&paths, &mut store, "feat+one", all_free).unwrap();
+        assert!(
+            !assigned.ports.values().any(|p| *p == share),
+            "the proxy must not sit on a role's port: {share} in {assigned:?}"
+        );
+        assert_eq!(
+            store.worktrees["feat+one"].share_port,
+            Some(share),
+            "recorded, so the number survives an unshare"
+        );
+        assert_eq!(
+            assign_share_port_with(&paths, &mut store, "feat+one", all_free).unwrap(),
+            share,
+            "a second share gets the same port"
+        );
+    }
+
+    // The Phase 3 critical, inverted. Adding a role to the set re-derives
+    // the whole window; the share port is kept out of `ports` precisely so
+    // that sharing a running worktree cannot move the ports its application
+    // is being reached on.
+    #[test]
+    fn taking_a_share_port_leaves_every_other_port_exactly_where_it_was() {
+        let (_dir, paths) = assign_fixture();
+        let mut store = crate::state::State::new();
+        with_record(&mut store, "feat+one");
+        let before = assign_with(
+            &paths,
+            &mut store,
+            "feat+one",
+            &roles(&["web", "api"]),
+            &[],
+            all_free,
+        )
+        .unwrap();
+
+        assign_share_port_with(&paths, &mut store, "feat+one", all_free).unwrap();
+
+        assert_eq!(store.worktrees["feat+one"].ports, before.ports);
+        let after = assign_with(
+            &paths,
+            &mut store,
+            "feat+one",
+            &roles(&["web", "api"]),
+            &[],
+            all_free,
+        )
+        .unwrap();
+        assert_eq!(
+            after.ports, before.ports,
+            "a start after a share must not move a port"
+        );
+        assert!(!after.reassigned, "and must not claim it did");
+    }
+
+    #[test]
+    fn a_share_port_is_never_a_port_another_worktree_owns() {
+        let (_dir, paths) = assign_fixture();
+        let mut store = crate::state::State::new();
+        with_record(&mut store, "feat+one");
+        with_record(&mut store, "feat+two");
+        let one = assign_share_port_with(&paths, &mut store, "feat+one", all_free).unwrap();
+
+        // Neighbour's roles must avoid it…
+        let two = assign_with(
+            &paths,
+            &mut store,
+            "feat+two",
+            &roles(&["web", "api", "db", "cache"]),
+            &[],
+            // Everything free on the host, so only pando's own bookkeeping
+            // can keep the two apart.
+            all_free,
+        )
+        .unwrap();
+        assert!(
+            !two.ports.values().any(|p| *p == one),
+            "another worktree took the share port {one}: {two:?}"
+        );
+
+        // …and so must its own share port.
+        let two_share = assign_share_port_with(&paths, &mut store, "feat+two", all_free).unwrap();
+        assert_ne!(two_share, one);
+    }
+
+    #[test]
+    fn a_share_port_that_something_else_has_taken_moves() {
+        let (_dir, paths) = assign_fixture();
+        let mut store = crate::state::State::new();
+        with_record(&mut store, "feat+one");
+        let first = assign_share_port_with(&paths, &mut store, "feat+one", all_free).unwrap();
+
+        let moved =
+            assign_share_port_with(&paths, &mut store, "feat+one", |port| port != first).unwrap();
+        assert_ne!(moved, first);
+        assert_eq!(store.worktrees["feat+one"].share_port, Some(moved));
+    }
+
+    #[test]
+    fn a_share_port_stays_inside_the_range() {
+        let (_dir, paths) = assign_fixture();
+        let mut store = crate::state::State::new();
+        with_record(&mut store, "feat+one");
+        let port = assign_share_port_with(&paths, &mut store, "feat+one", all_free).unwrap();
+        assert!((PORT_MIN..=PORT_MAX).contains(&port), "{port}");
+    }
+
+    #[test]
+    fn a_worktree_with_no_record_cannot_take_a_share_port() {
+        let (_dir, paths) = assign_fixture();
+        let mut store = crate::state::State::new();
+        assert!(assign_share_port_with(&paths, &mut store, "nope", all_free).is_err());
     }
 
     #[test]

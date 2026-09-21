@@ -132,6 +132,62 @@ pub fn ipv6_loopback_available() -> bool {
     std::net::TcpListener::bind(("::1", 0)).is_ok()
 }
 
+/// The quick-tunnel URL the fake provider publishes.
+pub const FAKE_TUNNEL_URL: &str = "https://fake-tunnel-for-tests.trycloudflare.com";
+
+/// Installs a fake `cloudflared` at `<home>/bin/cloudflared`.
+///
+/// The same hook a developer would use for a real shim, so no test has to
+/// put anything on PATH: `std::env::set_var` is unsafe in this edition and
+/// racy across parallel tests, and a child's `PATH` is not reliably what
+/// program lookup uses.
+///
+/// Every fake echoes its own arguments first, so a test can assert what
+/// pando asked the provider for — which port it tunnelled, and that it
+/// shadowed the user's config.
+pub fn fake_cloudflared(home: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = home.join("bin");
+    std::fs::create_dir_all(&bin).expect("create the shim directory");
+    let path = bin.join("cloudflared");
+    std::fs::write(&path, format!("#!/bin/sh\necho \"ARGS: $*\"\n{body}"))
+        .expect("write the fake cloudflared");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("make the fake cloudflared executable");
+}
+
+/// A fake that publishes a URL in cloudflared's own bordered format and
+/// then stays up, as a tunnel does. `exec` so the pid pando records is the
+/// one that has to be killed.
+pub fn fake_cloudflared_publishing(home: &Path) {
+    fake_cloudflared(
+        home,
+        &format!(
+            "echo 'INF Requesting new quick Tunnel on trycloudflare.com...'\n\
+             echo 'INF +----------------------------------------------------+'\n\
+             echo 'INF |  {FAKE_TUNNEL_URL}  |'\n\
+             echo 'INF +----------------------------------------------------+'\n\
+             exec sleep 300\n"
+        ),
+    );
+}
+
+/// A fake that starts, says so, and never publishes anything.
+pub fn fake_cloudflared_silent(home: &Path) {
+    fake_cloudflared(
+        home,
+        "echo 'INF Requesting new quick Tunnel on trycloudflare.com...'\nexec sleep 300\n",
+    );
+}
+
+/// A fake that fails the way a rate-limited cloudflared does.
+pub fn fake_cloudflared_failing(home: &Path) {
+    fake_cloudflared(
+        home,
+        "echo 'ERR failed to request quick Tunnel: 429 Too Many Requests' >&2\nexit 1\n",
+    );
+}
+
 /// Polls `ready` until it is true or the deadline passes. Returns whether it
 /// became true. Fixed sleeps make process tests flaky on a loaded machine;
 /// this makes them fast when the machine is idle and patient when it is not.

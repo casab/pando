@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, killpg};
 use nix::sys::wait::{WaitPidFlag, waitpid};
@@ -104,6 +104,117 @@ pub fn group_alive(pgid: i32) -> bool {
         Err(Errno::EPERM) => true,
         Err(_) => false,
     }
+}
+
+/// What a captured command printed, and how it ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Captured {
+    pub code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl Captured {
+    pub fn success(&self) -> bool {
+        self.code == Some(0)
+    }
+
+    /// The last non-empty line of stderr — what a failing script actually
+    /// complained about, without the build noise above it.
+    pub fn last_stderr_line(&self) -> Option<&str> {
+        self.stderr
+            .lines()
+            .map(str::trim)
+            .rev()
+            .find(|l| !l.is_empty())
+    }
+}
+
+/// Runs a shell command to completion with its output captured and a hard
+/// deadline.
+///
+/// Two differences from `Command::output()`, both of which matter for a
+/// command a project supplied:
+///
+/// - **It leads its own process group.** A command that times out is killed
+///   with everything it started, not just the shell that started them.
+/// - **It cannot hang forever.** A script that waits on something that
+///   never comes would otherwise block whatever asked for its answer, and
+///   in the TUI that is a slot nothing can clear.
+///
+/// The pipes are drained on their own threads, so a command that prints
+/// more than a pipe buffer holds does not deadlock against the wait.
+pub fn run_captured(
+    shell_cmd: &str,
+    cwd: &Path,
+    env: &[(String, String)],
+    timeout: Duration,
+) -> Result<Captured> {
+    let mut command = Command::new("bash");
+    command
+        .arg("-lc")
+        .arg(shell_cmd)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    unsafe {
+        command.pre_exec(|| {
+            nix::unistd::setsid()
+                .map(|_| ())
+                .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
+        });
+    }
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("run {shell_cmd:?}"))?;
+    // After `setsid` the child leads a group whose id is its pid.
+    let pgid = child.id() as i32;
+
+    let mut out_pipe = child.stdout.take();
+    let mut err_pipe = child.stderr.take();
+    let out_reader = std::thread::spawn(move || drain(out_pipe.as_mut()));
+    let err_reader = std::thread::spawn(move || drain(err_pipe.as_mut()));
+
+    let deadline = Instant::now() + timeout;
+    let code = loop {
+        match child.try_wait().context("wait for the command")? {
+            Some(status) => break status.code(),
+            None if Instant::now() >= deadline => {
+                // The group, not the child: the shell may have started
+                // something that is the actual reason this is still here.
+                let _ = stop(pgid, Duration::from_secs(1));
+                let _ = child.wait();
+                let stderr = err_reader.join().unwrap_or_default();
+                bail!(
+                    "{shell_cmd:?} was still running after {}s{}",
+                    timeout.as_secs(),
+                    match stderr.lines().map(str::trim).rev().find(|l| !l.is_empty()) {
+                        Some(line) => format!(" — its last output was: {line}"),
+                        None => String::new(),
+                    }
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    Ok(Captured {
+        code,
+        stdout: out_reader.join().unwrap_or_default(),
+        stderr: err_reader.join().unwrap_or_default(),
+    })
+}
+
+fn drain(pipe: Option<&mut impl std::io::Read>) -> String {
+    let Some(pipe) = pipe else {
+        return String::new();
+    };
+    let mut buf = Vec::new();
+    let _ = pipe.read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 /// Single-quotes one word of a `bash -lc` command line, with any single
