@@ -1736,7 +1736,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 /// A shell that runs what a spawn runs: `bash -lc`, in the main checkout.
 /// Its output is captured rather than inherited, so nothing here can paint
 /// over the TUI, and `run_captured` bounds the wait as well as the drain.
-fn runtime_shell(cwd: &Path) -> impl Fn(&str) -> Option<String> {
+pub fn runtime_shell(cwd: &Path) -> impl Fn(&str) -> Option<String> {
     move |command: &str| {
         let captured = proc::run_captured(command, cwd, &[], PROBE_TIMEOUT).ok()?;
         Some(format!("{}\n{}", captured.stdout, captured.stderr))
@@ -1747,7 +1747,7 @@ fn runtime_shell(cwd: &Path) -> impl Fn(&str) -> Option<String> {
 ///
 /// Not pando's home: `~/.pando` is where pando writes, `~/.nvm` is where
 /// nvm is.
-fn user_home() -> PathBuf {
+pub fn user_home() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/"))

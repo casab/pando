@@ -2313,3 +2313,35 @@ fn doctor_writes_nothing_and_does_not_create_a_home() {
     );
     assert_eq!(status_porcelain(&root), "");
 }
+
+#[test]
+fn doctor_reports_the_runtime_this_project_pins_and_where_it_says_so() {
+    let e = env_of(Kind::NextPnpmCompose);
+    let out = e.pando(&["doctor"]);
+    let text = stdout(&out);
+    assert!(text.lines().any(|l| l == "runtime"), "{text}");
+    // Read out of the repository, so this says the same thing on every
+    // machine — unlike what the shell resolves, which is the point of the
+    // section and is never asserted on here.
+    assert!(text.contains("wants 22 (.nvmrc)"), "{text}");
+    assert!(
+        text.contains("`bash -lc`"),
+        "and it names the shell pando really uses:\n{text}"
+    );
+}
+
+#[test]
+fn doctor_reports_the_docker_it_would_use_and_the_context_it_is_on() {
+    let e = env_of(Kind::NextPnpmCompose);
+    common::docker::install(&e.home);
+    let out = e.pando(&["doctor"]);
+    let text = stdout(&out);
+    assert!(text.lines().any(|l| l == "tools"), "{text}");
+    assert!(text.contains("Docker version 27.0.0-fake"), "{text}");
+    assert!(text.contains("context: fake-context"), "{text}");
+    assert!(text.contains("2.29.0-fake"), "compose too:\n{text}");
+    assert!(
+        text.contains(&e.home.join("bin").join("docker").display().to_string()),
+        "and the path it resolved from, which is the shim:\n{text}"
+    );
+}

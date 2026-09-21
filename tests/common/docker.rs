@@ -370,6 +370,18 @@ def do_down():
 
 
 record()
+# What `pando doctor` asks: a client version, a compose plugin version,
+# and the active context. None of them needs a daemon, and a real docker
+# answers all three whether or not one is running.
+if not WORDS and "--version" in ARGS:
+    print("Docker version 27.0.0-fake, build fake")
+    sys.exit(0)
+if WORDS[:2] == ["compose", "version"]:
+    print("2.29.0-fake")
+    sys.exit(0)
+if WORDS[:2] == ["context", "show"]:
+    print("fake-context")
+    sys.exit(0)
 if os.path.exists(os.path.join(ROOT, "daemon-down")):
     sys.stderr.write(
         "Cannot connect to the Docker daemon at unix:///var/run/docker.sock."

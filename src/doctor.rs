@@ -23,9 +23,12 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
 
+use crate::actions::Machine;
 use crate::config::{self, Config, ServiceConfig};
 use crate::paths::PandoPaths;
-use crate::{detect, ports, state, template};
+use crate::process as proc;
+use crate::runtime::{self, Verdict};
+use crate::{actions, detect, ports, services, state, template, tunnel};
 
 /// Exit 1, with nothing more to say.
 ///
@@ -53,6 +56,8 @@ impl std::error::Error for Unhealthy {}
 pub enum Section {
     Project,
     Config,
+    Runtime,
+    Tools,
 }
 
 impl Section {
@@ -60,11 +65,20 @@ impl Section {
         match self {
             Section::Project => "project",
             Section::Config => "config",
+            Section::Runtime => "runtime",
+            Section::Tools => "tools",
         }
     }
 
-    /// Every section, in print order.
-    const ALL: [Section; 2] = [Section::Project, Section::Config];
+    /// Every section, in print order. Runtime is high, deliberately: a
+    /// process started under the wrong toolchain dies of it, and what the
+    /// shell pando uses resolves is the least guessable thing here.
+    const ALL: [Section; 4] = [
+        Section::Project,
+        Section::Config,
+        Section::Runtime,
+        Section::Tools,
+    ];
 }
 
 /// How much a finding matters, and nothing finer.
@@ -122,6 +136,8 @@ impl Finding {
 pub struct Report {
     pub project: ProjectReport,
     pub config: ConfigReport,
+    pub runtime: RuntimeReport,
+    pub tools: Vec<ToolReport>,
     pub findings: Vec<Finding>,
 }
 
@@ -183,6 +199,70 @@ pub struct KeyReport {
     pub ignored: bool,
 }
 
+/// What the project asks of a toolchain, what this machine answers, and
+/// the line that would reconcile the two.
+///
+/// The section the original plan predates, and the one that pays for
+/// itself: pando spawns everything with `bash -lc`, which is not the
+/// developer's interactive shell, so a manager initialised in `.zshrc` is
+/// invisible here while everything works when they type it by hand. Naming
+/// the absolute path the binary resolved from is what makes that
+/// diagnosable at all.
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeReport {
+    /// `null` when nobody has answered the prelude question, `""` when
+    /// somebody answered "this machine needs nothing".
+    pub prelude: Option<String>,
+    /// The file the prelude came from, highest precedence first.
+    pub prelude_from: Option<String>,
+    /// One per language the repository pins that pando can probe.
+    pub languages: Vec<LanguageReport>,
+    /// Every requirement the repository states, probed or not:
+    /// `engines.pnpm` is a fact about the project with no language entry
+    /// behind it.
+    pub requirements: Vec<runtime::Requirement>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LanguageReport {
+    pub language: String,
+    /// Exactly as the project wrote it: `22`, `>=18 <21`, `lts/*`.
+    pub spec: String,
+    /// The file it came from.
+    pub source: String,
+    /// What the version that resolved reported, when one did.
+    pub resolved: Option<String>,
+    /// **The absolute path it resolved from.** The line that turns "node
+    /// 24" into a diagnosis.
+    pub resolved_from: Option<String>,
+    /// `satisfied`, `mismatch`, or `unknown`.
+    pub verdict: &'static str,
+    /// Why the probe never got as far as asking, when it did not.
+    pub failure: Option<String>,
+    /// The version managers for this language that this machine has.
+    pub managers: Vec<&'static str>,
+    /// The prelude lines that would fix a mismatch, one per installed
+    /// manager. Printed, never run.
+    pub fixes: Vec<String>,
+}
+
+/// One executable pando runs, as the shell pando runs it in resolves it.
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolReport {
+    /// `git`, `docker`, `docker compose`, `pnpm`.
+    pub name: String,
+    /// The absolute path `command -v` printed, `null` when nothing did.
+    pub path: Option<String>,
+    /// The first line of what it printed when asked its version.
+    pub version: Option<String>,
+    /// Anything else worth one line about it: which docker context is
+    /// active, for instance.
+    pub detail: Option<String>,
+    /// Why pando looked for it.
+    pub needed_for: String,
+    pub found: bool,
+}
+
 impl Report {
     /// Whether nothing found will break a command. The exit code, and the
     /// only thing that decides it.
@@ -212,6 +292,8 @@ impl Report {
             match section {
                 Section::Project => render_project(&mut out, &self.project),
                 Section::Config => render_config(&mut out, &self.config),
+                Section::Runtime => render_runtime(&mut out, &self.runtime),
+                Section::Tools => render_tools(&mut out, &self.tools),
             }
             for finding in self.of(section) {
                 render_finding(&mut out, finding);
@@ -229,8 +311,19 @@ fn render_finding(out: &mut String, finding: &Finding) {
         Severity::Note => '-',
     };
     let _ = writeln!(out, "  {mark} {}", finding.message);
-    if let Some(fix) = &finding.fix {
-        let _ = writeln!(out, "      fix: {fix}");
+    let Some(fix) = &finding.fix else { return };
+    // A fix can be several lines — the prelude candidates for a runtime
+    // mismatch are one line each — and each of them is a line a developer
+    // may want to copy, so none of them is folded into the one above.
+    for (index, line) in fix.lines().enumerate() {
+        match index {
+            0 => {
+                let _ = writeln!(out, "      fix: {line}");
+            }
+            _ => {
+                let _ = writeln!(out, "           {line}");
+            }
+        }
     }
 }
 
@@ -325,6 +418,97 @@ fn render_config(out: &mut String, config: &ConfigReport) {
     }
 }
 
+fn render_runtime(out: &mut String, runtime: &RuntimeReport) {
+    row(
+        out,
+        "prelude",
+        &match (&runtime.prelude, &runtime.prelude_from) {
+            (None, _) => "nobody has answered that question yet".to_string(),
+            (Some(line), _) if line.trim().is_empty() => {
+                "\"\" — answered: this machine needs nothing in front of a command".to_string()
+            }
+            (Some(line), Some(from)) => format!("{line}  (from {from})"),
+            (Some(line), None) => line.clone(),
+        },
+    );
+    if runtime.languages.is_empty() && runtime.requirements.is_empty() {
+        row(out, "pinned", "nothing — this repository states no runtime");
+        return;
+    }
+    for language in &runtime.languages {
+        row(
+            out,
+            &language.language,
+            &format!("wants {} ({})", language.spec, language.source),
+        );
+        let has = match (&language.resolved, &language.resolved_from) {
+            (Some(version), Some(path)) => {
+                format!("`bash -lc` resolves {version}, from {path}")
+            }
+            (Some(version), None) => format!("`bash -lc` resolves {version}"),
+            _ => match &language.failure {
+                Some(failure) => format!("the probe never ran: {failure}"),
+                None => format!("`bash -lc` here has no {} at all", language.language),
+            },
+        };
+        row(out, "", &has);
+        row(
+            out,
+            "",
+            &match language.managers.as_slice() {
+                [] => "no version manager pando knows about is installed for it".to_string(),
+                managers => format!("version managers here: {}", managers.join(", ")),
+            },
+        );
+    }
+    // A requirement with no language entry behind it is still a fact the
+    // repository states, and an agent reading this should see it.
+    for requirement in &runtime.requirements {
+        if runtime
+            .languages
+            .iter()
+            .any(|l| l.language == requirement.language)
+        {
+            continue;
+        }
+        row(
+            out,
+            &requirement.language,
+            &format!(
+                "wants {} ({}) — nothing here probes it",
+                requirement.spec, requirement.source
+            ),
+        );
+    }
+}
+
+fn render_tools(out: &mut String, tools: &[ToolReport]) {
+    if tools.is_empty() {
+        row(out, "", "nothing to look for");
+        return;
+    }
+    // Two spaces past the longest name, so `docker compose` does not run
+    // into its own version number.
+    let width = tools
+        .iter()
+        .map(|t| t.name.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(12)
+        + 2;
+    for tool in tools {
+        let mut text = match (&tool.version, &tool.path) {
+            (Some(version), Some(path)) => format!("{version}  ({path})"),
+            (None, Some(path)) => format!("found, and said nothing  ({path})"),
+            _ => format!("not found — {}", tool.needed_for),
+        };
+        if let Some(detail) = &tool.detail {
+            text.push_str(&format!("  {detail}"));
+        }
+        let _ = writeln!(out, "  {:<width$}{text}", tool.name);
+    }
+}
+
 /// A key row's left-hand side: `key = value`, or a bare table header.
 fn lhs(key: &KeyReport) -> String {
     let ignored = if key.ignored { "  (ignored)" } else { "" };
@@ -338,7 +522,23 @@ fn lhs(key: &KeyReport) -> String {
 
 /// Everything doctor has to say about this project, gathered without
 /// writing anything anywhere.
+///
+/// The shell is the one a real spawn uses — `bash -lc`, in the main
+/// checkout — built here the way `actions::resolve_silencing` builds it,
+/// so what doctor reports about this machine is what the start path would
+/// have found.
 pub fn run(paths: &PandoPaths) -> Report {
+    let shell = actions::runtime_shell(paths.root());
+    let machine = Machine {
+        shell: &shell,
+        home: actions::user_home(),
+    };
+    run_on(paths, &machine)
+}
+
+/// [`run`] with the machine injected, so a test can report on a laptop it
+/// does not have.
+pub fn run_on(paths: &PandoPaths, machine: &Machine<'_>) -> Report {
     let mut findings: Vec<Finding> = Vec::new();
 
     // Its own load, not the one `main` did: `main` hands every command the
@@ -357,11 +557,168 @@ pub fn run(paths: &PandoPaths) -> Report {
     let config_report = config_report(paths, error, warnings, &mut findings);
     validate_config(paths, &config, &mut findings);
     let project = project_report(paths, &config, &mut findings);
+    let runtime = runtime_report(paths, &config, machine, &mut findings);
+    let tools = tools_report(paths, &config, machine, &mut findings);
 
     Report {
         project,
         config: config_report,
+        runtime,
+        tools,
         findings,
+    }
+}
+
+// ---- runtime --------------------------------------------------------------
+
+fn runtime_report(
+    paths: &PandoPaths,
+    config: &Config,
+    machine: &Machine<'_>,
+    findings: &mut Vec<Finding>,
+) -> RuntimeReport {
+    let prelude = config.runtime.prelude.clone();
+    let effective = prelude.clone().unwrap_or_default();
+    let effective = effective.trim();
+    let prelude_from = config::prelude_origin(paths).map(|p| p.display().to_string());
+    let requirements = runtime::requirements(paths.root());
+
+    let mut languages = Vec::new();
+    for entry in &runtime::LANGUAGES {
+        let Some(requirement) = runtime::for_language(&requirements, entry.name) else {
+            continue;
+        };
+        // `runtime::check`, never `actions`' own first-mismatch walk: that
+        // one remembers what passed, and doctor writes nothing. It also
+        // stops at the first language, and a report that named one of two
+        // problems would be the kind of report this command exists to
+        // replace.
+        let check = runtime::check(requirement, effective, machine.shell);
+        let managers: Vec<&'static str> = runtime::installed(entry, &machine.home)
+            .into_iter()
+            .map(|manager| manager.name)
+            .collect();
+        let fixes: Vec<String> = runtime::fixes(
+            entry,
+            &machine.home,
+            runtime::from_version_file(entry, requirement),
+        )
+        .into_iter()
+        .map(|fix| format!("{}  ({})", fix.line, fix.why))
+        .collect();
+        let report = LanguageReport {
+            language: requirement.language.clone(),
+            spec: requirement.spec.clone(),
+            source: requirement.source.clone(),
+            resolved: check.resolved.version.clone(),
+            resolved_from: check.resolved.path.clone(),
+            verdict: match check.verdict {
+                Verdict::Satisfied => "satisfied",
+                Verdict::Mismatch => "mismatch",
+                Verdict::Unknown => "unknown",
+            },
+            failure: match check.resolved.ran {
+                true => None,
+                false => Some(
+                    check
+                        .resolved
+                        .failure
+                        .clone()
+                        .unwrap_or_else(|| "no output".to_string()),
+                ),
+            },
+            managers,
+            fixes,
+        };
+        if check.verdict == Verdict::Mismatch {
+            findings.push(mismatch_finding(&report, prelude.as_deref(), &prelude_from));
+        }
+        languages.push(report);
+    }
+    RuntimeReport {
+        prelude,
+        prelude_from,
+        languages,
+        requirements,
+    }
+}
+
+/// A mismatch, at the severity the three outcomes in the plan give it.
+///
+/// With no prelude set it is a **note**: nobody has been asked yet, and
+/// the next `start` asks — exit 3 with the question, which is designed
+/// behaviour rather than a break. With one set, empty included, it is a
+/// **problem**: somebody has said how this machine resolves the runtime,
+/// and it does not, so the next start spawns a process that dies of it.
+fn mismatch_finding(
+    language: &LanguageReport,
+    prelude: Option<&str>,
+    prelude_from: &Option<String>,
+) -> Finding {
+    let wanted = format!(
+        "{} {} ({})",
+        language.language, language.spec, language.source
+    );
+    let got = match (&language.resolved, &language.resolved_from) {
+        (Some(version), Some(path)) => format!("`bash -lc` here resolves {version}, from {path}"),
+        _ => match &language.failure {
+            Some(failure) => format!("the prelude never got as far as asking: {failure}"),
+            None => format!("`bash -lc` here has no {} at all", language.language),
+        },
+    };
+    let mut fix = String::new();
+    let _ = writeln!(
+        fix,
+        "pando runs every command with `bash -lc`, which is not your interactive shell"
+    );
+    match language.fixes.as_slice() {
+        [] => {
+            let _ = writeln!(
+                fix,
+                "no version manager pando knows about is installed for {} — install one, or \
+                 put the right binary on the PATH a login bash shell has",
+                language.language
+            );
+        }
+        fixes => {
+            let _ = writeln!(fix, "set [runtime].prelude to one of:");
+            for line in fixes {
+                let _ = writeln!(fix, "  {line}");
+            }
+        }
+    }
+    match prelude {
+        None => Finding {
+            section: Section::Runtime,
+            severity: Severity::Note,
+            message: format!(
+                "this project asks for {wanted}, and {got} — nobody has answered the prelude \
+                 question, so the next `start` will ask"
+            ),
+            fix: Some(fix.trim_end().to_string()),
+        },
+        Some(line) if line.trim().is_empty() => Finding {
+            section: Section::Runtime,
+            severity: Severity::Problem,
+            message: format!(
+                "this project asks for {wanted}, and {got} — `[runtime].prelude` is set to \"\", \
+                 which says this machine needs nothing in front of a command"
+            ),
+            fix: Some(fix.trim_end().to_string()),
+        },
+        Some(line) => Finding {
+            section: Section::Runtime,
+            severity: Severity::Problem,
+            message: format!(
+                "this project asks for {wanted}, and {got} — the prelude {line:?}{} is not \
+                 working",
+                match prelude_from {
+                    Some(from) => format!(" in {from}"),
+                    None => String::new(),
+                }
+            ),
+            fix: Some(fix.trim_end().to_string()),
+        },
     }
 }
 
@@ -560,6 +917,360 @@ fn value_repr(value: &toml_edit::Value) -> String {
 fn comment(suffix: Option<&str>) -> Option<String> {
     let text = suffix?.trim();
     (!text.is_empty()).then(|| text.to_string())
+}
+
+// ---- tools ----------------------------------------------------------------
+
+const TOOL_PATH_MARK: &str = "pando-tool-path:";
+const TOOL_VERSION_MARK: &str = "pando-tool-version:";
+const TOOL_DETAIL_MARK: &str = "pando-tool-detail:";
+const TOOL_DONE_MARK: &str = "pando-tool-ok";
+
+/// One executable to look for, and what to ask it.
+struct ToolProbe {
+    name: String,
+    program: String,
+    /// What to pass it for a version. Static, and pando's own: nothing a
+    /// project wrote reaches a command line here.
+    args: &'static str,
+    /// A second question worth one line, such as which docker context is
+    /// active.
+    detail_args: Option<&'static str>,
+    /// How the detail is introduced when there is one.
+    detail_label: &'static str,
+    needed_for: String,
+    /// What to say when it is not there. `None` means a line and nothing
+    /// more — a tool this project has not asked pando to run.
+    missing: Option<(Severity, String)>,
+}
+
+#[derive(Default)]
+struct ToolFound {
+    path: Option<String>,
+    version: Option<String>,
+    detail: Option<String>,
+}
+
+fn tools_report(
+    paths: &PandoPaths,
+    config: &Config,
+    machine: &Machine<'_>,
+    findings: &mut Vec<Finding>,
+) -> Vec<ToolReport> {
+    let probes = tool_probes(paths, config);
+    // Run behind the prelude, because every command pando runs is run
+    // behind it: a package manager that only exists after `nvm use` is
+    // there for a real spawn and would read as missing here.
+    let prelude = config.runtime.prelude.clone().unwrap_or_default();
+    let (found, failure) = probe_tools(machine.shell, &probes, prelude.trim());
+    if let Some(failure) = &failure {
+        findings.push(Finding::note(
+            Section::Tools,
+            format!("pando could not ask this shell what it has: {failure}"),
+        ));
+    }
+    let mut out = Vec::new();
+    for (index, probe) in probes.iter().enumerate() {
+        let entry = found.get(&index);
+        let present = entry.is_some_and(|f| f.path.is_some());
+        // Only when the probe itself ran: "not found" is a claim about
+        // this machine, and a shell that never answered has not made it.
+        if !present
+            && failure.is_none()
+            && let Some((severity, reason)) = &probe.missing
+        {
+            findings.push(Finding {
+                section: Section::Tools,
+                severity: *severity,
+                message: format!(
+                    "{} is not on the PATH `bash -lc` has — {reason}",
+                    probe.name
+                ),
+                fix: Some(
+                    "install it, or set [runtime].prelude so a login bash shell finds it"
+                        .to_string(),
+                ),
+            });
+        }
+        out.push(ToolReport {
+            name: probe.name.clone(),
+            path: entry.and_then(|f| f.path.clone()),
+            version: entry.and_then(|f| f.version.clone()),
+            detail: entry
+                .and_then(|f| f.detail.clone())
+                .map(|d| format!("{}{d}", probe.detail_label)),
+            needed_for: probe.needed_for.clone(),
+            found: present,
+        });
+    }
+    out
+}
+
+/// Every tool worth asking about: the ones pando itself runs, and the ones
+/// this project's own config and lockfiles say it will run.
+fn tool_probes(paths: &PandoPaths, config: &Config) -> Vec<ToolProbe> {
+    let mut probes = vec![ToolProbe {
+        name: "git".to_string(),
+        program: "git".to_string(),
+        args: "--version",
+        detail_args: None,
+        detail_label: "",
+        needed_for: "everything: worktrees are git's".to_string(),
+        missing: Some((
+            Severity::Problem,
+            "pando has nothing to manage without it".to_string(),
+        )),
+    }];
+
+    // The shim hook `services::docker_program` already knows about, so a
+    // developer whose docker is not on PATH is reported through the same
+    // binary an isolated start would use.
+    let docker = services::docker_program(paths).display().to_string();
+    let isolates = config
+        .services
+        .iter()
+        .any(|s| matches!(s, ServiceConfig::Compose { .. }));
+    let needed = "`start --isolated`, which runs private copies of the project's services";
+    let missing_docker = isolates.then(|| {
+        (
+            Severity::Note,
+            "this project declares compose services, so `--isolated` cannot run; a plain \
+             `start` still can"
+                .to_string(),
+        )
+    });
+    probes.push(ToolProbe {
+        name: "docker".to_string(),
+        program: docker.clone(),
+        args: "--version",
+        detail_args: Some("context show"),
+        detail_label: "context: ",
+        needed_for: needed.to_string(),
+        missing: missing_docker.clone(),
+    });
+    probes.push(ToolProbe {
+        name: "docker compose".to_string(),
+        program: docker,
+        args: "compose version --short",
+        detail_args: None,
+        detail_label: "",
+        needed_for: needed.to_string(),
+        // Never its own finding: when docker is missing this is the same
+        // news twice, and when docker is there a compose plugin that is
+        // not is reported by the line.
+        missing: None,
+    });
+    probes.push(ToolProbe {
+        name: "cloudflared".to_string(),
+        program: tunnel::cloudflared_program(paths).display().to_string(),
+        args: "--version",
+        detail_args: None,
+        detail_label: "",
+        needed_for: "`pando share`, which publishes a worktree at a public URL".to_string(),
+        // `share` is opt-in and says this itself. A line is enough.
+        missing: None,
+    });
+
+    for (program, needed_for, named_by_config) in project_programs(paths, config) {
+        if probes.iter().any(|p| p.program == program) {
+            continue;
+        }
+        probes.push(ToolProbe {
+            name: program.clone(),
+            program,
+            args: "--version",
+            detail_args: None,
+            detail_label: "",
+            needed_for: needed_for.clone(),
+            missing: named_by_config.then_some((Severity::Problem, needed_for)),
+        });
+    }
+    probes
+}
+
+/// The lockfile a package manager writes, and the binary that writes it.
+const LOCKFILE_PROGRAMS: [(&str, &str); 11] = [
+    ("pnpm-lock.yaml", "pnpm"),
+    ("package-lock.json", "npm"),
+    ("yarn.lock", "yarn"),
+    ("bun.lockb", "bun"),
+    ("bun.lock", "bun"),
+    ("uv.lock", "uv"),
+    ("poetry.lock", "poetry"),
+    ("Gemfile.lock", "bundle"),
+    ("mix.lock", "mix"),
+    ("go.sum", "go"),
+    ("Cargo.lock", "cargo"),
+];
+
+/// Programs this project will have pando run, with whether config names
+/// them.
+///
+/// Config naming one is the difference between a line and a problem: a
+/// lockfile is a signal that a manager is *probably* wanted, an
+/// `install =` is pando being told to run it.
+fn project_programs(paths: &PandoPaths, config: &Config) -> Vec<(String, String, bool)> {
+    let mut out: Vec<(String, String, bool)> = Vec::new();
+    if let Some(install) = config.project.install.as_deref()
+        && let Some(program) = command_program(install)
+    {
+        out.push((
+            program,
+            "the install step every new worktree runs".to_string(),
+            true,
+        ));
+    }
+    for hook in &config.hooks {
+        let Some(program) = command_program(&hook.cmd) else {
+            continue;
+        };
+        if out.iter().any(|(p, _, _)| *p == program) {
+            continue;
+        }
+        out.push((program, format!("the hook {:?}", hook.name), true));
+    }
+    let signals = detect::signals(paths.root());
+    for lockfile in &signals.lockfiles {
+        let Some((_, program)) = LOCKFILE_PROGRAMS.iter().find(|(l, _)| l == lockfile) else {
+            continue;
+        };
+        if out.iter().any(|(p, _, _)| p == program) {
+            continue;
+        }
+        out.push((
+            (*program).to_string(),
+            format!("{lockfile} is in this repository"),
+            false,
+        ));
+    }
+    out
+}
+
+/// The program a shell command really runs: the last `&&`-joined step's
+/// first word that is not a `KEY=value` prefix.
+///
+/// The last step, because `corepack enable && pnpm install` is about pnpm.
+fn command_program(cmd: &str) -> Option<String> {
+    let steps: Vec<&str> = cmd.split("&&").filter(|s| !s.trim().is_empty()).collect();
+    let step = steps.last()?;
+    let word = step.split_whitespace().find(|w| !w.contains('='))?;
+    // A path, a template or a quoted word is not a program name worth
+    // asking `command -v` about, and it is exactly the shape that would
+    // put something surprising on a command line.
+    let plain = word
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    plain.then(|| word.to_string())
+}
+
+/// Asks one shell where every tool is and what it says it is.
+///
+/// One shell for all of them, and it is the *same* shell the runtime probe
+/// and every spawn use — `bash -lc` in the main checkout, output captured,
+/// with a deadline on it. A login shell reads a profile, so a dozen of
+/// them is a dozen times the wait for one answer; and going through
+/// `Machine` is what lets a test report on a laptop it does not have.
+///
+/// Returns what it learned plus, when the shell never got to the end, why:
+/// "not found" is a claim about this machine, and a probe that did not run
+/// has not made it.
+fn probe_tools(
+    shell: runtime::Shell<'_>,
+    probes: &[ToolProbe],
+    prelude: &str,
+) -> (BTreeMap<usize, ToolFound>, Option<String>) {
+    if probes.is_empty() {
+        return (BTreeMap::new(), None);
+    }
+    let script = tool_script(probes, prelude);
+    let Some(text) = shell(&script) else {
+        return (
+            BTreeMap::new(),
+            Some("the shell did not answer inside its deadline".to_string()),
+        );
+    };
+    let mut found: BTreeMap<usize, ToolFound> = BTreeMap::new();
+    let mut done = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line == TOOL_DONE_MARK {
+            done = true;
+            continue;
+        }
+        for (mark, field) in [
+            (TOOL_PATH_MARK, 0u8),
+            (TOOL_VERSION_MARK, 1),
+            (TOOL_DETAIL_MARK, 2),
+        ] {
+            let Some(rest) = line.strip_prefix(mark) else {
+                continue;
+            };
+            let Some((index, value)) = rest.split_once(' ') else {
+                continue;
+            };
+            let Ok(index) = index.parse::<usize>() else {
+                continue;
+            };
+            let value = value.trim();
+            if value.is_empty() {
+                continue;
+            }
+            let entry = found.entry(index).or_default();
+            match field {
+                0 => entry.path = Some(value.to_string()),
+                1 => entry.version = Some(value.to_string()),
+                _ => entry.detail = Some(value.to_string()),
+            }
+        }
+    }
+    if done {
+        return (found, None);
+    }
+    // The body never ran. With a prelude set that is the prelude's
+    // failure, and it is the same one every spawn would hit.
+    let last = text
+        .lines()
+        .map(str::trim)
+        .rev()
+        .find(|line| !line.is_empty())
+        .unwrap_or("no output")
+        .to_string();
+    (
+        found,
+        Some(match prelude.is_empty() {
+            true => format!("the probe did not finish — {last}"),
+            false => format!("the prelude in front of it failed — {last}"),
+        }),
+    )
+}
+
+/// One shell script for every probe, composed the way a real spawn is.
+fn tool_script(probes: &[ToolProbe], prelude: &str) -> String {
+    let mut body = String::new();
+    for (index, probe) in probes.iter().enumerate() {
+        let program = proc::shell_quote(&probe.program);
+        let _ = write!(
+            body,
+            "if __pando_p=$(command -v {program} 2>/dev/null); then \
+             printf '{TOOL_PATH_MARK}{index} %s\\n' \"$__pando_p\"; \
+             printf '{TOOL_VERSION_MARK}{index} %s\\n' \
+             \"$({program} {} 2>&1 | head -n 1)\"; ",
+            probe.args
+        );
+        if let Some(detail) = probe.detail_args {
+            let _ = write!(
+                body,
+                "printf '{TOOL_DETAIL_MARK}{index} %s\\n' \
+                 \"$({program} {detail} 2>&1 | head -n 1)\"; "
+            );
+        }
+        let _ = writeln!(body, "fi");
+    }
+    let _ = writeln!(body, "echo {TOOL_DONE_MARK}");
+    match prelude {
+        "" => body,
+        prelude => format!("{prelude} && {{\n{body}}}"),
+    }
 }
 
 // ---- validation -----------------------------------------------------------
@@ -762,6 +1473,9 @@ mod tests {
         paths: PandoPaths,
         root: std::path::PathBuf,
         home: std::path::PathBuf,
+        /// The *developer's* home, where version managers live — never
+        /// the real one, so no test reads what this laptop has installed.
+        machine_home: std::path::PathBuf,
     }
 
     fn fixture() -> Fx {
@@ -784,11 +1498,14 @@ mod tests {
         }
         let home = std::fs::canonicalize(&home).expect("canonical home");
         let paths = PandoPaths::new(&home, ProjectRef::from_root(&root).expect("project"));
+        let machine_home = dir.path().join("developer-home");
+        std::fs::create_dir_all(&machine_home).expect("machine home");
         Fx {
             _dir: dir,
             paths,
             root,
             home,
+            machine_home,
         }
     }
 
@@ -796,6 +1513,51 @@ mod tests {
         let path = fx.paths.config_file();
         std::fs::create_dir_all(path.parent().expect("project dir")).expect("mkdir");
         std::fs::write(&path, body).expect("write config");
+    }
+
+    /// A shell that finds every tool the script asks about and reports
+    /// nothing for the runtime.
+    ///
+    /// Injected rather than spawned: a unit test that ran a real login
+    /// shell would be slow, would read whatever this laptop has installed,
+    /// and would fail on a runner with a different PATH.
+    fn every_tool(script: &str) -> Option<String> {
+        if !script.contains(TOOL_DONE_MARK) {
+            return Some("pando-runtime-ok\n".to_string());
+        }
+        let mut out = String::new();
+        for index in 0.. {
+            if !script.contains(&format!("{TOOL_PATH_MARK}{index} ")) {
+                break;
+            }
+            let _ = writeln!(out, "{TOOL_PATH_MARK}{index} /usr/bin/thing{index}");
+            let _ = writeln!(out, "{TOOL_VERSION_MARK}{index} 1.2.3");
+        }
+        let _ = writeln!(out, "{TOOL_DONE_MARK}");
+        Some(out)
+    }
+
+    /// A shell that finds nothing at all, for the tests that are about a
+    /// tool pando cannot find.
+    fn no_tools(script: &str) -> Option<String> {
+        if !script.contains(TOOL_DONE_MARK) {
+            return Some("pando-runtime-ok\n".to_string());
+        }
+        Some(format!("{TOOL_DONE_MARK}\n"))
+    }
+
+    fn report_of(fx: &Fx, shell: &dyn Fn(&str) -> Option<String>) -> Report {
+        run_on(
+            &fx.paths,
+            &Machine {
+                shell,
+                home: fx.machine_home.clone(),
+            },
+        )
+    }
+
+    fn report(fx: &Fx) -> Report {
+        report_of(fx, &every_tool)
     }
 
     fn messages(report: &Report) -> Vec<String> {
@@ -809,7 +1571,7 @@ mod tests {
     #[test]
     fn a_project_with_no_config_at_all_is_healthy_and_says_where_everything_is() {
         let fx = fixture();
-        let report = run(&fx.paths);
+        let report = report(&fx);
         assert!(report.healthy(), "{:?}", report.findings);
         assert_eq!(report.project.root, fx.root.display().to_string());
         assert_eq!(report.project.home, fx.home.display().to_string());
@@ -822,7 +1584,7 @@ mod tests {
     #[test]
     fn every_layer_is_named_with_its_path_whether_or_not_it_is_there() {
         let fx = fixture();
-        let report = run(&fx.paths);
+        let report = report(&fx);
         let layers: Vec<&str> = report.config.layers.iter().map(|l| l.layer).collect();
         assert_eq!(layers, vec!["committed", "user", "project"]);
         assert_eq!(
@@ -848,7 +1610,7 @@ mod tests {
             "[project]\ninstall = \"pnpm install --frozen-lockfile\"  # detected: pnpm-lock.yaml\n\
              \n[dev]\ncmd = \"pnpm dev\"  # answered: 2026-09-21\nports = { PORT = \"web\" }\n",
         );
-        let report = run(&fx.paths);
+        let report = report(&fx);
         let project = report
             .config
             .layers
@@ -888,7 +1650,7 @@ mod tests {
             "[[services]]  # detected: docker-compose.yml names postgres\n\
              kind = \"compose\"\nfile = \"docker-compose.yml\"\ninclude = [\"postgres\"]\n",
         );
-        let report = run(&fx.paths);
+        let report = report(&fx);
         let project = &report.config.layers[2];
         let header = project
             .keys
@@ -915,7 +1677,7 @@ mod tests {
             "[project]\nroot = \"/somewhere/else\"\ninstall = \"make setup\"\n",
         )
         .expect("write committed config");
-        let report = run(&fx.paths);
+        let report = report(&fx);
         let committed = &report.config.layers[0];
         let root = committed
             .keys
@@ -957,7 +1719,7 @@ mod tests {
     fn a_project_layer_that_does_not_load_is_the_headline_problem() {
         let fx = fixture();
         write_project_config(&fx, "[project]\nnonsense_key = 1\n");
-        let report = run(&fx.paths);
+        let report = report(&fx);
         assert!(!report.healthy());
         assert!(report.config.error.is_some());
         assert!(
@@ -979,7 +1741,7 @@ mod tests {
     fn a_layer_that_is_not_valid_toml_says_so_instead_of_pretending_it_is_empty() {
         let fx = fixture();
         write_project_config(&fx, "[project\n");
-        let report = run(&fx.paths);
+        let report = report(&fx);
         let project = &report.config.layers[2];
         assert!(project.present);
         assert!(
@@ -999,7 +1761,7 @@ mod tests {
         git(&fx.root, &["add", "."]);
         git(&fx.root, &["commit", "--quiet", "-m", "ignore"]);
         write_project_config(&fx, "[project]\nprovision = [\".env\", \"secrets.json\"]\n");
-        let report = run(&fx.paths);
+        let report = report(&fx);
         assert!(!report.healthy());
         assert!(
             mentions(&report, "\"secrets.json\""),
@@ -1024,7 +1786,7 @@ mod tests {
             "[project]\nprovision = [\".env\"]\n\n[project.provision_from]\n\
              \".env.local\" = \".env.example\"\n",
         );
-        let report = run(&fx.paths);
+        let report = report(&fx);
         assert!(report.healthy(), "{:?}", report.findings);
         assert!(
             mentions(&report, "\".env.local\""),
@@ -1044,7 +1806,7 @@ mod tests {
         ] {
             let fx = fixture();
             write_project_config(&fx, &format!("[project]\ninstall = {install:?}\n"));
-            let report = run(&fx.paths);
+            let report = report(&fx);
             assert!(!report.healthy(), "{install} should be a problem");
             let fix = report
                 .findings
@@ -1067,7 +1829,7 @@ mod tests {
         ] {
             let fx = fixture();
             write_project_config(&fx, &format!("[project]\ninstall = {install:?}\n"));
-            let report = run(&fx.paths);
+            let report = report(&fx);
             assert!(report.healthy(), "{install}: {:?}", report.findings);
         }
     }
@@ -1079,7 +1841,7 @@ mod tests {
             &fx,
             "[project]\ninstall = \"corepack enable && pnpm install\"\n",
         );
-        let report = run(&fx.paths);
+        let report = report(&fx);
         assert!(!report.healthy(), "{:?}", report.findings);
     }
 
@@ -1091,7 +1853,7 @@ mod tests {
             "[processes.web]\ncmd = \"serve --port {port:web}\"\nports = [\"web\"]\n\
              env = { API = \"http://localhost:{port:api}\" }\n",
         );
-        let report = run(&fx.paths);
+        let report = report(&fx);
         assert!(!report.healthy(), "{:?}", report.findings);
         assert!(mentions(&report, "env.API"), "{:?}", messages(&report));
         assert!(mentions(&report, "{port:api}"), "{:?}", messages(&report));
@@ -1107,7 +1869,7 @@ mod tests {
              [[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
              include = [\"postgres\"]\n",
         );
-        let report = run(&fx.paths);
+        let report = report(&fx);
         assert!(report.healthy(), "{:?}", report.findings);
     }
 
@@ -1117,7 +1879,7 @@ mod tests {
         let fx = fixture();
         std::fs::set_permissions(&fx.home, std::fs::Permissions::from_mode(0o755))
             .expect("chmod home");
-        let report = run(&fx.paths);
+        let report = report(&fx);
         assert_eq!(report.project.home_mode.as_deref(), Some("755"));
         assert!(mentions(&report, "mode 755"), "{:?}", messages(&report));
         assert!(report.healthy(), "a loose home is a note, not a problem");
@@ -1126,10 +1888,354 @@ mod tests {
         assert_eq!(report.project.windows_held, 0);
     }
 
+    // ---- tools ------------------------------------------------------
+
+    fn tool(report: &Report, name: &str) -> ToolReport {
+        report
+            .tools
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("no {name} in {:?}", report.tools))
+            .clone()
+    }
+
+    #[test]
+    fn a_missing_tool_is_a_line_and_only_a_problem_when_this_project_needs_it() {
+        let fx = fixture();
+        let report = report_of(&fx, &no_tools);
+        // git is not optional: worktrees are git's.
+        assert!(!report.healthy(), "{:?}", report.findings);
+        assert!(
+            mentions(&report, "git is not on the PATH"),
+            "{:?}",
+            messages(&report)
+        );
+        // cloudflared is, and `share` says so itself.
+        assert!(!tool(&report, "cloudflared").found);
+        assert!(
+            !mentions(&report, "cloudflared is not on the PATH"),
+            "{:?}",
+            messages(&report)
+        );
+        // Every tool still gets a line, whether or not it is there.
+        let text = report.render();
+        assert!(text.contains("cloudflared"), "{text}");
+        assert!(text.contains("`pando share`"), "{text}");
+    }
+
+    #[test]
+    fn docker_missing_is_a_note_only_when_the_project_declares_compose_services() {
+        let fx = fixture();
+        let plain = report_of(&fx, &no_tools);
+        assert!(
+            !mentions(&plain, "docker is not on the PATH"),
+            "{:?}",
+            messages(&plain)
+        );
+        write_project_config(
+            &fx,
+            "[[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
+             include = [\"postgres\"]\n",
+        );
+        let with_services = report_of(&fx, &no_tools);
+        let docker = with_services
+            .findings
+            .iter()
+            .find(|f| f.message.starts_with("docker is not on the PATH"))
+            .unwrap_or_else(|| panic!("{:?}", messages(&with_services)));
+        // A note, not a problem: a plain `start` still works, and only
+        // `--isolated` does not.
+        assert_eq!(docker.severity, Severity::Note);
+        assert!(
+            docker.message.contains("a plain `start` still can"),
+            "{}",
+            docker.message
+        );
+    }
+
+    #[test]
+    fn a_tool_reports_the_path_it_resolved_from_and_anything_else_worth_a_line() {
+        let fx = fixture();
+        let shell = |script: &str| -> Option<String> {
+            if !script.contains(TOOL_DONE_MARK) {
+                return Some("pando-runtime-ok\n".to_string());
+            }
+            Some(format!(
+                "{TOOL_PATH_MARK}1 /usr/local/bin/docker\n\
+                 {TOOL_VERSION_MARK}1 Docker version 27.0.3, build 1234\n\
+                 {TOOL_DETAIL_MARK}1 desktop-linux\n\
+                 {TOOL_DONE_MARK}\n"
+            ))
+        };
+        let report = report_of(&fx, &shell);
+        let docker = tool(&report, "docker");
+        assert!(docker.found);
+        assert_eq!(docker.path.as_deref(), Some("/usr/local/bin/docker"));
+        assert_eq!(
+            docker.version.as_deref(),
+            Some("Docker version 27.0.3, build 1234")
+        );
+        assert_eq!(docker.detail.as_deref(), Some("context: desktop-linux"));
+        let text = report.render();
+        assert!(text.contains("/usr/local/bin/docker"), "{text}");
+        assert!(text.contains("context: desktop-linux"), "{text}");
+    }
+
+    #[test]
+    fn the_program_a_config_tells_pando_to_run_is_a_problem_when_it_is_missing() {
+        let fx = fixture();
+        write_project_config(
+            &fx,
+            "[project]\ninstall = \"pnpm install --frozen-lockfile\"\n",
+        );
+        let report = report_of(&fx, &no_tools);
+        assert!(!report.healthy());
+        assert!(
+            mentions(&report, "pnpm is not on the PATH"),
+            "{:?}",
+            messages(&report)
+        );
+        assert!(
+            mentions(&report, "the install step"),
+            "and why pando wanted it: {:?}",
+            messages(&report)
+        );
+    }
+
+    #[test]
+    fn a_probe_that_never_finished_claims_nothing_about_the_machine() {
+        let fx = fixture();
+        // No done mark: the shell died, or the prelude in front of it did.
+        let shell = |_: &str| Some("bash: line 1: nvm: command not found\n".to_string());
+        let report = report_of(&fx, &shell);
+        assert!(
+            report.healthy(),
+            "a shell that did not answer is not evidence that git is missing: {:?}",
+            report.findings
+        );
+        assert!(
+            mentions(&report, "could not ask this shell what it has"),
+            "{:?}",
+            messages(&report)
+        );
+        assert!(
+            mentions(&report, "command not found"),
+            "{:?}",
+            messages(&report)
+        );
+    }
+
+    #[test]
+    fn the_tool_script_runs_behind_the_prelude_a_real_spawn_would_use() {
+        let probes = vec![ToolProbe {
+            name: "git".to_string(),
+            program: "git".to_string(),
+            args: "--version",
+            detail_args: None,
+            detail_label: "",
+            needed_for: "worktrees".to_string(),
+            missing: None,
+        }];
+        let script = tool_script(&probes, "nvm use 22");
+        assert!(script.starts_with("nvm use 22 && {"), "{script}");
+        assert!(script.contains("command -v 'git'"), "{script}");
+        assert!(tool_script(&probes, "").starts_with("if "));
+    }
+
+    #[test]
+    fn a_program_name_comes_from_the_last_step_of_a_chained_command() {
+        assert_eq!(command_program("pnpm dev").as_deref(), Some("pnpm"));
+        assert_eq!(
+            command_program("corepack enable && pnpm install").as_deref(),
+            Some("pnpm")
+        );
+        assert_eq!(
+            command_program("BUNDLE_FROZEN=true bundle install").as_deref(),
+            Some("bundle")
+        );
+        // A path or a template is not a name worth asking about, and is
+        // exactly the shape that would put something odd on a command line.
+        assert_eq!(command_program("./scripts/setup.sh"), None);
+        assert_eq!(command_program("{worktree}/run"), None);
+    }
+
+    // ---- runtime ----------------------------------------------------
+
+    /// A shell that resolves node, for the tests about what this machine
+    /// answers. The marks are `runtime`'s own: a fake that stopped
+    /// matching them would read as "could not parse" and fail loudly.
+    fn shell_resolving_node<'a>(
+        version: &'a str,
+        path: &'a str,
+    ) -> impl Fn(&str) -> Option<String> + 'a {
+        move |script: &str| {
+            // Tools are not what these tests are about, so they are all
+            // there: a missing git would be a problem in every one of them.
+            if script.contains(TOOL_DONE_MARK) {
+                return every_tool(script);
+            }
+            Some(format!(
+                "pando-runtime-path:{path}\npando-runtime-version:v{version}\n\
+                 pando-runtime-ok\n"
+            ))
+        }
+    }
+
+    fn pin_node(fx: &Fx, version: &str) {
+        std::fs::write(fx.root.join(".nvmrc"), format!("{version}\n")).expect("write .nvmrc");
+    }
+
+    #[test]
+    fn a_runtime_the_shell_resolves_says_nothing_and_still_shows_its_working() {
+        let fx = fixture();
+        pin_node(&fx, "22");
+        let report = report_of(&fx, &shell_resolving_node("22.14.0", "/n/bin/node"));
+        assert!(report.healthy(), "{:?}", report.findings);
+        let node = &report.runtime.languages[0];
+        assert_eq!(node.verdict, "satisfied");
+        assert_eq!(node.spec, "22");
+        assert_eq!(node.source, ".nvmrc");
+        assert_eq!(node.resolved.as_deref(), Some("22.14.0"));
+        assert_eq!(node.resolved_from.as_deref(), Some("/n/bin/node"));
+        let text = report.render();
+        assert!(text.contains("wants 22 (.nvmrc)"), "{text}");
+        assert!(
+            text.contains("/n/bin/node"),
+            "the path it resolved from is the diagnosis:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_mismatch_nobody_has_been_asked_about_is_a_note_with_the_question_coming() {
+        let fx = fixture();
+        pin_node(&fx, "22");
+        let report = report_of(&fx, &shell_resolving_node("24.21.0", "/n/bin/node"));
+        assert!(
+            report.healthy(),
+            "the next start asks; that is designed, not broken: {:?}",
+            report.findings
+        );
+        assert!(
+            mentions(&report, "nobody has answered the prelude question"),
+            "{:?}",
+            messages(&report)
+        );
+        assert!(
+            mentions(&report, "24.21.0, from /n/bin/node"),
+            "{:?}",
+            messages(&report)
+        );
+        assert_eq!(report.runtime.languages[0].verdict, "mismatch");
+    }
+
+    #[test]
+    fn a_mismatch_with_a_prelude_that_says_nothing_is_needed_is_a_problem() {
+        let fx = fixture();
+        pin_node(&fx, "22");
+        write_project_config(&fx, "[runtime]\nprelude = \"\"\n");
+        let report = report_of(&fx, &shell_resolving_node("24.21.0", "/n/bin/node"));
+        assert!(!report.healthy(), "{:?}", report.findings);
+        assert!(
+            mentions(&report, "which says this machine needs nothing"),
+            "{:?}",
+            messages(&report)
+        );
+    }
+
+    #[test]
+    fn a_mismatch_with_a_prelude_set_names_the_prelude_and_the_file_it_is_in() {
+        let fx = fixture();
+        pin_node(&fx, "22");
+        write_project_config(&fx, "[runtime]\nprelude = \"nvm use 18\"\n");
+        let report = report_of(&fx, &shell_resolving_node("24.21.0", "/n/bin/node"));
+        assert!(!report.healthy(), "{:?}", report.findings);
+        assert!(
+            mentions(&report, "\"nvm use 18\""),
+            "{:?}",
+            messages(&report)
+        );
+        assert!(
+            mentions(&report, &fx.paths.config_file().display().to_string()),
+            "{:?}",
+            messages(&report)
+        );
+        assert!(
+            mentions(&report, "is not working"),
+            "{:?}",
+            messages(&report)
+        );
+        assert_eq!(
+            report.runtime.prelude_from.as_deref(),
+            Some(fx.paths.config_file().display().to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn a_mismatch_offers_the_prelude_of_a_manager_this_machine_really_has() {
+        let fx = fixture();
+        pin_node(&fx, "22");
+        // Under the *injected* machine home, so what this laptop has
+        // installed never decides the assertion.
+        std::fs::create_dir_all(fx.machine_home.join(".nvm")).expect("nvm dir");
+        std::fs::write(fx.machine_home.join(".nvm/nvm.sh"), "# fake\n").expect("nvm.sh");
+        let report = report_of(&fx, &shell_resolving_node("24.21.0", "/n/bin/node"));
+        let node = &report.runtime.languages[0];
+        assert!(node.managers.contains(&"nvm"), "{:?}", node.managers);
+        let from_home = node
+            .fixes
+            .iter()
+            .find(|fix| fix.contains(&fx.machine_home.display().to_string()))
+            .expect("a fix built from the injected home");
+        assert!(from_home.contains("nvm use"), "{from_home}");
+        let fix = report
+            .findings
+            .iter()
+            .find(|f| f.section == Section::Runtime)
+            .and_then(|f| f.fix.clone())
+            .unwrap_or_default();
+        assert!(fix.contains("set [runtime].prelude to one of:"), "{fix}");
+        assert!(fix.contains("nvm"), "{fix}");
+    }
+
+    #[test]
+    fn a_requirement_with_no_language_behind_it_is_still_reported() {
+        let fx = fixture();
+        std::fs::write(
+            fx.root.join("package.json"),
+            "{\"engines\": {\"pnpm\": \">=9\"}}\n",
+        )
+        .expect("write package.json");
+        let report = report(&fx);
+        assert!(
+            report
+                .runtime
+                .requirements
+                .iter()
+                .any(|r| r.language == "pnpm" && r.spec == ">=9"),
+            "{:?}",
+            report.runtime.requirements
+        );
+        let text = report.render();
+        assert!(text.contains("nothing here probes it"), "{text}");
+        assert!(report.healthy(), "{:?}", report.findings);
+    }
+
+    #[test]
+    fn a_repository_that_pins_nothing_says_so_and_probes_no_language() {
+        let fx = fixture();
+        let report = report(&fx);
+        assert!(report.runtime.languages.is_empty());
+        assert!(
+            report.render().contains("states no runtime"),
+            "{}",
+            report.render()
+        );
+    }
+
     #[test]
     fn the_report_renders_every_section_even_when_it_has_nothing_to_say() {
         let fx = fixture();
-        let text = run(&fx.paths).render();
+        let text = report(&fx).render();
         for section in Section::ALL {
             assert!(
                 text.lines().any(|l| l == section.title()),
