@@ -58,7 +58,27 @@ fn classify_level(lower: &str) -> LogLevel {
 }
 
 fn has_ansi_codes(raw: &str) -> bool {
-    raw.contains("\x1b[")
+    // Any ESC, not only a CSI introducer: an OSC 8 hyperlink carries
+    // `ESC ]` and no `ESC [` at all, and a line that is not classified as
+    // ANSI keeps its escape bytes as text.
+    raw.contains('\x1b')
+}
+
+/// Whether a parsed line's spans join back to `plain`, byte for byte.
+///
+/// The viewer finds search matches in `plain` and then paints them by
+/// walking the spans with those same offsets, so a sequence one of the two
+/// removes and the other keeps would highlight the wrong bytes. When they
+/// disagree, `plain` is the one to trust.
+fn spans_join_to(line: &Line<'static>, plain: &str) -> bool {
+    let mut rest = plain;
+    for span in &line.spans {
+        match rest.strip_prefix(span.content.as_ref()) {
+            Some(tail) => rest = tail,
+            None => return false,
+        }
+    }
+    rest.is_empty()
 }
 
 fn parse_line(raw: &str, file_offset: u64) -> ParsedLine {
@@ -72,10 +92,14 @@ fn parse_line(raw: &str, file_offset: u64) -> ParsedLine {
     let plain_lower = plain.to_lowercase();
     let json_at = if has_ansi { None } else { json_start(&plain) };
     let styled = if has_ansi {
+        // Falling back to `plain` rather than to `raw`: the old fallback
+        // put the escape bytes of a line the parser could not read
+        // straight onto the screen.
         raw.into_text()
             .ok()
             .and_then(|text| text.into_iter().next())
-            .unwrap_or_else(|| Line::raw(raw.to_string()))
+            .filter(|line| spans_join_to(line, &plain))
+            .unwrap_or_else(|| keyword_colorize(&plain, &plain_lower))
     } else if let Some(idx) = json_at {
         // Syntax-color the JSON; the severity gutter already carries the
         // level, so no whole-line wash. Any prefix (timestamp, tag) keeps
@@ -248,18 +272,52 @@ fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            if chars.peek() == Some(&'[') {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            // CSI: parameter bytes, then one final byte. Ending at the
+            // first ASCII letter instead ate the first letter of the text
+            // after an unterminated colour sequence. ECMA-48 also allows
+            // intermediate bytes (0x20-0x2f) before the final one, but in
+            // log text a space after the parameters means a broken
+            // sequence followed by prose — `\x1b[38;2;1;2 unterminated`
+            // is not a request to paint nothing and print `nterminated`.
+            Some('[') => {
                 chars.next();
                 while let Some(&nc) = chars.peek() {
-                    chars.next();
-                    if nc.is_ascii_alphabetic() || nc == 'm' {
+                    if ('\u{30}'..='\u{3f}').contains(&nc) {
+                        chars.next();
+                        continue;
+                    }
+                    if ('\u{40}'..='\u{7e}').contains(&nc) {
+                        chars.next();
+                    }
+                    // Anything else never terminated the sequence: leave
+                    // it for the outer loop to keep as text.
+                    break;
+                }
+            }
+            // OSC: a string parameter (a hyperlink, a window title) that
+            // runs to BEL or to the ST pair `ESC \`.
+            Some(']') => {
+                chars.next();
+                for nc in chars.by_ref() {
+                    if nc == '\x07' {
+                        break;
+                    }
+                    if nc == '\x1b' {
+                        if chars.peek() == Some(&'\\') {
+                            chars.next();
+                        }
                         break;
                     }
                 }
             }
-        } else {
-            out.push(c);
+            // A bare ESC, or one of the two-character forms (charset
+            // select and friends): drop the ESC and keep what follows.
+            _ => {}
         }
     }
     out
@@ -596,6 +654,30 @@ struct OpenBlock {
 /// process writing mid-block) can keep the brace depth positive forever.
 const MAX_BLOCK_LINES: usize = 500;
 
+/// How many bytes before `offset` a tail remembers, to prove on the next
+/// poll that the file was appended to rather than rewritten underneath it.
+const ANCHOR_BYTES: usize = 64;
+
+/// What makes this the same file: a new inode (or device, or creation time
+/// where the platform records one) is a different file behind one path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    dev: u64,
+    ino: u64,
+    created: Option<std::time::SystemTime>,
+}
+
+impl FileIdentity {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            created: meta.created().ok(),
+        }
+    }
+}
+
 pub struct LogTail {
     path: PathBuf,
     buffer: VecDeque<ParsedLine>,
@@ -617,6 +699,13 @@ pub struct LogTail {
     lines_seen: u64,
     block_id_counter: u64,
     open_block: Option<OpenBlock>,
+    /// The file this tail read `offset` bytes of, as of the last poll.
+    /// `None` until the first successful one.
+    identity: Option<FileIdentity>,
+    /// The last [`ANCHOR_BYTES`] bytes before `offset`, as this tail read
+    /// them. Logs are appended to, so bytes before `offset` never change —
+    /// unless the file was rewritten.
+    anchor: Vec<u8>,
 }
 
 impl LogTail {
@@ -633,6 +722,8 @@ impl LogTail {
             lines_seen: 0,
             block_id_counter: 0,
             open_block: None,
+            identity: None,
+            anchor: Vec::new(),
         }
     }
 
@@ -676,16 +767,38 @@ impl LogTail {
             }
         };
 
-        let size = file
+        let meta = file
             .metadata()
-            .with_context(|| format!("stat log {}", self.path.display()))?
-            .len();
+            .with_context(|| format!("stat log {}", self.path.display()))?;
+        let size = meta.len();
+        let identity = FileIdentity::of(&meta);
 
-        if size < self.offset {
+        // A log is rewritten under a tail far more often than it is
+        // truncated to something shorter: `start` empties it in place and
+        // the new run can pass the old size before the next poll. Reading
+        // on from the stale offset then dropped the head of the new
+        // content and spliced a fragment of it onto a line that no longer
+        // exists. Three signals, cheapest first:
+        //
+        // - the file is shorter than what was read of it;
+        // - a different file is behind the path (a rotation, a recreate);
+        // - the bytes just before `offset` are no longer the bytes this
+        //   tail read there — the only one that catches an in-place
+        //   truncate, where inode and creation time are both unchanged.
+        //
+        // A rewrite that lands on exactly the old size between two polls
+        // is not detectable this way and is left alone; the anchor is only
+        // consulted when there is something new to read.
+        let rewritten = size < self.offset
+            || self.identity.is_some_and(|known| known != identity)
+            || (size > self.offset && !self.anchor_still_matches(&mut file));
+        self.identity = Some(identity);
+        if rewritten {
             self.offset = 0;
             self.leftover.clear();
             self.line_start_offset = 0;
             self.open_block = None;
+            self.anchor.clear();
         }
         let mut skip_partial_first_line = false;
         if self.offset == 0 {
@@ -705,6 +818,7 @@ impl LogTail {
         let mut raw = Vec::new();
         let read_bytes = file.read_to_end(&mut raw).context("read log")?;
         self.offset += read_bytes as u64;
+        self.remember_anchor(&raw);
         let mut chunk = String::from_utf8_lossy(&raw).into_owned();
         if skip_partial_first_line {
             chunk = match chunk.find('\n') {
@@ -742,6 +856,36 @@ impl LogTail {
         }
         self.line_start_offset = cursor;
         Ok(added)
+    }
+
+    /// Whether the bytes before `offset` are still the ones this tail read
+    /// there. A read that cannot be made at all counts as a rewrite: the
+    /// safe direction is to start over rather than to splice.
+    fn anchor_still_matches(&self, file: &mut File) -> bool {
+        if self.anchor.is_empty() {
+            return true;
+        }
+        let Some(at) = self.offset.checked_sub(self.anchor.len() as u64) else {
+            return false;
+        };
+        let mut seen = vec![0u8; self.anchor.len()];
+        if file.seek(SeekFrom::Start(at)).is_err() {
+            return false;
+        }
+        if file.read_exact(&mut seen).is_err() {
+            return false;
+        }
+        seen == self.anchor
+    }
+
+    /// Keeps the last [`ANCHOR_BYTES`] bytes read, which always end at
+    /// `offset`.
+    fn remember_anchor(&mut self, read: &[u8]) {
+        self.anchor.extend_from_slice(read);
+        if self.anchor.len() > ANCHOR_BYTES {
+            let extra = self.anchor.len() - ANCHOR_BYTES;
+            self.anchor.drain(..extra);
+        }
     }
 
     fn push_line(&mut self, raw: &str, file_offset: u64) {
@@ -1009,6 +1153,135 @@ mod tests {
     // `rich_colorize` sliced the line there — panicking the whole process,
     // `pando logs` and the TUI alike. Every shape in the review's table,
     // including the one a binary blob produces through `from_utf8_lossy`.
+    /// Every span of a line, joined back into the text it paints.
+    fn painted(line: &Line<'static>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    // `pando start` empties the log in place (`fs::write`, so the same
+    // inode) and the new run can write past the old size before the next
+    // 250 ms poll. Detecting truncation only by `size < offset` then
+    // resumed at a stale byte offset: the head of the new content was
+    // silently dropped and a fragment of it spliced onto the last old
+    // line.
+    #[test]
+    fn a_log_rewritten_in_place_between_polls_is_reread_from_the_start() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("dev.log");
+        let old: String = (0..10).map(|n| format!("old line {n}\n")).collect();
+        write_all(&path, &old);
+        let mut tail = LogTail::new(path.clone(), 200);
+        tail.poll().unwrap();
+        let before = std::fs::metadata(&path).unwrap().ino();
+
+        let new: String = (0..60).map(|n| format!("brand new line {n}\n")).collect();
+        assert!(new.len() > old.len(), "the new run outgrows the old file");
+        write_all(&path, &new);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().ino(),
+            before,
+            "an in-place truncate keeps the inode, so file identity alone \
+             cannot see this one"
+        );
+        tail.poll().unwrap();
+
+        let lines = plain_lines(&tail);
+        let expected: Vec<String> = (0..60).map(|n| format!("brand new line {n}")).collect();
+        assert_eq!(
+            &lines[10..],
+            expected.as_slice(),
+            "every new line, in order, with no spliced fragment"
+        );
+        assert_eq!(lines.len(), 70, "and the old ones kept above them");
+    }
+
+    // The other shape of the same thing: the path is the same and the file
+    // behind it is not. Its first bytes match, so only the inode says so.
+    #[test]
+    fn a_log_replaced_by_a_different_file_is_reread_from_the_start() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("dev.log");
+        let old: String = (0..10).map(|n| format!("old line {n}\n")).collect();
+        write_all(&path, &old);
+        let mut tail = LogTail::new(path.clone(), 200);
+        tail.poll().unwrap();
+        let before = std::fs::metadata(&path).unwrap().ino();
+
+        std::fs::remove_file(&path).unwrap();
+        let rotated: String = (0..30).map(|n| format!("old line {n}\n")).collect();
+        write_all(&path, &rotated);
+        assert_ne!(
+            std::fs::metadata(&path).unwrap().ino(),
+            before,
+            "a recreated file is a different inode"
+        );
+        tail.poll().unwrap();
+
+        assert_eq!(
+            plain_lines(&tail).len(),
+            40,
+            "the new file is read from its start, not appended to blindly"
+        );
+    }
+
+    // An OSC 8 hyperlink carries no `ESC [` at all, so the line was not
+    // classified as ANSI and `strip_ansi` dropped the lone ESC and left the
+    // payload on screen as text.
+    #[test]
+    fn osc_sequences_are_stripped_and_never_reach_the_screen() {
+        for raw in [
+            // ST-terminated (ESC \) and BEL-terminated hyperlinks.
+            "\x1b]8;;https://example.com\x1b\\click\x1b]8;;\x1b\\",
+            "\x1b]8;;https://example.com\x07click\x1b]8;;\x07",
+        ] {
+            let parsed = parse_plain(raw);
+            assert_eq!(parsed.plain, "click", "{raw:?}");
+            assert!(parsed.has_ansi, "an OSC line is an ANSI line: {raw:?}");
+            assert_eq!(painted(&parsed.styled), parsed.plain, "{raw:?}");
+        }
+    }
+
+    // `strip_ansi` ended a CSI at the first ASCII letter, so an
+    // unterminated colour sequence ate the first letter of the text after
+    // it. A CSI ends at its final byte, and a byte that can be neither a
+    // parameter nor a final byte means the sequence was never one.
+    #[test]
+    fn an_unterminated_csi_does_not_eat_the_next_character() {
+        let parsed = parse_plain("\x1b[38;2;1;2 unterminated");
+        assert_eq!(parsed.plain, " unterminated");
+        assert_eq!(painted(&parsed.styled), parsed.plain);
+    }
+
+    // Whatever the shape, no escape byte may reach the buffer, and the
+    // styled spans have to join back to `plain` byte for byte — the
+    // viewer's search highlighting maps offsets found in one onto the
+    // other.
+    #[test]
+    fn malformed_escape_sequences_leave_no_escape_byte_and_stay_in_lockstep() {
+        for raw in [
+            "\x1b]8;;https://example.com",     // unterminated OSC
+            "plain text then an escape\x1b",   // a bare ESC at the end
+            "\x1b[38;5;2mcoloured\x1b[0m end", // a well-formed one
+            "\x1b(Bcharset select",
+            "\x1b[?25lhidden cursor",
+            "\x1b[1;2;3",
+        ] {
+            let parsed = parse_plain(raw);
+            assert!(
+                !parsed.plain.contains('\x1b'),
+                "an escape byte survived into {:?} from {raw:?}",
+                parsed.plain
+            );
+            assert_eq!(
+                painted(&parsed.styled),
+                parsed.plain,
+                "spans and plain must agree for {raw:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_date_ish_token_after_a_multibyte_character_does_not_panic() {
         let panicky = [
