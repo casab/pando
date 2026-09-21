@@ -1255,6 +1255,12 @@ pub fn resolve_on(
         if candidate.value.trim().is_empty() {
             bail!("an empty answer is not a {}", slot_label(*slot));
         }
+        // Before a single key is written: an answer that would make the
+        // merged config refuse to load is refused now, while nothing is on
+        // disk, instead of at the next load with half a project broken.
+        let mut proposed = config.clone();
+        detect::apply(*slot, &candidate, &mut proposed);
+        refuse_unloadable(paths, *slot, &candidate.value, &proposed)?;
         // A slot whose answer is a whole `[[table]]` entry: appended, with
         // the note on the entry's own header rather than on each key.
         if let Some((array, entries)) = detect::array_edits(*slot, &[&candidate]) {
@@ -1316,10 +1322,50 @@ fn apply_service_answer(
         return Ok(());
     };
     let refs: Vec<&detect::Candidate> = chosen.iter().collect();
+    let mut proposed = config.clone();
+    detect::apply_services(&file, &refs, &mut proposed);
+    let names: Vec<&str> = refs.iter().map(|c| c.value.as_str()).collect();
+    refuse_unloadable(paths, Slot::Services, &names.join(", "), &proposed)?;
     let (array, entries) = detect::service_entry(&file, &refs);
     config::set_detected_array_entry(paths, Slot::Services.layer(), array, entries, note)?;
     detect::apply_services(&file, &refs, config);
     Ok(())
+}
+
+/// An answer pando could not load back is not an answer.
+///
+/// The one choke point every answer passes through between being chosen
+/// and being written — every slot, and every front end: a prompt, `--yes`,
+/// an answers file, the TUI modal. It applies the answer to a *copy* and
+/// asks pando's own loader whether the result is legal; a copy that is not
+/// never reaches disk.
+///
+/// This exists because two answers could each be reasonable and the pair
+/// illegal. An env example naming `API_PORT` gives the application a role
+/// called `api`; a compose file with a service called `api` gives it that
+/// name too — and a role is one port and belongs to one thing, so
+/// `validate_services` refuses the pair. Written, it refused at the *next*
+/// load, in the project layer, which fails hard: `start`, `new`, `restart`
+/// and the TUI all stopped until a human edited the file pando had just
+/// written.
+///
+/// Generic rather than a check for that one pair, deliberately. Every
+/// cross-slot rule `validate` knows about is covered, present and future,
+/// and the message a developer sees is the loader's own — the same
+/// sentence they would have read later, minus the broken file.
+fn refuse_unloadable(
+    paths: &PandoPaths,
+    slot: Slot,
+    answer: &str,
+    proposed: &Config,
+) -> Result<()> {
+    let Err(e) = config::validate(proposed, &paths.project) else {
+        return Ok(());
+    };
+    bail!(
+        "{answer:?} cannot be this project's {}: {e:#} — nothing was written",
+        slot_label(slot)
+    )
 }
 
 /// Edits gathered per table, keeping the order they were produced in.
@@ -8911,6 +8957,74 @@ time.sleep(300)
     /// question is silent, and these are all about what it asks.
     fn resolve_isolating(paths: &PandoPaths, config: &Config, ask: Ask<'_>) -> Result<Config> {
         super::resolve_process(paths, config, Mode::Isolated, ask, &noop)
+    }
+
+    // ---- an answer pando could not load back ------------------------
+
+    /// The pair the detection notes routed here: an env example naming
+    /// `API_PORT` gives the application a role called `api`, and a compose
+    /// file with a service called `api` gives it that name too. Each
+    /// answer is reasonable; together they are a config pando's own loader
+    /// refuses — and it used to refuse it at the *next* load, in the
+    /// project layer, which fails hard.
+    #[test]
+    fn an_answer_that_would_make_the_config_refuse_to_load_is_refused_before_it_is_written() {
+        let fx = compose_fixture(
+            "services:\n  api:\n    image: postgres:16\n    ports: [\"5432:5432\"]\n",
+            "PORT=3000\nDATABASE_URL=postgres://acme:acme@localhost:5432/acme\n",
+        );
+        let mut config = fx.config.clone();
+        config.processes.insert(
+            "dev".to_string(),
+            ProcessConfig {
+                cmd: "next dev".to_string(),
+                ports: Some(crate::config::PortsSpec::Map(BTreeMap::from([(
+                    "API_PORT".to_string(),
+                    "api".to_string(),
+                )]))),
+                ..Default::default()
+            },
+        );
+
+        let err = resolve_isolating(&fx.paths, &config, &refuse).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("both claim the role"), "{text}");
+        assert!(text.contains("nothing was written"), "{text}");
+
+        // And nothing was: the file pando writes has no services entry in
+        // it, and it still loads.
+        let written = std::fs::read_to_string(fx.paths.config_file()).unwrap_or_default();
+        assert!(!written.contains("[[services]]"), "{written}");
+        assert!(
+            crate::config::load(&fx.paths).is_ok(),
+            "the project layer still loads"
+        );
+    }
+
+    #[test]
+    fn the_same_answer_is_written_when_nothing_else_claims_the_name() {
+        let fx = compose_fixture(
+            "services:\n  api:\n    image: postgres:16\n    ports: [\"5432:5432\"]\n",
+            "PORT=3000\nDATABASE_URL=postgres://acme:acme@localhost:5432/acme\n",
+        );
+        let mut config = fx.config.clone();
+        config.processes.insert(
+            "dev".to_string(),
+            ProcessConfig {
+                cmd: "next dev".to_string(),
+                ports: Some(crate::config::PortsSpec::Map(BTreeMap::from([(
+                    "PORT".to_string(),
+                    "web".to_string(),
+                )]))),
+                ..Default::default()
+            },
+        );
+        let resolved = resolve_isolating(&fx.paths, &config, &refuse).unwrap();
+        let crate::config::ServiceConfig::Compose { include, .. } = &resolved.services[0] else {
+            panic!("a compose entry");
+        };
+        assert_eq!(include, &vec!["api".to_string()]);
+        assert!(crate::config::load(&fx.paths).is_ok());
     }
 
     const TWO_DATABASES: &str = "services:\n  \

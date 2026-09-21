@@ -1189,7 +1189,65 @@ fn services_report(
             },
         });
     }
+    name_collisions(paths, config, findings);
     ServicesReport { compose, native }
+}
+
+/// A compose service whose name is already a role of one of this project's
+/// processes.
+///
+/// A role is one port and belongs to one thing, so the two cannot both
+/// have it: `validate_services` refuses the pair, and a config that holds
+/// it does not load. pando now refuses to *write* that pair — the answer is
+/// checked against the loader before a key reaches disk — but the two
+/// halves are still sitting in the repository waiting to be offered, and a
+/// developer who answers the services question is told "no" without ever
+/// having been told why. This is the why, at rest, before the question.
+///
+/// Only for services that have not been answered for yet: once one is in
+/// `include` the config does not load at all, and that is the Config
+/// section's headline problem rather than a second copy of it here.
+fn name_collisions(paths: &PandoPaths, config: &Config, findings: &mut Vec<Finding>) {
+    let mut owner: BTreeMap<String, String> = BTreeMap::new();
+    for (process, spec) in &config.processes {
+        for role in spec.roles() {
+            owner.insert(role, format!("the process {process:?}"));
+        }
+    }
+    if owner.is_empty() {
+        return;
+    }
+    let answered = declared_services(config);
+    let signals = detect::signals(paths.root());
+    for file in &signals.compose_files {
+        let Ok(read) = crate::compose::read(&paths.root().join(file)) else {
+            continue;
+        };
+        for name in read.services.keys() {
+            if answered.contains(name) {
+                continue;
+            }
+            let Some(owner) = owner.get(name) else {
+                continue;
+            };
+            findings.push(
+                Finding::note(
+                    Section::Services,
+                    format!(
+                        "{file} declares a service called {name:?}, and {owner} already \
+                         owns the role {name:?} — a role is one port and belongs to one \
+                         thing, so pando will refuse to run a private copy of it under \
+                         that name"
+                    ),
+                )
+                .with_fix(format!(
+                    "rename the role in that process's `ports`, or rename the service in \
+                     {file} — answering the services question with {name:?} is refused \
+                     until one of them moves"
+                )),
+            );
+        }
+    }
 }
 
 // ---- hooks ----------------------------------------------------------------
@@ -3076,6 +3134,56 @@ mod tests {
         // the services section is where a reader looks for it.
         assert!(
             mentions(&report, "kind = \"native\""),
+            "{:?}",
+            messages(&report)
+        );
+    }
+
+    #[test]
+    fn a_compose_service_that_shares_a_name_with_a_role_is_reported_before_the_question() {
+        let fx = fixture();
+        write_compose(
+            &fx,
+            "services:\n  api:\n    image: kong:3\n  postgres:\n    image: postgres:16\n",
+        );
+        write_project_config(
+            &fx,
+            "[processes.dev]\ncmd = \"serve\"\nports = { WEB_PORT = \"web\", API_PORT = \"api\" }\n",
+        );
+        let report = report(&fx);
+        assert!(
+            mentions(&report, "declares a service called \"api\""),
+            "{:?}",
+            messages(&report)
+        );
+        assert!(
+            mentions(&report, "already owns the role \"api\""),
+            "{:?}",
+            messages(&report)
+        );
+        assert!(
+            !mentions(&report, "\"postgres\""),
+            "only the one that collides: {:?}",
+            messages(&report)
+        );
+        // A note: nothing is broken until somebody answers the question,
+        // and answering it is now refused.
+        assert!(report.healthy(), "{:?}", report.findings);
+    }
+
+    #[test]
+    fn no_collision_is_reported_for_a_service_the_config_already_includes() {
+        let fx = fixture();
+        write_compose(&fx, "services:\n  postgres:\n    image: postgres:16\n");
+        write_project_config(
+            &fx,
+            "[processes.dev]\ncmd = \"serve\"\nports = [\"web\"]\n\n\
+             [[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
+             include = [\"postgres\"]\n",
+        );
+        let report = report(&fx);
+        assert!(
+            !mentions(&report, "already owns the role"),
             "{:?}",
             messages(&report)
         );
