@@ -52,6 +52,20 @@ pub struct Signals {
     /// Root-level files that are gitignored and present — what a new
     /// worktree would be missing.
     pub ignored_present: Vec<String>,
+    /// Local files the repository does not have but ships an example of:
+    /// `(destination, source)`, sorted by destination.
+    ///
+    /// A fresh clone is the case. `.env` is gitignored, so it never arrives
+    /// with the clone, and there is nothing for a worktree to be given a
+    /// copy of — while `.env.example` sits beside it, tracked and unused.
+    /// A pair is here only when the destination is gitignored in the main
+    /// checkout and really absent, so nothing pando offers from this could
+    /// ever show as untracked.
+    ///
+    /// Defaulted rather than required, so a dump written by an older pando
+    /// still deserialises.
+    #[serde(default)]
+    pub provision_seeds: Vec<(String, String)>,
 }
 
 /// Also the install hook's fingerprint: a lockfile changing is what means
@@ -123,6 +137,7 @@ pub fn signals(root: &Path) -> Signals {
         markers: present(root, &MARKER_FILES),
         compose_files: present(root, &COMPOSE_FILES),
         ignored_present: ignored_present(root),
+        provision_seeds: provision_seeds(root),
     }
 }
 
@@ -275,6 +290,64 @@ fn ignored_present(root: &Path) -> Vec<String> {
     found.sort();
     found.dedup();
     found
+}
+
+/// Suffixes that make a tracked file the example of a local one.
+const EXAMPLE_SUFFIXES: [&str; 3] = [".example", ".sample", ".template"];
+
+/// Root-level example files whose real file is gitignored and not here:
+/// `(destination, source)`.
+///
+/// The fresh-clone case. `.env.example` is tracked and arrives with the
+/// clone; `.env` is gitignored and never does, so `ignored_present` — which
+/// only lists files that exist — has nothing to offer and a worktree is
+/// created without the file the app needs.
+///
+/// Both conditions are checked here rather than at the question, because
+/// proposing a seed that `new` would then refuse is worse than proposing
+/// none: `git check-ignore` is what authorises a write into a worktree, and
+/// a destination that is not ignored can never be one.
+fn provision_seeds(root: &Path) -> Vec<(String, String)> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, String)> = Vec::new();
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let source = entry.file_name().to_string_lossy().to_string();
+        let Some(destination) = EXAMPLE_SUFFIXES
+            .iter()
+            .find_map(|suffix| source.strip_suffix(suffix))
+        else {
+            continue;
+        };
+        if destination.is_empty()
+            || PROVISION_DENYLIST.contains(&destination)
+            || root.join(destination).exists()
+            || !is_gitignored(root, destination)
+        {
+            continue;
+        }
+        out.push((destination.to_string(), source));
+    }
+    out.sort();
+    out
+}
+
+/// Whether the project's own gitignore covers a path, whether or not it
+/// exists. Exit 0 means ignored; anything else — including a git that could
+/// not run — means it is not, because only a definite yes may authorise a
+/// write.
+fn is_gitignored(root: &Path, rel: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["check-ignore", "-q", "--", rel])
+        .output()
+        .map(|out| out.status.code() == Some(0))
+        .unwrap_or(false)
 }
 
 // ---- framework rules ------------------------------------------------------
@@ -573,6 +646,11 @@ pub struct Candidate {
     /// For the schema slot: the whole `[[hooks]]` entry, because a hook is
     /// a command *and* the files it is keyed on.
     pub hook: Option<crate::config::HookConfig>,
+    /// For the provision slot: which of the paths in `value` have no file
+    /// in the main checkout and come from an example instead. Empty for
+    /// the ordinary answer, where every path is a file that is already
+    /// there.
+    pub provision_from: BTreeMap<String, String>,
 }
 
 /// What the rules found for one slot.
@@ -994,11 +1072,18 @@ fn port_role(key: &str) -> Option<String> {
 }
 
 /// `a`, `a and b`, `a, b and c` — a list in a sentence.
-fn listed(names: &[&str]) -> String {
+fn listed<S: AsRef<str>>(names: &[S]) -> String {
     match names.split_last() {
         None => String::new(),
-        Some((last, [])) => (*last).to_string(),
-        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+        Some((last, [])) => last.as_ref().to_string(),
+        Some((last, rest)) => format!(
+            "{} and {}",
+            rest.iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>()
+                .join(", "),
+            last.as_ref()
+        ),
     }
 }
 
@@ -1844,19 +1929,55 @@ fn package_runner(signals: &Signals) -> &'static str {
     }
 }
 
+/// Which local files each worktree needs a copy of.
+///
+/// Two shapes. A file that is gitignored and present is a file pando can
+/// link, and there is nothing to decide about it. A file the repository
+/// only ships an *example* of is a different offer: nothing is copied from
+/// a tracked file into a worktree unless a developer says so, because the
+/// example's defaults are not their local settings and pando has no way to
+/// know whether that is close enough. So a proposal with a seed in it is
+/// never decided, and the question below it is the plain answer: only what
+/// is already here.
 fn provision_proposal(signals: &Signals) -> Option<Proposal> {
-    if signals.ignored_present.is_empty() {
+    let present = &signals.ignored_present;
+    let seeds = &signals.provision_seeds;
+    if present.is_empty() && seeds.is_empty() {
         return None;
     }
-    Some(Proposal::of(
-        Slot::Provision,
-        vec![Candidate {
-            value: signals.ignored_present.join(","),
+    let mut candidates: Vec<Candidate> = Vec::new();
+    if !seeds.is_empty() {
+        let mut paths = present.clone();
+        for (destination, _) in seeds {
+            if !paths.contains(destination) {
+                paths.push(destination.clone());
+            }
+        }
+        let seeded = listed(
+            &seeds
+                .iter()
+                .map(|(destination, source)| format!("{destination} from {source}"))
+                .collect::<Vec<_>>(),
+        );
+        candidates.push(Candidate {
+            value: paths.join(","),
+            why: match present.is_empty() {
+                true => format!("{seeded} — this clone has none of its own"),
+                false => format!("gitignored and present, plus {seeded}"),
+            },
+            provision_from: seeds.iter().cloned().collect(),
+            ..Candidate::default()
+        });
+    }
+    if !present.is_empty() {
+        candidates.push(Candidate {
+            value: present.join(","),
             why: "gitignored and present in the main checkout".to_string(),
             ..Candidate::default()
-        }],
-        true,
-    ))
+        });
+    }
+    let decided = seeds.is_empty();
+    Some(Proposal::of(Slot::Provision, candidates, decided))
 }
 
 // ---- turning a choice into config -----------------------------------------
@@ -1888,6 +2009,9 @@ pub fn still_needed(slot: Slot, config: &Config) -> bool {
         // is "this machine needs nothing", which is an answer, and asking
         // again would be asking a developer to say no twice.
         Slot::Prelude => config.runtime.prelude.is_none(),
+        // And again: `provision = []` is "no worktree needs a local file
+        // of mine", which a developer may have said by declining.
+        Slot::Provision => config.project.provision.is_none(),
         // Anything already in `[[services]]` is an answer about every
         // service: a developer who listed two has said the third is not
         // wanted, and a second run must not offer it again.
@@ -1949,6 +2073,9 @@ pub fn custom(slot: Slot, value: &str) -> Candidate {
         service: None,
         hook: None,
         preselected: false,
+        // A list the developer typed is a list of files they have. Seeding
+        // from an example is an offer, and they did not take it.
+        provision_from: BTreeMap::new(),
         processes: (slot == Slot::Processes).then(|| {
             BTreeMap::from([(
                 DEV.to_string(),
@@ -1982,7 +2109,14 @@ pub fn apply(slot: Slot, candidate: &Candidate, config: &mut Config) {
         Slot::Install => config.project.install = Some(candidate.value.clone()),
         Slot::VersionFiles => config.runtime.version_files = split_list(&candidate.value),
         Slot::Prelude => config.runtime.prelude = Some(candidate.value.clone()),
-        Slot::Provision => config.project.provision = split_list(&candidate.value),
+        Slot::Provision => {
+            config.project.provision = Some(split_list(&candidate.value));
+            // Only what this answer brought: an answer with no seeds in it
+            // is not a statement that the developer's own mapping is wrong.
+            if !candidate.provision_from.is_empty() {
+                config.project.provision_from = candidate.provision_from.clone();
+            }
+        }
         Slot::Processes => {
             for (name, process) in candidate.processes.iter().flatten() {
                 config.processes.insert(name.clone(), process.clone());
@@ -2135,13 +2269,36 @@ pub fn edits(slot: Slot, candidate: &Candidate) -> Vec<Edit> {
             }
             out
         }
-        Slot::VersionFiles | Slot::Provision => {
+        Slot::VersionFiles => {
             let (table, key) = keyed.expect("this slot writes one key");
             vec![single(
                 table,
                 key,
                 toml_edit::Value::Array(toml_edit::Array::from_iter(split_list(&candidate.value))),
             )]
+        }
+        Slot::Provision => {
+            let (table, key) = keyed.expect("this slot writes one key");
+            let mut out = vec![single(
+                table,
+                key,
+                toml_edit::Value::Array(toml_edit::Array::from_iter(split_list(&candidate.value))),
+            )];
+            // The list says which files a worktree gets; this says where
+            // the ones the main checkout does not have come from. Two keys,
+            // because the second is only true of some of the first.
+            if !candidate.provision_from.is_empty() {
+                let mut inline = toml_edit::InlineTable::new();
+                for (destination, source) in &candidate.provision_from {
+                    inline.insert(destination, source.as_str().into());
+                }
+                out.push(single(
+                    &["project"],
+                    "provision_from",
+                    toml_edit::Value::InlineTable(inline),
+                ));
+            }
+            out
         }
         Slot::PortEnv => {
             let (table, key) = keyed.expect("this slot writes one key");
@@ -3282,11 +3439,133 @@ services:
         };
         let mut config = Config::default();
         apply(Slot::Provision, &candidate, &mut config);
-        assert_eq!(config.project.provision, vec![".env", ".env.local"]);
+        assert_eq!(
+            config.project.provision.as_deref(),
+            Some(&[".env".to_string(), ".env.local".to_string()][..])
+        );
         let edits = edits(Slot::Provision, &candidate);
         assert_eq!(
             edits[0].value.to_string().trim(),
             "[\".env\", \".env.local\"]"
+        );
+    }
+
+    // ---- provisioning from an example ------------------------------------
+
+    /// A repository that ships an example of a local file, with or without
+    /// the local file itself.
+    fn seed_fixture(files: &[(&str, &str)]) -> TempDir {
+        let dir = tempdir().unwrap();
+        crate::testutil::git(dir.path(), &["init", "--quiet", "--initial-branch=main"]);
+        for (rel, contents) in files {
+            std::fs::write(dir.path().join(rel), contents).unwrap();
+        }
+        dir
+    }
+
+    // The fresh-clone case: `.env` is gitignored so it never arrives, and
+    // the example beside it is the only thing that says what it looks like.
+    #[test]
+    fn an_example_of_a_missing_gitignored_file_is_a_provision_source() {
+        let dir = seed_fixture(&[
+            (".gitignore", ".env\n.env.local\n"),
+            (".env.example", "PORT=3000\n"),
+            (".env.local.example", "FLAG=1\n"),
+        ]);
+        assert_eq!(
+            provision_seeds(dir.path()),
+            vec![
+                (".env".to_string(), ".env.example".to_string()),
+                (".env.local".to_string(), ".env.local.example".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_file_the_checkout_already_has_is_not_seeded_from_its_example() {
+        let dir = seed_fixture(&[
+            (".gitignore", ".env\n"),
+            (".env.example", "PORT=3000\n"),
+            (".env", "PORT=3001\n"),
+        ]);
+        assert!(
+            provision_seeds(dir.path()).is_empty(),
+            "the developer's own file is the source; the example is the fallback"
+        );
+    }
+
+    // `git check-ignore` is what authorises a write into a worktree, so a
+    // destination it would refuse must never be offered — proposing a seed
+    // `new` then refuses is worse than proposing none.
+    #[test]
+    fn an_example_of_a_file_that_is_not_gitignored_is_never_offered() {
+        let dir = seed_fixture(&[
+            (".gitignore", "node_modules/\n"),
+            ("config.yml.example", "debug: true\n"),
+        ]);
+        assert!(provision_seeds(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn a_seed_makes_the_provision_slot_a_question_with_the_plain_answer_under_it() {
+        let signals = Signals {
+            ignored_present: vec![".env.local".to_string()],
+            provision_seeds: vec![(".env".to_string(), ".env.example".to_string())],
+            ..Default::default()
+        };
+        let proposal = provision_proposal(&signals).unwrap();
+        assert!(
+            !proposal.decided,
+            "copying a tracked example into a worktree is the developer's call"
+        );
+        assert_eq!(values(&proposal), vec![".env.local,.env", ".env.local"]);
+        let seeded = proposal.preferred().unwrap();
+        assert_eq!(
+            seeded.provision_from,
+            BTreeMap::from([(".env".to_string(), ".env.example".to_string())])
+        );
+        assert!(
+            seeded.why.contains(".env from .env.example"),
+            "{}",
+            seeded.why
+        );
+        assert!(
+            proposal.candidates[1].provision_from.is_empty(),
+            "the plain answer takes only what is already here"
+        );
+    }
+
+    #[test]
+    fn with_nothing_to_seed_the_provision_slot_is_decided_as_it_always_was() {
+        let signals = Signals {
+            ignored_present: vec![".env".to_string(), ".env.local".to_string()],
+            ..Default::default()
+        };
+        let proposal = provision_proposal(&signals).unwrap();
+        assert!(proposal.decided);
+        assert_eq!(values(&proposal), vec![".env,.env.local"]);
+    }
+
+    #[test]
+    fn a_seeded_answer_writes_the_list_and_where_the_missing_file_comes_from() {
+        let candidate = Candidate {
+            value: ".env".to_string(),
+            why: "seeded".to_string(),
+            provision_from: BTreeMap::from([(".env".to_string(), ".env.example".to_string())]),
+            ..Candidate::default()
+        };
+        let mut config = Config::default();
+        apply(Slot::Provision, &candidate, &mut config);
+        assert_eq!(config.project.provision_paths(), [".env".to_string()]);
+        assert_eq!(config.project.provision_from[".env"], ".env.example");
+
+        let edits = edits(Slot::Provision, &candidate);
+        assert_eq!(edits.len(), 2, "the list, and where the file comes from");
+        assert_eq!(edits[1].table, vec!["project"]);
+        assert_eq!(edits[1].key, "provision_from");
+        assert_eq!(
+            edits[1].value.to_string().trim(),
+            r#"{ ".env" = ".env.example" }"#
         );
     }
 

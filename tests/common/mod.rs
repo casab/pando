@@ -126,11 +126,11 @@ impl Kind {
         let mut config = Config::default();
         match self {
             Kind::Plain => {
-                config.project.provision = strings(&[".env", ".env.local"]);
+                config.project.provision = Some(strings(&[".env", ".env.local"]));
             }
             Kind::NextPnpmCompose | Kind::NextMessy => {
                 config.project.install = Some("pnpm install --frozen-lockfile".to_string());
-                config.project.provision = strings(&[".env", ".env.local"]);
+                config.project.provision = Some(strings(&[".env", ".env.local"]));
                 config.runtime.version_files = strings(&[".nvmrc"]);
                 config.processes.insert(
                     "dev".to_string(),
@@ -163,7 +163,7 @@ impl Kind {
             }
             Kind::DjangoUvPostgres => {
                 config.project.install = Some("uv sync --frozen".to_string());
-                config.project.provision = strings(&[".env"]);
+                config.project.provision = Some(strings(&[".env"]));
                 config.runtime.version_files = strings(&[".python-version"]);
                 config.processes.insert(
                     "dev".to_string(),
@@ -202,7 +202,7 @@ impl Kind {
             Kind::RustLib => {}
             Kind::MonoWebApi => {
                 config.project.install = Some("pnpm install --frozen-lockfile".to_string());
-                config.project.provision = strings(&[".env"]);
+                config.project.provision = Some(strings(&[".env"]));
                 // Two processes, each in its own directory, with the web
                 // one told the api's port. The root `dev` script is a
                 // `pnpm -r` wrapper, which works but gives one log and one
@@ -280,6 +280,18 @@ pub fn fixture_repo(parent: &Path) -> PathBuf {
 /// Builds a fixture under `parent` and returns its paths. Every kind gets a
 /// commit, a `.gitignore`, and any ignored files its config would provision.
 pub fn build(kind: Kind, parent: &Path) -> Fixture {
+    build_with(kind, parent, true)
+}
+
+/// The same fixture as a fresh clone leaves it: everything tracked, and
+/// none of the gitignored local files, because those are gitignored and
+/// never arrive with a clone. The state a project's own `.env.example` is
+/// the only source of local settings in.
+pub fn build_fresh_clone(kind: Kind, parent: &Path) -> Fixture {
+    build_with(kind, parent, false)
+}
+
+fn build_with(kind: Kind, parent: &Path, local_files: bool) -> Fixture {
     let root = parent.join(kind.dir_name());
     std::fs::create_dir_all(&root).unwrap();
     git(&root, &["init", "--quiet", "--initial-branch=main"]);
@@ -288,8 +300,10 @@ pub fn build(kind: Kind, parent: &Path) -> Fixture {
     }
     git(&root, &["add", "."]);
     git(&root, &["commit", "--quiet", "-m", "initial commit"]);
-    for (rel, contents) in ignored_files_for(kind) {
-        write_file(&root, rel, contents);
+    if local_files {
+        for (rel, contents) in ignored_files_for(kind) {
+            write_file(&root, rel, contents);
+        }
     }
     Fixture { root, remote: None }
 }

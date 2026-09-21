@@ -11,12 +11,14 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use common::{Kind, build, docker, listener_on_port_env, listener_printing, paths_for};
+use common::{
+    Kind, build, build_fresh_clone, docker, listener_on_port_env, listener_printing, paths_for,
+};
 use pando::compose;
 use pando::config::{self, Config};
 use pando::paths::PandoPaths;
 use pando::state::{self, ServiceKind};
-use pando::{actions, process};
+use pando::{actions, process, services};
 use tempfile::TempDir;
 
 struct Iso {
@@ -659,6 +661,67 @@ fn an_env_key_no_file_in_the_worktree_sets_is_an_error_naming_it() {
     );
     assert!(err.contains("NOWHERE_URL"), "{err}");
     assert!(err.contains(".env.example"), "{err}");
+}
+
+// A fresh clone has no `.env`, so the worktree's one is a copy of the
+// project's example. From then on it is the worktree's own ignored file,
+// and the port rewriting reads it exactly as it reads a linked one: an edit
+// made inside the worktree is what reaches the app, with this worktree's
+// service ports in it.
+#[test]
+fn the_ports_of_a_seeded_env_file_are_rewritten_like_any_other() {
+    let dir = TempDir::new().unwrap();
+    let root = build_fresh_clone(Kind::NextPnpmCompose, dir.path()).root;
+    let home = dir.path().join("pando-home");
+    let paths = paths_for(&home, &root);
+    std::fs::create_dir_all(paths.project_dir()).unwrap();
+    std::fs::write(
+        paths.config_file(),
+        "[project]\nprovision = [\".env\"]\n\
+         provision_from = { \".env\" = \".env.example\" }\n",
+    )
+    .unwrap();
+    let config = config::load(&paths).unwrap().config;
+    let name = actions::new(&paths, &config, "feat/one", None, &|_| {}).unwrap();
+    let worktree = config.worktrees_dir(&paths).join(&name);
+    let seeded = worktree.join(".env");
+    assert!(seeded.is_file(), "the example seeded the worktree's .env");
+
+    let mapping = BTreeMap::from([
+        ("DATABASE_URL".to_string(), "postgres".to_string()),
+        ("REDIS_URL".to_string(), "redis".to_string()),
+    ]);
+    let ports = BTreeMap::from([
+        ("postgres".to_string(), 15432u16),
+        ("redis".to_string(), 16379),
+    ]);
+
+    let env = services::app_env(&worktree, &mapping, &ports).unwrap();
+    assert_eq!(
+        env["DATABASE_URL"],
+        "postgres://acme:acme@localhost:15432/acme"
+    );
+    assert_eq!(env["REDIS_URL"], "redis://localhost:16379");
+
+    // And it is the worktree's file that is read, not the example it came
+    // from: a developer editing their own ignored file is the point of
+    // having one.
+    std::fs::write(
+        &seeded,
+        "DATABASE_URL=postgres://acme:acme@localhost:5432/just_this_worktree\n\
+         REDIS_URL=redis://localhost:6379\n",
+    )
+    .unwrap();
+    let env = services::app_env(&worktree, &mapping, &ports).unwrap();
+    assert_eq!(
+        env["DATABASE_URL"],
+        "postgres://acme:acme@localhost:15432/just_this_worktree"
+    );
+    assert_eq!(
+        common::status_porcelain(&worktree),
+        "",
+        "and none of it shows in the worktree: the file is gitignored"
+    );
 }
 
 #[test]

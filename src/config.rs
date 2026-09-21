@@ -82,8 +82,26 @@ pub struct ProjectSection {
     pub base: Option<String>,
     /// Paths linked or copied into each new worktree. Every entry must be
     /// gitignored in the main checkout; `new` refuses otherwise.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub provision: Vec<String>,
+    ///
+    /// `None` is "nobody has said yet", which detection may answer;
+    /// `Some([])` is "no worktree needs a local file of mine", which is an
+    /// answer a developer gave and which is never asked about again. The
+    /// same distinction `[dev].ports` makes, for the same reason: a
+    /// question nothing can record is asked on every `new`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provision: Option<Vec<String>>,
+    /// Where a provisioned path comes from when the main checkout has no
+    /// file to link: destination to source, both relative to the
+    /// repository root.
+    ///
+    /// A fresh clone has no `.env` — it is gitignored, so it never arrives
+    /// — while `.env.example` is right there, tracked. Seeding from it is
+    /// an answer to the provision question, never an automatic behaviour,
+    /// and the file that lands in the worktree is always a **copy**: a
+    /// symlink to the tracked example would make the worktree's own edits
+    /// writes into the repository.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub provision_from: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "ProvisionMode::is_default")]
     pub provision_mode: ProvisionMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -93,6 +111,12 @@ pub struct ProjectSection {
 impl ProjectSection {
     fn is_empty(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// The paths to provision, with "nobody has said" and "nothing, on
+    /// purpose" both reading as the empty list.
+    pub fn provision_paths(&self) -> &[String] {
+        self.provision.as_deref().unwrap_or_default()
     }
 }
 
@@ -913,20 +937,32 @@ pub fn validate(config: &Config, project: &ProjectRef) -> Result<()> {
             bail!("probe {:?} has no cmd", probe.name);
         }
     }
-    for entry in &config.project.provision {
-        let path = Path::new(entry);
-        if path.is_absolute() {
-            bail!("provision path {entry:?} must be relative to the repository root");
-        }
-        if path
-            .components()
-            .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
-        {
-            bail!("provision path {entry:?} must not escape the repository root");
-        }
-        if entry.trim().is_empty() {
-            bail!("provision paths must not be empty");
-        }
+    for entry in config.project.provision_paths() {
+        validate_repository_relative("provision path", entry)?;
+    }
+    // Both halves: the destination is written inside a worktree, and the
+    // source is read out of the repository. A `..` in either one is pando
+    // reaching somewhere it does not own.
+    for (destination, source) in &config.project.provision_from {
+        validate_repository_relative("provision_from path", destination)?;
+        validate_repository_relative("provision_from source", source)?;
+    }
+    Ok(())
+}
+
+fn validate_repository_relative(label: &str, entry: &str) -> Result<()> {
+    let path = Path::new(entry);
+    if entry.trim().is_empty() {
+        bail!("{label}s must not be empty");
+    }
+    if path.is_absolute() {
+        bail!("{label} {entry:?} must be relative to the repository root");
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
+    {
+        bail!("{label} {entry:?} must not escape the repository root");
     }
     Ok(())
 }

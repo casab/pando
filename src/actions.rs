@@ -77,7 +77,7 @@ pub fn new(
     // non-ignored file is refused with the path named, not fixed up. The
     // worktree gets asked again once it exists, because it may have a
     // different `.gitignore` checked out.
-    for rel in &config.project.provision {
+    for rel in config.project.provision_paths() {
         ensure_gitignored(&root, rel)?;
     }
 
@@ -1173,25 +1173,31 @@ pub fn resolve_on(
                     "{} takes one of its {offered} options, not several",
                     slot_label(*slot)
                 ),
-                // Written down as an empty list rather than left out: "this
-                // process has no ports" and "nobody has said yet" have to
-                // be different states, or the question returns on every
-                // start and the answer is a port nothing will ever bind.
-                Answer::None if *slot == Slot::PortEnv => {
-                    let (table, key) = Slot::PortEnv.key().expect("the port slot writes one key");
+                // Written down as an empty list rather than left out:
+                // "this process has no ports" and "no worktree needs a
+                // local file of mine" both have to be tellable from
+                // "nobody has said yet", or the question returns on every
+                // run with nowhere to put the answer but the TOML by hand.
+                Answer::None if matches!(*slot, Slot::PortEnv | Slot::Provision) => {
+                    let (table, key) = slot.key().expect("both of these write one key");
                     config::set_detected(
                         paths,
-                        Slot::PortEnv.layer(),
+                        slot.layer(),
                         table,
                         key,
                         toml_edit::Value::Array(toml_edit::Array::new()),
                         config::Note::Answered,
                     )?;
-                    config
-                        .processes
-                        .entry(detect::DEV.to_string())
-                        .or_default()
-                        .ports = Some(config::PortsSpec::List(Vec::new()));
+                    match slot {
+                        Slot::PortEnv => {
+                            config
+                                .processes
+                                .entry(detect::DEV.to_string())
+                                .or_default()
+                                .ports = Some(config::PortsSpec::List(Vec::new()));
+                        }
+                        _ => config.project.provision = Some(Vec::new()),
+                    }
                     continue;
                 }
                 Answer::None => bail!("{} has no \"none\" answer", slot_label(*slot)),
@@ -1307,11 +1313,14 @@ fn question_for(proposal: &detect::Proposal, details: &[String]) -> Question {
         // A set answer takes the options as they are; there is no command
         // to type in place of "which of these containers".
         allow_custom: !proposal.slot.is_multi(),
-        // "This process has no port", "none of those services", and "this
-        // machine needs nothing in front of its commands": three slots
-        // whose empty answer means something and has to be recordable.
-        allow_none: matches!(proposal.slot, Slot::PortEnv | Slot::Prelude)
-            || proposal.slot.is_multi(),
+        // "This process has no port", "none of those services", "this
+        // machine needs nothing in front of its commands", and "no
+        // worktree needs a local file of mine": four slots whose empty
+        // answer means something and has to be recordable.
+        allow_none: matches!(
+            proposal.slot,
+            Slot::PortEnv | Slot::Prelude | Slot::Provision
+        ) || proposal.slot.is_multi(),
         multi: proposal.slot.is_multi(),
         checked: proposal.preselected(),
         details: details.to_vec(),
@@ -1341,7 +1350,10 @@ fn already_answered(slot: Slot, config: &Config) -> bool {
         // ""` is "this machine needs nothing", and a developer who has
         // said that is not asked again.
         Slot::Prelude => config.runtime.prelude.is_some(),
-        Slot::Provision => !config.project.provision.is_empty(),
+        // Unset, not empty: `provision = []` is a developer saying no
+        // worktree needs a local file of theirs, and an answer nothing
+        // records is asked again on every `new`.
+        Slot::Provision => config.project.provision.is_some(),
         Slot::Services => !config.services.is_empty(),
         Slot::SchemaHook => !config.hooks.is_empty(),
         // Both of these now live in one place, because they are the same
@@ -4323,18 +4335,31 @@ fn ensure_gitignored(dir: &Path, rel: &str) -> Result<()> {
 /// authorising `check-ignore` is re-run there, immediately before each
 /// write.
 fn provision_worktree_files(paths: &PandoPaths, config: &Config, worktree: &Path) -> Result<()> {
-    for rel in &config.project.provision {
-        let src = paths.root().join(rel);
+    for rel in config.project.provision_paths() {
         let dst = worktree.join(rel);
-        if !src.exists() || dst.exists() {
+        if dst.exists() {
             continue;
         }
+        let Some((src, seeded)) = provision_source(paths, config, rel) else {
+            continue;
+        };
+        // Invariant 1, checked in the worktree the file lands in and
+        // immediately before the write — a seeded file is no different, and
+        // the example it comes from being tracked buys it nothing.
         ensure_gitignored(worktree, rel)?;
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create dir {}", parent.display()))?;
         }
-        match config.project.provision_mode {
+        // A seed is always copied, whatever the mode says. A symlink to the
+        // tracked example would make every edit inside the worktree a write
+        // into the repository, which is the invariant this whole path
+        // exists to keep.
+        let mode = match seeded {
+            true => ProvisionMode::Copy,
+            false => config.project.provision_mode,
+        };
+        match mode {
             ProvisionMode::Link => std::os::unix::fs::symlink(&src, &dst)
                 .with_context(|| format!("symlink {} → {}", src.display(), dst.display()))?,
             ProvisionMode::Copy => {
@@ -4344,6 +4369,22 @@ fn provision_worktree_files(paths: &PandoPaths, config: &Config, worktree: &Path
         }
     }
     Ok(())
+}
+
+/// Where a provisioned path's contents come from, and whether that is the
+/// project's own example rather than a local file.
+///
+/// The main checkout's own file first: an example is the fallback for a
+/// clone that has none, and the moment the developer writes their real one
+/// it is what every new worktree gets. `None` when there is nothing to copy
+/// from, which is skipped rather than invented.
+fn provision_source(paths: &PandoPaths, config: &Config, rel: &str) -> Option<(PathBuf, bool)> {
+    let src = paths.root().join(rel);
+    if src.exists() {
+        return Some((src, false));
+    }
+    let seed = paths.root().join(config.project.provision_from.get(rel)?);
+    seed.exists().then_some((seed, true))
 }
 
 fn ref_exists(root: &Path, refname: &str) -> bool {
@@ -8546,7 +8587,10 @@ time.sleep(300)
             Some("pnpm install --frozen-lockfile")
         );
         assert_eq!(config.runtime.version_files, vec![".nvmrc"]);
-        assert_eq!(config.project.provision, vec![".env"]);
+        assert_eq!(
+            config.project.provision.as_deref(),
+            Some(&[".env".to_string()][..])
+        );
         assert!(
             config.processes.is_empty(),
             "new does not need the dev command yet"
@@ -9206,7 +9250,7 @@ time.sleep(300)
     #[test]
     fn new_refuses_a_provision_path_that_is_not_gitignored() {
         let mut fx = fixture();
-        fx.config.project.provision = vec!["README.md".into()];
+        fx.config.project.provision = Some(vec!["README.md".into()]);
         let err = new(&fx.paths, &fx.config, "feat/one", None, &noop).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("not ignored"), "{msg}");
@@ -9220,7 +9264,7 @@ time.sleep(300)
     #[test]
     fn new_refuses_a_provision_path_outside_the_repository() {
         let mut fx = fixture();
-        fx.config.project.provision = vec!["../escape.env".into()];
+        fx.config.project.provision = Some(vec!["../escape.env".into()]);
         let err = new(&fx.paths, &fx.config, "feat/one", None, &noop).unwrap_err();
         assert!(
             format!("{err:#}").contains("check-ignore"),
@@ -9231,7 +9275,7 @@ time.sleep(300)
     #[test]
     fn provisioned_files_are_symlinked_by_default_and_copied_on_request() {
         let mut fx = fixture();
-        fx.config.project.provision = vec![".env".into()];
+        fx.config.project.provision = Some(vec![".env".into()]);
         let name = new(&fx.paths, &fx.config, "feat/link", None, &noop).unwrap();
         let linked = fx.worktrees_dir().join(&name).join(".env");
         assert!(
@@ -9260,9 +9304,157 @@ time.sleep(300)
     fn a_missing_provision_source_is_skipped_rather_than_invented() {
         let mut fx = fixture();
         std::fs::remove_file(fx.root.join(".env")).unwrap();
-        fx.config.project.provision = vec![".env".into()];
+        fx.config.project.provision = Some(vec![".env".into()]);
         let name = new(&fx.paths, &fx.config, "feat/one", None, &noop).unwrap();
         assert!(!fx.worktrees_dir().join(&name).join(".env").exists());
+    }
+
+    /// The fixture as a fresh clone leaves it: the example is tracked and
+    /// here, the local file it is an example of is gitignored and never
+    /// arrived.
+    fn fresh_clone_fixture() -> Fx {
+        let fx = fixture();
+        std::fs::remove_file(fx.root.join(".env")).unwrap();
+        std::fs::write(fx.root.join(".env.example"), EXAMPLE).unwrap();
+        git(&fx.root, &["add", "."]);
+        git(&fx.root, &["commit", "--quiet", "-m", "ship an example"]);
+        fx
+    }
+
+    const EXAMPLE: &str = "PORT=3000\nDATABASE_URL=postgres://acme@localhost:5432/acme\n";
+
+    fn seeded(fx: &Fx) -> Config {
+        let mut config = fx.config.clone();
+        config.project.provision = Some(vec![".env".to_string()]);
+        config.project.provision_from =
+            BTreeMap::from([(".env".to_string(), ".env.example".to_string())]);
+        config
+    }
+
+    // A fresh clone has nothing gitignored and present, so there was
+    // nothing to provision and no question either — and every worktree came
+    // out without the file the app reads.
+    #[test]
+    fn a_clone_with_no_local_files_is_offered_the_example_beside_them() {
+        let fx = fresh_clone_fixture();
+        let (ask, asked) = scripted(vec![Answer::Choice(0)]);
+        let config = resolve_for_new(&fx.paths, &fx.config, &ask, &noop).unwrap();
+
+        let questions = asked.borrow();
+        assert_eq!(
+            questions.iter().map(|q| q.slot).collect::<Vec<_>>(),
+            vec![Slot::Provision],
+            "copying a tracked example into a worktree is asked, never assumed"
+        );
+        assert!(
+            questions[0].allow_none,
+            "and it has to be declinable, or it is asked on every new"
+        );
+        assert_eq!(config.project.provision_paths(), [".env".to_string()]);
+        assert_eq!(config.project.provision_from[".env"], ".env.example");
+
+        let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+        assert!(written.contains(r#"provision = [".env"]"#), "{written}");
+        assert!(
+            written.contains(r#"provision_from = { ".env" = ".env.example" }"#),
+            "{written}"
+        );
+
+        // Asked once: the file pando wrote loads and answers the slot.
+        let loaded = crate::config::load(&fx.paths).unwrap();
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        resolve_for_new(&fx.paths, &loaded.config, &refuse, &noop).unwrap();
+    }
+
+    // "No thanks" is an answer. Without somewhere to put it the question
+    // came back on every `new`, which is the thing "ask once" is about.
+    #[test]
+    fn declining_the_provision_question_is_written_down_as_no_files() {
+        let fx = fresh_clone_fixture();
+        let (ask, _) = scripted(vec![Answer::None]);
+        let config = resolve_for_new(&fx.paths, &fx.config, &ask, &noop).unwrap();
+        assert_eq!(config.project.provision, Some(Vec::new()));
+
+        let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+        assert!(
+            written.contains("provision = []"),
+            "an empty list, so it reads as answered rather than missing: {written}"
+        );
+        resolve_for_new(&fx.paths, &config, &refuse, &noop).unwrap();
+    }
+
+    // Invariant 1: the file lands in the worktree, so the worktree's own
+    // gitignore authorises it — and it is a copy, because a symlink to the
+    // tracked example would make every edit in the worktree a write into
+    // the repository.
+    #[test]
+    fn a_seeded_file_is_a_copy_of_the_example_and_never_a_link_to_it() {
+        let fx = fresh_clone_fixture();
+        let config = seeded(&fx);
+        let name = new(&fx.paths, &config, "feat/one", None, &noop).unwrap();
+        let seeded_file = fx.worktrees_dir().join(&name).join(".env");
+        assert!(
+            !std::fs::symlink_metadata(&seeded_file)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "a link would put the worktree's edits inside the repository"
+        );
+        assert_eq!(std::fs::read_to_string(&seeded_file).unwrap(), EXAMPLE);
+        assert_eq!(
+            std::fs::read_to_string(fx.root.join(".env.example")).unwrap(),
+            EXAMPLE,
+            "and the example itself is untouched"
+        );
+        assert!(!fx.root.join(".env").exists(), "nothing was written here");
+    }
+
+    // The example is the fallback, not the source. The moment the developer
+    // writes their own file, that is what every new worktree gets — and it
+    // is linked, as it always was.
+    #[test]
+    fn the_checkouts_own_file_beats_the_example_it_would_have_been_seeded_from() {
+        let fx = fresh_clone_fixture();
+        std::fs::write(fx.root.join(".env"), "SECRET=real\n").unwrap();
+        let config = seeded(&fx);
+        let name = new(&fx.paths, &config, "feat/one", None, &noop).unwrap();
+        let provisioned = fx.worktrees_dir().join(&name).join(".env");
+        assert!(
+            std::fs::symlink_metadata(&provisioned)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "a real local file is linked, exactly as before"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&provisioned).unwrap(),
+            "SECRET=real\n"
+        );
+    }
+
+    // The gitignore that authorises the write is the worktree's, and a
+    // branch can carry an older one. A seeded file is no exception, and the
+    // refusal has to unwind the worktree it was discovered in.
+    #[test]
+    fn a_branch_that_does_not_ignore_the_seeded_file_is_refused_and_unwound() {
+        let fx = fresh_clone_fixture();
+        git(&fx.root, &["checkout", "--quiet", "-b", "legacy"]);
+        std::fs::write(fx.root.join(".gitignore"), "node_modules/\n").unwrap();
+        git(
+            &fx.root,
+            &["commit", "--quiet", "-am", "an older gitignore"],
+        );
+        git(&fx.root, &["checkout", "--quiet", "main"]);
+
+        let config = seeded(&fx);
+        let err = new(&fx.paths, &config, "legacy", None, &noop).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not ignored"), "{msg}");
+        assert!(msg.contains(".env"), "{msg}");
+        assert!(
+            fx.names().is_empty(),
+            "the half-created worktree must have been unwound"
+        );
     }
 
     #[test]
@@ -9379,7 +9571,7 @@ time.sleep(300)
     #[test]
     fn a_provisioned_env_file_does_not_block_removal() {
         let mut fx = fixture();
-        fx.config.project.provision = vec![".env".into()];
+        fx.config.project.provision = Some(vec![".env".into()]);
         let name = new(&fx.paths, &fx.config, "feat/one", None, &noop).unwrap();
         rm(&fx.paths, &name, false, false).unwrap();
         assert!(fx.names().is_empty());
@@ -9590,7 +9782,7 @@ time.sleep(300)
     #[test]
     fn a_refused_rm_leaves_the_provisioned_files_alone() {
         let mut fx = fixture();
-        fx.config.project.provision = vec![".env".into()];
+        fx.config.project.provision = Some(vec![".env".into()]);
         let name = new(&fx.paths, &fx.config, "feat/p", None, &noop).unwrap();
         let worktree = fx.worktrees_dir().join(&name);
         let env = worktree.join(".env");
@@ -9696,7 +9888,7 @@ time.sleep(300)
     fn a_refusal_after_the_worktree_exists_unwinds_it() {
         let mut fx = fixture();
         with_a_branch_that_does_not_ignore(&fx, "local.pando", "legacy");
-        fx.config.project.provision = vec!["local.pando".into()];
+        fx.config.project.provision = Some(vec!["local.pando".into()]);
 
         // A forked branch is pando's own doing, so it goes too.
         let err = new(&fx.paths, &fx.config, "feat/new", Some("legacy"), &noop).unwrap_err();

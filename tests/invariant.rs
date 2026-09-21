@@ -14,7 +14,7 @@ mod common;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use common::{Kind, build, git, git_raw, paths_for, status_porcelain};
+use common::{Kind, build, build_fresh_clone, git, git_raw, paths_for, status_porcelain};
 use pando::config::{self, Config};
 use pando::{actions, state};
 use tempfile::TempDir;
@@ -126,12 +126,40 @@ fn harness_with(config_toml: &str) -> Harness {
 }
 
 fn harness_of(kind: Kind, config_toml: &str) -> Harness {
+    let h = harness_built(kind, config_toml, true);
+    assert!(
+        h.baseline.contains_key(".env"),
+        "the fixture must have an ignored .env to provision"
+    );
+    h
+}
+
+/// A fixture as a fresh clone leaves it: the gitignored local files never
+/// arrived, so the project's own example is the only thing a worktree could
+/// be given a copy of.
+fn fresh_clone_harness(kind: Kind, config_toml: &str) -> Harness {
+    let h = harness_built(kind, config_toml, false);
+    assert!(
+        !h.baseline.contains_key(".env"),
+        "a fresh clone has no .env — that is the whole case"
+    );
+    assert!(
+        h.baseline.contains_key(".env.example"),
+        "and it does have the example, tracked"
+    );
+    h
+}
+
+fn harness_built(kind: Kind, config_toml: &str, local_files: bool) -> Harness {
     let dir = TempDir::new().unwrap();
     // Canonical throughout: on macOS the temp dir is /var/... but git (and
     // every path pando canonicalises) says /private/var/..., and the
     // comparisons below are all path equality.
     let parent = std::fs::canonicalize(dir.path()).unwrap();
-    let root = build(kind, &parent).root;
+    let root = match local_files {
+        true => build(kind, &parent).root,
+        false => build_fresh_clone(kind, &parent).root,
+    };
     let home = parent.join("pando-home");
     let paths = paths_for(&home, &root);
 
@@ -143,10 +171,6 @@ fn harness_of(kind: Kind, config_toml: &str) -> Harness {
     assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
 
     let baseline = tree(&root);
-    assert!(
-        baseline.contains_key(".env"),
-        "the fixture must have an ignored .env to provision"
-    );
     Harness {
         parent,
         root: paths.root().to_path_buf(),
@@ -222,7 +246,7 @@ fn every_command_leaves_the_repository_untouched() {
 #[test]
 fn a_refused_command_leaves_the_repository_untouched() {
     let mut h = harness();
-    h.config.project.provision = vec!["README.md".into()];
+    h.config.project.provision = Some(vec!["README.md".into()]);
     assert!(
         actions::new(&h.paths, &h.config, "feat/one", None, &|_| {}).is_err(),
         "README.md is tracked, so provisioning it must be refused"
@@ -369,7 +393,7 @@ fn a_branch_whose_gitignore_lacks_the_provision_path_is_refused() {
     git(&h.root, &["commit", "--quiet", "-am", "legacy gitignore"]);
     git(&h.root, &["checkout", "--quiet", "main"]);
 
-    h.config.project.provision = vec!["local.pando".into()];
+    h.config.project.provision = Some(vec!["local.pando".into()]);
     h.baseline = tree(&h.root);
 
     let err = actions::new(&h.paths, &h.config, "legacy", None, &|_| {}).unwrap_err();
@@ -406,7 +430,7 @@ fn an_uncommitted_gitignore_edit_does_not_authorise_a_write_into_a_worktree() {
     )
     .unwrap();
     std::fs::write(h.root.join("secrets.local"), "TOKEN=1\n").unwrap();
-    h.config.project.provision = vec!["secrets.local".into()];
+    h.config.project.provision = Some(vec!["secrets.local".into()]);
 
     // The edit itself is the user's, so the comparison is against the tree
     // as they left it rather than against an empty `git status`.
@@ -1045,6 +1069,78 @@ fn a_failed_install_leaves_the_repository_and_the_worktree_alone() {
     let worktree = h.config.worktrees_dir(&h.paths).join("feat+one");
     assert!(worktree.is_dir(), "the worktree survives a failed install");
     h.assert_untouched("a failed install", Some(&worktree));
+}
+
+// A fresh clone has no `.env` to link, and the project's own `.env.example`
+// is right there. Seeding from it is still a write *into a worktree*, so it
+// is held to Invariant 1 in full: the worktree's own gitignore authorises
+// it, nothing lands in the repository, and the file is a copy — a symlink
+// to the tracked example would make the worktree's edits writes into the
+// repository by the back door.
+#[test]
+fn seeding_a_worktree_env_file_from_the_example_writes_nothing_into_the_repository() {
+    let h = fresh_clone_harness(
+        Kind::NextPnpmCompose,
+        "[project]\nprovision = [\".env\"]\nprovision_from = { \".env\" = \".env.example\" }\n",
+    );
+    h.assert_untouched("setup", None);
+
+    let name = actions::new(&h.paths, &h.config, "feat/one", None, &|_| {}).unwrap();
+    let worktree = h.config.worktrees_dir(&h.paths).join(&name);
+    h.assert_untouched("new with a seeded provision source", Some(&worktree));
+
+    let seeded = worktree.join(".env");
+    let example = std::fs::read_to_string(h.root.join(".env.example")).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&seeded).unwrap(),
+        example,
+        "the worktree got the example's contents"
+    );
+    assert!(
+        !std::fs::symlink_metadata(&seeded)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "a link would make an edit in the worktree a write into the repository"
+    );
+    assert!(
+        !h.root.join(".env").exists(),
+        "and nothing was created in the main checkout"
+    );
+
+    actions::rm(&h.paths, &name, false, false, &|_| {}).unwrap();
+    h.assert_untouched("rm", None);
+}
+
+// The same file, on a branch whose committed gitignore never had the rule.
+// The worktree is what has the last word, and the refusal has to unwind
+// everything it created.
+#[test]
+fn a_branch_that_does_not_ignore_a_seeded_file_is_refused_and_leaves_nothing() {
+    let mut h = fresh_clone_harness(
+        Kind::NextPnpmCompose,
+        "[project]\nprovision = [\".env\"]\nprovision_from = { \".env\" = \".env.example\" }\n",
+    );
+    git(&h.root, &["checkout", "--quiet", "-b", "legacy"]);
+    std::fs::write(h.root.join(".gitignore"), "node_modules/\n.next/\n").unwrap();
+    git(&h.root, &["commit", "--quiet", "-am", "an older gitignore"]);
+    git(&h.root, &["checkout", "--quiet", "main"]);
+    h.baseline = tree(&h.root);
+
+    let err = actions::new(&h.paths, &h.config, "legacy", None, &|_| {}).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("not ignored"), "{msg}");
+    assert!(msg.contains(".env"), "{msg}");
+
+    h.assert_untouched("a seeded write the worktree refused", None);
+    assert!(
+        actions::ls(&h.paths).unwrap().is_empty(),
+        "the half-created worktree must have been unwound"
+    );
+    assert!(
+        !h.config.worktrees_dir(&h.paths).join("legacy").exists(),
+        "the worktree directory must be gone"
+    );
 }
 
 // The runtime question is about the machine, so its answer goes to the
