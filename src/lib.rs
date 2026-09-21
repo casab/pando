@@ -25,6 +25,7 @@ pub mod ports;
 pub mod process;
 pub mod project;
 pub mod services;
+pub mod share_proxy;
 pub mod state;
 pub mod template;
 #[cfg(test)]

@@ -106,6 +106,17 @@ pub fn group_alive(pgid: i32) -> bool {
     }
 }
 
+/// Single-quotes one word of a `bash -lc` command line, with any single
+/// quote inside closed, escaped, and reopened.
+///
+/// Here rather than beside a caller because every command pando builds ends
+/// up in [`SpawnOptions::shell_cmd`], and a home directory or a worktree
+/// path with a space in it is ordinary: a word that is not quoted is a
+/// command that runs something else.
+pub fn shell_quote(word: &str) -> String {
+    format!("'{}'", word.replace('\'', "'\\''"))
+}
+
 /// SIGTERM to the whole group, then SIGKILL to whatever is left after
 /// `grace`. Returns once the group is empty, or once it has been SIGKILLed.
 ///

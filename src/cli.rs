@@ -14,6 +14,7 @@ use crate::cache;
 use crate::config::Config;
 use crate::log_tail::{self, LogLevel};
 use crate::paths::PandoPaths;
+use crate::share_proxy;
 use crate::state::{Phase, ProcessRecord, WorktreeRecord};
 use crate::worktree::{PrState, Worktree};
 
@@ -141,6 +142,15 @@ pub enum Command {
         /// One JSON object per line: timestamp, level, text.
         #[arg(long)]
         json: bool,
+    },
+    /// The share proxy. Spawned by `share`, never run by hand: it reads its
+    /// cookie from the environment and would have nothing to inject.
+    #[command(name = share_proxy::SUBCOMMAND, hide = true)]
+    ShareProxy {
+        #[arg(long)]
+        listen: u16,
+        #[arg(long)]
+        upstream: u16,
     },
 }
 
@@ -276,7 +286,26 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             follow,
             json,
         } => logs(paths, &name, &source, tail, follow, json, &mut out),
+        // Never reached: `main` runs the proxy before it goes looking for a
+        // repository, because the proxy has none.
+        Command::ShareProxy { listen, upstream } => run_share_proxy(listen, upstream),
     }
+}
+
+/// Runs the share proxy, reading its cookie from the environment.
+///
+/// Called from `main` before project discovery: the proxy's working
+/// directory is a temp directory, it has no repository and no config, and
+/// the one thing it needs is an environment variable.
+pub fn run_share_proxy(listen: u16, upstream: u16) -> Result<()> {
+    let cookie = std::env::var(share_proxy::ENV_COOKIE).with_context(|| {
+        format!(
+            "{} is not set — `{}` is spawned by `pando share`, not run by hand",
+            share_proxy::ENV_COOKIE,
+            share_proxy::SUBCOMMAND
+        )
+    })?;
+    share_proxy::run_in_process(listen, upstream, &cookie)
 }
 
 /// Everything pando narrates goes to stderr, so a command's stdout stays

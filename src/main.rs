@@ -37,6 +37,12 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    // Before anything looks for a repository. The share proxy runs detached
+    // from a temp directory, with no project, no config and no home to
+    // guard — one environment variable and two ports are all it has.
+    if let Some(pando::cli::Command::ShareProxy { listen, upstream }) = cli.command {
+        return pando::cli::run_share_proxy(listen, upstream);
+    }
     let cwd = std::env::current_dir().context(
         "cannot read the current directory — it may have been deleted; cd somewhere that exists",
     )?;

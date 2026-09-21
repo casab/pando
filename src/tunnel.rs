@@ -153,7 +153,7 @@ fn program_is_runnable(program: &Path) -> bool {
         .arg("-c")
         .arg(format!(
             "command -v {} >/dev/null 2>&1",
-            shell_single_quote(&program.to_string_lossy())
+            process::shell_quote(&program.to_string_lossy())
         ))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -179,8 +179,8 @@ pub fn start_tunnel(paths: &PandoPaths, name: &str, local_port: u16) -> Result<T
     let shell_cmd = format!(
         "exec {program} tunnel --no-autoupdate --output default --config {config} \
          --url http://127.0.0.1:{local_port}",
-        program = shell_single_quote(&cloudflared_program(paths).to_string_lossy()),
-        config = shell_single_quote(&config_path.to_string_lossy()),
+        program = process::shell_quote(&cloudflared_program(paths).to_string_lossy()),
+        config = process::shell_quote(&config_path.to_string_lossy()),
     );
     // Not the worktree: a tunnel holding a directory open is one more
     // reason `rm` cannot remove it, and the tunnel needs nothing from there.
@@ -328,23 +328,6 @@ fn tail_log(path: &Path) -> String {
         return "(empty log)".to_string();
     }
     last.into_iter().rev().collect::<Vec<_>>().join(" | ")
-}
-
-/// Single-quotes a string for a `bash -lc` command line. A home directory
-/// with a space in it is ordinary; a shim path that is not quoted is a
-/// command that runs the wrong thing.
-pub fn shell_single_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for c in s.chars() {
-        if c == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(c);
-        }
-    }
-    out.push('\'');
-    out
 }
 
 #[cfg(test)]
@@ -563,7 +546,7 @@ mod tests {
         let spawn = process::spawn_detached(SpawnOptions {
             shell_cmd: &format!(
                 "exec {}",
-                shell_single_quote(&cloudflared_program(&fx.paths).to_string_lossy())
+                process::shell_quote(&cloudflared_program(&fx.paths).to_string_lossy())
             ),
             cwd: &std::env::temp_dir(),
             log_file: &log,
@@ -707,10 +690,10 @@ mod tests {
     #[test]
     fn a_shim_path_with_a_space_in_it_is_quoted() {
         assert_eq!(
-            shell_single_quote("/tmp/x y/cloudflared"),
+            process::shell_quote("/tmp/x y/cloudflared"),
             "'/tmp/x y/cloudflared'"
         );
-        assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
+        assert_eq!(process::shell_quote("a'b"), "'a'\\''b'");
     }
 
     #[test]
