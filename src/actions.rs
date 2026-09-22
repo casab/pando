@@ -6451,6 +6451,67 @@ mod tests {
         ));
     }
 
+    /// A desktop application, a worker, a watcher: something that owns no
+    /// port and never will. `ports = []` is a written answer, and it has
+    /// to be a workable one — a readiness rule that waits for a socket
+    /// nobody ever opens would leave every such project hanging until the
+    /// start timeout failed it.
+    ///
+    /// Through `refresh`, so the liveness check and the port scan are the
+    /// real ones rather than closures saying what this test would like to
+    /// hear.
+    #[test]
+    fn a_process_that_owns_no_ports_starts_and_reaches_running() {
+        let mut fx = fixture();
+        with_dev(
+            &mut fx,
+            ProcessConfig {
+                cmd: "sleep 30".to_string(),
+                ports: Some(crate::config::PortsSpec::List(Vec::new())),
+                ..Default::default()
+            },
+        );
+        let name = worktree_named(&fx, "feat/one");
+
+        let began = Instant::now();
+        let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+        let _guard = guard(&outcome);
+        assert!(
+            began.elapsed() < Duration::from_secs(10),
+            "start never waits on a readiness that cannot come: {:?}",
+            began.elapsed()
+        );
+        assert!(outcome.ports.is_empty(), "no roles, so no ports");
+        assert_eq!(outcome.started[0].record.ready_port, None);
+        assert_eq!(outcome.url, None, "and nothing to point a browser at");
+
+        let phase = refresh(&fx.paths).state.worktrees[&name].processes["dev"]
+            .phase
+            .clone();
+        assert!(
+            matches!(phase, Phase::Running { .. }),
+            "alive is the whole of ready for a process with no port: {phase:?}"
+        );
+
+        // And it stays there. Reaching Running is what takes it out of the
+        // reach of the start timeout, so a second read is the proof that
+        // nothing pulls it back.
+        for _ in 0..3 {
+            std::thread::sleep(Duration::from_millis(100));
+            let again = refresh(&fx.paths).state.worktrees[&name].processes["dev"]
+                .phase
+                .clone();
+            assert!(matches!(again, Phase::Running { .. }), "{again:?}");
+        }
+        assert_eq!(
+            state::aggregate_phase(&fx.state().worktrees[&name])
+                .expect("a phase")
+                .word(),
+            "running",
+            "and the worktree reads as running, which is what a list shows"
+        );
+    }
+
     #[test]
     fn a_ready_role_the_process_does_not_own_is_refused() {
         let mut fx = fixture();
