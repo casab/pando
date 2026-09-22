@@ -1,0 +1,1810 @@
+//! Tests for `detect`.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+use tempfile::{TempDir, tempdir};
+
+use crate::catalog::package_managers;
+use crate::config::{Config, PortsSpec, ProcessConfig};
+
+use super::*;
+use super::{apply::*, dev::*, services::*, signals::*, workspaces::*};
+
+fn scripts(pairs: &[(&str, &str)]) -> Signals {
+    Signals {
+        scripts: pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        ..Default::default()
+    }
+}
+
+/// Env example keys with values nothing reads, for the port rules.
+fn env_pairs(keys: &[&str]) -> Vec<(String, String)> {
+    keys.iter()
+        .map(|k| (k.to_string(), "1".to_string()))
+        .collect()
+}
+
+fn with_lock(mut signals: Signals, lock: &str) -> Signals {
+    signals.lockfiles.push(lock.to_string());
+    signals
+}
+
+fn values(proposal: &Proposal) -> Vec<&str> {
+    proposal
+        .candidates
+        .iter()
+        .map(|c| c.value.as_str())
+        .collect()
+}
+
+fn dev_of(signals: &Signals, rule: Option<&'static FrameworkRule>) -> Proposal {
+    dev_cmd_proposal(signals, rule).expect("a dev command")
+}
+
+// ---- parsing ---------------------------------------------------------
+
+#[test]
+fn scripts_come_out_of_a_package_json() {
+    let manifest = r#"{"name":"x","scripts":{"dev":"next dev","build":"next build"}}"#;
+    let parsed = parse_scripts(manifest);
+    assert_eq!(parsed["dev"], "next dev");
+    assert_eq!(parsed.len(), 2);
+    assert!(parse_scripts("not json").is_empty());
+    assert!(parse_scripts(r#"{"name":"x"}"#).is_empty());
+}
+
+#[test]
+fn make_and_just_targets_yield_their_recipes() {
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Makefile"),
+        ".PHONY: run\nrun:\n\tgo run .\n\nbuild:\n\tgo build ./...\n\nCFLAGS := -O2\n",
+    )
+    .unwrap();
+    let targets = parse_targets(dir.path());
+    assert_eq!(targets["run"].recipe, ["go run ."]);
+    assert_eq!(targets["run"].tool, "make");
+    assert_eq!(targets["build"].recipe, ["go build ./..."]);
+    assert!(
+        !targets.contains_key("CFLAGS"),
+        "a variable assignment is not a target: {targets:?}"
+    );
+    assert!(
+        !targets.contains_key(".PHONY"),
+        "a directive about other targets is not one: {targets:?}"
+    );
+}
+
+// Text after the colon is the prerequisite list in make and in just,
+// never the recipe. `run: build fmt` used to yield `build fmt` as the
+// command that starts the dev server — accepted silently, and written
+// to config with a comment claiming the run target said so.
+#[test]
+fn what_follows_a_target_name_is_prerequisites_not_the_recipe() {
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Makefile"),
+        "run: build fmt\n\tgo run .\n\nbuild:\n\tgo build ./...\n\n\
+             serve: ; python3 -m http.server\n\nall: build run\nnext:\n\techo hi\n",
+    )
+    .unwrap();
+    let targets = parse_targets(dir.path());
+    assert_eq!(
+        targets["run"].recipe,
+        ["go run ."],
+        "the indented line below the target is the recipe: {targets:?}"
+    );
+    assert_eq!(
+        targets["run"].prereqs,
+        ["build", "fmt"],
+        "and what follows the colon is what runs first: {targets:?}"
+    );
+    assert_eq!(
+        targets["serve"].recipe,
+        ["python3 -m http.server"],
+        "make's one-liner form puts the recipe after a semicolon: {targets:?}"
+    );
+    assert!(
+        targets["serve"].prereqs.is_empty(),
+        "the semicolon ends the prerequisites: {targets:?}"
+    );
+    assert!(
+        !targets.contains_key("all"),
+        "a target whose next line is another target has no recipe: {targets:?}"
+    );
+}
+
+/// The shape a first run met: a `dev` target whose recipe is five
+/// lines, the first of them a guard that exits 0 when the tool it
+/// checks for is present. Taking that line alone spawned something
+/// that succeeded and returned in a millisecond, and left an empty log
+/// behind for the developer to read.
+#[test]
+fn a_multi_line_recipe_is_kept_whole_and_started_through_make() {
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Makefile"),
+        "APP := demo\nBIN := build\n\n.PHONY: dev\n\
+             dev:\n\
+             \t@command -v watcher >/dev/null || { echo \"install watcher\"; exit 1; }\n\
+             \t@echo \"watching\"\n\
+             \t@# a comment line\n\
+             \t@killall $(APP) 2>/dev/null; $(BIN)/$(APP) &\n\
+             \t@watcher -o -r Sources/ | while read; do \\\n\
+             \t\tkillall $(APP) 2>/dev/null; \\\n\
+             \t\t$(BIN)/$(APP) & \\\n\
+             \tdone\n",
+    )
+    .unwrap();
+    let targets = parse_targets(dir.path());
+    let dev = &targets["dev"];
+    assert_eq!(
+        dev.recipe.len(),
+        4,
+        "the comment is not a command and the continuation is one line: {dev:?}"
+    );
+    assert!(
+        dev.recipe[0].contains("command -v watcher"),
+        "the guard is the first line, not the whole recipe: {dev:?}"
+    );
+    assert!(
+        dev.recipe[3].starts_with("@watcher") && dev.recipe[3].ends_with("done"),
+        "a trailing backslash continues one command: {dev:?}"
+    );
+    assert_eq!(
+        dev.sole_command(),
+        None,
+        "four commands are not one command: {dev:?}"
+    );
+    assert_eq!(dev.command("dev"), "make dev");
+}
+
+#[test]
+fn a_target_that_is_one_plain_line_is_still_proposed_as_that_line() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("Makefile"), "dev:\n\t@npm run dev\n").unwrap();
+    let targets = parse_targets(dir.path());
+    assert_eq!(
+        targets["dev"].command("dev"),
+        "npm run dev",
+        "no prerequisites, one line, nothing make expands: {targets:?}"
+    );
+}
+
+/// Three reasons a recipe line is not the command, one per test case.
+/// Each on its own would be enough to make the recipe the wrong thing
+/// to propose.
+#[test]
+fn a_prerequisite_a_second_line_or_a_make_variable_all_mean_make() {
+    let cases: [(&str, &str); 4] = [
+        ("run: build\n\t./app\n", "run"),
+        ("run:\n\t./build.sh\n\t./app\n", "run"),
+        ("run:\n\t$(BIN)/app\n", "run"),
+        // `$$` is how a makefile escapes a `$` for the shell, so the
+        // raw line is not what the shell should see either.
+        ("run:\n\techo $$PATH\n", "run"),
+    ];
+    for (makefile, name) in cases {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("Makefile"), makefile).unwrap();
+        let targets = parse_targets(dir.path());
+        assert_eq!(
+            targets[name].command(name),
+            "make run",
+            "{makefile:?} is not representable by one of its lines"
+        );
+    }
+}
+
+/// A justfile is the same judgement with just's spellings: `{{ … }}` is
+/// its interpolation, and `$VAR` is not — just hands that to the shell
+/// exactly as written.
+#[test]
+fn a_justfile_target_is_judged_by_justs_own_expansion() {
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("justfile"),
+        "dev:\n    ./serve --port $PORT\n\nweb:\n    ./serve {{ bin }}\n",
+    )
+    .unwrap();
+    let targets = parse_targets(dir.path());
+    assert_eq!(targets["dev"].tool, "just");
+    assert_eq!(
+        targets["dev"].command("dev"),
+        "./serve --port $PORT",
+        "just passes a shell variable through untouched"
+    );
+    assert_eq!(
+        targets["web"].command("web"),
+        "just web",
+        "but `{{{{ … }}}}` is just's own and means nothing to a shell"
+    );
+}
+
+/// `-` tells make to carry on when the command fails and `+` tells it
+/// to run the line even under `-n`. Both vanish if the line is lifted
+/// out, and both are about the command rather than part of it.
+#[test]
+fn a_line_prefix_that_is_a_directive_keeps_the_target_with_its_runner() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("Makefile"), "dev:\n\t-@./serve\n").unwrap();
+    let targets = parse_targets(dir.path());
+    assert_eq!(targets["dev"].recipe, ["-@./serve"], "the prefix is kept");
+    assert_eq!(targets["dev"].command("dev"), "make dev");
+}
+
+/// A blank line and a column-zero comment sit among recipe lines
+/// without ending the recipe — make ignores both — so a recipe read as
+/// ending at the first of them would be truncated all over again.
+#[test]
+fn a_blank_line_or_a_column_zero_comment_does_not_end_a_recipe() {
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Makefile"),
+        "dev:\n\techo one\n\n# still the dev recipe\n\techo two\n\nbuild:\n\techo three\n",
+    )
+    .unwrap();
+    let targets = parse_targets(dir.path());
+    assert_eq!(targets["dev"].recipe, ["echo one", "echo two"]);
+    assert_eq!(targets["build"].recipe, ["echo three"]);
+}
+
+#[test]
+fn env_example_keys_are_read_in_file_order() {
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".env.example"),
+        "# a comment\nPORT=3000\n\nDB_PORT=5432\nEMPTY\n",
+    )
+    .unwrap();
+    assert_eq!(
+        env_example(dir.path()),
+        vec![
+            ("PORT".to_string(), "3000".to_string()),
+            ("DB_PORT".to_string(), "5432".to_string())
+        ]
+    );
+}
+
+// ---- the dev command -------------------------------------------------
+
+#[test]
+fn a_production_start_script_is_not_a_dev_server() {
+    let signals = with_lock(
+        scripts(&[
+            ("dev", "next dev"),
+            ("start", "next start"),
+            ("build", "next build"),
+            ("lint", "next lint"),
+        ]),
+        "pnpm-lock.yaml",
+    );
+    let proposal = dev_of(&signals, None);
+    assert_eq!(values(&proposal), vec!["pnpm dev"]);
+    assert!(proposal.decided);
+}
+
+// Several candidates with an unambiguous `dev` is still a decision: the
+// developer named it, and pando is only confirming.
+#[test]
+fn an_exact_dev_script_wins_over_its_siblings() {
+    let signals = with_lock(
+        scripts(&[
+            ("dev", "next dev"),
+            ("serve", "http-server"),
+            ("start", "node server.js"),
+        ]),
+        "pnpm-lock.yaml",
+    );
+    let proposal = dev_of(&signals, None);
+    assert_eq!(
+        values(&proposal),
+        vec!["pnpm dev", "pnpm serve", "pnpm start"],
+        "serve outranks start, and both stay on offer"
+    );
+    assert!(proposal.decided, "the one named dev is the answer");
+}
+
+// A `dev` that starts several servers gives one log and one readiness
+// rule for two processes. It works, so it is offered first — but it is
+// not assumed.
+#[test]
+fn a_dev_script_that_fans_out_is_asked_about() {
+    for body in [
+        "concurrently \"npm:dev:*\"",
+        "npm-run-all -p dev:*",
+        "turbo run dev",
+        "pnpm -r --parallel dev",
+    ] {
+        let signals = with_lock(
+            scripts(&[("dev", body), ("dev:web", "next dev")]),
+            "pnpm-lock.yaml",
+        );
+        let proposal = dev_of(&signals, None);
+        assert!(!proposal.decided, "{body:?} should be asked about");
+        assert_eq!(proposal.preferred().unwrap().value, "pnpm dev");
+    }
+}
+
+#[test]
+fn the_runner_comes_from_the_lockfile() {
+    for (lock, expected) in [
+        ("pnpm-lock.yaml", "pnpm dev"),
+        ("package-lock.json", "npm run dev"),
+        ("yarn.lock", "yarn dev"),
+        ("bun.lockb", "bun run dev"),
+    ] {
+        let signals = with_lock(scripts(&[("dev", "next dev")]), lock);
+        assert_eq!(values(&dev_of(&signals, None)), vec![expected]);
+    }
+    // No lockfile at all: npm is the safe default.
+    assert_eq!(
+        values(&dev_of(&scripts(&[("dev", "next dev")]), None)),
+        vec!["npm run dev"]
+    );
+}
+
+#[test]
+fn a_project_with_nothing_to_run_proposes_nothing() {
+    assert!(dev_cmd_proposal(&Signals::default(), None).is_none());
+}
+
+// ---- the port --------------------------------------------------------
+
+#[test]
+fn a_service_port_is_never_offered_as_the_web_port() {
+    let signals = Signals {
+        env_example: env_pairs(&["PORT", "API_PORT", "DB_PORT", "SMTP_PORT", "REDIS_PORT"]),
+        ..Default::default()
+    };
+    let proposal = port_proposal(&signals, None).unwrap();
+    assert_eq!(values(&proposal), vec!["PORT", "API_PORT"]);
+    assert!(!proposal.decided, "two candidates is a question");
+}
+
+// A substring match made `SUPPORT_EMAIL` and `REPORT_URL` port
+// candidates, which turned a slot that resolved silently into a
+// question — and a non-interactive `start` that exited 0 into an exit 3.
+#[test]
+fn only_a_key_that_is_or_ends_with_port_is_a_port() {
+    let signals = Signals {
+        env_example: env_pairs(&[
+            "PORT",
+            "SUPPORT_EMAIL",
+            "REPORT_URL",
+            "IMPORT_PATH",
+            "EXPORT_DIR",
+            "PASSPORT_SECRET",
+            "API_PORT",
+        ]),
+        ..Default::default()
+    };
+    let proposal = port_proposal(&signals, None).unwrap();
+    assert_eq!(
+        values(&proposal),
+        vec!["PORT", "API_PORT"],
+        "support, report, import, export and passport are not ports"
+    );
+}
+
+#[test]
+fn a_framework_convention_answers_the_port_with_no_env_file_at_all() {
+    let go = RULES.iter().find(|r| r.name == "Go").unwrap();
+    let proposal = port_proposal(&Signals::default(), Some(go)).unwrap();
+    assert_eq!(values(&proposal), vec!["PORT"]);
+    assert!(proposal.decided);
+}
+
+// The monorepo shape this was built for: the project names its ports by
+// role in its own env example, and there is no `PORT` to say which of
+// them is *the* one. Two variables are two roles, not two guesses at a
+// single answer.
+#[test]
+fn port_variables_named_by_role_become_several_roles() {
+    let signals = Signals {
+        env_example: env_pairs(&["WEB_PORT", "API_PORT", "DATABASE_PORT"]),
+        ..Default::default()
+    };
+    let proposal = port_proposal(&signals, None).unwrap();
+    let first = proposal.preferred().unwrap();
+    assert_eq!(first.value, "WEB_PORT, API_PORT");
+    assert_eq!(first.why, "WEB_PORT and API_PORT in the env example");
+    assert_eq!(
+        first.ports,
+        Some(PortsSpec::Map(BTreeMap::from([
+            ("WEB_PORT".to_string(), "web".to_string()),
+            ("API_PORT".to_string(), "api".to_string()),
+        ]))),
+        "the database's port belongs to the services slot, never to a role"
+    );
+    assert_eq!(
+        values(&proposal),
+        vec!["WEB_PORT, API_PORT", "WEB_PORT", "API_PORT"],
+        "the single keys stay on offer: pando cannot know one process owns them all"
+    );
+
+    let mut config = Config::default();
+    apply(Slot::PortEnv, first, &mut config);
+    assert_eq!(config.processes[DEV].roles(), vec!["api", "web"]);
+    assert_eq!(
+        config.processes[DEV].port_env()["WEB_PORT"],
+        "{port:web}",
+        "the map form is sugar for the env the app really reads"
+    );
+}
+
+// The project's own declaration beats the convention pando brought with
+// it — and says so, because the note in the file is the only place a
+// developer sees which of the two won.
+#[test]
+fn the_projects_own_port_variables_beat_the_framework_guess() {
+    let next = RULES.iter().find(|r| r.name == "Next.js").unwrap();
+    let signals = Signals {
+        env_example: env_pairs(&["WEB_PORT", "API_PORT"]),
+        ..Default::default()
+    };
+    let proposal = port_proposal(&signals, Some(next)).unwrap();
+    assert_eq!(
+        values(&proposal),
+        vec!["WEB_PORT, API_PORT", "PORT", "WEB_PORT", "API_PORT"],
+        "the framework's PORT is still an option, just not the first one"
+    );
+    assert_eq!(
+        proposal.preferred().unwrap().why,
+        "WEB_PORT and API_PORT in the env example, over the Next.js convention"
+    );
+    assert!(!proposal.decided);
+}
+
+// A project that writes `PORT` has said where its web server's port
+// comes from. The role reading is for a project that named its ports
+// instead, so this one keeps the question it always had.
+#[test]
+fn a_project_that_names_port_keeps_the_single_answer() {
+    let signals = Signals {
+        env_example: env_pairs(&["PORT", "API_PORT"]),
+        ..Default::default()
+    };
+    let proposal = port_proposal(&signals, None).unwrap();
+    assert_eq!(values(&proposal), vec!["PORT", "API_PORT"]);
+    assert!(
+        proposal.candidates.iter().all(|c| c.ports.is_none()),
+        "no candidate here answers with a whole map"
+    );
+}
+
+// Every spelling of a service's port a real project uses. One of these
+// becoming a role would hand the app a port with no database behind it.
+#[test]
+fn a_service_family_port_is_never_one_of_the_apps_roles() {
+    for key in [
+        "DATABASE_PORT",
+        "DATABASE_REPLICA_PORT",
+        "DB_PORT",
+        "READ_DB_PORT",
+        // Every `<something>DB_PORT`: the suffix list this replaced
+        // caught these with a plain `ends_with`, and a word boundary
+        // here would hand each of them a role with nothing behind it.
+        "INFLUXDB_PORT",
+        "COUCHDB_PORT",
+        "DYNAMODB_PORT",
+        "REPLICA_PORT",
+        "REDIS_PORT",
+        "MONGO_PORT",
+        "MONGODB_PORT",
+        "POSTGRES_PORT",
+        "PG_PORT",
+        "MYSQL_PORT",
+        "MARIADB_PORT",
+        "SMTP_PORT",
+        "MAIL_PORT",
+    ] {
+        assert!(is_service_port(key), "{key} is a service's port");
+    }
+    // The prefix arm is word-bounded, so a family that merely *starts*
+    // a longer word is not a match.
+    for key in [
+        "PORT",
+        "WEB_PORT",
+        "API_PORT",
+        "ADMIN_PORT",
+        "DBX_PORT",
+        "PGADMIN_PORT",
+        "METRICS_PORT",
+        "GRPC_PORT",
+    ] {
+        assert!(!is_service_port(key), "{key} is the application's own");
+    }
+}
+
+#[test]
+fn a_multi_role_answer_is_written_as_one_inline_table() {
+    let signals = Signals {
+        env_example: env_pairs(&["WEB_PORT", "API_PORT"]),
+        ..Default::default()
+    };
+    let proposal = port_proposal(&signals, None).unwrap();
+    let edits = edits(Slot::PortEnv, proposal.preferred().unwrap());
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].table, vec!["dev"]);
+    assert_eq!(edits[0].key, "ports");
+    assert_eq!(
+        edits[0].value.to_string().trim(),
+        r#"{ API_PORT = "api", WEB_PORT = "web" }"#
+    );
+}
+
+#[test]
+fn a_framework_that_takes_its_port_in_the_command_has_no_env_question() {
+    let django = RULES.iter().find(|r| r.name == "Django").unwrap();
+    assert!(port_proposal(&Signals::default(), Some(django)).is_none());
+
+    let mut config = Config::default();
+    apply(
+        Slot::DevCmd,
+        &Candidate {
+            value: "python manage.py runserver 127.0.0.1:{port:web}".into(),
+            why: "the Django rule".into(),
+            ports: Some(PortsSpec::List(vec!["web".into()])),
+            ..Candidate::default()
+        },
+        &mut config,
+    );
+    assert!(
+        !still_needed(Slot::PortEnv, &config),
+        "the command already carries the port"
+    );
+}
+
+// ---- framework rules -------------------------------------------------
+
+fn marker_fixture(files: &[(&str, &str)]) -> (TempDir, Signals) {
+    let dir = tempdir().unwrap();
+    for (name, body) in files {
+        let path = dir.path().join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+    let signals = signals(dir.path());
+    (dir, signals)
+}
+
+#[test]
+fn a_marker_file_names_the_framework() {
+    let (dir, s) = marker_fixture(&[("manage.py", "")]);
+    assert_eq!(framework(dir.path(), &s).unwrap().name, "Django");
+    let (dir, s) = marker_fixture(&[("nuxt.config.ts", "")]);
+    assert_eq!(framework(dir.path(), &s).unwrap().name, "Nuxt");
+}
+
+#[test]
+fn a_script_body_names_the_framework_when_no_marker_file_does() {
+    let signals = scripts(&[("dev", "next dev")]);
+    let dir = tempdir().unwrap();
+    assert_eq!(framework(dir.path(), &signals).unwrap().name, "Next.js");
+}
+
+// A crate with no binary has nothing to serve, and proposing
+// `cargo run` for it would be an invention.
+#[test]
+fn a_library_crate_matches_no_framework() {
+    let (dir, s) = marker_fixture(&[("Cargo.toml", "[package]\nname = \"x\"\n\n[lib]\n")]);
+    assert!(framework(dir.path(), &s).is_none());
+
+    let (dir, s) = marker_fixture(&[
+        ("Cargo.toml", "[package]\nname = \"x\"\n"),
+        ("src/main.rs", "fn main() {}"),
+    ]);
+    assert_eq!(framework(dir.path(), &s).unwrap().name, "Rust");
+}
+
+// ---- install ---------------------------------------------------------
+
+// Invariant 1: a lockfile can never change because pando ran an
+// install. Every command here has been checked against its tool's
+// documentation, so the list is the assertion — a new entry has to be
+// added here deliberately.
+#[test]
+fn every_file_the_runtime_reads_is_a_version_file_signal() {
+    for language in crate::runtime::LANGUAGES {
+        for source in language.files {
+            assert!(
+                VERSION_FILES.contains(&source.file),
+                "{} pins {} but signals never looks for it",
+                source.file,
+                language.name
+            );
+        }
+    }
+    for shared in crate::runtime::SHARED_VERSION_FILES {
+        assert!(VERSION_FILES.contains(&shared), "{shared}");
+    }
+}
+
+#[test]
+fn every_install_command_is_a_frozen_one() {
+    const KNOWN_FROZEN: [&str; 7] = [
+        "pnpm install --frozen-lockfile",
+        "npm ci",
+        "yarn install --immutable",
+        "bun install --frozen-lockfile",
+        "uv sync --frozen",
+        "poetry install --sync",
+        "BUNDLE_FROZEN=true bundle install",
+    ];
+    for lock in package_managers::lockfiles() {
+        let Some((cmd, _)) = package_managers::install_for(lock) else {
+            continue;
+        };
+        assert!(
+            KNOWN_FROZEN.contains(&cmd),
+            "{lock} proposes {cmd:?}, which has not been checked against Invariant 1"
+        );
+    }
+}
+
+#[test]
+fn a_build_that_resolves_its_own_modules_gets_no_install_step() {
+    assert!(package_managers::install_for("go.sum").is_none());
+    assert!(package_managers::install_for("Cargo.lock").is_none());
+    let signals = Signals {
+        lockfiles: vec!["go.sum".to_string()],
+        ..Default::default()
+    };
+    assert!(install_proposal(&signals).is_none());
+}
+
+#[test]
+fn two_lockfiles_are_a_question() {
+    let signals = Signals {
+        lockfiles: vec![
+            "pnpm-lock.yaml".to_string(),
+            "package-lock.json".to_string(),
+        ],
+        ..Default::default()
+    };
+    let proposal = install_proposal(&signals).unwrap();
+    assert_eq!(
+        values(&proposal),
+        vec!["pnpm install --frozen-lockfile", "npm ci"]
+    );
+    assert!(!proposal.decided, "pando does not guess which one is live");
+}
+
+// ---- workspaces ------------------------------------------------------
+
+/// A workspace with a web app and an api app, the shape the fixture
+/// catalogue's `mono-web-api` has.
+fn workspace(dir: &Path) {
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{ "workspaces": ["apps/*"], "scripts": { "dev": "pnpm -r --parallel dev" } }"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+    std::fs::create_dir_all(dir.join("apps/web")).unwrap();
+    std::fs::write(
+        dir.join("apps/web/package.json"),
+        r#"{ "scripts": { "dev": "vite" } }"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join("apps/web/vite.config.ts"), "export default {}\n").unwrap();
+    std::fs::create_dir_all(dir.join("apps/api")).unwrap();
+    std::fs::write(
+        dir.join("apps/api/package.json"),
+        r#"{ "scripts": { "dev": "node --watch src/index.js" } }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join(".env.example"),
+        "WEB_PORT=5173\nAPI_PORT=4000\nVITE_API_URL=http://localhost:4000\n\
+             DATABASE_URL=postgres://app:app@localhost:5432/app\n",
+    )
+    .unwrap();
+}
+
+fn proposed_processes(root: &Path) -> Proposal {
+    let signals = signals(root);
+    propose(root, &signals)
+        .into_iter()
+        .find(|p| p.slot == Slot::Processes)
+        .expect("a processes proposal")
+}
+
+#[test]
+fn a_workspace_proposes_one_process_per_app() {
+    let dir = tempdir().unwrap();
+    workspace(dir.path());
+    let proposal = proposed_processes(dir.path());
+    assert!(
+        !proposal.decided,
+        "two processes instead of one is the developer's call"
+    );
+    let processes = proposal.candidates[0]
+        .processes
+        .clone()
+        .expect("the per-app form carries processes");
+    assert_eq!(
+        processes.keys().cloned().collect::<Vec<_>>(),
+        vec!["api", "web"]
+    );
+
+    let web = &processes["web"];
+    assert_eq!(web.cwd.as_deref(), Some("apps/web"));
+    assert_eq!(
+        web.cmd, "pnpm dev -- --port {port:web}",
+        "Vite takes its port on the command line, so the flag goes on its own script"
+    );
+    assert_eq!(web.roles(), vec!["web"]);
+    assert_eq!(
+        web.env["VITE_API_URL"], "http://localhost:{port:api}",
+        "a localhost URL pointing at another app becomes that app's role"
+    );
+    assert!(
+        !web.env.contains_key("WEB_PORT"),
+        "and nothing says the port twice: {:?}",
+        web.env
+    );
+    assert_eq!(web.ready.clone().unwrap().role.as_deref(), Some("web"));
+
+    let api = &processes["api"];
+    assert_eq!(api.cwd.as_deref(), Some("apps/api"));
+    assert_eq!(api.cmd, "pnpm dev");
+    assert_eq!(
+        api.env["PORT"], "{port:api}",
+        "Node reads its port from the environment"
+    );
+    assert!(
+        !api.env.contains_key("VITE_API_URL"),
+        "the app a reference points at is the one that need not be told"
+    );
+    assert_eq!(api.ready.clone().unwrap().role.as_deref(), Some("api"));
+
+    // The question shows each process with its directory and command.
+    let summary = &proposal.candidates[0].value;
+    for needle in ["api", "web", "apps/api", "apps/web", "pnpm dev"] {
+        assert!(summary.contains(needle), "{summary}");
+    }
+}
+
+#[test]
+fn the_root_script_is_offered_beside_the_per_app_form() {
+    let dir = tempdir().unwrap();
+    workspace(dir.path());
+    let proposal = proposed_processes(dir.path());
+    assert_eq!(proposal.candidates.len(), 2);
+    let fallback = &proposal.candidates[1];
+    assert_eq!(fallback.value, "pnpm dev");
+    let processes = fallback.processes.clone().expect("one process");
+    assert_eq!(processes.keys().cloned().collect::<Vec<_>>(), vec!["dev"]);
+    assert_eq!(processes["dev"].cmd, "pnpm dev");
+    assert!(
+        processes["dev"].ports.is_none(),
+        "declining leaves the port question to be asked"
+    );
+}
+
+#[test]
+fn one_app_is_not_a_workspace_worth_splitting_up() {
+    let dir = tempdir().unwrap();
+    workspace(dir.path());
+    std::fs::remove_dir_all(dir.path().join("apps/api")).unwrap();
+    let signals = signals(dir.path());
+    assert!(
+        propose(dir.path(), &signals)
+            .iter()
+            .all(|p| p.slot != Slot::Processes),
+        "one app with a dev script is the single-process case"
+    );
+}
+
+#[test]
+fn an_app_with_no_dev_script_is_not_a_process() {
+    let dir = tempdir().unwrap();
+    workspace(dir.path());
+    std::fs::create_dir_all(dir.path().join("apps/tools")).unwrap();
+    std::fs::write(
+        dir.path().join("apps/tools/package.json"),
+        r#"{ "scripts": { "build": "tsc" } }"#,
+    )
+    .unwrap();
+    let apps = workspace_apps(dir.path(), &signals(dir.path()));
+    assert_eq!(
+        apps.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+        vec!["api", "web"]
+    );
+}
+
+// Two apps with one directory name would claim one role, and
+// `config::validate` would refuse the file pando had just written.
+#[test]
+fn two_apps_with_the_same_name_are_not_proposed_at_all() {
+    let dir = tempdir().unwrap();
+    workspace(dir.path());
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{ "workspaces": ["apps/*", "packages/*"] }"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("packages/web")).unwrap();
+    std::fs::write(
+        dir.path().join("packages/web/package.json"),
+        r#"{ "scripts": { "dev": "vite" } }"#,
+    )
+    .unwrap();
+    assert!(workspace_apps(dir.path(), &signals(dir.path())).is_empty());
+}
+
+#[test]
+fn a_repository_that_is_not_a_workspace_proposes_nothing() {
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{ "scripts": { "dev": "next dev" } }"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("apps/web")).unwrap();
+    std::fs::write(
+        dir.path().join("apps/web/package.json"),
+        r#"{ "scripts": { "dev": "vite" } }"#,
+    )
+    .unwrap();
+    assert!(
+        workspace_apps(dir.path(), &signals(dir.path())).is_empty(),
+        "an apps/ directory is not a workspace; the manifest has to say so"
+    );
+}
+
+#[test]
+fn workspace_globs_are_read_from_every_convention() {
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("pnpm-workspace.yaml"),
+        "packages:\n  - 'apps/*'\n",
+    )
+    .unwrap();
+    assert_eq!(workspace_globs(dir.path()), vec!["apps/*"]);
+
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{ "workspaces": { "packages": ["services/*"] } }"#,
+    )
+    .unwrap();
+    assert_eq!(workspace_globs(dir.path()), vec!["services/*"]);
+
+    // turbo and nx describe pipelines, not membership.
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("turbo.json"), "{}").unwrap();
+    assert_eq!(workspace_globs(dir.path()), vec!["apps/*", "packages/*"]);
+}
+
+#[test]
+fn only_a_localhost_url_names_another_apps_port() {
+    assert_eq!(localhost_url_port("http://localhost:4000"), Some(4000));
+    assert_eq!(
+        localhost_url_port("http://127.0.0.1:4000/api/v1"),
+        Some(4000)
+    );
+    assert_eq!(
+        localhost_url_port("postgres://app:app@localhost:5432/app"),
+        Some(5432)
+    );
+    assert_eq!(localhost_url_port("https://api.example.com:443"), None);
+    assert_eq!(localhost_url_port("http://localhost"), None);
+    assert_eq!(localhost_url_port("4000"), None);
+}
+
+#[test]
+fn a_url_that_matches_no_app_is_left_alone() {
+    let dir = tempdir().unwrap();
+    workspace(dir.path());
+    let processes = proposed_processes(dir.path()).candidates[0]
+        .processes
+        .clone()
+        .unwrap();
+    for (name, process) in &processes {
+        assert!(
+            !process.env.contains_key("DATABASE_URL"),
+            "{name} was told about a database that is not one of the apps: {:?}",
+            process.env
+        );
+    }
+}
+
+#[test]
+fn the_processes_slot_writes_a_table_per_app() {
+    let dir = tempdir().unwrap();
+    workspace(dir.path());
+    let candidate = proposed_processes(dir.path()).candidates[0].clone();
+    let edits = edits(Slot::Processes, &candidate);
+    let web: Vec<(&str, String)> = edits
+        .iter()
+        .filter(|e| e.table == vec!["processes", "web"])
+        .map(|e| (e.key.as_str(), e.value.to_string().trim().to_string()))
+        .collect();
+    assert_eq!(
+        web,
+        vec![
+            ("cmd", "\"pnpm dev -- --port {port:web}\"".to_string()),
+            ("cwd", "\"apps/web\"".to_string()),
+            ("ports", "[\"web\"]".to_string()),
+            (
+                "env",
+                "{ VITE_API_URL = \"http://localhost:{port:api}\" }".to_string()
+            ),
+            ("ready", "{ role = \"web\" }".to_string()),
+        ]
+    );
+    assert!(
+        edits.iter().any(|e| e.table == vec!["processes", "api"]),
+        "and one for the api"
+    );
+}
+
+// The single-process fallback keeps the `[dev]` shorthand: that is
+// what it is for, and it is the shape every example is written in.
+#[test]
+fn the_single_process_answer_is_written_as_the_dev_shorthand() {
+    let dir = tempdir().unwrap();
+    workspace(dir.path());
+    let candidate = proposed_processes(dir.path()).candidates[1].clone();
+    let edits = edits(Slot::Processes, &candidate);
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].table, vec!["dev"]);
+    assert_eq!(edits[0].key, "cmd");
+}
+
+#[test]
+fn a_command_typed_at_the_process_question_is_one_process() {
+    let candidate = custom(Slot::Processes, "./scripts/dev.sh --port {port:web}");
+    let processes = candidate.processes.clone().expect("one process");
+    assert_eq!(processes.keys().cloned().collect::<Vec<_>>(), vec!["dev"]);
+    assert_eq!(processes["dev"].roles(), vec!["web"]);
+    let mut config = Config::default();
+    apply(Slot::Processes, &candidate, &mut config);
+    assert_eq!(
+        config.processes["dev"].cmd,
+        "./scripts/dev.sh --port {port:web}"
+    );
+}
+
+// A typed answer here used to be accepted and then silently dropped:
+// the schema slot's answer is a whole `[[hooks]]` entry, and a
+// candidate with no hook on it gives `edits` and `apply` nothing to
+// write. Exit 0, and a config with no migration in it.
+#[test]
+fn a_command_typed_at_the_schema_question_is_a_hook_entry() {
+    let candidate = custom(Slot::SchemaHook, "npm run db:migrate");
+    let hook = candidate.hook.clone().expect("a hook entry");
+    assert_eq!(hook.name, SCHEMA_HOOK);
+    assert_eq!(hook.after, crate::config::HookPoint::Services);
+    assert_eq!(hook.cmd, "npm run db:migrate");
+    assert!(
+        hook.fingerprint.is_empty(),
+        "a command pando did not propose carries no globs it could key on, and a guessed \
+             fingerprint is a migration that never runs"
+    );
+
+    let mut config = Config::default();
+    apply(Slot::SchemaHook, &candidate, &mut config);
+    assert_eq!(config.hooks.len(), 1);
+    assert_eq!(config.hooks[0].cmd, "npm run db:migrate");
+    let (array, entries) = array_edits(Slot::SchemaHook, &[&candidate]).expect("an entry");
+    assert_eq!(array, "hooks");
+    assert!(
+        entries.iter().any(|(key, _)| key == "cmd"),
+        "and it is written out: {entries:?}"
+    );
+}
+
+// ---- compose services ------------------------------------------------
+
+/// A repository with a compose file and an env example, which is all
+/// the services rule reads.
+fn compose_fixture(compose: &str, env: &[(&str, &str)]) -> (TempDir, Signals) {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("docker-compose.yml"), compose).unwrap();
+    let signals = Signals {
+        env_example: env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        ..Default::default()
+    };
+    (dir, signals)
+}
+
+// The first-contact failure this rule exists for: the compose file's
+// only candidate was the app itself, so the only answer on offer was
+// "run a second copy of the thing you are developing".
+#[test]
+fn a_service_built_from_this_repository_is_not_a_dependency() {
+    let (dir, signals) = compose_fixture(
+        r#"
+services:
+  web:
+    image: acme/web:dev
+    build: .
+    ports: ["3000:3000"]
+  worker:
+    build:
+      context: ./services/worker
+  postgres:
+    image: postgres:16
+    ports: ["5432:5432"]
+"#,
+        &[("DATABASE_URL", "postgres://acme@localhost:5432/acme")],
+    );
+    let proposal = services_proposal(
+        dir.path(),
+        &signals,
+        None,
+        &MachineEvidence::unknown(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        values(&proposal),
+        vec!["postgres"],
+        "the app and its worker are this repository, not things it depends on"
+    );
+    assert!(
+        proposal.decided,
+        "one resolved dependency is not a question"
+    );
+}
+
+// A question whose only answer is wrong is worse than silence — but the
+// answer still has to be recorded, or the next start works it out again
+// and nothing in the file says pando ever looked.
+#[test]
+fn a_compose_file_of_only_this_project_is_answered_without_being_asked() {
+    let (dir, signals) = compose_fixture(
+        "services:\n  web:\n    build: .\n  worker:\n    build: ./worker\n",
+        &[],
+    );
+    let proposal = services_proposal(
+        dir.path(),
+        &signals,
+        None,
+        &MachineEvidence::unknown(),
+        None,
+    )
+    .unwrap();
+    assert!(
+        proposal.candidates.is_empty(),
+        "nothing survived the filter"
+    );
+    assert!(proposal.decided, "so there is nothing to ask about");
+    assert_eq!(
+        proposal.service_file(),
+        Some("docker-compose.yml"),
+        "the empty answer is still about a file, and has to be writable"
+    );
+    let why = proposal
+        .none_because
+        .expect("a reason for the empty answer");
+    assert!(why.contains("web and worker"), "{why}");
+    assert!(why.contains("built from this repository"), "{why}");
+}
+
+// The other way a compose file has nothing to offer: pando can address
+// none of what is in it. That used to propose nothing and record
+// nothing, so it was worked out again on every start — the same
+// re-ask-forever shape a filtered-out app had. One shape for "none".
+#[test]
+fn a_file_of_services_nothing_addresses_is_answered_without_being_asked() {
+    let (dir, signals) = compose_fixture(
+        r#"
+services:
+  mailpit:
+    image: axllent/mailpit
+    ports: ["1025:1025"]
+  dashboard:
+    image: grafana/grafana
+"#,
+        &[("PORT", "3000")],
+    );
+    let proposal = services_proposal(
+        dir.path(),
+        &signals,
+        None,
+        &MachineEvidence::unknown(),
+        None,
+    )
+    .unwrap();
+    assert!(proposal.candidates.is_empty());
+    assert!(proposal.decided);
+    assert_eq!(proposal.service_file(), Some("docker-compose.yml"));
+    let why = proposal
+        .none_because
+        .expect("a reason for the empty answer");
+    assert!(why.contains("dashboard and mailpit"), "{why}");
+    assert!(
+        why.contains("nothing in the env example addresses"),
+        "{why}"
+    );
+}
+
+// The empty answer is permanent — `already_answered` is true from then
+// on — so it may only be recorded about a file pando read whole. A
+// top-level `include:` brings in services this list does not even have,
+// and "none of them" about those is an answer nobody gave.
+#[test]
+fn a_file_pando_could_not_read_whole_records_no_empty_answer() {
+    let (dir, signals) = compose_fixture(
+        r#"
+include:
+  - infra/compose.yml
+services:
+  web:
+    build: .
+"#,
+        &[],
+    );
+    assert!(
+        services_proposal(
+            dir.path(),
+            &signals,
+            None,
+            &MachineEvidence::unknown(),
+            None
+        )
+        .is_none(),
+        "nothing is offered and nothing is written down: the next run \
+             with Docker present gets to decide"
+    );
+}
+
+// The filter is about *this project*, not about `build:` existing. A
+// service built out of a sibling checkout is a dependency like any
+// other, and a worktree wants its own copy.
+#[test]
+fn a_build_context_outside_the_project_is_still_a_dependency() {
+    let (dir, signals) = compose_fixture(
+        r#"
+services:
+  vendor:
+    build: ../vendor-service
+    ports: ["9000:9000"]
+"#,
+        &[("VENDOR_URL", "http://localhost:9000")],
+    );
+    let proposal = services_proposal(
+        dir.path(),
+        &signals,
+        None,
+        &MachineEvidence::unknown(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(values(&proposal), vec!["vendor"]);
+    assert!(proposal.preferred().unwrap().preselected);
+}
+
+#[test]
+fn a_build_context_is_resolved_against_the_compose_files_own_directory() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("deploy")).unwrap();
+    for (file, context, inside) in [
+        ("docker-compose.yml", ".", true),
+        ("docker-compose.yml", "./services/api", true),
+        ("docker-compose.yml", "../elsewhere", false),
+        // From a file one level down, `..` is still the project.
+        ("deploy/docker-compose.yml", "..", true),
+        ("deploy/docker-compose.yml", "../..", false),
+    ] {
+        assert_eq!(
+            built_from_project(root, file, context),
+            inside,
+            "{file} + {context}"
+        );
+    }
+    // What `docker compose config` hands over: already absolute.
+    assert!(built_from_project(
+        root,
+        "docker-compose.yml",
+        root.join("apps/api").to_str().unwrap()
+    ));
+    assert!(!built_from_project(root, "docker-compose.yml", "/tmp"));
+}
+
+// ---- what detection may fill in --------------------------------------
+
+#[test]
+fn a_lone_dev_with_no_command_may_be_filled_and_anything_else_may_not() {
+    let mut empty = Config::default();
+    assert!(
+        may_fill_dev(&empty),
+        "nothing configured is pando's to fill"
+    );
+
+    empty.processes.insert(
+        DEV.to_string(),
+        ProcessConfig {
+            cwd: Some("apps/web".to_string()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        may_fill_dev(&empty),
+        "a [dev] with no command is an invitation"
+    );
+    assert!(still_needed(Slot::DevCmd, &empty));
+    assert!(still_needed(Slot::PortEnv, &empty));
+    assert!(
+        !still_needed(Slot::Processes, &empty),
+        "but the shape question has been answered by writing [dev] at all"
+    );
+
+    let mut written = Config::default();
+    written.processes.insert(
+        DEV.to_string(),
+        ProcessConfig {
+            cmd: "sleep 300".to_string(),
+            ..Default::default()
+        },
+    );
+    assert!(
+        !may_fill_dev(&written),
+        "a command the developer wrote is an answer about its ports too"
+    );
+
+    let mut named = Config::default();
+    named.processes.insert(
+        "web".to_string(),
+        ProcessConfig {
+            cmd: "vite".to_string(),
+            ..Default::default()
+        },
+    );
+    assert!(
+        !may_fill_dev(&named),
+        "a process under another name means [dev] would land beside [processes]"
+    );
+
+    // And after an answer to the shape question.
+    let mut per_app = Config::default();
+    per_app
+        .processes
+        .insert("web".to_string(), ProcessConfig::default());
+    per_app
+        .processes
+        .insert("api".to_string(), ProcessConfig::default());
+    assert!(!fills_one_dev_process(&per_app));
+    let mut single = Config::default();
+    single
+        .processes
+        .insert(DEV.to_string(), ProcessConfig::default());
+    assert!(fills_one_dev_process(&single));
+}
+
+// ---- writing the answer ----------------------------------------------
+
+#[test]
+fn a_chosen_candidate_becomes_both_config_and_a_patch() {
+    let candidate = Candidate {
+        value: "PORT".to_string(),
+        why: "the Next.js convention".to_string(),
+        ..Candidate::default()
+    };
+    let mut config = Config::default();
+    apply(Slot::PortEnv, &candidate, &mut config);
+    assert_eq!(config.processes["dev"].roles(), vec!["web"]);
+    assert_eq!(config.processes["dev"].port_env()["PORT"], "{port:web}");
+
+    let edits = edits(Slot::PortEnv, &candidate);
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].table, vec!["dev"]);
+    assert_eq!(edits[0].key, "ports");
+    assert_eq!(edits[0].value.to_string().trim(), "{ PORT = \"web\" }");
+}
+
+#[test]
+fn a_list_slot_round_trips_through_its_comma_separated_value() {
+    let candidate = Candidate {
+        value: ".env,.env.local".to_string(),
+        why: "gitignored and present".to_string(),
+        ..Candidate::default()
+    };
+    let mut config = Config::default();
+    apply(Slot::Provision, &candidate, &mut config);
+    assert_eq!(
+        config.project.provision.as_deref(),
+        Some(&[".env".to_string(), ".env.local".to_string()][..])
+    );
+    let edits = edits(Slot::Provision, &candidate);
+    assert_eq!(
+        edits[0].value.to_string().trim(),
+        "[\".env\", \".env.local\"]"
+    );
+}
+
+// ---- provisioning from an example ------------------------------------
+
+/// A repository that ships an example of a local file, with or without
+/// the local file itself.
+fn seed_fixture(files: &[(&str, &str)]) -> TempDir {
+    let dir = tempdir().unwrap();
+    crate::testutil::git(dir.path(), &["init", "--quiet", "--initial-branch=main"]);
+    for (rel, contents) in files {
+        std::fs::write(dir.path().join(rel), contents).unwrap();
+    }
+    dir
+}
+
+// The fresh-clone case: `.env` is gitignored so it never arrives, and
+// the example beside it is the only thing that says what it looks like.
+#[test]
+fn an_example_of_a_missing_gitignored_file_is_a_provision_source() {
+    let dir = seed_fixture(&[
+        (".gitignore", ".env\n.env.local\n"),
+        (".env.example", "PORT=3000\n"),
+        (".env.local.example", "FLAG=1\n"),
+    ]);
+    assert_eq!(
+        provision_seeds(dir.path()),
+        vec![
+            (".env".to_string(), ".env.example".to_string()),
+            (".env.local".to_string(), ".env.local.example".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn a_file_the_checkout_already_has_is_not_seeded_from_its_example() {
+    let dir = seed_fixture(&[
+        (".gitignore", ".env\n"),
+        (".env.example", "PORT=3000\n"),
+        (".env", "PORT=3001\n"),
+    ]);
+    assert!(
+        provision_seeds(dir.path()).is_empty(),
+        "the developer's own file is the source; the example is the fallback"
+    );
+}
+
+// `git check-ignore` is what authorises a write into a worktree, so a
+// destination it would refuse must never be offered — proposing a seed
+// `new` then refuses is worse than proposing none.
+#[test]
+fn an_example_of_a_file_that_is_not_gitignored_is_never_offered() {
+    let dir = seed_fixture(&[
+        (".gitignore", "node_modules/\n"),
+        ("config.yml.example", "debug: true\n"),
+    ]);
+    assert!(provision_seeds(dir.path()).is_empty());
+}
+
+#[test]
+fn a_seed_makes_the_provision_slot_a_question_with_the_plain_answer_under_it() {
+    let signals = Signals {
+        ignored_present: vec![".env.local".to_string()],
+        provision_seeds: vec![(".env".to_string(), ".env.example".to_string())],
+        ..Default::default()
+    };
+    let proposal = provision_proposal(&signals).unwrap();
+    assert!(
+        !proposal.decided,
+        "copying a tracked example into a worktree is the developer's call"
+    );
+    assert_eq!(values(&proposal), vec![".env.local", ".env.local,.env"]);
+
+    let plain = proposal.preferred().unwrap();
+    assert!(
+        plain.provision_from.is_empty() && !plain.needs_a_human,
+        "only what is already here leads, and it is what --yes takes"
+    );
+
+    let seeded = &proposal.candidates[1];
+    assert_eq!(
+        seeded.provision_from,
+        BTreeMap::from([(".env".to_string(), ".env.example".to_string())])
+    );
+    assert!(
+        seeded.needs_a_human,
+        "copying a file pando did not write is not a flag's decision"
+    );
+    assert!(
+        seeded.why.contains(".env copied from .env.example"),
+        "the option names the source, so a human can go and read it: {}",
+        seeded.why
+    );
+}
+
+// The case the whole feature is for — a clone with nothing local at all
+// — has no plain answer to lead with, so there is nothing `--yes` may
+// take and the question is what an unattended run gets.
+#[test]
+fn a_clone_with_only_a_seed_to_offer_has_nothing_yes_may_take() {
+    let signals = Signals {
+        provision_seeds: vec![(".env".to_string(), ".env.example".to_string())],
+        ..Default::default()
+    };
+    let proposal = provision_proposal(&signals).unwrap();
+    assert_eq!(values(&proposal), vec![".env"]);
+    assert!(proposal.candidates[0].needs_a_human);
+    assert!(!proposal.decided);
+}
+
+#[test]
+fn with_nothing_to_seed_the_provision_slot_is_decided_as_it_always_was() {
+    let signals = Signals {
+        ignored_present: vec![".env".to_string(), ".env.local".to_string()],
+        ..Default::default()
+    };
+    let proposal = provision_proposal(&signals).unwrap();
+    assert!(proposal.decided);
+    assert_eq!(values(&proposal), vec![".env,.env.local"]);
+}
+
+#[test]
+fn a_seeded_answer_writes_the_list_and_where_the_missing_file_comes_from() {
+    let candidate = Candidate {
+        value: ".env".to_string(),
+        why: "seeded".to_string(),
+        provision_from: BTreeMap::from([(".env".to_string(), ".env.example".to_string())]),
+        ..Candidate::default()
+    };
+    let mut config = Config::default();
+    apply(Slot::Provision, &candidate, &mut config);
+    assert_eq!(config.project.provision_paths(), [".env".to_string()]);
+    assert_eq!(config.project.provision_from[".env"], ".env.example");
+
+    let edits = edits(Slot::Provision, &candidate);
+    assert_eq!(edits.len(), 2, "the list, and where the file comes from");
+    assert_eq!(edits[1].table, vec!["project"]);
+    assert_eq!(edits[1].key, "provision_from");
+    assert_eq!(
+        edits[1].value.to_string().trim(),
+        r#"{ ".env" = ".env.example" }"#
+    );
+}
+
+#[test]
+fn a_command_that_carries_its_port_writes_both_keys() {
+    let candidate = Candidate {
+        value: "python manage.py runserver 127.0.0.1:{port:web}".to_string(),
+        why: "the Django rule".to_string(),
+        ports: Some(PortsSpec::List(vec!["web".to_string()])),
+        ..Candidate::default()
+    };
+    let edits = edits(Slot::DevCmd, &candidate);
+    assert_eq!(edits.len(), 2, "the command and the role it needs");
+    assert_eq!(edits[1].key, "ports");
+    assert_eq!(edits[1].value.to_string().trim(), "[\"web\"]");
+}
+
+// ---- native versus container, decided from evidence ------------------
+
+/// A project whose env example names these addresses, and optionally
+/// a compose file declaring these services.
+fn project(env: &[(&str, &str)], compose: Option<&str>) -> (TempDir, Signals) {
+    let dir = tempdir().unwrap();
+    if let Some(yaml) = compose {
+        std::fs::write(dir.path().join("docker-compose.yml"), yaml).unwrap();
+    }
+    let signals = Signals {
+        env_example: env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        ..Default::default()
+    };
+    (dir, signals)
+}
+
+/// A machine that has everything, or one that has nothing.
+fn machine(docker: bool, engines: &[(&str, bool)]) -> MachineEvidence {
+    MachineEvidence {
+        probed: true,
+        docker,
+        engines: engines.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+    }
+}
+
+const COMPOSE_PG: &str =
+    "services:\n  postgres:\n    image: postgres:16\n  redis:\n    image: redis:7\n";
+
+fn choice_of(
+    dir: &TempDir,
+    signals: &Signals,
+    evidence: &MachineEvidence,
+    prefer: Option<&str>,
+) -> ServiceChoice {
+    let compose = compose_services_proposal(dir.path(), signals, None);
+    let native = native_candidates(signals, evidence);
+    let file = compose
+        .as_ref()
+        .and_then(|p| p.service_file())
+        .map(str::to_string)
+        .or_else(|| crate::compose::find(dir.path()));
+    service_choice(
+        file.as_deref(),
+        compose.as_ref().map(|p| p.candidates.len()).unwrap_or(0),
+        &native,
+        evidence,
+        prefer,
+    )
+}
+
+// The engine is named by the scheme of the URL or by the port a bare
+// number defaults to — never by the key's prefix. `DATABASE_URL` is
+// `DATABASE` for Postgres, MySQL and Mongo alike, and using it to
+// pick an engine would be a coin toss wearing a rule's clothes.
+#[test]
+fn the_engine_comes_from_the_scheme_or_the_port_and_never_from_the_key() {
+    for (value, expected) in [
+        ("postgres://u:p@localhost:5432/app", Some("postgres")),
+        ("postgresql://localhost/app", Some("postgres")),
+        ("mysql://u:p@localhost:3306/app", Some("mariadb")),
+        ("redis://localhost:6379", Some("redis")),
+        ("mongodb+srv://localhost/app", Some("mongodb")),
+        // No scheme pando knows: the port is the fallback.
+        ("5432", Some("postgres")),
+        ("27017", Some("mongodb")),
+        ("http://localhost:3000", None),
+        ("8080", None),
+    ] {
+        assert_eq!(recipe_for_address(value), expected, "{value}");
+    }
+    // The same key spelling, three different engines: the proof that
+    // the prefix is not what decided any of them.
+    for (value, expected) in [
+        ("postgres://localhost:5432/a", "postgres"),
+        ("mysql://localhost:3306/a", "mariadb"),
+        ("mongodb://localhost:27017/a", "mongodb"),
+    ] {
+        let (dir, signals) = project(&[("DATABASE_URL", value)], None);
+        let native = native_candidates(&signals, &MachineEvidence::unknown());
+        assert_eq!(values_of(&native), vec![expected], "{value}");
+        let _ = dir;
+    }
+}
+
+fn values_of(candidates: &[Candidate]) -> Vec<&str> {
+    candidates.iter().map(|c| c.value.as_str()).collect()
+}
+
+// Two keys naming the same engine are one server, and two engines
+// are two candidates, sorted so two runs agree.
+#[test]
+fn one_candidate_per_engine_however_many_keys_name_it() {
+    let (dir, signals) = project(
+        &[
+            ("REDIS_URL", "redis://localhost:6379"),
+            ("DATABASE_URL", "postgres://localhost:5432/app"),
+            ("CACHE_URL", "redis://localhost:6379/1"),
+        ],
+        None,
+    );
+    let native = native_candidates(&signals, &MachineEvidence::unknown());
+    assert_eq!(values_of(&native), vec!["postgres", "redis"]);
+    let _ = dir;
+}
+
+// The shape Phase 6 exists for: a project that needs services and has
+// no file describing them. There is no compose option at all, so the
+// preference never comes into it.
+#[test]
+fn a_project_with_no_compose_file_and_a_database_in_its_env_gets_the_recipes() {
+    let (dir, signals) = project(
+        &[
+            ("DATABASE_URL", "postgres://localhost:5432/app"),
+            ("REDIS_URL", "redis://localhost:6379"),
+        ],
+        None,
+    );
+    let evidence = machine(true, &[("postgres", true), ("redis", true)]);
+    let choice = choice_of(&dir, &signals, &evidence, None);
+    assert_eq!(choice.mechanism, Some("native"));
+    assert!(choice.native_declared);
+    assert!(!choice.compose_declared);
+    assert!(
+        choice.evidence[0].contains("no compose file"),
+        "{:?}",
+        choice.evidence
+    );
+    assert!(
+        choice.evidence[1].contains("postgres and redis"),
+        "{:?}",
+        choice.evidence
+    );
+
+    let proposal = propose_with(dir.path(), &signals, None, &evidence, None)
+        .into_iter()
+        .find(|p| p.slot == Slot::Services)
+        .expect("a services proposal");
+    assert_eq!(proposal.mechanism, Some("native"));
+    assert_eq!(values(&proposal), vec!["postgres", "redis"]);
+    assert!(proposal.decided, "this machine has both engines");
+}
+
+// The common path is unchanged: a compose file is the project's own
+// statement about how to run its services, and nobody has said
+// otherwise. The evidence line is how a developer learns there was a
+// choice at all.
+#[test]
+fn a_compose_file_wins_when_nobody_has_said_which_to_prefer() {
+    let (dir, signals) = project(
+        &[
+            ("DATABASE_URL", "postgres://localhost:5432/app"),
+            ("REDIS_URL", "redis://localhost:6379"),
+        ],
+        Some(COMPOSE_PG),
+    );
+    let evidence = machine(true, &[("postgres", true), ("redis", true)]);
+    let choice = choice_of(&dir, &signals, &evidence, None);
+    assert_eq!(choice.mechanism, Some("compose"));
+    assert!(choice.compose_declared && choice.native_declared);
+    let said = choice.evidence.join(" | ");
+    assert!(said.contains("nobody has said which to prefer"), "{said}");
+    assert!(said.contains("[isolation] prefer"), "{said}");
+}
+
+#[test]
+fn a_machine_that_prefers_the_recipes_gets_them() {
+    let (dir, signals) = project(
+        &[("DATABASE_URL", "postgres://localhost:5432/app")],
+        Some(COMPOSE_PG),
+    );
+    let evidence = machine(true, &[("postgres", true), ("redis", true)]);
+    let choice = choice_of(&dir, &signals, &evidence, Some("native"));
+    assert_eq!(choice.mechanism, Some("native"));
+    assert!(
+        choice.evidence.iter().any(|l| l.contains("prefers native")),
+        "{:?}",
+        choice.evidence
+    );
+}
+
+// A preference this machine cannot honour is not overruled quietly.
+#[test]
+fn a_preference_for_an_engine_that_is_not_installed_falls_back_and_says_so() {
+    let (dir, signals) = project(
+        &[("DATABASE_URL", "postgres://localhost:5432/app")],
+        Some(COMPOSE_PG),
+    );
+    let evidence = machine(true, &[("postgres", false)]);
+    let choice = choice_of(&dir, &signals, &evidence, Some("native"));
+    assert_eq!(choice.mechanism, Some("compose"));
+    let said = choice.evidence.join(" | ");
+    assert!(said.contains("postgres is not installed here"), "{said}");
+    assert!(said.contains("so compose it is"), "{said}");
+}
+
+// And the mirror: a project that declares a compose file, on a
+// machine with no docker and every engine. Not a preference and not
+// a guess — the mechanism the project declares is one this machine
+// has been shown not to have.
+#[test]
+fn no_docker_and_every_engine_takes_the_recipes_without_being_asked() {
+    let (dir, signals) = project(
+        &[
+            ("DATABASE_URL", "postgres://localhost:5432/app"),
+            ("REDIS_URL", "redis://localhost:6379"),
+        ],
+        Some(COMPOSE_PG),
+    );
+    let evidence = machine(false, &[("postgres", true), ("redis", true)]);
+    let choice = choice_of(&dir, &signals, &evidence, None);
+    assert_eq!(choice.mechanism, Some("native"));
+    assert!(
+        choice
+            .evidence
+            .iter()
+            .any(|l| l.contains("docker is not on this machine")),
+        "{:?}",
+        choice.evidence
+    );
+
+    // …and the other way, for a machine that prefers compose and has
+    // no docker.
+    let choice = choice_of(&dir, &signals, &evidence, Some("compose"));
+    assert_eq!(choice.mechanism, Some("native"));
+    assert!(
+        choice
+            .evidence
+            .iter()
+            .any(|l| l.contains("docker is not on this machine")),
+        "{:?}",
+        choice.evidence
+    );
+}
+
+// An engine the project wants and this machine lacks is still
+// offered — the project plainly needs one — but it is not ticked, so
+// the question is asked rather than the answer taken.
+#[test]
+fn an_engine_this_machine_lacks_is_offered_unticked_and_asks() {
+    let (dir, signals) = project(&[("DATABASE_URL", "postgres://localhost:5432/app")], None);
+    let evidence = machine(false, &[("postgres", false)]);
+    let proposal = propose_with(dir.path(), &signals, None, &evidence, None)
+        .into_iter()
+        .find(|p| p.slot == Slot::Services)
+        .expect("a services proposal");
+    assert_eq!(proposal.mechanism, Some("native"));
+    assert!(!proposal.decided, "it was taken without asking");
+    assert!(proposal.preselected().is_empty());
+    assert!(
+        proposal.candidates[0].why.contains("not installed here"),
+        "{:?}",
+        proposal.candidates[0].why
+    );
+}
+
+// Detection's own tests must not depend on the laptop they run on,
+// so "nobody looked" is a distinct answer from "nothing is there".
+#[test]
+fn evidence_nobody_gathered_answers_maybe_rather_than_no() {
+    let unknown = MachineEvidence::unknown();
+    assert_eq!(unknown.can_run("postgres"), None);
+    assert_eq!(unknown.has_docker(), None);
+    let looked = machine(false, &[]);
+    assert_eq!(looked.can_run("postgres"), Some(false));
+    assert_eq!(looked.has_docker(), Some(false));
+
+    // With nobody having looked, a project with both options keeps
+    // the compose file its own repository declares.
+    let (dir, signals) = project(
+        &[("DATABASE_URL", "postgres://localhost:5432/app")],
+        Some(COMPOSE_PG),
+    );
+    assert_eq!(
+        choice_of(&dir, &signals, &unknown, None).mechanism,
+        Some("compose")
+    );
+}
+
+// The entry a native answer writes: the recipe is implied by the
+// name when they match, and spelled out when they do not.
+#[test]
+fn a_native_entry_names_its_recipe_only_when_it_has_to() {
+    let (dir, signals) = project(&[("DATABASE_URL", "postgres://localhost:5432/app")], None);
+    let native = native_candidates(&signals, &MachineEvidence::unknown());
+    let (array, entries) = native_entry(&native[0]);
+    assert_eq!(array, "services");
+    let keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(keys, vec!["kind", "name", "env"]);
+    assert_eq!(entries[0].1.as_str(), Some("native"));
+    assert_eq!(entries[1].1.as_str(), Some("postgres"));
+
+    // A MySQL URL wants the `mariadb` recipe under a name of its
+    // own, so the preset has to be written down.
+    let (dir2, signals) = project(&[("DB_URL", "mysql://localhost:3306/app")], None);
+    let native = native_candidates(&signals, &MachineEvidence::unknown());
+    let (_, entries) = native_entry(&native[0]);
+    let keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(keys, vec!["kind", "name", "env"]);
+    assert_eq!(entries[1].1.as_str(), Some("mariadb"));
+    let _ = (dir, dir2);
+}
+
+/// The brief quotes pando's no-preference line verbatim, twice.
+///
+/// It sits in a fenced block there, so nothing about it is code and
+/// nothing compares it to the string pando emits. Reword
+/// [`NO_PREFERENCE_EVIDENCE`] with the brief left alone and the brief
+/// goes on quoting a sentence pando no longer says — silently, with
+/// every other test green. This is the same rot the README's clap
+/// check exists to stop, in the one other document that quotes the
+/// binary word for word.
+#[test]
+fn the_brief_quotes_the_preference_line_pando_actually_says() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("agent/brief.md");
+    let brief = std::fs::read_to_string(&path).expect("the brief");
+    // The brief is hard-wrapped, so the sentence straddles lines.
+    let collapsed = brief.split_whitespace().collect::<Vec<_>>().join(" ");
+    let quotes = collapsed.matches(NO_PREFERENCE_EVIDENCE).count();
+    assert_eq!(
+        quotes, 2,
+        "agent/brief.md quotes pando's no-preference line {quotes} times, expected 2 — \
+             if NO_PREFERENCE_EVIDENCE was reworded, reword the brief's two fenced copies \
+             with it; the brief is the one document that quotes this string verbatim"
+    );
+}

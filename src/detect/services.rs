@@ -1,0 +1,782 @@
+//! Services and the schema hook: what a project talks to, where each
+//! service can come from, and how its schema is prepared.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use crate::catalog::package_managers;
+use crate::config::Config;
+
+use super::dev::{listed, lockfiles, python_runner};
+use super::proposal::{Candidate, ComposeResolver, Proposal, ServiceHint, Slot};
+use super::signals::Signals;
+
+/// Images an application talks to, and the env-key prefixes that name one
+/// when the service's own name does not.
+///
+/// A service whose image is on this list and that nothing in the env
+/// example points at is the ambiguous case: the developer may want a
+/// private copy of it and pando cannot tell, so it asks. A service whose
+/// image is *not* on this list — a mail catcher, a dashboard, something
+/// pando has never heard of — is left unticked without a question, because
+/// an app that never reads an address for it is not talking to it.
+const SERVICE_IMAGES: [(&str, &[&str]); 12] = [
+    (
+        "postgres",
+        &["DATABASE", "DB", "POSTGRES", "PG", "POSTGRESQL"],
+    ),
+    ("postgis", &["DATABASE", "DB", "POSTGRES", "PG"]),
+    ("mysql", &["DATABASE", "DB", "MYSQL"]),
+    ("mariadb", &["DATABASE", "DB", "MYSQL", "MARIADB"]),
+    ("redis", &["REDIS", "CACHE"]),
+    ("valkey", &["REDIS", "VALKEY", "CACHE"]),
+    ("mongo", &["MONGO", "MONGODB", "DATABASE"]),
+    ("elasticsearch", &["ELASTIC", "ELASTICSEARCH", "SEARCH"]),
+    ("rabbitmq", &["RABBITMQ", "AMQP", "QUEUE", "BROKER"]),
+    ("kafka", &["KAFKA", "BROKER"]),
+    ("minio", &["MINIO", "S3", "STORAGE"]),
+    ("clickhouse", &["CLICKHOUSE"]),
+];
+
+/// Prefixes for images an app usually does not address, so a missing key
+/// is not a question. A mail catcher is the classic: it exists so nothing
+/// leaves the machine, and half of them are never configured at all.
+const UTILITY_IMAGES: [(&str, &[&str]); 3] = [
+    ("mailpit", &["SMTP", "MAIL", "MAILER"]),
+    ("mailhog", &["SMTP", "MAIL", "MAILER"]),
+    ("maildev", &["SMTP", "MAIL", "MAILER"]),
+];
+
+/// Key suffixes that hold an address pando can rewrite. `_NAME`, `_USER`
+/// and `_PASSWORD` are about the same service and hold nothing pando can
+/// point anywhere, so they are not candidates.
+///
+/// `_HOST` is not one either, and deliberately: `services::rewrite` can put
+/// a port into a URL or replace a bare number, and a bare `localhost` has
+/// nowhere to put one. Proposing it wrote a mapping that could never be
+/// satisfied and failed the start that used it.
+///
+/// In preference order: a URL carries everything, a DSN nearly as much, and
+/// a port is a number pando can simply replace.
+const ADDRESS_SUFFIXES: [&str; 3] = ["_URL", "_DSN", "_PORT"];
+
+/// What a rule can say about which env key names one compose service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EnvKey {
+    /// This key, and no other service is using it.
+    Found(String),
+    /// The only key a rule would have used is already pointed at another
+    /// service of the same file. Two databases from one image is the
+    /// ordinary case; pando cannot tell which one the app means, so it asks.
+    TakenBy { key: String, service: String },
+    /// Nothing in the env example names this service at all.
+    Nothing,
+}
+
+/// The env key the app reads to find one compose service, when a rule can
+/// say which.
+///
+/// `claimed` is every key an earlier service of the same file already owns.
+/// An env map with one key pointing at two services is not a thing that can
+/// be written down: the later one silently wins, the earlier one runs with
+/// nothing addressing it, and the app talks to whichever pando happened to
+/// write last.
+fn env_key_for(
+    service: &str,
+    image: Option<&str>,
+    env: &[(String, String)],
+    claimed: &BTreeMap<String, String>,
+) -> EnvKey {
+    let mut prefixes: Vec<String> = vec![service.to_uppercase()];
+    if let Some(image) = image {
+        let family = image_family(image);
+        for (known, keys) in SERVICE_IMAGES.iter().chain(UTILITY_IMAGES.iter()) {
+            if Some(*known) == family {
+                prefixes.extend(keys.iter().map(|k| (*k).to_string()));
+            }
+        }
+    }
+    // By suffix first, then by prefix: the best *kind* of key wins over
+    // the best-matching name, because a `_PORT` that merely belongs to a
+    // differently named prefix for the same service is a worse answer than
+    // the `_URL` that carries the credentials too.
+    let mut taken: Option<EnvKey> = None;
+    for suffix in ADDRESS_SUFFIXES {
+        for prefix in &prefixes {
+            let Some((key, _)) = env
+                .iter()
+                .find(|(key, _)| key == &format!("{prefix}{suffix}"))
+            else {
+                continue;
+            };
+            match claimed.get(key) {
+                None => return EnvKey::Found(key.clone()),
+                // Remembered rather than returned: a later suffix may still
+                // find this service a key of its own, and only when none
+                // does is "somebody else has it" the answer.
+                Some(owner) if taken.is_none() => {
+                    taken = Some(EnvKey::TakenBy {
+                        key: key.clone(),
+                        service: owner.clone(),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    taken.unwrap_or(EnvKey::Nothing)
+}
+
+/// The image's last path segment with its tag stripped, when pando knows
+/// it as either kind of service.
+fn image_family(image: &str) -> Option<&'static str> {
+    let image = image.split('@').next().unwrap_or(image);
+    let last = image.rsplit('/').next().unwrap_or(image);
+    let name = last.split(':').next().unwrap_or(last);
+    SERVICE_IMAGES
+        .iter()
+        .chain(UTILITY_IMAGES.iter())
+        .map(|(known, _)| *known)
+        .find(|known| *known == name)
+}
+
+fn is_app_service(image: Option<&str>) -> bool {
+    let Some(family) = image.and_then(image_family) else {
+        return false;
+    };
+    SERVICE_IMAGES.iter().any(|(known, _)| *known == family)
+}
+
+/// Where a service a proposal offers would come from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceSource {
+    /// Declared by the project's own compose file.
+    Compose { file: String },
+    /// Run by a recipe, because nothing in the repository says how.
+    Native { recipe: String },
+}
+
+/// What this machine can actually run, as evidence rather than as a guess.
+///
+/// Injected rather than probed here: `detect` is pure file reading and
+/// runs on the start path before anything is spawned. `actions` probes it
+/// through the shell a real spawn uses and `doctor` through the one it
+/// was given, so what each of them reports is what the start path would
+/// have found. An empty one means "nobody looked", which is not the same
+/// as "nothing is installed" — see [`MachineEvidence::unknown`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MachineEvidence {
+    /// Whether anything looked at all.
+    pub probed: bool,
+    /// Whether a `docker` that answers is on PATH.
+    pub docker: bool,
+    /// Recipe name to whether every binary it needs is on PATH.
+    pub engines: BTreeMap<String, bool>,
+}
+
+impl MachineEvidence {
+    /// Nobody looked. Every question about this machine answers "maybe",
+    /// which is what keeps detection's own tests independent of the host
+    /// they run on.
+    pub fn unknown() -> MachineEvidence {
+        MachineEvidence::default()
+    }
+
+    /// Whether this machine can run the recipe, or `None` when nobody
+    /// looked.
+    pub fn can_run(&self, recipe: &str) -> Option<bool> {
+        if !self.probed {
+            return None;
+        }
+        Some(self.engines.get(recipe).copied().unwrap_or(false))
+    }
+
+    pub fn has_docker(&self) -> Option<bool> {
+        self.probed.then_some(self.docker)
+    }
+}
+
+/// What a project's env example says it talks to, by the one thing that
+/// names an engine unambiguously: the scheme of a URL, or the port a bare
+/// number defaults to.
+///
+/// Not the key's prefix. `DATABASE_URL` is `DATABASE` for Postgres, MySQL
+/// and MongoDB alike in [`SERVICE_IMAGES`] — good enough to *match* a key
+/// to a compose service whose image already named the engine, and no use
+/// at all for working out which engine a project wants when nothing else
+/// says. `postgres://` says it; `5432` says it.
+const SERVICE_ADDRESSES: [(&str, &[&str], u16); 4] = [
+    ("postgres", &["postgres", "postgresql", "pgsql"], 5432),
+    ("mariadb", &["mysql", "mariadb"], 3306),
+    ("redis", &["redis", "rediss", "valkey"], 6379),
+    ("mongodb", &["mongodb", "mongodb+srv"], 27017),
+];
+
+/// The recipe an env value names, by its URL scheme or its port.
+pub(super) fn recipe_for_address(value: &str) -> Option<&'static str> {
+    let value = value.trim();
+    if let Some(scheme) = value.split("://").next().filter(|s| *s != value) {
+        let scheme = scheme.to_ascii_lowercase();
+        if let Some((recipe, _, _)) = SERVICE_ADDRESSES
+            .iter()
+            .find(|(_, schemes, _)| schemes.contains(&scheme.as_str()))
+        {
+            return Some(recipe);
+        }
+    }
+    // A bare number, or the port at the end of a URL whose scheme said
+    // nothing. The default port is weaker evidence than a scheme and is
+    // only ever reached when the scheme was silent.
+    let port = crate::services::parse_env(&format!("X={value}"))
+        .get("X")
+        .and_then(|v| port_of(v))?;
+    SERVICE_ADDRESSES
+        .iter()
+        .find(|(_, _, default)| *default == port)
+        .map(|(recipe, _, _)| *recipe)
+}
+
+fn port_of(value: &str) -> Option<u16> {
+    let value = value.trim();
+    if let Ok(port) = value.parse::<u16>() {
+        return Some(port);
+    }
+    let rest = value.split("://").nth(1)?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let hostport = authority.rsplit('@').next()?;
+    hostport.rsplit(':').next()?.parse().ok()
+}
+
+/// Every service this project appears to need that no file in it explains.
+///
+/// One candidate per recipe, not per key: two keys naming the same engine
+/// are one server. Sorted by the recipe name so two runs agree.
+pub(super) fn native_candidates(signals: &Signals, evidence: &MachineEvidence) -> Vec<Candidate> {
+    let mut by_recipe: BTreeMap<&str, (String, String)> = BTreeMap::new();
+    for (key, value) in &signals.env_example {
+        if !ADDRESS_SUFFIXES.iter().any(|s| key.ends_with(s)) {
+            continue;
+        }
+        let Some(recipe) = recipe_for_address(value) else {
+            continue;
+        };
+        // The first key wins, which is file order: a project that names
+        // a database twice means one database.
+        by_recipe
+            .entry(recipe)
+            .or_insert_with(|| (key.clone(), value.clone()));
+    }
+    by_recipe
+        .into_iter()
+        .map(|(recipe, (key, value))| {
+            let runnable = evidence.can_run(recipe);
+            let why = match runnable {
+                Some(true) => format!(".env.example {key}={value}; {recipe} is on this machine"),
+                Some(false) => format!(
+                    ".env.example {key}={value}; {recipe} is not installed here, so starting \
+                     it will say what to install"
+                ),
+                None => format!(".env.example {key}={value}"),
+            };
+            Candidate {
+                value: recipe.to_string(),
+                why,
+                // Ticked when this machine can actually run it: an engine
+                // that is not installed is still offered, because the
+                // project plainly wants one, but it is not taken silently.
+                preselected: runnable != Some(false),
+                service: Some(ServiceHint {
+                    source: ServiceSource::Native {
+                        recipe: recipe.to_string(),
+                    },
+                    env_key: Some(key),
+                }),
+                ..Candidate::default()
+            }
+        })
+        .collect()
+}
+
+/// Which mechanism a project's private services would use, and the
+/// evidence that decided it.
+///
+/// Three inputs, in this order: what the project itself declares, what
+/// this machine can actually run, and what the developer said they
+/// prefer. Never a bare verdict — `evidence` is what `doctor` prints
+/// under the answer, because "pando will use native" with no reason
+/// behind it is a thing to argue with rather than a thing to act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceChoice {
+    /// `compose`, `native`, or `None` when the project declares nothing
+    /// to isolate.
+    pub mechanism: Option<&'static str>,
+    /// Whether the project's own compose file offers anything worth a
+    /// private copy.
+    pub compose_declared: bool,
+    /// Whether the env example names a dependency a recipe could run.
+    pub native_declared: bool,
+    /// One line per fact that went into the answer, in the order they
+    /// were weighed.
+    pub evidence: Vec<String>,
+}
+
+/// [`service_choice`] for a project, reading the two halves the way
+/// `propose` reads them.
+///
+/// The one entry point a caller outside detection uses: `doctor` reports
+/// the answer, the proposal machinery acts on it, and neither of them
+/// gets its own copy of how the decision is made.
+pub fn service_choice_for(
+    root: &Path,
+    signals: &Signals,
+    evidence: &MachineEvidence,
+    config: &Config,
+) -> ServiceChoice {
+    let compose = compose_services_proposal(root, signals, None);
+    let native = native_candidates(signals, evidence);
+    let file = compose
+        .as_ref()
+        .and_then(|p| p.service_file())
+        .map(str::to_string)
+        .or_else(|| crate::compose::find(root));
+    service_choice(
+        file.as_deref(),
+        compose.as_ref().map(|p| p.candidates.len()).unwrap_or(0),
+        &native,
+        evidence,
+        config.isolation.preferred(),
+    )
+}
+
+/// What pando says when both mechanisms are real and nobody has chosen.
+///
+/// Named, because `agent/brief.md` quotes it twice — it is the line an
+/// agent is told to show a developer instead of answering a machine-wide
+/// preference on their behalf. A reword here with the brief left alone
+/// would leave the brief quoting a sentence pando no longer says, and a
+/// fenced block in a document is not something the compiler can see.
+/// [`the_brief_quotes_the_preference_line_pando_actually_says`] is what
+/// makes the two fail together.
+pub const NO_PREFERENCE_EVIDENCE: &str = "nobody has said which to prefer, so the project's own compose file wins — set \
+     `[isolation] prefer = \"native\"` in ~/.pando/config.toml to run the recipes instead";
+
+/// Decides between the two mechanisms from evidence.
+///
+/// `compose_candidates` is what the compose file offers after the
+/// build-from-this-repository filter; `native` is what the env example
+/// names. The preference only ever breaks a tie — it cannot conjure a
+/// mechanism the project does not declare, and it cannot pick one this
+/// machine has been shown not to have.
+pub fn service_choice(
+    compose_file: Option<&str>,
+    compose_candidates: usize,
+    native: &[Candidate],
+    evidence: &MachineEvidence,
+    prefer: Option<&str>,
+) -> ServiceChoice {
+    let compose_declared = compose_candidates > 0;
+    let native_declared = !native.is_empty();
+    let mut why: Vec<String> = Vec::new();
+    match compose_file {
+        Some(file) if compose_declared => why.push(format!(
+            "{file} declares {compose_candidates} service{} this project depends on",
+            if compose_candidates == 1 { "" } else { "s" }
+        )),
+        Some(file) => why.push(format!("{file} declares nothing this project depends on")),
+        None => why.push("this repository has no compose file".to_string()),
+    }
+    match native_declared {
+        true => why.push(format!(
+            "its env example addresses {}",
+            listed(&native.iter().map(|c| c.value.as_str()).collect::<Vec<_>>())
+        )),
+        false => why
+            .push("nothing in its env example names an engine pando has a recipe for".to_string()),
+    }
+
+    let mechanism = match (compose_declared, native_declared) {
+        (false, false) => None,
+        // One option is not a choice, and saying so is shorter than
+        // explaining a preference that could not have applied.
+        (true, false) => Some("compose"),
+        (false, true) => {
+            if let Some(unrunnable) = native
+                .iter()
+                .find(|c| evidence.can_run(&c.value) == Some(false))
+            {
+                why.push(format!(
+                    "{} is not installed here, and there is no compose file to fall back to — \
+                     starting it will say what to install",
+                    unrunnable.value
+                ));
+            }
+            Some("native")
+        }
+        (true, true) => {
+            let docker = evidence.has_docker();
+            let every_engine = native
+                .iter()
+                .all(|c| evidence.can_run(&c.value) != Some(false));
+            if let Some(prefer) = prefer {
+                why.push(format!(
+                    "this machine prefers {prefer} (~/.pando/config.toml)"
+                ));
+                match prefer {
+                    "native" if every_engine => Some("native"),
+                    // A preference this machine cannot honour is not
+                    // overruled quietly: the other mechanism is used and
+                    // the evidence says which engine was missing.
+                    "native" => {
+                        let missing: Vec<&str> = native
+                            .iter()
+                            .filter(|c| evidence.can_run(&c.value) == Some(false))
+                            .map(|c| c.value.as_str())
+                            .collect();
+                        why.push(format!(
+                            "but {} is not installed here, so compose it is",
+                            listed(&missing)
+                        ));
+                        Some("compose")
+                    }
+                    // Only when the recipes could actually run. A
+                    // machine with neither docker nor the engines gets
+                    // the compose it asked for and the refusal that
+                    // comes with it, rather than an evidence line
+                    // promising recipes that are not there either.
+                    "compose" if docker == Some(false) && every_engine => {
+                        why.push(
+                            "but docker is not on this machine, so the recipes it is".to_string(),
+                        );
+                        Some("native")
+                    }
+                    _ => Some("compose"),
+                }
+            } else if docker == Some(false) && every_engine {
+                // Not a preference and not a guess: the mechanism the
+                // project declares is one this machine has been shown
+                // not to have.
+                why.push("docker is not on this machine".to_string());
+                Some("native")
+            } else {
+                // The project's own compose file is the project's own
+                // statement about how to run its services, and nobody
+                // has said otherwise. The line below is how a developer
+                // learns there was a choice at all.
+                why.push(NO_PREFERENCE_EVIDENCE.to_string());
+                Some("compose")
+            }
+        }
+    };
+    ServiceChoice {
+        mechanism,
+        compose_declared,
+        native_declared,
+        evidence: why,
+    }
+}
+
+/// Every service the project's compose file declares, with the env key
+/// that names it where a rule found one.
+///
+/// Decided — no question at all — only when every service is resolved:
+/// either an env key points at it, or its image is not one an application
+/// talks to. One redis with nothing pointing at it is enough to ask,
+/// because pando cannot tell whether the project wants a private copy.
+pub(super) fn compose_services_proposal(
+    root: &Path,
+    signals: &Signals,
+    resolve: Option<ComposeResolver<'_>>,
+) -> Option<Proposal> {
+    let file = crate::compose::find(root)?;
+    let path = root.join(&file);
+    let mut parsed = crate::compose::read(&path).ok()?;
+    // Half a file read is not a proposal. Compose resolves `extends:` and a
+    // top-level `include:`; ask it when it is available.
+    if parsed.unresolved.any()
+        && let Some(resolve) = resolve
+        && let Some(resolved) = resolve(&path)
+    {
+        parsed = resolved;
+    }
+    if parsed.services.is_empty() {
+        return None;
+    }
+    let mut candidates = Vec::new();
+    let mut resolved = true;
+    // Which service owns which key so far, in file order. A key belongs to
+    // the first service a rule gave it to; the second one is a question.
+    let mut claimed: BTreeMap<String, String> = BTreeMap::new();
+    // The services that are this project rather than something it depends
+    // on, kept so the refusal can name them.
+    let mut built_here: Vec<String> = Vec::new();
+    for (name, service) in &parsed.services {
+        // A service compose builds out of this repository is the
+        // application. Running a private copy of it per worktree is not
+        // isolation, it is a second copy of the thing being developed, and
+        // it is the one answer that is certainly wrong — so it is not on
+        // offer at all.
+        if let Some(context) = &service.build
+            && built_from_project(root, &file, context)
+        {
+            built_here.push(name.clone());
+            continue;
+        }
+        let image = service.image.as_deref();
+        let found = env_key_for(name, image, &signals.env_example, &claimed);
+        let app_service = is_app_service(image);
+        if !matches!(found, EnvKey::Found(_)) && app_service {
+            resolved = false;
+        }
+        let of_the_image = match image {
+            Some(image) => format!("{file}, {image}"),
+            None => file.clone(),
+        };
+        let why = match &found {
+            EnvKey::Found(key) => format!("{of_the_image} → {key}"),
+            EnvKey::TakenBy { key, service } => {
+                format!("{of_the_image}; {key} already points at {service}")
+            }
+            EnvKey::Nothing => format!("{of_the_image}; nothing in the env example names it"),
+        };
+        let env_key = match found {
+            EnvKey::Found(key) => {
+                claimed.insert(key.clone(), name.clone());
+                Some(key)
+            }
+            _ => None,
+        };
+        candidates.push(Candidate {
+            value: name.clone(),
+            why,
+            preselected: env_key.is_some(),
+            service: Some(ServiceHint {
+                source: ServiceSource::Compose { file: file.clone() },
+                env_key,
+            }),
+            ..Candidate::default()
+        });
+    }
+    // A file that could not be read whole — no Docker to ask, or compose
+    // refused it — is never decided: the ports and images here may not be
+    // the ones compose uses, and an `include:` brings in services this list
+    // does not even have. It still proposes, because a project with a
+    // compose file silently looking like a project with none is worse than
+    // a question.
+    if let Some(keys) = parsed.unresolved.describe() {
+        resolved = false;
+        for candidate in &mut candidates {
+            if parsed.unresolved.include || parsed.unresolved.extends.contains(&candidate.value) {
+                candidate.preselected = false;
+            }
+            candidate.why = format!(
+                "{}; pando does not follow {keys} in this file, so check this one",
+                candidate.why
+            );
+        }
+    }
+    // Nothing to offer, for one of two reasons: every service in the file
+    // is this project's own, or nothing in the env example addresses any
+    // of them and none of their images is one an app talks to. Either way
+    // there is nothing to ask — a question whose only answer is wrong is
+    // worse than silence — and either way the *answer* still has to be
+    // written down, or the next start works it out again and a developer
+    // reading the file never learns that pando looked. It is the same
+    // empty answer a developer gives by declining the question, recorded
+    // the same way: an entry naming the file with an empty `include`. One
+    // shape for "none", not two.
+    //
+    // Unless pando could not read the file whole. "Half a file read is not
+    // a proposal" applies hardest here: a top-level `include:` brings in
+    // services this list does not have, and recording "none of them" about
+    // a file pando has not finished reading would answer the slot for good
+    // — silencing, permanently, whatever the next run with Docker present
+    // would have found. Nothing is written, and it is asked again.
+    // `resolved` is already false when a key went unfollowed, so the
+    // empty-candidates case is spelled out rather than folded in: a file
+    // whose every service is built here *and* carries an `extends:` must
+    // still reach the refusal below, not fall through to a proposal with
+    // nothing in it.
+    if candidates.is_empty() || (candidates.iter().all(|c| !c.preselected) && resolved) {
+        if parsed.unresolved.any() {
+            return None;
+        }
+        let built = listed(&built_here.iter().map(String::as_str).collect::<Vec<_>>());
+        let unaddressed = listed(
+            &candidates
+                .iter()
+                .map(|c| c.value.as_str())
+                .collect::<Vec<_>>(),
+        );
+        let mut proposal = Proposal::of(Slot::Services, Vec::new(), true);
+        proposal.none_because = Some(match (candidates.is_empty(), built_here.is_empty()) {
+            (true, _) => format!("{file} declares only {built}, built from this repository"),
+            (false, true) => format!("nothing in the env example addresses {unaddressed}"),
+            (false, false) => format!(
+                "nothing in the env example addresses {unaddressed}, and {built} is built \
+                 from this repository"
+            ),
+        });
+        proposal.file = Some(file);
+        return Some(proposal);
+    }
+    Some(Proposal::of(Slot::Services, candidates, resolved))
+}
+
+/// Which services this project runs private copies of, and by which
+/// mechanism.
+///
+/// The compose half and the native half are worked out independently —
+/// each is a fact about the repository — and [`service_choice`] decides
+/// between them from those facts, this machine, and the developer's
+/// preference. Only the chosen half becomes a question.
+pub(super) fn services_proposal(
+    root: &Path,
+    signals: &Signals,
+    resolve: Option<ComposeResolver<'_>>,
+    evidence: &MachineEvidence,
+    prefer: Option<&str>,
+) -> Option<Proposal> {
+    let compose = compose_services_proposal(root, signals, resolve);
+    let native = native_candidates(signals, evidence);
+    let compose_file = compose
+        .as_ref()
+        .and_then(|p| p.service_file())
+        .map(str::to_string)
+        .or_else(|| crate::compose::find(root));
+    let compose_candidates = compose.as_ref().map(|p| p.candidates.len()).unwrap_or(0);
+    let choice = service_choice(
+        compose_file.as_deref(),
+        compose_candidates,
+        &native,
+        evidence,
+        prefer,
+    );
+    match choice.mechanism {
+        Some("native") => {
+            // Decided when this machine can run every one of them.
+            // An engine that is not installed is still offered — the
+            // project plainly wants one — but it is not taken silently.
+            let decided = native.iter().all(|c| c.preselected);
+            let mut proposal = Proposal::of(Slot::Services, native, decided);
+            proposal.mechanism = Some("native");
+            proposal.evidence = choice.evidence;
+            Some(proposal)
+        }
+        _ => {
+            let mut proposal = compose?;
+            proposal.mechanism = choice.mechanism;
+            proposal.evidence = choice.evidence;
+            Some(proposal)
+        }
+    }
+}
+
+/// Whether a compose service's build context points inside the project.
+///
+/// Resolved the way compose resolves it: relative to the directory the
+/// compose file is in, which is where `build: ./api` looks. A context
+/// `docker compose config` already made absolute is used as it stands.
+///
+/// [`crate::paths::resolve_for_compare`] rather than `canonicalize`: a
+/// context directory that does not exist still says where compose *would*
+/// look, and on macOS the repository's own `/var/...` and the canonical
+/// `/private/var/...` are the same directory and have to compare equal.
+pub(super) fn built_from_project(root: &Path, file: &str, context: &str) -> bool {
+    let compose_file = root.join(file);
+    let dir = compose_file.parent().unwrap_or(root);
+    let context = Path::new(context);
+    let resolved = if context.is_absolute() {
+        context.to_path_buf()
+    } else {
+        dir.join(context)
+    };
+    crate::paths::resolve_for_compare(&resolved)
+        .starts_with(crate::paths::resolve_for_compare(root))
+}
+
+/// The command that brings a fresh database up to the current schema.
+///
+/// Each rule carries the globs whose change means it has to run again,
+/// because a hook without them runs on every start and one with the wrong
+/// ones never runs at all.
+pub(super) fn schema_hook_proposal(root: &Path, signals: &Signals) -> Option<Proposal> {
+    let candidates = schema_candidates(root, signals);
+    if candidates.is_empty() {
+        return None;
+    }
+    // One candidate is one answer; several is a question.
+    let decided = candidates.len() == 1;
+    Some(Proposal::of(Slot::SchemaHook, candidates, decided))
+}
+
+/// The name every proposed schema hook gets. One name, so a second run
+/// recognises the hook it wrote rather than appending another one.
+pub const SCHEMA_HOOK: &str = "migrate";
+
+fn schema_candidates(root: &Path, signals: &Signals) -> Vec<Candidate> {
+    let mut out = Vec::new();
+    let mut push = |cmd: String, globs: &[&str], why: &str| {
+        out.push(Candidate {
+            value: cmd.clone(),
+            why: why.to_string(),
+            hook: Some(crate::config::HookConfig {
+                name: SCHEMA_HOOK.to_string(),
+                after: crate::config::HookPoint::Services,
+                fingerprint: globs.iter().map(|g| (*g).to_string()).collect(),
+                cmd,
+                cwd: None,
+                fallback: None,
+            }),
+            ..Candidate::default()
+        })
+    };
+    let exec = package_runner(signals);
+    if root.join("prisma/schema.prisma").is_file() {
+        push(
+            format!("{exec} prisma migrate deploy"),
+            &["prisma/migrations/**"],
+            "prisma/schema.prisma",
+        );
+    }
+    if root.join("drizzle.config.ts").is_file() || root.join("drizzle.config.js").is_file() {
+        push(
+            format!("{exec} drizzle-kit migrate"),
+            &["drizzle/**"],
+            "drizzle.config",
+        );
+    }
+    if root.join("manage.py").is_file() {
+        // `python_runner` carries its own trailing space, or is empty for
+        // a project whose interpreter is simply on PATH.
+        push(
+            format!("{}python manage.py migrate", python_runner(signals)),
+            &["*/migrations/*.py"],
+            "manage.py",
+        );
+    }
+    if root.join("alembic.ini").is_file() {
+        push(
+            format!("{}alembic upgrade head", python_runner(signals)),
+            &["**/versions/*.py"],
+            "alembic.ini",
+        );
+    }
+    if root.join("config/database.yml").is_file() {
+        push(
+            "bin/rails db:prepare".to_string(),
+            &["db/migrate/*.rb"],
+            "config/database.yml",
+        );
+    }
+    out
+}
+
+/// How this project runs a binary from its dependencies: the first
+/// lockfile's manager decides, and `npx` is what is left.
+fn package_runner(signals: &Signals) -> &'static str {
+    lockfiles(signals)
+        .next()
+        .and_then(package_managers::for_lockfile)
+        .and_then(|manager| manager.exec)
+        .unwrap_or("npx")
+}
