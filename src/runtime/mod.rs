@@ -1,0 +1,271 @@
+//! What a project says about the runtime it needs.
+//!
+//! The split this module exists for: a version file is a *project* fact —
+//! it is the same for everyone who clones the repository — while the
+//! version manager that satisfies it is a fact about one laptop. This
+//! module owns the first half, and the table it owns is shaped so the
+//! second half (the probe, in `actions`) reads the same entries instead of
+//! growing its own copy of what a language is.
+//!
+//! The table is a `const` array rather than a stack of match arms, so a
+//! later phase can load the same shape from disk.
+
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::path::Path;
+
+mod fixes;
+mod languages;
+mod probe;
+mod probe_cache;
+mod version;
+
+pub use fixes::{Fix, fixes, from_version_file, installed};
+pub use languages::{Family, LANGUAGES, Language, Manager, Source, SourceKind, language};
+pub use probe::{Check, Resolved, Shell, Verdict, check, probe_command};
+pub use probe_cache::{ProbeCache, fingerprint, load_cache, save_cache};
+pub use version::{first_version, satisfies};
+
+/// One thing the project says it needs, and where it says it.
+///
+/// Serde-friendly because `signals --json` publishes it: this is the fact
+/// an agent reads to know which toolchain a repository wants.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Requirement {
+    /// What the requirement is about: a language in [`LANGUAGES`], or the
+    /// key an `engines` block used for something that is not one, such as
+    /// `pnpm`. Normalised, so `.tool-versions`' `nodejs` is `node` here.
+    pub language: String,
+    /// Exactly as the project wrote it: `22`, `>=18 <21`, `lts/*`.
+    pub spec: String,
+    /// The file it came from, with the key when the file holds several:
+    /// `.nvmrc`, `.tool-versions`, `package.json engines.node`.
+    pub source: String,
+    /// Whether the spec names one version rather than a range. A pin beats
+    /// a range when a project states both, which is why this is recorded
+    /// rather than worked out again at every call site.
+    pub pinned: bool,
+}
+
+impl Requirement {
+    fn new(language: &str, spec: &str, source: String) -> Requirement {
+        Requirement {
+            language: language.to_string(),
+            spec: spec.to_string(),
+            source,
+            pinned: is_pin(spec),
+        }
+    }
+}
+
+/// Files that state several languages at once, read once each.
+const TOOL_VERSIONS: &str = ".tool-versions";
+const MISE_FILE: &str = "mise.toml";
+pub const SHARED_VERSION_FILES: [&str; 2] = [TOOL_VERSIONS, MISE_FILE];
+const MANIFEST: &str = "package.json";
+
+/// Everything the repository says about the runtimes it needs.
+///
+/// Read-only, and pure file reading: it runs on the start path before
+/// anything is spawned, so it may not shell out.
+///
+/// Within one language a pin sorts before a range, which is what "a pinned
+/// file beats a range" means in practice: the first entry for a language is
+/// the one to compare against, and the rest are still recorded because a
+/// report that says `.nvmrc` wants 22 *and* `engines` wants `>=18` is the
+/// one that explains itself.
+pub fn requirements(root: &Path) -> Vec<Requirement> {
+    let tool_versions = read_tool_versions(root);
+    let mise = read_mise(root);
+    let engines = read_engines(root);
+    let mut out: Vec<Requirement> = Vec::new();
+
+    for language in LANGUAGES {
+        let mut found: Vec<Requirement> = Vec::new();
+        for source in language.files {
+            if let Some(spec) = read_source(root, source) {
+                found.push(Requirement::new(
+                    language.name,
+                    &spec,
+                    source.file.to_string(),
+                ));
+            }
+        }
+        for (file, entries) in [(TOOL_VERSIONS, &tool_versions), (MISE_FILE, &mise)] {
+            for (tool, spec) in entries {
+                if language.owns(tool) {
+                    found.push(Requirement::new(language.name, spec, file.to_string()));
+                }
+            }
+        }
+        if let Some(key) = language.engines_key
+            && let Some(spec) = engines.get(key)
+        {
+            found.push(Requirement::new(
+                language.name,
+                spec,
+                format!("{MANIFEST} engines.{key}"),
+            ));
+        }
+        // Stable: a pin first, and otherwise the order the files were read
+        // in, which is the order the table lists them.
+        found.sort_by_key(|r| !r.pinned);
+        out.extend(found);
+    }
+
+    // An `engines` key no language in the table claims — `npm`, `pnpm`,
+    // `yarn` — is still something the project stated, and `signals --json`
+    // publishes it. Nothing probes it, because the table has no entry that
+    // says how.
+    for (key, spec) in &engines {
+        if !LANGUAGES
+            .iter()
+            .any(|language| language.engines_key == Some(key.as_str()))
+        {
+            out.push(Requirement::new(
+                key,
+                spec,
+                format!("{MANIFEST} engines.{key}"),
+            ));
+        }
+    }
+    out
+}
+
+/// The requirement to compare a language against: its pin if it has one,
+/// else the first range anything stated.
+pub fn for_language<'a>(
+    requirements: &'a [Requirement],
+    language: &str,
+) -> Option<&'a Requirement> {
+    requirements.iter().find(|r| r.language == language)
+}
+
+fn read_source(root: &Path, source: &Source) -> Option<String> {
+    let text = std::fs::read_to_string(root.join(source.file)).ok()?;
+    match source.kind {
+        SourceKind::Plain => first_meaningful_line(&text),
+        SourceKind::TomlKey(table, key) => Some(
+            toml::from_str::<toml::Table>(&text)
+                .ok()?
+                .get(table)?
+                .get(key)?
+                .as_str()?
+                .trim()
+                .to_string(),
+        )
+        .filter(|s| !s.is_empty()),
+    }
+}
+
+/// The first line that is neither blank nor a comment. `.python-version`
+/// may hold several versions; the first is the one that is used.
+fn first_meaningful_line(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+}
+
+/// `<tool> <version> [fallback…]` lines, asdf's and mise's shared format.
+fn read_tool_versions(root: &Path) -> Vec<(String, String)> {
+    let Ok(text) = std::fs::read_to_string(root.join(TOOL_VERSIONS)) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let tool = parts.next()?;
+            // Only the first: the rest are fallbacks, and a fallback is not
+            // what the project is asking for.
+            let spec = parts.next()?;
+            Some((tool.to_ascii_lowercase(), spec.to_string()))
+        })
+        .collect()
+}
+
+/// `[tools]` in `mise.toml`, whose values are a string, a list, or a table
+/// with a `version` key.
+fn read_mise(root: &Path) -> Vec<(String, String)> {
+    let Ok(text) = std::fs::read_to_string(root.join(MISE_FILE)) else {
+        return Vec::new();
+    };
+    let Ok(table) = toml::from_str::<toml::Table>(&text) else {
+        return Vec::new();
+    };
+    let Some(tools) = table.get("tools").and_then(toml::Value::as_table) else {
+        return Vec::new();
+    };
+    tools
+        .iter()
+        .filter_map(|(tool, value)| Some((tool.to_ascii_lowercase(), mise_spec(value)?)))
+        .collect()
+}
+
+fn mise_spec(value: &toml::Value) -> Option<String> {
+    match value {
+        toml::Value::String(s) => Some(s.trim().to_string()),
+        toml::Value::Array(items) => items.first().and_then(mise_spec),
+        toml::Value::Table(table) => table.get("version").and_then(mise_spec),
+        _ => None,
+    }
+}
+
+/// `engines` in `package.json`: the one requirement source that is a range
+/// by convention, and the one nothing read until now.
+fn read_engines(root: &Path) -> BTreeMap<String, String> {
+    let Ok(text) = std::fs::read_to_string(root.join(MANIFEST)) else {
+        return BTreeMap::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return BTreeMap::new();
+    };
+    let Some(engines) = value.get("engines").and_then(|e| e.as_object()) else {
+        return BTreeMap::new();
+    };
+    engines
+        .iter()
+        .filter_map(|(key, value)| {
+            let spec = value.as_str()?.trim();
+            (!spec.is_empty()).then(|| (key.to_ascii_lowercase(), spec.to_string()))
+        })
+        .collect()
+}
+
+/// A spec stripped of the decoration a version file is allowed to carry: a
+/// leading `v`, an `=`, and a vendor prefix such as `ruby-` or `temurin-`.
+///
+/// Shared by the pin test and, in the next work item, by the comparison, so
+/// both agree on what a version even is.
+pub fn normalize_spec(spec: &str) -> &str {
+    let spec = spec.trim();
+    // `temurin-21.0.1`, `ruby-3.2.2`: a vendor name, then the version.
+    let spec = match spec.split_once('-') {
+        Some((prefix, rest))
+            if !prefix.is_empty()
+                && prefix.chars().all(|c| c.is_ascii_alphabetic())
+                && rest.starts_with(|c: char| c.is_ascii_digit()) =>
+        {
+            rest
+        }
+        _ => spec,
+    };
+    spec.trim_start_matches(['=', 'v', 'V'])
+}
+
+/// Whether a spec names one version rather than a range or an alias.
+fn is_pin(spec: &str) -> bool {
+    let spec = normalize_spec(spec);
+    !spec.is_empty()
+        && spec
+            .split('.')
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+}
+
+#[cfg(test)]
+pub(crate) use probe::probe_reply;
+
+#[cfg(test)]
+mod tests;
