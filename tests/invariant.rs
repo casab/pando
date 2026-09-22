@@ -1560,6 +1560,115 @@ fn doctor_writes_nothing_anywhere() {
     }
 }
 
+// The agent path, end to end, over every hard shape: the commands the
+// setup skill runs, in the order the brief runs them, and then the
+// lifecycle they exist to make possible.
+//
+// Invariant 1 is the promise a plugin inherits. A developer will not
+// distinguish "the plugin wrote in my repository" from "pando did", and
+// the plugin's own guardrail — never write into the developer's
+// repository — is only as good as this.
+#[test]
+fn the_whole_agent_path_never_writes_into_the_repository() {
+    // The same recorded answers `tests/agent.rs` drives, against the
+    // same shapes. Here it is only ever the tree that is asserted.
+    for (kind, answers, lifecycle) in [
+        (
+            Kind::WorkspaceNoLock,
+            r#"{"processes": "api: npm run dev in apps/api; web: npm run dev in apps/web"}"#,
+            // No lockfile, so config has no install step and `new` runs
+            // no hook. Every other shape here installs with `npm ci`,
+            // which a test may not reach the network to run.
+            true,
+        ),
+        (
+            Kind::EnvPorts,
+            r#"{"port_env": "WEB_PORT, ADMIN_PORT"}"#,
+            false,
+        ),
+        (Kind::ComposeAppOnly, "{}", false),
+        (Kind::PinnedRuntime, "{}", false),
+        (
+            Kind::ServicesNoManifest,
+            r#"{"services": ["postgres", "redis"]}"#,
+            false,
+        ),
+        // The one worth the lifecycle: seeding a worktree's `.env` from
+        // a tracked example is the only thing on this path that writes
+        // inside a worktree at all.
+        (Kind::EnvNeverArrived, r#"{"provision": ".env"}"#, true),
+    ] {
+        let name = kind.dir_name();
+        let h = harness_built(kind, "", true);
+        // The machine answer, so a host that does not resolve a pin is
+        // answering the same question as one that does.
+        std::fs::write(h.home.join("config.toml"), "[runtime]\nprelude = \"\"\n").unwrap();
+        let file = h.home.join("answers.json");
+        std::fs::write(&file, answers).unwrap();
+        let file = file.to_str().unwrap().to_string();
+
+        for args in [
+            vec!["signals"],
+            vec!["init", "--answers", &file, "--dry-run"],
+            vec!["init", "--answers", &file],
+            vec!["doctor", "--json"],
+            vec!["signals"],
+        ] {
+            let out = pando(&h, &args);
+            // doctor is 0 or 1 — one of these shapes pins a runtime no
+            // machine resolves, which is the fixture working. Nothing
+            // else here may fail at all.
+            let allowed: &[i32] = match args[0] {
+                "doctor" => &[0, 1],
+                _ => &[0],
+            };
+            assert!(
+                allowed.contains(&out.status.code().unwrap_or(-1)),
+                "{name}: {args:?} exited {:?}: {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            h.assert_untouched(&format!("{name}: {}", args.join(" ")), None);
+        }
+
+        if !lifecycle {
+            continue;
+        }
+        let out = pando(&h, &["new", "feat/one"]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{name}: new failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let worktree = h.config.worktrees_dir(&h.paths).join("feat+one");
+        h.assert_untouched(&format!("{name}: new"), Some(&worktree));
+        if kind == Kind::EnvNeverArrived {
+            // Proof the interesting half of this shape really ran: the
+            // worktree was given a file made out of a tracked example,
+            // and the repository is still untouched above.
+            assert!(
+                worktree.join(".env").is_file(),
+                "{name}: the worktree was never seeded, so this lifecycle proved nothing"
+            );
+        }
+        assert_eq!(
+            pando(&h, &["path", "feat+one"]).status.code(),
+            Some(0),
+            "{name}: path"
+        );
+        h.assert_untouched(&format!("{name}: path"), Some(&worktree));
+        let out = pando(&h, &["rm", "feat+one"]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{name}: rm failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        h.assert_untouched(&format!("{name}: rm"), None);
+    }
+}
+
 /// Every path under `root` with its size *and* its modification time.
 ///
 /// Stricter than [`tree`], and only doctor needs it: "this command writes

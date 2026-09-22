@@ -240,3 +240,346 @@ fn the_plugin_manifest_is_valid_and_the_marketplace_points_at_it() {
         "the marketplace's source has no plugin manifest in it"
     );
 }
+
+// ---- a recorded answers file, end to end -----------------------------------
+//
+// No network and no model: a fixed answers file — what a program sends
+// after reading `pando signals` — driven through `pando init --answers`
+// against each hard fixture, with the resulting config and doctor's
+// verdict asserted. The corpus *is* pando's validation, so the promise
+// "an agent can configure this correctly on the first try" is only worth
+// something if the shapes are the ones a first run really meets.
+
+mod common;
+
+use common::{Kind, build, paths_for, status_porcelain};
+use pando::config::{Config, PortsSpec, ServiceConfig};
+use tempfile::TempDir;
+
+/// One hard shape, the answers a program would record for it, and what
+/// has to be true afterwards.
+struct Recorded {
+    kind: Kind,
+    /// The answers file, verbatim.
+    answers: &'static str,
+    /// The questions the rules cannot settle here, in the order they are
+    /// asked — which is what the answers file is for and what the
+    /// decisions log must hold afterwards. `None` where the answer
+    /// depends on what this machine has installed.
+    asks: Option<&'static [&'static str]>,
+    /// Whether `doctor` exits 0 afterwards.
+    healthy: bool,
+    /// What config must say. Asserted against the loaded config rather
+    /// than the file's text: a service entry's provenance comment
+    /// depends on whether this machine has the engine, and the *answer*
+    /// does not.
+    expect: fn(&Config),
+}
+
+const RECORDED: &[Recorded] = &[
+    // Several apps and no workspace file. Which apps to run is the
+    // developer's call — and it is the only question, because taking the
+    // per-app form settles the dev command and the ports with it.
+    Recorded {
+        kind: Kind::WorkspaceNoLock,
+        answers: r#"{"processes": "api: npm run dev in apps/api; web: npm run dev in apps/web"}"#,
+        asks: Some(&["processes"]),
+        healthy: true,
+        expect: |c| {
+            assert_eq!(c.processes.keys().collect::<Vec<_>>(), ["api", "web"]);
+            assert_eq!(c.processes["web"].cwd.as_deref(), Some("apps/web"));
+            assert_eq!(c.processes["api"].cwd.as_deref(), Some("apps/api"));
+            assert_eq!(
+                c.project.install, None,
+                "no lockfile means no frozen install exists, and pando never proposes a loose one"
+            );
+        },
+    },
+    // Two app ports in the env example and a dev script that takes
+    // neither on the command line: which of them the one process serves
+    // on is a question, and the pre-ticked answer is both.
+    Recorded {
+        kind: Kind::EnvPorts,
+        answers: r#"{"port_env": "WEB_PORT, ADMIN_PORT"}"#,
+        asks: Some(&["port_env"]),
+        healthy: true,
+        expect: |c| {
+            assert_eq!(c.project.install.as_deref(), Some("npm ci"));
+            let PortsSpec::Map(ports) = c.processes["dev"].ports.as_ref().expect("ports") else {
+                panic!("the env example names its ports by role");
+            };
+            assert_eq!(ports["WEB_PORT"], "web");
+            assert_eq!(ports["ADMIN_PORT"], "admin");
+        },
+    },
+    // The shape this phase exists to get right: one compose service,
+    // built from this repository. It packages the application, so there
+    // is no container option, nothing to ask, and a recorded negative so
+    // the question never comes back.
+    Recorded {
+        kind: Kind::ComposeAppOnly,
+        answers: "{}",
+        asks: Some(&[]),
+        healthy: true,
+        expect: |c| {
+            assert_eq!(c.services.len(), 1);
+            let ServiceConfig::Compose { file, include, .. } = &c.services[0] else {
+                panic!("a compose file that packages the app is still a compose entry");
+            };
+            assert_eq!(file, "docker-compose.yml");
+            assert!(
+                include.is_empty(),
+                "the negative is recorded, not left unanswered: {include:?}"
+            );
+        },
+    },
+    // A pin no machine resolves. Nothing is asked, everything is
+    // configured, and doctor says the one true thing about it.
+    Recorded {
+        kind: Kind::PinnedRuntime,
+        answers: "{}",
+        asks: Some(&[]),
+        healthy: false,
+        expect: |c| {
+            assert_eq!(c.runtime.version_files, [".nvmrc"]);
+            assert_eq!(c.project.install.as_deref(), Some("npm ci"));
+        },
+    },
+    // Services with nothing in the repository describing them. Whether
+    // the engines are installed here decides whether this is a question
+    // or a decision; it does not change the answer.
+    Recorded {
+        kind: Kind::ServicesNoManifest,
+        answers: r#"{"services": ["postgres", "redis"]}"#,
+        asks: None,
+        healthy: true,
+        expect: |c| {
+            let named: Vec<(&str, Vec<&str>)> = c
+                .services
+                .iter()
+                .map(|s| match s {
+                    ServiceConfig::Native { name, env, .. } => {
+                        (name.as_str(), env.keys().map(String::as_str).collect())
+                    }
+                    ServiceConfig::Compose { .. } => {
+                        panic!("there is no compose file here to run containers from")
+                    }
+                })
+                .collect();
+            assert_eq!(
+                named,
+                vec![
+                    ("postgres", vec!["DATABASE_URL"]),
+                    ("redis", vec!["CACHE_URL"])
+                ],
+                "the engine comes from the URL scheme, and the app is told where it is"
+            );
+        },
+    },
+    // A gitignored env that never arrived. Copying a file out of a
+    // tracked example is a write nobody has authorised, so `--yes`
+    // declines it — and an answers file naming it is a developer
+    // authorising it.
+    Recorded {
+        kind: Kind::EnvNeverArrived,
+        answers: r#"{"provision": ".env"}"#,
+        asks: Some(&["provision"]),
+        healthy: true,
+        expect: |c| {
+            assert_eq!(
+                c.project.provision.as_deref(),
+                Some([".env".to_string()].as_slice())
+            );
+            assert_eq!(c.project.provision_from[".env"], ".env.example");
+        },
+    },
+];
+
+struct Fixture {
+    _dir: TempDir,
+    root: PathBuf,
+    home: PathBuf,
+}
+
+fn fixture(kind: Kind) -> Fixture {
+    let dir = TempDir::new().unwrap();
+    let parent = std::fs::canonicalize(dir.path()).unwrap();
+    let root = build(kind, &parent).root;
+    let home = parent.join("pando-home");
+    let paths = paths_for(&home, &root);
+    paths.ensure_home().unwrap();
+    // The one question that is about this machine rather than the
+    // fixture: pando spawns with `bash -lc`, and whether that shell
+    // resolves what a project pins is a fact about the host. Answering
+    // it here is what keeps every assertion below the same on every
+    // machine — including the one fixture that pins a version nothing
+    // resolves, whose whole point is the refusal.
+    std::fs::write(home.join("config.toml"), "[runtime]\nprelude = \"\"\n").unwrap();
+    Fixture {
+        root,
+        home,
+        _dir: dir,
+    }
+}
+
+impl Fixture {
+    fn pando(&self, args: &[&str], stdin: Option<&str>) -> std::process::Output {
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pando"))
+            .env("PANDO_HOME", &self.home)
+            .current_dir(&self.root)
+            .args(args)
+            .stdin(match stdin {
+                Some(_) => std::process::Stdio::piped(),
+                None => std::process::Stdio::null(),
+            })
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("run pando");
+        if let Some(text) = stdin {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .expect("a piped stdin")
+                .write_all(text.as_bytes())
+                .expect("write the answers");
+        }
+        child.wait_with_output().expect("wait for pando")
+    }
+
+    fn config(&self) -> Config {
+        let paths = paths_for(&self.home, &self.root);
+        let loaded = pando::config::load(&paths).expect("the config pando just wrote");
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        loaded.config
+    }
+
+    fn decisions(&self) -> Vec<serde_json::Value> {
+        let paths = paths_for(&self.home, &self.root);
+        let Ok(text) = std::fs::read_to_string(paths.decisions_file()) else {
+            return Vec::new();
+        };
+        text.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("one object per line"))
+            .collect()
+    }
+}
+
+#[test]
+fn a_recorded_answers_file_configures_every_hard_shape() {
+    for case in RECORDED {
+        let name = case.kind.dir_name();
+        let fx = fixture(case.kind);
+
+        // The preview first, because the brief tells an agent to show it
+        // before writing — and a preview that is not the real renderer
+        // is a preview of something else.
+        let preview = fx.pando(&["init", "--answers", "-", "--dry-run"], Some(case.answers));
+        assert_eq!(
+            preview.status.code(),
+            Some(0),
+            "{name}: dry run failed: {}",
+            String::from_utf8_lossy(&preview.stderr)
+        );
+        let previewed = String::from_utf8_lossy(&preview.stdout).into_owned();
+
+        let out = fx.pando(&["init", "--answers", "-"], Some(case.answers));
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{name}: init failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let paths = paths_for(&fx.home, &fx.root);
+        let written = std::fs::read_to_string(paths.config_file()).expect("a config file");
+        assert!(
+            previewed.contains(&written),
+            "{name}: the preview was not what landed"
+        );
+        (case.expect)(&fx.config());
+
+        // Every answer a program gave says so, and every answer a rule
+        // gave says that instead.
+        if case.asks.is_some_and(|asks| !asks.is_empty()) {
+            assert!(
+                written.contains("# answered: a program,"),
+                "{name}: a key a program answered does not say so: {written}"
+            );
+        }
+
+        // What the rules could not settle is exactly what the decisions
+        // log holds — the corpus the rules get better from.
+        if let Some(asks) = case.asks {
+            let slots: Vec<String> = fx
+                .decisions()
+                .iter()
+                .map(|d| d["slot"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(
+                slots, asks,
+                "{name}: the decisions log holds the wrong slots"
+            );
+        }
+
+        // And then the proof, which is the point of the whole pass.
+        let doctor = fx.pando(&["doctor", "--json"], None);
+        let report: serde_json::Value =
+            serde_json::from_str(&String::from_utf8_lossy(&doctor.stdout))
+                .unwrap_or_else(|e| panic!("{name}: doctor --json did not parse: {e}"));
+        assert_eq!(
+            report["ok"], case.healthy,
+            "{name}: doctor said {:#?}",
+            report["findings"]
+        );
+        assert_eq!(
+            doctor.status.code(),
+            Some(if case.healthy { 0 } else { 1 }),
+            "{name}: the exit code and `ok` disagree"
+        );
+
+        // Not one byte in the repository, on any of those paths.
+        assert_eq!(status_porcelain(&fx.root), "", "{name}");
+    }
+}
+
+/// The one shape that cannot be green, and why that is the fixture
+/// working rather than the setup failing.
+///
+/// It pins a runtime version no machine will ever have. pando configures
+/// it completely and then refuses to start it, naming the pin and the
+/// line that would fix it — which is the refusal-before-spawn path, and
+/// the thing an agent must report rather than work around.
+#[test]
+fn a_pinned_runtime_nothing_resolves_is_configured_and_then_refused() {
+    let fx = fixture(Kind::PinnedRuntime);
+    assert_eq!(
+        fx.pando(&["init", "--answers", "-"], Some("{}"))
+            .status
+            .code(),
+        Some(0),
+        "the project is configurable; it is this machine that cannot run it"
+    );
+
+    let doctor = fx.pando(&["doctor", "--json"], None);
+    let report: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&doctor.stdout)).expect("doctor --json");
+    let problems: Vec<&serde_json::Value> = report["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .filter(|f| f["severity"] == "problem")
+        .collect();
+    assert_eq!(problems.len(), 1, "{problems:#?}");
+    let message = problems[0]["message"].as_str().unwrap();
+    assert!(message.contains("99.0.0"), "{message}");
+    assert!(message.contains("node"), "{message}");
+    assert!(
+        problems[0]["fix"]
+            .as_str()
+            .is_some_and(|fix| fix.contains("prelude")),
+        "and the fix names the one thing that would change it: {problems:#?}"
+    );
+}
