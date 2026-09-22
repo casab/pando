@@ -1587,6 +1587,13 @@ fn the_whole_agent_path_never_writes_into_the_repository() {
             false,
         ),
         (Kind::ComposeAppOnly, "{}", false),
+        // The hybrid: an app-only compose file and a database that only
+        // the env example names.
+        (
+            Kind::ComposeAppAndDatabase,
+            r#"{"services": ["postgres"]}"#,
+            false,
+        ),
         (Kind::PinnedRuntime, "{}", false),
         (
             Kind::ServicesNoManifest,

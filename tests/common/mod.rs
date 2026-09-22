@@ -116,6 +116,11 @@ pub enum Kind {
     /// A gitignored env file that never arrived, with the example beside
     /// it.
     EnvNeverArrived,
+    /// The hybrid: a compose file that packages only the application,
+    /// and an env example that addresses a database the compose file
+    /// says nothing about. A compose file is not automatically a
+    /// container option, so the database has to be proposed natively.
+    ComposeAppAndDatabase,
 }
 
 impl Kind {
@@ -134,6 +139,7 @@ impl Kind {
             "pinned-runtime" => Kind::PinnedRuntime,
             "services-no-manifest" => Kind::ServicesNoManifest,
             "env-never-arrived" => Kind::EnvNeverArrived,
+            "compose-app-and-database" => Kind::ComposeAppAndDatabase,
             _ => return None,
         })
     }
@@ -153,6 +159,7 @@ impl Kind {
             Kind::PinnedRuntime => "pinned-runtime",
             Kind::ServicesNoManifest => "services-no-manifest",
             Kind::EnvNeverArrived => "env-never-arrived",
+            Kind::ComposeAppAndDatabase => "compose-app-and-database",
         }
     }
 
@@ -367,6 +374,29 @@ impl Kind {
                     },
                 );
             }
+            // A compose file that packages the application, and a
+            // database it says nothing about. The build-from-this-
+            // repository filter leaves the compose file offering
+            // nothing, so there is no container option to weigh at all —
+            // and the env example's address is still a declaration, so
+            // the database is proposed as a recipe. No compose entry is
+            // written: the mechanism chosen was the other one, and the
+            // native answer closes the slot on its own.
+            Kind::ComposeAppAndDatabase => {
+                config.project.install = Some("npm ci".to_string());
+                config.project.provision = Some(strings(&[".env"]));
+                config.processes.insert(
+                    "dev".to_string(),
+                    ProcessConfig {
+                        cmd: "npm run dev".to_string(),
+                        ports: Some(port_env("PORT")),
+                        ..Default::default()
+                    },
+                );
+                config
+                    .services
+                    .push(native_service("postgres", "DATABASE_URL"));
+            }
             Kind::MonoWebApi => {
                 config.project.install = Some("pnpm install --frozen-lockfile".to_string());
                 config.project.provision = Some(strings(&[".env"]));
@@ -420,7 +450,7 @@ impl Kind {
         config
     }
 
-    pub const ALL: [Kind; 13] = [
+    pub const ALL: [Kind; 14] = [
         Kind::Plain,
         Kind::NextPnpmCompose,
         Kind::DjangoUvPostgres,
@@ -434,6 +464,7 @@ impl Kind {
         Kind::PinnedRuntime,
         Kind::ServicesNoManifest,
         Kind::EnvNeverArrived,
+        Kind::ComposeAppAndDatabase,
     ];
 }
 
@@ -854,6 +885,38 @@ func main() {
             ),
             (".env.example", "PORT=3000\nSECRET=replace-me\n"),
         ],
+        // A compose file that packages the application — and nothing
+        // else, not even commented out — beside an env example that
+        // plainly addresses a database. The two halves of the hybrid.
+        Kind::ComposeAppAndDatabase => vec![
+            (".gitignore", ".env\nnode_modules/\n"),
+            (
+                "package.json",
+                "{\n  \"name\": \"compose-app-and-database\",\n  \
+                 \"scripts\": { \"dev\": \"node server.js\" }\n}\n",
+            ),
+            ("package-lock.json", "{\n  \"lockfileVersion\": 3\n}\n"),
+            ("server.js", "// a server\n"),
+            ("Dockerfile", "FROM scratch\n"),
+            (
+                "docker-compose.yml",
+                r#"services:
+  app:
+    build: .
+    volumes:
+      - .:/srv
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD", "true"]
+      interval: 5s
+"#,
+            ),
+            (
+                ".env.example",
+                "PORT=3000\nDATABASE_URL=postgres://user:pass@localhost:5432/appdb\n",
+            ),
+        ],
         Kind::NextMessy => vec![
             (
                 "package.json",
@@ -929,6 +992,10 @@ fn ignored_files_for(kind: Kind) -> Vec<(&'static str, &'static str)> {
              CACHE_URL=redis://localhost:6379\n",
         )],
         Kind::ComposeAppOnly | Kind::PinnedRuntime => vec![(".env", "PORT=3000\n")],
+        Kind::ComposeAppAndDatabase => vec![(
+            ".env",
+            "PORT=3000\nDATABASE_URL=postgres://user:pass@localhost:5432/appdb\n",
+        )],
         Kind::ServicesNoManifest => vec![(
             ".env",
             "PORT=3000\nDATABASE_URL=postgres://user:pass@localhost:5432/appdb\n\

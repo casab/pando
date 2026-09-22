@@ -333,6 +333,32 @@ const RECORDED: &[Recorded] = &[
             );
         },
     },
+    // The hybrid of the shape above and the services one below, and the
+    // only fixture that exercises both halves of the brief's §5 in a
+    // single project: the compose file packages the application, so it
+    // is not a container option, and the database the env example
+    // addresses has to be proposed as a recipe instead. Nothing is
+    // written about the compose file at all — the mechanism chosen was
+    // the other one.
+    Recorded {
+        kind: Kind::ComposeAppAndDatabase,
+        answers: r#"{"services": ["postgres"]}"#,
+        asks: None,
+        healthy: true,
+        expect: |c| {
+            assert_eq!(c.project.install.as_deref(), Some("npm ci"));
+            assert_eq!(c.services.len(), 1, "{:?}", c.services);
+            let ServiceConfig::Native { name, env, .. } = &c.services[0] else {
+                panic!("a compose file that packages the app runs no private copy of anything");
+            };
+            assert_eq!(name, "postgres");
+            assert_eq!(
+                env.keys().collect::<Vec<_>>(),
+                ["DATABASE_URL"],
+                "the app is told where its own private copy is"
+            );
+        },
+    },
     // A pin no machine resolves. Nothing is asked, everything is
     // configured, and doctor says the one true thing about it.
     Recorded {

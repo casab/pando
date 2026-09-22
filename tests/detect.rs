@@ -425,6 +425,10 @@ fn each_hard_shape_asks_exactly_what_it_should() {
         (Kind::PinnedRuntime, vec![]),
         // The addresses name the engines, so the recipes are decided.
         (Kind::ServicesNoManifest, vec![]),
+        // And the hybrid of those two: the compose file offers nothing,
+        // the env example's address names the engine, and the recipe is
+        // decided the same way.
+        (Kind::ComposeAppAndDatabase, vec![]),
         // Seeding a worktree's `.env` from an example is a copy of a
         // tracked file into a worktree, which is a write nobody has
         // authorised yet — so it is asked rather than taken, and `--yes`
@@ -502,6 +506,58 @@ fn a_project_that_needs_services_with_no_manifest_gets_recipes() {
     let evidence = services.evidence.join(" | ");
     assert!(evidence.contains("no compose file"), "{evidence}");
     assert!(evidence.contains("postgres and redis"), "{evidence}");
+}
+
+// The hybrid the two shapes above only cover half of each: a compose
+// file *and* a database, where the compose file is not a container
+// option because the one service in it is the application.
+//
+// This is the branch of `service_choice` where `compose_declared` is
+// false and `native_declared` is true while a compose file is sitting
+// right there — the case in which reading "there is a compose file, so
+// run the services in containers" gets the whole project wrong.
+#[test]
+fn a_compose_file_that_packages_the_app_still_leaves_the_database_native() {
+    let (_dir, root) = fixture(Kind::ComposeAppAndDatabase);
+    let signals = detect::signals(&root);
+    assert_eq!(
+        signals.compose_files,
+        vec!["docker-compose.yml".to_string()],
+        "the shape is only interesting while the compose file is really there"
+    );
+    let services = detect::propose(&root, &signals)
+        .into_iter()
+        .find(|p| p.slot == Slot::Services)
+        .expect("a services proposal");
+    assert_eq!(
+        services.mechanism,
+        Some("native"),
+        "a compose file that packages the app is not a container option"
+    );
+    let names: Vec<&str> = services
+        .candidates
+        .iter()
+        .map(|c| c.value.as_str())
+        .collect();
+    assert_eq!(names, vec!["postgres"]);
+    assert!(
+        services.decided,
+        "the app's own address names the engine, so there is nothing to ask"
+    );
+    let evidence = services.evidence.join(" | ");
+    assert!(
+        evidence.contains("docker-compose.yml declares nothing this project depends on"),
+        "the evidence has to say which mechanism was weighed and dropped: {evidence}"
+    );
+    assert!(
+        evidence.contains("env example addresses postgres"),
+        "{evidence}"
+    );
+    // And no preference was consulted: there was never a tie to break.
+    assert!(
+        !evidence.contains("prefer"),
+        "one option is not a choice, and saying so is shorter: {evidence}"
+    );
 }
 
 // A pin no machine resolves, and an `engines` range that disagrees with
