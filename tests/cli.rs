@@ -1965,6 +1965,10 @@ fn dry_run_prints_the_config_it_would_write_and_writes_nothing() {
         !e.home.join("preview").exists(),
         "and the scratch copy it made is gone"
     );
+    assert!(
+        !e.project_dir().join("decisions.jsonl").exists(),
+        "a preview that records the decisions it did not make is not a preview"
+    );
     assert_eq!(status_porcelain(&e.root), "");
 
     // And the real run then writes exactly what the preview showed.
