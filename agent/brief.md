@@ -169,12 +169,36 @@ is refused if it would make the config unloadable, and lands with
 glance which lines a machine chose. A key you wrote by hand has none of
 that and is indistinguishable from one they wrote themselves.
 
-There is **one thing you cannot write**, and it matters: the
-native-versus-container preference lives in `[isolation] prefer` in the
-developer's own `~/.pando/config.toml`. It is a machine-wide preference,
-not one of the nine questions, and there is no `--answers` key for it. If
-the project has both mechanisms available, quote pando's own line to the
-developer and let them set it. See §5.
+There is **one thing you cannot write**, and it matters:
+
+```toml
+# ~/.pando/config.toml
+[isolation]
+prefer = "native"     # or "compose"
+```
+
+That key decides whether a private service runs in a container or from an
+engine installed on the machine, and it is **machine-wide**. Not
+per-project, not per-worktree: one line, and it governs **every repository
+this developer opens with pando**, including the ones you have never seen
+and the ones they have not written yet. That is why it is not one of the
+nine questions and why `--answers` has no key for it — an answer inferred
+from the evidence in front of you would quietly settle a question about
+projects that evidence says nothing about.
+
+So when it comes up, you do exactly two things: quote pando's own
+evidence line, and name the file and the key. pando prints the line
+itself, and it is the better one because it says what it is deciding
+*between*:
+
+```
+nobody has said which to prefer, so the project's own compose file wins —
+set `[isolation] prefer = "native"` in ~/.pando/config.toml to run the
+recipes instead
+```
+
+Then stop. Do not write the file, do not append to it, do not offer to.
+See §5 for when this arises at all — which is less often than it sounds.
 
 ## 5. Private services: container, native, or neither
 
@@ -244,7 +268,13 @@ recipes instead
 ```
 
 Quote that line to the developer, once, and stop. You cannot write it,
-`--answers` has no key for it, and it is a preference about their laptop.
+`--answers` has no key for it, and it is not a fact about this repository
+at all: `[isolation] prefer` is machine-wide, so the answer you would be
+inferring from *this* project's evidence would govern every other project
+on their machine too. That asymmetry is the whole reason the key is theirs
+and not yours. Say which project raised it, and let them decide for all of
+them.
+
 If they have no docker and the engines are there, pando has already chosen
 the recipes on the evidence and there is nothing to ask at all.
 
@@ -288,6 +318,19 @@ which is what every developer without an agent gets. So: answer from the
 published evidence, or refuse. **An answer you guessed pollutes a corpus
 somebody will train a rule on.** A question asked is cheap; a wrong config
 written confidently is not.
+
+There is exactly one thing the log cannot hold, and you are the only one
+who can put it on the record: **`[isolation] prefer`.** It is a question
+the rules could not settle — pando says so in as many words, in the line
+§4 quotes — and it is one no program may write, so it never becomes an
+`answer` line and never becomes an `override` line either. It is a gap in
+the corpus, and a gap nobody names is a gap nobody fixes.
+
+So when a project reaches that tie, **say so in your report**: that pando
+found both mechanisms, that it kept the project's compose file because
+nobody had said otherwise, and that the developer is the only one who can
+change it. One sentence, in the words pando used. That sentence is what
+the decisions log would have held.
 
 ## 8. Guardrails
 

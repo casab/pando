@@ -3804,6 +3804,14 @@ mod tests {
                 "a compose file that only packages the app",
             ),
             ("[isolation] prefer", "the preference an agent cannot write"),
+            (
+                "machine-wide",
+                "that the preference is not a fact about this repository",
+            ),
+            (
+                "gap in the corpus",
+                "the one answer the decisions log cannot hold",
+            ),
             ("decisions.jsonl", "what pando records about the answerer"),
             ("exit 3", "the code that means a question is open"),
             ("--json", "never parse human-readable output"),
