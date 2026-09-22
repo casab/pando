@@ -1964,6 +1964,18 @@ pub fn service_choice_for(
     )
 }
 
+/// What pando says when both mechanisms are real and nobody has chosen.
+///
+/// Named, because `agent/brief.md` quotes it twice — it is the line an
+/// agent is told to show a developer instead of answering a machine-wide
+/// preference on their behalf. A reword here with the brief left alone
+/// would leave the brief quoting a sentence pando no longer says, and a
+/// fenced block in a document is not something the compiler can see.
+/// [`the_brief_quotes_the_preference_line_pando_actually_says`] is what
+/// makes the two fail together.
+pub const NO_PREFERENCE_EVIDENCE: &str = "nobody has said which to prefer, so the project's own compose file wins — set \
+     `[isolation] prefer = \"native\"` in ~/.pando/config.toml to run the recipes instead";
+
 /// Decides between the two mechanisms from evidence.
 ///
 /// `compose_candidates` is what the compose file offers after the
@@ -2066,12 +2078,7 @@ pub fn service_choice(
                 // statement about how to run its services, and nobody
                 // has said otherwise. The line below is how a developer
                 // learns there was a choice at all.
-                why.push(
-                    "nobody has said which to prefer, so the project's own compose file wins — \
-                     set `[isolation] prefer = \"native\"` in ~/.pando/config.toml to run the \
-                     recipes instead"
-                        .to_string(),
-                );
+                why.push(NO_PREFERENCE_EVIDENCE.to_string());
                 Some("compose")
             }
         }
@@ -4598,5 +4605,29 @@ services:
         assert_eq!(keys, vec!["kind", "name", "env"]);
         assert_eq!(entries[1].1.as_str(), Some("mariadb"));
         let _ = (dir, dir2);
+    }
+
+    /// The brief quotes pando's no-preference line verbatim, twice.
+    ///
+    /// It sits in a fenced block there, so nothing about it is code and
+    /// nothing compares it to the string pando emits. Reword
+    /// [`NO_PREFERENCE_EVIDENCE`] with the brief left alone and the brief
+    /// goes on quoting a sentence pando no longer says — silently, with
+    /// every other test green. This is the same rot the README's clap
+    /// check exists to stop, in the one other document that quotes the
+    /// binary word for word.
+    #[test]
+    fn the_brief_quotes_the_preference_line_pando_actually_says() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("agent/brief.md");
+        let brief = std::fs::read_to_string(&path).expect("the brief");
+        // The brief is hard-wrapped, so the sentence straddles lines.
+        let collapsed = brief.split_whitespace().collect::<Vec<_>>().join(" ");
+        let quotes = collapsed.matches(NO_PREFERENCE_EVIDENCE).count();
+        assert_eq!(
+            quotes, 2,
+            "agent/brief.md quotes pando's no-preference line {quotes} times, expected 2 — \
+             if NO_PREFERENCE_EVIDENCE was reworded, reword the brief's two fenced copies \
+             with it; the brief is the one document that quotes this string verbatim"
+        );
     }
 }
