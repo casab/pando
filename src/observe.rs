@@ -4,8 +4,9 @@
 //! did not choose — a framework that ignores `PORT`, a second listener for
 //! HMR — so the ports a worktree really serves on are scanned from its
 //! process group's listening sockets. And when it dies, pando is no longer
-//! its parent, so there is no exit status to read: the reason comes from the
-//! last lines of the log.
+//! its parent, so `waitpid` has nothing to say: the reason is read back
+//! afterwards, from the last lines of the log and from the status the
+//! shell recorded for itself on the way out.
 //!
 //! Every lookup here is best effort. A missing `lsof`, a denied scan, or a
 //! group that has already gone yields an empty list rather than an error:
@@ -25,8 +26,10 @@ const SCAN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Every pid in the process group, including the leader.
 ///
-/// The leader is a `bash -lc` that usually `exec`s away or exits early, so
-/// the interesting pids are almost never the one pando recorded.
+/// The leader is a `bash -lc`. It waits for the process it started when
+/// pando asked it to record an exit status, and otherwise `exec`s away or
+/// exits early — so the interesting pids are not reliably the one pando
+/// recorded, in either case.
 pub fn group_pids(pgid: i32) -> Vec<u32> {
     group_pids_checked(pgid).unwrap_or_default()
 }
@@ -290,6 +293,32 @@ pub fn classify_failure(last_lines: &[String]) -> Option<Hint> {
     None
 }
 
+/// What the *way* a process ended says, when its log says nothing.
+///
+/// Two facts and no diagnosis past them: the status it exited with, and
+/// whether it wrote anything at all. Exiting 0 with an empty log is the
+/// one combination worth a suggestion — a dev server that is running is
+/// still running, and one that meant to fail says why — and it is exactly
+/// what a guard line lifted out of a Makefile recipe does when the tool it
+/// checks for is installed.
+///
+/// `None` when the log has something in it: then the log is the answer,
+/// and [`classify_failure`] is what reads it.
+pub fn exit_note(code: Option<i32>, printed_anything: bool) -> Option<String> {
+    if printed_anything {
+        return None;
+    }
+    Some(
+        if code == Some(0) {
+            "it printed nothing at all; a dev server stays up, so a command that exits 0 \
+             straight away is usually not the one that starts it"
+        } else {
+            "it printed nothing at all, so there is no log to read"
+        }
+        .to_string(),
+    )
+}
+
 /// The first port-looking number in a line, for the address-in-use hint.
 /// Bounded to the ephemeral-and-above range so a timestamp or a pid is not
 /// reported as a port.
@@ -512,6 +541,42 @@ mod tests {
         assert_eq!(port_in_text("listen eaddrinuse :::17342"), Some(17_342));
         assert_eq!(port_in_text("errno 48 address already in use"), None);
         assert_eq!(port_in_text("no numbers at all"), None);
+    }
+
+    // ---- the exit note ---------------------------------------------------
+
+    #[test]
+    fn a_silent_success_is_the_only_exit_worth_a_suggestion() {
+        let zero = exit_note(Some(0), false).expect("a silent exit 0 is worth saying");
+        assert!(zero.contains("printed nothing"), "{zero}");
+        assert!(
+            zero.contains("exits 0"),
+            "and says why that is a signal: {zero}"
+        );
+
+        let one = exit_note(Some(1), false).expect("a silent failure is still worth saying");
+        assert!(one.contains("printed nothing"), "{one}");
+        assert!(
+            !one.contains("exits 0"),
+            "a command that failed loudly is not evidence about the command: {one}"
+        );
+
+        assert_eq!(
+            exit_note(None, false),
+            exit_note(Some(1), false),
+            "with no status recorded, the silence is still all there is"
+        );
+    }
+
+    #[test]
+    fn a_process_that_printed_something_gets_no_note() {
+        assert_eq!(exit_note(Some(0), true), None);
+        assert_eq!(exit_note(Some(1), true), None);
+        assert_eq!(
+            exit_note(None, true),
+            None,
+            "the log is the answer whenever there is one"
+        );
     }
 
     // ---- against real processes -----------------------------------------

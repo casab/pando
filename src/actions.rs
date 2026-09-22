@@ -5656,19 +5656,53 @@ fn explain_new_failures(store: &mut state::State, failed_before: &[(String, Stri
             {
                 continue;
             }
-            let lines =
-                crate::log_tail::snapshot(&p.log_path, FAILURE_TAIL_LINES).unwrap_or_default();
-            let Some(hint) = crate::observe::classify_failure(&lines) else {
+            let explained = explain_failure(reason, &p.log_path);
+            if &explained == reason {
                 continue;
-            };
+            }
             p.phase = Phase::Failed {
                 at: *at,
-                reason: format!("{reason} — {}", hint.hint),
+                reason: explained,
             };
             changed = true;
         }
     }
     changed
+}
+
+/// Everything that can be said about one failure, in one line.
+///
+/// Three sources, in the order a reader wants them. What the phase knew —
+/// that the process is gone, or that nothing bound the port it was waiting
+/// for. Then the status its shell recorded on the way out, which is the
+/// only thing that separates a crash from a command that did its job and
+/// returned. Then either what the log says, or — when the log is empty —
+/// that it is empty, which is a fact about the command and not an absence
+/// of information.
+///
+/// The empty half is why this exists. A first run proposed a Makefile
+/// guard as a dev command; it exited 0 in a millisecond because the tool
+/// it guarded was installed, and `status`, `doctor` and the TUI all said
+/// "failed — process exited" over a log file with nothing in it.
+fn explain_failure(reason: &str, log_path: &Path) -> String {
+    let mut out = reason.to_string();
+    let code = proc::recorded_exit_status(&crate::paths::exit_status_file(log_path));
+    // Only onto the phase's own "it is gone": a timeout is a process that
+    // is still running, and has no status to report.
+    if out == state::EXITED
+        && let Some(code) = code
+    {
+        out = format!("{out} with status {code}");
+    }
+    let lines = crate::log_tail::snapshot(log_path, FAILURE_TAIL_LINES).unwrap_or_default();
+    let printed_anything = std::fs::metadata(log_path).is_ok_and(|m| m.len() > 0);
+    if let Some(note) = crate::observe::exit_note(code, printed_anything) {
+        out = format!("{out} — {note}");
+    }
+    if let Some(hint) = crate::observe::classify_failure(&lines) {
+        out = format!("{out} — {}", hint.hint);
+    }
+    out
 }
 
 /// Which worktrees pando created, from a state it has already read.
@@ -10646,6 +10680,90 @@ time.sleep(300)
         }
         // And the worktree keeps its ports, so a restart reuses them.
         assert!(!fx.state().worktrees[&name].ports.is_empty());
+    }
+
+    /// The report that started this: a dev command that succeeded and
+    /// returned, recorded as "failed — process exited" over an empty log.
+    /// Now the exit status is in the line every read path shows.
+    #[test]
+    fn a_dev_command_that_exits_at_once_reports_the_status_it_exited_with() {
+        let mut fx = fixture();
+        // The generic guard shape: a prerequisite check that exits 0 when
+        // the tool it checks for is there, which is the usual case.
+        with_dev(
+            &mut fx,
+            dev("command -v sh >/dev/null || { echo 'sh not found'; exit 1; }"),
+        );
+        let name = worktree_named(&fx, "feat/one");
+        let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+        let _guard = guard(&outcome);
+
+        assert!(wait_until(Duration::from_secs(10), || matches!(
+            refresh(&fx.paths).state.worktrees[&name].processes["dev"].phase,
+            Phase::Failed { .. }
+        )));
+        let phase = refresh(&fx.paths).state.worktrees[&name].processes["dev"]
+            .phase
+            .clone();
+        let Phase::Failed { reason, .. } = &phase else {
+            panic!("expected a failure, got {phase:?}");
+        };
+        assert!(
+            reason.contains("status 0"),
+            "the exit status is the whole difference between a crash and a \
+             command that did its job and returned: {reason}"
+        );
+        assert!(
+            !log_of(&fx, &name).contains("sh not found"),
+            "the guard took its success branch, which is the case being tested"
+        );
+    }
+
+    /// The other half, without depending on what a login shell on this
+    /// machine prints: an empty log and a recorded status, explained.
+    #[test]
+    fn a_failure_with_an_empty_log_says_that_it_is_empty() {
+        let dir = tempdir().unwrap();
+        let log = dir.path().join("dev.log");
+        std::fs::write(&log, b"").unwrap();
+        let status = crate::paths::exit_status_file(&log);
+
+        std::fs::write(&status, "0").unwrap();
+        let silent = explain_failure(state::EXITED, &log);
+        assert!(silent.starts_with("process exited"), "{silent}");
+        assert!(silent.contains("status 0"), "{silent}");
+        assert!(
+            silent.contains("printed nothing"),
+            "an empty log is a fact to state, not an absence to skip over: {silent}"
+        );
+        assert!(
+            silent.contains("not the one that starts it"),
+            "and it means something worth saying: {silent}"
+        );
+
+        // A timeout is a process that is still up, so no status belongs to
+        // it — and none is invented.
+        let timeout = "timeout: nothing bound port 17000 in 30s";
+        let waited = explain_failure(timeout, &log);
+        assert!(
+            !waited.contains("status 0"),
+            "only the phase's own \"it is gone\" takes a status: {waited}"
+        );
+        assert!(waited.starts_with(timeout), "{waited}");
+
+        // And a log with something in it is explained by the log.
+        std::fs::write(&log, "Error: listen EADDRINUSE :::17342\n").unwrap();
+        std::fs::write(&status, "1").unwrap();
+        let loud = explain_failure(state::EXITED, &log);
+        assert!(loud.contains("status 1"), "{loud}");
+        assert!(
+            !loud.contains("printed nothing"),
+            "it printed something: {loud}"
+        );
+        assert!(
+            loud.contains("17342"),
+            "and that is what explains it: {loud}"
+        );
     }
 
     #[test]

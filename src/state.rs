@@ -15,6 +15,14 @@ pub const STATE_VERSION: u32 = 2;
 /// How long a process may sit in `Starting` before it is called failed.
 pub const START_TIMEOUT_SECS: i64 = 30;
 
+/// The reason written for a process that is simply gone.
+///
+/// A constant because it is half a sentence: this is what the phase knows,
+/// and `actions::explain_new_failures` — which can read the log and the
+/// status the shell recorded — finishes it. Matching on the wrong spelling
+/// there would silently stop every failure being explained.
+pub const EXITED: &str = "process exited";
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct State {
     pub version: u32,
@@ -343,7 +351,7 @@ pub fn advance_phases(
                     if !is_alive(proc.pid) {
                         proc.phase = Phase::Failed {
                             at: now,
-                            reason: "process exited".into(),
+                            reason: EXITED.into(),
                         };
                         changed = true;
                     } else if proc
@@ -372,7 +380,7 @@ pub fn advance_phases(
                     if !is_alive(proc.pid) {
                         proc.phase = Phase::Failed {
                             at: now,
-                            reason: "process exited".into(),
+                            reason: EXITED.into(),
                         };
                         changed = true;
                     }
