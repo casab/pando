@@ -92,7 +92,8 @@ repository, which is what makes it safe to read before deciding anything.
   "project": { "id": "...", "root": "/abs/path", "name": "..." },
   "signals": {
     "scripts": {},              // package.json scripts, and their equivalents
-    "targets": {},              // Makefile / justfile targets
+    "targets": {},              // Makefile / justfile targets: name to
+                                //   { tool, prereqs, recipe } — see below
     "lockfiles": [],            // every lockfile at the root
     "workspace_markers": [],    // pnpm-workspace.yaml, turbo.json, …
     "version_files": [],        // .nvmrc, .python-version, mise.toml, …
@@ -117,6 +118,26 @@ repository, which is what makes it safe to read before deciding anything.
   "slots": [ /* one per question — see below */ ]
 }
 ```
+
+A target is published whole, because one line of a recipe is not the
+command a target runs:
+
+```jsonc
+"targets": {
+  "dev": {
+    "tool": "make",           // or "just"
+    "prereqs": ["build"],     // what runs first
+    "recipe": [               // every command line, continuations joined,
+      "@./build.sh",          //   `@`/`-`/`+` prefixes kept, comments dropped
+      "@./serve"
+    ]
+  }
+}
+```
+
+pando proposes `make dev` for that target and only proposes a recipe line
+itself when the target *is* that line: no prerequisites, one command, no `$`
+in a makefile or `{{` in a justfile, and no `-` or `+` prefix.
 
 `extends`, `include` and `error` are why a services proposal can be missing
 or under-ticked: they are the parts of a compose file this build did not

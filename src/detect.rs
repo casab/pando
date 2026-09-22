@@ -26,8 +26,8 @@ use crate::config::{Config, PortsSpec, ProcessConfig, ReadySpec};
 pub struct Signals {
     /// `package.json` scripts: name to body.
     pub scripts: BTreeMap<String, String>,
-    /// Makefile or justfile targets: name to the first line of the recipe.
-    pub targets: BTreeMap<String, String>,
+    /// Makefile or justfile targets: name to the target.
+    pub targets: BTreeMap<String, Target>,
     /// Lockfiles present at the root, in the order pando checks them.
     pub lockfiles: Vec<String>,
     pub workspace_markers: Vec<String>,
@@ -166,60 +166,190 @@ fn parse_scripts(manifest: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// Targets of a `Makefile` or `justfile` that might start something, with
-/// the first line of their recipe.
-fn parse_targets(root: &Path) -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
-    for file in ["Makefile", "makefile", "justfile", "Justfile"] {
+/// A `Makefile` or `justfile` target, as much of it as deciding how to run
+/// it takes.
+///
+/// The whole recipe and the prerequisites, not one line: which of the two
+/// ways to start a target is right — `make <target>` or the command itself
+/// — cannot be decided from a fragment. See [`target_candidates`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Target {
+    /// The tool that runs it: `make` or `just`.
+    pub tool: String,
+    /// What follows the colon: the targets that run *first*.
+    #[serde(default)]
+    pub prereqs: Vec<String>,
+    /// Every command line of the recipe, in order, with continuations
+    /// joined and the runner's own `@`, `-` and `+` prefixes left on —
+    /// they are part of what the recipe says. Blank lines and comment-only
+    /// lines are dropped: they are not commands.
+    #[serde(default)]
+    pub recipe: Vec<String>,
+}
+
+impl Target {
+    /// The command line this target *is*, when proposing it instead of the
+    /// runner loses nothing. See [`target_candidates`] for why the bar is
+    /// this high.
+    pub fn sole_command(&self) -> Option<&str> {
+        if !self.prereqs.is_empty() {
+            return None;
+        }
+        let [only] = self.recipe.as_slice() else {
+            return None;
+        };
+        // `-` and `+` are directives about how the runner treats the
+        // command rather than part of it; `@` only suppresses the echo,
+        // which is what running the line directly does anyway.
+        let body = only.trim_start_matches(['@', '-', '+']);
+        if only[..only.len() - body.len()].contains(['-', '+']) {
+            return None;
+        }
+        let runner_expands = match self.tool.as_str() {
+            // just passes `$VAR` through to the shell unchanged; `{{ … }}`
+            // is its own interpolation.
+            "just" => body.contains("{{"),
+            // In a makefile every `$` is make's, including `$$`, which is
+            // how a makefile escapes one *for* the shell.
+            _ => body.contains('$'),
+        };
+        (!runner_expands).then_some(body.trim())
+    }
+
+    /// What starts this target: its own command when it is representable by
+    /// one, otherwise the runner and the target's name.
+    pub fn command(&self, name: &str) -> String {
+        match self.sole_command() {
+            Some(command) => command.to_string(),
+            None => format!("{} {name}", self.tool),
+        }
+    }
+}
+
+/// Targets of a `Makefile` or `justfile` that might start something.
+fn parse_targets(root: &Path) -> BTreeMap<String, Target> {
+    let mut out: BTreeMap<String, Target> = BTreeMap::new();
+    for (file, tool) in [
+        ("Makefile", "make"),
+        ("makefile", "make"),
+        ("justfile", "just"),
+        ("Justfile", "just"),
+    ] {
         let Ok(text) = std::fs::read_to_string(root.join(file)) else {
             continue;
         };
         let lines: Vec<&str> = text.lines().collect();
         for (i, line) in lines.iter().enumerate() {
+            // A target starts at column zero and its name is one word.
+            if line.starts_with([' ', '\t']) {
+                continue;
+            }
             let Some((name, rest)) = line.split_once(':') else {
                 continue;
             };
-            // A target starts at column zero and its name is one word.
-            if line.starts_with([' ', '\t']) || name.trim().is_empty() {
+            let name = name.trim();
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            {
                 continue;
             }
-            let name = name.trim();
-            if !name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-            {
+            // `.PHONY`, `.DEFAULT_GOAL` and the rest are directives to make
+            // about other targets, never something to run.
+            if name.starts_with('.') {
                 continue;
             }
             // `x := 1` is an assignment, not a target.
             if rest.trim_start().starts_with('=') {
                 continue;
             }
+            // `dev:: …` is make's double-colon rule. The second colon is
+            // part of the operator, not a prerequisite.
+            let rest = rest.strip_prefix(':').unwrap_or(rest);
             // What follows the colon is the prerequisite list — the targets
             // that run *first* — in both make and just, never the recipe.
             // Only make's one-liner form, a semicolon after the
-            // prerequisites, puts a command on the target line. Otherwise
-            // the recipe is the indented line below, and a target whose
-            // next line is not indented has no recipe at all.
-            let inline = rest.split_once(';').map(|(_, cmd)| cmd.trim());
-            let recipe = match inline {
-                Some(cmd) if !cmd.is_empty() => cmd.to_string(),
-                _ => lines
-                    .get(i + 1)
-                    .filter(|l| l.starts_with([' ', '\t']))
-                    .map(|l| l.trim())
-                    .filter(|l| !l.is_empty())
-                    .unwrap_or_default()
-                    .to_string(),
+            // prerequisites, puts a command on the target line.
+            let (before, inline) = match rest.split_once(';') {
+                Some((before, command)) => (before, command.trim()),
+                None => (rest, ""),
             };
-            // make's "do not echo this line" prefix is not part of the
-            // command.
-            let recipe = recipe.trim_start_matches('@').trim().to_string();
-            if !recipe.is_empty() {
-                out.entry(name.to_string()).or_insert(recipe);
+            let mut recipe: Vec<String> = Vec::new();
+            if !inline.is_empty() {
+                recipe.push(inline.to_string());
             }
+            recipe.extend(recipe_below(&lines, i));
+            if recipe.is_empty() {
+                // A target whose next line is not indented has no recipe.
+                continue;
+            }
+            out.entry(name.to_string()).or_insert(Target {
+                tool: tool.to_string(),
+                prereqs: before.split_whitespace().map(str::to_string).collect(),
+                recipe,
+            });
         }
     }
     out
+}
+
+/// The indented recipe under the target on line `at`, one entry per command.
+///
+/// Four details of the format, each of which the one-line version got
+/// wrong. A trailing `\` continues the command onto the next physical line,
+/// however many times. Blank lines and comment-only lines sit *among*
+/// recipe lines without ending the recipe, and are not commands — except a
+/// `#!` shebang, which is just's way of handing the whole recipe to another
+/// interpreter and is very much part of it. A comment may also be at column
+/// zero and still not end the recipe. Everything else at column zero does.
+fn recipe_below(lines: &[&str], at: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut continued: Option<String> = None;
+    for line in lines.iter().skip(at + 1) {
+        let trimmed = line.trim();
+        // A continuation swallows the next physical line whatever it is,
+        // including one that would otherwise end the recipe.
+        if let Some(mut started) = continued.take() {
+            started.push(' ');
+            match trimmed.strip_suffix('\\') {
+                Some(head) => {
+                    started.push_str(head.trim_end());
+                    continued = Some(started);
+                }
+                None => {
+                    started.push_str(trimmed);
+                    out.push(started);
+                }
+            }
+            continue;
+        }
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !line.starts_with([' ', '\t']) {
+            if trimmed.starts_with('#') {
+                continue;
+            }
+            break;
+        }
+        if is_comment_line(trimmed) {
+            continue;
+        }
+        match trimmed.strip_suffix('\\') {
+            Some(head) => continued = Some(head.trim_end().to_string()),
+            None => out.push(trimmed.to_string()),
+        }
+    }
+    out.extend(continued);
+    out
+}
+
+/// A recipe line that is only a comment, `@#` included. A `#!` shebang is
+/// not one: just runs the recipe through it.
+fn is_comment_line(trimmed: &str) -> bool {
+    let body = trimmed.trim_start_matches(['@', '-', '+']);
+    body.starts_with('#') && !body.starts_with("#!")
 }
 
 impl Signals {
@@ -1039,17 +1169,37 @@ fn dev_cmd_proposal(signals: &Signals, rule: Option<&'static FrameworkRule>) -> 
     Some(Proposal::of(Slot::DevCmd, candidates, decided))
 }
 
-/// Makefile or justfile targets that look like they start something. The
-/// recipe is proposed, not `make run`: the recipe is the command, and `make`
-/// swallows signals and output in between.
+/// Makefile or justfile targets that look like they start something.
+///
+/// `make <target>` is proposed, not the recipe. A recipe is a *make*
+/// program rather than a shell script, and lifting a line out of one drops
+/// three separate things: the prerequisites, which run first and are how
+/// `run: build` says the binary has to exist; every line after the one that
+/// was taken, and the first line is as often a guard — a `command -v … ||
+/// exit 1` check — as it is the command; and `$(VAR)`, which is make's
+/// expansion and expands to nothing at all in a plain shell. A first run on
+/// a repository pando had not generated met all three at once: the opening
+/// guard of a `dev` target, proposed on its own, spawned, exited 0 in a
+/// millisecond and left an empty log.
+///
+/// The narrow exception is a target that *is* its recipe: no
+/// prerequisites, exactly one command line, and nothing in that line the
+/// runner would expand — any `$` for make, because every `$` in a makefile
+/// is make's own, `$$` included, which is how a makefile escapes one *for*
+/// the shell; `{{` for just, which passes `$VAR` through untouched. A `-`
+/// or `+` line prefix disqualifies it too, because those say how the runner
+/// should treat the command and vanish with the runner. There the original
+/// reasoning still holds and is kept: the recipe is the command, and
+/// leaving `make` in the middle only adds a process between pando and the
+/// server, with its own output and its own view of a signal.
 fn target_candidates(signals: &Signals) -> Vec<Candidate> {
     let mut out = Vec::new();
     for name in ["dev", "run", "serve", "start"] {
-        if let Some(recipe) = signals.targets.get(name)
-            && !is_production(recipe)
+        if let Some(target) = signals.targets.get(name)
+            && !target.recipe.iter().any(|line| is_production(line))
         {
             out.push(Candidate {
-                value: recipe.clone(),
+                value: target.command(name),
                 why: format!("the {name} target"),
                 ..Candidate::default()
             });
@@ -3055,11 +3205,16 @@ mod tests {
         )
         .unwrap();
         let targets = parse_targets(dir.path());
-        assert_eq!(targets["run"], "go run .");
-        assert_eq!(targets["build"], "go build ./...");
+        assert_eq!(targets["run"].recipe, ["go run ."]);
+        assert_eq!(targets["run"].tool, "make");
+        assert_eq!(targets["build"].recipe, ["go build ./..."]);
         assert!(
             !targets.contains_key("CFLAGS"),
             "a variable assignment is not a target: {targets:?}"
+        );
+        assert!(
+            !targets.contains_key(".PHONY"),
+            "a directive about other targets is not one: {targets:?}"
         );
     }
 
@@ -3078,17 +3233,163 @@ mod tests {
         .unwrap();
         let targets = parse_targets(dir.path());
         assert_eq!(
-            targets["run"], "go run .",
+            targets["run"].recipe,
+            ["go run ."],
             "the indented line below the target is the recipe: {targets:?}"
         );
         assert_eq!(
-            targets["serve"], "python3 -m http.server",
+            targets["run"].prereqs,
+            ["build", "fmt"],
+            "and what follows the colon is what runs first: {targets:?}"
+        );
+        assert_eq!(
+            targets["serve"].recipe,
+            ["python3 -m http.server"],
             "make's one-liner form puts the recipe after a semicolon: {targets:?}"
+        );
+        assert!(
+            targets["serve"].prereqs.is_empty(),
+            "the semicolon ends the prerequisites: {targets:?}"
         );
         assert!(
             !targets.contains_key("all"),
             "a target whose next line is another target has no recipe: {targets:?}"
         );
+    }
+
+    /// The shape a first run met: a `dev` target whose recipe is five
+    /// lines, the first of them a guard that exits 0 when the tool it
+    /// checks for is present. Taking that line alone spawned something
+    /// that succeeded and returned in a millisecond, and left an empty log
+    /// behind for the developer to read.
+    #[test]
+    fn a_multi_line_recipe_is_kept_whole_and_started_through_make() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Makefile"),
+            "APP := demo\nBIN := build\n\n.PHONY: dev\n\
+             dev:\n\
+             \t@command -v watcher >/dev/null || { echo \"install watcher\"; exit 1; }\n\
+             \t@echo \"watching\"\n\
+             \t@# a comment line\n\
+             \t@killall $(APP) 2>/dev/null; $(BIN)/$(APP) &\n\
+             \t@watcher -o -r Sources/ | while read; do \\\n\
+             \t\tkillall $(APP) 2>/dev/null; \\\n\
+             \t\t$(BIN)/$(APP) & \\\n\
+             \tdone\n",
+        )
+        .unwrap();
+        let targets = parse_targets(dir.path());
+        let dev = &targets["dev"];
+        assert_eq!(
+            dev.recipe.len(),
+            4,
+            "the comment is not a command and the continuation is one line: {dev:?}"
+        );
+        assert!(
+            dev.recipe[0].contains("command -v watcher"),
+            "the guard is the first line, not the whole recipe: {dev:?}"
+        );
+        assert!(
+            dev.recipe[3].starts_with("@watcher") && dev.recipe[3].ends_with("done"),
+            "a trailing backslash continues one command: {dev:?}"
+        );
+        assert_eq!(
+            dev.sole_command(),
+            None,
+            "four commands are not one command: {dev:?}"
+        );
+        assert_eq!(dev.command("dev"), "make dev");
+    }
+
+    #[test]
+    fn a_target_that_is_one_plain_line_is_still_proposed_as_that_line() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("Makefile"), "dev:\n\t@npm run dev\n").unwrap();
+        let targets = parse_targets(dir.path());
+        assert_eq!(
+            targets["dev"].command("dev"),
+            "npm run dev",
+            "no prerequisites, one line, nothing make expands: {targets:?}"
+        );
+    }
+
+    /// Three reasons a recipe line is not the command, one per test case.
+    /// Each on its own would be enough to make the recipe the wrong thing
+    /// to propose.
+    #[test]
+    fn a_prerequisite_a_second_line_or_a_make_variable_all_mean_make() {
+        let cases: [(&str, &str); 4] = [
+            ("run: build\n\t./app\n", "run"),
+            ("run:\n\t./build.sh\n\t./app\n", "run"),
+            ("run:\n\t$(BIN)/app\n", "run"),
+            // `$$` is how a makefile escapes a `$` for the shell, so the
+            // raw line is not what the shell should see either.
+            ("run:\n\techo $$PATH\n", "run"),
+        ];
+        for (makefile, name) in cases {
+            let dir = tempdir().unwrap();
+            std::fs::write(dir.path().join("Makefile"), makefile).unwrap();
+            let targets = parse_targets(dir.path());
+            assert_eq!(
+                targets[name].command(name),
+                "make run",
+                "{makefile:?} is not representable by one of its lines"
+            );
+        }
+    }
+
+    /// A justfile is the same judgement with just's spellings: `{{ … }}` is
+    /// its interpolation, and `$VAR` is not — just hands that to the shell
+    /// exactly as written.
+    #[test]
+    fn a_justfile_target_is_judged_by_justs_own_expansion() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("justfile"),
+            "dev:\n    ./serve --port $PORT\n\nweb:\n    ./serve {{ bin }}\n",
+        )
+        .unwrap();
+        let targets = parse_targets(dir.path());
+        assert_eq!(targets["dev"].tool, "just");
+        assert_eq!(
+            targets["dev"].command("dev"),
+            "./serve --port $PORT",
+            "just passes a shell variable through untouched"
+        );
+        assert_eq!(
+            targets["web"].command("web"),
+            "just web",
+            "but `{{{{ … }}}}` is just's own and means nothing to a shell"
+        );
+    }
+
+    /// `-` tells make to carry on when the command fails and `+` tells it
+    /// to run the line even under `-n`. Both vanish if the line is lifted
+    /// out, and both are about the command rather than part of it.
+    #[test]
+    fn a_line_prefix_that_is_a_directive_keeps_the_target_with_its_runner() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("Makefile"), "dev:\n\t-@./serve\n").unwrap();
+        let targets = parse_targets(dir.path());
+        assert_eq!(targets["dev"].recipe, ["-@./serve"], "the prefix is kept");
+        assert_eq!(targets["dev"].command("dev"), "make dev");
+    }
+
+    /// A blank line and a column-zero comment sit among recipe lines
+    /// without ending the recipe — make ignores both — so a recipe read as
+    /// ending at the first of them would be truncated all over again.
+    #[test]
+    fn a_blank_line_or_a_column_zero_comment_does_not_end_a_recipe() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Makefile"),
+            "dev:\n\techo one\n\n# still the dev recipe\n\techo two\n\nbuild:\n\techo three\n",
+        )
+        .unwrap();
+        let targets = parse_targets(dir.path());
+        assert_eq!(targets["dev"].recipe, ["echo one", "echo two"]);
+        assert_eq!(targets["build"].recipe, ["echo three"]);
     }
 
     #[test]

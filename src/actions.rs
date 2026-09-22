@@ -9643,6 +9643,62 @@ time.sleep(300)
         );
     }
 
+    /// The shape a first run met: a repository with no manifest pando
+    /// reads and a `Makefile` whose `dev` target is several lines, the
+    /// first of them a guard. What is written has to be runnable, and what
+    /// the developer is offered has to be something they can recognise.
+    #[test]
+    fn a_multi_line_make_target_is_written_as_make_dev() {
+        let fx = fixture();
+        std::fs::write(
+            fx.root.join("Makefile"),
+            "APP := demo\nBIN := build\n\n.PHONY: dev\n\
+             dev:\n\
+             \t@command -v watcher >/dev/null || { echo \"install watcher\"; exit 1; }\n\
+             \t@echo \"watching\"\n\
+             \t@killall $(APP) 2>/dev/null; $(BIN)/$(APP) &\n",
+        )
+        .unwrap();
+        git(&fx.root, &["add", "."]);
+        git(&fx.root, &["commit", "--quiet", "-m", "make"]);
+
+        let (ask, asked) = scripted(vec![Answer::None]);
+        let config = resolve_process(&fx.paths, &fx.config, &ask, &noop).unwrap();
+        assert_eq!(
+            config.processes["dev"].cmd, "make dev",
+            "the target is run by make, not by one line lifted out of it"
+        );
+        assert!(
+            asked.borrow().iter().all(|q| q.slot != Slot::DevCmd),
+            "one candidate is a decision, not a question: {:?}",
+            asked.borrow()
+        );
+        let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+        assert!(
+            written.contains("cmd = \"make dev\"  # detected: the dev target"),
+            "{written}"
+        );
+        assert!(
+            !written.contains("command -v"),
+            "a guard that exits 0 is never what a developer is offered: {written}"
+        );
+    }
+
+    /// And the narrow case the old behaviour was right about is kept: one
+    /// plain line, nothing make would expand, so `make` in the middle would
+    /// only be a process between pando and the server.
+    #[test]
+    fn a_one_line_make_target_is_still_written_as_the_line_itself() {
+        let fx = fixture();
+        std::fs::write(fx.root.join("Makefile"), "dev:\n\t@./serve --dev\n").unwrap();
+        git(&fx.root, &["add", "."]);
+        git(&fx.root, &["commit", "--quiet", "-m", "make"]);
+
+        let (ask, _asked) = scripted(vec![Answer::None]);
+        let config = resolve_process(&fx.paths, &fx.config, &ask, &noop).unwrap();
+        assert_eq!(config.processes["dev"].cmd, "./serve --dev");
+    }
+
     #[test]
     fn an_answer_is_written_to_the_config_with_a_comment() {
         let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");
