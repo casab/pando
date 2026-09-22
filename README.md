@@ -32,7 +32,9 @@ Your repository works the same way.
 - Lists, creates, and removes git worktrees for the repo you are in
 - Starts each worktree's dev server on its own ports, detached, with logs
 - Optionally gives each worktree private copies of its services: Postgres,
-  Redis, whatever your compose file declares
+  Redis, MariaDB, whatever your compose file declares — or, on a machine
+  that would rather not run Docker, the same databases natively from a
+  recipe you can override
 - Shares any running worktree through a public tunnel URL
 - Shows all of it on one terminal screen, with a real log viewer
 
@@ -86,9 +88,18 @@ with their own ports, logs and readiness; several processes per worktree;
 the log viewer; private per-worktree services from the project's own
 compose file; public tunnel URLs; `init`, `doctor` and `signals`; native
 service recipes for machines without Docker; and the JSON contract an
-agent reads. macOS and Linux.
+agent reads.
+
+macOS is what it is developed and tested on. The Unix-only parts have
+Linux branches written and no CI, so Linux is intended rather than
+demonstrated: nobody has yet compiled it there, let alone run it.
 
 What that does not mean: there is no published binary and no version to
-install, and every worktree pando has created and every server it has
-started has been inside a generated fixture repository. It has not been
-run on a real project yet.
+install, and almost every worktree pando has created has been inside a
+generated fixture repository. It has been pointed at exactly one real
+project, which found three bugs in an afternoon — a Makefile target read
+down to its first line, a failure that left an empty log and no
+explanation, and a backgrounded server reported as dead. All three are
+fixed, and the count is the point: a tool this heavily tested against
+situations it invented still breaks on first contact with one it did
+not.
