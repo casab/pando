@@ -1,0 +1,1458 @@
+use super::schema::glob_match;
+use super::validate::normalize;
+use super::*;
+use crate::paths::PandoPaths;
+use crate::project::ProjectRef;
+use chrono::Utc;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use tempfile::TempDir;
+
+struct Fixture {
+    _dir: TempDir,
+    root: PathBuf,
+    paths: PandoPaths,
+}
+
+fn fixture() -> Fixture {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("acme-shop");
+    std::fs::create_dir_all(&root).unwrap();
+    let project = ProjectRef::from_root(&root).unwrap();
+    let paths = PandoPaths::new(dir.path().join("pando-home"), project);
+    Fixture {
+        root: paths.root().to_path_buf(),
+        paths,
+        _dir: dir,
+    }
+}
+
+fn write_committed(f: &Fixture, text: &str) {
+    std::fs::write(f.root.join("pando.toml"), text).unwrap();
+}
+
+fn write_home(f: &Fixture, text: &str) {
+    std::fs::create_dir_all(f.paths.project_dir()).unwrap();
+    std::fs::write(f.paths.config_file(), text).unwrap();
+}
+
+/// The machine-wide layer: one file for every project on this laptop.
+fn write_user(f: &Fixture, text: &str) {
+    std::fs::create_dir_all(&f.paths.home).unwrap();
+    std::fs::write(f.paths.user_config_file(), text).unwrap();
+}
+
+fn home_text(f: &Fixture) -> String {
+    std::fs::read_to_string(f.paths.config_file()).unwrap()
+}
+
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+/// A file a developer wrote by hand: comments above and beside keys,
+/// tables out of alphabetical order, and a key pando is about to change.
+const HANDWRITTEN: &str = r#"# my project
+# two comment lines
+
+[share]
+provider = "cloudflared"
+
+[project]
+# the base everything forks from
+base = "trunk"
+install = "npm ci"   # frozen on purpose
+provision = [".env"]
+
+[runtime]
+prelude = "nvm use"
+"#;
+
+#[test]
+fn a_patch_leaves_every_line_it_did_not_touch_byte_for_byte() {
+    let f = fixture();
+    write_home(&f, HANDWRITTEN);
+    set_detected(
+        &f.paths,
+        Layer::Project,
+        &["project"],
+        "install",
+        "pnpm install --frozen-lockfile",
+        Note::Detected("pnpm-lock.yaml".into()),
+    )
+    .unwrap();
+
+    let after = home_text(&f);
+    let before_lines: Vec<&str> = HANDWRITTEN.lines().collect();
+    let after_lines: Vec<&str> = after.lines().collect();
+    assert_eq!(
+        before_lines.len(),
+        after_lines.len(),
+        "a patch must not add or remove lines:\n{after}"
+    );
+    for (before, after) in before_lines.iter().zip(&after_lines) {
+        if before.starts_with("install") {
+            assert_eq!(
+                *after, "install = \"pnpm install --frozen-lockfile\"  # detected: pnpm-lock.yaml",
+                "the patched line carries the new value and its note"
+            );
+        } else {
+            assert_eq!(before, after, "an untouched line changed");
+        }
+    }
+    // And it is still the config pando reads back.
+    let loaded = load(&f.paths).unwrap();
+    assert_eq!(
+        loaded.config.project.install.as_deref(),
+        Some("pnpm install --frozen-lockfile")
+    );
+    assert_eq!(loaded.config.project.base.as_deref(), Some("trunk"));
+    assert_eq!(loaded.config.runtime.prelude.as_deref(), Some("nvm use"));
+}
+
+#[test]
+fn a_new_key_lands_in_its_table_without_disturbing_the_others() {
+    let f = fixture();
+    write_home(&f, HANDWRITTEN);
+    set_detected(
+        &f.paths,
+        Layer::Project,
+        &["runtime"],
+        "version_files",
+        toml_edit::Array::from_iter([".nvmrc"]),
+        Note::Detected(".nvmrc".into()),
+    )
+    .unwrap();
+
+    let after = home_text(&f);
+    assert!(
+        after.contains("version_files = [\".nvmrc\"]  # detected: .nvmrc"),
+        "{after}"
+    );
+    assert!(after.contains("prelude = \"nvm use\""), "{after}");
+    assert!(
+        after.contains("# the base everything forks from"),
+        "{after}"
+    );
+    assert!(after.starts_with("# my project\n"), "{after}");
+    let loaded = load(&f.paths).unwrap();
+    assert_eq!(loaded.config.runtime.version_files, vec![".nvmrc"]);
+}
+
+#[test]
+fn a_missing_table_is_created_and_the_file_gets_a_header() {
+    let f = fixture();
+    set_detected(
+        &f.paths,
+        Layer::Project,
+        &["dev"],
+        "cmd",
+        "pnpm dev",
+        Note::Detected("package.json scripts.dev".into()),
+    )
+    .unwrap();
+
+    let after = home_text(&f);
+    assert!(after.starts_with("# pando.toml"), "{after}");
+    assert!(
+        after.contains("[dev]\n"),
+        "the table is not inline: {after}"
+    );
+    assert!(
+        after.contains("cmd = \"pnpm dev\"  # detected: package.json scripts.dev"),
+        "{after}"
+    );
+    let loaded = load(&f.paths).unwrap();
+    assert_eq!(
+        loaded.config.processes["dev"].cmd, "pnpm dev",
+        "[dev] normalises into processes.dev"
+    );
+}
+
+#[test]
+fn an_answered_note_records_the_date() {
+    let f = fixture();
+    set_detected(
+        &f.paths,
+        Layer::Project,
+        &["dev"],
+        "cmd",
+        "pnpm dev:web",
+        Note::Answered,
+    )
+    .unwrap();
+    let after = home_text(&f);
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    assert!(after.contains(&format!("# answered: {today}")), "{after}");
+}
+
+#[test]
+fn patching_the_same_value_twice_replaces_the_note_and_not_the_file() {
+    let f = fixture();
+    set_detected(
+        &f.paths,
+        Layer::Project,
+        &["dev"],
+        "cmd",
+        "a",
+        Note::Detected("one".into()),
+    )
+    .unwrap();
+    let first = home_text(&f);
+    set_detected(
+        &f.paths,
+        Layer::Project,
+        &["dev"],
+        "cmd",
+        "b",
+        Note::Answered,
+    )
+    .unwrap();
+    let second = home_text(&f);
+    assert!(first.contains("cmd = \"a\"  # detected: one"));
+    assert!(second.contains("cmd = \"b\"  # answered:"), "{second}");
+    assert!(
+        !second.contains("detected: one"),
+        "the stale note must go with the stale value: {second}"
+    );
+}
+
+#[test]
+fn the_config_pando_writes_is_private() {
+    let f = fixture();
+    set_detected(
+        &f.paths,
+        Layer::Project,
+        &["dev"],
+        "cmd",
+        "pnpm dev",
+        Note::Answered,
+    )
+    .unwrap();
+    assert_eq!(mode_of(&f.paths.config_file()), 0o600);
+    // Writing again over an existing file keeps it that way.
+    set_detected(
+        &f.paths,
+        Layer::Project,
+        &["dev"],
+        "cwd",
+        "apps/web",
+        Note::Answered,
+    )
+    .unwrap();
+    assert_eq!(mode_of(&f.paths.config_file()), 0o600);
+    assert!(
+        !f.paths.config_file().with_extension("toml.tmp").exists(),
+        "the temp file must be renamed away"
+    );
+}
+
+// The no-op path compares the rendered document with the file's own
+// bytes, so anything `toml_edit` normalises on the way through would
+// make an empty patch rewrite the file. These are the shapes that
+// normalisation would show up in.
+#[test]
+fn an_empty_patch_rewrites_nothing_whatever_the_file_looks_like() {
+    for (label, original) in [
+        ("no trailing newline", "[project]\nbase = \"main\""),
+        ("crlf line endings", "[project]\r\nbase = \"main\"\r\n"),
+        (
+            "blank lines and indentation",
+            "\n\n[project]\n  base = \"main\"\n\n\n",
+        ),
+        ("comments only", "# nothing but a comment\n"),
+        ("an empty file", ""),
+    ] {
+        let f = fixture();
+        write_home(&f, original);
+        patch(&f.paths, Layer::Project, |_doc| Ok(())).unwrap();
+        assert_eq!(home_text(&f), original, "{label}");
+    }
+}
+
+#[test]
+fn patching_never_touches_a_committed_pando_toml() {
+    let f = fixture();
+    let committed = "[project]\nbase = \"main\"\n";
+    write_committed(&f, committed);
+    set_detected(
+        &f.paths,
+        Layer::Project,
+        &["project"],
+        "install",
+        "pnpm install --frozen-lockfile",
+        Note::Detected("pnpm-lock.yaml".into()),
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("pando.toml")).unwrap(),
+        committed,
+        "the repository's own file is read-only to pando"
+    );
+    assert!(f.paths.config_file().starts_with(&f.paths.home));
+}
+
+#[test]
+fn a_home_file_that_is_not_valid_toml_is_never_overwritten() {
+    let f = fixture();
+    let broken = "[project\nbase = \"main\"\n";
+    write_home(&f, broken);
+    let err = set_detected(
+        &f.paths,
+        Layer::Project,
+        &["dev"],
+        "cmd",
+        "x",
+        Note::Answered,
+    )
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("not valid TOML"), "{msg}");
+    assert_eq!(
+        home_text(&f),
+        broken,
+        "a file pando cannot parse is a file someone is editing"
+    );
+}
+
+// `[dev]` is shorthand for `[processes.dev]` and the two forms may not
+// both be in one file, so a document that already has a `[processes]`
+// table gets the long form — otherwise pando writes a file it then
+// refuses to read.
+#[test]
+fn a_dev_key_takes_the_long_form_when_the_file_already_has_processes() {
+    let f = fixture();
+    write_home(&f, "[processes.dev]\ncwd = \"apps/web\"\n");
+    set_detected(
+        &f.paths,
+        Layer::Project,
+        &["dev"],
+        "cmd",
+        "pnpm dev",
+        Note::Detected("package.json scripts.dev".into()),
+    )
+    .unwrap();
+
+    let text = home_text(&f);
+    assert!(
+        !text.contains("[dev]"),
+        "the shorthand beside [processes] is a file pando cannot load: {text}"
+    );
+    assert!(text.contains("[processes.dev]"), "{text}");
+    assert!(text.contains("cmd = \"pnpm dev\""), "{text}");
+    let loaded = load(&f.paths).expect("the file pando wrote must load");
+    assert_eq!(loaded.config.processes["dev"].cmd, "pnpm dev");
+    assert_eq!(
+        loaded.config.processes["dev"].cwd.as_deref(),
+        Some("apps/web"),
+        "and what was already there is untouched"
+    );
+}
+
+// Phase 2b review, finding 3. The conflict `normalize` refuses is
+// between the *merged* layers, so a `[processes]` table in the file the
+// team committed was invisible to the redirect above — and a `[dev]`
+// written beside it left `start`, `new`, `restart` and the TUI refusing
+// to run until a human edited pando's own file.
+#[test]
+fn a_dev_key_takes_the_long_form_when_the_committed_layer_has_processes() {
+    let f = fixture();
+    write_committed(&f, "[processes.dev]\ncwd = \"apps/web\"\n");
+    write_home(&f, "[project]\ninstall = \"true\"\n");
+    set_detected(
+        &f.paths,
+        Layer::Project,
+        &["dev"],
+        "cmd",
+        "pnpm dev",
+        Note::Detected("package.json scripts.dev".into()),
+    )
+    .unwrap();
+
+    let text = home_text(&f);
+    assert!(
+        !text.contains("[dev]"),
+        "[dev] here and [processes.dev] there cannot both apply: {text}"
+    );
+    assert!(text.contains("[processes.dev]"), "{text}");
+    let loaded = load(&f.paths).expect("the file pando wrote must load");
+    assert_eq!(loaded.config.processes["dev"].cmd, "pnpm dev");
+    assert_eq!(
+        loaded.config.processes["dev"].cwd.as_deref(),
+        Some("apps/web"),
+        "the committed layer's own key still applies"
+    );
+}
+
+// One question, one note. Ten identical `# answered:` lines for a
+// two-app workspace say the same thing ten times, and the bare
+// `[processes]` header above them is a line no human would write.
+// And the same for the machine-wide layer: `[dev]` written beside a
+// `[processes]` table in *any* other layer is a merged config pando's
+// own loader refuses.
+#[test]
+fn a_dev_key_takes_the_long_form_when_the_user_layer_has_processes() {
+    let f = fixture();
+    write_user(&f, "[processes.dev]\nenv = { TZ = \"UTC\" }\n");
+    set_detected(
+        &f.paths,
+        Layer::Project,
+        &["dev"],
+        "cmd",
+        "pnpm dev",
+        Note::Detected("package.json scripts.dev".into()),
+    )
+    .unwrap();
+
+    let text = home_text(&f);
+    assert!(
+        !text.contains("[dev]"),
+        "[dev] here and [processes.dev] there cannot both apply: {text}"
+    );
+    assert!(text.contains("[processes.dev]"), "{text}");
+    let loaded = load(&f.paths).expect("the file pando wrote must load");
+    assert_eq!(loaded.config.processes["dev"].cmd, "pnpm dev");
+    assert_eq!(
+        loaded.config.processes["dev"]
+            .env
+            .get("TZ")
+            .map(String::as_str),
+        Some("UTC"),
+        "the user layer's own key still applies"
+    );
+}
+
+#[test]
+fn a_whole_table_carries_one_note_on_its_header_and_no_bare_parent() {
+    let f = fixture();
+    set_detected_table(
+        &f.paths,
+        Layer::Project,
+        &["processes", "web"],
+        vec![
+            ("cmd".to_string(), "pnpm dev".into()),
+            ("cwd".to_string(), "apps/web".into()),
+        ],
+        Note::TookFirst(2),
+    )
+    .unwrap();
+
+    let text = home_text(&f);
+    assert!(
+        !text.lines().any(|l| l.trim() == "[processes]"),
+        "the intermediate table is implicit: {text}"
+    );
+    // The file's own header mentions the marker, so only lines that
+    // are not themselves comments count.
+    assert_eq!(
+        text.lines()
+            .filter(|line| !line.starts_with('#') && line.contains("# answered:"))
+            .count(),
+        1,
+        "one note for the whole table: {text}"
+    );
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("[processes.web]") && l.contains("# answered:")),
+        "and it is on the header: {text}"
+    );
+    let loaded = load(&f.paths).expect("the file pando wrote must load");
+    assert_eq!(loaded.config.processes["web"].cmd, "pnpm dev");
+}
+
+#[test]
+fn a_key_whose_table_is_a_scalar_is_refused_by_name() {
+    let f = fixture();
+    write_home(&f, "dev = 3\n");
+    let err = set_detected(
+        &f.paths,
+        Layer::Project,
+        &["dev"],
+        "cmd",
+        "x",
+        Note::Answered,
+    )
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("[dev]"), "{msg}");
+    assert_eq!(home_text(&f), "dev = 3\n");
+}
+
+#[test]
+fn a_patch_that_changes_nothing_leaves_the_file_alone() {
+    let f = fixture();
+    write_home(&f, HANDWRITTEN);
+    let before = std::fs::metadata(f.paths.config_file())
+        .unwrap()
+        .modified()
+        .unwrap();
+    patch(&f.paths, Layer::Project, |_doc| Ok(())).unwrap();
+    assert_eq!(home_text(&f), HANDWRITTEN);
+    assert_eq!(
+        std::fs::metadata(f.paths.config_file())
+            .unwrap()
+            .modified()
+            .unwrap(),
+        before,
+        "an empty patch must not rewrite the file"
+    );
+}
+
+#[test]
+fn defaults_load_when_no_file_exists() {
+    let f = fixture();
+    let loaded = load(&f.paths).unwrap();
+    assert_eq!(loaded.config, Config::default());
+    assert!(loaded.warnings.is_empty());
+    assert_eq!(
+        loaded.config.worktrees_dir(&f.paths),
+        f.paths.worktrees_dir()
+    );
+}
+
+#[test]
+fn the_pando_home_layer_overrides_the_committed_layer() {
+    let f = fixture();
+    write_committed(
+        &f,
+        "[project]\nbase = \"main\"\ninstall = \"pnpm install --frozen-lockfile\"\n",
+    );
+    write_home(&f, "[project]\nbase = \"develop\"\n");
+
+    let loaded = load(&f.paths).unwrap();
+    assert_eq!(loaded.config.project.base.as_deref(), Some("develop"));
+    assert_eq!(
+        loaded.config.project.install.as_deref(),
+        Some("pnpm install --frozen-lockfile"),
+        "keys the home layer does not mention survive the merge"
+    );
+}
+
+// Committed < user < project. The middle layer is the machine's: it
+// beats what the repository ships and loses to what pando decided for
+// this project.
+#[test]
+fn the_user_layer_sits_between_the_committed_and_project_layers() {
+    let f = fixture();
+    write_committed(
+        &f,
+        "[project]\nbase = \"main\"\ninstall = \"pnpm install --frozen-lockfile\"\n\
+             \n[runtime]\nprelude = \"committed\"\n",
+    );
+    write_user(
+        &f,
+        "[project]\nbase = \"user\"\n\n[runtime]\nprelude = \"user\"\n",
+    );
+    write_home(&f, "[project]\nbase = \"project\"\n");
+
+    let loaded = load(&f.paths).unwrap();
+    assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+    assert_eq!(
+        loaded.config.project.base.as_deref(),
+        Some("project"),
+        "the project layer wins over both"
+    );
+    assert_eq!(
+        loaded.config.runtime.prelude.as_deref(),
+        Some("user"),
+        "the user layer wins over a committed one"
+    );
+    assert_eq!(
+        loaded.config.project.install.as_deref(),
+        Some("pnpm install --frozen-lockfile"),
+        "keys no higher layer mentions survive the merge"
+    );
+}
+
+// The same rule the committed layer lives under, for the same reason:
+// one file shared by every project on the machine must not be able to
+// say where pando writes for one of them.
+#[test]
+fn a_user_file_cannot_set_root_or_worktrees_dir() {
+    let f = fixture();
+    let inside = f.root.join("worktrees");
+    write_user(
+        &f,
+        &format!(
+            "[project]\nroot = \"/somewhere/else\"\nworktrees_dir = \"{}\"\nbase = \"main\"\n",
+            inside.display()
+        ),
+    );
+
+    let loaded = load(&f.paths).unwrap();
+    assert_eq!(loaded.config.project.root, None);
+    assert_eq!(loaded.config.project.worktrees_dir, None);
+    assert_eq!(
+        loaded.config.project.base.as_deref(),
+        Some("main"),
+        "the rest of the user section still applies"
+    );
+    assert_eq!(
+        loaded.warnings.len(),
+        2,
+        "both keys warn: {:?}",
+        loaded.warnings
+    );
+    assert!(
+        loaded
+            .warnings
+            .iter()
+            .all(|w| w.contains("machine-wide config")
+                && w.contains(&f.paths.user_config_file().display().to_string())),
+        "{:?}",
+        loaded.warnings
+    );
+}
+
+// A file pando did not write, so it is dropped with a warning rather
+// than taking every command in every project down with it.
+#[test]
+fn a_user_file_that_is_broken_or_invalid_is_dropped_with_a_warning() {
+    for bad in [
+        "this is not toml {{{",
+        "[project]\nbase = \"main\"\nnope = 1\n",
+        "[dev]\ncmd = \"x\"\n\n[processes.api]\ncmd = \"y\"\n",
+    ] {
+        let f = fixture();
+        write_user(&f, bad);
+        let loaded = load(&f.paths).unwrap_or_else(|e| panic!("{bad:?} bricked load: {e:#}"));
+        assert_eq!(
+            loaded.config,
+            Config::default(),
+            "the whole layer is dropped: {bad:?}"
+        );
+        assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
+        assert!(
+            loaded.warnings[0].contains("ignoring")
+                && loaded.warnings[0].contains(&f.paths.user_config_file().display().to_string()),
+            "{:?}",
+            loaded.warnings
+        );
+    }
+}
+
+// `load_without_home` runs when pando's *own* file is unusable. The
+// developer's machine-wide file is not implicated by that, and `stop`
+// and `logs` should still honour what it says.
+#[test]
+fn the_user_layer_is_still_read_when_pandos_own_layer_is_skipped() {
+    let f = fixture();
+    write_user(&f, "[runtime]\nprelude = \"user\"\n");
+    write_home(&f, "this is not toml {{{");
+    assert!(
+        load(&f.paths).is_err(),
+        "pando's own layer still fails hard"
+    );
+    let loaded = load_without_home(&f.paths);
+    assert_eq!(loaded.config.runtime.prelude.as_deref(), Some("user"));
+}
+
+// Neither file is wrong on its own, so neither is dropped and both are
+// named — the same treatment a committed and a project layer get.
+#[test]
+fn a_conflict_between_the_committed_and_user_layers_names_both() {
+    let f = fixture();
+    write_committed(&f, "[dev]\ncmd = \"pnpm dev\"\n");
+    write_user(&f, "[processes.api]\ncmd = \"node api\"\n");
+    let msg = format!("{:#}", load(&f.paths).unwrap_err());
+    assert!(msg.contains("may not both be set"), "{msg}");
+    assert!(
+        msg.contains(&f.root.join("pando.toml").display().to_string()),
+        "{msg}"
+    );
+    assert!(
+        msg.contains(&f.paths.user_config_file().display().to_string()),
+        "{msg}"
+    );
+}
+
+#[test]
+fn a_committed_file_cannot_set_root_or_worktrees_dir() {
+    let f = fixture();
+    let inside = f.root.join("worktrees");
+    write_committed(
+        &f,
+        &format!(
+            "[project]\nroot = \"/somewhere/else\"\nworktrees_dir = \"{}\"\nbase = \"main\"\n",
+            inside.display()
+        ),
+    );
+
+    let loaded = load(&f.paths).unwrap();
+    assert_eq!(loaded.config.project.root, None);
+    assert_eq!(loaded.config.project.worktrees_dir, None);
+    assert_eq!(
+        loaded.config.project.base.as_deref(),
+        Some("main"),
+        "the rest of the committed section still applies"
+    );
+    assert_eq!(
+        loaded.warnings.len(),
+        2,
+        "both keys warn: {:?}",
+        loaded.warnings
+    );
+    assert!(
+        loaded
+            .warnings
+            .iter()
+            .all(|w| w.contains("committed config"))
+    );
+}
+
+#[test]
+fn a_worktrees_dir_inside_the_repository_is_refused() {
+    let f = fixture();
+    write_home(
+        &f,
+        &format!(
+            "[project]\nworktrees_dir = \"{}\"\n",
+            f.root.join(".pando-worktrees").display()
+        ),
+    );
+    let err = load(&f.paths).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("inside the repository"),
+        "unexpected error: {err:#}"
+    );
+}
+
+// The repository root is canonical; a configured path that reaches it
+// through a symlinked ancestor (/var vs /private/var on macOS) must be
+// refused just the same.
+#[test]
+fn a_non_canonical_worktrees_dir_inside_the_repository_is_refused() {
+    let f = fixture();
+    let dir = TempDir::new().unwrap();
+    let link = dir.path().join("link-to-root");
+    std::os::unix::fs::symlink(&f.root, &link).unwrap();
+    write_home(
+        &f,
+        &format!(
+            "[project]\nworktrees_dir = \"{}\"\n",
+            link.join("wt").display()
+        ),
+    );
+    let err = load(&f.paths).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("inside the repository"),
+        "unexpected error: {err:#}"
+    );
+}
+
+#[test]
+fn a_worktrees_dir_outside_the_repository_is_accepted() {
+    let f = fixture();
+    let outside = f.root.parent().unwrap().join("trees");
+    write_home(
+        &f,
+        &format!("[project]\nworktrees_dir = \"{}\"\n", outside.display()),
+    );
+    let loaded = load(&f.paths).unwrap();
+    assert_eq!(loaded.config.worktrees_dir(&f.paths), outside);
+}
+
+#[test]
+fn unknown_keys_are_rejected() {
+    let f = fixture();
+    write_home(&f, "[project]\nbaze = \"main\"\n");
+    let err = load(&f.paths).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("baze"),
+        "the error should name the unknown key: {err:#}"
+    );
+
+    // Every table denies unknown fields, including a service variant
+    // behind the `kind` tag and a whole unknown section.
+    write_home(
+        &f,
+        "[[services]]\nkind = \"compose\"\nfile = \"c.yml\"\nincldue = [\"db\"]\n",
+    );
+    assert!(
+        load(&f.paths).is_err(),
+        "unknown service key must be rejected"
+    );
+
+    write_home(&f, "[nonsense]\nkey = 1\n");
+    assert!(load(&f.paths).is_err(), "unknown section must be rejected");
+}
+
+#[test]
+fn dev_and_processes_together_are_an_error() {
+    let f = fixture();
+    write_home(
+        &f,
+        "[dev]\ncmd = \"pnpm dev\"\n\n[processes.api]\ncmd = \"node api\"\n",
+    );
+    let err = load(&f.paths).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("may not both be set"),
+        "unexpected error: {err:#}"
+    );
+}
+
+#[test]
+fn dev_is_shorthand_for_a_process_named_dev() {
+    let f = fixture();
+    write_home(
+        &f,
+        "[dev]\ncmd = \"pnpm dev\"\nports = { PORT = \"web\" }\n",
+    );
+    let loaded = load(&f.paths).unwrap();
+    assert!(loaded.config.dev.is_none(), "[dev] is normalised away");
+    let dev = loaded.config.processes.get("dev").expect("processes.dev");
+    assert_eq!(dev.cmd, "pnpm dev");
+    assert_eq!(dev.roles(), vec!["web".to_string()]);
+}
+
+#[test]
+fn the_map_form_of_ports_is_sugar_for_a_role_plus_an_env_template() {
+    let spec = PortsSpec::Map(BTreeMap::from([("PORT".to_string(), "web".to_string())]));
+    assert_eq!(spec.roles(), vec!["web".to_string()]);
+    assert_eq!(
+        spec.env_templates(),
+        BTreeMap::from([("PORT".to_string(), "{port:web}".to_string())])
+    );
+
+    let list = PortsSpec::List(vec!["web".to_string(), "api".to_string()]);
+    assert_eq!(list.roles(), vec!["web".to_string(), "api".to_string()]);
+    assert!(
+        list.env_templates().is_empty(),
+        "the list form puts the port in the command, not the environment"
+    );
+}
+
+// Two variables naming one role is one port: a framework that wants both
+// `PORT` and `NEXT_PUBLIC_PORT` must get the same number in each.
+#[test]
+fn two_env_vars_for_one_role_are_still_one_role() {
+    let spec = PortsSpec::Map(BTreeMap::from([
+        ("PORT".to_string(), "web".to_string()),
+        ("NEXT_PUBLIC_PORT".to_string(), "web".to_string()),
+    ]));
+    assert_eq!(spec.roles(), vec!["web".to_string()]);
+    assert_eq!(spec.env_templates().len(), 2);
+}
+
+#[test]
+fn ports_accept_both_the_list_and_the_map_form() {
+    let f = fixture();
+    write_home(
+        &f,
+        "[processes.web]\ncmd = \"uv run manage.py runserver 127.0.0.1:{port:web}\"\nports = [\"web\"]\n",
+    );
+    let loaded = load(&f.paths).unwrap();
+    let web = loaded.config.processes.get("web").unwrap();
+    assert_eq!(web.ports, Some(PortsSpec::List(vec!["web".into()])));
+}
+
+#[test]
+fn the_full_spec_example_round_trips() {
+    let f = fixture();
+    write_home(
+        &f,
+        r#"
+[project]
+base = "main"
+provision = [".env", ".env.local"]
+provision_mode = "copy"
+install = "pnpm install --frozen-lockfile"
+
+[runtime]
+prelude = ""
+version_files = [".nvmrc"]
+
+[dev]
+cmd = "pnpm dev"
+cwd = "."
+ports = { PORT = "web" }
+env = { NODE_ENV = "development" }
+ready = { role = "web", timeout_s = 30 }
+
+[[services]]
+kind = "compose"
+file = "docker-compose.yml"
+include = ["redis"]
+env = { REDIS_URL = "redis" }
+
+[[services]]
+kind = "native"
+name = "postgres"
+preset = "postgres"
+port_env = "DATABASE_URL"
+init = "initdb --pgdata {datadir}"
+cmd = "exec postgres -D {datadir} -p {port} -k {socket_dir}"
+ready = "pg_isready -h 127.0.0.1 -p {port}"
+
+[[hooks]]
+name = "migrate"
+after = "services"
+fingerprint = ["prisma/migrations/**"]
+cmd = "pnpm prisma migrate deploy"
+
+[[probes]]
+name = "native-abi"
+cmd = "node -e 'require(\"better-sqlite3\")'"
+match = "NODE_MODULE_VERSION"
+hint = "Rebuild native modules under the dev runtime."
+
+[branches]
+rules = [{ match = "*-beta", base = "beta" }]
+
+[share]
+provider = "cloudflared"
+auth_cmd = "./scripts/dev-cookie.sh"
+"#,
+    );
+    let loaded = load(&f.paths).unwrap();
+    let c = &loaded.config;
+    assert_eq!(c.project.provision_mode, ProvisionMode::Copy);
+    assert_eq!(c.runtime.version_files, vec![".nvmrc".to_string()]);
+    assert_eq!(c.services.len(), 2);
+    assert!(matches!(c.services[0], ServiceConfig::Compose { .. }));
+    assert!(matches!(c.services[1], ServiceConfig::Native { .. }));
+    assert_eq!(c.hooks[0].after, HookPoint::Services);
+    assert_eq!(c.probes[0].match_, "NODE_MODULE_VERSION");
+    assert_eq!(c.share.provider.as_deref(), Some("cloudflared"));
+    assert_eq!(c.base_for_branch("fix/thing-beta"), Some("beta"));
+    assert_eq!(c.base_for_branch("feat/other"), Some("main"));
+
+    // Serialising and reloading must produce the same value, or `write`
+    // would quietly drop fields detection put there.
+    let text = toml::to_string_pretty(c).unwrap();
+    let back: Config = toml::from_str(&text).unwrap();
+    assert_eq!(normalize(back).unwrap(), *c);
+}
+
+// `kind = "native"` parses, validates, and is then dropped by the start
+// path, so a developer read "no services configured" while looking at a
+// file that configures one. It is not an error — the block is legal and
+
+// `[isolation]` holds one key per layer, and each is wrong in the
+// other's file: "this project has no services" in a machine-wide
+// file says it for every project on the laptop, and "prefer native"
+// in a committed file imposes one developer's machine on everyone
+// who clones the repository.
+#[test]
+fn a_machine_wide_file_may_not_say_a_project_has_no_services() {
+    let f = fixture();
+    write_user(
+        &f,
+        "[runtime]\nprelude = \"\"\n\n[isolation]\nnone = true\n",
+    );
+    let loaded = load(&f.paths).unwrap();
+    assert!(!loaded.config.isolation.none, "it applied to every project");
+    // The rest of the file survives: one wrong key is stripped, not
+    // the whole layer.
+    assert_eq!(loaded.config.runtime.prelude.as_deref(), Some(""));
+    assert!(
+        loaded
+            .warnings
+            .iter()
+            .any(|w| w.contains("isolation.none") && w.contains("every project")),
+        "{:?}",
+        loaded.warnings
+    );
+}
+
+#[test]
+fn a_committed_file_may_not_say_which_mechanism_this_machine_prefers() {
+    let f = fixture();
+    write_committed(&f, "[isolation]\nprefer = \"native\"\n");
+    let loaded = load(&f.paths).unwrap();
+    assert_eq!(loaded.config.isolation.preferred(), None);
+    assert!(
+        loaded
+            .warnings
+            .iter()
+            .any(|w| w.contains("isolation.prefer") && w.contains("property of a machine")),
+        "{:?}",
+        loaded.warnings
+    );
+
+    // And the machine-wide file, which is its home, keeps it.
+    write_user(&f, "[isolation]\nprefer = \"native\"\n");
+    assert_eq!(
+        load(&f.paths).unwrap().config.isolation.preferred(),
+        Some("native")
+    );
+}
+
+// Two layers that are each fine alone and cannot both apply: the
+// refusal names every file present rather than picking a winner.
+#[test]
+fn a_committed_service_and_a_recorded_none_cannot_both_apply() {
+    let f = fixture();
+    write_committed(
+        &f,
+        "[[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\ninclude = []\n",
+    );
+    write_home(&f, "[isolation]\nnone = true\n");
+    let e = format!("{:#}", load(&f.paths).unwrap_err());
+    assert!(e.contains("none = true"), "{e}");
+    assert!(e.contains("cannot all apply"), "{e}");
+    assert!(e.contains("pando.toml"), "it names the files: {e}");
+}
+
+#[test]
+fn a_native_block_is_kept_as_written_and_no_longer_warns() {
+    let f = fixture();
+    write_home(
+        &f,
+        r#"
+[[services]]
+kind = "compose"
+file = "docker-compose.yml"
+include = ["redis"]
+
+[[services]]
+kind = "native"
+name = "postgres"
+preset = "postgres"
+port_env = "DATABASE_URL"
+"#,
+    );
+    let loaded = load(&f.paths).unwrap();
+    assert_eq!(
+        loaded.config.services.len(),
+        2,
+        "the block is kept exactly as written"
+    );
+    // It warned for as long as nothing could run it. Something can
+    // now, so the warning would be the false statement.
+    assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+}
+
+// A native service is a role, a port, a log tab and a data directory
+// under its own name, so every rule a compose service's name obeys
+// applies to it too — and until now nothing checked any of them.
+
+#[test]
+fn a_native_service_may_not_take_a_role_a_process_already_owns() {
+    let f = fixture();
+    write_home(
+        &f,
+        "[processes.dev]\ncmd = \"x\"\nports = [\"postgres\"]\n\n\
+             [[services]]\nkind = \"native\"\nname = \"postgres\"\n",
+    );
+    let e = format!("{:#}", load(&f.paths).unwrap_err());
+    assert!(e.contains("both claim the role \"postgres\""), "{e}");
+}
+
+#[test]
+fn a_native_service_may_not_share_a_name_with_a_compose_service() {
+    let f = fixture();
+    write_home(
+        &f,
+        "[[services]]\nkind = \"compose\"\nfile = \"c.yml\"\ninclude = [\"postgres\"]\n\n\
+             [[services]]\nkind = \"native\"\nname = \"postgres\"\n",
+    );
+    let e = format!("{:#}", load(&f.paths).unwrap_err());
+    // One sentence about a duplicate, not two identical halves of a
+    // role collision.
+    assert!(e.contains("two [[services]] entries"), "{e}");
+    assert!(e.contains("\"postgres\""), "{e}");
+}
+
+#[test]
+fn a_native_service_may_not_share_a_name_with_a_hook() {
+    let f = fixture();
+    write_home(
+        &f,
+        "[[services]]\nkind = \"native\"\nname = \"migrate\"\n\n\
+             [[hooks]]\nname = \"migrate\"\nafter = \"services\"\ncmd = \"m\"\n",
+    );
+    let e = format!("{:#}", load(&f.paths).unwrap_err());
+    assert!(e.contains("logs/<worktree>/migrate.log"), "{e}");
+}
+
+#[test]
+fn a_native_service_name_that_is_a_path_is_refused() {
+    let f = fixture();
+    write_home(&f, "[[services]]\nkind = \"native\"\nname = \"../evil\"\n");
+    let e = format!("{:#}", load(&f.paths).unwrap_err());
+    assert!(e.contains("single name, not a path"), "{e}");
+}
+
+#[test]
+fn a_native_env_key_may_only_point_at_the_service_the_entry_runs() {
+    let f = fixture();
+    write_home(
+        &f,
+        "[[services]]\nkind = \"native\"\nname = \"postgres\"\n\
+             env = { DATABASE_URL = \"pg\" }\n",
+    );
+    let e = format!("{:#}", load(&f.paths).unwrap_err());
+    assert!(
+        e.contains("this [[services]] entry runs \"postgres\""),
+        "{e}"
+    );
+
+    // And the same key pointing at itself is fine.
+    write_home(
+        &f,
+        "[[services]]\nkind = \"native\"\nname = \"postgres\"\n\
+             env = { DATABASE_URL = \"postgres\" }\n",
+    );
+    load(&f.paths).unwrap();
+}
+
+#[test]
+fn arrays_of_tables_are_replaced_whole_not_merged() {
+    let f = fixture();
+    write_committed(
+        &f,
+        "[[services]]\nkind = \"compose\"\nfile = \"a.yml\"\ninclude = [\"postgres\"]\n\n[[services]]\nkind = \"compose\"\nfile = \"b.yml\"\n",
+    );
+    write_home(
+        &f,
+        "[[services]]\nkind = \"compose\"\nfile = \"only.yml\"\n",
+    );
+
+    let loaded = load(&f.paths).unwrap();
+    assert_eq!(loaded.config.services.len(), 1);
+    assert!(matches!(
+        &loaded.config.services[0],
+        ServiceConfig::Compose { file, .. } if file == "only.yml"
+    ));
+}
+
+#[test]
+fn provision_paths_must_stay_inside_the_repository() {
+    let f = fixture();
+    for bad in ["/etc/passwd", "../secrets/.env", ".."] {
+        write_home(&f, &format!("[project]\nprovision = [\"{bad}\"]\n"));
+        assert!(
+            load(&f.paths).is_err(),
+            "provision path {bad:?} should be refused"
+        );
+    }
+    write_home(
+        &f,
+        "[project]\nprovision = [\".env\", \"apps/web/.env.local\"]\n",
+    );
+    assert!(load(&f.paths).is_ok());
+}
+
+#[test]
+fn write_only_ever_touches_the_pando_home_copy() {
+    let f = fixture();
+    let mut config = Config::default();
+    config.project.base = Some("main".into());
+    write(&f.paths, &config).unwrap();
+
+    assert!(f.paths.config_file().is_file());
+    assert!(
+        !f.root.join("pando.toml").exists(),
+        "write must never create a file inside the repository"
+    );
+    let entries: Vec<_> = std::fs::read_dir(&f.root).unwrap().collect();
+    assert!(entries.is_empty(), "the repository must be untouched");
+
+    let loaded = load(&f.paths).unwrap();
+    assert_eq!(loaded.config, config);
+    assert!(
+        !f.paths.config_file().with_extension("toml.tmp").exists(),
+        "the temp file must not leak after the rename"
+    );
+}
+
+#[test]
+fn a_broken_file_is_reported_and_skipped() {
+    let f = fixture();
+    write_committed(&f, "this is not toml {{{");
+    let loaded = load(&f.paths).unwrap();
+    assert_eq!(loaded.config, Config::default());
+    assert_eq!(loaded.warnings.len(), 1);
+    assert!(loaded.warnings[0].contains("ignoring"));
+}
+
+// A committed file is someone else's work, and often a newer pando's.
+// A key this build does not know, or a value it will not accept, must
+// not stop `pando ls` for everyone who pulled it — the layer is dropped
+// with a warning, exactly as a file that does not even parse already is.
+#[test]
+fn a_committed_file_that_does_not_validate_is_dropped_with_a_warning() {
+    let f = fixture();
+    for bad in [
+        "[dev]\ncmd = \"x\"\n\n[processes.api]\ncmd = \"y\"\n",
+        "[project]\nprovision = [\"../shared/.env\"]\n",
+        "[project]\nbase = \"main\"\nnope = 1\n",
+    ] {
+        write_committed(&f, bad);
+        let loaded = load(&f.paths).unwrap_or_else(|e| panic!("{bad:?} bricked load: {e:#}"));
+        assert_eq!(
+            loaded.config,
+            Config::default(),
+            "the whole layer is dropped: {bad:?}"
+        );
+        assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
+        assert!(
+            loaded.warnings[0].contains("ignoring"),
+            "{:?}",
+            loaded.warnings
+        );
+    }
+}
+
+// The home layer is pando's own file, so a problem there is pando's bug
+// or the user's edit, and still fails hard.
+#[test]
+fn a_home_file_that_does_not_validate_still_fails() {
+    let f = fixture();
+    write_home(&f, "[project]\nbase = \"main\"\nnope = 1\n");
+    let err = load(&f.paths).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("nope"), "{msg}");
+    assert!(
+        msg.contains(&f.paths.config_file().display().to_string()),
+        "the failing file should be named: {msg}"
+    );
+}
+
+// Each layer is fine on its own and only the merge is not, so neither
+// file explains it alone and both are named.
+#[test]
+fn a_conflict_that_only_appears_after_merging_names_both_files() {
+    let f = fixture();
+    write_committed(&f, "[dev]\ncmd = \"pnpm dev\"\n");
+    write_home(&f, "[processes.api]\ncmd = \"node api\"\n");
+    let err = load(&f.paths).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("may not both be set"), "{msg}");
+    assert!(
+        msg.contains(&f.root.join("pando.toml").display().to_string()),
+        "{msg}"
+    );
+    assert!(
+        msg.contains(&f.paths.config_file().display().to_string()),
+        "{msg}"
+    );
+}
+
+// ---- several processes ------------------------------------------------
+
+/// Loads a home config and returns the error message it refused with.
+fn refusal(text: &str) -> String {
+    let f = fixture();
+    write_home(&f, text);
+    format!("{:#}", load(&f.paths).unwrap_err())
+}
+
+fn accepts(text: &str) -> Config {
+    let f = fixture();
+    write_home(&f, text);
+    load(&f.paths).expect("this config is valid").config
+}
+
+#[test]
+fn two_processes_claiming_one_role_are_refused_by_name() {
+    let msg = refusal(
+        "[processes.web]\ncmd = \"a\"\nports = [\"web\"]\n\n\
+             [processes.api]\ncmd = \"b\"\nports = { PORT = \"web\" }\n",
+    );
+    assert!(
+        msg.contains("\"api\""),
+        "the message names both processes: {msg}"
+    );
+    assert!(msg.contains("\"web\""), "{msg}");
+    // Both forms of `ports` own roles the same way, so the map form is
+    // caught as well as the list.
+    assert!(msg.contains("role"), "{msg}");
+}
+
+#[test]
+fn one_process_may_reference_another_processs_role() {
+    // The whole reason `{port:<role>}` exists: the web process is told
+    // the port the api was given. Referencing is not owning.
+    let config = accepts(
+        "[processes.web]\ncmd = \"a\"\nports = [\"web\"]\n\
+             env = { VITE_API_URL = \"http://localhost:{port:api}\" }\n\n\
+             [processes.api]\ncmd = \"b\"\nports = [\"api\"]\n",
+    );
+    assert_eq!(config.processes["web"].roles(), vec!["web"]);
+    assert_eq!(config.processes["api"].roles(), vec!["api"]);
+}
+
+#[test]
+fn a_role_repeated_inside_one_process_is_still_one_port() {
+    // `PORT` and `NEXT_PUBLIC_PORT` both meaning `web` is one port, not
+    // a process colliding with itself.
+    let config = accepts(
+        "[processes.web]\ncmd = \"a\"\nports = { PORT = \"web\", NEXT_PUBLIC_PORT = \"web\" }\n",
+    );
+    assert_eq!(config.processes["web"].roles(), vec!["web"]);
+}
+
+#[test]
+fn a_ready_role_a_process_does_not_own_is_refused() {
+    let msg = refusal(
+        "[processes.web]\ncmd = \"a\"\nports = [\"web\"]\n\n\
+             [processes.api]\ncmd = \"b\"\nports = [\"api\"]\nready = { role = \"web\" }\n",
+    );
+    assert!(msg.contains("ready.role"), "{msg}");
+    assert!(msg.contains("\"api\""), "the process is named: {msg}");
+    assert!(
+        msg.contains("owns api"),
+        "and so is what it does own: {msg}"
+    );
+}
+
+#[test]
+fn a_ready_role_a_process_does_own_is_fine() {
+    let config = accepts(
+        "[processes.web]\ncmd = \"a\"\nports = [\"web\"]\nready = { role = \"web\", timeout_s = 90 }\n",
+    );
+    let ready = config.processes["web"].ready.clone().expect("a ready rule");
+    assert_eq!(ready.role.as_deref(), Some("web"));
+    assert_eq!(ready.timeout_s, Some(90));
+}
+
+#[test]
+fn a_cwd_that_escapes_the_worktree_is_refused() {
+    for cwd in ["/etc", "../sibling", "apps/../../elsewhere"] {
+        let msg = refusal(&format!("[processes.web]\ncmd = \"a\"\ncwd = \"{cwd}\"\n"));
+        assert!(
+            msg.contains("web"),
+            "the process is named for cwd {cwd:?}: {msg}"
+        );
+        assert!(
+            msg.contains("relative") || msg.contains("escape"),
+            "cwd {cwd:?} was refused for the wrong reason: {msg}"
+        );
+    }
+    let msg = refusal("[processes.web]\ncmd = \"a\"\ncwd = \"  \"\n");
+    assert!(msg.contains("empty"), "{msg}");
+}
+
+#[test]
+fn a_cwd_inside_the_worktree_is_kept_as_written() {
+    let config = accepts("[processes.web]\ncmd = \"a\"\ncwd = \"apps/web\"\n");
+    assert_eq!(config.processes["web"].cwd.as_deref(), Some("apps/web"));
+    // The worktree root itself, spelled out, is not an escape.
+    let config = accepts("[dev]\ncmd = \"a\"\ncwd = \".\"\n");
+    assert_eq!(config.processes["dev"].cwd.as_deref(), Some("."));
+}
+
+// Phase 2b review, finding 1. A TOML key may be any quoted string, and
+// a process's name is a path component of its log file: `start` then
+// creates and truncates a `.log` file wherever the name points, up to
+// and including inside the repository.
+#[test]
+fn a_process_name_that_escapes_the_log_directory_is_refused() {
+    for bad in [
+        "../../../../../escaped-log",
+        "../../../../../acme-shop/inside-repo",
+        "apps/web",
+        "/absolute",
+        "..",
+        ".",
+        "",
+        "   ",
+    ] {
+        let msg = refusal(&format!("[processes.\"{bad}\"]\ncmd = \"true\"\n"));
+        assert!(
+            msg.contains("logs/<worktree>"),
+            "{bad:?} must be refused as a log path: {msg}"
+        );
+        if !bad.trim().is_empty() {
+            assert!(
+                msg.contains(&format!("{bad:?}")),
+                "the refusal quotes the name: {msg}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_process_name_with_a_directory_in_it_suggests_the_name_it_meant() {
+    let msg = refusal("[processes.\"apps/web\"]\ncmd = \"true\"\n");
+    assert!(msg.contains("\"apps/web\""), "{msg}");
+    assert!(msg.contains("try \"web\""), "{msg}");
+}
+
+// A process named `install` shares the install hook's log file, and
+// `reset_log` truncates it on every start; `tunnel` and `proxy` are
+// `share`'s, reserved the same way.
+#[test]
+fn a_process_named_after_one_of_pandos_own_logs_is_refused() {
+    for reserved in crate::paths::RESERVED_LOG_SOURCES {
+        let msg = refusal(&format!("[processes.{reserved}]\ncmd = \"true\"\n"));
+        assert!(msg.contains("reserved"), "{msg}");
+        assert!(msg.contains(reserved), "{msg}");
+    }
+    let config = accepts("[processes.installer]\ncmd = \"true\"\n");
+    assert!(config.processes.contains_key("installer"));
+}
+
+#[test]
+fn a_process_name_in_any_alphabet_is_still_fine() {
+    let config = accepts("[processes.\"wörker\"]\ncmd = \"true\"\nports = []\n");
+    assert!(config.processes.contains_key("wörker"));
+}
+
+// Hooks write into the same directory under the same rules, so the same
+// name check applies to them — before Phase 3 gives anyone a way to
+// write one.
+#[test]
+fn a_hook_name_that_escapes_the_log_directory_or_is_reserved_is_refused() {
+    let msg = refusal(
+        "[[hooks]]\nname = \"../../../../../escaped-hook\"\nafter = \"install\"\ncmd = \"true\"\n",
+    );
+    assert!(msg.contains("\"../../../../../escaped-hook\""), "{msg}");
+    assert!(msg.contains("logs/<worktree>"), "{msg}");
+
+    let msg = refusal("[[hooks]]\nname = \"install\"\nafter = \"install\"\ncmd = \"true\"\n");
+    assert!(msg.contains("reserved"), "{msg}");
+
+    let config = accepts("[[hooks]]\nname = \"migrate\"\nafter = \"services\"\ncmd = \"true\"\n");
+    assert_eq!(config.hooks[0].name, "migrate");
+}
+
+#[test]
+fn a_committed_config_that_fails_the_new_rules_is_dropped_rather_than_fatal() {
+    // The Phase 1 rule, still holding for rules Phase 2b added: a file
+    // the team committed may be newer, or wrong, and must not brick
+    // every command.
+    let f = fixture();
+    write_committed(
+        &f,
+        "[processes.web]\ncmd = \"a\"\nports = [\"web\"]\n\n\
+             [processes.api]\ncmd = \"b\"\nports = [\"web\"]\n",
+    );
+    let loaded = load(&f.paths).expect("a committed file is dropped, not fatal");
+    assert!(loaded.config.processes.is_empty());
+    assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
+    assert!(loaded.warnings[0].contains("role"), "{:?}", loaded.warnings);
+}
+
+#[test]
+fn glob_match_handles_the_shapes_branch_rules_use() {
+    assert!(glob_match("*-beta", "fix/thing-beta"));
+    assert!(!glob_match("*-beta", "fix/betamax"));
+    assert!(glob_match("release/*", "release/1.2"));
+    assert!(glob_match("v?.?", "v4.1"));
+    assert!(!glob_match("v?.?", "v4.11"));
+    assert!(glob_match("*", "anything"));
+    assert!(glob_match("exact", "exact"));
+    assert!(!glob_match("exact", "exactly"));
+}
+
+#[test]
+fn branch_rules_win_over_the_project_base_and_first_match_wins() {
+    let mut config = Config::default();
+    config.project.base = Some("main".into());
+    config.branches.rules = vec![
+        BranchRule {
+            match_: "release/*".into(),
+            base: "release".into(),
+        },
+        BranchRule {
+            match_: "*".into(),
+            base: "catch-all".into(),
+        },
+    ];
+    assert_eq!(config.base_for_branch("release/1.2"), Some("release"));
+    assert_eq!(config.base_for_branch("feat/x"), Some("catch-all"));
+}
