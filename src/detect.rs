@@ -2542,7 +2542,21 @@ pub fn custom(slot: Slot, value: &str) -> Candidate {
         // `dev`: every question has a custom answer, and the custom answer
         // to "several processes?" is "no, this one".
         service: None,
-        hook: None,
+        // The schema slot's answer is a whole `[[hooks]]` entry, and
+        // without one there is nothing for `edits` or `apply` to write —
+        // a typed answer here used to be accepted and then silently
+        // dropped. No fingerprint, because a command pando did not
+        // propose carries no globs it could key on: an empty one means
+        // "every start", which is slow and correct, where a guessed one
+        // would be fast and wrong.
+        hook: (slot == Slot::SchemaHook).then(|| crate::config::HookConfig {
+            name: SCHEMA_HOOK.to_string(),
+            after: crate::config::HookPoint::Services,
+            fingerprint: Vec::new(),
+            cmd: value.to_string(),
+            cwd: None,
+            fallback: None,
+        }),
         preselected: false,
         // A list the developer typed is a list of files they have. Seeding
         // from an example is an offer, and they did not take it.
@@ -3770,6 +3784,35 @@ mod tests {
         assert_eq!(
             config.processes["dev"].cmd,
             "./scripts/dev.sh --port {port:web}"
+        );
+    }
+
+    // A typed answer here used to be accepted and then silently dropped:
+    // the schema slot's answer is a whole `[[hooks]]` entry, and a
+    // candidate with no hook on it gives `edits` and `apply` nothing to
+    // write. Exit 0, and a config with no migration in it.
+    #[test]
+    fn a_command_typed_at_the_schema_question_is_a_hook_entry() {
+        let candidate = custom(Slot::SchemaHook, "npm run db:migrate");
+        let hook = candidate.hook.clone().expect("a hook entry");
+        assert_eq!(hook.name, SCHEMA_HOOK);
+        assert_eq!(hook.after, crate::config::HookPoint::Services);
+        assert_eq!(hook.cmd, "npm run db:migrate");
+        assert!(
+            hook.fingerprint.is_empty(),
+            "a command pando did not propose carries no globs it could key on, and a guessed \
+             fingerprint is a migration that never runs"
+        );
+
+        let mut config = Config::default();
+        apply(Slot::SchemaHook, &candidate, &mut config);
+        assert_eq!(config.hooks.len(), 1);
+        assert_eq!(config.hooks[0].cmd, "npm run db:migrate");
+        let (array, entries) = array_edits(Slot::SchemaHook, &[&candidate]).expect("an entry");
+        assert_eq!(array, "hooks");
+        assert!(
+            entries.iter().any(|(key, _)| key == "cmd"),
+            "and it is written out: {entries:?}"
         );
     }
 
