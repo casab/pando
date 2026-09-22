@@ -182,6 +182,7 @@ pub const LANGUAGES: [Language; 6] = [
 /// Files that state several languages at once, read once each.
 const TOOL_VERSIONS: &str = ".tool-versions";
 const MISE_FILE: &str = "mise.toml";
+pub const SHARED_VERSION_FILES: [&str; 2] = [TOOL_VERSIONS, MISE_FILE];
 const MANIFEST: &str = "package.json";
 
 /// Everything the repository says about the runtimes it needs.

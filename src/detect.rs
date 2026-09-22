@@ -73,6 +73,11 @@ pub struct Signals {
 
 const WORKSPACE_MARKERS: [&str; 3] = ["pnpm-workspace.yaml", "turbo.json", "nx.json"];
 
+/// Every file that pins a runtime version. Spelled out rather than derived
+/// from [`crate::runtime::LANGUAGES`] because the order is written into
+/// config as `runtime.version_files`, and doctor compares that array in
+/// order: a reordering would call every config written before it stale. A
+/// test holds this list to the table instead.
 const VERSION_FILES: [&str; 7] = [
     ".nvmrc",
     ".node-version",
@@ -3545,6 +3550,23 @@ mod tests {
     // install. Every command here has been checked against its tool's
     // documentation, so the list is the assertion — a new entry has to be
     // added here deliberately.
+    #[test]
+    fn every_file_the_runtime_reads_is_a_version_file_signal() {
+        for language in crate::runtime::LANGUAGES {
+            for source in language.files {
+                assert!(
+                    VERSION_FILES.contains(&source.file),
+                    "{} pins {} but signals never looks for it",
+                    source.file,
+                    language.name
+                );
+            }
+        }
+        for shared in crate::runtime::SHARED_VERSION_FILES {
+            assert!(VERSION_FILES.contains(&shared), "{shared}");
+        }
+    }
+
     #[test]
     fn every_install_command_is_a_frozen_one() {
         const KNOWN_FROZEN: [&str; 7] = [
