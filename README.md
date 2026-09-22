@@ -44,6 +44,20 @@ pando never writes into your repository. Not a config file, not a gitignore
 line, not a lockfile change. Everything it learns and everything it runs lives
 under `~/.pando`.
 
+## For agents
+
+pando publishes what it knows as JSON so a program can read it instead of
+parsing English, and answers come back through one validated write path.
+
+- [`agent/json.md`](agent/json.md) — every machine-readable shape,
+  versioned, with the exit codes. `3` means pando has a question and the
+  question is on stderr.
+- [`agent/brief.md`](agent/brief.md) — the procedure for turning that
+  evidence into answers: read before asking, write only through
+  `pando init --answers`, never a byte in the repository.
+- [`agent/`](agent/README.md) — a Claude Code plugin and Codex skills, both
+  thin over that one brief.
+
 ## Commands
 
 ```

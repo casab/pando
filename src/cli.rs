@@ -3687,6 +3687,9 @@ mod tests {
     // rename that would rot the brief rots them.
     #[test]
     fn every_host_wrapper_only_names_commands_pando_has() {
+        // The repository's own README is prose for people, whose command
+        // table is not in this shape. Everything here is a document an
+        // agent is pointed at and follows literally.
         for file in [
             "agent/README.md",
             "agent/skills/pando-setup/SKILL.md",
