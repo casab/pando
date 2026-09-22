@@ -304,12 +304,16 @@ yours to fix:
 - **a runtime the machine does not resolve.** The fix is a `prelude` line,
   and `doctor` prints the exact one. It is about their laptop: offer it,
   do not run an installer.
-- **a non-frozen install in a config somebody wrote by hand.** doctor calls
-  it a problem — not a note — because nothing downstream stops it: what
-  `project.install` says is what `pando new` runs, and it can rewrite the
-  project's lockfile. The finding prints the frozen form as its fix. Show
-  them both and let them change it; do not "fix" it by loosening anything,
-  and never write one yourself.
+- **a non-frozen install in a config somebody wrote by hand.** pando never
+  *proposes* one — but it does not overrule one either. What
+  `project.install` says is what `pando new` runs, because a developer who
+  wrote that line has answered the question and a tool that silently
+  refuses their answer is worse than one that runs it and says so. So
+  doctor calls it a **problem** rather than a note, and prints the frozen
+  form as its fix; and if the command really does rewrite a lockfile, the
+  `new` that ran it says *that* out loud too, naming the worktree the file
+  changed in. Show them the finding, let them change it, and do not "fix"
+  it by loosening anything. Never write one yourself — see §8.
 
 Do not claim a project starts unless you started it. If you did not run
 `pando start`, say that you did not.
@@ -350,12 +354,15 @@ Absolute. None of these has an exception worth taking.
   and a developer will not distinguish your plugin from the tool. If a
   project cannot run without an untracked file, say which file and why, and
   let them create it in their own project.
-- **Never propose or run a non-frozen install.** `npm ci`, not
-  `npm install`. `pnpm install --frozen-lockfile`, not `pnpm install`. No
-  lockfile means no *frozen* install exists, so pando proposes none — and
-  if the project installs by a step of its own that you have read, naming
-  that step is an answer. Guessing one, or reaching for the non-frozen
-  form because the slot looked empty, is not.
+- **Never write or run a non-frozen install.** `npm ci`, not
+  `npm install`. `pnpm install --frozen-lockfile`, not `pnpm install`.
+  This one is a rule about *you*, not a promise about pando: pando will
+  honour a line a developer wrote there, and it should — but a line you
+  wrote has no developer behind it. No lockfile means no *frozen* install
+  exists, so pando proposes none; if the project installs by a step of its
+  own that you have actually read, naming that step is an answer. Guessing
+  one, or reaching for the non-frozen form because the slot looked empty,
+  is not.
 - **Never run a mutating pando command against a repository the developer
   did not point you at.** `new`, `start`, `stop`, `rm`, `share`, `init`
   are mutating. `ls`, `status`, `path`, `logs`, `doctor`, `signals` are
