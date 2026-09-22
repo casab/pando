@@ -1,7 +1,6 @@
 //! pando: one repo, every branch alive.
 //!
-//! Modules land one per work item of the current phase plan; the dependency
-//! direction is inner to outer with no upward imports:
+//! The dependency direction is inner to outer, with no upward imports:
 //!
 //! ```text
 //! catalog · paths → compose → project · config · ports · process · runtime · state
@@ -13,6 +12,30 @@
 //!       → doctor
 //!       → cli · tui
 //! ```
+//!
+//! A module that grew past one concern is a directory: its `mod.rs` holds
+//! the module doc and re-exports every public item, so a caller always
+//! writes `crate::actions::start`, never the file it lives in, and each
+//! file below it is one concern with its own `//!` line. Tests sit in a
+//! `tests.rs` beside them.
+//!
+//! # Where to add something
+//!
+//! | To add | Edit |
+//! |---|---|
+//! | a package manager or lockfile | a row in [`catalog::package_managers`] |
+//! | a framework | a row in [`catalog::frameworks::RULES`] |
+//! | a service image a compose file uses | a row in [`catalog::images::IMAGES`] |
+//! | a language or version manager | `runtime/languages.rs` |
+//! | a native service (postgres, redis…) | a TOML file in `recipes/builtin/`, and a row in [`recipes::BUILT_IN`] |
+//! | a CLI verb | `cli/mod.rs` (`Command`, `dispatch`), its output in a file of its own under `cli/`, the behaviour in `actions/`, and the verb list in `CLAUDE.md`, which a test holds to clap |
+//! | a question pando asks | [`detect::Slot`], its proposal in `detect/`, its config edit in `detect/apply.rs`, and [`actions::ALL_SLOTS`]; the slot names are a published contract with a test that pins them |
+//! | a `doctor` section | [`doctor::Section`], its report type in `doctor/report.rs`, a file under `doctor/`, its renderer in `doctor/render.rs`, and `agent/json.md`, which a test holds to the enum |
+//! | a TUI key or panel | `tui/app/` for state and keys, `tui/render/` for drawing |
+//!
+//! Tables in `catalog` are data: a fact lives in one row, and every module
+//! that needs it reads the row. Where two lists must differ in order, both
+//! exist and a test holds them to one set.
 
 pub mod actions;
 pub mod cache;
