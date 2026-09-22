@@ -2514,7 +2514,7 @@ fn a_busy_log() -> Vec<String> {
 #[test]
 fn the_tui_spawns_nothing_that_could_paint_over_the_screen() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let expected: [(&str, usize); 12] = [
+    let expected: [(&str, usize); 17] = [
         ("src/tui/app/mod.rs", 0),
         ("src/tui/app/background.rs", 0),
         ("src/tui/app/dialogs.rs", 0),
@@ -2524,7 +2524,12 @@ fn the_tui_spawns_nothing_that_could_paint_over_the_screen() {
         ("src/tui/app/pending.rs", 0),
         ("src/tui/app/tails.rs", 0),
         ("src/tui/app/tests.rs", 0),
-        ("src/tui/render.rs", 0),
+        ("src/tui/render/mod.rs", 0),
+        ("src/tui/render/chrome.rs", 0),
+        ("src/tui/render/detail.rs", 0),
+        ("src/tui/render/list.rs", 0),
+        ("src/tui/render/log_viewer.rs", 0),
+        ("src/tui/render/tests.rs", 0),
         ("src/tui/modal.rs", 0),
         ("src/tui/mod.rs", 0),
     ];
