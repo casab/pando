@@ -246,7 +246,7 @@ half `signals` deliberately leaves out. It writes nothing anywhere.
   "config":   { "layers": [ { "layer": "committed|user|project", "path": "...",
                               "present": true, "error": null,
                               "keys": [ { "key": "dev.cmd", "value": "\"pnpm dev\"",
-                                          "note": "detected: package.json scripts.dev",
+                                          "note": "# detected: package.json scripts.dev",
                                           "ignored": false } ] } ],
                 "error": null },
   "runtime":  { "prelude": "...", "prelude_from": "...",
@@ -270,10 +270,25 @@ half `signals` deliberately leaves out. It writes nothing anywhere.
 here will break a command, and `ok` is `false` — or `note`, which is
 something to know that breaks nothing. Every finding carries its own `fix`.
 
-`config.layers[].keys[].note` is the provenance of every key pando wrote:
-`detected: <evidence>`, `answered: <date>`, `answered: a program, <date>`,
-or `answered: --yes took the first of N options`. It is how a developer, or
-a program, tells what decided each line.
+`config.layers[].keys[].note` is the provenance of every key pando wrote,
+verbatim from the file and so with the comment's own `#` on the front:
+`# detected: <evidence>`, `# answered: <date>`, `# answered: a program,
+<date>`, or `# answered: --yes took the first of N options`. A key with a
+comment a developer wrote themselves carries that instead, and one with no
+comment carries `null`. It is how a developer, or a program, tells what
+decided each line.
+
+A `# detected:` value that pando's rules **would not write now** is a
+finding in the `config` section, at `note`. pando asks each question once
+and never asks again, so a value an older rule wrote survives every
+improvement to that rule — and so does a value that was right until the
+repository changed under it. The finding names the key, the file, what it
+holds, and what the rules offer for that key instead; the fix is to delete
+the line, which is what makes the next command that needs it ask again.
+pando never rewrites the value itself. A value marked `# answered:` is
+never reported: that is a decision, by a person or by a program, and pando
+does not second-guess decisions — so a deliberate answer closes this for
+good.
 
 `services.isolation` carries the native-versus-container decision and the
 evidence behind it. It is the report a program should quote to a human

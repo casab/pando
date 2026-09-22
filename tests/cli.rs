@@ -2795,6 +2795,39 @@ fn doctor_names_a_detected_value_the_rules_would_not_write_now() {
     assert!(!after.contains("pando detected itself"), "{after}");
 }
 
+/// `agent/json.md` describes the provenance comment on a config key, and
+/// it is one of the few strings in the JSON an agent is told to branch
+/// on. It documented the spelling without the `#` the note is actually
+/// copied out of the file with, and nothing held the document to the
+/// binary.
+#[test]
+fn the_documented_provenance_note_is_the_one_doctor_prints() {
+    let e = env();
+    e.write_config("[project]\ninstall = \"true\"  # detected: a rule that once existed\n");
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout(&e.pando(&["doctor", "--json"]))).expect("one object");
+    let note = json["config"]["layers"]
+        .as_array()
+        .expect("layers")
+        .iter()
+        .flat_map(|layer| layer["keys"].as_array().cloned().unwrap_or_default())
+        .find(|key| key["key"] == "project.install")
+        .and_then(|key| key["note"].as_str().map(str::to_string))
+        .expect("the note on project.install");
+    assert_eq!(note, "# detected: a rule that once existed");
+
+    let doc = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("agent/json.md"))
+        .expect("read agent/json.md");
+    assert!(
+        doc.contains("`# detected: <evidence>`"),
+        "agent/json.md documents a spelling the binary does not print"
+    );
+    assert!(
+        !doc.contains("\"note\": \"detected:"),
+        "the example in agent/json.md drops the comment's own `#`"
+    );
+}
+
 #[test]
 fn doctor_writes_nothing_and_does_not_create_a_home() {
     let dir = TempDir::new().unwrap();
