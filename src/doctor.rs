@@ -1150,13 +1150,21 @@ fn worktrees_report(
             };
             let hint = failure_hint(&p.log_path, reason.as_deref());
             if let Some(reason) = &reason {
-                let tail = format!("`pando logs {name} --source {process}` has the last of it");
+                // Where to look is not always the log. Sending a developer
+                // to `pando logs` over a file with nothing in it is the
+                // dead end a first run walked into — `doctor` said failed,
+                // pointed here, and here said nothing — and the record
+                // already knows the difference.
+                let where_to_look = match log_has_output(&p.log_path) {
+                    true => format!("`pando logs {name} --source {process}` has the last of it"),
+                    false => "its log is empty, so there is nothing to read there".to_string(),
+                };
                 findings.push(Finding::problem(
                     Section::Worktrees,
                     format!("{name}: the process {process:?} failed — {reason}"),
                     match &hint {
-                        Some(hint) => format!("{hint}\n{tail}"),
-                        None => format!("{tail}; `pando start {name}` tries again"),
+                        Some(hint) => format!("{hint}\n{where_to_look}"),
+                        None => format!("{where_to_look}; `pando start {name}` tries again"),
                     },
                 ));
             }
@@ -1306,6 +1314,14 @@ fn worktrees_report(
 /// when the failure is first seen. A record whose log only became
 /// explanatory afterwards has nothing, and that is the case worth reading
 /// the file for.
+/// Whether the log has anything in it to send anyone to.
+///
+/// Bytes, not lines: a process killed mid-line wrote something worth
+/// reading, and `pando logs` prints it.
+fn log_has_output(log: &Path) -> bool {
+    std::fs::metadata(log).is_ok_and(|m| m.len() > 0)
+}
+
 fn failure_hint(log: &Path, reason: Option<&str>) -> Option<String> {
     let reason = reason?;
     let lines = crate::log_tail::snapshot(log, FAILURE_TAIL_LINES).unwrap_or_default();
@@ -4721,6 +4737,57 @@ mod tests {
             .unwrap_or_default();
         assert!(fix.contains("17342"), "the classifier's hint: {fix}");
         assert!(fix.contains("pando logs feat+one --source dev"), "{fix}");
+    }
+
+    /// The end of the dead end: when the process printed nothing, the fix
+    /// line does not send the developer to an empty file. The record knows
+    /// the difference, and after the exit status landed it knows why.
+    #[test]
+    fn a_failure_with_an_empty_log_is_not_sent_to_read_it() {
+        let fx = fixture();
+        let log = fx.paths.log_file("feat+one", "dev");
+        std::fs::create_dir_all(log.parent().expect("logs dir")).expect("mkdir");
+        std::fs::write(&log, "").expect("write log");
+        let mut record = state::WorktreeRecord::new(&fx.root, true);
+        record.processes.insert(
+            "dev".to_string(),
+            state::ProcessRecord {
+                pid: 999_999,
+                pgid: 999_999,
+                started_at: chrono::Utc::now(),
+                log_path: log.clone(),
+                ready_port: None,
+                ready_timeout_s: None,
+                observed_ports: Vec::new(),
+                swept: false,
+                phase: state::Phase::Failed {
+                    at: chrono::Utc::now(),
+                    reason: "process exited with status 0 — it printed nothing at all".to_string(),
+                },
+            },
+        );
+        write_state(&fx, &one_worktree("feat+one", record));
+        let report = report(&fx);
+        let fix = report
+            .findings
+            .iter()
+            .find(|f| f.section == Section::Worktrees && f.severity == Severity::Problem)
+            .and_then(|f| f.fix.clone())
+            .unwrap_or_default();
+        assert!(
+            !fix.contains("pando logs"),
+            "there is nothing to read there: {fix}"
+        );
+        assert!(fix.contains("empty"), "and it says so: {fix}");
+        assert!(
+            fix.contains("pando start feat+one"),
+            "and still says what to do: {fix}"
+        );
+        assert!(
+            mentions(&report, "status 0"),
+            "the reason is unchanged: {:?}",
+            messages(&report)
+        );
     }
 
     #[test]
