@@ -2719,6 +2719,82 @@ fn doctor_still_runs_when_the_project_layer_cannot_be_loaded() {
     );
 }
 
+/// The gap a first contact left: an improved rule that could not reach
+/// the developer who needed it, because the bad value it replaced was
+/// already in their config and "ask once" meant nobody asked again.
+///
+/// The shape is the honest one and nothing more: a Makefile target with
+/// a prerequisite, whose first recipe line is a guard that exits before
+/// anything starts, and a config holding that line as the dev command.
+#[test]
+fn doctor_names_a_detected_value_the_rules_would_not_write_now() {
+    let e = env();
+    std::fs::write(
+        e.root.join("Makefile"),
+        concat!(
+            "build:\n\t./scripts/build.sh\n\n",
+            "dev: build\n",
+            "\tcommand -v watcher >/dev/null || { echo \"install watcher first\"; exit 1; }\n",
+            "\t./scripts/serve.sh --reload\n",
+        ),
+    )
+    .unwrap();
+    e.write_config(
+        "[dev]\ncmd = 'command -v watcher >/dev/null || { echo \"install watcher first\"; \
+         exit 1; }'  # detected: the dev target\n",
+    );
+
+    let out = e.pando(&["doctor"]);
+    // A note: a stale detection is suspicious, not broken, so it does not
+    // fail the shell on its own.
+    assert_eq!(code(&out), EXIT_OK, "stdout: {}", stdout(&out));
+    let text = stdout(&out);
+    assert!(text.contains("dev.cmd"), "{text}");
+    assert!(text.contains("pando detected itself"), "{text}");
+    assert!(
+        text.contains("command -v watcher"),
+        "what it holds now:\n{text}"
+    );
+    assert!(text.contains("make dev"), "what it would detect:\n{text}");
+    assert!(
+        text.contains("delete that line"),
+        "and the fix that reopens the question:\n{text}"
+    );
+    assert!(text.contains("0 problems, 1 note"), "{text}");
+
+    // And in the shape an agent reads, as a finding like any other.
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout(&e.pando(&["doctor", "--json"]))).expect("one object");
+    assert_eq!(json["ok"], true);
+    let finding = json["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .find(|f| {
+            f["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("pando detected itself"))
+        })
+        .unwrap_or_else(|| panic!("{}", json["findings"]));
+    assert_eq!(finding["section"], "config");
+    assert_eq!(finding["severity"], "note");
+    assert!(
+        finding["fix"]
+            .as_str()
+            .is_some_and(|f| f.contains("delete")),
+        "{finding}"
+    );
+
+    // Answering it by hand closes it: pando does not second-guess a
+    // decision, whatever its rules would say.
+    e.write_config(
+        "[dev]\ncmd = 'command -v watcher >/dev/null || { echo \"install watcher first\"; \
+         exit 1; }'  # answered: 2026-09-22\n",
+    );
+    let after = stdout(&e.pando(&["doctor"]));
+    assert!(!after.contains("pando detected itself"), "{after}");
+}
+
 #[test]
 fn doctor_writes_nothing_and_does_not_create_a_home() {
     let dir = TempDir::new().unwrap();
