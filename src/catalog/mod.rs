@@ -9,4 +9,5 @@
 //! the lookups over it; the modules that act on the data stay where they
 //! are.
 
+pub mod frameworks;
 pub mod package_managers;
