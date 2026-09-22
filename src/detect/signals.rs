@@ -75,7 +75,11 @@ pub(super) const VERSION_FILES: [&str; 7] = [
 
 const ENV_EXAMPLES: [&str; 3] = [".env.example", ".env.sample", ".env.template"];
 
-const COMPOSE_FILES: [&str; 4] = [
+/// The compose file names `signals` reports, in the order it reports them.
+/// The same names as [`crate::compose::COMPOSE_FILES`], whose order is
+/// compose's own precedence instead; `signals --json` publishes this order,
+/// so the two stay separate lists and a test holds them to one set.
+pub(super) const COMPOSE_FILES: [&str; 4] = [
     "docker-compose.yml",
     "docker-compose.yaml",
     "compose.yml",

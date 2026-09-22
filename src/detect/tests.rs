@@ -1808,3 +1808,12 @@ fn the_brief_quotes_the_preference_line_pando_actually_says() {
              with it; the brief is the one document that quotes this string verbatim"
     );
 }
+
+#[test]
+fn signals_looks_for_every_file_name_compose_does() {
+    let mut ours = super::signals::COMPOSE_FILES.to_vec();
+    let mut compose = crate::compose::COMPOSE_FILES.to_vec();
+    ours.sort();
+    compose.sort();
+    assert_eq!(ours, compose);
+}
