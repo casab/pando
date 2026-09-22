@@ -26,7 +26,7 @@ records every question a program answered. See
 
 ## Compatibility
 
-Every shape carries `version`, an integer, currently **1**. It is bumped
+Every shape carries `version`, an integer, currently **2**. It is bumped
 independently of pando's own version, so a program pins what it parses
 rather than which release it runs against.
 
@@ -49,6 +49,17 @@ Within a version:
 
 A change that breaks any of the above bumps `version`. Pin it, check it,
 and refuse a shape you were not written for rather than guessing.
+
+**Changed in 2.** `signals.targets` went from a name-to-string map, where the
+string was the first line of the target's recipe, to a name-to-object map
+carrying `tool`, `prereqs` and `recipe`. The old shape was not merely
+narrower, it was wrong: one line of a recipe is not the command a target
+runs, and pando proposed such a line as a dev command on a real project.
+
+One coarseness worth knowing: `signals`, `doctor`, `status` and `logs` share
+a single version, so a break in one bumps all four. Nothing about `doctor`,
+`status` or `logs` changed in 2. Splitting them so a program can pin what it
+actually parses is recorded as a follow-up, not done here.
 
 ## stdout, stderr, and exit codes
 
@@ -88,7 +99,7 @@ repository, which is what makes it safe to read before deciding anything.
 
 ```jsonc
 {
-  "version": 1,
+  "version": 2,
   "project": { "id": "...", "root": "/abs/path", "name": "..." },
   "signals": {
     "scripts": {},              // package.json scripts, and their equivalents
@@ -227,7 +238,7 @@ half `signals` deliberately leaves out. It writes nothing anywhere.
 
 ```jsonc
 {
-  "version": 1,
+  "version": 2,
   "ok": true,               // the exit code as a value: false means exit 1
   "project":  { "id": "...", "root": "...", "home": "...", "worktrees_dir": "...",
                 "home_mode": "700", "port_min": 17000, "port_max": 32767,
@@ -272,7 +283,7 @@ rather than re-deriving.
 
 ```jsonc
 {
-  "version": 1,
+  "version": 2,
   "project": { "id": "...", "root": "...", "name": "..." },
   "worktrees": [
     {
@@ -312,7 +323,7 @@ when the share is behind an auth command.
 
 ```jsonc
 {
-  "version": 1,
+  "version": 2,
   "project": { "id": "...", "root": "...", "name": "..." },
   "worktrees": [
     { "name": "feat+one", "path": "...", "branch": "feat/one", "head": "abc1234",
@@ -333,7 +344,7 @@ never spawns `gh`, so it works offline and may be stale or `null`.
 One JSON object per line, on stdout, forever if `-f` was passed:
 
 ```jsonc
-{ "version": 1, "ts": "2026-09-20T10:00:00+00:00", "level": "debug|info|warn|error", "line": "ready in 412ms" }
+{ "version": 2, "ts": "2026-09-20T10:00:00+00:00", "level": "debug|info|warn|error", "line": "ready in 412ms" }
 ```
 
 `ts` is the line's *own* timestamp when pando could read one, normalised to

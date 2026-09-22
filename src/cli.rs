@@ -20,7 +20,7 @@ use crate::worktree::{PrState, Worktree};
 
 /// Shape version for machine-readable output, bumped independently of the
 /// crate version so agents can pin what they parse.
-pub const JSON_VERSION: u32 = 1;
+pub const JSON_VERSION: u32 = 2;
 
 /// What `git log --format=%h` abbreviates to, and what the JSON documents.
 const SHORT_SHA_LEN: usize = 7;
@@ -3014,7 +3014,9 @@ mod tests {
 
         let text = capture(|b| status_json(&fx.paths, None, b));
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(v["version"], 1);
+        // Pinned as a literal on purpose: a bump must fail here, at the
+        // commit that makes it, rather than passing quietly.
+        assert_eq!(v["version"], 2);
         assert_eq!(v["project"]["name"], "acme-shop");
         let wt = &v["worktrees"][0];
         assert_eq!(wt["name"], "feat+one");
@@ -3694,7 +3696,9 @@ mod tests {
         let text = capture(|b| ls_json(&fx.paths, b));
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
 
-        assert_eq!(v["version"], 1);
+        // Pinned as a literal on purpose: a bump must fail here, at the
+        // commit that makes it, rather than passing quietly.
+        assert_eq!(v["version"], 2);
         assert_eq!(v["project"]["id"], fx.paths.project.id.as_str());
         assert_eq!(v["project"]["name"], "acme-shop");
         assert_eq!(v["project"]["root"], fx.root.display().to_string().as_str());

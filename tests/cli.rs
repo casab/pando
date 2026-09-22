@@ -232,7 +232,9 @@ fn ls_json_parses_and_carries_the_documented_keys() {
     assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
 
     let v: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("valid json");
-    assert_eq!(v["version"], 1);
+    // Pinned as a literal: a version bump must fail here, at the commit
+    // that makes it, rather than passing quietly.
+    assert_eq!(v["version"], 2);
     assert!(v["project"]["id"].as_str().is_some());
     let w = &v["worktrees"][0];
     for key in [
@@ -868,7 +870,9 @@ fn start_status_logs_and_stop_work_from_the_cli() {
     let out = e.pando(&["status", "--json"]);
     assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
     let v: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("status --json parses");
-    assert_eq!(v["version"], 1);
+    // Pinned as a literal: a version bump must fail here, at the commit
+    // that makes it, rather than passing quietly.
+    assert_eq!(v["version"], 2);
     let wt = &v["worktrees"][0];
     assert_eq!(wt["name"], "feat+one");
     let port = wt["ports"]["web"].as_u64().expect("a web port");
@@ -2363,7 +2367,9 @@ fn signals_is_json_identical_on_two_runs_and_writes_nothing() {
         "detection is read-only, so two runs say the same thing"
     );
     let parsed: serde_json::Value = serde_json::from_str(&stdout(&first)).unwrap();
-    assert_eq!(parsed["version"], 1, "versioned like the other shapes");
+    // Pinned as a literal: a version bump must fail here, at the commit
+    // that makes it, rather than passing quietly.
+    assert_eq!(parsed["version"], 2, "versioned like the other shapes");
     assert_eq!(parsed["project"]["name"], "next-pnpm-compose");
     assert!(
         !e.config_file().exists(),
@@ -2922,7 +2928,9 @@ fn doctor_json_is_versioned_and_carries_every_section() {
     let out = e.pando(&["doctor", "--json"]);
     let json: serde_json::Value =
         serde_json::from_str(&stdout(&out)).expect("doctor --json parses as JSON");
-    assert_eq!(json["version"], serde_json::json!(1));
+    // Pinned as a literal: a version bump must fail here, at the commit
+    // that makes it, rather than passing quietly.
+    assert_eq!(json["version"], serde_json::json!(2));
     assert_eq!(
         json["ok"],
         serde_json::json!(code(&out) == EXIT_OK),
