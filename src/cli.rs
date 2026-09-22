@@ -3733,6 +3733,55 @@ mod tests {
         assert_every_documented_command_is_real("agent/brief.md");
     }
 
+    /// The README's own command list, against clap.
+    ///
+    /// It is prose for people, so it is not in the shape
+    /// [`assert_every_documented_command_is_real`] parses — the
+    /// description runs on after the verb, and the first line is a bare
+    /// `pando` that opens the TUI. But the Status section under the list
+    /// says every command in it is implemented, and that is a claim worth
+    /// failing over: the line above it said "there is no code yet" for
+    /// eight phases of code, because nothing read it.
+    #[test]
+    fn the_readme_lists_only_commands_pando_has() {
+        use clap::CommandFactory;
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md");
+        let text = std::fs::read_to_string(&path).expect("the README");
+        let cli = Cli::command();
+        let mut checked = 0;
+        let mut fenced = false;
+        for line in text.lines() {
+            if line.trim_start().starts_with("```") {
+                fenced = !fenced;
+                continue;
+            }
+            // Only the fenced list. "pando never writes into your
+            // repository" is a sentence, and the promise it belongs to is
+            // not a command table.
+            if !fenced {
+                continue;
+            }
+            let Some(rest) = line.strip_prefix("pando ") else {
+                continue;
+            };
+            // The one line with no verb: `pando` alone, padded out to the
+            // description column.
+            if rest.starts_with(' ') {
+                continue;
+            }
+            let verb = rest.split_whitespace().next().unwrap_or_default();
+            assert!(
+                cli.get_subcommands().any(|c| c.get_name() == verb),
+                "README.md lists `pando {verb}`, and pando has no {verb:?} command"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 13,
+            "only {checked} commands were found in README.md — did the list move?"
+        );
+    }
+
     /// The brief is the only place the reasoning lives, so the things it
     /// has to teach are worth failing over if somebody trims it.
     ///

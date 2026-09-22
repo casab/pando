@@ -79,4 +79,15 @@ pando signals         dump detection signals as JSON, for humans or agents
 
 ## Status
 
-Design phase. There is no code yet.
+Built, not released. Every command above is implemented and covered by
+tests, in this order: worktrees and their lifecycle; detached dev servers
+with their own ports, logs and readiness; several processes per worktree;
+the log viewer; private per-worktree services from the project's own
+compose file; public tunnel URLs; `init`, `doctor` and `signals`; native
+service recipes for machines without Docker; and the JSON contract an
+agent reads. macOS and Linux.
+
+What that does not mean: there is no published binary and no version to
+install, and every worktree pando has created and every server it has
+started has been inside a generated fixture repository. It has not been
+run on a real project yet.
