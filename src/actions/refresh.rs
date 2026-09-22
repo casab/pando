@@ -11,9 +11,6 @@ use crate::state::{self, Phase};
 
 use super::share::sweep_dead_shares;
 
-/// How many log lines the failure classifier reads.
-const FAILURE_TAIL_LINES: usize = 40;
-
 /// State as of right now: phases advanced, observed ports captured, and the
 /// reason a dead process died written down.
 ///
@@ -335,7 +332,8 @@ pub(super) fn explain_failure(reason: &str, log_path: &Path, group_alive: bool) 
     {
         out = format!("{out} with status {code}");
     }
-    let lines = crate::log_tail::snapshot(log_path, FAILURE_TAIL_LINES).unwrap_or_default();
+    let lines = crate::log_tail::snapshot(log_path, crate::log_tail::FAILURE_TAIL_LINES)
+        .unwrap_or_default();
     let printed_anything = std::fs::metadata(log_path).is_ok_and(|m| m.len() > 0);
     if let Some(note) = crate::observe::exit_note(code, printed_anything, group_alive) {
         out = format!("{out} — {note}");

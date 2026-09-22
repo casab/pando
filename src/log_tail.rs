@@ -958,6 +958,11 @@ impl LogTail {
     }
 }
 
+/// How many log lines pando reads to explain why a process failed. One
+/// budget for every reader, so `status` and `doctor` explain a failure from
+/// the same lines.
+pub const FAILURE_TAIL_LINES: usize = 40;
+
 pub fn snapshot(path: &Path, max_lines: usize) -> Result<Vec<String>> {
     let mut tail = LogTail::new(path.to_path_buf(), max_lines);
     tail.poll()?;

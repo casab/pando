@@ -10,10 +10,6 @@ use crate::{actions, state};
 
 use super::report::{Finding, ProcessReport, Section, WorktreeReport, WorktreeServiceReport};
 
-/// How many log lines the failure classifier reads. The same budget the
-/// read path uses.
-const FAILURE_TAIL_LINES: usize = 40;
-
 pub(super) fn worktrees_report(
     paths: &PandoPaths,
     config: &Config,
@@ -216,7 +212,8 @@ fn log_has_output(log: &Path) -> bool {
 
 fn failure_hint(log: &Path, reason: Option<&str>) -> Option<String> {
     let reason = reason?;
-    let lines = crate::log_tail::snapshot(log, FAILURE_TAIL_LINES).unwrap_or_default();
+    let lines =
+        crate::log_tail::snapshot(log, crate::log_tail::FAILURE_TAIL_LINES).unwrap_or_default();
     let hint = crate::observe::classify_failure(&lines)?;
     (!reason.contains(&hint.hint)).then_some(hint.hint)
 }
