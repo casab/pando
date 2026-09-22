@@ -2828,6 +2828,61 @@ fn the_documented_provenance_note_is_the_one_doctor_prints() {
     );
 }
 
+/// The check that a config pando *just wrote* is never one it complains
+/// about. It closes the loop the whole finding rests on: the same
+/// candidate list writes the value and is later asked whether the value
+/// is still among them, so any disagreement between `detect::edits` and
+/// what doctor reads back is a contradiction, and this is where it
+/// surfaces.
+///
+/// Every fixture shape, because the shapes differ in exactly the way
+/// that would break it: a framework command that carries its own port
+/// role writes two keys under one note, a workspace writes whole tables,
+/// and a project with nothing to run writes no dev command at all.
+#[test]
+fn a_config_pando_just_wrote_never_reads_as_a_stale_detection() {
+    // A run that wrote no `# detected:` line at all would pass this
+    // without testing anything, so the loop counts what it compared.
+    let mut compared = 0usize;
+    for kind in common::Kind::ALL {
+        let e = env_of(kind);
+        // Whatever `--yes` can settle without a person. It may stop at a
+        // question it is not allowed to answer; what it wrote before
+        // stopping is the config under test either way.
+        e.pando(&["init", "--yes"]);
+        let json: serde_json::Value =
+            serde_json::from_str(&stdout(&e.pando(&["doctor", "--json"]))).expect("one object");
+        let stale: Vec<&str> = json["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .filter_map(|f| f["message"].as_str())
+            .filter(|m| m.contains("pando detected itself"))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "{}: pando reported a value it had just written: {stale:?}",
+            kind.dir_name()
+        );
+        compared += json["config"]["layers"]
+            .as_array()
+            .expect("layers")
+            .iter()
+            .flat_map(|layer| layer["keys"].as_array().cloned().unwrap_or_default())
+            .filter(|key| {
+                key["value"].is_string()
+                    && key["note"]
+                        .as_str()
+                        .is_some_and(|note| note.starts_with("# detected:"))
+            })
+            .count();
+    }
+    assert!(
+        compared > 0,
+        "no fixture wrote a detected value, so nothing here was compared"
+    );
+}
+
 #[test]
 fn doctor_writes_nothing_and_does_not_create_a_home() {
     let dir = TempDir::new().unwrap();
