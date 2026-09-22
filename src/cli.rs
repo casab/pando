@@ -424,7 +424,7 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             tail,
             follow,
             json,
-        } => logs(paths, &name, &source, tail, follow, json, &mut out),
+        } => logs(paths, &name, &source, tail, follow, json, &mut out, &notice),
         // Never reached: `main` runs the proxy before it goes looking for a
         // repository, because the proxy has none.
         Command::ShareProxy { listen, upstream } => run_share_proxy(listen, upstream),
@@ -2226,6 +2226,15 @@ fn level_word(level: LogLevel) -> &'static str {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Prints the tail of one log, and — when there is nothing to print —
+/// says so.
+///
+/// `notice` is where "nothing to print" goes, and it is not `out`:
+/// `pando logs > file` and `pando logs --json | …` both take stdout
+/// literally, so a sentence about the log cannot be on it. Printing
+/// nothing and exiting 0 was the third dead end of the same first run —
+/// `doctor` said the process failed and pointed here, here said nothing,
+/// and there was no way to tell an empty log from a broken command.
 pub fn logs<W: Write>(
     paths: &PandoPaths,
     name: &str,
@@ -2234,6 +2243,7 @@ pub fn logs<W: Write>(
     follow: bool,
     json: bool,
     out: &mut W,
+    notice: &dyn Fn(&str),
 ) -> Result<()> {
     // `source` is a path component of the file about to be read, so a
     // traversal here reads outside the worktree's log directory entirely —
@@ -2266,8 +2276,15 @@ pub fn logs<W: Write>(
         .poll()
         .with_context(|| format!("read {}", path.display()))?;
     let first = tailer.lines().len().saturating_sub(tail);
+    let mut printed = 0usize;
     for line in tailer.lines().iter().skip(first) {
         write_log_line(out, &line.plain, line.level, json)?;
+        printed += 1;
+    }
+    if printed == 0 {
+        for line in silence_notes(paths, name, source, &path) {
+            notice(&line);
+        }
     }
     if !follow {
         return Ok(());
@@ -2301,6 +2318,51 @@ pub fn logs<W: Write>(
         }
         out.flush()?;
     }
+}
+
+/// Why `logs` printed nothing: what the file is, and — when the record
+/// knows — what the process did.
+///
+/// Three states that used to be one silence. An empty file is a fact about
+/// the run: the process wrote nothing, which is itself the strongest thing
+/// anyone can say about a dev command that exited at once. A file with
+/// bytes but no complete line is a different fact and is not pando's doing
+/// either. Neither is "the command is broken", which is the only thing a
+/// silent exit 0 leaves a developer free to conclude.
+///
+/// The second line comes from the state record, read without writing
+/// anything: the process's own phase, which for a failure is the reason
+/// `explain_failure` already composed. That is the sentence the developer
+/// came here looking for.
+fn silence_notes(
+    paths: &PandoPaths,
+    name: &str,
+    source: &str,
+    path: &std::path::Path,
+) -> Vec<String> {
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let mut out = vec![match size {
+        0 => format!("the {source} log for {name} is empty — nothing was ever written to it"),
+        n => format!("the {source} log for {name} holds {n} bytes and not one complete line yet"),
+    }];
+    // `inspect`, not `refresh`: reading a log may not signal anything or
+    // write state.
+    let state = actions::inspect(paths).state;
+    let Some(process) = state
+        .worktrees
+        .get(name)
+        .and_then(|record| record.processes.get(source))
+    else {
+        return out;
+    };
+    out.push(match &process.phase {
+        Phase::Failed { reason, .. } => format!("{source} failed: {reason}"),
+        Phase::Running { .. } => {
+            format!("{source} is running and has not printed anything yet")
+        }
+        Phase::Starting { .. } => format!("{source} is still starting"),
+    });
+    out
 }
 
 fn write_log_line<W: Write>(out: &mut W, plain: &str, level: LogLevel, json: bool) -> Result<()> {
@@ -2410,6 +2472,23 @@ mod tests {
         let mut buf = Vec::new();
         f(&mut buf).unwrap();
         String::from_utf8(buf).unwrap()
+    }
+
+    /// The notice channel, for a test that is not about it.
+    fn quiet(_: &str) {}
+
+    /// stdout and the notices, separately — which is the whole point of
+    /// there being two channels.
+    fn capture_both(
+        f: impl FnOnce(&mut Vec<u8>, &dyn Fn(&str)) -> Result<()>,
+    ) -> (String, Vec<String>) {
+        let notes = std::cell::RefCell::new(Vec::new());
+        let mut buf = Vec::new();
+        f(&mut buf, &|line: &str| {
+            notes.borrow_mut().push(line.to_string())
+        })
+        .unwrap();
+        (String::from_utf8(buf).unwrap(), notes.into_inner())
     }
 
     #[test]
@@ -3271,11 +3350,14 @@ mod tests {
         let fx = fixture();
         write_log(&fx, "feat+one", "web", "web line\n");
         write_log(&fx, "feat+one", "api", "api line\n");
-        let text = capture(|b| logs(&fx.paths, "feat+one", "api", 5, false, false, b));
+        let text = capture(|b| logs(&fx.paths, "feat+one", "api", 5, false, false, b, &quiet));
         assert_eq!(text, "api line\n");
 
         let mut out = Vec::new();
-        let err = logs(&fx.paths, "feat+one", "worker", 5, false, false, &mut out).unwrap_err();
+        let err = logs(
+            &fx.paths, "feat+one", "worker", 5, false, false, &mut out, &quiet,
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("worker"), "{msg}");
         assert!(
@@ -3324,6 +3406,7 @@ mod tests {
             false,
             false,
             &mut out,
+            &quiet,
         )
         .unwrap_err();
         let msg = format!("{err:#}");
@@ -3337,7 +3420,7 @@ mod tests {
 
         // And the hook logs pando writes itself are still readable by name.
         write_log(&fx, "feat+one", "install", "install line\n");
-        let text = capture(|b| logs(&fx.paths, "feat+one", "install", 5, false, false, b));
+        let text = capture(|b| logs(&fx.paths, "feat+one", "install", 5, false, false, b, &quiet));
         assert_eq!(text, "install line\n");
     }
 
@@ -3345,8 +3428,103 @@ mod tests {
     fn logs_prints_the_last_lines() {
         let fx = fixture();
         write_log(&fx, "feat+one", "dev", "one\ntwo\nthree\nfour\n");
-        let text = capture(|b| logs(&fx.paths, "feat+one", "dev", 2, false, false, b));
+        let text = capture(|b| logs(&fx.paths, "feat+one", "dev", 2, false, false, b, &quiet));
         assert_eq!(text, "three\nfour\n");
+    }
+
+    /// The third dead end of the first contact run, and the worst of them:
+    /// `doctor` said the process failed and pointed at `pando logs`; that
+    /// printed nothing and exited 0. Following pando's own advice led to
+    /// silence, with no way to tell an empty log from a wrong worktree
+    /// name, a wrong `--source`, or a broken command.
+    #[test]
+    fn an_empty_log_says_that_it_is_empty() {
+        let fx = fixture();
+        write_log(&fx, "feat+one", "dev", "");
+        let (text, notes) =
+            capture_both(|b, n| logs(&fx.paths, "feat+one", "dev", 10, false, false, b, n));
+        assert_eq!(text, "", "stdout is still only the log");
+        assert!(
+            notes.iter().any(|n| n.contains("is empty")),
+            "an empty log is a fact pando knows: {notes:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("dev") && n.contains("feat+one")),
+            "and it names what was read: {notes:?}"
+        );
+    }
+
+    /// A file with bytes in it and no complete line is a different state
+    /// again, and used to be the same silence.
+    #[test]
+    fn a_log_with_no_complete_line_says_so_rather_than_nothing() {
+        let fx = fixture();
+        write_log(&fx, "feat+one", "dev", "half a line with no newline");
+        let (text, notes) =
+            capture_both(|b, n| logs(&fx.paths, "feat+one", "dev", 10, false, false, b, n));
+        assert_eq!(text, "");
+        assert!(
+            notes.iter().any(|n| n.contains("27 bytes")),
+            "the size is the whole difference from an empty file: {notes:?}"
+        );
+        assert!(
+            !notes.iter().any(|n| n.contains("is empty")),
+            "and it is not empty: {notes:?}"
+        );
+    }
+
+    /// The sentence the developer came for: why the log is empty. The
+    /// record already knows, because `explain_failure` wrote it there.
+    #[test]
+    fn an_empty_log_carries_the_reason_the_record_knows() {
+        let fx = fixture();
+        write_log(&fx, "feat+one", "dev", "");
+        let mut store = crate::state::State::new();
+        let mut record = WorktreeRecord::new(fx.paths.worktree_path("feat+one"), true);
+        record.processes.insert(
+            "dev".to_string(),
+            ProcessRecord {
+                pid: 1,
+                pgid: 1,
+                started_at: Utc::now(),
+                log_path: fx.paths.log_file("feat+one", "dev"),
+                ready_port: None,
+                ready_timeout_s: None,
+                observed_ports: Vec::new(),
+                swept: false,
+                phase: Phase::Failed {
+                    at: Utc::now(),
+                    reason: "process exited with status 0 — it printed nothing at all".to_string(),
+                },
+            },
+        );
+        store.worktrees.insert("feat+one".to_string(), record);
+        crate::state::save(&fx.paths.state_file(), &store).unwrap();
+
+        let (_, notes) =
+            capture_both(|b, n| logs(&fx.paths, "feat+one", "dev", 10, false, false, b, n));
+        assert!(
+            notes.iter().any(|n| n.contains("status 0")),
+            "the reason is already written down; this is where it is wanted: {notes:?}"
+        );
+    }
+
+    /// `--json` is a stream of objects, one per line. A note about the log
+    /// is not one of them, so it goes to the other channel and stdout
+    /// stays parseable — empty is a valid answer there.
+    #[test]
+    fn an_empty_log_in_json_keeps_stdout_clean() {
+        let fx = fixture();
+        write_log(&fx, "feat+one", "dev", "");
+        let (text, notes) =
+            capture_both(|b, n| logs(&fx.paths, "feat+one", "dev", 10, false, true, b, n));
+        assert_eq!(text, "", "nothing that is not a log line may be on stdout");
+        assert!(
+            !notes.is_empty(),
+            "and the developer is still told: {notes:?}"
+        );
     }
 
     #[test]
@@ -3358,7 +3536,7 @@ mod tests {
             "dev",
             "2026-09-20T10:00:00Z ready in 412ms\nError: it broke\n",
         );
-        let text = capture(|b| logs(&fx.paths, "feat+one", "dev", 10, false, true, b));
+        let text = capture(|b| logs(&fx.paths, "feat+one", "dev", 10, false, true, b, &quiet));
         let lines: Vec<serde_json::Value> = text
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
@@ -3397,6 +3575,7 @@ mod tests {
             false,
             false,
             &mut Vec::new(),
+            &quiet,
         )
         .unwrap_err();
         assert!(
@@ -3413,6 +3592,7 @@ mod tests {
             false,
             false,
             &mut Vec::new(),
+            &quiet,
         )
         .unwrap_err();
         let msg = format!("{err:#}");

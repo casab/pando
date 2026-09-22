@@ -527,7 +527,7 @@ fn starting_and_stopping_never_writes_into_the_repository() {
     h.assert_untouched("status --json", Some(&worktree));
 
     let mut out = Vec::new();
-    pando::cli::logs(&h.paths, &name, "dev", 5, false, false, &mut out).unwrap();
+    pando::cli::logs(&h.paths, &name, "dev", 5, false, false, &mut out, &|_| {}).unwrap();
     assert!(
         String::from_utf8_lossy(&out).contains("listening on"),
         "the log has the process's own output"
@@ -731,7 +731,7 @@ fn two_processes_never_write_into_the_repository() {
 
     // One log per process, and `--source` picks between them.
     let mut out = Vec::new();
-    pando::cli::logs(&h.paths, &name, "api", 5, false, false, &mut out).unwrap();
+    pando::cli::logs(&h.paths, &name, "api", 5, false, false, &mut out, &|_| {}).unwrap();
     let api_log = String::from_utf8_lossy(&out).into_owned();
     assert!(
         api_log.contains(&format!("listening on {api_port}")),
