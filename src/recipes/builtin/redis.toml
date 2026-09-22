@@ -1,0 +1,26 @@
+# Redis.
+#
+# No initialisation: redis makes its own data directory and writes
+# `dump.rdb` into it, so the whole of "one instance's data" is the
+# directory pando gives it. No Unix socket either — redis creates one
+# only when asked — so nothing here needs `{socket_dir}`.
+#
+# Persistence is left at redis's own defaults rather than turned off: a
+# worktree that is stopped and started again should find what it had,
+# which is the same promise the Postgres recipe makes. SIGTERM makes
+# redis save before it exits, and `stop` sends exactly that.
+kind = "service"
+name = "redis"
+aliases = ["valkey", "cache"]
+summary = "Redis: one instance of this worktree's own, on a port pando allocated"
+binaries = ["redis-server", "redis-cli"]
+version_flag = "--version"
+install = "brew install redis   (or your distribution's redis-server package)"
+notes = "no password, bound to 127.0.0.1 — nothing off this machine can reach it"
+
+[service]
+port_env = "REDIS_URL"
+ready_timeout_s = 30
+
+cmd = "exec redis-server --port {port} --bind 127.0.0.1 --dir {datadir} --daemonize no"
+ready = "redis-cli -h 127.0.0.1 -p {port} ping"

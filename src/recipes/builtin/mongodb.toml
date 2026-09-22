@@ -1,0 +1,33 @@
+# MongoDB.
+#
+# **Untested against a real server.** No machine this was written on had
+# `mongod`, so every line here is from the documentation rather than
+# from a run. `untested = true` is what says so: `doctor` reports it,
+# `start` says it once, and the note below repeats it. That is more
+# honest than not shipping a recipe at all — a developer who has mongod
+# can try it and fix one file — and much more honest than shipping one
+# that looks as proven as the others.
+#
+# `--nounixsocket` rather than a socket directory: mongo does not need
+# one, and not creating it is simpler than keeping it short. Nothing is
+# created either: mongo makes a database on its first write, so there is
+# no `create` step to be idempotent about.
+kind = "service"
+name = "mongodb"
+aliases = ["mongo"]
+summary = "MongoDB: a server of this worktree's own, on a port pando allocated"
+binaries = ["mongod", "mongosh"]
+version_flag = "--version"
+install = "brew install mongodb-community   (from the mongodb/brew tap)"
+notes = "no authentication, bound to 127.0.0.1 — and this recipe has never been run against a real mongod, so treat a failure here as the recipe's fault before your own"
+untested = true
+
+[service]
+port_env = "MONGODB_URI"
+ready_timeout_s = 60
+
+cmd = "exec mongod --dbpath {datadir} --port {port} --bind_ip 127.0.0.1 --nounixsocket"
+
+# `{{ping:1}}` renders to `{ping:1}`: a bare `{ping:1}` is a placeholder
+# to pando's own substitution language, and would be refused as unknown.
+ready = "mongosh --host 127.0.0.1 --port {port} --quiet --eval 'db.adminCommand({{ping: 1}}).ok'"

@@ -1,0 +1,55 @@
+# PostgreSQL.
+#
+# Two things here are not obvious and are both deliberate:
+#
+# - **`-k {socket_dir}`.** Postgres puts its Unix socket inside the data
+#   directory unless told otherwise, and `sun_path` is 104 bytes on
+#   macOS. A project name plus a branch name overflows that, so the
+#   socket goes to a short, hashed path in the temporary directory and
+#   every client here connects over TCP.
+# - **`--auth trust` on `127.0.0.1`.** A development database on a random
+#   high port bound to loopback gets trust authentication, because the
+#   alternative is a password the developer never asked for and cannot
+#   find. `doctor` says so in one line. Anyone who wants a password drops
+#   their own `postgres.toml` in the recipes directory.
+kind = "service"
+name = "postgres"
+aliases = ["postgresql", "pg"]
+summary = "PostgreSQL: a cluster of this worktree's own, on a port pando allocated"
+binaries = ["postgres", "initdb", "pg_isready", "psql", "createdb"]
+version_flag = "--version"
+install = "brew install postgresql@16   (or your distribution's postgresql-server package)"
+notes = "trust authentication on 127.0.0.1 — any password in the URL is accepted, and nothing off this machine can reach it"
+
+[service]
+port_env = "DATABASE_URL"
+ready_timeout_s = 60
+
+# What initdb makes, and so what `{db_user}` and `{db_name}` mean when the
+# app's own URL names neither.
+db_user = "postgres"
+db_name = "postgres"
+
+init = "initdb --pgdata {datadir} --username postgres --auth trust --encoding UTF8 --no-locale"
+
+# `exec`, so the pid pando records is the server's and not a shell that is
+# waiting on it. `listen_addresses` is spelled out because the default,
+# `localhost`, also binds `::1`.
+cmd = "exec postgres -D {datadir} -p {port} -k {socket_dir} -c listen_addresses=127.0.0.1"
+
+# `-U postgres -d postgres`, not because pg_isready authenticates — it
+# does not, and returns 0 either way — but because the connection it opens
+# is refused by name, and a bare probe leaves
+# `FATAL: role "<your login>" does not exist` in the server's own log every
+# time it is asked. A developer reading that log has enough to worry about.
+ready = "pg_isready -h 127.0.0.1 -p {port} -U postgres -d postgres -q"
+
+# Idempotent, and run after every readiness: the role and the database the
+# app's own URL names have to exist, and which ones those are can change
+# without the data directory changing at all. `{db_user}` and `{db_name}`
+# come from the URL pando rewrote, and are `postgres` when there is none —
+# in which case both lines are no-ops, since initdb made them.
+create = '''
+psql -h 127.0.0.1 -p {port} -U postgres -d postgres -v ON_ERROR_STOP=1 -tAc "SELECT 1 FROM pg_roles WHERE rolname = '{db_user}'" | grep -q 1 || psql -h 127.0.0.1 -p {port} -U postgres -d postgres -v ON_ERROR_STOP=1 -c "CREATE ROLE \"{db_user}\" LOGIN SUPERUSER"
+psql -h 127.0.0.1 -p {port} -U postgres -d postgres -v ON_ERROR_STOP=1 -tAc "SELECT 1 FROM pg_database WHERE datname = '{db_name}'" | grep -q 1 || createdb -h 127.0.0.1 -p {port} -U postgres -O "{db_user}" "{db_name}"
+'''

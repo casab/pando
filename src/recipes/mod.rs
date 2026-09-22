@@ -486,184 +486,20 @@ struct RawRecipe {
 
 /// The recipes this build ships, as `(file name, TOML text)`.
 ///
+/// Each one is a file in `src/recipes/builtin/`, written in exactly the
+/// format a developer drops into `~/.pando/recipes/`, and the comment at
+/// the top of each says what in it is deliberate. Adding a built-in is a
+/// file there and a row here.
+///
 /// Three of the four were run against a real server while they were
 /// written; MongoDB was not, because no machine here has `mongod`, and
 /// it says so in its own `untested` field rather than in a comment.
 pub const BUILT_IN: [(&str, &str); 4] = [
-    ("mariadb", MARIADB),
-    ("mongodb", MONGODB),
-    ("postgres", POSTGRES),
-    ("redis", REDIS),
+    ("mariadb", include_str!("builtin/mariadb.toml")),
+    ("mongodb", include_str!("builtin/mongodb.toml")),
+    ("postgres", include_str!("builtin/postgres.toml")),
+    ("redis", include_str!("builtin/redis.toml")),
 ];
-
-/// PostgreSQL.
-///
-/// Two things here are not obvious and are both deliberate:
-///
-/// - **`-k {socket_dir}`.** Postgres puts its Unix socket inside the data
-///   directory unless told otherwise, and `sun_path` is 104 bytes on
-///   macOS. A project name plus a branch name overflows that, so the
-///   socket goes to a short, hashed path in the temporary directory and
-///   every client here connects over TCP.
-/// - **`--auth trust` on `127.0.0.1`.** A development database on a random
-///   high port bound to loopback gets trust authentication, because the
-///   alternative is a password the developer never asked for and cannot
-///   find. `doctor` says so in one line. Anyone who wants a password drops
-///   their own `postgres.toml` in the recipes directory.
-const POSTGRES: &str = r#"
-kind = "service"
-name = "postgres"
-aliases = ["postgresql", "pg"]
-summary = "PostgreSQL: a cluster of this worktree's own, on a port pando allocated"
-binaries = ["postgres", "initdb", "pg_isready", "psql", "createdb"]
-version_flag = "--version"
-install = "brew install postgresql@16   (or your distribution's postgresql-server package)"
-notes = "trust authentication on 127.0.0.1 — any password in the URL is accepted, and nothing off this machine can reach it"
-
-[service]
-port_env = "DATABASE_URL"
-ready_timeout_s = 60
-
-# What initdb makes, and so what `{db_user}` and `{db_name}` mean when the
-# app's own URL names neither.
-db_user = "postgres"
-db_name = "postgres"
-
-init = "initdb --pgdata {datadir} --username postgres --auth trust --encoding UTF8 --no-locale"
-
-# `exec`, so the pid pando records is the server's and not a shell that is
-# waiting on it. `listen_addresses` is spelled out because the default,
-# `localhost`, also binds `::1`.
-cmd = "exec postgres -D {datadir} -p {port} -k {socket_dir} -c listen_addresses=127.0.0.1"
-
-# `-U postgres -d postgres`, not because pg_isready authenticates — it
-# does not, and returns 0 either way — but because the connection it opens
-# is refused by name, and a bare probe leaves
-# `FATAL: role "<your login>" does not exist` in the server's own log every
-# time it is asked. A developer reading that log has enough to worry about.
-ready = "pg_isready -h 127.0.0.1 -p {port} -U postgres -d postgres -q"
-
-# Idempotent, and run after every readiness: the role and the database the
-# app's own URL names have to exist, and which ones those are can change
-# without the data directory changing at all. `{db_user}` and `{db_name}`
-# come from the URL pando rewrote, and are `postgres` when there is none —
-# in which case both lines are no-ops, since initdb made them.
-create = '''
-psql -h 127.0.0.1 -p {port} -U postgres -d postgres -v ON_ERROR_STOP=1 -tAc "SELECT 1 FROM pg_roles WHERE rolname = '{db_user}'" | grep -q 1 || psql -h 127.0.0.1 -p {port} -U postgres -d postgres -v ON_ERROR_STOP=1 -c "CREATE ROLE \"{db_user}\" LOGIN SUPERUSER"
-psql -h 127.0.0.1 -p {port} -U postgres -d postgres -v ON_ERROR_STOP=1 -tAc "SELECT 1 FROM pg_database WHERE datname = '{db_name}'" | grep -q 1 || createdb -h 127.0.0.1 -p {port} -U postgres -O "{db_user}" "{db_name}"
-'''
-"#;
-
-/// Redis.
-///
-/// No initialisation: redis makes its own data directory and writes
-/// `dump.rdb` into it, so the whole of "one instance's data" is the
-/// directory pando gives it. No Unix socket either — redis creates one
-/// only when asked — so nothing here needs `{socket_dir}`.
-///
-/// Persistence is left at redis's own defaults rather than turned off: a
-/// worktree that is stopped and started again should find what it had,
-/// which is the same promise the Postgres recipe makes. SIGTERM makes
-/// redis save before it exits, and `stop` sends exactly that.
-const REDIS: &str = r#"
-kind = "service"
-name = "redis"
-aliases = ["valkey", "cache"]
-summary = "Redis: one instance of this worktree's own, on a port pando allocated"
-binaries = ["redis-server", "redis-cli"]
-version_flag = "--version"
-install = "brew install redis   (or your distribution's redis-server package)"
-notes = "no password, bound to 127.0.0.1 — nothing off this machine can reach it"
-
-[service]
-port_env = "REDIS_URL"
-ready_timeout_s = 30
-
-cmd = "exec redis-server --port {port} --bind 127.0.0.1 --dir {datadir} --daemonize no"
-ready = "redis-cli -h 127.0.0.1 -p {port} ping"
-"#;
-
-/// MariaDB, which is also what `mysql` usually means on a developer's
-/// machine.
-///
-/// Three things here are deliberate:
-///
-/// - **`--socket {socket_dir}/mysql.sock`.** MariaDB's compiled-in socket
-///   path is relative to nothing useful and its default lands beside the
-///   data directory; `sun_path` is 104 bytes, and pando's data directory
-///   path is most of that already. Clients here connect over TCP with
-///   `--protocol=tcp`, which is not the default when a host is given.
-/// - **`--skip-grant-tables`, said out loud.** MariaDB enforces passwords
-///   and a development URL carries one pando has no safe way to set — it
-///   would be spliced into a `CREATE USER … IDENTIFIED BY` statement. So
-///   the grant tables are skipped, which accepts any user and any
-///   password on loopback. The origin tool did this silently; this recipe
-///   says it in `notes`, `doctor` prints it, and anyone who wants real
-///   accounts drops in their own `mariadb.toml`. Unlike MySQL's,
-///   MariaDB's `--skip-grant-tables` does not imply `--skip-networking`,
-///   which is why the binaries below are MariaDB's own by name: the same
-///   flag on `mysqld` would leave nothing to connect to.
-/// - **`create` makes the database and nothing else.** With the grant
-///   tables skipped there is no user to create, and `IF NOT EXISTS` is
-///   what makes it safe to run on every start.
-const MARIADB: &str = r#"
-kind = "service"
-name = "mariadb"
-aliases = ["mysql"]
-summary = "MariaDB: a server of this worktree's own, on a port pando allocated"
-binaries = ["mariadbd", "mariadb", "mariadb-install-db"]
-version_flag = "--version"
-install = "brew install mariadb   (or your distribution's mariadb-server package)"
-notes = "the grant tables are skipped, so any user and any password are accepted on 127.0.0.1 — a development server, and nothing off this machine can reach it"
-
-[service]
-port_env = "DATABASE_URL"
-ready_timeout_s = 60
-
-init = "mariadb-install-db --datadir={datadir} --auth-root-authentication-method=normal"
-
-cmd = "exec mariadbd --datadir={datadir} --port={port} --bind-address=127.0.0.1 --socket={socket_dir}/mysql.sock --skip-grant-tables --skip-name-resolve --pid-file={datadir}/pando.pid"
-
-ready = "mariadb --protocol=tcp -h 127.0.0.1 -P {port} -u root -e 'SELECT 1'"
-
-create = "mariadb --protocol=tcp -h 127.0.0.1 -P {port} -u root -e 'CREATE DATABASE IF NOT EXISTS `{db_name}`'"
-"#;
-
-/// MongoDB.
-///
-/// **Untested against a real server.** No machine this was written on had
-/// `mongod`, so every line here is from the documentation rather than
-/// from a run. `untested = true` is what says so: `doctor` reports it,
-/// `start` says it once, and the note below repeats it. That is more
-/// honest than not shipping a recipe at all — a developer who has mongod
-/// can try it and fix one file — and much more honest than shipping one
-/// that looks as proven as the others.
-///
-/// `--nounixsocket` rather than a socket directory: mongo does not need
-/// one, and not creating it is simpler than keeping it short. Nothing is
-/// created either: mongo makes a database on its first write, so there is
-/// no `create` step to be idempotent about.
-const MONGODB: &str = r#"
-kind = "service"
-name = "mongodb"
-aliases = ["mongo"]
-summary = "MongoDB: a server of this worktree's own, on a port pando allocated"
-binaries = ["mongod", "mongosh"]
-version_flag = "--version"
-install = "brew install mongodb-community   (from the mongodb/brew tap)"
-notes = "no authentication, bound to 127.0.0.1 — and this recipe has never been run against a real mongod, so treat a failure here as the recipe's fault before your own"
-untested = true
-
-[service]
-port_env = "MONGODB_URI"
-ready_timeout_s = 60
-
-cmd = "exec mongod --dbpath {datadir} --port {port} --bind_ip 127.0.0.1 --nounixsocket"
-
-# `{{ping:1}}` renders to `{ping:1}`: a bare `{ping:1}` is a placeholder
-# to pando's own substitution language, and would be refused as unknown.
-ready = "mongosh --host 127.0.0.1 --port {port} --quiet --eval 'db.adminCommand({{ping: 1}}).ok'"
-"#;
 
 #[cfg(test)]
 mod tests {
