@@ -698,6 +698,14 @@ mod tests {
                 Some(expected),
                 "{cmd:?} should have recorded {expected}"
             );
+            // The trap writes the status and *then* the shell finishes
+            // exiting, so the status file appearing does not mean the
+            // process is already reaped. Asserting straight off that race
+            // is a flake under load, which is how this one was found.
+            let gone = Instant::now() + Duration::from_secs(10);
+            while is_alive(r.pid) && Instant::now() < gone {
+                std::thread::sleep(Duration::from_millis(20));
+            }
             assert!(!is_alive(r.pid), "{cmd:?} should be over");
         }
     }
