@@ -69,7 +69,7 @@ asks them. Each has a `proposal`, and its state decides what you do:
 
 | State | Means | You |
 |---|---|---|
-| `"proposal": null` | no rule had anything to say | **do nothing.** There is no question. An answer you send is reported as unused |
+| `"proposal": null` | no rule had anything to say | **do nothing.** There is no question here — with one exception, `prelude`, which is never proposed in `signals` at all. See below |
 | `"decided": true` | a rule settled it | **do nothing.** Same |
 | `"decided": false` | pando will ask | **this is the only one you answer** |
 
@@ -84,11 +84,18 @@ them* — a real answer, and the opposite of `null`.
 
 Three more facts that are not visible in the shape:
 
-- **`prelude` is never proposed by `signals`.** It is the one question
-  about the laptop rather than the repository and it costs a shell probe.
-  It is asked only when the machine does not resolve what the project pins;
-  `doctor`'s `runtime` section is where that evidence lives, with the exact
-  line to set as its `fix`.
+- **`prelude` is never proposed by `signals`** — it reads as
+  `"proposal": null` on every project, answered or not. It is the one
+  question about the laptop rather than the repository and it costs a
+  shell probe, so it is raised at the moment an answer is needed, which
+  means `init` can exit 3 on a slot `signals` showed you nothing for.
+  `doctor`'s `runtime` section is the evidence: what the project pins,
+  what `bash -lc` resolves here, and the exact line that would reconcile
+  them, as the finding's `fix`. That line is the developer's to approve —
+  it runs in front of every command pando spawns for them. Once they have,
+  `{"prelude": "<the line>"}` is how it goes in, and `{"prelude": null}`
+  is "this machine needs nothing". Never install a runtime to make the
+  question go away.
 - **Answering `processes` with the per-app form settles `dev_cmd` and
   `port_env` too** — every app gets its command and its port. Answers you
   sent for those two are then reported as unused, which is correct and not

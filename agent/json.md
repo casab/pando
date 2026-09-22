@@ -39,9 +39,10 @@ Within a version:
 - **`null` means "pando has nothing to say here."** It never means `false`,
   never means zero, and never means an empty list. `"dirty": null` is "git
   could not be asked", which is a different fact from `"dirty": false`.
-- **A key may be absent where it would be `null`.** Treat absent and `null`
-  as the same thing. (`slots[].proposal.candidates[].service.recipe` is the
-  one that does this today.)
+- **A key may be absent where it would be `null` or empty.** Treat absent,
+  `null` and empty as the same thing — `signals` omits
+  `slots[].proposal.candidates[].service.recipe` for a compose service,
+  and the decisions log omits an empty list rather than printing `[]`.
 - Object key **order is not part of the contract**. Array order is: every
   list pando prints is deterministic, and two runs of a read-only command
   print the same bytes.
@@ -336,6 +337,7 @@ including the ones with no agent.
   "wrote": "pnpm dev:web",    // what config says about the slot afterwards
   "evidence": {
     "prompt": "Which command starts the local development server?",
+    // the three below are omitted when they are empty, as everywhere else
     "details": [],            // what the question printed above its options
     "mechanism": null,        // "compose" or "native", at the services question
     "weighed": [],            // and the facts that chose that mechanism
