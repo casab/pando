@@ -1,0 +1,393 @@
+//! `init`: every slot resolved in one pass, and the machine evidence
+//! detection reads.
+
+use anyhow::{Context, Result};
+use chrono::Utc;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use crate::config::{self, Config};
+use crate::detect::{self, Slot};
+use crate::paths::PandoPaths;
+use crate::process as proc;
+
+use super::questions::{Answering, already_answered, resolve_silencing, slot_label};
+// Only for the intra-doc links above `ALL_SLOTS` and `init_dry_run`.
+#[cfg(doc)]
+use super::questions::resolve;
+
+/// Every slot `init` fills: everything `new` needs and everything `start`
+/// needs, in the order the config file reads.
+///
+/// Deliberately the same slots, asked through the same [`resolve`] those
+/// two commands call. `init` is the batch form of the just-in-time
+/// questions, not a second set of them: one implementation of each
+/// question, or the two drift and a developer gets a different config
+/// depending on which command reached the slot first.
+pub const ALL_SLOTS: [Slot; 9] = [
+    Slot::Install,
+    Slot::VersionFiles,
+    Slot::Prelude,
+    // Before the slots that fill a single process, exactly as
+    // `START_SLOTS` orders them: this one decides whether there is one.
+    Slot::Processes,
+    Slot::DevCmd,
+    Slot::PortEnv,
+    // Asked here, unlike on a plain `start`, which silences it: a start
+    // that is not isolating has no business asking about a mode it is not
+    // in, and `init` is the pass where every question is on the table.
+    Slot::Services,
+    Slot::SchemaHook,
+    Slot::Provision,
+];
+
+/// One slot, after `init` has been through it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotSummary {
+    pub slot: Slot,
+    /// The slot in a sentence: "install command", "dev command".
+    pub label: &'static str,
+    /// What config says now, short enough for one line. `None` when
+    /// nothing says anything: a slot no rule found a candidate for and
+    /// nobody answered.
+    pub value: Option<String>,
+    /// Whether this run is what answered it.
+    pub answered_now: bool,
+}
+
+/// What `init` did, and what config says afterwards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitReport {
+    /// The project layer: the file every answer about this project is in.
+    pub config_file: PathBuf,
+    /// The machine-wide file, named only when this run put an answer
+    /// there — the prelude is the one slot that belongs to the laptop.
+    pub user_file: Option<PathBuf>,
+    /// One entry per slot, in the order they were asked.
+    pub slots: Vec<SlotSummary>,
+    /// What loading the written config back had to say.
+    pub warnings: Vec<String>,
+}
+
+impl InitReport {
+    /// Whether this run answered anything at all. A second `init` answers
+    /// nothing, which is the point of writing the first one down.
+    pub fn answered_anything(&self) -> bool {
+        self.slots.iter().any(|s| s.answered_now)
+    }
+}
+
+/// Asks every unanswered question in one pass, writes every answer, and
+/// reports what config holds afterwards.
+///
+/// Starts nothing: it is [`resolve`] over [`ALL_SLOTS`] and a summary. Like
+/// every other answer path it writes inside pando's home and nowhere else.
+pub fn init(
+    paths: &PandoPaths,
+    config: &Config,
+    answers: &Answering<'_>,
+    progress: &dyn Fn(&str),
+) -> Result<InitReport> {
+    let before: Vec<bool> = ALL_SLOTS
+        .iter()
+        .map(|slot| already_answered(*slot, config))
+        .collect();
+    resolve_silencing(paths, config, &ALL_SLOTS, &[], answers, progress)?;
+    // Read back from disk rather than reported from memory. The summary is
+    // then a statement about the file that exists, and a file pando cannot
+    // read again is a failure worth having at the end of `init` rather
+    // than at the start of whatever the developer runs next.
+    let loaded = config::load(paths)?;
+    Ok(init_report(paths, &loaded, &before))
+}
+
+/// [`init`], against a copy of the files it would write.
+///
+/// Returns the report and the files as they would be, each with the path
+/// it would really land at. The same pass, the same resolver and the same
+/// renderer: a preview that re-implemented the writing would be a preview
+/// of something else.
+///
+/// The copies live in a scratch directory under pando's **own home**,
+/// which is one of the three places Invariant 1 names — a preview is not
+/// a reason to add a fourth — and it is removed before this returns.
+pub fn init_dry_run(
+    paths: &PandoPaths,
+    config: &Config,
+    answers: &Answering<'_>,
+    progress: &dyn Fn(&str),
+) -> Result<(InitReport, Vec<(PathBuf, String)>)> {
+    let scratch = Scratch::new(paths)?;
+    let previewed = PandoPaths::new(scratch.dir.clone(), paths.project.clone());
+    // What pando has already written for this project and this machine, so
+    // the preview edits the real file rather than one that starts empty:
+    // the answer it adds lands among the developer's own keys and
+    // comments, exactly where it would.
+    let files = [
+        (paths.config_file(), previewed.config_file()),
+        (paths.user_config_file(), previewed.user_config_file()),
+    ];
+    for (from, to) in &files {
+        let Ok(text) = std::fs::read_to_string(from) else {
+            continue;
+        };
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+        std::fs::write(to, text).with_context(|| format!("write {}", to.display()))?;
+    }
+    let report = init(&previewed, config, answers, progress)?;
+    // Only the files this pass would *change*. A machine-wide config the
+    // run never touched is not part of the answer to "what would you
+    // write", and printing it back is noise in front of the thing that is.
+    let rendered: Vec<(PathBuf, String)> = files
+        .iter()
+        .filter_map(|(real, preview)| {
+            let body = std::fs::read_to_string(preview).ok()?;
+            let before = std::fs::read_to_string(real).ok();
+            (before.as_deref() != Some(body.as_str())).then(|| (real.clone(), body))
+        })
+        .collect();
+    Ok((
+        InitReport {
+            // Named as the files it would really write, not the copies it
+            // wrote instead.
+            config_file: paths.config_file(),
+            user_file: report.user_file.map(|_| paths.user_config_file()),
+            ..report
+        },
+        rendered,
+    ))
+}
+
+/// A throwaway pando home, removed when it goes out of scope — including
+/// when the pass it was made for failed partway through.
+struct Scratch {
+    dir: PathBuf,
+}
+
+impl Scratch {
+    fn new(paths: &PandoPaths) -> Result<Scratch> {
+        // Through the one function that makes the home 0700 and refuses it
+        // inside the repository, rather than beside it with a `create_dir`
+        // that knows neither rule.
+        paths.ensure_home()?;
+        let dir = paths.home.join("preview").join(format!(
+            "{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        Ok(Scratch { dir })
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+        // And the directory they all share, once the last one has gone:
+        // `remove_dir` only succeeds on an empty one, so a preview running
+        // beside this one keeps it.
+        if let Some(parent) = self.dir.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
+}
+
+fn init_report(paths: &PandoPaths, loaded: &config::Loaded, before: &[bool]) -> InitReport {
+    let slots: Vec<SlotSummary> = ALL_SLOTS
+        .iter()
+        .enumerate()
+        .map(|(i, slot)| SlotSummary {
+            slot: *slot,
+            label: slot_label(*slot),
+            value: slot_value(&loaded.config, *slot),
+            answered_now: !before[i] && already_answered(*slot, &loaded.config),
+        })
+        .collect();
+    let user_file = slots
+        .iter()
+        .any(|s| s.answered_now && s.slot.layer() == config::Layer::User)
+        .then(|| paths.user_config_file());
+    InitReport {
+        config_file: paths.config_file(),
+        user_file,
+        slots,
+        warnings: loaded.warnings.clone(),
+    }
+}
+
+/// What config says about one slot, in the fewest words that are still
+/// true. A line for a human to read; nothing parses it back.
+pub(super) fn slot_value(config: &Config, slot: Slot) -> Option<String> {
+    match slot {
+        Slot::Install => config.project.install.clone(),
+        Slot::VersionFiles => (!config.runtime.version_files.is_empty())
+            .then(|| config.runtime.version_files.join(", ")),
+        // The empty prelude is an answer — "this machine needs nothing" —
+        // and an empty cell would read as no answer at all.
+        Slot::Prelude => config
+            .runtime
+            .prelude
+            .as_ref()
+            .map(|line| match line.trim().is_empty() {
+                true => "nothing in front of this project's commands".to_string(),
+                false => line.clone(),
+            }),
+        Slot::Processes => (!config.processes.is_empty()).then(|| {
+            config
+                .processes
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        }),
+        Slot::DevCmd => config
+            .processes
+            .get(detect::DEV)
+            .map(|process| process.cmd.clone())
+            .filter(|cmd| !cmd.trim().is_empty()),
+        Slot::PortEnv => config
+            .processes
+            .get(detect::DEV)
+            .and_then(|process| process.ports.as_ref())
+            .map(ports_summary),
+        Slot::Services => services_summary(config),
+        // The command, with the name of the hook that runs it: the label
+        // says "schema command", and a bare `migrate` is the tab it logs
+        // to rather than the thing it does.
+        Slot::SchemaHook => (!config.hooks.is_empty()).then(|| {
+            config
+                .hooks
+                .iter()
+                .map(|hook| format!("{}: {}", hook.name, hook.cmd))
+                .collect::<Vec<_>>()
+                .join("; ")
+        }),
+        // `[]` is an answer here too: no worktree needs a local file of
+        // this developer's.
+        Slot::Provision => config
+            .project
+            .provision
+            .as_ref()
+            .map(|paths| match paths.is_empty() {
+                true => "none".to_string(),
+                false => paths.join(", "),
+            }),
+    }
+}
+
+fn ports_summary(ports: &config::PortsSpec) -> String {
+    match ports {
+        config::PortsSpec::Map(map) if !map.is_empty() => map
+            .iter()
+            .map(|(var, role)| format!("{var} = {role}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        config::PortsSpec::List(roles) if !roles.is_empty() => roles.join(", "),
+        // Both empty forms mean the same thing, and it is an answer.
+        _ => "no ports".to_string(),
+    }
+}
+
+/// The services a worktree would run private copies of. `none` when an
+/// entry exists and includes nothing, which is the written-down answer
+/// "none of them"; `None` when no entry exists at all.
+fn services_summary(config: &Config) -> Option<String> {
+    if config.services.is_empty() {
+        return None;
+    }
+    let mut names: Vec<String> = Vec::new();
+    for service in &config.services {
+        match service {
+            config::ServiceConfig::Compose { include, .. } => names.extend(include.iter().cloned()),
+            config::ServiceConfig::Native { name, .. } => names.push(name.clone()),
+        }
+    }
+    Some(match names.is_empty() {
+        true => "none".to_string(),
+        false => names.join(", "),
+    })
+}
+
+/// What this machine can run, probed through the shell a real spawn uses.
+///
+/// One `bash -lc` for every engine and for docker at once, and only when
+/// the services slot is still unanswered — a project that has already
+/// said what it runs is not asking this question, and a start is not the
+/// place to pay for an answer nobody wanted.
+///
+/// A probe that cannot run leaves the evidence `unknown`, which is not
+/// the same as "nothing is installed": a decision made from a failed
+/// probe would be a guess wearing evidence's clothes.
+pub fn machine_evidence(
+    paths: &PandoPaths,
+    recipes: &crate::recipes::Recipes,
+) -> detect::MachineEvidence {
+    let (script, names) = machine_evidence_script(paths, recipes);
+    let root = paths.root();
+    let Ok(captured) = proc::run_captured(&script, root, &[], EVIDENCE_TIMEOUT) else {
+        return detect::MachineEvidence::unknown();
+    };
+    machine_evidence_from(&captured.stdout, &names)
+}
+
+/// The one script both probes run, and the recipe names it answers for.
+///
+/// Shared so that what `doctor` reports and what the start path decides
+/// from cannot drift: `doctor` asks the shell it was given, the start
+/// path asks the shell a real spawn uses, and both read the same lines.
+pub fn machine_evidence_script(
+    paths: &PandoPaths,
+    recipes: &crate::recipes::Recipes,
+) -> (String, Vec<String>) {
+    use std::fmt::Write as _;
+    let mut script = String::new();
+    // The same PATH a recipe command gets, and for the same reason: a
+    // shim in pando's own `bin` is what the adapter will run, so it is
+    // what the evidence has to be about. Without this the report and the
+    // start path could disagree about whether an engine is there at all.
+    let _ = writeln!(
+        script,
+        "export PATH={}:\"$PATH\"",
+        proc::shell_quote(&paths.home.join("bin").display().to_string())
+    );
+    let _ = writeln!(script, "command -v docker >/dev/null 2>&1 && echo docker");
+    let mut names: Vec<String> = Vec::new();
+    for (name, loaded) in recipes.entries() {
+        let Some(_) = loaded.recipe.service() else {
+            continue;
+        };
+        if loaded.recipe.binaries.is_empty() {
+            continue;
+        }
+        let checks: Vec<String> = loaded
+            .recipe
+            .binaries
+            .iter()
+            .map(|b| format!("command -v {} >/dev/null 2>&1", proc::shell_quote(b)))
+            .collect();
+        let _ = writeln!(script, "{} && echo {name}", checks.join(" && "));
+        names.push(name.to_string());
+    }
+    (script, names)
+}
+
+/// What the probe's output means.
+pub fn machine_evidence_from(stdout: &str, names: &[String]) -> detect::MachineEvidence {
+    let found: Vec<&str> = stdout.lines().map(str::trim).collect();
+    detect::MachineEvidence {
+        probed: true,
+        docker: found.contains(&"docker"),
+        engines: names
+            .iter()
+            .map(|name| (name.clone(), found.contains(&name.as_str())))
+            .collect(),
+    }
+}
+
+/// How long the machine probe gets. It is one login shell asking
+/// `command -v` a dozen times, which is fast; the budget is for a shell
+/// whose profile is slow, not for the lookups.
+const EVIDENCE_TIMEOUT: Duration = Duration::from_secs(20);

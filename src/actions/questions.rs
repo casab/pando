@@ -1,0 +1,1080 @@
+//! Questions: what pando asks when it cannot work something out, and how
+//! the answer is written to `pando.toml`.
+
+use anyhow::{Context, Result, bail};
+use std::path::Path;
+
+use crate::config::{self, Config};
+use crate::decisions;
+use crate::detect::{self, Slot};
+use crate::paths::PandoPaths;
+use crate::services;
+
+use super::init::{machine_evidence, slot_value};
+use super::lifecycle::Mode;
+use super::runtime::{
+    Machine, RuntimeOutcome, answer_prelude, resolve_runtime, runtime_shell, user_home,
+};
+
+/// Something pando needs to know and cannot work out on its own.
+///
+/// Asked at the moment the answer is needed, answered once, and written to
+/// `pando.toml` so it is never asked again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Question {
+    pub slot: Slot,
+    pub prompt: String,
+    /// Each option as its value and the signal that found it, in rule order.
+    pub options: Vec<(String, String)>,
+    /// The option the rules put first. `None` when they found nothing, in
+    /// which case only a typed answer will do.
+    pub preselect: Option<usize>,
+    /// Whether a command typed by hand is acceptable. Always true in this
+    /// phase: every slot accepts a shell command, so there is no dead end.
+    pub allow_custom: bool,
+    /// Whether "this process has none" is an answer. True for the port
+    /// question: a worker or a watcher really has no port, and that has to
+    /// be sayable, or the question comes back on every start. True for the
+    /// services question too, where it means "none of them".
+    pub allow_none: bool,
+    /// Whether the answer is a *set* of the options rather than one of
+    /// them: which services this project runs private copies of.
+    pub multi: bool,
+    /// For a multi-select question, the options that start ticked.
+    pub checked: Vec<usize>,
+    /// The report a question needs to be answerable: what the project
+    /// asks for, what this machine answered, and where from. Printed
+    /// above the options by every front end, and carried on the question
+    /// rather than narrated separately so the exit-3 render has it too.
+    pub details: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Answer {
+    Choice(usize),
+    /// The first option, taken because `--yes` was passed rather than
+    /// because anyone chose it. Written down as exactly that: a config that
+    /// claims a rule decided something a flag decided is a config nobody
+    /// can review.
+    Auto(usize),
+    Custom(String),
+    /// Several of the options, for a question whose answer is a set: which
+    /// of the compose file's services this project runs private copies of.
+    Many(Vec<usize>),
+    /// "This process has none of those." Only offered where a question has
+    /// an empty answer that means something: the port, and the empty set
+    /// at the services question.
+    None,
+    /// One of the shapes above, from a program rather than a person:
+    /// `init --answers`.
+    ///
+    /// A wrapper rather than four more variants, so the shapes stay four
+    /// and the one thing that differs — the note written beside the key —
+    /// is decided in one place. [`answered_by`] peels it before anything
+    /// matches on what is inside.
+    Program(Box<Answer>),
+}
+
+/// How a front end asks. The CLI prompts on a terminal and refuses
+/// elsewhere; the TUI opens a modal; a test hands back a scripted answer.
+pub type Ask<'a> = &'a dyn Fn(&Question) -> Result<Answer>;
+
+/// An answer a caller already has in hand, for a question nobody is going
+/// to be asked.
+///
+/// Deliberately not an [`Ask`]. A question is something a front end *puts*
+/// to somebody, and there is nobody to put this one to: the rules proposed
+/// nothing, so there are no options and no preselection, and a terminal
+/// that prompted here would be asking a developer to invent a command out
+/// of nothing on every project pando has no guess for. A program reading
+/// its own file is the one answerer that can have something to say.
+pub type Volunteered<'a> = &'a dyn Fn(&Question) -> Option<Result<Answer>>;
+
+/// Where one resolution pass gets its answers.
+pub struct Answering<'a> {
+    /// What a front end puts to somebody.
+    pub ask: Ask<'a>,
+    /// What a program supplies for a slot no rule proposed anything for —
+    /// and, by its presence, the fact that a program rather than a person
+    /// is driving this pass at all.
+    pub program: Option<Volunteered<'a>>,
+}
+
+impl<'a> Answering<'a> {
+    /// A pass with a person behind it: nothing is volunteered, and a slot
+    /// the rules are silent about stays silent.
+    pub fn asking(ask: Ask<'a>) -> Answering<'a> {
+        Answering { ask, program: None }
+    }
+
+    /// A pass a program is driving, with its own answers to fall back on.
+    pub fn by_program(ask: Ask<'a>, program: Volunteered<'a>) -> Answering<'a> {
+        Answering {
+            ask,
+            program: Some(program),
+        }
+    }
+}
+
+/// The error every front end turns into exit code 3.
+///
+/// A question is not a failure, and an agent has to be able to tell them
+/// apart without reading English.
+#[derive(Debug, Clone)]
+pub struct NeedsAnswer {
+    pub question: Question,
+}
+
+impl std::fmt::Display for NeedsAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.question.prompt)
+    }
+}
+
+impl std::error::Error for NeedsAnswer {}
+
+/// Who answered, for the comment written beside the key it fills.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Answerer {
+    Human,
+    Program,
+}
+
+impl Answerer {
+    /// The note for this answer: what a person choosing or typing it
+    /// earns, or the one that says a program did.
+    pub(super) fn note(self, human: config::Note) -> config::Note {
+        match self {
+            Answerer::Human => human,
+            Answerer::Program => config::Note::Program,
+        }
+    }
+}
+
+/// Peels [`Answer::Program`] off the shape underneath it, so one match
+/// handles the four shapes and the provenance is decided once.
+/// A program's answer, held until the answer is actually on disk.
+///
+/// The record says what config says *afterwards*, so it cannot be written
+/// at the moment the answer arrives: an answer that is refused a moment
+/// later by [`refuse_unloadable`] never happened, and a log that claims
+/// otherwise is worse than no log.
+pub(super) struct Pending {
+    slot: Slot,
+    answer: serde_json::Value,
+    shape: decisions::Shape,
+    evidence: decisions::Evidence,
+}
+
+/// What a program answered, in the shape an answers file would have sent.
+///
+/// `None` for every other answerer. A person's answer is not this file's
+/// business — the rules are not being asked to learn from it — and
+/// neither is `--yes`, which took what the rules already preferred.
+pub(super) fn pending_decision(
+    question: &Question,
+    proposal: &detect::Proposal,
+    answer: &Answer,
+    by: Answerer,
+) -> Option<Pending> {
+    if by != Answerer::Program {
+        return None;
+    }
+    // By value, exactly as the answers file names it, so the log can be
+    // turned back into one.
+    let option = |index: usize| {
+        question
+            .options
+            .get(index)
+            .map(|(value, _)| value.clone())
+            .unwrap_or_default()
+    };
+    let (answer, shape) = match answer {
+        Answer::Choice(index) => (
+            serde_json::Value::String(option(*index)),
+            decisions::Shape::Choice,
+        ),
+        Answer::Custom(text) => (
+            serde_json::Value::String(text.trim().to_string()),
+            decisions::Shape::Custom,
+        ),
+        Answer::Many(indexes) => (
+            serde_json::Value::Array(
+                indexes
+                    .iter()
+                    .map(|index| serde_json::Value::String(option(*index)))
+                    .collect(),
+            ),
+            decisions::Shape::Set,
+        ),
+        Answer::None => (serde_json::Value::Null, decisions::Shape::None),
+        // `--yes` never reaches here, and every wrapper is peeled before
+        // this is called.
+        Answer::Auto(_) | Answer::Program(_) => return None,
+    };
+    Some(Pending {
+        slot: question.slot,
+        answer,
+        shape,
+        evidence: decisions::Evidence {
+            prompt: question.prompt.clone(),
+            details: question.details.clone(),
+            mechanism: proposal.mechanism.map(str::to_string),
+            weighed: proposal.evidence.clone(),
+            preferred: question.preselect,
+            // The candidates rather than the question's options, because
+            // the two are the same list and only one of them carries why
+            // an option was preselected and whether a flag was allowed to
+            // take it.
+            options: proposal
+                .candidates
+                .iter()
+                .map(|c| decisions::Opt {
+                    value: c.value.clone(),
+                    why: c.why.clone(),
+                    preselected: c.preselected,
+                    needs_a_human: c.needs_a_human,
+                })
+                .collect(),
+        },
+    })
+}
+
+/// Writes one pending decision down, now that its answer is on disk.
+///
+/// `wrote` is read back through [`config::load`] rather than taken from
+/// the config in hand: a later run compares against what it computes from
+/// the file, and recording anything else is a false override waiting to
+/// happen.
+///
+/// Never fatal. A corpus that costs somebody their `init` is one nobody
+/// will leave switched on.
+fn record_decision(paths: &PandoPaths, pending: Option<Pending>, progress: &dyn Fn(&str)) {
+    let Some(pending) = pending else { return };
+    let wrote = config::load(paths)
+        .ok()
+        .and_then(|loaded| slot_value(&loaded.config, pending.slot));
+    let entry = decisions::Entry::answered(
+        pending.slot,
+        pending.answer,
+        pending.shape,
+        wrote,
+        pending.evidence,
+    );
+    if let Err(e) = decisions::append(paths, &entry) {
+        progress(&format!(
+            "could not record the answer to the {} question: {e:#}",
+            slot_label(pending.slot)
+        ));
+    }
+}
+
+pub(super) fn answered_by(answer: Answer) -> (Answer, Answerer) {
+    let mut answer = answer;
+    let mut by = Answerer::Human;
+    while let Answer::Program(inner) = answer {
+        by = Answerer::Program;
+        answer = *inner;
+    }
+    (answer, by)
+}
+
+/// The slots `new` fills: what to install, what pins the runtime, and which
+/// local files a worktree needs a copy of.
+pub const NEW_SLOTS: [Slot; 3] = [Slot::Install, Slot::VersionFiles, Slot::Provision];
+
+/// The slots `start` fills: how many processes there are, then the dev
+/// process and how it takes its port, then the schema step. `Processes`
+/// first, because the answer to it decides whether the others have
+/// anything left to ask.
+///
+/// `Services` is in the list on every start, because a project whose
+/// services a rule resolved outright should have them in config — that is
+/// what the shared-mode health chips read. It is in [`SILENT_UNLESS_ISOLATED`]
+/// too, so on a plain start it is only ever *taken*, never *asked*:
+/// "which services do you want private copies of?" is a question about a
+/// mode this start is not in.
+pub const START_SLOTS: [Slot; 6] = [
+    // First, and before anything is spawned: a process started under the
+    // wrong runtime dies of it, and the point of asking is to not start
+    // it.
+    Slot::Prelude,
+    Slot::Processes,
+    Slot::DevCmd,
+    Slot::PortEnv,
+    Slot::Services,
+    Slot::SchemaHook,
+];
+
+/// Slots a start that is not isolating may accept but must not ask about.
+const SILENT_UNLESS_ISOLATED: [Slot; 1] = [Slot::Services];
+
+/// Fills the dev process from detection when config has none.
+pub fn resolve_process(
+    paths: &PandoPaths,
+    config: &Config,
+    mode: Mode,
+    ask: Ask<'_>,
+    progress: &dyn Fn(&str),
+) -> Result<Config> {
+    // Only a start that is isolating may *ask* which services to run
+    // private copies of. `--shared` is a start that is putting them away,
+    // which is no more a reason to ask than a plain one.
+    let silent: &[Slot] = if mode == Mode::Isolated {
+        &[]
+    } else {
+        &SILENT_UNLESS_ISOLATED
+    };
+    resolve_silencing(
+        paths,
+        config,
+        &START_SLOTS,
+        silent,
+        &Answering::asking(ask),
+        progress,
+    )
+}
+
+/// Fills what `new` needs before it creates anything.
+pub fn resolve_for_new(
+    paths: &PandoPaths,
+    config: &Config,
+    ask: Ask<'_>,
+    progress: &dyn Fn(&str),
+) -> Result<Config> {
+    resolve(paths, config, &NEW_SLOTS, ask, progress)
+}
+
+/// Detects, asks where it has to, and writes every answer to `pando.toml`.
+///
+/// Returns the config with the answers applied, so the caller does not have
+/// to re-read the file it just wrote.
+pub fn resolve(
+    paths: &PandoPaths,
+    config: &Config,
+    slots: &[Slot],
+    ask: Ask<'_>,
+    progress: &dyn Fn(&str),
+) -> Result<Config> {
+    resolve_silencing(paths, config, slots, &[], &Answering::asking(ask), progress)
+}
+
+/// [`resolve`], with slots that may be *taken* when the rules decided them
+/// and must never be *asked* about.
+///
+/// One case so far: the services question is about isolation, and a start
+/// that is not isolating has no business asking it — but a project whose
+/// services the rules resolved outright should still get them written
+/// down, because that is what shared mode reads to show whether the
+/// global database is up.
+pub fn resolve_silencing(
+    paths: &PandoPaths,
+    config: &Config,
+    slots: &[Slot],
+    silent: &[Slot],
+    answers: &Answering<'_>,
+    progress: &dyn Fn(&str),
+) -> Result<Config> {
+    let shell = runtime_shell(paths.root());
+    let machine = Machine {
+        shell: &shell,
+        home: user_home(),
+    };
+    resolve_on(paths, config, slots, silent, answers, progress, &machine)
+}
+
+/// [`resolve_silencing`] with the machine injected, so a test can answer
+/// for a laptop it does not have.
+pub fn resolve_on(
+    paths: &PandoPaths,
+    config: &Config,
+    slots: &[Slot],
+    silent: &[Slot],
+    answers: &Answering<'_>,
+    progress: &dyn Fn(&str),
+    machine: &Machine<'_>,
+) -> Result<Config> {
+    let ask = answers.ask;
+    let mut config = config.clone();
+    // First, and before the early return below: the commonest shape for a
+    // developer changing an answer a program wrote is a project where
+    // every slot is answered already, and nothing else in a run like that
+    // looks at config twice.
+    for slot in decisions::note_overrides(paths, &|slot| slot_value(&config, slot), progress) {
+        progress(&format!(
+            "{}: this is not what a program answered any more — recorded in {}",
+            slot_label(slot),
+            paths.decisions_file().display()
+        ));
+    }
+    // Before the early return, and not inside the slot loop: a prelude
+    // that is already set reads as an answered slot, and "the prelude is
+    // set and still does not work" is exactly the case worth reporting.
+    // It is also read-only unless it has something to say, so a project
+    // that pins nothing pays one directory read for it.
+    let runtime = if slots.contains(&Slot::Prelude) {
+        resolve_runtime(paths, &config, machine)?
+    } else {
+        RuntimeOutcome::Fine
+    };
+    let mut prelude_details: Vec<String> = Vec::new();
+    let mut prelude_proposal: Option<detect::Proposal> = None;
+    match runtime {
+        // The prelude is not working, and only the developer can say what
+        // should replace it. Nothing is spawned, which is the point.
+        RuntimeOutcome::Broken(report) => bail!("{report}"),
+        RuntimeOutcome::Ask { proposal, report } => {
+            prelude_details = report;
+            prelude_proposal = Some(proposal);
+        }
+        RuntimeOutcome::Fine => {}
+    }
+    if prelude_proposal.is_none() && slots.iter().all(|slot| already_answered(*slot, &config)) {
+        return Ok(config);
+    }
+    let signals = detect::signals(paths.root());
+    // Only ever called for a compose file pando's own reader could not
+    // follow — `extends:` or a top-level `include:` — so a plain project
+    // costs no process spawn. `config` prints; it creates nothing.
+    let program = services::docker_program(paths);
+    let resolve = |file: &Path| -> Option<crate::compose::ComposeFile> {
+        let dir = file.parent()?;
+        services::Compose::new(
+            &program,
+            crate::compose::project_name(paths.project_id(), "detect"),
+            vec![file.to_path_buf()],
+            dir,
+        )
+        .config()
+        .ok()
+    };
+    // Only when something is still unanswered about the services: the
+    // probe is a login shell, and a project that has already said what it
+    // runs is not asking this question.
+    let recipes = crate::recipes::Recipes::load(&paths.recipes_dir());
+    // …and only for a start that could act on the answer. A plain
+    // `start` never asks which services to run private copies of — see
+    // `SILENT_UNLESS_ISOLATED` — so paying for a login shell to find out
+    // what this machine has would be a cost with no question behind it.
+    let asking_about_services =
+        !already_answered(Slot::Services, &config) && !silent.contains(&Slot::Services);
+    let evidence = match asking_about_services {
+        true => machine_evidence(paths, &recipes),
+        false => detect::MachineEvidence::unknown(),
+    };
+    let mut proposals = detect::propose_with(
+        paths.root(),
+        &signals,
+        Some(&resolve),
+        &evidence,
+        config.isolation.preferred(),
+    );
+    // The one proposal that is not tier 1: it took a probe to find, and it
+    // is about this machine rather than this repository. It goes through
+    // the same loop as every other slot from here on.
+    proposals.extend(prelude_proposal);
+    // Asked of the config as it was loaded: once detection has written
+    // `[dev].cmd`, the file is indistinguishable from one a developer
+    // wrote by hand, and a `[dev]` they wrote is an answer about its ports
+    // too. The only thing that changes it mid-run is an answer to the
+    // shape question itself.
+    let mut may_fill_dev = detect::may_fill_dev(&config);
+
+    for slot in slots {
+        if matches!(slot, Slot::DevCmd | Slot::PortEnv) && !may_fill_dev {
+            continue;
+        }
+        // Just in time, and once: a slot the developer has already filled
+        // in, by hand or by answering before, is never asked about again —
+        // and a config that declares its processes has answered every
+        // question about them, including the ones detection could only
+        // write into `[dev]`.
+        //
+        // Re-read from `config` on every pass, because an earlier slot in
+        // this same run may have answered a later one: taking the
+        // per-app form settles the dev command and its ports with it.
+        if already_answered(*slot, &config) || !detect::still_needed(*slot, &config) {
+            continue;
+        }
+        let Some(proposal) = proposals.iter().find(|p| p.slot == *slot) else {
+            // No rule had anything to say. There is nobody to ask — but a
+            // program driving this pass may still have an answer for it.
+            if volunteer(paths, &mut config, *slot, answers, progress)? && *slot == Slot::Processes
+            {
+                may_fill_dev = detect::fills_one_dev_process(&config);
+            }
+            continue;
+        };
+        if !proposal.decided && silent.contains(slot) {
+            continue;
+        }
+        // The one slot whose answer is about the machine. It is written
+        // to a different file, and it is verified before it is written,
+        // which is two reasons not to run it through the generic path.
+        if *slot == Slot::Prelude {
+            let pending =
+                answer_prelude(paths, &mut config, proposal, &prelude_details, ask, machine)?;
+            record_decision(paths, pending, progress);
+            continue;
+        }
+        // What a program answered, if it was a program: filled where the
+        // question is asked, written down where the answer lands on disk.
+        let mut pending: Option<Pending> = None;
+        // The one slot whose answer is a set. It never takes the
+        // single-candidate path below, because "these three" is not one of
+        // the options — it is a subset of them.
+        if slot.is_multi() {
+            let (chosen, note): (Vec<detect::Candidate>, config::Note) = if proposal.decided {
+                let taken: Vec<detect::Candidate> =
+                    proposal.preferred_set().into_iter().cloned().collect();
+                // With nothing taken the reason is the proposal's own: a
+                // rule settled the slot with the empty answer, and there is
+                // no candidate left to read a `why` off.
+                let why = taken
+                    .first()
+                    .map(|c| c.why.clone())
+                    .or_else(|| proposal.none_because.clone())
+                    .unwrap_or_default();
+                if taken.is_empty() {
+                    // Every guess is visible, the empty one included: this
+                    // is pando saying it looked at the compose file and
+                    // found nothing in it to run a private copy of.
+                    progress(&format!(
+                        "this project has no services to run private copies of (detected: {why})"
+                    ));
+                } else {
+                    // Not "running private copies of": a start that is not
+                    // isolating runs none, and this line is written on
+                    // every start that fills the slot.
+                    progress(&format!(
+                        "using {} as this project's services (detected: {why})",
+                        taken
+                            .iter()
+                            .map(|c| c.value.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    ));
+                }
+                (taken, config::Note::Detected(why))
+            } else {
+                let question = question_for(proposal, &[]);
+                let offered = question.options.len();
+                let (answer, by) = answered_by(ask(&question)?);
+                pending = pending_decision(&question, proposal, &answer, by);
+                match answer {
+                    Answer::Many(indexes) => (
+                        indexes
+                            .iter()
+                            .map(|index| pick(proposal, *index))
+                            .collect::<Result<Vec<_>>>()?,
+                        by.note(config::Note::Answered),
+                    ),
+                    // `--yes`. Written down as what it is: a flag took the
+                    // options the rules had resolved. A config that claims
+                    // a human chose them is one nobody can review.
+                    Answer::Auto(_) => {
+                        let taken: Vec<detect::Candidate> =
+                            proposal.preferred_set().into_iter().cloned().collect();
+                        let note = config::Note::TookRuled {
+                            taken: taken.len(),
+                            offered,
+                        };
+                        (taken, note)
+                    }
+                    Answer::None => (Vec::new(), by.note(config::Note::Answered)),
+                    _ => bail!(
+                        "{} is answered with a set of the {offered} options",
+                        slot_label(*slot)
+                    ),
+                }
+            };
+            apply_service_answer(paths, &mut config, proposal, &chosen, note)?;
+            record_decision(paths, pending, progress);
+            continue;
+        }
+        let candidate = if proposal.decided {
+            let candidate = proposal
+                .preferred()
+                .expect("a decided proposal has a candidate")
+                .clone();
+            // Every guess is visible: a one-line notice now, and a comment
+            // in the file afterwards.
+            progress(&format!(
+                "using {:?} for {} (detected: {})",
+                candidate.value,
+                slot_label(*slot),
+                candidate.why
+            ));
+            let why = candidate.why.clone();
+            (candidate, config::Note::Detected(why))
+        } else {
+            let question = question_for(proposal, &[]);
+            let offered = question.options.len();
+            let (answer, by) = answered_by(ask(&question)?);
+            pending = pending_decision(&question, proposal, &answer, by);
+            match answer {
+                Answer::Choice(index) => {
+                    let candidate = pick(proposal, index)?;
+                    let why = candidate.why.clone();
+                    (candidate, by.note(config::Note::Detected(why)))
+                }
+                Answer::Auto(index) => (pick(proposal, index)?, config::Note::TookFirst(offered)),
+                Answer::Custom(value) => (
+                    detect::custom(*slot, value.trim()),
+                    by.note(config::Note::Answered),
+                ),
+                // Only the multi-select slot has a set for an answer, and
+                // it never reaches here.
+                Answer::Many(_) => bail!(
+                    "{} takes one of its {offered} options, not several",
+                    slot_label(*slot)
+                ),
+                // Written down as an empty list rather than left out:
+                // "this process has no ports" and "no worktree needs a
+                // local file of mine" both have to be tellable from
+                // "nobody has said yet", or the question returns on every
+                // run with nowhere to put the answer but the TOML by hand.
+                Answer::None if matches!(*slot, Slot::PortEnv | Slot::Provision) => {
+                    write_empty_answer(
+                        paths,
+                        &mut config,
+                        *slot,
+                        by.note(config::Note::Answered),
+                        pending,
+                        progress,
+                    )?;
+                    continue;
+                }
+                Answer::None => bail!("{} has no \"none\" answer", slot_label(*slot)),
+                Answer::Program(_) => unreachable!("answered_by peels every wrapper"),
+            }
+        };
+        let (candidate, note) = candidate;
+        write_answer(
+            paths,
+            &mut config,
+            *slot,
+            &candidate,
+            note,
+            pending,
+            progress,
+        )?;
+        if *slot == Slot::Processes {
+            // The answer decided the shape. The per-app form leaves the
+            // single-process slots nothing to fill; the root-script form
+            // leaves them the port.
+            may_fill_dev = detect::fills_one_dev_process(&config);
+        }
+    }
+    Ok(config)
+}
+
+/// Writes one single-value answer: checks it loads, patches its keys, and
+/// records what a program decided.
+///
+/// One implementation, because there are two callers — the question loop
+/// and [`volunteer`] — and an answer written twice in two ways is an
+/// answer that means two things.
+fn write_answer(
+    paths: &PandoPaths,
+    config: &mut Config,
+    slot: Slot,
+    candidate: &detect::Candidate,
+    note: config::Note,
+    pending: Option<Pending>,
+    progress: &dyn Fn(&str),
+) -> Result<()> {
+    if candidate.value.trim().is_empty() {
+        bail!("an empty answer is not a {}", slot_label(slot));
+    }
+    // Before a single key is written: an answer that would make the
+    // merged config refuse to load is refused now, while nothing is on
+    // disk, instead of at the next load with half a project broken.
+    let mut proposed = config.clone();
+    detect::apply(slot, candidate, &mut proposed);
+    refuse_unloadable(paths, slot, &candidate.value, &proposed)?;
+    // A slot whose answer is a whole `[[table]]` entry: appended, with
+    // the note on the entry's own header rather than on each key.
+    if let Some((array, entries)) = detect::array_edits(slot, &[candidate]) {
+        config::set_detected_array_entry(paths, slot.layer(), array, entries, note)?;
+        detect::apply(slot, candidate, config);
+        record_decision(paths, pending, progress);
+        return Ok(());
+    }
+    let edits = detect::edits(slot, candidate);
+    if slot == Slot::Processes {
+        // A whole process table is one answer to one question, so the
+        // note goes on the table's header rather than on each of its
+        // five keys.
+        for (table, entries) in group_by_table(edits) {
+            let table: Vec<&str> = table.iter().map(String::as_str).collect();
+            config::set_detected_table(paths, slot.layer(), &table, entries, note.clone())?;
+        }
+    } else {
+        for edit in edits {
+            let table: Vec<&str> = edit.table.iter().map(String::as_str).collect();
+            config::set_detected(
+                paths,
+                slot.layer(),
+                &table,
+                &edit.key,
+                edit.value,
+                note.clone(),
+            )?;
+        }
+    }
+    detect::apply(slot, candidate, config);
+    record_decision(paths, pending, progress);
+    Ok(())
+}
+
+/// Writes "none of them" as the empty form of the slot's own value.
+///
+/// The same two callers, and the same reason: `ports = []` and
+/// `provision = []` are answers, and an answer nothing records is asked
+/// again on every run with nowhere to put it but the TOML by hand.
+fn write_empty_answer(
+    paths: &PandoPaths,
+    config: &mut Config,
+    slot: Slot,
+    note: config::Note,
+    pending: Option<Pending>,
+    progress: &dyn Fn(&str),
+) -> Result<()> {
+    // Through the same gate every other answer goes through. Nothing
+    // `validate` knows about refuses an empty list today; the guarantee
+    // is that no answer is written without being read back, and an
+    // exception to it is one the next rule walks into.
+    let mut proposed = config.clone();
+    apply_empty(slot, &mut proposed);
+    refuse_unloadable(paths, slot, "none of them", &proposed)?;
+    let (table, key) = slot.key().expect("both of these write one key");
+    config::set_detected(
+        paths,
+        slot.layer(),
+        table,
+        key,
+        toml_edit::Value::Array(toml_edit::Array::new()),
+        note,
+    )?;
+    apply_empty(slot, config);
+    record_decision(paths, pending, progress);
+    Ok(())
+}
+
+/// Fills a slot no rule proposed anything for, from a program's own
+/// answer.
+///
+/// "Every question has a custom answer" has to hold where pando had no
+/// guess at all, or it quietly becomes "except the ones we had nothing to
+/// offer for" — and those are the projects that need a caller's help
+/// most. A workspace with no lockfile is the plain case: pando will not
+/// propose a non-frozen install, so it proposes nothing, and the one who
+/// knows what installs this project is whoever is driving.
+///
+/// It is not a question. Nothing is prompted and nothing exits 3: a
+/// caller with an answer in hand supplies it, and a caller without one
+/// leaves the slot exactly as silent as it was.
+///
+/// Two slots are deliberately out:
+///
+/// - **`services`** takes a set of the options, and with no proposal there
+///   are no options. A service pando did not find is not one it can run.
+/// - **`prelude`** is verified against this machine before it is written,
+///   and that verification only exists behind the proposal that raised the
+///   question. A prelude nothing checked, written machine-wide by a
+///   program, can break every command pando spawns; an unused answer
+///   cannot.
+fn volunteer(
+    paths: &PandoPaths,
+    config: &mut Config,
+    slot: Slot,
+    answers: &Answering<'_>,
+    progress: &dyn Fn(&str),
+) -> Result<bool> {
+    let Some(program) = answers.program else {
+        return Ok(false);
+    };
+    if slot == Slot::Prelude || !slot.allows_custom() {
+        return Ok(false);
+    }
+    // An empty proposal, so the question a program answers here is built
+    // by the same function every other question is — and so the decisions
+    // log records, honestly, that the rules offered nothing.
+    let proposal = detect::Proposal::of(slot, Vec::new(), false);
+    let question = question_for(&proposal, &[]);
+    let Some(answer) = program(&question) else {
+        return Ok(false);
+    };
+    let (answer, by) = answered_by(answer?);
+    let pending = pending_decision(&question, &proposal, &answer, by);
+    match answer {
+        Answer::Custom(value) => {
+            let candidate = detect::custom(slot, value.trim());
+            let note = by.note(config::Note::Answered);
+            write_answer(paths, config, slot, &candidate, note, pending, progress)?;
+        }
+        Answer::None if slot.allows_none() => {
+            write_empty_answer(
+                paths,
+                config,
+                slot,
+                by.note(config::Note::Answered),
+                pending,
+                progress,
+            )?;
+        }
+        // Nothing was on offer, so there was nothing to choose: only a
+        // typed answer, or the empty one where the slot has it.
+        _ => bail!(
+            "{} has no options here — the rules found nothing to offer, so only a command of \
+             your own is an answer",
+            slot_label(slot)
+        ),
+    }
+    progress(&format!(
+        "{}: nothing was proposed here, and the answer supplied was taken",
+        slot_label(slot)
+    ));
+    Ok(true)
+}
+
+/// Writes the answer to the one multi-select slot: a `[[services]]` entry
+/// listing the services chosen and the env keys that point at them.
+///
+/// An empty set is a real answer — "none of them" — and it is written down
+/// as an entry with an empty `include`. An answer nothing records is asked
+/// again on every start: a prompt the developer already declined, and exit
+/// 3 for a script, with nowhere to put the answer but the TOML by hand.
+/// `Slot::PortEnv` writes `ports = []` for exactly this reason.
+fn apply_service_answer(
+    paths: &PandoPaths,
+    config: &mut Config,
+    proposal: &detect::Proposal,
+    chosen: &[detect::Candidate],
+    note: config::Note,
+) -> Result<()> {
+    let refs: Vec<&detect::Candidate> = chosen.iter().collect();
+    if proposal.mechanism == Some("native") {
+        return apply_native_service_answer(paths, config, &refs, note);
+    }
+    // The compose file the question was about. Without one there is
+    // nothing to write an entry for, and nothing was asked either.
+    let Some(file) = proposal.service_file().map(str::to_string) else {
+        return Ok(());
+    };
+    let mut proposed = config.clone();
+    detect::apply_services(&file, &refs, &mut proposed);
+    let names: Vec<&str> = refs.iter().map(|c| c.value.as_str()).collect();
+    refuse_unloadable(paths, Slot::Services, &names.join(", "), &proposed)?;
+    let (array, entries) = detect::service_entry(&file, &refs);
+    config::set_detected_array_entry(paths, Slot::Services.layer(), array, entries, note)?;
+    detect::apply_services(&file, &refs, config);
+    Ok(())
+}
+
+/// Writes the answer to the native half of the services question: one
+/// `[[services]] kind = "native"` entry per service chosen.
+///
+/// The negative is the interesting half. A compose entry records "none of
+/// them" as an empty `include`; a native entry is one service and has
+/// nowhere to put it, so the answer goes in `[isolation] none` instead —
+/// a project fact, in the project layer, beside the machine-wide
+/// `prefer`. Without somewhere to record it the question would return on
+/// every isolated start, with nowhere to answer it but the TOML by hand.
+fn apply_native_service_answer(
+    paths: &PandoPaths,
+    config: &mut Config,
+    chosen: &[&detect::Candidate],
+    note: config::Note,
+) -> Result<()> {
+    if chosen.is_empty() {
+        let mut proposed = config.clone();
+        proposed.isolation.none = true;
+        refuse_unloadable(paths, Slot::Services, "none of them", &proposed)?;
+        config::set_detected(
+            paths,
+            config::Layer::Project,
+            &["isolation"],
+            "none",
+            toml_edit::Value::from(true),
+            note,
+        )?;
+        config.isolation.none = true;
+        return Ok(());
+    }
+    // Every entry checked against the loader before any of them is
+    // written: two services that are legal apart and not together — a
+    // name a process already owns as a role — must not leave the file
+    // half answered.
+    let mut proposed = config.clone();
+    detect::apply_native_services(chosen, &mut proposed);
+    let names: Vec<&str> = chosen.iter().map(|c| c.value.as_str()).collect();
+    refuse_unloadable(paths, Slot::Services, &names.join(", "), &proposed)?;
+    for candidate in chosen {
+        let (array, entries) = detect::native_entry(candidate);
+        config::set_detected_array_entry(
+            paths,
+            Slot::Services.layer(),
+            array,
+            entries,
+            note.clone(),
+        )?;
+    }
+    detect::apply_native_services(chosen, config);
+    Ok(())
+}
+
+/// "None of them", written as the empty form of the slot's own value.
+///
+/// The shape that makes a negative answer recordable: `ports = []` is a
+/// process with no ports, `provision = []` is a worktree that needs no
+/// local file of anyone's, and either is tellable from "nobody has said".
+fn apply_empty(slot: Slot, config: &mut Config) {
+    match slot {
+        Slot::PortEnv => {
+            config
+                .processes
+                .entry(detect::DEV.to_string())
+                .or_default()
+                .ports = Some(config::PortsSpec::List(Vec::new()));
+        }
+        _ => config.project.provision = Some(Vec::new()),
+    }
+}
+
+/// An answer pando could not load back is not an answer.
+///
+/// The one choke point every answer passes through between being chosen
+/// and being written — every slot, and every front end: a prompt, `--yes`,
+/// an answers file, the TUI modal. It applies the answer to a *copy* and
+/// asks pando's own loader whether the result is legal; a copy that is not
+/// never reaches disk.
+///
+/// This exists because two answers could each be reasonable and the pair
+/// illegal. An env example naming `API_PORT` gives the application a role
+/// called `api`; a compose file with a service called `api` gives it that
+/// name too — and a role is one port and belongs to one thing, so
+/// `validate_services` refuses the pair. Written, it refused at the *next*
+/// load, in the project layer, which fails hard: `start`, `new`, `restart`
+/// and the TUI all stopped until a human edited the file pando had just
+/// written.
+///
+/// Generic rather than a check for that one pair, deliberately. Every
+/// cross-slot rule `validate` knows about is covered, present and future,
+/// and the message a developer sees is the loader's own — the same
+/// sentence they would have read later, minus the broken file.
+fn refuse_unloadable(
+    paths: &PandoPaths,
+    slot: Slot,
+    answer: &str,
+    proposed: &Config,
+) -> Result<()> {
+    let Err(e) = config::validate(proposed, &paths.project) else {
+        return Ok(());
+    };
+    bail!(
+        "{answer:?} cannot be this project's {}: {e:#} — nothing was written",
+        slot_label(slot)
+    )
+}
+
+/// Edits gathered per table, keeping the order they were produced in.
+///
+/// The keys of one table are written together so the note explaining them
+/// can sit on the table rather than on every key.
+type TableEdits = Vec<(Vec<String>, Vec<(String, toml_edit::Value)>)>;
+
+fn group_by_table(edits: Vec<detect::Edit>) -> TableEdits {
+    let mut out: TableEdits = Vec::new();
+    for edit in edits {
+        match out.iter_mut().find(|(table, _)| *table == edit.table) {
+            Some((_, entries)) => entries.push((edit.key, edit.value)),
+            None => out.push((edit.table, vec![(edit.key, edit.value)])),
+        }
+    }
+    out
+}
+
+/// The candidate an answer chose, by index.
+pub(super) fn pick(proposal: &detect::Proposal, index: usize) -> Result<detect::Candidate> {
+    proposal
+        .candidates
+        .get(index)
+        .with_context(|| format!("option {index} is not on offer"))
+        .cloned()
+}
+
+/// The question a proposal becomes: the options, which one a flag may
+/// take, and which shapes are answers here.
+///
+/// Public because `signals` publishes exactly this — an agent reading it
+/// is looking at the question it would be asked, not at a second
+/// description of one.
+pub fn question_for(proposal: &detect::Proposal, details: &[String]) -> Question {
+    Question {
+        slot: proposal.slot,
+        prompt: proposal.slot.prompt().to_string(),
+        options: proposal
+            .candidates
+            .iter()
+            .map(|c| (c.value.clone(), c.why.clone()))
+            .collect(),
+        // The first option a flag may take on a developer's behalf, which
+        // is the first one for every slot but provisioning: `--yes` takes
+        // the preselection, and an option that copies a file pando did not
+        // write is not one it may accept unattended. `None` means there is
+        // nothing here `--yes` can take, and the question is printed
+        // instead — "agents never hang" is about failing loudly, not about
+        // accepting anything rather than stopping.
+        preselect: proposal.candidates.iter().position(|c| !c.needs_a_human),
+        // Both off the slot itself, so an answers file can check the
+        // shape of what a program sent the moment the file is read —
+        // before a question exists to check it against.
+        allow_custom: proposal.slot.allows_custom(),
+        allow_none: proposal.slot.allows_none(),
+        multi: proposal.slot.is_multi(),
+        checked: proposal.preselected(),
+        details: details.to_vec(),
+    }
+}
+
+pub(super) fn slot_label(slot: Slot) -> &'static str {
+    match slot {
+        Slot::Install => "install command",
+        Slot::VersionFiles => "runtime version file",
+        Slot::Prelude => "runtime prelude",
+        Slot::Processes => "process list",
+        Slot::DevCmd => "dev command",
+        Slot::PortEnv => "port variable",
+        Slot::Services => "service list",
+        Slot::SchemaHook => "schema command",
+        Slot::Provision => "provision list",
+    }
+}
+
+/// Whether config already says what this slot needs, from any layer.
+///
+/// Public because it is the one answer to "is there still a question
+/// here": `init` reports it, `signals` publishes it, and a second
+/// implementation of it would be a second opinion.
+pub fn already_answered(slot: Slot, config: &Config) -> bool {
+    match slot {
+        Slot::Install => config.project.install.is_some(),
+        Slot::VersionFiles => !config.runtime.version_files.is_empty(),
+        // Set to anything at all, the empty string included: `prelude =
+        // ""` is "this machine needs nothing", and a developer who has
+        // said that is not asked again.
+        Slot::Prelude => config.runtime.prelude.is_some(),
+        // Unset, not empty: `provision = []` is a developer saying no
+        // worktree needs a local file of theirs, and an answer nothing
+        // records is asked again on every `new`.
+        Slot::Provision => config.project.provision.is_some(),
+        Slot::Services => !config.services.is_empty(),
+        Slot::SchemaHook => !config.hooks.is_empty(),
+        // Both of these now live in one place, because they are the same
+        // question asked twice: has anything already said what this
+        // project's processes are?
+        Slot::Processes | Slot::DevCmd | Slot::PortEnv => !detect::still_needed(slot, config),
+    }
+}
