@@ -156,6 +156,7 @@ fn up_wait_pump_stop_and_down_make_exactly_the_invocations_they_should() {
         cwd: &h.worktree,
         log_file: &log,
         env: &[],
+        status_file: None,
     })
     .unwrap();
     h.pumps.push(spawned.pgid);

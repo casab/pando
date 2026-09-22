@@ -199,6 +199,7 @@ pub fn start_tunnel(paths: &PandoPaths, name: &str, local_port: u16) -> Result<T
         cwd: &cwd,
         log_file: &log_path,
         env: &[],
+        status_file: None,
     })
     .context("spawn cloudflared")?;
 
@@ -684,6 +685,7 @@ mod tests {
             cwd: &std::env::temp_dir(),
             log_file: &log,
             env: &[],
+            status_file: None,
         })
         .unwrap();
         assert!(wait_until(Duration::from_secs(5), || {

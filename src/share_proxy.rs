@@ -86,6 +86,7 @@ pub fn spawn_with(
         cwd: &std::env::temp_dir(),
         log_file: &log_path,
         env: &proxy_env(cookie),
+        status_file: None,
     })
     .context("spawn the share proxy")?;
     Ok(ProxySpawn {

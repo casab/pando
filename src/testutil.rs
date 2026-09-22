@@ -68,6 +68,7 @@ pub fn spawn_guarded(shell_cmd: &str, cwd: &Path, log_file: &Path) -> Detached {
         cwd,
         log_file,
         env: &[],
+        status_file: None,
     })
     .expect("spawn detached");
     Detached {

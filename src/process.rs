@@ -15,6 +15,9 @@ pub struct SpawnOptions<'a> {
     pub cwd: &'a Path,
     pub log_file: &'a Path,
     pub env: &'a [(String, String)],
+    /// Where the shell writes the exit status it ends with, for the
+    /// callers that want one. See [`spawn_detached`].
+    pub status_file: Option<&'a Path>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +26,21 @@ pub struct SpawnResult {
     pub pgid: i32,
 }
 
+/// Starts a command in its own session, writing its output to a log file.
+///
+/// `status_file`, when given, is how a caller learns *how* the process
+/// ended. pando is not the parent by the time anything asks — `start`
+/// returns and the process is reparented — so `waitpid` has nothing to
+/// say, and the shell records the status itself: an `EXIT` trap that
+/// writes `$?` beside the log. The file is only ever as good as the shell
+/// managing to run its trap, so every reader treats a missing one as "not
+/// known" rather than as a failure.
+///
+/// The trap is also what stops bash from `exec`ing the command in its
+/// place, so the recorded pid is the shell rather than the command. That
+/// costs one process and changes nothing that reads it: the shell waits
+/// for the command, so it is alive for exactly as long, and both are in
+/// the group `stop` signals.
 pub fn spawn_detached(opts: SpawnOptions<'_>) -> Result<SpawnResult> {
     if let Some(parent) = opts.log_file.parent() {
         std::fs::create_dir_all(parent)
@@ -37,9 +55,24 @@ pub fn spawn_detached(opts: SpawnOptions<'_>) -> Result<SpawnResult> {
         .try_clone()
         .context("clone log file handle for stderr")?;
 
+    // `$?` inside an EXIT trap is the status the shell is exiting with,
+    // including the one an explicit `exit` was given.
+    //
+    // The path goes in a variable rather than into the trap body: the body
+    // is itself a quoted word, and a worktree is named after a branch,
+    // which may contain the very quote that would end it.
+    let recorded = opts.status_file.map(|status| {
+        format!(
+            "__pando_status={}\n\
+             trap 'printf %s \"$?\" > \"$__pando_status\"' EXIT\n\
+             {}",
+            shell_quote(&status.to_string_lossy()),
+            opts.shell_cmd
+        )
+    });
     let mut cmd = Command::new("bash");
     cmd.arg("-lc")
-        .arg(opts.shell_cmd)
+        .arg(recorded.as_deref().unwrap_or(opts.shell_cmd))
         .current_dir(opts.cwd)
         .stdin(Stdio::null())
         .stdout(out)
@@ -66,6 +99,18 @@ pub fn spawn_detached(opts: SpawnOptions<'_>) -> Result<SpawnResult> {
     std::mem::drop(child);
 
     Ok(SpawnResult { pid, pgid })
+}
+
+/// The exit status a [`spawn_detached`] process recorded, once it has
+/// ended. `None` is "nothing recorded one": no status file was asked for,
+/// the process is still running, or its shell died without running its
+/// trap — which is what a `SIGKILL`, and pando's own `stop`, look like.
+pub fn recorded_exit_status(status_file: &Path) -> Option<i32> {
+    std::fs::read_to_string(status_file)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 pub fn is_alive(pid: u32) -> bool {
@@ -594,6 +639,7 @@ mod tests {
             cwd: dir.path(),
             log_file: &log,
             env: &[],
+            status_file: None,
         })
         .unwrap();
 
@@ -614,6 +660,93 @@ mod tests {
         );
     }
 
+    /// The whole point of the sidecar: by the time anything asks how a
+    /// dev server ended, pando is not its parent and `waitpid` has nothing
+    /// to say. The shell says instead.
+    #[test]
+    fn a_process_records_the_status_it_exited_with() {
+        // A directory with a space and a quote in its name, because a
+        // worktree is named after a branch and a branch can be called
+        // anything.
+        let dir = tempdir().unwrap();
+        let odd = dir.path().join("it's here");
+        std::fs::create_dir_all(&odd).unwrap();
+        for (cmd, expected) in [("exit 0", 0), ("exit 3", 3), ("true", 0)] {
+            let log = odd.join("log.txt");
+            let status = crate::paths::exit_status_file(&log);
+            let _ = std::fs::remove_file(&status);
+            let r = spawn_detached(SpawnOptions {
+                shell_cmd: cmd,
+                cwd: dir.path(),
+                log_file: &log,
+                env: &[],
+                status_file: Some(&status),
+            })
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while recorded_exit_status(&status).is_none() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(
+                recorded_exit_status(&status),
+                Some(expected),
+                "{cmd:?} should have recorded {expected}"
+            );
+            assert!(!is_alive(r.pid), "{cmd:?} should be over");
+        }
+    }
+
+    /// A status is recorded through an explicit `exit` as well as off the
+    /// end of the script, because an `EXIT` trap runs for both — and the
+    /// guard shape that started all of this is an explicit `exit`.
+    #[test]
+    fn an_explicit_exit_is_recorded_too() {
+        let dir = tempdir().unwrap();
+        let log = dir.path().join("log.txt");
+        let status = crate::paths::exit_status_file(&log);
+        spawn_detached(SpawnOptions {
+            shell_cmd: "command -v sh >/dev/null || { echo missing; exit 1; }",
+            cwd: dir.path(),
+            log_file: &log,
+            env: &[],
+            status_file: Some(&status),
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while recorded_exit_status(&status).is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(recorded_exit_status(&status), Some(0));
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "",
+            "and it printed nothing at all, which is the other half of the story"
+        );
+    }
+
+    #[test]
+    fn nothing_is_recorded_for_a_caller_that_did_not_ask() {
+        let dir = tempdir().unwrap();
+        let log = dir.path().join("log.txt");
+        let r = spawn_detached(SpawnOptions {
+            shell_cmd: "exit 7",
+            cwd: dir.path(),
+            log_file: &log,
+            env: &[],
+            status_file: None,
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while is_alive(r.pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            recorded_exit_status(&crate::paths::exit_status_file(&log)),
+            None,
+            "no sidecar is written beside a log nobody asked to pair one with"
+        );
+    }
+
     #[test]
     fn spawn_puts_child_in_its_own_process_group() {
         let dir = tempdir().unwrap();
@@ -623,6 +756,7 @@ mod tests {
             cwd: dir.path(),
             log_file: &log,
             env: &[],
+            status_file: None,
         })
         .unwrap();
 
@@ -648,6 +782,7 @@ mod tests {
             cwd: dir.path(),
             log_file: &log,
             env: &[],
+            status_file: None,
         })
         .unwrap();
 
@@ -677,6 +812,7 @@ mod tests {
             cwd: dir.path(),
             log_file: &log,
             env: &[],
+            status_file: None,
         })
         .unwrap();
 
@@ -703,6 +839,7 @@ mod tests {
                 ("WEB_PORT".into(), "17224".into()),
                 ("API_PORT".into(), "17225".into()),
             ],
+            status_file: None,
         })
         .unwrap();
 

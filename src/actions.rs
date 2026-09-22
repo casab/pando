@@ -3078,6 +3078,7 @@ pub fn start(
                 cwd: &plan.cwd,
                 log_file: &plan.log_file,
                 env: &plan.env,
+                status_file: Some(&crate::paths::exit_status_file(&plan.log_file)),
             })
         });
         let spawn = match spawned {
@@ -4898,6 +4899,7 @@ fn pump_service_logs(
             cwd: worktree,
             log_file: &log_file,
             env: &[],
+            status_file: None,
         })
         .with_context(|| format!("start the log pump for the service {service:?}"))?;
         if let Some(record) = store
@@ -5306,6 +5308,10 @@ fn reset_log(log_file: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create log dir {}", parent.display()))?;
     }
+    // The exit status beside it belongs to the run being replaced. A run
+    // that dies before its own shell can record one would otherwise be
+    // explained by the previous run's status.
+    let _ = std::fs::remove_file(crate::paths::exit_status_file(log_file));
     std::fs::write(log_file, b"").with_context(|| format!("truncate {}", log_file.display()))
 }
 
@@ -7888,6 +7894,7 @@ time.sleep(300)
             cwd: &std::env::temp_dir(),
             log_file: &log_path,
             env: &[],
+            status_file: None,
         })?;
         Ok(share_proxy::ProxySpawn {
             pid: spawn.pid,

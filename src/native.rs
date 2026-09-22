@@ -587,6 +587,7 @@ impl Native {
             cwd: &self.datadir,
             log_file: &self.log_file,
             env: &[],
+            status_file: None,
         })
         .with_context(|| format!("start the service {:?}", self.service))
     }

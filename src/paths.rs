@@ -380,6 +380,17 @@ pub fn default_home() -> PathBuf {
     home.join(".pando")
 }
 
+/// Where the shell running a detached process records the status it exits
+/// with: beside its log, under the same name.
+///
+/// Derived from the log rather than stored, so a record written by an
+/// earlier pando finds its own sidecar without a migration. Not a `.log`,
+/// deliberately: both log viewers build their tab list from the `.log`
+/// files in the directory, so this is invisible to them.
+pub fn exit_status_file(log_file: &Path) -> PathBuf {
+    log_file.with_extension("status")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
