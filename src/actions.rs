@@ -9879,6 +9879,60 @@ time.sleep(300)
         assert_eq!(config.processes["dev"].cmd, "./serve --dev");
     }
 
+    /// What the trailing comment means, which `docs/05-config-spec.md`
+    /// had wrong until 2026-09-22: it splits on **where the value came
+    /// from, not who typed it**.
+    ///
+    /// A developer picking one of pando's options is accepting a value
+    /// pando's rules produced, and the `why` written beside it is the
+    /// rule's reasoning — so it is `# detected:`, the same as a value
+    /// pando took without asking. Only an answer with no rule behind it
+    /// is `# answered:`.
+    ///
+    /// It is load-bearing, not cosmetic. `doctor` measures a
+    /// `# detected:` value against what the rules offer now and says so
+    /// when they no longer offer it; a typed answer has no rule behind it
+    /// to have changed and is never second-guessed. Writing a chosen
+    /// option as `# answered:` would silence exactly the case that check
+    /// exists for.
+    #[test]
+    fn a_chosen_option_is_detected_and_a_typed_answer_is_answered() {
+        for (answer, expected) in [
+            (
+                Answer::Choice(1),
+                "cmd = \"./scripts/run.sh\"  # detected: the run target",
+            ),
+            (
+                Answer::Custom("./serve --dev".to_string()),
+                "cmd = \"./serve --dev\"  # answered:",
+            ),
+        ] {
+            let fx = fixture();
+            // Two candidates and no certainty, so the question is really
+            // asked: `make dev` for a target with a prerequisite, and the
+            // one-line `run` target lifted as itself.
+            std::fs::write(
+                fx.root.join("Makefile"),
+                "build:\n\t./scripts/build.sh\n\ndev: build\n\t./scripts/serve.sh\n\t./scripts/watch.sh\n\nrun:\n\t./scripts/run.sh\n",
+            )
+            .unwrap();
+            git(&fx.root, &["add", "."]);
+            git(&fx.root, &["commit", "--quiet", "-m", "make"]);
+
+            let (ask, asked) = scripted(vec![answer, Answer::None]);
+            resolve_process(&fx.paths, &fx.config, &ask, &noop).unwrap();
+            assert!(
+                asked.borrow().iter().any(|q| q.slot == Slot::DevCmd),
+                "the question has to have been asked for this to mean anything"
+            );
+            let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+            assert!(
+                written.contains(expected),
+                "want {expected:?} in:\n{written}"
+            );
+        }
+    }
+
     #[test]
     fn an_answer_is_written_to_the_config_with_a_comment() {
         let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");
