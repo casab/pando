@@ -65,6 +65,7 @@ pando                 open the TUI for the repo you are in
 pando new <branch>    create a worktree and branch from the default base
 pando start <name>    start its dev server; --isolated for private services
 pando stop [name]     stop one worktree, or all of them
+pando restart <name>  stop and start again, keeping the ports
 pando ls              list worktrees with ports and status
 pando rm <name>       stop everything, remove the worktree, wipe its data
 pando share <name>    expose it at a public URL

@@ -3780,6 +3780,24 @@ mod tests {
             checked >= 13,
             "only {checked} commands were found in README.md — did the list move?"
         );
+
+        // And the other direction, which is the half that was missing:
+        // the Status section says every command in the list is
+        // implemented, and a reader takes a checked list to be a whole
+        // one. `help` is clap's own, and a hidden subcommand is hidden
+        // precisely because it is not for people.
+        for sub in cli.get_subcommands() {
+            let name = sub.get_name();
+            if name == "help" || sub.is_hide_set() {
+                continue;
+            }
+            assert!(
+                text.contains(&format!("\npando {name} "))
+                    || text.contains(&format!("\npando {name}\n")),
+                "pando has a {name:?} command and README.md does not list it — a list that is \
+                 checked reads as a complete one"
+            );
+        }
     }
 
     /// The brief is the only place the reasoning lives, so the things it
