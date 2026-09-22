@@ -2125,6 +2125,52 @@ fn an_answer_a_person_replaced_is_recorded_once_as_an_override() {
     assert_eq!(decisions_of(&e).len(), log.len());
 }
 
+// The comparison is on the slot's *answer*, not on the file.
+//
+// `processes` is answered with a shape — a process per app, or the root
+// script — so its value is the process names. Switching between the two
+// forms is the decision being overturned and is recorded; tuning a
+// command inside the form that was chosen is not, and a corpus about
+// which shape a program picked is better off without it.
+#[test]
+fn an_edit_inside_the_shape_a_program_chose_is_not_an_override() {
+    let e = env_of(Kind::WorkspaceNoLock);
+    let answers = r#"{"processes": "api: npm run dev in apps/api; web: npm run dev in apps/web"}"#;
+    assert_eq!(
+        code(&e.pando_stdin(&["init", "--answers", "-"], answers)),
+        EXIT_OK
+    );
+    assert_eq!(decisions_of(&e).len(), 1);
+
+    // A command tuned inside the shape that was chosen.
+    let written = std::fs::read_to_string(e.config_file()).unwrap();
+    std::fs::write(
+        e.config_file(),
+        written.replace(r#"cmd = "npm run dev""#, r#"cmd = "npm run dev --silent""#),
+    )
+    .unwrap();
+    assert_eq!(code(&e.pando(&["init"])), EXIT_OK);
+    assert_eq!(
+        decisions_of(&e).len(),
+        1,
+        "the shape is still the one the program chose"
+    );
+
+    // And now the shape itself: the per-app table for the root script.
+    std::fs::write(
+        e.config_file(),
+        "[processes.dev]\ncmd = \"npm run dev\"\n\n[project]\nprovision = [\".env\"]\n",
+    )
+    .unwrap();
+    let out = e.pando(&["init"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    let log = decisions_of(&e);
+    assert_eq!(log.len(), 2, "{log:#?}");
+    assert_eq!(log[1]["kind"], "override");
+    assert_eq!(log[1]["was"], "api, web");
+    assert_eq!(log[1]["now"], "dev");
+}
+
 // Only what a program decided. A rule that settled a slot is not a gap in
 // the rules, and `--yes` taking what the rules preferred is not one
 // either — recording those would bury the lines that mean something.

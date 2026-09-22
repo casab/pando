@@ -357,8 +357,10 @@ than an audit trail.
 
 An override is noticed by comparing what config says about the slot
 against what the log last recorded, on the next command that resolves
-anything. A change that does not change the slot's answer — a comment, a
-reordering — is not an override, and pando would rather miss one than
+anything. The comparison is on the slot's *answer*: a comment or a
+reordering is not an override, and neither is editing a command inside
+the shape that was chosen at `processes` — switching between a process
+per app and the root script is. pando would rather miss an override than
 invent one. `version` here is the line's own, bumped independently of the
 `version` on the printed shapes.
 

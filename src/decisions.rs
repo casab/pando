@@ -235,9 +235,16 @@ fn last_known(entries: &[Entry]) -> Vec<(Slot, Option<String>)> {
 /// changed their mind, which is the one label in this file that cannot be
 /// collected any other way.
 ///
-/// An override that changes nothing a slot's value shows — a comment, a
-/// reordering — is not noticed. That is the honest limit of comparing
-/// answers rather than diffing files, and it errs towards silence.
+/// The comparison is on the slot's *answer*, not on the file, and the two
+/// differ in one place worth knowing about. The `processes` question is
+/// answered with a shape — a process per app, or the root script — so its
+/// value is the process names: switching between the two forms is
+/// recorded, and editing a command inside the form that was chosen is
+/// not. That is the right granularity for a corpus about the decision
+/// that was made, and it is a limit rather than a feature everywhere
+/// else: an edit that leaves the slot's value alone is not noticed.
+/// Silence is the error this errs towards, because an override pando
+/// invented would poison the corpus it exists to build.
 pub fn note_overrides(
     paths: &PandoPaths,
     current: &dyn Fn(Slot) -> Option<String>,
