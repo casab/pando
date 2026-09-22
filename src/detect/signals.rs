@@ -134,7 +134,7 @@ pub(super) fn parse_scripts(manifest: &str) -> BTreeMap<String, String> {
 ///
 /// The whole recipe and the prerequisites, not one line: which of the two
 /// ways to start a target is right — `make <target>` or the command itself
-/// — cannot be decided from a fragment. See [`target_candidates`].
+/// — cannot be decided from a fragment. See `target_candidates`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Target {
     /// The tool that runs it: `make` or `just`.
@@ -152,7 +152,7 @@ pub struct Target {
 
 impl Target {
     /// The command line this target *is*, when proposing it instead of the
-    /// runner loses nothing. See [`target_candidates`] for why the bar is
+    /// runner loses nothing. See `target_candidates` for why the bar is
     /// this high.
     pub fn sole_command(&self) -> Option<&str> {
         if !self.prereqs.is_empty() {

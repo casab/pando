@@ -42,7 +42,7 @@ pub struct Language {
     /// them: a Python project may have `python3`, `python`, or both.
     pub binaries: &'static [&'static str],
     /// What to ask one for its version. Its output goes through
-    /// [`first_version`], which every language in the table shares.
+    /// [`first_version`](super::first_version), which every language in the table shares.
     pub version_flag: &'static str,
     /// Who can satisfy this language on a machine, in the order a
     /// question offers them.

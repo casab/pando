@@ -70,8 +70,8 @@ impl Slot {
     ///
     /// One value rather than a set of options, because a developer may
     /// name a file no rule found — but still a list, which is why
-    /// `--answers` takes a JSON array here and [`join_list`] turns it
-    /// into the form [`edits`] splits again.
+    /// `--answers` takes a JSON array here and [`join_list`](super::join_list) turns it
+    /// into the form [`edits`](super::edits) splits again.
     pub fn is_list(self) -> bool {
         matches!(self, Slot::VersionFiles | Slot::Provision)
     }
@@ -102,7 +102,7 @@ impl Slot {
     }
     /// Where the answer is written, as a table path plus a key. `None` for
     /// [`Slot::Processes`], whose answer is whole tables rather than one
-    /// key; [`edits`] is what knows how to write that.
+    /// key; [`edits`](super::edits) is what knows how to write that.
     pub fn key(self) -> Option<(&'static [&'static str], &'static str)> {
         Some(match self {
             Slot::Install => (&["project"], "install"),
