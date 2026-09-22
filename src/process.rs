@@ -103,8 +103,14 @@ pub fn spawn_detached(opts: SpawnOptions<'_>) -> Result<SpawnResult> {
 
 /// The exit status a [`spawn_detached`] process recorded, once it has
 /// ended. `None` is "nothing recorded one": no status file was asked for,
-/// the process is still running, or its shell died without running its
-/// trap — which is what a `SIGKILL`, and pando's own `stop`, look like.
+/// the process is still running, or its shell died before its trap could
+/// run.
+///
+/// [`stop`] is the third case. Measured on bash 3.2 and 5.3, a group
+/// `SIGTERM` or `SIGKILL` leaves no status behind — see
+/// `a_stopped_process_never_records_a_clean_exit`, which asserts the part
+/// that would actually mislead rather than the shell's exact behaviour: a
+/// process pando ended is never reported as having finished cleanly.
 pub fn recorded_exit_status(status_file: &Path) -> Option<i32> {
     std::fs::read_to_string(status_file)
         .ok()?
@@ -720,6 +726,33 @@ mod tests {
         assert!(
             !std::fs::read_to_string(&log).unwrap().contains("missing"),
             "the guard took its success branch and said nothing"
+        );
+    }
+
+    /// A process pando ended did not end on its own, and must never be
+    /// read as having exited 0 by itself. What the shell records for a
+    /// fatal signal is its business — nothing here, on either bash on this
+    /// machine — but a clean status is the one answer that would be a lie.
+    #[test]
+    fn a_stopped_process_never_records_a_clean_exit() {
+        let dir = tempdir().unwrap();
+        let log = dir.path().join("log.txt");
+        let status = crate::paths::exit_status_file(&log);
+        let r = spawn_detached(SpawnOptions {
+            shell_cmd: "sleep 30",
+            cwd: dir.path(),
+            log_file: &log,
+            env: &[],
+            status_file: Some(&status),
+        })
+        .unwrap();
+        assert!(is_alive(r.pid));
+        stop(r.pgid, Duration::from_secs(5)).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert_ne!(
+            recorded_exit_status(&status),
+            Some(0),
+            "a process pando signalled did not finish on its own"
         );
     }
 

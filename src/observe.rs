@@ -304,12 +304,26 @@ pub fn classify_failure(last_lines: &[String]) -> Option<Hint> {
 ///
 /// `None` when the log has something in it: then the log is the answer,
 /// and [`classify_failure`] is what reads it.
-pub fn exit_note(code: Option<i32>, printed_anything: bool) -> Option<String> {
+///
+/// `left_something_running` is the one thing that takes the suggestion
+/// away, and it is why this takes three arguments rather than two. A
+/// command that backgrounds the server and returns — `./app &`, the shape
+/// a recipe line that ends in `&` has — exits 0 having printed nothing
+/// while the server it started is up. Saying "wrong command" there would
+/// be a confident lie; saying what is actually true is more use than
+/// either.
+pub fn exit_note(
+    code: Option<i32>,
+    printed_anything: bool,
+    left_something_running: bool,
+) -> Option<String> {
     if printed_anything {
         return None;
     }
     Some(
-        if code == Some(0) {
+        if left_something_running {
+            "it printed nothing at all, and something it started is still running"
+        } else if code == Some(0) {
             "it printed nothing at all; a dev server stays up, so a command that exits 0 \
              straight away is usually not the one that starts it"
         } else {
@@ -547,14 +561,14 @@ mod tests {
 
     #[test]
     fn a_silent_success_is_the_only_exit_worth_a_suggestion() {
-        let zero = exit_note(Some(0), false).expect("a silent exit 0 is worth saying");
+        let zero = exit_note(Some(0), false, false).expect("a silent exit 0 is worth saying");
         assert!(zero.contains("printed nothing"), "{zero}");
         assert!(
             zero.contains("exits 0"),
             "and says why that is a signal: {zero}"
         );
 
-        let one = exit_note(Some(1), false).expect("a silent failure is still worth saying");
+        let one = exit_note(Some(1), false, false).expect("a silent failure is still worth saying");
         assert!(one.contains("printed nothing"), "{one}");
         assert!(
             !one.contains("exits 0"),
@@ -562,18 +576,31 @@ mod tests {
         );
 
         assert_eq!(
-            exit_note(None, false),
-            exit_note(Some(1), false),
+            exit_note(None, false, false),
+            exit_note(Some(1), false, false),
             "with no status recorded, the silence is still all there is"
         );
     }
 
+    /// A command that backgrounds the server and returns exits 0 having
+    /// said nothing, and the server is fine. The suggestion would be a
+    /// confident lie, so it is replaced by what is true.
+    #[test]
+    fn a_silent_success_that_left_something_running_is_not_accused() {
+        let note = exit_note(Some(0), false, true).expect("still worth saying");
+        assert!(
+            !note.contains("not the one that starts it"),
+            "nothing may be diagnosed over a group that is still up: {note}"
+        );
+        assert!(note.contains("still running"), "{note}");
+    }
+
     #[test]
     fn a_process_that_printed_something_gets_no_note() {
-        assert_eq!(exit_note(Some(0), true), None);
-        assert_eq!(exit_note(Some(1), true), None);
+        assert_eq!(exit_note(Some(0), true, false), None);
+        assert_eq!(exit_note(Some(1), true, false), None);
         assert_eq!(
-            exit_note(None, true),
+            exit_note(None, true, true),
             None,
             "the log is the answer whenever there is one"
         );

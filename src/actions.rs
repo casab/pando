@@ -5656,7 +5656,7 @@ fn explain_new_failures(store: &mut state::State, failed_before: &[(String, Stri
             {
                 continue;
             }
-            let explained = explain_failure(reason, &p.log_path);
+            let explained = explain_failure(reason, &p.log_path, proc::group_alive(p.pgid));
             if &explained == reason {
                 continue;
             }
@@ -5684,7 +5684,13 @@ fn explain_new_failures(store: &mut state::State, failed_before: &[(String, Stri
 /// guard as a dev command; it exited 0 in a millisecond because the tool
 /// it guarded was installed, and `status`, `doctor` and the TUI all said
 /// "failed — process exited" over a log file with nothing in it.
-fn explain_failure(reason: &str, log_path: &Path) -> String {
+///
+/// `group_alive` is the guard on the one claim here that is a judgement
+/// rather than a fact: a command that backgrounds the server and returns
+/// looks identical from the leader's exit status, and is not the wrong
+/// command. Read after the phases are advanced, so the leader has already
+/// been reaped and a zombie cannot hold its own group open.
+fn explain_failure(reason: &str, log_path: &Path, group_alive: bool) -> String {
     let mut out = reason.to_string();
     let code = proc::recorded_exit_status(&crate::paths::exit_status_file(log_path));
     // Only onto the phase's own "it is gone": a timeout is a process that
@@ -5696,7 +5702,7 @@ fn explain_failure(reason: &str, log_path: &Path) -> String {
     }
     let lines = crate::log_tail::snapshot(log_path, FAILURE_TAIL_LINES).unwrap_or_default();
     let printed_anything = std::fs::metadata(log_path).is_ok_and(|m| m.len() > 0);
-    if let Some(note) = crate::observe::exit_note(code, printed_anything) {
+    if let Some(note) = crate::observe::exit_note(code, printed_anything, group_alive) {
         out = format!("{out} — {note}");
     }
     if let Some(hint) = crate::observe::classify_failure(&lines) {
@@ -10780,6 +10786,56 @@ time.sleep(300)
         );
     }
 
+    /// A status file outlives the run that wrote it unless something
+    /// removes it, and the next run of the same process would then be
+    /// explained by the previous one's exit. `reset_log` takes both.
+    #[test]
+    fn resetting_a_log_takes_the_exit_status_beside_it() {
+        let dir = tempdir().unwrap();
+        let log = dir.path().join("logs").join("dev.log");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, "the previous run\n").unwrap();
+        let status = crate::paths::exit_status_file(&log);
+        std::fs::write(&status, "0").unwrap();
+
+        reset_log(&log).unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "");
+        assert!(
+            !status.exists(),
+            "the previous run's status may not explain the next one"
+        );
+        // And it is fine with nothing to remove.
+        reset_log(&log).unwrap();
+    }
+
+    /// The shape that would have been accused wrongly: a command that
+    /// backgrounds the server and returns. Its leader exits 0 having
+    /// printed nothing, exactly like the guard — and the server is fine.
+    #[test]
+    fn a_command_that_backgrounds_the_server_is_not_called_the_wrong_one() {
+        let mut fx = fixture();
+        with_dev(&mut fx, dev("sleep 30 & exit 0"));
+        let name = worktree_named(&fx, "feat/one");
+        let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+        let _guard = guard(&outcome);
+
+        assert!(wait_until(Duration::from_secs(10), || matches!(
+            refresh(&fx.paths).state.worktrees[&name].processes["dev"].phase,
+            Phase::Failed { .. }
+        )));
+        let phase = refresh(&fx.paths).state.worktrees[&name].processes["dev"]
+            .phase
+            .clone();
+        let Phase::Failed { reason, .. } = &phase else {
+            panic!("expected a failure, got {phase:?}");
+        };
+        assert!(
+            !reason.contains("not the one that starts it"),
+            "the server it started is up; nothing here is evidence against the \
+             command: {reason}"
+        );
+    }
+
     /// The other half, without depending on what a login shell on this
     /// machine prints: an empty log and a recorded status, explained.
     #[test]
@@ -10790,7 +10846,7 @@ time.sleep(300)
         let status = crate::paths::exit_status_file(&log);
 
         std::fs::write(&status, "0").unwrap();
-        let silent = explain_failure(state::EXITED, &log);
+        let silent = explain_failure(state::EXITED, &log, false);
         assert!(silent.starts_with("process exited"), "{silent}");
         assert!(silent.contains("status 0"), "{silent}");
         assert!(
@@ -10805,7 +10861,7 @@ time.sleep(300)
         // A timeout is a process that is still up, so no status belongs to
         // it — and none is invented.
         let timeout = "timeout: nothing bound port 17000 in 30s";
-        let waited = explain_failure(timeout, &log);
+        let waited = explain_failure(timeout, &log, false);
         assert!(
             !waited.contains("status 0"),
             "only the phase's own \"it is gone\" takes a status: {waited}"
@@ -10815,7 +10871,7 @@ time.sleep(300)
         // And a log with something in it is explained by the log.
         std::fs::write(&log, "Error: listen EADDRINUSE :::17342\n").unwrap();
         std::fs::write(&status, "1").unwrap();
-        let loud = explain_failure(state::EXITED, &log);
+        let loud = explain_failure(state::EXITED, &log, false);
         assert!(loud.contains("status 1"), "{loud}");
         assert!(
             !loud.contains("printed nothing"),
