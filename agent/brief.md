@@ -69,20 +69,27 @@ asks them. Each has a `proposal`, and its state decides what you do:
 
 | State | Means | You |
 |---|---|---|
-| `"proposal": null` | no rule had anything to say | **do nothing.** There is no question here — with one exception, `prelude`, which is never proposed in `signals` at all. See below |
-| `"decided": true` | a rule settled it | **do nothing.** Same |
-| `"decided": false` | pando will ask | **this is the only one you answer** |
+| `"proposal": null` | no rule had anything to say | **nothing to choose from — and the one place your own knowledge is the only thing there is.** No options, no preselection, and nobody is asked. A value you send here is taken as a command of your own, validated and written like any other. Send one only if you know it |
+| `"decided": true` | a rule settled it | **do nothing.** A value you send is reported as unused |
+| `"decided": false` | pando will ask | **this is the one you answer from the options** |
 
 Also check `"answered": true` — config already says, from some layer, and
 the slot is closed.
 
-Getting this wrong is the commonest way to waste a run. A project with no
-lockfile has `"install": {"proposal": null}`: pando will not propose a
-non-frozen install and neither will you. A `decided: true` proposal with no
-candidates and a `none_because` is a rule deciding the answer is *none of
-them* — a real answer, and the opposite of `null`.
+`null` is not "this slot is closed". It is "the rules found nothing", and a
+project with no lockfile is the plain case: `"install": {"proposal": null}`,
+because pando will not propose an install that can rewrite a lockfile and
+there is no frozen one to propose. Whether anything should go there is then
+a question about the project that only its developer — or a program reading
+their README — can answer. `{"install": "make deps"}` is a legitimate
+answer. `{"install": "npm install"}` is not, and no absence of a rule makes
+it one: the guardrail is yours as much as pando's.
 
-Three more facts that are not visible in the shape:
+A `decided: true` proposal with no candidates and a `none_because` is a
+different thing again — a rule deciding the answer is *none of them*, which
+is a real answer and the opposite of `null`.
+
+Four more facts that are not visible in the shape:
 
 - **`prelude` is never proposed by `signals`** — it reads as
   `"proposal": null` on every project, answered or not. It is the one
@@ -100,6 +107,13 @@ Three more facts that are not visible in the shape:
   `port_env` too** — every app gets its command and its port. Answers you
   sent for those two are then reported as unused, which is correct and not
   an error.
+- **Two slots take no answer when nothing was proposed.** `services` is a
+  set of the options, and with no options there is nothing to name — a
+  service pando did not find is not a service it can run. `prelude` is
+  checked against this machine before it is written, and that check only
+  exists behind the proposal that raises the question; a line nothing
+  verified, written machine-wide by a program, runs in front of every
+  command pando spawns. Both report your value as unused instead.
 - **A `needs_a_human: true` candidate is not one `--yes` may take**, but an
   answers file naming its exact text *is* an explicit answer and is
   accepted. Seeding a worktree's `.env` from a committed example is the one
@@ -111,7 +125,7 @@ Three more facts that are not visible in the shape:
 
 | Question | Who | Notes |
 |---|---|---|
-| `install` | rules | a frozen install or nothing. Never propose a non-frozen one |
+| `install` | rules, then you | a frozen install, or silence where no lockfile exists — and silence is a slot you may fill from what the project's own docs say. Never a non-frozen one |
 | `version_files` | rules | which file pins the runtime |
 | `prelude` | machine → human | only when the machine does not resolve the pin. `doctor` gives the exact line; the human decides whether to run it |
 | `processes` | **human** | one process, or one per app of a workspace |
@@ -142,6 +156,11 @@ pando init --answers answers.json             # then write
   the set question and is a usage error anywhere else.
 - a string that matches no option is a command of your own, wherever
   `allow_custom` is true.
+- **a slot with no proposal at all takes that same custom answer.** There
+  are no options for it to match, so whatever you send is a command of your
+  own: validated, refused if it would make the config unloadable, and
+  written with the same `# answered: a program` beside it. `services` and
+  `prelude` are the two exceptions, for the reasons in §2.
 
 **Never edit `pando.toml`.** Not with `sed`, not with an editor, not "just
 this once". Every answer that goes through `init --answers` is validated,
@@ -246,8 +265,12 @@ yours to fix:
 - **a runtime the machine does not resolve.** The fix is a `prelude` line,
   and `doctor` prints the exact one. It is about their laptop: offer it,
   do not run an installer.
-- **a non-frozen install in a config somebody wrote by hand.** pando will
-  not run one. Tell them; do not "fix" it by loosening anything.
+- **a non-frozen install in a config somebody wrote by hand.** doctor calls
+  it a problem — not a note — because nothing downstream stops it: what
+  `project.install` says is what `pando new` runs, and it can rewrite the
+  project's lockfile. The finding prints the frozen form as its fix. Show
+  them both and let them change it; do not "fix" it by loosening anything,
+  and never write one yourself.
 
 Do not claim a project starts unless you started it. If you did not run
 `pando start`, say that you did not.
@@ -277,7 +300,10 @@ Absolute. None of these has an exception worth taking.
   let them create it in their own project.
 - **Never propose or run a non-frozen install.** `npm ci`, not
   `npm install`. `pnpm install --frozen-lockfile`, not `pnpm install`. No
-  lockfile means no install step — silence is the answer.
+  lockfile means no *frozen* install exists, so pando proposes none — and
+  if the project installs by a step of its own that you have read, naming
+  that step is an answer. Guessing one, or reaching for the non-frozen
+  form because the slot looked empty, is not.
 - **Never run a mutating pando command against a repository the developer
   did not point you at.** `new`, `start`, `stop`, `rm`, `share`, `init`
   are mutating. `ls`, `status`, `path`, `logs`, `doctor`, `signals` are
@@ -347,11 +373,15 @@ Ask once, with both options and their `why`. Then:
 { "processes": "api: npm run dev in apps/api; web: npm run dev in apps/web" }
 ```
 
-Note what you did **not** do: you did not answer `install` (there is no
-question — and inventing `npm install` would be a non-frozen install), and
-you did not answer `port_env` (the `processes` answer settles it; pando
-will report your value as unused if you send it, which is noise in front of
-the thing that matters).
+Note what you did **not** do. You did not invent an `install`: the slot has
+no proposal because there is no lockfile to freeze against, and `npm
+install` is the one command the guardrail forbids. The slot is answerable —
+if the repository's own README said it is installed with `make deps`, then
+`{"install": "make deps"}` answers a question pando had nothing to offer
+for, and the decisions log records that the rules offered nothing. A guess
+in that slot is worse than silence. And you did not answer `port_env`: the
+`processes` answer settles it, and pando reports your value as unused if
+you send it, which is noise in front of the thing that matters.
 
 ## C. A compose file that only packages the app
 

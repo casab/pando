@@ -1983,6 +1983,156 @@ fn dry_run_prints_the_config_it_would_write_and_writes_nothing() {
     );
 }
 
+// ---- a slot the rules are silent about ------------------------------------
+//
+// "Every question has a custom answer" has to hold where pando had no
+// guess at all, or it quietly becomes "except the ones we had nothing to
+// offer for" — and those are exactly the projects that need the caller's
+// help most.
+
+#[test]
+fn an_answers_file_fills_a_slot_no_rule_proposed_anything_for() {
+    // No lockfile, so pando will not propose an install — it never
+    // proposes a non-frozen one — and the slot has no proposal at all.
+    let e = env_of(Kind::WorkspaceNoLock);
+    assert_eq!(
+        signals_of(&e)["slots"][0]["proposal"],
+        serde_json::Value::Null,
+        "this shape is only interesting while the rules stay silent here"
+    );
+
+    // The per-app form answers the one question this shape really has,
+    // and settles the ports with it; `install` and `schema_hook` are the
+    // two the rules never offered anything for. The install command is a
+    // step of the project's own, which is the honest shape here: there is
+    // no lockfile, so there is no frozen install for a rule to have found.
+    let out = e.pando_stdin(
+        &["init", "--answers", "-"],
+        r#"{"install": "make deps",
+            "processes": "api: npm run dev in apps/api; web: npm run dev in apps/web",
+            "schema_hook": "npm run db:migrate"}"#,
+    );
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("nothing was proposed here"),
+        "a guess pando takes is a guess it says out loud: {}",
+        stderr(&out)
+    );
+
+    let written = std::fs::read_to_string(e.config_file()).unwrap();
+    assert!(
+        written.contains(r#"install = "make deps"  # answered: a program,"#),
+        "{written}"
+    );
+    // And the schema answer is a whole [[hooks]] entry, which is the part
+    // that used to be accepted and then silently dropped.
+    assert!(written.contains("[[hooks]]"), "{written}");
+    assert!(
+        written.contains(r#"cmd = "npm run db:migrate""#),
+        "{written}"
+    );
+
+    // Nothing was reported unused, because everything was used.
+    assert!(!stderr(&out).contains("was not used"), "{}", stderr(&out));
+    assert_eq!(
+        code(&e.pando(&["doctor"])),
+        EXIT_OK,
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert_eq!(status_porcelain(&e.root), "");
+
+    // And afterwards `signals` says the true thing about the slot, which
+    // is the half a program reads on its next pass: the rules are still
+    // silent here — no rule was written by this — and the question is
+    // nevertheless closed. A program that re-read only `proposal` would
+    // answer it again on every run.
+    let after = signals_of(&e);
+    assert_eq!(after["slots"][0]["slot"], "install");
+    assert_eq!(after["slots"][0]["proposal"], serde_json::Value::Null);
+    assert_eq!(
+        after["slots"][0]["answered"],
+        serde_json::Value::Bool(true),
+        "a slot a program filled is a slot config answers for: {:#?}",
+        after["slots"][0]
+    );
+}
+
+// And it is recorded like every other answer a program gave — with an
+// empty option list, which is the corpus saying in so many words that the
+// rules had nothing to offer here.
+#[test]
+fn a_slot_the_rules_were_silent_about_is_recorded_with_no_options() {
+    let e = env_of(Kind::WorkspaceNoLock);
+    let out = e.pando_stdin(
+        &["init", "--answers", "-"],
+        r#"{"install": "make deps",
+            "processes": "api: npm run dev in apps/api; web: npm run dev in apps/web"}"#,
+    );
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    let log = decisions_of(&e);
+    let install = log
+        .iter()
+        .find(|d| d["slot"] == "install")
+        .unwrap_or_else(|| panic!("{log:#?}"));
+    assert_eq!(install["kind"], "answer");
+    assert_eq!(install["shape"], "custom");
+    assert_eq!(install["answer"], "make deps");
+    assert_eq!(install["wrote"], "make deps");
+    assert_eq!(
+        install["evidence"]["options"].as_array().map(Vec::len),
+        Some(0),
+        "the rules offered nothing, and the record says so"
+    );
+    assert_eq!(install["evidence"]["preferred"], serde_json::Value::Null);
+}
+
+// Only a program volunteers. A person at a terminal is never asked to
+// invent a command out of nothing, and `--yes` has nothing to take.
+#[test]
+fn a_slot_the_rules_are_silent_about_stays_silent_without_an_answers_file() {
+    let e = env_of(Kind::WorkspaceNoLock);
+    let out = e.pando(&["init", "--yes"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    let written = std::fs::read_to_string(e.config_file()).unwrap();
+    assert!(
+        !written.contains("install ="),
+        "no lockfile, no install, and no question about it: {written}"
+    );
+    assert!(!written.contains("[[hooks]]"), "{written}");
+}
+
+// The two that are deliberately out. Both stay exactly as they were: an
+// answer nothing used, reported rather than applied.
+#[test]
+fn the_set_question_and_the_machine_question_are_not_volunteered_for() {
+    let e = env_of(Kind::WorkspaceNoLock);
+    // With the machine answer taken away, and a shape that pins no
+    // runtime at all, the prelude is unanswered *and* unproposed on every
+    // host — which is the state a volunteered answer would fill.
+    e.unanswer_the_runtime();
+    let out = e.pando_stdin(
+        &["init", "--answers", "-"],
+        r#"{"services": ["postgres"], "prelude": "export FOO=1",
+            "processes": "api: npm run dev in apps/api; web: npm run dev in apps/web"}"#,
+    );
+    assert_eq!(code(&out), EXIT_OK, "stdout: {}", stdout(&out));
+    let printed = stderr(&out);
+    for name in ["services", "prelude"] {
+        assert!(
+            printed.contains(&format!("nothing asked about {name}")),
+            "{printed}"
+        );
+    }
+    let written = std::fs::read_to_string(e.config_file()).unwrap();
+    assert!(!written.contains("[[services]]"), "{written}");
+    // The machine-wide file is the one a prelude would land in, and this
+    // run must not have touched it: a prelude nothing verified can break
+    // every command pando spawns.
+    let user = std::fs::read_to_string(e.home.join("config.toml")).unwrap_or_default();
+    assert!(!user.contains("export FOO=1"), "{user}");
+}
+
 // ---- the decisions log ----------------------------------------------------
 //
 // Every answer a program supplies that the rules could not decide, with

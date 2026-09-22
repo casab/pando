@@ -883,6 +883,43 @@ pub enum Answer {
 /// elsewhere; the TUI opens a modal; a test hands back a scripted answer.
 pub type Ask<'a> = &'a dyn Fn(&Question) -> Result<Answer>;
 
+/// An answer a caller already has in hand, for a question nobody is going
+/// to be asked.
+///
+/// Deliberately not an [`Ask`]. A question is something a front end *puts*
+/// to somebody, and there is nobody to put this one to: the rules proposed
+/// nothing, so there are no options and no preselection, and a terminal
+/// that prompted here would be asking a developer to invent a command out
+/// of nothing on every project pando has no guess for. A program reading
+/// its own file is the one answerer that can have something to say.
+pub type Volunteered<'a> = &'a dyn Fn(&Question) -> Option<Result<Answer>>;
+
+/// Where one resolution pass gets its answers.
+pub struct Answering<'a> {
+    /// What a front end puts to somebody.
+    pub ask: Ask<'a>,
+    /// What a program supplies for a slot no rule proposed anything for —
+    /// and, by its presence, the fact that a program rather than a person
+    /// is driving this pass at all.
+    pub program: Option<Volunteered<'a>>,
+}
+
+impl<'a> Answering<'a> {
+    /// A pass with a person behind it: nothing is volunteered, and a slot
+    /// the rules are silent about stays silent.
+    pub fn asking(ask: Ask<'a>) -> Answering<'a> {
+        Answering { ask, program: None }
+    }
+
+    /// A pass a program is driving, with its own answers to fall back on.
+    pub fn by_program(ask: Ask<'a>, program: Volunteered<'a>) -> Answering<'a> {
+        Answering {
+            ask,
+            program: Some(program),
+        }
+    }
+}
+
 /// The error every front end turns into exit code 3.
 ///
 /// A question is not a failure, and an agent has to be able to tell them
@@ -1092,7 +1129,14 @@ pub fn resolve_process(
     } else {
         &SILENT_UNLESS_ISOLATED
     };
-    resolve_silencing(paths, config, &START_SLOTS, silent, ask, progress)
+    resolve_silencing(
+        paths,
+        config,
+        &START_SLOTS,
+        silent,
+        &Answering::asking(ask),
+        progress,
+    )
 }
 
 /// Fills what `new` needs before it creates anything.
@@ -1116,7 +1160,7 @@ pub fn resolve(
     ask: Ask<'_>,
     progress: &dyn Fn(&str),
 ) -> Result<Config> {
-    resolve_silencing(paths, config, slots, &[], ask, progress)
+    resolve_silencing(paths, config, slots, &[], &Answering::asking(ask), progress)
 }
 
 /// [`resolve`], with slots that may be *taken* when the rules decided them
@@ -1132,7 +1176,7 @@ pub fn resolve_silencing(
     config: &Config,
     slots: &[Slot],
     silent: &[Slot],
-    ask: Ask<'_>,
+    answers: &Answering<'_>,
     progress: &dyn Fn(&str),
 ) -> Result<Config> {
     let shell = runtime_shell(paths.root());
@@ -1140,7 +1184,7 @@ pub fn resolve_silencing(
         shell: &shell,
         home: user_home(),
     };
-    resolve_on(paths, config, slots, silent, ask, progress, &machine)
+    resolve_on(paths, config, slots, silent, answers, progress, &machine)
 }
 
 /// [`resolve_silencing`] with the machine injected, so a test can answer
@@ -1150,10 +1194,11 @@ pub fn resolve_on(
     config: &Config,
     slots: &[Slot],
     silent: &[Slot],
-    ask: Ask<'_>,
+    answers: &Answering<'_>,
     progress: &dyn Fn(&str),
     machine: &Machine<'_>,
 ) -> Result<Config> {
+    let ask = answers.ask;
     let mut config = config.clone();
     // First, and before the early return below: the commonest shape for a
     // developer changing an answer a program wrote is a project where
@@ -1256,6 +1301,12 @@ pub fn resolve_on(
             continue;
         }
         let Some(proposal) = proposals.iter().find(|p| p.slot == *slot) else {
+            // No rule had anything to say. There is nobody to ask — but a
+            // program driving this pass may still have an answer for it.
+            if volunteer(paths, &mut config, *slot, answers, progress)? && *slot == Slot::Processes
+            {
+                may_fill_dev = detect::fills_one_dev_process(&config);
+            }
             continue;
         };
         if !proposal.decided && silent.contains(slot) {
@@ -1388,25 +1439,14 @@ pub fn resolve_on(
                 // "nobody has said yet", or the question returns on every
                 // run with nowhere to put the answer but the TOML by hand.
                 Answer::None if matches!(*slot, Slot::PortEnv | Slot::Provision) => {
-                    // Through the same gate every other answer goes
-                    // through. Nothing `validate` knows about refuses an
-                    // empty list today; the guarantee is that no answer
-                    // is written without being read back, and an
-                    // exception to it is one the next rule walks into.
-                    let mut proposed = config.clone();
-                    apply_empty(*slot, &mut proposed);
-                    refuse_unloadable(paths, *slot, "none of them", &proposed)?;
-                    let (table, key) = slot.key().expect("both of these write one key");
-                    config::set_detected(
+                    write_empty_answer(
                         paths,
-                        slot.layer(),
-                        table,
-                        key,
-                        toml_edit::Value::Array(toml_edit::Array::new()),
+                        &mut config,
+                        *slot,
                         by.note(config::Note::Answered),
+                        pending,
+                        progress,
                     )?;
-                    apply_empty(*slot, &mut config);
-                    record_decision(paths, pending, progress);
                     continue;
                 }
                 Answer::None => bail!("{} has no \"none\" answer", slot_label(*slot)),
@@ -1414,47 +1454,15 @@ pub fn resolve_on(
             }
         };
         let (candidate, note) = candidate;
-        if candidate.value.trim().is_empty() {
-            bail!("an empty answer is not a {}", slot_label(*slot));
-        }
-        // Before a single key is written: an answer that would make the
-        // merged config refuse to load is refused now, while nothing is on
-        // disk, instead of at the next load with half a project broken.
-        let mut proposed = config.clone();
-        detect::apply(*slot, &candidate, &mut proposed);
-        refuse_unloadable(paths, *slot, &candidate.value, &proposed)?;
-        // A slot whose answer is a whole `[[table]]` entry: appended, with
-        // the note on the entry's own header rather than on each key.
-        if let Some((array, entries)) = detect::array_edits(*slot, &[&candidate]) {
-            config::set_detected_array_entry(paths, slot.layer(), array, entries, note.clone())?;
-            detect::apply(*slot, &candidate, &mut config);
-            record_decision(paths, pending, progress);
-            continue;
-        }
-        let edits = detect::edits(*slot, &candidate);
-        if *slot == Slot::Processes {
-            // A whole process table is one answer to one question, so the
-            // note goes on the table's header rather than on each of its
-            // five keys.
-            for (table, entries) in group_by_table(edits) {
-                let table: Vec<&str> = table.iter().map(String::as_str).collect();
-                config::set_detected_table(paths, slot.layer(), &table, entries, note.clone())?;
-            }
-        } else {
-            for edit in edits {
-                let table: Vec<&str> = edit.table.iter().map(String::as_str).collect();
-                config::set_detected(
-                    paths,
-                    slot.layer(),
-                    &table,
-                    &edit.key,
-                    edit.value,
-                    note.clone(),
-                )?;
-            }
-        }
-        detect::apply(*slot, &candidate, &mut config);
-        record_decision(paths, pending, progress);
+        write_answer(
+            paths,
+            &mut config,
+            *slot,
+            &candidate,
+            note,
+            pending,
+            progress,
+        )?;
         if *slot == Slot::Processes {
             // The answer decided the shape. The per-app form leaves the
             // single-process slots nothing to fill; the root-script form
@@ -1463,6 +1471,176 @@ pub fn resolve_on(
         }
     }
     Ok(config)
+}
+
+/// Writes one single-value answer: checks it loads, patches its keys, and
+/// records what a program decided.
+///
+/// One implementation, because there are two callers — the question loop
+/// and [`volunteer`] — and an answer written twice in two ways is an
+/// answer that means two things.
+fn write_answer(
+    paths: &PandoPaths,
+    config: &mut Config,
+    slot: Slot,
+    candidate: &detect::Candidate,
+    note: config::Note,
+    pending: Option<Pending>,
+    progress: &dyn Fn(&str),
+) -> Result<()> {
+    if candidate.value.trim().is_empty() {
+        bail!("an empty answer is not a {}", slot_label(slot));
+    }
+    // Before a single key is written: an answer that would make the
+    // merged config refuse to load is refused now, while nothing is on
+    // disk, instead of at the next load with half a project broken.
+    let mut proposed = config.clone();
+    detect::apply(slot, candidate, &mut proposed);
+    refuse_unloadable(paths, slot, &candidate.value, &proposed)?;
+    // A slot whose answer is a whole `[[table]]` entry: appended, with
+    // the note on the entry's own header rather than on each key.
+    if let Some((array, entries)) = detect::array_edits(slot, &[candidate]) {
+        config::set_detected_array_entry(paths, slot.layer(), array, entries, note)?;
+        detect::apply(slot, candidate, config);
+        record_decision(paths, pending, progress);
+        return Ok(());
+    }
+    let edits = detect::edits(slot, candidate);
+    if slot == Slot::Processes {
+        // A whole process table is one answer to one question, so the
+        // note goes on the table's header rather than on each of its
+        // five keys.
+        for (table, entries) in group_by_table(edits) {
+            let table: Vec<&str> = table.iter().map(String::as_str).collect();
+            config::set_detected_table(paths, slot.layer(), &table, entries, note.clone())?;
+        }
+    } else {
+        for edit in edits {
+            let table: Vec<&str> = edit.table.iter().map(String::as_str).collect();
+            config::set_detected(
+                paths,
+                slot.layer(),
+                &table,
+                &edit.key,
+                edit.value,
+                note.clone(),
+            )?;
+        }
+    }
+    detect::apply(slot, candidate, config);
+    record_decision(paths, pending, progress);
+    Ok(())
+}
+
+/// Writes "none of them" as the empty form of the slot's own value.
+///
+/// The same two callers, and the same reason: `ports = []` and
+/// `provision = []` are answers, and an answer nothing records is asked
+/// again on every run with nowhere to put it but the TOML by hand.
+fn write_empty_answer(
+    paths: &PandoPaths,
+    config: &mut Config,
+    slot: Slot,
+    note: config::Note,
+    pending: Option<Pending>,
+    progress: &dyn Fn(&str),
+) -> Result<()> {
+    // Through the same gate every other answer goes through. Nothing
+    // `validate` knows about refuses an empty list today; the guarantee
+    // is that no answer is written without being read back, and an
+    // exception to it is one the next rule walks into.
+    let mut proposed = config.clone();
+    apply_empty(slot, &mut proposed);
+    refuse_unloadable(paths, slot, "none of them", &proposed)?;
+    let (table, key) = slot.key().expect("both of these write one key");
+    config::set_detected(
+        paths,
+        slot.layer(),
+        table,
+        key,
+        toml_edit::Value::Array(toml_edit::Array::new()),
+        note,
+    )?;
+    apply_empty(slot, config);
+    record_decision(paths, pending, progress);
+    Ok(())
+}
+
+/// Fills a slot no rule proposed anything for, from a program's own
+/// answer.
+///
+/// "Every question has a custom answer" has to hold where pando had no
+/// guess at all, or it quietly becomes "except the ones we had nothing to
+/// offer for" — and those are the projects that need a caller's help
+/// most. A workspace with no lockfile is the plain case: pando will not
+/// propose a non-frozen install, so it proposes nothing, and the one who
+/// knows what installs this project is whoever is driving.
+///
+/// It is not a question. Nothing is prompted and nothing exits 3: a
+/// caller with an answer in hand supplies it, and a caller without one
+/// leaves the slot exactly as silent as it was.
+///
+/// Two slots are deliberately out:
+///
+/// - **`services`** takes a set of the options, and with no proposal there
+///   are no options. A service pando did not find is not one it can run.
+/// - **`prelude`** is verified against this machine before it is written,
+///   and that verification only exists behind the proposal that raised the
+///   question. A prelude nothing checked, written machine-wide by a
+///   program, can break every command pando spawns; an unused answer
+///   cannot.
+fn volunteer(
+    paths: &PandoPaths,
+    config: &mut Config,
+    slot: Slot,
+    answers: &Answering<'_>,
+    progress: &dyn Fn(&str),
+) -> Result<bool> {
+    let Some(program) = answers.program else {
+        return Ok(false);
+    };
+    if slot == Slot::Prelude || !slot.allows_custom() {
+        return Ok(false);
+    }
+    // An empty proposal, so the question a program answers here is built
+    // by the same function every other question is — and so the decisions
+    // log records, honestly, that the rules offered nothing.
+    let proposal = detect::Proposal::of(slot, Vec::new(), false);
+    let question = question_for(&proposal, &[]);
+    let Some(answer) = program(&question) else {
+        return Ok(false);
+    };
+    let (answer, by) = answered_by(answer?);
+    let pending = pending_decision(&question, &proposal, &answer, by);
+    match answer {
+        Answer::Custom(value) => {
+            let candidate = detect::custom(slot, value.trim());
+            let note = by.note(config::Note::Answered);
+            write_answer(paths, config, slot, &candidate, note, pending, progress)?;
+        }
+        Answer::None if slot.allows_none() => {
+            write_empty_answer(
+                paths,
+                config,
+                slot,
+                by.note(config::Note::Answered),
+                pending,
+                progress,
+            )?;
+        }
+        // Nothing was on offer, so there was nothing to choose: only a
+        // typed answer, or the empty one where the slot has it.
+        _ => bail!(
+            "{} has no options here — the rules found nothing to offer, so only a command of \
+             your own is an answer",
+            slot_label(slot)
+        ),
+    }
+    progress(&format!(
+        "{}: nothing was proposed here, and the answer supplied was taken",
+        slot_label(slot)
+    ));
+    Ok(true)
 }
 
 /// Writes the answer to the one multi-select slot: a `[[services]]` entry
@@ -1776,14 +1954,14 @@ impl InitReport {
 pub fn init(
     paths: &PandoPaths,
     config: &Config,
-    ask: Ask<'_>,
+    answers: &Answering<'_>,
     progress: &dyn Fn(&str),
 ) -> Result<InitReport> {
     let before: Vec<bool> = ALL_SLOTS
         .iter()
         .map(|slot| already_answered(*slot, config))
         .collect();
-    resolve(paths, config, &ALL_SLOTS, ask, progress)?;
+    resolve_silencing(paths, config, &ALL_SLOTS, &[], answers, progress)?;
     // Read back from disk rather than reported from memory. The summary is
     // then a statement about the file that exists, and a file pando cannot
     // read again is a failure worth having at the end of `init` rather
@@ -1805,7 +1983,7 @@ pub fn init(
 pub fn init_dry_run(
     paths: &PandoPaths,
     config: &Config,
-    ask: Ask<'_>,
+    answers: &Answering<'_>,
     progress: &dyn Fn(&str),
 ) -> Result<(InitReport, Vec<(PathBuf, String)>)> {
     let scratch = Scratch::new(paths)?;
@@ -1828,7 +2006,7 @@ pub fn init_dry_run(
         }
         std::fs::write(to, text).with_context(|| format!("write {}", to.display()))?;
     }
-    let report = init(&previewed, config, ask, progress)?;
+    let report = init(&previewed, config, answers, progress)?;
     // Only the files this pass would *change*. A machine-wide config the
     // run never touched is not part of the answer to "what would you
     // write", and printing it back is noise in front of the thing that is.
@@ -9624,7 +9802,7 @@ time.sleep(300)
     #[test]
     fn init_takes_every_slot_a_rule_decided_and_asks_nothing() {
         let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");
-        let report = init(&fx.paths, &fx.config, &refuse, &noop).unwrap();
+        let report = init(&fx.paths, &fx.config, &Answering::asking(&refuse), &noop).unwrap();
 
         assert!(report.answered_anything());
         let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
@@ -9641,11 +9819,17 @@ time.sleep(300)
     #[test]
     fn a_second_init_asks_nothing_and_answers_nothing() {
         let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");
-        init(&fx.paths, &fx.config, &refuse, &noop).unwrap();
+        init(&fx.paths, &fx.config, &Answering::asking(&refuse), &noop).unwrap();
         let first = std::fs::read_to_string(fx.paths.config_file()).unwrap();
 
         let loaded = crate::config::load(&fx.paths).unwrap();
-        let report = init(&fx.paths, &loaded.config, &refuse, &noop).unwrap();
+        let report = init(
+            &fx.paths,
+            &loaded.config,
+            &Answering::asking(&refuse),
+            &noop,
+        )
+        .unwrap();
         assert!(!report.answered_anything());
         assert_eq!(
             std::fs::read_to_string(fx.paths.config_file()).unwrap(),
@@ -9663,7 +9847,7 @@ time.sleep(300)
             "PORT=3000\n",
         );
         let (ask, asked) = scripted(vec![Answer::Custom("pnpm dev".to_string())]);
-        let report = init(&fx.paths, &fx.config, &ask, &noop).unwrap();
+        let report = init(&fx.paths, &fx.config, &Answering::asking(&ask), &noop).unwrap();
 
         let slots: Vec<Slot> = asked.borrow().iter().map(|q| q.slot).collect();
         assert_eq!(
@@ -9689,7 +9873,7 @@ time.sleep(300)
     fn init_starts_nothing() {
         let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");
         let name = worktree_named(&fx, "feat/one");
-        init(&fx.paths, &fx.config, &refuse, &noop).unwrap();
+        init(&fx.paths, &fx.config, &Answering::asking(&refuse), &noop).unwrap();
         assert!(
             fx.state().worktrees[&name].processes.is_empty(),
             "init answered questions and started something"
@@ -9702,7 +9886,7 @@ time.sleep(300)
     #[test]
     fn the_summary_says_what_the_written_config_holds() {
         let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");
-        let report = init(&fx.paths, &fx.config, &refuse, &noop).unwrap();
+        let report = init(&fx.paths, &fx.config, &Answering::asking(&refuse), &noop).unwrap();
         let value = |slot: Slot| {
             report
                 .slots
@@ -9739,7 +9923,7 @@ time.sleep(300)
             Answer::Choice(0),
             Answer::Choice(0),
         ]);
-        let report = init(&fx.paths, &fx.config, &ask, &noop).unwrap();
+        let report = init(&fx.paths, &fx.config, &Answering::asking(&ask), &noop).unwrap();
         assert_eq!(
             asked.borrow().first().map(|q| q.slot),
             Some(Slot::Prelude),
@@ -11633,7 +11817,7 @@ time.sleep(300)
             config,
             &[Slot::Prelude],
             &[],
-            ask,
+            &Answering::asking(ask),
             &noop,
             &machine,
         )
@@ -11869,7 +12053,16 @@ time.sleep(300)
             shell: &panicking,
             home: machine.home.path().to_path_buf(),
         };
-        resolve_on(&fx.paths, &fx.config, &NEW_SLOTS, &[], &refuse, &noop, &m).unwrap();
+        resolve_on(
+            &fx.paths,
+            &fx.config,
+            &NEW_SLOTS,
+            &[],
+            &Answering::asking(&refuse),
+            &noop,
+            &m,
+        )
+        .unwrap();
         drop(shell);
     }
 }

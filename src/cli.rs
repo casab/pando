@@ -299,9 +299,20 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
         } => {
             let answers = answers.as_deref().map(read_answers).transpose()?;
             let ask = init_asker(answers.as_ref(), yes);
+            // The second channel: what the file has to say about a slot no
+            // rule proposed anything for, where there is no question to
+            // put to anybody and a program is the only one who could know.
+            let volunteered = volunteered_from(answers.as_ref());
+            let answering = match &volunteered {
+                Some(program) => actions::Answering::by_program(&ask, program),
+                None => actions::Answering::asking(&ask),
+            };
             let (report, preview) = match dry_run {
-                true => actions::init_dry_run(paths, config, &ask, &notice)?,
-                false => (actions::init(paths, config, &ask, &notice)?, Vec::new()),
+                true => actions::init_dry_run(paths, config, &answering, &notice)?,
+                false => (
+                    actions::init(paths, config, &answering, &notice)?,
+                    Vec::new(),
+                ),
             };
             // Before the summary, because it is about what the file the
             // summary describes does *not* say.
@@ -964,6 +975,19 @@ fn read_answers(path: &str) -> Result<Answers> {
         }
     };
     Answers::parse(&text)
+}
+
+/// The answers file as the volunteered channel, for the slots no rule
+/// proposed anything for.
+///
+/// Separate from the asker on purpose: a volunteered answer is only ever
+/// *offered*, never demanded, so `None` here means "this pass has no
+/// program behind it" and a slot the rules are silent about stays silent.
+fn volunteered_from(
+    answers: Option<&Answers>,
+) -> Option<impl Fn(&actions::Question) -> Option<Result<actions::Answer>> + '_> {
+    let answers = answers?;
+    Some(move |question: &actions::Question| answers.for_question(question))
 }
 
 /// The `init` asker: the answers file where it has something to say, and

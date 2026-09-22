@@ -168,7 +168,7 @@ loops:
 
 | State | Means | What a program does |
 |---|---|---|
-| `"proposal": null` | no rule had anything to say about this slot at all | **Nothing to answer.** An `--answers` value for it is reported as unused and not applied. Do not ask a human either — pando is not asking |
+| `"proposal": null` | no rule had anything to say about this slot at all | **Nothing to choose, and still answerable.** There are no options and nobody is asked, so an `--answers` value is taken as a command of your own — validated and written like any other. `services` and `prelude` are the two exceptions and report it as unused. Do not put the slot to a human: pando is not asking |
 | `"decided": true` | a rule settled it; no question will be asked | Leave it alone. An `--answers` value for it is reported as unused |
 | `"decided": false` | pando will ask | This is the only state an answer changes. Answer by value |
 
@@ -176,13 +176,23 @@ A proposal with `"decided": true`, no candidates and a `none_because` is a
 rule deciding the answer is *none of them* — which is a real answer, and
 the opposite of `"proposal": null`.
 
-Two more facts about `slots` that are not visible in the shape:
+`answered` is the key that says a `null` proposal is closed. A slot a
+program filled still has no proposal — nothing about the rules changed —
+so a reader that watches `proposal` alone will answer it again on every
+run. Watch `answered`.
+
+Three more facts about `slots` that are not visible in the shape:
 
 - **`prelude` is never proposed here.** It is the one question about this
   laptop rather than this repository, it costs a `bash -lc` probe, and
   `signals` spawns nothing. It is asked only when this machine does not
   resolve what the project pins; `doctor`'s `runtime` section is where that
   evidence lives.
+- **Two slots take no answer when nothing was proposed.** The set question,
+  `services`, is answered by naming options, and there are none. `prelude`
+  is verified against this machine before it is written, and the check only
+  exists behind the proposal that raises the question. A value for either
+  is reported as unused.
 - **Answering one slot can settle another.** Taking the per-app form at
   `processes` fills the dev command and its ports for every app, so
   `dev_cmd` and `port_env` are never asked and an answer sent for them is
@@ -377,7 +387,7 @@ One JSON object. Keys are the question names above. Values:
 
 | JSON | Means |
 |---|---|
-| `"some text"` | the option whose `value` is exactly that text, **or**, if nothing matches, a command of your own (where `allow_custom` is true) |
+| `"some text"` | the option whose `value` is exactly that text, **or**, if nothing matches — or there were no options at all — a command of your own (where `allow_custom` is true) |
 | `["a", "b"]` | the set answer, at the one question where `multi` is true; every element must name an option |
 | `["a", "b"]` | the whole list, at `version_files` and `provision`, whose single answer is a list of files |
 | `null` | "none of them", where `allow_none` is true |
