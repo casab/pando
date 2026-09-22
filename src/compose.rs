@@ -29,35 +29,6 @@ pub const COMPOSE_FILES: [&str; 4] = [
     "docker-compose.yml",
 ];
 
-/// Container ports for images pando knows, for a service whose compose
-/// entry publishes nothing.
-///
-/// A service with no `ports` is one the project reaches over the compose
-/// network, where nothing needs publishing. An isolated worktree runs its
-/// processes on the host, so the port has to be published — and this table
-/// is the only way to know which one, short of pulling the image and
-/// reading its `EXPOSE`. A service that is in neither the file nor this
-/// table is refused for isolation by name; guessing would publish the
-/// wrong port and fail much later, inside the app.
-///
-/// Matched against the image name with the tag stripped, by the last path
-/// segment, so `postgres:16`, `library/postgres`, and
-/// `public.ecr.aws/docker/library/postgres:16-alpine` all match `postgres`.
-const IMAGE_PORTS: [(&str, &[u16]); 12] = [
-    ("postgres", &[5432]),
-    ("postgis", &[5432]),
-    ("mysql", &[3306]),
-    ("mariadb", &[3306]),
-    ("redis", &[6379]),
-    ("valkey", &[6379]),
-    ("mongo", &[27017]),
-    ("mailpit", &[8025, 1025]),
-    ("mailhog", &[8025, 1025]),
-    ("elasticsearch", &[9200]),
-    ("rabbitmq", &[5672, 15672]),
-    ("minio", &[9000, 9001]),
-];
-
 /// The compose file as much of it as pando needs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ComposeFile {
@@ -188,21 +159,10 @@ impl Service {
     }
 }
 
-/// The container ports pando knows for an image, by its last path segment
-/// with any tag or digest stripped.
+/// The container ports pando knows for an image, from
+/// [`crate::catalog::images`].
 pub fn image_ports(image: &str) -> Option<&'static [u16]> {
-    let name = image_name(image);
-    IMAGE_PORTS
-        .iter()
-        .find(|(known, _)| *known == name)
-        .map(|(_, ports)| *ports)
-}
-
-/// `public.ecr.aws/docker/library/postgres:16-alpine` becomes `postgres`.
-fn image_name(image: &str) -> &str {
-    let image = image.split('@').next().unwrap_or(image);
-    let last = image.rsplit('/').next().unwrap_or(image);
-    last.split(':').next().unwrap_or(last)
+    crate::catalog::images::ports(image)
 }
 
 /// The compose file `root` declares, if any, in compose's own precedence

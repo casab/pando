@@ -4,48 +4,13 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::catalog::images::{self, Role};
 use crate::catalog::package_managers;
 use crate::config::Config;
 
 use super::dev::{listed, lockfiles, python_runner};
 use super::proposal::{Candidate, ComposeResolver, Proposal, ServiceHint, Slot};
 use super::signals::Signals;
-
-/// Images an application talks to, and the env-key prefixes that name one
-/// when the service's own name does not.
-///
-/// A service whose image is on this list and that nothing in the env
-/// example points at is the ambiguous case: the developer may want a
-/// private copy of it and pando cannot tell, so it asks. A service whose
-/// image is *not* on this list — a mail catcher, a dashboard, something
-/// pando has never heard of — is left unticked without a question, because
-/// an app that never reads an address for it is not talking to it.
-const SERVICE_IMAGES: [(&str, &[&str]); 12] = [
-    (
-        "postgres",
-        &["DATABASE", "DB", "POSTGRES", "PG", "POSTGRESQL"],
-    ),
-    ("postgis", &["DATABASE", "DB", "POSTGRES", "PG"]),
-    ("mysql", &["DATABASE", "DB", "MYSQL"]),
-    ("mariadb", &["DATABASE", "DB", "MYSQL", "MARIADB"]),
-    ("redis", &["REDIS", "CACHE"]),
-    ("valkey", &["REDIS", "VALKEY", "CACHE"]),
-    ("mongo", &["MONGO", "MONGODB", "DATABASE"]),
-    ("elasticsearch", &["ELASTIC", "ELASTICSEARCH", "SEARCH"]),
-    ("rabbitmq", &["RABBITMQ", "AMQP", "QUEUE", "BROKER"]),
-    ("kafka", &["KAFKA", "BROKER"]),
-    ("minio", &["MINIO", "S3", "STORAGE"]),
-    ("clickhouse", &["CLICKHOUSE"]),
-];
-
-/// Prefixes for images an app usually does not address, so a missing key
-/// is not a question. A mail catcher is the classic: it exists so nothing
-/// leaves the machine, and half of them are never configured at all.
-const UTILITY_IMAGES: [(&str, &[&str]); 3] = [
-    ("mailpit", &["SMTP", "MAIL", "MAILER"]),
-    ("mailhog", &["SMTP", "MAIL", "MAILER"]),
-    ("maildev", &["SMTP", "MAIL", "MAILER"]),
-];
 
 /// Key suffixes that hold an address pando can rewrite. `_NAME`, `_USER`
 /// and `_PASSWORD` are about the same service and hold nothing pando can
@@ -88,13 +53,8 @@ fn env_key_for(
     claimed: &BTreeMap<String, String>,
 ) -> EnvKey {
     let mut prefixes: Vec<String> = vec![service.to_uppercase()];
-    if let Some(image) = image {
-        let family = image_family(image);
-        for (known, keys) in SERVICE_IMAGES.iter().chain(UTILITY_IMAGES.iter()) {
-            if Some(*known) == family {
-                prefixes.extend(keys.iter().map(|k| (*k).to_string()));
-            }
-        }
+    if let Some(known) = image.and_then(images::known) {
+        prefixes.extend(known.env_prefixes.iter().map(|k| (*k).to_string()));
     }
     // By suffix first, then by prefix: the best *kind* of key wins over
     // the best-matching name, because a `_PORT` that merely belongs to a
@@ -127,24 +87,10 @@ fn env_key_for(
     taken.unwrap_or(EnvKey::Nothing)
 }
 
-/// The image's last path segment with its tag stripped, when pando knows
-/// it as either kind of service.
-fn image_family(image: &str) -> Option<&'static str> {
-    let image = image.split('@').next().unwrap_or(image);
-    let last = image.rsplit('/').next().unwrap_or(image);
-    let name = last.split(':').next().unwrap_or(last);
-    SERVICE_IMAGES
-        .iter()
-        .chain(UTILITY_IMAGES.iter())
-        .map(|(known, _)| *known)
-        .find(|known| *known == name)
-}
-
 fn is_app_service(image: Option<&str>) -> bool {
-    let Some(family) = image.and_then(image_family) else {
-        return false;
-    };
-    SERVICE_IMAGES.iter().any(|(known, _)| *known == family)
+    image
+        .and_then(images::known)
+        .is_some_and(|known| known.role == Role::App)
 }
 
 /// Where a service a proposal offers would come from.
@@ -201,7 +147,7 @@ impl MachineEvidence {
 /// number defaults to.
 ///
 /// Not the key's prefix. `DATABASE_URL` is `DATABASE` for Postgres, MySQL
-/// and MongoDB alike in [`SERVICE_IMAGES`] — good enough to *match* a key
+/// and MongoDB alike in [`images::IMAGES`] — good enough to *match* a key
 /// to a compose service whose image already named the engine, and no use
 /// at all for working out which engine a project wants when nothing else
 /// says. `postgres://` says it; `5432` says it.
