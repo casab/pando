@@ -3683,6 +3683,18 @@ mod tests {
         assert_every_documented_command_is_real("agent/json.md");
     }
 
+    // The host wrappers are glue, but glue that names commands: the same
+    // rename that would rot the brief rots them.
+    #[test]
+    fn every_host_wrapper_only_names_commands_pando_has() {
+        for file in [
+            "agent/skills/pando-setup/SKILL.md",
+            "agent/skills/pando-operate/SKILL.md",
+        ] {
+            assert_every_documented_command_is_real(file);
+        }
+    }
+
     // The brief is a procedure written for a language model, which is the
     // one kind of reader that will follow a command that does not exist
     // and report that it worked.

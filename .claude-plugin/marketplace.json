@@ -1,0 +1,14 @@
+{
+  "name": "pando",
+  "description": "The pando plugin: set pando up on a project, and operate it day to day.",
+  "owner": {
+    "name": "pando"
+  },
+  "plugins": [
+    {
+      "name": "pando",
+      "source": "./agent",
+      "description": "Set pando up on a project and operate it: a git worktree per branch, each with its own dev server, private services, logs and shareable URL."
+    }
+  ]
+}
