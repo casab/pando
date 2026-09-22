@@ -30,10 +30,15 @@ fn read(relative: &str) -> String {
 
 /// Every host wrapper, by path. One list, so a host added later cannot
 /// escape any test here.
-const WRAPPERS: [&str; 2] = [
+const WRAPPERS: [&str; 4] = [
     "agent/skills/pando-setup/SKILL.md",
     "agent/skills/pando-operate/SKILL.md",
+    "agent/codex/pando-setup/SKILL.md",
+    "agent/codex/pando-operate/SKILL.md",
 ];
+
+/// The two skills, under the names both hosts use for them.
+const SKILLS: [&str; 2] = ["pando-setup", "pando-operate"];
 
 /// The frontmatter block and the body, split at the closing `---`.
 fn frontmatter_and_body(text: &str) -> (String, String) {
@@ -115,11 +120,11 @@ fn every_wrapper_sends_its_reader_to_the_brief() {
 /// not a place anything can be relied on to exist.
 #[test]
 fn the_brief_is_reachable_from_every_wrapper_as_it_names_it() {
-    for file in WRAPPERS {
-        let text = read(file);
+    for skill in SKILLS {
+        let text = read(&format!("agent/skills/{skill}/SKILL.md"));
         assert!(
             text.contains("${CLAUDE_PLUGIN_ROOT}/brief.md"),
-            "{file} must reach the brief through the plugin root, which is agent/"
+            "agent/skills/{skill} must reach the brief through the plugin root, which is agent/"
         );
     }
     // Which is only true because the plugin root is the directory the
@@ -127,6 +132,87 @@ fn the_brief_is_reachable_from_every_wrapper_as_it_names_it() {
     assert!(repo("agent/.claude-plugin/plugin.json").is_file());
     assert!(repo("agent/brief.md").is_file());
     assert!(repo("agent/json.md").is_file());
+
+    // Codex has no such variable, so its installer puts the brief beside
+    // the wrapper that names it. Run for real, into a temporary home —
+    // the claim "beside this file" is worth nothing unless something
+    // checks that it lands there.
+    let home = tempfile::tempdir().unwrap();
+    let out = std::process::Command::new("bash")
+        .arg(repo("agent/codex/install.sh"))
+        .env("CODEX_HOME", home.path())
+        .output()
+        .expect("run the installer");
+    assert!(
+        out.status.success(),
+        "the installer failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for skill in SKILLS {
+        let installed = home.path().join("skills").join(skill);
+        for file in ["SKILL.md", "brief.md", "json.md"] {
+            assert!(
+                installed.join(file).is_file(),
+                "{} is not there after an install",
+                installed.join(file).display()
+            );
+        }
+        // The same brief, not a second one.
+        assert_eq!(
+            std::fs::read_to_string(installed.join("brief.md")).unwrap(),
+            read("agent/brief.md"),
+            "the installed brief is not the one in the repository"
+        );
+        assert_eq!(
+            std::fs::read_to_string(installed.join("SKILL.md")).unwrap(),
+            read(&format!("agent/codex/{skill}/SKILL.md"))
+        );
+    }
+    // And it wrote nowhere else: a script that installs into somebody's
+    // real home when asked for a temporary one is a script nothing can
+    // test.
+    let mut top: Vec<String> = std::fs::read_dir(home.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    top.sort();
+    assert_eq!(top, vec!["skills"]);
+}
+
+/// Both hosts, the same two skills, under the same two names.
+///
+/// A developer who moves between them should not have to learn a second
+/// vocabulary, and a bug report naming a skill should be findable in
+/// either packaging.
+#[test]
+fn both_hosts_ship_the_same_two_skills_under_the_same_names() {
+    for host in ["agent/skills", "agent/codex"] {
+        for skill in SKILLS {
+            let file = format!("{host}/{skill}/SKILL.md");
+            let (front, _) = frontmatter_and_body(&read(&file));
+            assert!(
+                front.contains(&format!("name: {skill}")),
+                "{file} calls itself something else"
+            );
+        }
+    }
+    // And they describe themselves identically, because they are the same
+    // skill: a host that matched one and not the other would send a
+    // developer down two different paths for the same request.
+    for skill in SKILLS {
+        let described = |host: &str| {
+            frontmatter_and_body(&read(&format!("{host}/{skill}/SKILL.md")))
+                .0
+                .lines()
+                .find_map(|l| l.strip_prefix("description: ").map(str::to_string))
+                .expect("a description")
+        };
+        assert_eq!(
+            described("agent/skills"),
+            described("agent/codex"),
+            "{skill} means two different things to the two hosts"
+        );
+    }
 }
 
 #[test]

@@ -3688,8 +3688,11 @@ mod tests {
     #[test]
     fn every_host_wrapper_only_names_commands_pando_has() {
         for file in [
+            "agent/README.md",
             "agent/skills/pando-setup/SKILL.md",
             "agent/skills/pando-operate/SKILL.md",
+            "agent/codex/pando-setup/SKILL.md",
+            "agent/codex/pando-operate/SKILL.md",
         ] {
             assert_every_documented_command_is_real(file);
         }
