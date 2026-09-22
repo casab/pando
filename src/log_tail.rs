@@ -888,6 +888,26 @@ impl LogTail {
         }
     }
 
+    /// Pushes the unterminated final line, when there is one, as a line.
+    /// Whether it pushed anything.
+    ///
+    /// A follower must never call this: more of that line is still coming,
+    /// and pushing it now would print it again when its newline arrives.
+    /// A one-shot read has no "still coming" — the file is what it is,
+    /// which is what `tail` does and what [`snapshot`] has always done.
+    /// Without it, `pando logs` withheld a crash's last words for want of
+    /// a newline while the failure classifier, which reads through
+    /// `snapshot`, could see them.
+    pub fn flush_pending(&mut self) -> bool {
+        if self.leftover.is_empty() {
+            return false;
+        }
+        let leftover = std::mem::take(&mut self.leftover);
+        let offset = self.line_start_offset;
+        self.push_line(&leftover, offset);
+        true
+    }
+
     fn push_line(&mut self, raw: &str, file_offset: u64) {
         if self.buffer.len() == self.capacity
             && let Some(evicted) = self.buffer.pop_front()
@@ -941,13 +961,7 @@ impl LogTail {
 pub fn snapshot(path: &Path, max_lines: usize) -> Result<Vec<String>> {
     let mut tail = LogTail::new(path.to_path_buf(), max_lines);
     tail.poll()?;
-    // A one-shot read won't get a terminating newline for the last line of a
-    // file that doesn't end in one; flush it so the final line isn't dropped.
-    if !tail.leftover.is_empty() {
-        let leftover = std::mem::take(&mut tail.leftover);
-        let offset = tail.line_start_offset;
-        tail.push_line(&leftover, offset);
-    }
+    tail.flush_pending();
     Ok(tail.lines().iter().map(|l| l.plain.clone()).collect())
 }
 

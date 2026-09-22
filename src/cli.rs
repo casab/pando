@@ -2275,6 +2275,11 @@ pub fn logs<W: Write>(
     tailer
         .poll()
         .with_context(|| format!("read {}", path.display()))?;
+    // A one-shot read takes the file as it stands, unterminated last line
+    // and all. A follower may not: the rest of that line is still coming.
+    if !follow {
+        tailer.flush_pending();
+    }
     let first = tailer.lines().len().saturating_sub(tail);
     let mut printed = 0usize;
     for line in tailer.lines().iter().skip(first) {
@@ -3456,15 +3461,36 @@ mod tests {
         );
     }
 
-    /// A file with bytes in it and no complete line is a different state
-    /// again, and used to be the same silence.
+    /// A process killed mid-line leaves its last words without a newline.
+    /// The failure classifier reads them — `snapshot` flushes the pending
+    /// line — and `pando logs` used to withhold them and print nothing, so
+    /// pando knew more about the crash than the developer could see.
     #[test]
-    fn a_log_with_no_complete_line_says_so_rather_than_nothing() {
+    fn a_last_line_with_no_newline_is_still_printed() {
         let fx = fixture();
-        write_log(&fx, "feat+one", "dev", "half a line with no newline");
+        write_log(&fx, "feat+one", "dev", "done\nSegmentation fault");
         let (text, notes) =
             capture_both(|b, n| logs(&fx.paths, "feat+one", "dev", 10, false, false, b, n));
-        assert_eq!(text, "");
+        assert_eq!(text, "done\nSegmentation fault\n");
+        assert!(
+            notes.is_empty(),
+            "there was something to print, so nothing to explain: {notes:?}"
+        );
+    }
+
+    /// Which leaves one state a one-shot read cannot reach and a follower
+    /// can: `-f` on a file holding an unterminated first line, where the
+    /// rest of it really is still coming.
+    #[test]
+    fn a_log_with_no_complete_line_is_described_by_its_size() {
+        let fx = fixture();
+        write_log(&fx, "feat+one", "dev", "half a line with no newline");
+        let notes = silence_notes(
+            &fx.paths,
+            "feat+one",
+            "dev",
+            &fx.paths.log_file("feat+one", "dev"),
+        );
         assert!(
             notes.iter().any(|n| n.contains("27 bytes")),
             "the size is the whole difference from an empty file: {notes:?}"
