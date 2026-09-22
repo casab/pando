@@ -403,7 +403,9 @@ Refusals, all exit 2 and all naming the key: a name that is not a question;
 a shape the question cannot take; a value that is not one of the options at
 a question that has them; an empty string. An answer for a slot that was
 already answered, or that nothing asked about, is **reported on stderr and
-not applied** — it is not an error, and the run still exits 0.
+not applied** — it is not an error, and the run still exits 0. A slot with
+no proposal at all is not "nothing asked about": it takes a custom answer,
+except at `services` and `prelude`. See the three-state table above.
 
 `--dry-run` runs the same pass against copies of the files it would write
 and prints them on stdout, config first. Use it to show a diff before

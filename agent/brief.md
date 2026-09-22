@@ -29,13 +29,22 @@ pando doctor --json      # what this machine answers, and what is wrong
 
 **Do not re-derive any of this.** No `cat package.json`, no `ls`, no
 `docker compose config`, no `node --version`. Everything those would tell
-you is already in the two objects above, and where it is *not*, that
-absence is itself the answer — a rule looked and found nothing, and your
-job is to notice that, not to go looking with different eyes.
+you is already in the two objects above, and for everything the rules
+cover, an absence there is itself the answer — a rule looked and found
+nothing, and your job is to notice that, not to go looking with different
+eyes.
 
-Read the repository's own files only when you are about to ask a human
-something and need one more sentence to make the question intelligible.
-Never as a substitute for `signals`.
+There is one exception, and §2 is where it is spelled out: a slot with
+**no proposal at all** is not a rule saying "no". It is the rules having
+nothing to offer, and it is the one place where something the project
+says about itself — a line in its README, a `Makefile` target the
+developer points you at — may become the answer. Even there, read for
+*that* question only, and never to second-guess a proposal `signals`
+already made.
+
+Read the repository's own files, otherwise, only when you are about to
+ask a human something and need one more sentence to make the question
+intelligible. Never as a substitute for `signals`.
 
 ## 1. The question budget
 
