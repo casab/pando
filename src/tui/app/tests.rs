@@ -2514,32 +2514,39 @@ fn a_busy_log() -> Vec<String> {
 #[test]
 fn the_tui_spawns_nothing_that_could_paint_over_the_screen() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let expected: [(&str, usize); 17] = [
-        ("src/tui/app/mod.rs", 0),
-        ("src/tui/app/background.rs", 0),
-        ("src/tui/app/dialogs.rs", 0),
-        ("src/tui/app/log_keys.rs", 0),
-        ("src/tui/app/log_view.rs", 0),
-        ("src/tui/app/operations.rs", 2),
-        ("src/tui/app/pending.rs", 0),
-        ("src/tui/app/tails.rs", 0),
-        ("src/tui/app/tests.rs", 0),
-        ("src/tui/render/mod.rs", 0),
-        ("src/tui/render/chrome.rs", 0),
-        ("src/tui/render/detail.rs", 0),
-        ("src/tui/render/list.rs", 0),
-        ("src/tui/render/log_viewer.rs", 0),
-        ("src/tui/render/tests.rs", 0),
-        ("src/tui/modal.rs", 0),
-        ("src/tui/mod.rs", 0),
-    ];
+    // Every file under `src/tui/`, found rather than listed, so a file
+    // added later is held to the rule without anyone remembering to add
+    // it here. Only these may spawn at all.
+    let allowed_spawns = |file: &str| match file {
+        "src/tui/app/operations.rs" => 2,
+        _ => 0,
+    };
+    let mut files: Vec<String> = Vec::new();
+    let mut dirs = vec![root.join("src/tui")];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let rel = path.strip_prefix(root).unwrap();
+                files.push(rel.to_string_lossy().into_owned());
+            }
+        }
+    }
+    files.sort();
+    assert!(
+        files.iter().any(|f| f == "src/tui/app/operations.rs"),
+        "the file allowed to spawn has moved: {files:?}"
+    );
     // Built rather than written, so this test does not match itself.
     // `wait` as well as `status`: waiting on a child pando spawned
     // blocks whatever thread asks, and the rule is about the thread,
     // not about which call is used to wait.
     let blocking = [format!(".{}()", "status"), format!(".{}()", "wait")];
     let spawn = format!("Command::{}", "new");
-    for (file, allowed) in expected {
+    for file in &files {
+        let allowed = allowed_spawns(file);
         let whole = std::fs::read_to_string(root.join(file)).unwrap();
         // Comments explain the rule; code has to keep it.
         let source: String = whole
