@@ -2829,7 +2829,7 @@ pub fn start(
         progress(&notice);
     }
     advance_before_reconcile(&mut store);
-    state::reconcile(&mut store, proc::is_alive);
+    state::reconcile(&mut store, proc::is_alive, proc::group_alive);
 
     let record = store
         .worktrees
@@ -3216,7 +3216,7 @@ fn stop_missing(
             progress(&notice);
         }
         advance_before_reconcile(&mut store);
-        state::reconcile(&mut store, proc::is_alive);
+        state::reconcile(&mut store, proc::is_alive, proc::group_alive);
         if let Some(record) = store.worktrees.get(name) {
             clear_native_sockets(paths, name, record);
         }
@@ -3309,7 +3309,7 @@ pub fn stop_all_with(
                     progress(&notice);
                 }
                 advance_before_reconcile(&mut store);
-                state::reconcile(&mut store, proc::is_alive);
+                state::reconcile(&mut store, proc::is_alive, proc::group_alive);
             }
             Err(e) => sweep_failed = Some(e),
         }
@@ -3679,7 +3679,7 @@ pub fn share_with(
             progress(&notice);
         }
         advance_before_reconcile(&mut store);
-        state::reconcile(&mut store, proc::is_alive);
+        state::reconcile(&mut store, proc::is_alive, proc::group_alive);
 
         let record = store
             .worktrees
@@ -5502,9 +5502,10 @@ pub fn inspect(paths: &PandoPaths) -> Refreshed {
 /// by the read path and by every mutation that is about to `reconcile`.
 fn advance_with(store: &mut state::State, scans: &BTreeMap<i32, Option<Vec<u16>>>) -> bool {
     let failed_before = failed_processes(store);
-    let mut changed = state::advance_phases(store, proc::is_alive, |pgid, port| {
-        port_is_bound(scans, pgid, port)
-    });
+    let mut changed =
+        state::advance_phases(store, proc::is_alive, proc::group_alive, |pgid, port| {
+            port_is_bound(scans, pgid, port)
+        });
     changed |= explain_new_failures(store, &failed_before);
     changed
 }
@@ -6449,12 +6450,82 @@ mod tests {
         assert!(state::advance_phases(
             &mut store,
             crate::process::is_alive,
+            crate::process::group_alive,
             |_, _| false
         ));
         assert!(matches!(
             store.worktrees[&name].processes["dev"].phase,
             Phase::Running { .. }
         ));
+    }
+
+    /// A dev command that backgrounds its server and returns.
+    ///
+    /// `swift build && ./app &`, `npm run dev &`, any recipe line ending
+    /// in `&`: the `bash -lc` pando spawned is the group leader, and it
+    /// exits the moment it has started the thing it was asked to start.
+    /// Asking after the leader alone calls that worktree Failed while the
+    /// application is serving — confidently wrong in the opposite
+    /// direction from the truth, which is the worst shape a report can
+    /// have. Found the first time pando was run on a repository it had
+    /// not generated, whose Makefile did exactly this.
+    ///
+    /// Two failures, not one: the phase flips to Failed, and `reconcile`
+    /// then drops the record outright, so the worktree stops listing the
+    /// process it is still running. Both read liveness of the group now,
+    /// which is what `stop` has always asked.
+    #[test]
+    fn a_process_that_backgrounds_its_server_is_not_called_dead() {
+        let mut fx = fixture();
+        with_dev(
+            &mut fx,
+            ProcessConfig {
+                // The leader exits at once; the group keeps a child.
+                cmd: "sleep 30 &".to_string(),
+                ports: Some(crate::config::PortsSpec::List(Vec::new())),
+                ..Default::default()
+            },
+        );
+        let name = worktree_named(&fx, "feat/one");
+        let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+        let _guard = guard(&outcome);
+
+        // The leader does not go at once: measured, a `bash -lc` that
+        // backgrounds something lives about half a second before it
+        // exits. A shorter wait than this passes for the wrong reason —
+        // it reads the window where the leader is still alive and never
+        // exercises the group probe at all.
+        let leader = outcome.started[0].record.pid;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while crate::process::is_alive(leader) {
+            assert!(
+                Instant::now() < deadline,
+                "the leader never exited, so this test would prove nothing"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        for read in 0..3 {
+            let state = refresh(&fx.paths).state;
+            let record = state.worktrees[&name]
+                .processes
+                .get("dev")
+                .unwrap_or_else(|| {
+                    panic!("read {read}: reconcile dropped a process whose group is alive")
+                });
+            assert!(
+                matches!(record.phase, Phase::Running { .. }),
+                "read {read}: the leader exited but its group is serving: {:?}",
+                record.phase
+            );
+        }
+        assert_eq!(
+            state::aggregate_phase(&fx.state().worktrees[&name])
+                .expect("a phase")
+                .word(),
+            "running",
+            "and the worktree a list shows reads as running"
+        );
     }
 
     /// A desktop application, a worker, a watcher: something that owns no
@@ -6573,6 +6644,7 @@ mod tests {
         assert!(state::advance_phases(
             &mut store,
             crate::process::is_alive,
+            crate::process::group_alive,
             |pgid, port| port_is_bound(&scans, pgid, port)
         ));
         assert!(

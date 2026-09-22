@@ -264,12 +264,49 @@ pub fn save(path: &Path, state: &State) -> Result<()> {
 ///
 /// Every read path calls this before trusting the map. Returns whether
 /// anything changed, so a caller holding the lock knows to save.
-pub fn reconcile(state: &mut State, is_alive: impl Fn(u32) -> bool) -> bool {
+/// Whether a process record still has something behind it.
+///
+/// The leader first, because that is the question `stop` and the Phase 2b
+/// orphan handling were both designed around: a `sleep 300 & exit 0` leaves
+/// a child holding the group open, and pando calls that record Failed so it
+/// survives `reconcile` and stays stoppable.
+///
+/// The group is consulted for **one** shape: a process that owns no port.
+/// A dev command that backgrounds its server and returns leaves exactly the
+/// same trace as an orphan — leader gone, group alive — and when a port is
+/// configured pando can tell them apart by asking whether anything bound
+/// it. When no port is configured there is no such question to ask, and
+/// reading the leader alone reports a dead worktree over a desktop
+/// application that is running. Measured on a real project: the `bash -lc`
+/// leader lives about half a second after backgrounding, and every read
+/// after that called it dead.
+fn record_alive(
+    pid: u32,
+    pgid: i32,
+    ready_port: Option<u16>,
+    is_alive: &impl Fn(u32) -> bool,
+    group_alive: &impl Fn(i32) -> bool,
+) -> bool {
+    // Reaps a zombie when we are the parent, which is what keeps the group
+    // probe below from seeing a corpse as a member.
+    if is_alive(pid) {
+        return true;
+    }
+    ready_port.is_none() && group_alive(pgid)
+}
+
+pub fn reconcile(
+    state: &mut State,
+    is_alive: impl Fn(u32) -> bool,
+    group_alive: impl Fn(i32) -> bool,
+) -> bool {
     let mut changed = false;
     for rec in state.worktrees.values_mut() {
         let before = rec.processes.len();
-        rec.processes
-            .retain(|_, p| is_alive(p.pid) || matches!(p.phase, Phase::Failed { .. }));
+        rec.processes.retain(|_, p| {
+            record_alive(p.pid, p.pgid, p.ready_port, &is_alive, &group_alive)
+                || matches!(p.phase, Phase::Failed { .. })
+        });
         changed |= rec.processes.len() != before;
 
         // A native service *is* its process, so a dead pid is a dead
@@ -336,6 +373,7 @@ fn sweep_dead_shares(state: &mut State, is_alive: &impl Fn(u32) -> bool) -> bool
 pub fn advance_phases(
     state: &mut State,
     is_alive: impl Fn(u32) -> bool,
+    group_alive: impl Fn(i32) -> bool,
     port_bound: impl Fn(i32, u16) -> bool,
 ) -> bool {
     let now = Utc::now();
@@ -348,7 +386,13 @@ pub fn advance_phases(
                         .ready_timeout_s
                         .map(|s| s as i64)
                         .unwrap_or(START_TIMEOUT_SECS);
-                    if !is_alive(proc.pid) {
+                    if !record_alive(
+                        proc.pid,
+                        proc.pgid,
+                        proc.ready_port,
+                        &is_alive,
+                        &group_alive,
+                    ) {
                         proc.phase = Phase::Failed {
                             at: now,
                             reason: EXITED.into(),
@@ -377,7 +421,13 @@ pub fn advance_phases(
                     }
                 }
                 Phase::Running { .. } => {
-                    if !is_alive(proc.pid) {
+                    if !record_alive(
+                        proc.pid,
+                        proc.pgid,
+                        proc.ready_port,
+                        &is_alive,
+                        &group_alive,
+                    ) {
                         proc.phase = Phase::Failed {
                             at: now,
                             reason: EXITED.into(),
@@ -870,7 +920,7 @@ mod tests {
         rec.processes.insert("api".into(), running(200));
         state.worktrees.insert("w".into(), rec);
 
-        assert!(reconcile(&mut state, |pid| pid == 100));
+        assert!(reconcile(&mut state, |pid| pid == 100, |_| false));
         let rec = state.worktrees.get("w").unwrap();
         assert!(rec.processes.contains_key("dev"));
         assert!(
@@ -892,7 +942,7 @@ mod tests {
             .insert("api".into(), process(200, failed(12, "process exited")));
         state.worktrees.insert("w".into(), rec);
 
-        assert!(reconcile(&mut state, |_| false));
+        assert!(reconcile(&mut state, |_| false, |_| false));
         let rec = state.worktrees.get("w").unwrap();
         assert!(
             !rec.processes.contains_key("web"),
@@ -910,7 +960,7 @@ mod tests {
     fn reconcile_keeps_the_worktree_record_and_its_ports() {
         let mut state = State::new();
         state.worktrees.insert("w".into(), record_with(999_999));
-        reconcile(&mut state, |_| false);
+        reconcile(&mut state, |_| false, |_| false);
 
         let rec = state.worktrees.get("w").expect("the record survives");
         assert!(rec.processes.is_empty());
@@ -929,14 +979,14 @@ mod tests {
     fn reconcile_is_a_no_op_when_everything_is_alive() {
         let mut state = full_state();
         let before = state.clone();
-        assert!(!reconcile(&mut state, |_| true));
+        assert!(!reconcile(&mut state, |_| true, |_| false));
         assert_eq!(state, before);
     }
 
     #[test]
     fn reconcile_drops_native_services_whose_process_died_and_keeps_compose() {
         let mut state = full_state();
-        reconcile(&mut state, |pid| pid != 5150);
+        reconcile(&mut state, |pid| pid != 5150, |_| false);
         let services = &state.worktrees.get("feat+x").unwrap().services;
         assert_eq!(services.len(), 1);
         assert_eq!(services[0].name, "postgres");
@@ -952,7 +1002,7 @@ mod tests {
             rec.services[0].pid = Some(9001);
             rec.services[0].pgid = Some(9001);
         }
-        assert!(reconcile(&mut state, |pid| pid != 9001));
+        assert!(reconcile(&mut state, |pid| pid != 9001, |_| false));
         let services = &state.worktrees.get("feat+x").unwrap().services;
         let compose = services.iter().find(|s| s.name == "postgres").unwrap();
         assert_eq!(compose.pid, None, "the pump is forgotten");
@@ -968,7 +1018,7 @@ mod tests {
     #[test]
     fn reconcile_clears_observed_ports_once_nothing_runs() {
         let mut state = full_state();
-        reconcile(&mut state, |_| false);
+        reconcile(&mut state, |_| false, |_| false);
         assert!(
             state
                 .worktrees
@@ -982,7 +1032,7 @@ mod tests {
     #[test]
     fn reconcile_clears_a_share_whose_tunnel_died() {
         let mut state = full_state();
-        assert!(reconcile(&mut state, |pid| pid != 7000));
+        assert!(reconcile(&mut state, |pid| pid != 7000, |_| false));
         assert!(state.worktrees.get("feat+x").unwrap().share.is_none());
     }
 
@@ -994,7 +1044,7 @@ mod tests {
             share.proxy_pgid = Some(999_999);
             share.proxy_port = Some(17_500);
         }
-        reconcile(&mut state, |pid| pid != 999_999);
+        reconcile(&mut state, |pid| pid != 999_999, |_| false);
         assert!(
             state.worktrees.get("feat+x").unwrap().share.is_none(),
             "a tunnel without its proxy serves the wrong thing"
@@ -1009,7 +1059,7 @@ mod tests {
             .insert("dev".into(), starting(100, Utc::now()));
         state.worktrees.insert("w".into(), rec);
 
-        assert!(advance_phases(&mut state, |_| true, |_, _| true));
+        assert!(advance_phases(&mut state, |_| true, |_| false, |_, _| true));
         let phase = &state.worktrees["w"].processes["dev"].phase;
         assert!(matches!(phase, Phase::Running { .. }), "got {phase:?}");
     }
@@ -1023,7 +1073,12 @@ mod tests {
         rec.processes.insert("worker".into(), proc);
         state.worktrees.insert("w".into(), rec);
 
-        assert!(advance_phases(&mut state, |_| true, |_, _| false));
+        assert!(advance_phases(
+            &mut state,
+            |_| true,
+            |_| false,
+            |_, _| false
+        ));
         let phase = &state.worktrees["w"].processes["worker"].phase;
         assert!(matches!(phase, Phase::Running { .. }), "got {phase:?}");
     }
@@ -1036,7 +1091,12 @@ mod tests {
             .insert("dev".into(), starting(100, Utc::now()));
         state.worktrees.insert("w".into(), rec);
 
-        assert!(advance_phases(&mut state, |_| false, |_, _| false));
+        assert!(advance_phases(
+            &mut state,
+            |_| false,
+            |_| false,
+            |_, _| false
+        ));
         let phase = &state.worktrees["w"].processes["dev"].phase;
         assert!(
             matches!(phase, Phase::Failed { reason, .. } if reason == "process exited"),
@@ -1052,7 +1112,12 @@ mod tests {
         rec.processes.insert("dev".into(), starting(100, long_ago));
         state.worktrees.insert("w".into(), rec);
 
-        assert!(advance_phases(&mut state, |_| true, |_, _| false));
+        assert!(advance_phases(
+            &mut state,
+            |_| true,
+            |_| false,
+            |_, _| false
+        ));
         let phase = &state.worktrees["w"].processes["dev"].phase;
         // The watched port is the content of this failure: "timeout" alone
         // does not say what pando was waiting for.
@@ -1076,7 +1141,7 @@ mod tests {
         state.worktrees.insert("w".into(), rec);
 
         assert!(
-            !advance_phases(&mut state, |_| true, |_, _| false),
+            !advance_phases(&mut state, |_| true, |_| false, |_, _| false),
             "still inside its own window, so nothing changes"
         );
         assert!(matches!(
@@ -1092,7 +1157,12 @@ mod tests {
             .get_mut("dev")
             .unwrap()
             .ready_timeout_s = Some(1);
-        assert!(advance_phases(&mut state, |_| true, |_, _| false));
+        assert!(advance_phases(
+            &mut state,
+            |_| true,
+            |_| false,
+            |_, _| false
+        ));
         let phase = &state.worktrees["w"].processes["dev"].phase;
         assert!(
             matches!(phase, Phase::Failed { reason, .. } if reason.contains("1s")),
@@ -1104,7 +1174,12 @@ mod tests {
     fn advance_phases_moves_running_to_failed_when_the_process_dies() {
         let mut state = State::new();
         state.worktrees.insert("w".into(), record_with(100));
-        assert!(advance_phases(&mut state, |_| false, |_, _| false));
+        assert!(advance_phases(
+            &mut state,
+            |_| false,
+            |_| false,
+            |_, _| false
+        ));
         let phase = &state.worktrees["w"].processes["dev"].phase;
         assert!(
             matches!(phase, Phase::Failed { reason, .. } if reason == "process exited"),
@@ -1130,7 +1205,12 @@ mod tests {
         state.worktrees.insert("failed".into(), failed);
 
         let before = state.clone();
-        assert!(!advance_phases(&mut state, |_| true, |_, _| true));
+        assert!(!advance_phases(
+            &mut state,
+            |_| true,
+            |_| false,
+            |_, _| true
+        ));
         assert_eq!(state, before);
     }
 
@@ -1142,7 +1222,7 @@ mod tests {
         rec.processes.insert("api".into(), running(200));
         state.worktrees.insert("w".into(), rec);
 
-        advance_phases(&mut state, |pid| pid == 100, |_, _| true);
+        advance_phases(&mut state, |pid| pid == 100, |_| false, |_, _| true);
         let procs = &state.worktrees["w"].processes;
         assert!(matches!(procs["dev"].phase, Phase::Running { .. }));
         assert!(matches!(procs["api"].phase, Phase::Failed { .. }));
