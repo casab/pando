@@ -223,7 +223,10 @@ fn install_hook(config: &Config) -> Option<config::HookConfig> {
     Some(config::HookConfig {
         name: INSTALL_HOOK.to_string(),
         after: config::HookPoint::Create,
-        fingerprint: detect::LOCKFILES.iter().map(|l| l.to_string()).collect(),
+        fingerprint: crate::catalog::package_managers::lockfiles()
+            .iter()
+            .map(|l| l.to_string())
+            .collect(),
         cmd: install.to_string(),
         cwd: None,
         fallback: None,

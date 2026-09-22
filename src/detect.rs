@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
+use crate::catalog::package_managers::{self, Ecosystem};
 use crate::config::{Config, PortsSpec, ProcessConfig, ReadySpec};
 
 // ---- signals --------------------------------------------------------------
@@ -68,22 +69,6 @@ pub struct Signals {
     pub provision_seeds: Vec<(String, String)>,
 }
 
-/// Also the install hook's fingerprint: a lockfile changing is what means
-/// the dependencies changed.
-pub const LOCKFILES: [&str; 11] = [
-    "pnpm-lock.yaml",
-    "package-lock.json",
-    "yarn.lock",
-    "bun.lockb",
-    "bun.lock",
-    "uv.lock",
-    "poetry.lock",
-    "Gemfile.lock",
-    "mix.lock",
-    "go.sum",
-    "Cargo.lock",
-];
-
 const WORKSPACE_MARKERS: [&str; 3] = ["pnpm-workspace.yaml", "turbo.json", "nx.json"];
 
 const VERSION_FILES: [&str; 7] = [
@@ -129,7 +114,7 @@ pub fn signals(root: &Path) -> Signals {
     Signals {
         scripts: parse_scripts(&manifest),
         targets: parse_targets(root),
-        lockfiles: present(root, &LOCKFILES),
+        lockfiles: present(root, &package_managers::lockfiles()),
         workspace_markers: present(root, &WORKSPACE_MARKERS),
         version_files: present(root, &VERSION_FILES),
         runtime_requirements: crate::runtime::requirements(root),
@@ -962,37 +947,11 @@ pub fn propose_with(
 
 /// Lockfile to frozen install command.
 ///
-/// Always the frozen variant: an install that can rewrite a lockfile would
-/// be pando writing into the repository, which Invariant 1 forbids. Go and
-/// Rust get nothing — `go run` and `cargo run` resolve their own modules,
-/// and proposing a warm-up step for them is noise.
-fn install_command(lockfile: &str) -> Option<(&'static str, &'static str)> {
-    Some(match lockfile {
-        "pnpm-lock.yaml" => ("pnpm install --frozen-lockfile", "pnpm-lock.yaml"),
-        "package-lock.json" => ("npm ci", "package-lock.json"),
-        "yarn.lock" => ("yarn install --immutable", "yarn.lock"),
-        "bun.lockb" | "bun.lock" => ("bun install --frozen-lockfile", "a bun lockfile"),
-        "uv.lock" => ("uv sync --frozen", "uv.lock"),
-        // Poetry has no `--frozen`, and needs none: `install` refuses a
-        // lockfile that no longer matches `pyproject.toml` rather than
-        // regenerating it.
-        "poetry.lock" => ("poetry install --sync", "poetry.lock"),
-        // The environment variable rather than `bundle config`, which would
-        // write `.bundle/config` into the repository.
-        "Gemfile.lock" => ("BUNDLE_FROZEN=true bundle install", "Gemfile.lock"),
-        // Deliberately nothing for `mix.lock`: `mix deps.get` writes the
-        // lockfile for a dependency that is not in it yet, and an install
-        // that can rewrite a lockfile is an Invariant 1 break. An Elixir
-        // project configures its own install command.
-        _ => return None,
-    })
-}
-
 fn install_proposal(signals: &Signals) -> Option<Proposal> {
     let candidates: Vec<Candidate> = signals
         .lockfiles
         .iter()
-        .filter_map(|lock| install_command(lock))
+        .filter_map(|lock| package_managers::install_for(lock))
         .map(|(cmd, why)| Candidate {
             value: cmd.to_string(),
             why: why.to_string(),
@@ -1058,28 +1017,16 @@ fn is_multiplexer(body: &str) -> bool {
 
 /// How this project runs a `package.json` script.
 fn script_runner(signals: &Signals) -> &'static str {
-    for lock in &signals.lockfiles {
-        return match lock.as_str() {
-            "pnpm-lock.yaml" => "pnpm ",
-            "yarn.lock" => "yarn ",
-            "bun.lockb" | "bun.lock" => "bun run ",
-            "package-lock.json" => "npm run ",
-            _ => continue,
-        };
-    }
-    "npm run "
+    package_managers::run_prefix(lockfiles(signals), Ecosystem::JavaScript).unwrap_or("npm run ")
 }
 
 /// How this project runs a Python command.
 fn python_runner(signals: &Signals) -> &'static str {
-    for lock in &signals.lockfiles {
-        return match lock.as_str() {
-            "uv.lock" => "uv run ",
-            "poetry.lock" => "poetry run ",
-            _ => continue,
-        };
-    }
-    ""
+    package_managers::run_prefix(lockfiles(signals), Ecosystem::Python).unwrap_or("")
+}
+
+fn lockfiles(signals: &Signals) -> impl Iterator<Item = &str> {
+    signals.lockfiles.iter().map(String::as_str)
 }
 
 /// Scripts that could be a dev server, best first.
@@ -2537,15 +2484,14 @@ fn schema_candidates(root: &Path, signals: &Signals) -> Vec<Candidate> {
     out
 }
 
-/// How this project runs a binary from its dependencies. `pnpm foo` and
-/// `bunx foo` run it; `npm foo` does not, which is what `npx` is for.
+/// How this project runs a binary from its dependencies: the first
+/// lockfile's manager decides, and `npx` is what is left.
 fn package_runner(signals: &Signals) -> &'static str {
-    match signals.lockfiles.first().map(String::as_str) {
-        Some("pnpm-lock.yaml") => "pnpm",
-        Some("yarn.lock") => "yarn",
-        Some("bun.lockb") | Some("bun.lock") => "bunx",
-        _ => "npx",
-    }
+    lockfiles(signals)
+        .next()
+        .and_then(package_managers::for_lockfile)
+        .and_then(|manager| manager.exec)
+        .unwrap_or("npx")
 }
 
 /// Which local files each worktree needs a copy of.
@@ -3758,8 +3704,8 @@ mod tests {
             "poetry install --sync",
             "BUNDLE_FROZEN=true bundle install",
         ];
-        for lock in LOCKFILES {
-            let Some((cmd, _)) = install_command(lock) else {
+        for lock in package_managers::lockfiles() {
+            let Some((cmd, _)) = package_managers::install_for(lock) else {
                 continue;
             };
             assert!(
@@ -3771,8 +3717,8 @@ mod tests {
 
     #[test]
     fn a_build_that_resolves_its_own_modules_gets_no_install_step() {
-        assert!(install_command("go.sum").is_none());
-        assert!(install_command("Cargo.lock").is_none());
+        assert!(package_managers::install_for("go.sum").is_none());
+        assert!(package_managers::install_for("Cargo.lock").is_none());
         let signals = Signals {
             lockfiles: vec!["go.sum".to_string()],
             ..Default::default()

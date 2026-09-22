@@ -4,7 +4,7 @@
 //! direction is inner to outer with no upward imports:
 //!
 //! ```text
-//! paths → compose → project · config · ports · process · runtime · state
+//! catalog · paths → compose → project · config · ports · process · runtime · state
 //!       · template · recipes
 //!       → detect · hooks · worktree · cache · log_tail · observe · services
 //!         · native · decisions
@@ -16,6 +16,7 @@
 
 pub mod actions;
 pub mod cache;
+pub mod catalog;
 pub mod cli;
 pub mod compose;
 pub mod config;

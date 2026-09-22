@@ -25,6 +25,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::actions::Machine;
+use crate::catalog::package_managers;
 use crate::config::{self, Config, ServiceConfig};
 use crate::paths::PandoPaths;
 use crate::process as proc;
@@ -2640,21 +2641,6 @@ fn tool_probes(paths: &PandoPaths, config: &Config) -> Vec<ToolProbe> {
     probes
 }
 
-/// The lockfile a package manager writes, and the binary that writes it.
-const LOCKFILE_PROGRAMS: [(&str, &str); 11] = [
-    ("pnpm-lock.yaml", "pnpm"),
-    ("package-lock.json", "npm"),
-    ("yarn.lock", "yarn"),
-    ("bun.lockb", "bun"),
-    ("bun.lock", "bun"),
-    ("uv.lock", "uv"),
-    ("poetry.lock", "poetry"),
-    ("Gemfile.lock", "bundle"),
-    ("mix.lock", "mix"),
-    ("go.sum", "go"),
-    ("Cargo.lock", "cargo"),
-];
-
 /// Programs this project will have pando run, with whether config names
 /// them.
 ///
@@ -2683,14 +2669,15 @@ fn project_programs(paths: &PandoPaths, config: &Config) -> Vec<(String, String,
     }
     let signals = detect::signals(paths.root());
     for lockfile in &signals.lockfiles {
-        let Some((_, program)) = LOCKFILE_PROGRAMS.iter().find(|(l, _)| l == lockfile) else {
+        let Some(manager) = package_managers::for_lockfile(lockfile) else {
             continue;
         };
+        let program = manager.program;
         if out.iter().any(|(p, _, _)| p == program) {
             continue;
         }
         out.push((
-            (*program).to_string(),
+            program.to_string(),
             format!("{lockfile} is in this repository"),
             false,
         ));
@@ -3241,43 +3228,6 @@ fn check_provision(paths: &PandoPaths, config: &Config, findings: &mut Vec<Findi
     }
 }
 
-/// A package-manager install and the flag that stops it rewriting a
-/// lockfile, plus the spelling pando would have written.
-///
-/// Only the shapes pando itself proposes. A project whose install step is
-/// `make setup` has said something pando has no opinion about, and guessing
-/// at it would make this check noise.
-const INSTALL_SHAPES: [(&str, &str, &[&str], &str); 8] = [
-    (
-        "pnpm",
-        "install",
-        &["--frozen-lockfile"],
-        "pnpm install --frozen-lockfile",
-    ),
-    ("npm", "install", &[], "npm ci"),
-    ("npm", "i", &[], "npm ci"),
-    (
-        "yarn",
-        "install",
-        &["--immutable", "--frozen-lockfile"],
-        "yarn install --immutable",
-    ),
-    (
-        "bun",
-        "install",
-        &["--frozen-lockfile"],
-        "bun install --frozen-lockfile",
-    ),
-    ("uv", "sync", &["--frozen", "--locked"], "uv sync --frozen"),
-    ("cargo", "fetch", &["--locked"], "cargo fetch --locked"),
-    (
-        "bundle",
-        "install",
-        &["BUNDLE_FROZEN", "--deployment", "--frozen"],
-        "BUNDLE_FROZEN=true bundle install",
-    ),
-];
-
 fn check_install(config: &Config, findings: &mut Vec<Finding>) {
     let Some(install) = config.project.install.as_deref() else {
         return;
@@ -3292,13 +3242,18 @@ fn check_install(config: &Config, findings: &mut Vec<Finding>) {
         let Some(program) = program else { continue };
         let index = words.iter().position(|w| w == program).unwrap_or(0);
         let sub = words.get(index + 1).copied().unwrap_or("");
-        let Some((_, _, markers, frozen)) = INSTALL_SHAPES
-            .iter()
-            .find(|(p, s, _, _)| p == program && *s == sub)
+        let Some(shape) = package_managers::for_program(program)
+            .and_then(|manager| manager.install_shape)
+            .filter(|shape| shape.verbs.contains(&sub))
         else {
             continue;
         };
-        if markers.iter().any(|marker| step.contains(marker)) {
+        let frozen = shape.suggest;
+        if shape
+            .frozen_markers
+            .iter()
+            .any(|marker| step.contains(marker))
+        {
             continue;
         }
         findings.push(Finding::problem(
