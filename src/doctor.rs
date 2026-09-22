@@ -210,6 +210,17 @@ pub struct KeyReport {
     /// `null` for a table header, whose own line carries the note for
     /// every key under it.
     pub value: Option<String>,
+    /// The same value before it was rendered, for the one question that
+    /// cannot be asked of text: whether this is still a value pando's own
+    /// rules would write here. Quote style, whitespace and the order an
+    /// inline table happens to be written in are formatting, and a
+    /// comparison that tripped over them would report every project.
+    ///
+    /// Not serialised: a reader already has `value`, and a second
+    /// spelling of the same thing in the shape agents read is one more
+    /// thing that can fall out of step with the first.
+    #[serde(skip)]
+    pub raw: Option<toml_edit::Value>,
     /// The trailing comment: `# detected: pnpm-lock.yaml`,
     /// `# answered: 2026-09-21`, or whatever a developer wrote there.
     pub note: Option<String>,
@@ -1064,6 +1075,7 @@ pub fn run_on(paths: &PandoPaths, machine: &Machine<'_>) -> Report {
 
     let config_report = config_report(paths, error, warnings, &mut findings);
     validate_config(paths, &config, &mut findings);
+    stale_detection_findings(paths, &config_report, &mut findings);
     let project = project_report(paths, &config, &mut findings);
     let runtime = runtime_report(paths, &config, machine, &mut findings);
     let tools = tools_report(paths, &config, machine, &mut findings);
@@ -2217,6 +2229,7 @@ fn walk_table(table: &toml_edit::Table, prefix: &str, out: &mut Vec<KeyReport>) 
             toml_edit::Item::Value(value) => out.push(KeyReport {
                 key: path,
                 value: Some(value_repr(value)),
+                raw: Some(value.clone()),
                 note: comment(value.decor().suffix().and_then(|s| s.as_str())),
                 ignored: false,
             }),
@@ -2225,6 +2238,7 @@ fn walk_table(table: &toml_edit::Table, prefix: &str, out: &mut Vec<KeyReport>) 
                     out.push(KeyReport {
                         key: path.clone(),
                         value: None,
+                        raw: None,
                         note: Some(note),
                         ignored: false,
                     });
@@ -2237,6 +2251,7 @@ fn walk_table(table: &toml_edit::Table, prefix: &str, out: &mut Vec<KeyReport>) 
                     out.push(KeyReport {
                         key: path.clone(),
                         value: None,
+                        raw: None,
                         note: comment(entry.decor().suffix().and_then(|s| s.as_str())),
                         ignored: false,
                     });
@@ -2261,6 +2276,199 @@ fn value_repr(value: &toml_edit::Value) -> String {
 fn comment(suffix: Option<&str>) -> Option<String> {
     let text = suffix?.trim();
     (!text.is_empty()).then(|| text.to_string())
+}
+
+// ---- detections that have gone stale --------------------------------------
+
+/// One value a rule would write right now, and the signal behind it.
+struct Offer {
+    /// The comparison form: quote style, whitespace and the order an
+    /// inline table happens to be written in taken out.
+    canonical: String,
+    /// The value as a file would hold it.
+    text: String,
+    /// What made it a candidate — `package.json scripts.dev`.
+    why: String,
+}
+
+/// Keys pando wrote itself that pando would not write now.
+///
+/// pando's rule is "ask just in time, once": a slot with an answer in it
+/// is never asked again. That is the right rule and it has a cost nothing
+/// else here pays — improve a detection rule, and every value the older,
+/// worse version of it wrote stays frozen exactly as wrong as the day it
+/// was written. pando records that it detected a value itself, re-derives
+/// detection on every read path, and until now never compared the two: a
+/// developer who upgraded saw the identical failure and had every reason
+/// to think the binary was stale.
+///
+/// **Reported, never fixed.** Silently rewriting a value would change what
+/// a developer's commands do with nobody asked, which breaks a larger
+/// promise than the one it mends. So this names the key, the file, what
+/// was detected, what would be detected now, and the one edit that reopens
+/// the question.
+///
+/// Three things it is careful about:
+///
+/// - **Only `# detected:`.** An `# answered:` value — a person's, a
+///   program's, `--yes`'s — is a decision, and pando does not second-guess
+///   decisions. A comment a developer wrote by hand is not one of pando's
+///   notes at all and is left alone for the same reason.
+/// - **Not among the candidates, rather than not the first.** Several
+///   candidates can each be right, and a rule that demotes one has not
+///   rejected it. Absent from the list is the signal that the rules have
+///   moved — or that the repository has, which fires the same check and is
+///   just as worth knowing.
+/// - **Keyed by the key, not by the slot.** A dev-command candidate that
+///   carries roles writes `dev.ports` beside `dev.cmd`, under the dev
+///   command's own note, so "what would be written here" has to be
+///   gathered across every proposal rather than from whichever slot owns
+///   the key.
+fn stale_detection_findings(
+    paths: &PandoPaths,
+    config: &ConfigReport,
+    findings: &mut Vec<Finding>,
+) {
+    let detected: Vec<(&LayerReport, &KeyReport, String)> = effective_keys(config)
+        .into_iter()
+        .filter_map(|(layer, key)| Some((layer, key, detected_why(key.note.as_deref())?)))
+        .collect();
+    // Nothing pando wrote: no reason to re-derive detection at all, which
+    // reads the repository and shells out to `git check-ignore`.
+    if detected.is_empty() {
+        return;
+    }
+    let offers = detectable_now(paths.root());
+    for (layer, key, why) in detected {
+        let (Some(raw), Some(text)) = (&key.raw, &key.value) else {
+            continue;
+        };
+        // pando has no opinion about this key any more, and a divergence
+        // needs two opinions. A rule that was withdrawn and put nothing in
+        // its place has nothing to say about the value it left behind.
+        let Some(offers) = offers.get(&key.key) else {
+            continue;
+        };
+        if offers.iter().any(|offer| offer.canonical == canonical(raw)) {
+            continue;
+        }
+        let list = offers
+            .iter()
+            .map(|offer| format!("{} ({})", offer.text, offer.why))
+            .collect::<Vec<_>>()
+            .join(", ");
+        findings.push(
+            Finding::note(
+                Section::Config,
+                format!(
+                    "{} = {text} in {} is a value pando detected itself ({why}), and pando \
+                     would not detect it now — for this key its rules offer {list}",
+                    key.key, layer.path
+                ),
+            )
+            .with_fix(format!(
+                "delete that line from {} and the next command that needs it asks the question \
+                 again; keep it if it is what you want — pando will not change a value on its own",
+                layer.path
+            )),
+        );
+    }
+}
+
+/// Every key the merged config actually reads, with the layer it reads it
+/// from.
+///
+/// The layers are built lowest precedence first, which is the order
+/// `config::load_layers` merges them in, so the last layer to set a key is
+/// the one that wins. `merge_tables` merges a table key by key, which is
+/// what makes "the last layer that set *this key*" the right question
+/// rather than "the last layer that set its table".
+///
+/// Table headers and array-of-table entries carry a note and no value of
+/// their own, and a stripped key is one pando removes from that layer and
+/// never reads. Neither is a value to have an opinion about.
+fn effective_keys(config: &ConfigReport) -> Vec<(&LayerReport, &KeyReport)> {
+    let mut out: Vec<(&LayerReport, &KeyReport)> = Vec::new();
+    for layer in &config.layers {
+        for key in &layer.keys {
+            if key.value.is_none() || key.ignored {
+                continue;
+            }
+            match out.iter_mut().find(|(_, held)| held.key == key.key) {
+                Some(entry) => *entry = (layer, key),
+                None => out.push((layer, key)),
+            }
+        }
+    }
+    out
+}
+
+/// Every value detection would write right now, keyed by the config key it
+/// would write it to.
+///
+/// Through [`detect::edits`], which is the one translation from a
+/// candidate to the keys it becomes — the same function the answer path
+/// writes through. A second reading of what a candidate means would be a
+/// second opinion, and the two would drift.
+fn detectable_now(root: &Path) -> BTreeMap<String, Vec<Offer>> {
+    let signals = detect::signals(root);
+    let mut out: BTreeMap<String, Vec<Offer>> = BTreeMap::new();
+    for proposal in detect::propose(root, &signals) {
+        for candidate in &proposal.candidates {
+            for edit in detect::edits(proposal.slot, candidate) {
+                let key = match edit.table.is_empty() {
+                    true => edit.key.clone(),
+                    false => format!("{}.{}", edit.table.join("."), edit.key),
+                };
+                let offer = Offer {
+                    canonical: canonical(&edit.value),
+                    text: value_repr(&edit.value),
+                    why: candidate.why.clone(),
+                };
+                let held = out.entry(key).or_default();
+                if !held.iter().any(|other| other.canonical == offer.canonical) {
+                    held.push(offer);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The evidence out of a `# detected:` note, and `None` for anything else.
+///
+/// `# answered:` in each of its four spellings, and a comment a developer
+/// wrote themselves, all come back `None`: this only ever looks at values
+/// pando's own rules put there.
+fn detected_why(note: Option<&str>) -> Option<String> {
+    let body = note?.strip_prefix('#')?.trim_start();
+    Some(body.strip_prefix("detected:")?.trim().to_string())
+}
+
+/// A value with its formatting taken out, so that two values meaning the
+/// same thing compare equal.
+///
+/// A literal string and a basic string are the same value; so are two
+/// inline tables written in a different key order, and an array with a
+/// space after its comma. Array *order* is kept, because `version_files`
+/// is a precedence list and reordering it means something.
+fn canonical(value: &toml_edit::Value) -> String {
+    match value {
+        toml_edit::Value::String(s) => format!("{:?}", s.value()),
+        toml_edit::Value::Array(array) => {
+            let items: Vec<String> = array.iter().map(canonical).collect();
+            format!("[{}]", items.join(","))
+        }
+        toml_edit::Value::InlineTable(table) => {
+            let mut items: Vec<String> = table
+                .iter()
+                .map(|(key, value)| format!("{key:?}={}", canonical(value)))
+                .collect();
+            items.sort();
+            format!("{{{}}}", items.join(","))
+        }
+        other => value_repr(other),
+    }
 }
 
 // ---- tools ----------------------------------------------------------------
@@ -3482,6 +3690,193 @@ mod tests {
             "said once, not twice:\n{text}"
         );
         assert!(report.healthy(), "a stripped key is a note, not a problem");
+    }
+
+    // ---- a detection that has gone stale ---------------------------------
+
+    /// A `Makefile` whose `dev` target is the shape a first run on a
+    /// repository pando had not generated actually met: a prerequisite,
+    /// and a recipe whose first line is a guard that exits before
+    /// anything is started.
+    ///
+    /// Generic on purpose. Target names, a `command -v` guard and a
+    /// script under `scripts/` are makefile convention; nothing here is
+    /// anybody's project.
+    const GUARDED_MAKEFILE: &str = concat!(
+        "build:\n\t./scripts/build.sh\n\n",
+        "dev: build\n",
+        "\tcommand -v watcher >/dev/null || { echo \"install watcher first\"; exit 1; }\n",
+        "\t./scripts/serve.sh --reload\n\n",
+        "run:\n\t./scripts/run.sh\n",
+    );
+
+    /// What an older pando wrote for that target: the guard line, lifted
+    /// out of the recipe on its own. Current rules propose `make dev`.
+    const LIFTED_GUARD: &str =
+        "command -v watcher >/dev/null || { echo \"install watcher first\"; exit 1; }";
+
+    fn write_makefile(fx: &Fx, body: &str) {
+        std::fs::write(fx.root.join("Makefile"), body).expect("write Makefile");
+    }
+
+    fn stale(report: &Report) -> Option<&Finding> {
+        report
+            .findings
+            .iter()
+            .find(|f| f.message.contains("pando detected itself"))
+    }
+
+    #[test]
+    fn a_detected_value_the_rules_would_not_write_now_is_named_with_what_they_offer() {
+        let fx = fixture();
+        write_makefile(&fx, GUARDED_MAKEFILE);
+        write_project_config(
+            &fx,
+            &format!("[dev]\ncmd = '{LIFTED_GUARD}'  # detected: the dev target\n"),
+        );
+        let report = report(&fx);
+        let finding = stale(&report).unwrap_or_else(|| panic!("{:?}", messages(&report)));
+        assert_eq!(finding.section, Section::Config);
+        // Suspicious, not broken: the developer may have kept it on
+        // purpose, and a process that fails is reported separately. The
+        // two together tell the story.
+        assert_eq!(finding.severity, Severity::Note);
+        assert!(report.healthy(), "{:?}", messages(&report));
+        // The key, the value, the evidence that wrote it, and what the
+        // rules offer in its place.
+        assert!(finding.message.contains("dev.cmd"), "{}", finding.message);
+        assert!(
+            finding.message.contains("command -v watcher"),
+            "{}",
+            finding.message
+        );
+        assert!(
+            finding.message.contains("(the dev target)"),
+            "{}",
+            finding.message
+        );
+        assert!(
+            finding.message.contains("\"make dev\""),
+            "{}",
+            finding.message
+        );
+        // And the fix is the edit that reopens the question, in the file
+        // that holds the line.
+        let fix = finding.fix.as_deref().expect("a fix");
+        assert!(
+            fix.contains(&fx.paths.config_file().display().to_string()),
+            "{fix}"
+        );
+        assert!(fix.contains("delete that line"), "{fix}");
+    }
+
+    #[test]
+    fn a_detected_value_that_is_still_among_the_candidates_says_nothing() {
+        let fx = fixture();
+        write_makefile(&fx, GUARDED_MAKEFILE);
+        write_project_config(
+            &fx,
+            "[dev]\ncmd = \"make dev\"  # detected: the dev target\n",
+        );
+        let report = report(&fx);
+        assert!(stale(&report).is_none(), "{:?}", messages(&report));
+    }
+
+    // The rule is "not among the candidates", not "not the first one".
+    // `make dev` leads here and `./scripts/run.sh` is the second option —
+    // still an option, and demoting a candidate is not rejecting it.
+    #[test]
+    fn a_detected_value_the_rules_demoted_but_still_offer_says_nothing() {
+        let fx = fixture();
+        write_makefile(&fx, GUARDED_MAKEFILE);
+        write_project_config(
+            &fx,
+            "[dev]\ncmd = \"./scripts/run.sh\"  # detected: the run target\n",
+        );
+        let report = report(&fx);
+        assert!(stale(&report).is_none(), "{:?}", messages(&report));
+    }
+
+    // A value somebody decided is not pando's to have a second opinion
+    // about — in any of the four spellings a decision is written in, and
+    // for a comment a developer wrote themselves.
+    #[test]
+    fn a_value_that_was_answered_rather_than_detected_is_never_second_guessed() {
+        for note in [
+            "# answered: 2026-09-21",
+            "# answered: a program, 2026-09-21",
+            "# answered: --yes took the first of 2 options",
+            "# the guard is deliberate, leave it",
+        ] {
+            let fx = fixture();
+            write_makefile(&fx, GUARDED_MAKEFILE);
+            write_project_config(&fx, &format!("[dev]\ncmd = '{LIFTED_GUARD}'  {note}\n"));
+            let report = report(&fx);
+            assert!(stale(&report).is_none(), "{note}: {:?}", messages(&report));
+        }
+    }
+
+    // Nothing to compare against is not a divergence. A repository with
+    // no script, no target and no framework marker gets no dev-command
+    // proposal at all, and a rule that was withdrawn has nothing to say
+    // about the value it left behind.
+    #[test]
+    fn a_key_the_rules_have_no_opinion_about_says_nothing() {
+        let fx = fixture();
+        write_project_config(
+            &fx,
+            "[dev]\ncmd = \"./serve\"  # detected: a rule that no longer exists\n",
+        );
+        let report = report(&fx);
+        assert!(stale(&report).is_none(), "{:?}", messages(&report));
+    }
+
+    // Formatting is not a divergence: the file writes a literal string
+    // where pando writes a basic one, and they are the same value.
+    #[test]
+    fn quote_style_is_not_a_divergence() {
+        let fx = fixture();
+        write_makefile(&fx, GUARDED_MAKEFILE);
+        write_project_config(&fx, "[dev]\ncmd = 'make dev'  # detected: the dev target\n");
+        let report = report(&fx);
+        assert!(stale(&report).is_none(), "{:?}", messages(&report));
+    }
+
+    // The one place a key does not belong to the slot named after it.
+    // Django's rule proposes a command carrying `{port:web}`, so
+    // answering the *dev command* question writes `dev.ports` too, under
+    // the dev command's own `# detected:` note. The port slot's own
+    // candidates are a different shape — `{ PORT = "web" }` — and
+    // measuring the one against the other would report every project
+    // built this way.
+    #[test]
+    fn a_key_one_candidate_writes_beside_its_own_is_not_measured_against_another_slot() {
+        let fx = fixture();
+        std::fs::write(fx.root.join("manage.py"), "#!/usr/bin/env python\n").expect("manage.py");
+        std::fs::write(fx.root.join(".env.example"), "PORT=8000\n").expect("env example");
+        write_project_config(
+            &fx,
+            "[dev]\ncmd = \"python manage.py runserver 127.0.0.1:{port:web}\"  \
+             # detected: the Django rule\nports = [\"web\"]  # detected: the Django rule\n",
+        );
+        let report = report(&fx);
+        assert!(stale(&report).is_none(), "{:?}", messages(&report));
+    }
+
+    // A higher layer wins, so a stale line a higher layer has already
+    // replaced is not what pando reads and not what doctor reports.
+    #[test]
+    fn a_stale_line_a_higher_layer_answers_over_is_not_reported() {
+        let fx = fixture();
+        write_makefile(&fx, GUARDED_MAKEFILE);
+        std::fs::write(
+            fx.root.join("pando.toml"),
+            format!("[dev]\ncmd = '{LIFTED_GUARD}'  # detected: the dev target\n"),
+        )
+        .expect("write committed config");
+        write_project_config(&fx, "[dev]\ncmd = \"make dev\"  # answered: 2026-09-22\n");
+        let report = report(&fx);
+        assert!(stale(&report).is_none(), "{:?}", messages(&report));
     }
 
     #[test]
