@@ -38,7 +38,7 @@ struct LogLineOut<'a> {
     line: &'a str,
 }
 
-fn level_word(level: LogLevel) -> &'static str {
+pub(super) fn level_word(level: LogLevel) -> &'static str {
     match level {
         LogLevel::Debug => "debug",
         LogLevel::Info => "info",

@@ -1,12 +1,12 @@
 use super::answers::answer_from;
 use super::answers::slot_named;
 use super::answers::slot_names;
-use super::logs::leading_timestamp;
 use super::logs::silence_notes;
+use super::logs::{leading_timestamp, level_word};
 use super::ls::ORDER;
 use super::prompt::asker;
 use super::prompt::prompt_with;
-use super::status::human_duration;
+use super::status::{human_duration, phase_word};
 use super::*;
 use crate::actions;
 use crate::actions::worktree_url;
@@ -1814,4 +1814,151 @@ fn the_answers_a_run_never_used_are_the_ones_nothing_asked_about() {
     let question = dev_question(&["pnpm dev"]);
     assert!(answers.for_question(&question).is_some());
     assert_eq!(answers.unasked(), vec![crate::detect::Slot::Install]);
+}
+
+/// The values `agent/json.md` offers for one enum-valued field, as it
+/// spells them: the first `"key": "a|b|c"` in the document.
+fn documented(doc: &str, key: &str) -> Vec<String> {
+    let needle = format!("\"{key}\": \"");
+    let value = doc
+        .match_indices(&needle)
+        .map(|(at, _)| {
+            let rest = &doc[at + needle.len()..];
+            &rest[..rest.find('"').expect("a closing quote")]
+        })
+        .find(|value| value.contains('|'))
+        .unwrap_or_else(|| panic!("agent/json.md lists no values for `{key}`"));
+    let mut values: Vec<String> = value.split('|').map(str::to_string).collect();
+    values.sort();
+    values
+}
+
+fn serde_word<T: serde::Serialize>(value: T) -> String {
+    serde_json::to_value(value)
+        .expect("serialises")
+        .as_str()
+        .expect("a unit variant serialises to a string")
+        .to_string()
+}
+
+/// agent/json.md quotes every enum-valued field by hand, and one of those
+/// strings was once wrong for as long as it shipped. This holds each list
+/// to the type that prints it. The matches are exhaustive on purpose: a new
+/// variant does not compile here until somebody decides what the document
+/// says about it.
+#[test]
+fn every_enum_value_agent_json_documents_is_one_the_binary_prints() {
+    use crate::decisions::Shape;
+    use crate::doctor::{Section, Severity};
+    use crate::log_tail::LogLevel;
+    use crate::state::ServiceKind;
+
+    let doc = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("agent/json.md"),
+    )
+    .expect("read agent/json.md");
+    let check = |key: &str, printed: Vec<String>| {
+        let mut printed = printed;
+        printed.sort();
+        assert_eq!(
+            documented(&doc, key),
+            printed,
+            "agent/json.md's `{key}` values and the binary's disagree"
+        );
+    };
+
+    let sections = [
+        Section::Project,
+        Section::Config,
+        Section::Runtime,
+        Section::Tools,
+        Section::Worktrees,
+        Section::Services,
+        Section::Hooks,
+        Section::Adoption,
+    ];
+    for s in sections {
+        match s {
+            Section::Project
+            | Section::Config
+            | Section::Runtime
+            | Section::Tools
+            | Section::Worktrees
+            | Section::Services
+            | Section::Hooks
+            | Section::Adoption => {}
+        }
+    }
+    check("section", sections.map(serde_word).to_vec());
+
+    let severities = [Severity::Problem, Severity::Note];
+    for s in severities {
+        match s {
+            Severity::Problem | Severity::Note => {}
+        }
+    }
+    check("severity", severities.map(serde_word).to_vec());
+
+    let kinds = [ServiceKind::Compose, ServiceKind::Native];
+    for k in kinds {
+        match k {
+            ServiceKind::Compose | ServiceKind::Native => {}
+        }
+    }
+    check("kind", kinds.map(serde_word).to_vec());
+
+    let states = [PrState::Open, PrState::Merged, PrState::Closed];
+    for s in states {
+        match s {
+            PrState::Open | PrState::Merged | PrState::Closed => {}
+        }
+    }
+    check("state", states.map(serde_word).to_vec());
+
+    let shapes = [Shape::Choice, Shape::Custom, Shape::Set, Shape::None];
+    for s in shapes {
+        match s {
+            Shape::Choice | Shape::Custom | Shape::Set | Shape::None => {}
+        }
+    }
+    check("shape", shapes.map(serde_word).to_vec());
+
+    let levels = [
+        LogLevel::Debug,
+        LogLevel::Info,
+        LogLevel::Warn,
+        LogLevel::Error,
+    ];
+    for l in levels {
+        match l {
+            LogLevel::Debug | LogLevel::Info | LogLevel::Warn | LogLevel::Error => {}
+        }
+    }
+    check("level", levels.map(|l| level_word(l).to_string()).to_vec());
+
+    let since = Utc::now();
+    let phases = [
+        Phase::Starting { since },
+        Phase::Running { since },
+        Phase::Failed {
+            at: since,
+            reason: String::new(),
+        },
+    ];
+    for p in &phases {
+        match p {
+            Phase::Starting { .. } | Phase::Running { .. } | Phase::Failed { .. } => {}
+        }
+    }
+    check(
+        "phase",
+        phases.iter().map(|p| phase_word(p).to_string()).collect(),
+    );
+
+    // Plain strings in the report rather than an enum; doctor's own tests
+    // pin the order it prints them in.
+    check(
+        "layer",
+        ["committed", "user", "project"].map(String::from).to_vec(),
+    );
 }

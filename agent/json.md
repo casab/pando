@@ -261,8 +261,8 @@ half `signals` deliberately leaves out. It writes nothing anywhere.
   "hooks":    [ { "name": "migrate", "after": "services", "cmd": "...",
                   "fingerprint": [...], "matches": [...], "runs": true } ],
   "adoption": [],           // project folders that look like this repo from before it moved
-  "findings": [ { "section": "runtime", "severity": "problem|note",
-                  "message": "...", "fix": "..." } ]
+  "findings": [ { "section": "project|config|runtime|tools|worktrees|services|hooks|adoption",
+                  "severity": "problem|note", "message": "...", "fix": "..." } ]
 }
 ```
 

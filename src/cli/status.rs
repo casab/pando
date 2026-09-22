@@ -97,7 +97,7 @@ struct StatusOutput {
     worktrees: Vec<StatusWorktreeOut>,
 }
 
-fn phase_word(phase: &Phase) -> &'static str {
+pub(super) fn phase_word(phase: &Phase) -> &'static str {
     match phase {
         Phase::Starting { .. } => "starting",
         Phase::Running { .. } => "running",
