@@ -7,14 +7,23 @@ one, a running dev environment: dev server, optional private services, logs,
 and a shareable URL. It is the generalization of `dwt`, a private tool that was
 built for a single project.
 
-## Current phase: implementation, phase by phase
+## Current phase: all seven are built; the work now is edges
 
-Implementation started on 2026-09-20. Work follows `plans/00-master.md`: one
-phase at a time, from that phase's plan file, one conventional commit per
-work item, with `cargo test`, `cargo clippy -- -D warnings`, and
+Implementation ran 2026-09-20 to 2026-09-22 and every phase in
+`plans/00-master.md` is done: worktrees, start and stop, multiple processes,
+the log viewer, compose isolation, share, `init`/`doctor`/`signals`, native
+service recipes, and the agent layer.
+
+What is left is not a phase. `plans/open-follow-ups.md` carries the known
+edges, each with who found it and where it belongs, and the release
+checklist in `docs/08-roadmap.md` is untouched: no licence, no CI, no
+published crate. Linux is a declared target that has never been compiled.
+
+The working rules do not change. One conventional commit per work item, with
+`cargo test`, `cargo clippy --all-targets -- -D warnings` and
 `cargo fmt --check` clean before every commit. Do not start a phase that has
-no plan file yet. The repo is local-only: never push, never add a remote,
-never open a PR. No attribution lines in commit messages.
+no plan file. The repo is local-only: never push, never add a remote, never
+open a PR. No attribution lines in commit messages.
 
 ## Docs and plans are never committed
 
@@ -49,12 +58,18 @@ database, a prod schema dump, and cookie auth."
   during development.
 - dwt's origin project is never used, not even read-only. Its path is in
   `CLAUDE.local.md` only so it can be recognised and avoided.
+- The maintainer's own repositories are off limits to pando sessions, which
+  has a consequence worth stating plainly: **the fixture corpus is the only
+  validation pando gets.** A corpus of tidy shapes therefore proves very
+  little — `plans/fixture-hard-shapes.md` exists because of this, and the
+  first real project pando met broke it in three ways no fixture had.
 
 ## Conventions
 
 - Config file: `pando.toml`. pando home: `~/.pando/`.
 - CLI verbs, used identically in every document:
-  `new start stop ls rm share unshare logs status path init doctor signals`.
+  `new start stop restart ls rm share unshare logs status path init doctor
+  signals`.
 - The two invariants in `docs/02-principles.md` override anything else in the
   docs. If a design idea conflicts with them, the idea loses.
 - Anything marked "default, undecided" in `docs/09-open-decisions.md` is not

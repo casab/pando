@@ -3943,6 +3943,32 @@ mod tests {
         assert_every_documented_command_is_real("agent/brief.md");
     }
 
+    /// `CLAUDE.md` names the CLI verbs and calls them canonical — "used
+    /// identically in every document" — which is exactly the claim that
+    /// rots. It was missing `restart` for as long as `restart` existed,
+    /// in the file that tells every other document what the list is.
+    ///
+    /// The README has its own check; this is the second place the verbs
+    /// are written down by hand, and the last one that was unguarded.
+    #[test]
+    fn claude_md_lists_every_verb_pando_has() {
+        use clap::CommandFactory;
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("CLAUDE.md");
+        let text = std::fs::read_to_string(&path).expect("CLAUDE.md");
+        // Hard-wrapped, so the list can straddle lines.
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        for sub in Cli::command().get_subcommands() {
+            let name = sub.get_name();
+            if name == "help" || sub.is_hide_set() {
+                continue;
+            }
+            assert!(
+                flat.contains(&format!(" {name} ")) || flat.contains(&format!(" {name}`")),
+                "CLAUDE.md calls its verb list canonical and does not name {name:?}"
+            );
+        }
+    }
+
     /// The README's own command list, against clap.
     ///
     /// It is prose for people, so it is not in the shape
