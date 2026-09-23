@@ -80,25 +80,54 @@ pando doctor          explain what was detected, why, and what is missing
 pando signals         dump detection signals as JSON, for humans or agents
 ```
 
+## Install
+
+There is no published binary yet. Build it from source with a Rust
+toolchain (edition 2024):
+
+```bash
+cargo install --path .        # puts `pando` in ~/.cargo/bin
+# or
+cargo build --release         # the binary is target/release/pando
+```
+
+`pando --version` says which version you have.
+
+## Working on pando
+
+`src/lib.rs` is the map: the dependency direction between modules, how a
+module that grew past one concern is laid out as a directory, and a table
+of where to add a package manager, a framework, a service image, a
+language, a native service recipe, a CLI verb, a question, a `doctor`
+section or a TUI key.
+
+What pando knows about the ecosystem lives in `src/catalog/` as data, one
+row per fact, and every module that needs a fact reads that row. The
+built-in service recipes are TOML files in `src/recipes/builtin/`, in
+the same format as a recipe you drop into `~/.pando/recipes/`.
+
+Before every commit: `cargo test`, `cargo clippy --all-targets -- -D
+warnings`, and `cargo fmt --check`.
+
 ## Status
 
-Built, not released. Every command above is implemented and covered by
-tests, in this order: worktrees and their lifecycle; detached dev servers
-with their own ports, logs and readiness; several processes per worktree;
-the log viewer; private per-worktree services from the project's own
-compose file; public tunnel URLs; `init`, `doctor` and `signals`; native
-service recipes for machines without Docker; and the JSON contract an
-agent reads.
+Version 0.2.0, built and not published. Every command above is
+implemented and covered by tests, in this order: worktrees and their
+lifecycle; detached dev servers with their own ports, logs and readiness;
+several processes per worktree; the log viewer; private per-worktree
+services from the project's own compose file; public tunnel URLs; `init`,
+`doctor` and `signals`; native service recipes for machines without
+Docker; and the JSON contract an agent reads.
 
 macOS is what it is developed and tested on. The Unix-only parts have
 Linux branches written and no CI, so Linux is intended rather than
 demonstrated: nobody has yet compiled it there, let alone run it.
 
-What that does not mean: there is no published binary and no version to
-install, and almost every worktree pando has created has been inside a
-generated fixture repository. It has been pointed at exactly one real
-project, which found three bugs in an afternoon — a Makefile target read
-down to its first line, a failure that left an empty log and no
+What that does not mean: there is no crate, no release binary and no
+package to install, and almost every worktree pando has created has been
+inside a generated fixture repository. It has been pointed at exactly one
+real project, which found three bugs in an afternoon — a Makefile target
+read down to its first line, a failure that left an empty log and no
 explanation, and a backgrounded server reported as dead. All three are
 fixed, and the count is the point: a tool this heavily tested against
 situations it invented still breaks on first contact with one it did
