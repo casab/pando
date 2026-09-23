@@ -11,3 +11,6 @@ CLAUDE.local.md
 
 # Rust build artifacts
 target/
+
+# Worktrees Claude Code creates for its agents
+.claude/worktrees/
