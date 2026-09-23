@@ -60,6 +60,7 @@ use runtime::runtime_report;
 use services::services_report;
 use stale::stale_detection_findings;
 use tools::tools_report;
+pub use validate::nothing_to_run_fix;
 use validate::validate_config;
 use worktrees::worktrees_report;
 
@@ -110,6 +111,14 @@ pub fn run_on(paths: &PandoPaths, machine: &Machine<'_>) -> Report {
     let services = services_report(paths, &config, machine, &mut findings);
     let hooks = hooks_report(paths, &config, &view, &worktrees, &mut findings);
     let adoption = adoption_report(paths, &mut findings);
+    // Lines composed below doctor name the machine-wide config by its
+    // default path; the fix has to name the one this run reads.
+    for finding in &mut findings {
+        finding.message = config::with_real_user_config(paths, &finding.message);
+        if let Some(fix) = &mut finding.fix {
+            *fix = config::with_real_user_config(paths, fix);
+        }
+    }
 
     Report {
         project,

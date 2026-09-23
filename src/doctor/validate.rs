@@ -14,6 +14,45 @@ pub(super) fn validate_config(paths: &PandoPaths, config: &Config, findings: &mu
     check_provision(paths, config, findings);
     check_install(config, findings);
     check_templates(config, findings);
+    check_something_to_run(paths, config, findings);
+}
+
+/// What to do about a project with no process: the file to write it in,
+/// by its absolute path, and the two lines to write. Shared with the CLI,
+/// which says the same thing when `start` finds nothing to start.
+pub fn nothing_to_run_fix(config_file: &Path) -> String {
+    format!(
+        "add a dev command to {}:\n[dev]\ncmd = \"…\"   # the command that runs it, e.g. \"cargo run\"",
+        config_file.display()
+    )
+}
+
+/// A project with no process configured and none detected: `start` has
+/// nothing to start, and nothing else in the report would say so — a
+/// library is healthy, and "nothing to report" read as "ready to run".
+fn check_something_to_run(paths: &PandoPaths, config: &Config, findings: &mut Vec<Finding>) {
+    if !config.processes.is_empty() {
+        return;
+    }
+    let signals = detect::signals(paths.root());
+    let detected = detect::propose(paths.root(), &signals)
+        .into_iter()
+        .any(|p| {
+            matches!(p.slot, detect::Slot::DevCmd | detect::Slot::Processes)
+                && !p.candidates.is_empty()
+        });
+    if detected {
+        // `start` asks, and the question is how it gets something to run.
+        return;
+    }
+    findings.push(
+        Finding::note(
+            Section::Config,
+            "nothing to run: no dev command detected or configured — `pando start` has \
+             nothing to start",
+        )
+        .with_fix(nothing_to_run_fix(&paths.config_file())),
+    );
 }
 
 /// Every path a worktree is given a copy of has to be gitignored in the

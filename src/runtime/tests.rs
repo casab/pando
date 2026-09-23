@@ -168,6 +168,23 @@ fn mise_tools_are_read_in_every_shape_they_are_written_in() {
     );
 }
 
+// The dot-prefixed spelling is the common one in the wild, and a project
+// pinning its runtimes that way used to be invisible to pando.
+#[test]
+fn a_dot_mise_toml_is_read_like_mise_toml() {
+    assert_eq!(
+        found(&[(".mise.toml", "[tools]\nnode = \"22\"\n")]),
+        vec![("node".into(), "22".into(), ".mise.toml".into(), true)]
+    );
+    // Both present: mise lets `mise.toml` win, so its entry sorts first.
+    let both = found(&[
+        ("mise.toml", "[tools]\nnode = \"22\"\n"),
+        (".mise.toml", "[tools]\nnode = \"20\"\n"),
+    ]);
+    assert_eq!(both[0].2, "mise.toml", "{both:?}");
+    assert_eq!(both[1].2, ".mise.toml", "{both:?}");
+}
+
 #[test]
 fn a_rust_toolchain_file_is_read_through_its_channel_key() {
     assert_eq!(

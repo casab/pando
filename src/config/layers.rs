@@ -2,6 +2,7 @@
 //! what each lower layer is and is not allowed to decide.
 
 use super::schema::Config;
+use super::suggest::KeyError;
 use super::validate::normalize;
 use super::validate::validate;
 use crate::paths::PandoPaths;
@@ -117,7 +118,7 @@ fn load_layers(paths: &PandoPaths, use_home: bool) -> Result<Loaded> {
             if present.len() > 1 && home_alone_is_fine {
                 bail!("{e:#} — {} cannot all apply", listed(&present));
             }
-            bail!("{e:#} — in {}", home_path.display())
+            bail!("{}", in_file(&e, &home_path))
         }
     }
 }
@@ -134,10 +135,30 @@ fn read_lower_layer(
     let mut table = read_table(path, warnings)?;
     strip_keys_only_pando_may_set(&mut table, path, layer, reason, warnings);
     if let Err(e) = build(table.clone(), &paths.project) {
+        // A key error's Display is already one line.
         warnings.push(format!("ignoring {}: {e:#}", path.display()));
         return None;
     }
     Some(table)
+}
+
+/// pando's own layer's error as one line naming its file: a key it does
+/// not take says where the file is in the sentence, anything else is
+/// followed by it.
+fn in_file(e: &anyhow::Error, path: &Path) -> String {
+    match e.downcast_ref::<KeyError>() {
+        Some(key) => key.render(Some(path)),
+        None => {
+            // toml puts the table it was in on a line of its own.
+            let text = format!("{e:#}");
+            let flat: Vec<&str> = text
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect();
+            format!("{} — in {}", flat.join(" "), path.display())
+        }
+    }
 }
 
 /// `a`, `a and b`, `a, b and c` — every file a refusal has to name.
@@ -152,7 +173,17 @@ fn listed(names: &[String]) -> String {
 /// One layer on its own: deserialise, normalise, validate. A layer that
 /// cannot survive this is not merged into anything.
 fn build(table: Table, project: &ProjectRef) -> Result<Config> {
-    let config: Config = Value::Table(table).try_into().context("parse pando.toml")?;
+    let config: Config = Value::Table(table)
+        .try_into()
+        .map_err(|e: toml::de::Error| {
+            // A key a table does not take is the common mistake, and it gets
+            // one line with what was probably meant; anything else keeps
+            // toml's words.
+            match KeyError::parse(&e.to_string()) {
+                Some(key) => anyhow::Error::new(key),
+                None => anyhow::Error::new(e).context("parse pando.toml"),
+            }
+        })?;
     let config = normalize(config)?;
     validate(&config, project)?;
     Ok(config)

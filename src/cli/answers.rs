@@ -318,12 +318,26 @@ pub(super) fn report_unused(answers: &Answers, before: &Config) {
     }
 }
 
+/// How a preview marks a slot nobody here could answer, in its value.
+const UNANSWERED: &str = "(unanswered)";
+
 /// What `init` prints: where the answers went, and what they say.
 ///
 /// The path first, because the one thing a developer wants after a batch
 /// of questions is the file to go and read.
 pub(super) fn render_init(report: &actions::InitReport, verb: &str) -> String {
     let mut out = String::new();
+    // Counted before anything is said about the file: "nothing left to
+    // answer" above a list of slots marked unanswered contradicted itself.
+    let unanswered = report
+        .slots
+        .iter()
+        .filter(|slot| {
+            slot.value
+                .as_deref()
+                .is_some_and(|v| v.starts_with(UNANSWERED))
+        })
+        .count();
     if report.answered_anything() {
         out.push_str(&format!("{verb} {}\n", report.config_file.display()));
         // Named only when this run put something there: the prelude is
@@ -332,6 +346,17 @@ pub(super) fn render_init(report: &actions::InitReport, verb: &str) -> String {
         if let Some(user) = &report.user_file {
             out.push_str(&format!("{verb} {}\n", user.display()));
         }
+    } else if unanswered > 0 {
+        out.push_str(&format!(
+            "{unanswered} {} still unanswered — `pando init` on a terminal asks {}, and \
+             `--yes` takes pando's recommendation\n",
+            if unanswered == 1 {
+                "question is"
+            } else {
+                "questions are"
+            },
+            if unanswered == 1 { "it" } else { "them" },
+        ));
     } else if report.config_file.exists() {
         out.push_str(&format!(
             "nothing left to answer — {} already says it all\n",
@@ -354,8 +379,58 @@ pub(super) fn render_init(report: &actions::InitReport, verb: &str) -> String {
     out
 }
 
-/// What exit code 3 prints: the question, its options, and the two ways out.
+/// What exit code 3 prints: the question, its options, and the ways out —
+/// with the file named absolutely, what to paste into it, and the answers
+/// file a program would use instead.
 pub fn render_needs_answer(needs: &actions::NeedsAnswer) -> String {
+    let mut out = render_question(needs);
+    out.push_str(&how_to_answer(&needs.question));
+    out
+}
+
+/// The paste-ready answer and the program's way in, under the question.
+fn how_to_answer(question: &actions::Question) -> String {
+    let mut out = String::new();
+    let file = answer_file(question);
+    let snippet = question.snippet.trim_end();
+    if !snippet.is_empty() {
+        out.push_str(match question.options.is_empty() {
+            true => "  the key to set there, with a value of your own:\n",
+            false => "  the first option, as it would be written there:\n",
+        });
+        for line in snippet.lines() {
+            out.push_str(&format!("    {line}\n"));
+        }
+    }
+    if question.slot == crate::detect::Slot::Prelude {
+        out.push_str(&format!(
+            "  or `prelude = \"\"` under [runtime] in {file}: run every command with what \
+             `bash -lc` resolves, and accept the mismatch\n"
+        ));
+    }
+    // The value an answers file would carry for the first option, so a
+    // program has a line to copy rather than a shape to guess.
+    let value = match (question.multi, question.options.first()) {
+        (true, _) => serde_json::Value::Array(
+            question
+                .checked
+                .iter()
+                .filter_map(|i| question.options.get(*i))
+                .map(|(value, _)| serde_json::Value::String(value.clone()))
+                .collect(),
+        )
+        .to_string(),
+        (false, Some((value, _))) => serde_json::Value::String(value.clone()).to_string(),
+        (false, None) => "\"<your own>\"".to_string(),
+    };
+    out.push_str(&format!(
+        "  or from a program: `pando init --answers <file.json>` with {{\"{}\": {value}}}\n",
+        slot_name(question.slot)
+    ));
+    out
+}
+
+fn render_question(needs: &actions::NeedsAnswer) -> String {
     let mut out = format!(
         "pando: {}
 ",
@@ -378,15 +453,15 @@ pub fn render_needs_answer(needs: &actions::NeedsAnswer) -> String {
             i + 1
         ));
     }
+    let file = answer_file(&needs.question);
     if needs.question.multi {
-        out.push_str(
-            "pando: answer it in pando.toml with a [[services]] table, or rerun with --yes to \
+        out.push_str(&format!(
+            "pando: answer it in {file} with a [[services]] table, or rerun with --yes to \
              take the ticked ones
-",
-        );
+"
+        ));
         return out;
     }
-    let file = answer_file(needs.question.slot);
     if needs.question.options.is_empty() {
         // `--yes` takes the first option, and there is no first option, so
         // offering it is an instruction to run the same failure again.
@@ -416,14 +491,22 @@ pando: answer it in {file} — nothing pando can accept for you exists here
 }
 
 /// Which file an answer to this question is written to, so the way out
-/// names the file to edit rather than the usual one.
+/// names the file to edit rather than the usual one: absolute, under
+/// whatever home `PANDO_HOME` names, when the question knows it.
 ///
 /// The prelude is about the machine, not the project, and its answer lives
 /// in pando's machine-wide config — telling an agent to put it in
 /// `pando.toml` would send it to a file pando will not read it from.
-fn answer_file(slot: crate::detect::Slot) -> &'static str {
-    match slot.layer() {
-        crate::config::Layer::User => "~/.pando/config.toml",
-        crate::config::Layer::Project => "pando.toml",
+fn answer_file(question: &actions::Question) -> String {
+    if let Some(file) = &question.answer_file {
+        return file.display().to_string();
+    }
+    match question.slot.layer() {
+        // The home this run uses, `PANDO_HOME` included, not the default.
+        crate::config::Layer::User => crate::paths::default_home()
+            .join("config.toml")
+            .display()
+            .to_string(),
+        crate::config::Layer::Project => "pando.toml".to_string(),
     }
 }

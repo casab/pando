@@ -11,10 +11,12 @@ use crate::paths::PandoPaths;
 use crate::services;
 
 use super::init::{machine_evidence, slot_value};
-use super::lifecycle::Mode;
+use super::lifecycle::{Mode, worktree_roles, would_isolate};
 use super::runtime::{
     Machine, RuntimeOutcome, answer_prelude, resolve_runtime, runtime_shell, user_home,
 };
+use super::services::{backends_reachable, placeholder_ports, service_roles};
+use super::worktree::find_worktree;
 
 /// Something pando needs to know and cannot work out on its own.
 ///
@@ -47,6 +49,26 @@ pub struct Question {
     /// above the options by every front end, and carried on the question
     /// rather than narrated separately so the exit-3 render has it too.
     pub details: Vec<String>,
+    /// The file this answer is written to, absolute — the project's
+    /// `pando.toml` under whatever home `PANDO_HOME` names, or the
+    /// machine-wide config for the prelude. `None` for a question built
+    /// with no project in hand, such as the one `signals` publishes.
+    pub answer_file: Option<std::path::PathBuf>,
+    /// What the first option would be in that file, ready to paste: the
+    /// same edits an answer writes. For a question with no options, the
+    /// key with a placeholder.
+    pub snippet: String,
+}
+
+impl Question {
+    /// The same question, told where its answer goes.
+    pub fn at(mut self, paths: &PandoPaths) -> Question {
+        self.answer_file = Some(match self.slot.layer() {
+            config::Layer::User => paths.user_config_file(),
+            _ => paths.config_file(),
+        });
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +154,26 @@ impl std::fmt::Display for NeedsAnswer {
 }
 
 impl std::error::Error for NeedsAnswer {}
+
+/// A value a *program* supplied that pando checked and refused — a
+/// prelude that fails its own probe, say.
+///
+/// The same class of mistake as an answers file naming a question pando
+/// does not ask: something wrong with what was handed in, not a failure
+/// of what pando tried to do. Front ends give it the usage-error code, so
+/// a program can tell "my answer was bad" from "the command broke"
+/// without reading English. A person typing the same value at a prompt
+/// gets an ordinary error, because for them there is no file to fix.
+#[derive(Debug, Clone)]
+pub struct RefusedAnswer(pub String);
+
+impl std::fmt::Display for RefusedAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for RefusedAnswer {}
 
 /// Who answered, for the comment written beside the key it fills.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -307,7 +349,13 @@ pub const START_SLOTS: [Slot; 6] = [
 ];
 
 /// Slots a start that is not isolating may accept but must not ask about.
-const SILENT_UNLESS_ISOLATED: [Slot; 1] = [Slot::Services];
+///
+/// The schema step too: it runs after the private services are up, and a
+/// start that is not isolating has none — asking whether to migrate a
+/// database this start does not have is a question about a mode it is
+/// not in. Its proposal is never decided, so such a start neither asks it
+/// nor takes it.
+const SILENT_UNLESS_ISOLATED: [Slot; 2] = [Slot::Services, Slot::SchemaHook];
 
 /// Fills the dev process from detection when config has none.
 pub fn resolve_process(
@@ -319,8 +367,50 @@ pub fn resolve_process(
 ) -> Result<Config> {
     // Only a start that is isolating may *ask* which services to run
     // private copies of. `--shared` is a start that is putting them away,
-    // which is no more a reason to ask than a plain one.
-    let silent: &[Slot] = if mode == Mode::Isolated {
+    // which is no more a reason to ask than a plain one. With no worktree
+    // to read, the flag is all there is; [`resolve_for_start`] knows more.
+    resolve_starting(paths, config, mode == Mode::Isolated, ask, progress)
+}
+
+/// [`resolve_process`] for a start of one worktree: what `start` and
+/// `restart` call.
+///
+/// Two things only the worktree can say. Whether this start isolates is
+/// not only the flag: a plain start of a worktree that is already
+/// isolated keeps its own services, so the schema and services questions
+/// are about the mode it is in. And a start that isolates with Docker not
+/// answering cannot happen at all, so that is found out before anything
+/// is asked — never after the developer has answered a question for it.
+pub fn resolve_for_start(
+    paths: &PandoPaths,
+    config: &Config,
+    name: &str,
+    mode: Mode,
+    ask: Ask<'_>,
+    progress: &dyn Fn(&str),
+) -> Result<Config> {
+    let isolating = mode == Mode::Isolated || would_isolate(paths, config, name, mode);
+    if isolating
+        && !service_roles(config).is_empty()
+        && let Ok(worktree) = find_worktree(paths, name)
+    {
+        let canonical =
+            std::fs::canonicalize(&worktree.path).unwrap_or_else(|_| worktree.path.clone());
+        let ports = placeholder_ports(&worktree_roles(config, true));
+        backends_reachable(paths, config, name, &canonical, &ports)?;
+    }
+    resolve_starting(paths, config, isolating, ask, progress)
+}
+
+/// The questions of a start that is, or is not, isolating.
+fn resolve_starting(
+    paths: &PandoPaths,
+    config: &Config,
+    isolating: bool,
+    ask: Ask<'_>,
+    progress: &dyn Fn(&str),
+) -> Result<Config> {
+    let silent: &[Slot] = if isolating {
         &[]
     } else {
         &SILENT_UNLESS_ISOLATED
@@ -342,7 +432,54 @@ pub fn resolve_for_new(
     ask: Ask<'_>,
     progress: &dyn Fn(&str),
 ) -> Result<Config> {
-    resolve(paths, config, &NEW_SLOTS, ask, progress)
+    let shell = runtime_shell(paths.root());
+    let machine = Machine {
+        shell: &shell,
+        home: user_home(),
+    };
+    resolve_for_new_on(paths, config, ask, progress, &machine)
+}
+
+/// [`resolve_for_new`] with the machine injected.
+pub(super) fn resolve_for_new_on(
+    paths: &PandoPaths,
+    config: &Config,
+    ask: Ask<'_>,
+    progress: &dyn Fn(&str),
+    machine: &Machine<'_>,
+) -> Result<Config> {
+    let answering = Answering::asking(ask);
+    let config = resolve_on(
+        paths,
+        config,
+        &NEW_SLOTS,
+        &[],
+        &answering,
+        progress,
+        machine,
+    )?;
+    // `new` spawns one thing, the install step — and an install run under
+    // the wrong runtime builds native modules for the wrong ABI, which
+    // `start` only finds out about afterwards. So when there is an install
+    // to run, the runtime question comes first; when there is none, `new`
+    // spawns nothing and has no business probing the machine.
+    let installs = config
+        .project
+        .install
+        .as_deref()
+        .is_some_and(|install| !install.trim().is_empty());
+    if !installs {
+        return Ok(config);
+    }
+    resolve_on(
+        paths,
+        &config,
+        &[Slot::Prelude],
+        &[],
+        &answering,
+        progress,
+        machine,
+    )
 }
 
 /// Detects, asks where it has to, and writes every answer to `pando.toml`.
@@ -479,8 +616,23 @@ pub fn resolve_on(
     // too. The only thing that changes it mid-run is an answer to the
     // shape question itself.
     let mut may_fill_dev = detect::may_fill_dev(&config);
+    // Answers that decide the shape of the dev process, held in memory
+    // until the port question after them is settled too. Written one by
+    // one, an interrupted pass — a start with no terminal that stops at
+    // the port question — left `[dev].cmd` on disk, and a `[dev]` on disk
+    // reads as a developer's own, which answers the port question for
+    // good: no ports, no URL, and a start that "succeeds". Held back, the
+    // interrupted pass writes nothing about the process, and the next one
+    // asks both questions again.
+    let defer_until_ports = slots.contains(&Slot::PortEnv);
+    let mut deferred: Vec<Deferred> = Vec::new();
 
     for slot in slots {
+        // Anything past the process-shape slots flushes what they held:
+        // the port question has been asked, skipped or answered by now.
+        if !matches!(slot, Slot::Processes | Slot::DevCmd | Slot::PortEnv) {
+            flush(paths, &mut deferred, progress)?;
+        }
         if matches!(slot, Slot::DevCmd | Slot::PortEnv) && !may_fill_dev {
             continue;
         }
@@ -546,8 +698,17 @@ pub fn resolve_on(
                     // Not "running private copies of": a start that is not
                     // isolating runs none, and this line is written on
                     // every start that fills the slot.
+                    // Each service's own evidence, once: two found from two
+                    // variables are two reasons, not the first one twice.
+                    let mut whys: Vec<&str> = Vec::new();
+                    for c in &taken {
+                        if !c.why.is_empty() && !whys.contains(&c.why.as_str()) {
+                            whys.push(&c.why);
+                        }
+                    }
+                    let whys = whys.join(" · ");
                     progress(&format!(
-                        "using {} as this project's services (detected: {why})",
+                        "using {} as this project's services (detected: {whys})",
                         taken
                             .iter()
                             .map(|c| c.value.as_str())
@@ -557,7 +718,7 @@ pub fn resolve_on(
                 }
                 (taken, config::Note::Detected(why))
             } else {
-                let question = question_for(proposal, &[]);
+                let question = question_for(proposal, &[]).at(paths);
                 let offered = question.options.len();
                 let (answer, by) = answered_by(ask(&question)?);
                 pending = pending_decision(&question, proposal, &answer, by);
@@ -608,7 +769,7 @@ pub fn resolve_on(
             let why = candidate.why.clone();
             (candidate, config::Note::Detected(why))
         } else {
-            let question = question_for(proposal, &[]);
+            let question = question_for(proposal, &[]).at(paths);
             let offered = question.options.len();
             let (answer, by) = answered_by(ask(&question)?);
             pending = pending_decision(&question, proposal, &answer, by);
@@ -635,6 +796,7 @@ pub fn resolve_on(
                 // "nobody has said yet", or the question returns on every
                 // run with nowhere to put the answer but the TOML by hand.
                 Answer::None if matches!(*slot, Slot::PortEnv | Slot::Provision) => {
+                    flush(paths, &mut deferred, progress)?;
                     write_empty_answer(
                         paths,
                         &mut config,
@@ -645,20 +807,49 @@ pub fn resolve_on(
                     )?;
                     continue;
                 }
+                // "No" to the schema step, recorded as the step pando found
+                // switched off: the command stays visible, and flipping
+                // `on` is the whole of changing one's mind.
+                Answer::None if *slot == Slot::SchemaHook => {
+                    let mut declined = proposal
+                        .preferred()
+                        .context("the schema question has an option to decline")?
+                        .clone();
+                    if let Some(hook) = declined.hook.as_mut() {
+                        hook.on = Some(config::HookScope::Never);
+                    }
+                    (declined, by.note(config::Note::Answered))
+                }
                 Answer::None => bail!("{} has no \"none\" answer", slot_label(*slot)),
                 Answer::Program(_) => unreachable!("answered_by peels every wrapper"),
             }
         };
         let (candidate, note) = candidate;
-        write_answer(
-            paths,
-            &mut config,
-            *slot,
-            &candidate,
-            note,
-            pending,
-            progress,
-        )?;
+        if defer_until_ports && matches!(slot, Slot::Processes | Slot::DevCmd) {
+            // Checked now, written later: the answer is refused while
+            // nothing is on disk, exactly as `write_answer` would.
+            let mut proposed = config.clone();
+            detect::apply(*slot, &candidate, &mut proposed);
+            refuse_unloadable(paths, *slot, &candidate.value, &proposed)?;
+            config = proposed;
+            deferred.push(Deferred {
+                slot: *slot,
+                candidate,
+                note,
+                pending,
+            });
+        } else {
+            flush(paths, &mut deferred, progress)?;
+            write_answer(
+                paths,
+                &mut config,
+                *slot,
+                &candidate,
+                note,
+                pending,
+                progress,
+            )?;
+        }
         if *slot == Slot::Processes {
             // The answer decided the shape. The per-app form leaves the
             // single-process slots nothing to fill; the root-script form
@@ -666,7 +857,38 @@ pub fn resolve_on(
             may_fill_dev = detect::fills_one_dev_process(&config);
         }
     }
+    flush(paths, &mut deferred, progress)?;
     Ok(config)
+}
+
+/// A single-value answer chosen in this pass and not yet on disk.
+struct Deferred {
+    slot: Slot,
+    candidate: detect::Candidate,
+    note: config::Note,
+    pending: Option<Pending>,
+}
+
+/// Writes every held answer, in the order it was given.
+///
+/// The in-memory config already carries them, so each is written to a
+/// scratch copy; only the file and the decisions log change here.
+fn flush(paths: &PandoPaths, deferred: &mut Vec<Deferred>, progress: &dyn Fn(&str)) -> Result<()> {
+    for held in deferred.drain(..) {
+        let mut scratch = config::load(paths)
+            .map(|loaded| loaded.config)
+            .unwrap_or_default();
+        write_answer(
+            paths,
+            &mut scratch,
+            held.slot,
+            &held.candidate,
+            held.note,
+            held.pending,
+            progress,
+        )?;
+    }
+    Ok(())
 }
 
 /// Writes one single-value answer: checks it loads, patches its keys, and
@@ -802,7 +1024,7 @@ fn volunteer(
     // by the same function every other question is — and so the decisions
     // log records, honestly, that the rules offered nothing.
     let proposal = detect::Proposal::of(slot, Vec::new(), false);
-    let question = question_for(&proposal, &[]);
+    let question = question_for(&proposal, &[]).at(paths);
     let Some(answer) = program(&question) else {
         return Ok(false);
     };
@@ -882,7 +1104,7 @@ fn apply_service_answer(
 /// a project fact, in the project layer, beside the machine-wide
 /// `prefer`. Without somewhere to record it the question would return on
 /// every isolated start, with nowhere to answer it but the TOML by hand.
-fn apply_native_service_answer(
+pub(super) fn apply_native_service_answer(
     paths: &PandoPaths,
     config: &mut Config,
     chosen: &[&detect::Candidate],
@@ -913,13 +1135,15 @@ fn apply_native_service_answer(
     refuse_unloadable(paths, Slot::Services, &names.join(", "), &proposed)?;
     for candidate in chosen {
         let (array, entries) = detect::native_entry(candidate);
-        config::set_detected_array_entry(
-            paths,
-            Slot::Services.layer(),
-            array,
-            entries,
-            note.clone(),
-        )?;
+        // One entry per service, so each cites its own evidence: a redis
+        // found from `CACHE_URL` is not "detected: DATABASE_URL".
+        let note = match &note {
+            config::Note::Detected(_) if !candidate.why.is_empty() => {
+                config::Note::Detected(candidate.why.clone())
+            }
+            other => other.clone(),
+        };
+        config::set_detected_array_entry(paths, Slot::Services.layer(), array, entries, note)?;
     }
     detect::apply_native_services(chosen, config);
     Ok(())
@@ -1036,6 +1260,8 @@ pub fn question_for(proposal: &detect::Proposal, details: &[String]) -> Question
         multi: proposal.slot.is_multi(),
         checked: proposal.preselected(),
         details: details.to_vec(),
+        answer_file: None,
+        snippet: detect::snippet(proposal.slot, &proposal.preferred_set()),
     }
 }
 

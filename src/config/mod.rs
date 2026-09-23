@@ -23,18 +23,20 @@
 mod edit;
 mod layers;
 mod schema;
+mod suggest;
 mod validate;
 
 pub use edit::{
-    Layer, Note, patch, prelude_origin, set_detected, set_detected_array_entry, set_detected_table,
-    write,
+    Layer, Note, install_origin, patch, prelude_origin, set_detected, set_detected_array_entry,
+    set_detected_table, write,
 };
 pub use layers::{Loaded, load, load_without_home};
 pub use schema::{
-    BranchRule, BranchesSection, Config, HookConfig, HookPoint, ISOLATION_KINDS, IsolationSection,
-    PortsSpec, ProbeConfig, ProcessConfig, ProjectSection, ProvisionMode, ReadySpec,
-    RuntimeSection, ServiceConfig, ShareSection,
+    BranchRule, BranchesSection, Config, HookConfig, HookPoint, HookScope, ISOLATION_KINDS,
+    IsolationSection, PortsSpec, ProbeConfig, ProcessConfig, ProjectSection, ProvisionMode,
+    ReadySpec, RuntimeSection, ServiceConfig, ShareSection,
 };
+pub use suggest::{KeyError, closest, edit_distance};
 pub use validate::validate;
 
 /// The role `share`, the browser-open key, and a readiness rule all default

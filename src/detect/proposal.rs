@@ -54,7 +54,12 @@ impl Slot {
     /// its commands, a worktree that needs no local file, an empty set of
     /// services. An answer nothing can record is asked again on every run.
     pub fn allows_none(self) -> bool {
-        matches!(self, Slot::PortEnv | Slot::Prelude | Slot::Provision) || self.is_multi()
+        // The schema step's "no" is the step pando found, written with
+        // `on = "never"`: switched off, still visible.
+        matches!(
+            self,
+            Slot::PortEnv | Slot::Prelude | Slot::Provision | Slot::SchemaHook
+        ) || self.is_multi()
     }
 
     /// Whether a command typed by hand is an answer. Every slot but the
@@ -113,6 +118,17 @@ impl Slot {
             Slot::Provision => (&["project"], "provision"),
             Slot::Processes | Slot::Services | Slot::SchemaHook => return None,
         })
+    }
+
+    /// What a typed answer to this slot is, for "something else — type
+    /// the …": a port answer is variable names, not a command.
+    pub fn custom_noun(self) -> &'static str {
+        match self {
+            Slot::PortEnv => "variable names",
+            Slot::VersionFiles | Slot::Provision => "file names",
+            Slot::Prelude => "shell line",
+            _ => "command",
+        }
     }
 
     /// The question asked when the rules cannot decide.

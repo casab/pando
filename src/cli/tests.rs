@@ -77,6 +77,647 @@ fn the_cli_definition_is_valid() {
     Cli::command().debug_assert();
 }
 
+// A person opening `--help` is looking for how to use it, so the top
+// level and every verb with a non-obvious shape show examples, and every
+// example is a command the binary really takes.
+#[test]
+fn help_carries_examples_that_parse() {
+    let mut cli = Cli::command();
+    let top = cli.render_help().to_string();
+    assert!(top.contains("Examples:"), "{top}");
+    for verb in [
+        "new",
+        "ls",
+        "start",
+        "stop",
+        "status",
+        "open",
+        "logs",
+        "completions",
+    ] {
+        let sub = cli
+            .find_subcommand_mut(verb)
+            .unwrap_or_else(|| panic!("no {verb}"));
+        let help = sub.render_help().to_string();
+        assert!(help.contains("Example"), "{verb} has no example:\n{help}");
+    }
+    for line in top.lines().chain(
+        cli.get_subcommands()
+            .flat_map(|s| s.get_after_help().map(|h| h.to_string()))
+            .collect::<Vec<_>>()
+            .iter()
+            .flat_map(|h| h.lines()),
+    ) {
+        let Some(rest) = line.trim_start().strip_prefix("pando ") else {
+            continue;
+        };
+        // The command is everything before the two-space gap that starts
+        // its description.
+        let command = rest.split("  ").next().unwrap().trim();
+        let mut argv = vec!["pando"];
+        argv.extend(command.split_whitespace().filter(|w| !w.starts_with('>')));
+        let argv: Vec<&str> = argv
+            .into_iter()
+            .take_while(|w| !w.starts_with('~'))
+            .collect();
+        Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?} does not parse: {e}"));
+    }
+}
+
+#[test]
+fn a_typo_is_matched_to_the_names_it_was_probably_meant_to_be() {
+    use super::names::{edit_distance, suggest};
+    assert_eq!(edit_distance("feat+one", "feat+one"), 0);
+    assert_eq!(edit_distance("feat+on", "feat+one"), 1);
+    assert_eq!(edit_distance("faet+one", "feat+one"), 2);
+
+    let fx = fixture();
+    for branch in ["feat/one", "feat/two", "fix/login"] {
+        actions::new(&fx.paths, &fx.config, branch, None, &|_| {}).unwrap();
+    }
+    let worktrees = crate::worktree::discover(&fx.paths.project).unwrap();
+    // A prefix of the branch or the directory name.
+    let mut prefix = suggest("feat", &worktrees);
+    prefix.sort();
+    assert_eq!(prefix, ["feat/one", "feat/two"]);
+    // A typo.
+    assert_eq!(suggest("fix/logni", &worktrees), ["fix/login"]);
+    // Something in the middle.
+    assert_eq!(suggest("login", &worktrees), ["fix/login"]);
+    // Nothing close.
+    assert!(suggest("zzzzzz", &worktrees).is_empty());
+}
+
+// A branch literally called `a+b`, beside the directory `a+b` of the
+// branch `a/b`: the typed string names two worktrees, and picking the
+// directory silently is how `rm a+b` removes the one that was not meant.
+#[test]
+fn a_name_that_is_one_worktrees_directory_and_anothers_branch_is_refused() {
+    let fx = fixture();
+    let first = actions::new(&fx.paths, &fx.config, "a/b", None, &|_| {}).unwrap();
+    assert_eq!(first, "a+b");
+    let elsewhere = fx.root.parent().unwrap().join("other");
+    git(
+        &fx.root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "a+b",
+            elsewhere.to_str().unwrap(),
+        ],
+    );
+
+    let err = super::names::resolve(&fx.paths, "a+b").unwrap_err();
+    assert!(err.downcast_ref::<UsageError>().is_some(), "{err:#}");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("names two worktrees"), "{msg}");
+    assert!(msg.contains("`a/b`") && msg.contains("`other`"), "{msg}");
+    // Each has an unambiguous name, and both resolve.
+    assert_eq!(super::names::resolve(&fx.paths, "a/b").unwrap(), "a+b");
+    assert_eq!(super::names::resolve(&fx.paths, "other").unwrap(), "other");
+}
+
+// `start --only web --wait` is about web. A sibling that failed an hour
+// ago used to fail it; a process with no port was "ready" the moment it
+// was alive, so a dev command that exited a second later was a success.
+#[test]
+fn a_wait_watches_only_what_it_started_and_a_portless_process_for_a_while() {
+    use super::wait::{Verdict, verdict};
+    let now = Utc::now();
+    let mut record = WorktreeRecord::new("/tmp/nowhere", true);
+    let mut api = fake_process(now - chrono::Duration::hours(1));
+    api.phase = Phase::Failed {
+        at: now,
+        reason: "process exited".into(),
+    };
+    record.processes.insert("api".into(), api);
+    let mut web = fake_process(now - chrono::Duration::seconds(60));
+    web.ready_port = Some(17_342);
+    web.phase = Phase::Running { since: now };
+    record.processes.insert("web".into(), web);
+
+    assert_eq!(verdict(&record, Some("web"), now), Verdict::Ready);
+    assert!(matches!(
+        verdict(&record, None, now),
+        Verdict::Failed { process, .. } if process == "api"
+    ));
+
+    // No port: running as soon as it is alive, and watched a while more.
+    let mut dev = fake_process(now);
+    dev.phase = Phase::Running { since: now };
+    record.processes.insert("dev".into(), dev);
+    assert_eq!(verdict(&record, Some("dev"), now), Verdict::Waiting);
+    let later = now + chrono::Duration::from_std(super::wait::NO_PORT_WATCH).unwrap();
+    assert_eq!(
+        verdict(&record, Some("dev"), later + chrono::Duration::seconds(1)),
+        Verdict::Ready
+    );
+}
+
+// A worker that died four seconds in was "started" with exit 0, because
+// the watch was three; and "worker is ready (0.1s)" was printed before
+// the watch had even begun.
+#[test]
+fn a_portless_process_is_watched_long_enough_and_called_up_only_after() {
+    use super::wait::{Verdict, ready_line, verdict};
+    let now = Utc::now();
+    let mut record = WorktreeRecord::new("/tmp/nowhere", true);
+    let mut worker = fake_process(now);
+    worker.phase = Phase::Running { since: now };
+    record.processes.insert("worker".into(), worker.clone());
+    let at = |secs| now + chrono::Duration::seconds(secs);
+
+    // Still watched at four seconds: a death then fails the wait.
+    assert_eq!(verdict(&record, None, at(4)), Verdict::Waiting);
+    assert_eq!(
+        ready_line(
+            "worker",
+            &worker,
+            at(1),
+            std::time::Duration::from_millis(100)
+        ),
+        None
+    );
+    assert_eq!(verdict(&record, None, at(6)), Verdict::Ready);
+    assert_eq!(
+        ready_line("worker", &worker, at(6), std::time::Duration::from_secs(6)).unwrap(),
+        "worker is up (no port to check; watched 5s)"
+    );
+
+    // Its own timeout stretches the watch, but not past ten seconds.
+    worker.ready_timeout_s = Some(8);
+    record.processes.insert("worker".into(), worker.clone());
+    assert_eq!(verdict(&record, None, at(7)), Verdict::Waiting);
+    assert_eq!(verdict(&record, None, at(9)), Verdict::Ready);
+    worker.ready_timeout_s = Some(300);
+    record.processes.insert("worker".into(), worker.clone());
+    assert_eq!(verdict(&record, None, at(9)), Verdict::Waiting);
+    assert_eq!(verdict(&record, None, at(11)), Verdict::Ready);
+
+    // A process with a port is ready the moment it is running.
+    let mut web = fake_process(now);
+    web.ready_port = Some(17_343);
+    web.phase = Phase::Running { since: now };
+    assert_eq!(
+        ready_line("web", &web, now, std::time::Duration::from_millis(1500)).unwrap(),
+        "web is ready (1.5s)"
+    );
+}
+
+// The heuristic is on `--help`, where a script author will look for it.
+#[test]
+fn start_help_says_how_a_portless_process_is_judged_ready() {
+    use clap::CommandFactory;
+    let mut cli = super::Cli::command();
+    let start = cli.find_subcommand_mut("start").unwrap();
+    let help = start.render_long_help().to_string();
+    assert!(help.contains("no port"), "{help}");
+    assert!(help.contains("5s") && help.contains("10s"), "{help}");
+}
+
+// The wait outlives the phase machine, which keeps a process `Starting`
+// past its window while the port scan cannot answer.
+#[test]
+fn a_wait_lasts_as_long_as_the_phase_can_stay_starting() {
+    let now = Utc::now();
+    let mut record = WorktreeRecord::new("/tmp/nowhere", true);
+    let mut web = fake_process(now);
+    web.ready_timeout_s = Some(10);
+    record.processes.insert("web".into(), web);
+    let limit = super::wait::limit(&record, None);
+    assert!(
+        limit.as_secs() > crate::state::longest_starting_secs(10) as u64,
+        "{limit:?}"
+    );
+}
+
+fn fake_process(started_at: chrono::DateTime<Utc>) -> ProcessRecord {
+    ProcessRecord {
+        pid: 1,
+        pgid: 1,
+        started_at,
+        log_path: PathBuf::from("/does/not/exist/dev.log"),
+        ready_port: None,
+        ready_timeout_s: None,
+        observed_ports: Vec::new(),
+        swept: false,
+        phase: Phase::Starting { since: started_at },
+    }
+}
+
+#[test]
+fn a_name_resolves_by_directory_by_branch_or_by_the_directory_it_is_run_in() {
+    let fx = fixture();
+    let name = actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
+    assert_eq!(super::names::resolve(&fx.paths, "feat+one").unwrap(), name);
+    assert_eq!(super::names::resolve(&fx.paths, "feat/one").unwrap(), name);
+    let err = super::names::resolve(&fx.paths, "feat/on").unwrap_err();
+    assert!(
+        format!("{err:#}").contains("did you mean feat/one?"),
+        "{err:#}"
+    );
+
+    let inside = fx.paths.worktrees_dir().join(&name).join("sub");
+    std::fs::create_dir_all(&inside).unwrap();
+    assert_eq!(
+        super::names::containing(&fx.paths, &inside).unwrap(),
+        Some(name.clone())
+    );
+    assert_eq!(super::names::containing(&fx.paths, &fx.root).unwrap(), None);
+}
+
+#[test]
+fn logs_default_to_dev_else_to_the_only_process() {
+    let fx = fixture();
+    let name = actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
+    // No log at all: `dev`, so the error names it.
+    assert_eq!(
+        super::logs::default_sources(&fx.paths, &name, "dev"),
+        super::logs::Sources::One("dev".to_string())
+    );
+    // One process, not called dev.
+    with_two_processes(&fx, &name, Phase::Running { since: Utc::now() });
+    let mut store = crate::state::load(&fx.paths.state_file()).unwrap();
+    let record = store.worktrees.get_mut(&name).unwrap();
+    record.processes.remove("api");
+    record.roles.remove("api");
+    crate::state::save(&fx.paths.state_file(), &store).unwrap();
+    write_log(&fx, &name, "web", "web line\n");
+    assert_eq!(
+        super::logs::default_sources(&fx.paths, &name, "dev"),
+        super::logs::Sources::One("web".to_string())
+    );
+    // A dev log wins whenever there is one.
+    write_log(&fx, &name, "dev", "dev line\n");
+    assert_eq!(
+        super::logs::default_sources(&fx.paths, &name, "dev"),
+        super::logs::Sources::One("dev".to_string())
+    );
+}
+
+// A worktree with an api and a web process and no `dev` used to answer a
+// plain `pando logs` with an error. It gets both, compose-style.
+#[test]
+fn logs_with_several_processes_and_no_dev_merge_them() {
+    let fx = fixture();
+    let name = actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
+    with_two_processes(&fx, &name, Phase::Running { since: Utc::now() });
+    write_log(&fx, &name, "api", "a1\na2\n");
+    write_log(&fx, &name, "web", "w1\n");
+    // A hook's log is not a process's, and stays out of the merge.
+    write_log(&fx, &name, "install", "installed\n");
+    let sources = match super::logs::default_sources(&fx.paths, &name, "dev") {
+        super::logs::Sources::Merged(sources) => sources,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(sources, vec!["api".to_string(), "web".to_string()]);
+
+    // No timestamps to order by: one source after the other.
+    let (text, notes) = capture_both(|b, n| {
+        super::logs::logs_merged(&fx.paths, &name, &sources, 50, false, false, b, n)
+    });
+    assert_eq!(text, "api | a1\napi | a2\nweb | w1\n");
+    assert!(notes.iter().any(|n| n.contains("-s api")), "{notes:?}");
+
+    // `-n` counts per source, as compose's `--tail` does.
+    let text = capture(|b| {
+        super::logs::logs_merged(&fx.paths, &name, &sources, 1, false, false, b, &quiet)
+    });
+    assert_eq!(text, "api | a2\nweb | w1\n");
+
+    // Timestamps on every line: one timeline.
+    write_log(
+        &fx,
+        &name,
+        "api",
+        "2026-09-20T10:00:00Z api first\n2026-09-20T10:00:02Z api third\n",
+    );
+    write_log(&fx, &name, "web", "2026-09-20T10:00:01Z web second\n");
+    let text = capture(|b| {
+        super::logs::logs_merged(&fx.paths, &name, &sources, 50, false, false, b, &quiet)
+    });
+    assert_eq!(
+        text,
+        "api | 2026-09-20T10:00:00Z api first\n\
+         web | 2026-09-20T10:00:01Z web second\n\
+         api | 2026-09-20T10:00:02Z api third\n"
+    );
+
+    // And as JSON, each line says where it came from.
+    let text = capture(|b| {
+        super::logs::logs_merged(&fx.paths, &name, &sources, 50, false, true, b, &quiet)
+    });
+    let first: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    assert_eq!(first["source"], "api");
+    assert_eq!(first["version"], JSON_VERSION);
+    // A read of one named log carries no `source`, as before.
+    let one = capture(|b| logs(&fx.paths, &name, "api", 1, false, true, b, &quiet));
+    let one: serde_json::Value = serde_json::from_str(one.trim()).unwrap();
+    assert!(one.get("source").is_none(), "{one}");
+}
+
+// The merged stream's `source` key is published, so the contract says so.
+#[test]
+fn agent_json_documents_the_merged_logs_source_key() {
+    let doc = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("agent/json.md"),
+    )
+    .unwrap();
+    let section = doc
+        .split("## `pando logs <name> --json`")
+        .nth(1)
+        .expect("the logs section")
+        .split("\n## ")
+        .next()
+        .unwrap();
+    assert!(section.contains("\"source\": \"api\""), "{section}");
+    assert!(section.contains("merged"), "{section}");
+}
+
+#[test]
+fn start_waits_on_a_terminal_unless_told_not_to() {
+    assert!(super::waits_on(false, false, true), "a terminal waits");
+    assert!(!super::waits_on(false, true, true), "--no-wait");
+    assert!(!super::waits_on(false, false, false), "a script does not");
+    assert!(super::waits_on(true, false, false), "--wait, from a script");
+}
+
+#[test]
+fn open_wants_something_up_or_a_share() {
+    let fx = fixture();
+    let name = actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
+    let config = with_dev(&fx.config);
+    let named = super::names::Named::of(&fx.paths, Some("feat/one"), &name);
+    let open =
+        |config: &Config, public| super::open::url_to_open(&fx.paths, config, &named, public);
+    let err = open(&config, false).unwrap_err();
+    // Named as a person knows it, and the command echoes what was typed.
+    assert_eq!(
+        format!("{err:#}"),
+        "feat/one is not running — `pando start feat/one` starts it"
+    );
+    let err = open(&config, true).unwrap_err();
+    assert_eq!(
+        format!("{err:#}"),
+        "feat/one is not shared — `pando share feat/one` publishes it"
+    );
+
+    with_share(&fx, &name, None);
+    assert_eq!(open(&config, false).unwrap(), "http://localhost:17342");
+    assert_eq!(
+        open(&config, true).unwrap(),
+        "https://fake-host.trycloudflare.com"
+    );
+}
+
+fn with_dev(config: &Config) -> Config {
+    let mut config = config.clone();
+    config.processes.insert(
+        "dev".into(),
+        crate::config::ProcessConfig {
+            cmd: "true".into(),
+            ..Default::default()
+        },
+    );
+    config
+}
+
+// `pando open feat/r` on a project with nothing to run suggested
+// "`pando start feat+r` starts it", which cannot work.
+#[test]
+fn open_on_a_project_with_nothing_to_run_says_so_and_how_to_add_one() {
+    let fx = fixture();
+    let name = actions::new(&fx.paths, &fx.config, "feat/r", None, &|_| {}).unwrap();
+    let named = super::names::Named::of(&fx.paths, Some("feat/r"), &name);
+    let err = super::open::url_to_open(&fx.paths, &fx.config, &named, false).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.starts_with("feat/r is not running, and this project has nothing to run"));
+    assert!(!msg.contains("pando start"), "{msg}");
+    assert!(
+        msg.contains(&fx.paths.config_file().display().to_string()),
+        "{msg}"
+    );
+    assert!(msg.contains("[dev]\ncmd = \""), "{msg}");
+}
+
+// `init --dry-run` said "nothing left to answer — … already says it all"
+// above "schema command (unanswered) …".
+#[test]
+fn init_never_says_nothing_is_left_above_an_unanswered_slot() {
+    let dir = tempdir().unwrap();
+    let file = dir.path().join("pando.toml");
+    std::fs::write(&file, "").unwrap();
+    let slot = |slot, label, value: &str| actions::SlotSummary {
+        slot,
+        label,
+        value: Some(value.to_string()),
+        answered_now: false,
+    };
+    let mut report = actions::InitReport {
+        config_file: file.clone(),
+        user_file: None,
+        slots: vec![
+            slot(crate::detect::Slot::DevCmd, "dev command", "cargo run"),
+            slot(
+                crate::detect::Slot::SchemaHook,
+                "schema command",
+                "(unanswered) run the schema step?",
+            ),
+        ],
+        warnings: Vec::new(),
+    };
+    let text = super::answers::render_init(&report, "would write");
+    assert!(!text.contains("nothing left"), "{text}");
+    assert!(text.starts_with("1 question is still unanswered"), "{text}");
+    assert!(text.contains("schema command  (unanswered)"), "{text}");
+
+    report.slots.pop();
+    let text = super::answers::render_init(&report, "would write");
+    assert!(text.starts_with("nothing left to answer"), "{text}");
+}
+
+// `start` on a library said "no processes configured; add [dev] to
+// pando.toml" — no path, no example — and a failed install said only that
+// it failed.
+#[test]
+fn a_start_error_says_which_file_to_edit_and_what_to_write() {
+    let fx = fixture();
+    let err = super::with_a_way_past(
+        &fx.paths,
+        anyhow::anyhow!("no processes configured; add [dev] to pando.toml"),
+    );
+    let msg = format!("{err:#}");
+    assert!(msg.starts_with("nothing to run: "), "{msg}");
+    assert!(
+        msg.contains(&format!(
+            "{}:\n[dev]\ncmd = \"",
+            fx.paths.config_file().display()
+        )),
+        "{msg}"
+    );
+
+    let err = super::with_a_way_past(
+        &fx.paths,
+        anyhow::anyhow!("exited 2: ERR_PNPM_OUTDATED_LOCKFILE").context("the install hook failed"),
+    );
+    let msg = format!("{err:#}");
+    assert!(
+        msg.starts_with("the install hook failed: exited 2: ERR_PNPM"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains(&format!(
+            "`project.install` in {} is the command; fix it there, or set it to \"\" to skip \
+             installing",
+            fx.paths.config_file().display()
+        )),
+        "{msg}"
+    );
+    // The file that really says it, when a committed one does.
+    std::fs::write(fx.root.join("pando.toml"), "[project]\ninstall = \"x\"\n").unwrap();
+    let msg = format!(
+        "{:#}",
+        super::with_a_way_past(
+            &fx.paths,
+            anyhow::anyhow!("the install hook failed: exited 2")
+        )
+    );
+    assert!(
+        msg.contains(&fx.root.join("pando.toml").display().to_string()),
+        "{msg}"
+    );
+
+    // Anything else, including a question, is left exactly as it was.
+    let usage = super::with_a_way_past(&fx.paths, UsageError("x".into()).into());
+    assert!(usage.downcast_ref::<UsageError>().is_some());
+}
+
+// An error from below the CLI knew only the directory: the sentence gets
+// the branch, a suggested command what was typed, and a path stays a path.
+#[test]
+fn an_error_is_reworded_to_the_name_a_person_knows() {
+    let named = super::names::Named {
+        dir: "feat+m".into(),
+        shown: "feat/m".into(),
+        typed: "feat+m".into(),
+    };
+    assert_eq!(
+        named.in_words(
+            "feat+m is still starting — `pando status feat+m` says when; log in /h/logs/feat+m/dev.log"
+        ),
+        "feat/m is still starting — `pando status feat+m` says when; log in /h/logs/feat+m/dev.log"
+    );
+    let typed_branch = super::names::Named {
+        typed: "feat/m".into(),
+        ..named.clone()
+    };
+    assert_eq!(
+        typed_branch.in_words("feat+m has no port yet — start it first"),
+        "feat/m has no port yet — start it first"
+    );
+    assert_eq!(
+        typed_branch.in_words("feat+mx is other"),
+        "feat+mx is other"
+    );
+    // A question keeps its type, so its exit code survives.
+    let question = anyhow::Error::new(UsageError("feat+m".into()));
+    assert!(
+        named
+            .reword(question)
+            .downcast_ref::<UsageError>()
+            .is_some()
+    );
+}
+
+#[test]
+fn completions_cover_every_verb() {
+    let mut out = Vec::new();
+    completions(clap_complete::Shell::Zsh, &mut out).unwrap();
+    let script = String::from_utf8(out).unwrap();
+    for sub in Cli::command().get_subcommands() {
+        if sub.is_hide_set() {
+            continue;
+        }
+        assert!(script.contains(sub.get_name()), "{}", sub.get_name());
+    }
+}
+
+fn completion_script(shell: clap_complete::Shell) -> String {
+    let mut out = Vec::new();
+    completions(shell, &mut out).unwrap();
+    String::from_utf8(out).unwrap()
+}
+
+// `completions zsh` completed `<name>` with file names.
+#[test]
+fn a_worktree_argument_completes_worktree_names_not_files() {
+    let verbs = super::completion::verbs_taking_a_worktree();
+    for verb in [
+        "start", "stop", "restart", "logs", "open", "share", "unshare", "status", "rm", "path",
+    ] {
+        assert!(verbs.iter().any(|v| v == verb), "{verb}: {verbs:?}");
+    }
+    assert!(!verbs.iter().any(|v| v == "new"), "new takes a new branch");
+
+    let zsh = completion_script(clap_complete::Shell::Zsh);
+    assert!(zsh.contains("_pando_worktrees() {"), "{zsh}");
+    assert!(zsh.contains("pando ls --names 2>/dev/null"), "{zsh}");
+    // Defined before the function that calls it.
+    assert!(zsh.find("_pando_worktrees() {") < zsh.find("_pando() {"));
+    let name_lines: Vec<&str> = zsh.lines().filter(|l| l.contains("name -- ")).collect();
+    assert_eq!(name_lines.len(), verbs.len(), "{name_lines:#?}");
+    for line in name_lines {
+        assert!(line.ends_with(":_pando_worktrees' \\"), "{line}");
+    }
+
+    let bash = completion_script(clap_complete::Shell::Bash);
+    assert_eq!(
+        bash.matches("$(pando ls --names 2>/dev/null)").count(),
+        verbs.len(),
+        "{bash}"
+    );
+    let fish = completion_script(clap_complete::Shell::Fish);
+    assert!(
+        fish.contains("__fish_seen_subcommand_from rm path start") && fish.contains("ls --names"),
+        "{fish}"
+    );
+}
+
+#[test]
+fn ls_names_lists_what_a_worktree_argument_accepts() {
+    let fx = fixture();
+    actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
+    let text = capture(|b| super::completion::names(&fx.paths, b));
+    let names: Vec<&str> = text.lines().collect();
+    assert_eq!(names, ["acme-shop", "feat/one"], "{text}");
+    for name in names {
+        super::names::resolve(&fx.paths, name).unwrap();
+    }
+}
+
+// A menu entry is a line: the long `--help` paragraph belongs to `--help`.
+#[test]
+fn completion_menus_get_the_short_help_only() {
+    let zsh = completion_script(clap_complete::Shell::Zsh);
+    for line in zsh.lines().filter(|l| l.starts_with('\'')) {
+        let Some(open) = line.find('[') else { continue };
+        let Some(close) = line.rfind(']') else {
+            continue;
+        };
+        if close <= open {
+            continue;
+        }
+        let description = &line[open + 1..close];
+        assert!(
+            description.chars().count() <= 100,
+            "a menu description of {} characters: {line}",
+            description.chars().count()
+        );
+    }
+}
+
 #[test]
 fn help_documents_the_needs_answer_exit_code() {
     let help = Cli::command().render_help().to_string();
@@ -93,43 +734,49 @@ fn widths(pairs: &[(Col, usize)]) -> BTreeMap<Col, usize> {
     pairs.iter().copied().collect()
 }
 
+fn every_column(path: usize) -> BTreeMap<Col, usize> {
+    widths(&[
+        (Col::Name, 10),
+        (Col::Status, 8),
+        (Col::Url, 22),
+        (Col::Ports, 5),
+        (Col::Mode, 8),
+        (Col::Public, 40),
+        (Col::Git, 5),
+        (Col::Branch, 10),
+        (Col::Head, 7),
+        (Col::Path, path),
+    ])
+}
+
 #[test]
 fn a_wide_terminal_keeps_every_column() {
-    let w = widths(&[
-        (Col::Name, 8),
-        (Col::Branch, 8),
-        (Col::Head, 7),
-        (Col::State, 7),
-        (Col::Ports, 5),
-        (Col::Status, 8),
-        (Col::Path, 40),
-    ]);
-    assert_eq!(keep_columns(200, &w), ORDER.to_vec());
+    assert_eq!(keep_columns(400, &every_column(40)), ORDER.to_vec());
 }
 
 // A tmux split is the normal case, so the listing has to survive one:
-// what a worktree is doing outlives what git thinks of it.
+// what a worktree is doing outlives what git thinks of it, and the URL is
+// what somebody came to copy.
 #[test]
-fn a_narrow_terminal_sheds_columns_and_keeps_the_name() {
-    let w = widths(&[
-        (Col::Name, 10),
-        (Col::Branch, 10),
-        (Col::Head, 7),
-        (Col::State, 7),
-        (Col::Ports, 5),
-        (Col::Status, 8),
-        (Col::Path, 60),
-    ]);
-    let mid = keep_columns(60, &w);
-    assert!(mid.contains(&Col::Name) && mid.contains(&Col::Status));
+fn a_narrow_terminal_sheds_columns_and_keeps_name_status_and_url() {
+    let w = every_column(60);
+    let mid = keep_columns(100, &w);
     assert!(
-        !mid.contains(&Col::Path),
-        "the path is the first thing to go after the sha"
+        !mid.contains(&Col::Path) && !mid.contains(&Col::Head),
+        "the path and the sha go first: {mid:?}"
     );
-    let tight = keep_columns(20, &w);
-    assert_eq!(tight, vec![Col::Name, Col::Status]);
+    assert!(mid.contains(&Col::Url), "{mid:?}");
+
+    let tight = keep_columns(44, &w);
+    assert_eq!(tight, vec![Col::Name, Col::Status, Col::Url]);
+    let tighter = keep_columns(24, &w);
+    assert_eq!(tighter, vec![Col::Name, Col::Status]);
     let sliver = keep_columns(4, &w);
-    assert_eq!(sliver, vec![Col::Name], "the name is never dropped");
+    assert_eq!(
+        sliver,
+        vec![Col::Name, Col::Status],
+        "the name and the status are never dropped"
+    );
 }
 
 #[test]
@@ -157,11 +804,13 @@ fn ls_shows_the_ports_and_status_of_a_running_worktree() {
 
     let text = capture(|b| ls_text_at(&fx.paths, b, 200));
     assert!(text.contains("PORTS") && text.contains("STATUS"), "{text}");
-    assert!(text.contains("17342"), "{text}");
+    // One port is named by its role like many are: a bare "17342" beside
+    // another row's "api:29496 web:29497" read as a different thing.
+    assert!(text.contains("web:17342"), "{text}");
     assert!(text.contains("running"), "{text}");
 
     let narrow = capture(|b| ls_text_at(&fx.paths, b, 24));
-    assert!(narrow.contains("feat+one"), "{narrow}");
+    assert!(narrow.contains("feat/one"), "{narrow}");
     assert!(
         !narrow.contains("PATH"),
         "a narrow listing sheds the path: {narrow}"
@@ -173,7 +822,7 @@ fn a_worktree_with_nothing_running_shows_dashes() {
     let fx = fixture();
     actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
     let text = capture(|b| ls_text_at(&fx.paths, b, 200));
-    assert!(text.contains("feat+one"), "{text}");
+    assert!(text.contains("feat/one"), "{text}");
     assert!(text.contains(" -"), "{text}");
 }
 
@@ -361,6 +1010,8 @@ fn dev_question(options: &[&str]) -> actions::Question {
         multi: false,
         checked: Vec::new(),
         details: Vec::new(),
+        answer_file: None,
+        snippet: String::new(),
     }
 }
 
@@ -380,6 +1031,8 @@ fn services_question() -> actions::Question {
         multi: true,
         checked: vec![1, 2],
         details: Vec::new(),
+        answer_file: None,
+        snippet: String::new(),
     }
 }
 
@@ -744,7 +1397,7 @@ fn status_text_names_what_each_worktree_is_doing() {
     let fx = fixture();
     actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
     let text = capture(|b| status_text(&fx.paths, None, b));
-    assert!(text.contains("feat+one"), "{text}");
+    assert!(text.contains("feat/one"), "{text}");
     assert!(text.contains("stopped"), "{text}");
 }
 
@@ -808,7 +1461,7 @@ fn status_text_lists_every_process_under_its_worktree() {
         3,
         "one worktree line and two process lines:\n{text}"
     );
-    assert!(lines[0].starts_with("feat+one"), "{text}");
+    assert!(lines[0].starts_with("feat/one"), "{text}");
     assert!(lines[0].contains("running"), "{text}");
     assert!(
         lines[0].contains("api 17343") && lines[0].contains("web 17342"),
@@ -856,7 +1509,7 @@ fn status_text_sheds_the_url_and_then_the_ports_as_the_terminal_narrows() {
             );
         }
         assert!(
-            text.contains("feat+one"),
+            text.contains("feat/one"),
             "the name is the identifier and never goes: {text}"
         );
     }
@@ -1206,30 +1859,157 @@ fn logs_names_the_sources_a_worktree_has() {
 #[test]
 fn ls_text_says_so_when_there_are_no_worktrees() {
     let fx = fixture();
-    let text = capture(|b| ls_text(&fx.paths, b));
+    let text = capture(|b| ls_text_at(&fx.paths, b, usize::MAX));
     assert!(text.contains("no worktrees"), "{text}");
 }
 
+// The lead's first read of the old table: a PATH column that wrapped every
+// row, and a STATE column that said `pando`. The branch is the name a
+// person knows, said once; the path is one flag away.
 #[test]
-fn ls_text_lists_name_branch_head_state_and_path() {
+fn ls_text_names_by_branch_says_what_runs_and_leaves_the_path_to_long() {
     let fx = fixture();
     actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
-    let text = capture(|b| ls_text(&fx.paths, b));
-
-    assert!(text.contains("NAME"), "{text}");
-    assert!(text.contains("feat+one"), "{text}");
+    let text = capture(|b| ls_text_at(&fx.paths, b, usize::MAX));
+    let header: Vec<&str> = text.lines().next().unwrap().split_whitespace().collect();
+    assert_eq!(header, ["NAME", "STATUS", "URL", "PORTS", "GIT"], "{text}");
     assert!(text.contains("feat/one"), "{text}");
-    assert!(text.contains("pando"), "state column: {text}");
     assert!(
-        text.contains(
-            &fx.paths
-                .worktrees_dir()
-                .join("feat+one")
-                .display()
-                .to_string()
-        ),
+        !text.contains("feat+one"),
+        "the directory spelling is not repeated: {text}"
+    );
+    assert!(text.contains("stopped"), "{text}");
+    assert!(text.contains("clean"), "{text}");
+    assert!(
+        !text.contains(" pando"),
+        "no word only pando understands: {text}"
+    );
+    let path = fx.paths.worktrees_dir().join("feat+one");
+    assert!(!text.contains(&path.display().to_string()), "{text}");
+
+    let long = LsView {
+        long: true,
+        ..LsView::plain(usize::MAX)
+    };
+    let text = capture(|b| ls_text_with(&fx.paths, b, &long));
+    assert!(text.contains("HEAD") && text.contains("PATH"), "{text}");
+    let canonical = std::fs::canonicalize(&path).unwrap();
+    assert!(text.contains(&canonical.display().to_string()), "{text}");
+}
+
+#[test]
+fn a_long_listing_writes_home_as_a_tilde() {
+    let fx = fixture();
+    actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
+    let path = std::fs::canonicalize(fx.paths.worktrees_dir().join("feat+one")).unwrap();
+    let home = path.parent().unwrap().to_path_buf();
+    let view = LsView {
+        long: true,
+        style: crate::term::Style::with(false, Some(home)),
+        ..LsView::plain(usize::MAX)
+    };
+    let text = capture(|b| ls_text_with(&fx.paths, b, &view));
+    assert!(text.contains("~/feat+one"), "{text}");
+}
+
+// A worktree whose directory is not its branch — adopted, or detached —
+// keeps its directory name, and gets a BRANCH column to say what it has
+// checked out.
+#[test]
+fn a_worktree_not_named_for_its_branch_brings_the_branch_column() {
+    let fx = fixture();
+    actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
+    let elsewhere = fx.root.parent().unwrap().join("scratch");
+    git(
+        &fx.root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "topic/x",
+            elsewhere.to_str().unwrap(),
+        ],
+    );
+    let text = capture(|b| ls_text_at(&fx.paths, b, usize::MAX));
+    assert!(text.lines().next().unwrap().contains("BRANCH"), "{text}");
+    let row = text.lines().find(|l| l.starts_with("scratch")).unwrap();
+    assert!(row.contains("topic/x"), "{text}");
+    assert!(row.contains("adopted"), "{text}");
+}
+
+// Two long branch names that differ late must not print as the same
+// truncated name.
+#[test]
+fn long_names_that_share_a_prefix_stay_distinct_on_a_narrow_terminal() {
+    let fx = fixture();
+    for n in 1..=2 {
+        let branch = format!("feature/very-long-branch-name-number-{n}-with-extra-words");
+        actions::new(&fx.paths, &fx.config, &branch, None, &|_| {}).unwrap();
+    }
+    let wide = capture(|b| ls_text_at(&fx.paths, b, usize::MAX));
+    assert!(
+        wide.contains("feature/very-long-branch-name-number-1-with-extra-words"),
+        "never cut when not a terminal: {wide}"
+    );
+    let narrow = capture(|b| ls_text_at(&fx.paths, b, 50));
+    let names: Vec<&str> = narrow
+        .lines()
+        .skip(1)
+        .map(|l| l.split_whitespace().next().unwrap())
+        .collect();
+    assert_eq!(names.len(), 2, "{narrow}");
+    assert_ne!(names[0], names[1], "{narrow}");
+    for line in narrow.lines() {
+        assert!(line.chars().count() <= 50, "{line:?} in\n{narrow}");
+    }
+}
+
+#[test]
+fn colour_is_only_there_when_asked_for_and_never_skews_a_column() {
+    let fx = fixture();
+    actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
+    let plain = capture(|b| ls_text_at(&fx.paths, b, usize::MAX));
+    assert!(!plain.contains('\x1b'), "{plain:?}");
+    let view = LsView {
+        style: crate::term::Style::with(true, None),
+        ..LsView::plain(usize::MAX)
+    };
+    let painted = capture(|b| ls_text_with(&fx.paths, b, &view));
+    assert!(painted.contains('\x1b'), "{painted:?}");
+    let stripped: Vec<usize> = painted.lines().map(crate::term::visible_width).collect();
+    let widths: Vec<usize> = plain.lines().map(|l| l.chars().count()).collect();
+    assert_eq!(stripped, widths, "{painted:?}");
+}
+
+#[test]
+fn the_listing_shows_mode_and_public_only_when_some_worktree_has_them() {
+    let fx = fixture();
+    let one = actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
+    actions::new(&fx.paths, &fx.config, "feat/two", None, &|_| {}).unwrap();
+    let text = capture(|b| ls_text_at(&fx.paths, b, usize::MAX));
+    assert!(!text.contains("MODE") && !text.contains("PUBLIC"), "{text}");
+
+    with_share(&fx, &one, None);
+    let mut store = crate::state::load(&fx.paths.state_file()).unwrap();
+    store.worktrees.get_mut(&one).unwrap().isolated = true;
+    crate::state::save(&fx.paths.state_file(), &store).unwrap();
+    let text = capture(|b| ls_text_at(&fx.paths, b, usize::MAX));
+    assert!(text.contains("MODE") && text.contains("isolated"), "{text}");
+    assert!(
+        text.contains("https://fake-host.trycloudflare.com"),
         "{text}"
     );
+    assert!(
+        text.contains("http://localhost:17342"),
+        "a running worktree has its URL: {text}"
+    );
+    // Narrow: the public URL shortens to `yes` before anything else of
+    // weight goes.
+    let narrow = capture(|b| ls_text_at(&fx.paths, b, 60));
+    assert!(narrow.contains("PUBLIC"), "{narrow}");
+    assert!(!narrow.contains("trycloudflare"), "{narrow}");
+    assert!(narrow.contains("yes"), "{narrow}");
 }
 
 #[test]
@@ -1256,7 +2036,7 @@ fn ls_text_marks_adopted_dirty_and_gone_worktrees() {
     let gone = actions::new(&fx.paths, &fx.config, "feat/gone", None, &|_| {}).unwrap();
     std::fs::remove_dir_all(fx.paths.worktrees_dir().join(&gone)).unwrap();
 
-    let text = capture(|b| ls_text(&fx.paths, b));
+    let text = capture(|b| ls_text_at(&fx.paths, b, usize::MAX));
     for word in ["adopted", "dirty", "gone"] {
         assert!(text.contains(word), "missing {word:?} in:\n{text}");
     }
@@ -1793,6 +2573,8 @@ fn a_list_slot_takes_an_array_and_joins_it_the_way_the_slot_splits_it() {
         multi: false,
         checked: Vec::new(),
         details: Vec::new(),
+        answer_file: None,
+        snippet: String::new(),
     };
     // The option's own text, reached without spelling the separator.
     assert_eq!(
@@ -1961,4 +2743,47 @@ fn every_enum_value_agent_json_documents_is_one_the_binary_prints() {
         "layer",
         ["committed", "user", "project"].map(String::from).to_vec(),
     );
+}
+
+// "answer it in pando.toml" named no key and no real path. Exit 3 now
+// names the absolute file (under whatever home `PANDO_HOME` names), what
+// the first option would be written as there, and the answers-file line
+// a program would send instead.
+#[test]
+fn exit_three_names_the_absolute_file_the_key_and_the_answers_file() {
+    let proposal = crate::detect::Proposal::of(
+        crate::detect::Slot::DevCmd,
+        vec![crate::detect::Candidate {
+            value: "pnpm dev".to_string(),
+            why: "package.json scripts.dev".to_string(),
+            ..Default::default()
+        }],
+        false,
+    );
+    let mut question = actions::question_for(&proposal, &[]);
+    question.answer_file = Some(std::path::PathBuf::from(
+        "/somewhere/pando-home/projects/p-1/pando.toml",
+    ));
+    let text = render_needs_answer(&actions::NeedsAnswer { question });
+    for wanted in [
+        "/somewhere/pando-home/projects/p-1/pando.toml",
+        "[dev]",
+        "cmd = \"pnpm dev\"",
+        "pando init --answers",
+        "{\"dev_cmd\": \"pnpm dev\"}",
+    ] {
+        assert!(text.contains(wanted), "{wanted}: {text}");
+    }
+}
+
+// The port question's typed answer is variable names, not a command, and
+// a choice is echoed so the transcript shows what was taken.
+#[test]
+fn the_port_question_asks_for_variable_names_and_echoes_the_choice() {
+    let mut question = dev_question(&["WEB_PORT", "PORT"]);
+    question.slot = crate::detect::Slot::PortEnv;
+    let (answer, printed) = answer_with(&question, &["2"]);
+    assert_eq!(answer.unwrap(), actions::Answer::Choice(1));
+    assert!(printed.contains("type the variable names"), "{printed}");
+    assert!(printed.contains("→ PORT"), "{printed}");
 }

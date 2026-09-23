@@ -102,8 +102,8 @@ database, a prod schema dump, and cookie auth."
 
 - Config file: `pando.toml`. pando home: `~/.pando/`.
 - CLI verbs, used identically in every document:
-  `new start stop restart ls rm share unshare logs status path init doctor
-  signals`.
+  `new start stop restart ls rm share unshare open logs status path init
+  doctor signals completions`.
 - The two invariants in `docs/02-principles.md` override anything else in the
   docs. If a design idea conflicts with them, the idea loses.
 - Anything marked "default, undecided" in `docs/09-open-decisions.md` is not

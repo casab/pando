@@ -99,6 +99,9 @@ fn none_label(slot: crate::detect::Slot) -> &'static str {
             "none — this machine needs no line in front of its commands"
         }
         crate::detect::Slot::Provision => "none — a new worktree needs no local file of yours",
+        crate::detect::Slot::SchemaHook => {
+            "no — do not run a schema step (written as on = \"never\")"
+        }
         _ => "none — this process has no port",
     }
 }
@@ -209,7 +212,11 @@ fn prompt_one(
         writeln!(out, "  {marker}{}) {value:<width$}  {why}", i + 1)?;
     }
     if question.allow_custom {
-        writeln!(out, "   c) something else — type the command")?;
+        writeln!(
+            out,
+            "   c) something else — type the {}",
+            question.slot.custom_noun()
+        )?;
     }
     if question.allow_none {
         writeln!(out, "   n) {}", none_label(question.slot))?;
@@ -228,19 +235,24 @@ fn prompt_one(
         if line.is_empty()
             && let Some(index) = question.preselect
         {
+            writeln!(out, "  → {}", question.options[index].0)?;
             return Ok(actions::Answer::Choice(index));
         }
         if question.allow_none && (line == "n" || line == "N") {
             return Ok(actions::Answer::None);
         }
         if question.allow_custom && (line == "c" || line == "C") {
-            write!(out, "  command > ")?;
+            write!(out, "  {} > ", question.slot.custom_noun())?;
             out.flush()?;
             let custom = read()?.unwrap_or_default().trim().to_string();
             if !custom.is_empty() {
                 return Ok(actions::Answer::Custom(custom));
             }
-            writeln!(out, "pando: an empty command is not an answer")?;
+            writeln!(
+                out,
+                "pando: nothing was typed — an empty {} is not an answer",
+                question.slot.custom_noun()
+            )?;
             continue;
         }
         // A number is a choice, always — even one that is out of range.
@@ -255,7 +267,10 @@ fn prompt_one(
                     .ok()
                     .filter(|n| *n >= 1 && *n <= question.options.len());
                 match chosen {
-                    Some(n) => return Ok(actions::Answer::Choice(n - 1)),
+                    Some(n) => {
+                        writeln!(out, "  → {}", question.options[n - 1].0)?;
+                        return Ok(actions::Answer::Choice(n - 1));
+                    }
                     None => writeln!(
                         out,
                         "pando: pick a number between 1 and {}",

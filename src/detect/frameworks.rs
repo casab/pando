@@ -16,12 +16,30 @@ pub fn framework(root: &Path, signals: &Signals) -> Option<&'static FrameworkRul
         let by_script = rule
             .script_markers
             .iter()
-            .any(|needle| signals.scripts.values().any(|body| body.contains(needle)));
+            .any(|needle| signals.scripts.values().any(|body| mentions(body, needle)));
         // A Cargo.toml with no binary is a library: nothing to serve.
         if rule.binary_only && by_marker && !binary_crate(root) {
             return false;
         }
         by_marker || by_script
+    })
+}
+
+/// Whether `body` runs `needle` as a word of its own. A plain substring
+/// test reads `vitest` as `vite` and `vite-node` as `vite`, and a project
+/// whose test runner happens to share a prefix with a dev server would be
+/// started as that dev server.
+fn mentions(body: &str, needle: &str) -> bool {
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    body.match_indices(needle).any(|(at, _)| {
+        let before = body[..at].chars().next_back().is_none_or(|c| !word(c));
+        let after = body[at + needle.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !word(c));
+        // A needle that ends in a space ("node ") has already said where
+        // the word ends.
+        before && (after || needle.ends_with(' '))
     })
 }
 
@@ -35,4 +53,60 @@ fn binary_crate(root: &Path) -> bool {
     std::fs::read_to_string(root.join("Cargo.toml"))
         .map(|text| text.contains("[[bin]]"))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Signals, framework, mentions};
+
+    fn with_scripts(pairs: &[(&str, &str)]) -> Signals {
+        Signals {
+            scripts: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn named(signals: &Signals) -> Option<&'static str> {
+        framework(std::path::Path::new("/nonexistent"), signals).map(|rule| rule.name)
+    }
+
+    // An Express app tested with vitest is an Express app: read as Vite,
+    // it would be started with `--port` appended to `node server.js`.
+    #[test]
+    fn a_test_runner_does_not_make_a_project_a_dev_server() {
+        let signals = with_scripts(&[("dev", "node server.js"), ("test", "vitest run")]);
+        assert_eq!(named(&signals), Some("Node"));
+    }
+
+    #[test]
+    fn astro_and_angular_are_their_own_frameworks() {
+        assert_eq!(named(&with_scripts(&[("dev", "astro dev")])), Some("Astro"));
+        assert_eq!(
+            named(&with_scripts(&[("start", "ng serve")])),
+            Some("Angular")
+        );
+        assert_eq!(named(&with_scripts(&[("dev", "vite")])), Some("Vite"));
+        assert_eq!(
+            named(&with_scripts(&[("dev", "react-router dev")])),
+            Some("Vite")
+        );
+    }
+
+    #[test]
+    fn a_script_marker_matches_a_whole_word_only() {
+        assert!(mentions("vite", "vite"));
+        assert!(mentions("vite --host", "vite"));
+        assert!(mentions("./node_modules/.bin/vite dev", "vite"));
+        assert!(mentions("concurrently \"vite\" \"tsc -w\"", "vite"));
+        assert!(!mentions("vitest run", "vite"));
+        assert!(!mentions("vite-node src/main.ts", "vite"));
+        assert!(!mentions("invite-users", "vite"));
+        assert!(mentions("node server.js", "node "));
+        assert!(!mentions("nodemon server.js", "node "));
+        assert!(mentions("nodemon server.js", "nodemon"));
+        assert!(mentions("next dev --turbo", "next dev"));
+    }
 }

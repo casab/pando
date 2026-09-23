@@ -69,8 +69,10 @@ pub fn text_dim() -> Color {
     pick(Color::Rgb(110, 115, 135), Color::Rgb(105, 110, 130))
 }
 
+/// The faintest text, for labels and key hints — still text, so it has to
+/// stay readable on `surface()`, not only on the terminal's background.
 pub fn text_muted() -> Color {
-    pick(Color::Rgb(70, 75, 90), Color::Rgb(150, 155, 175))
+    pick(Color::Rgb(92, 97, 116), Color::Rgb(130, 135, 155))
 }
 
 pub fn surface() -> Color {

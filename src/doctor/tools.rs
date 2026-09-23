@@ -96,7 +96,125 @@ pub(super) fn tools_report(
             found: present,
         });
     }
+    if failure.is_none() {
+        daemon_check(paths, config, machine, prelude.trim(), &mut out, findings);
+    }
     out
+}
+
+/// Marks the daemon probe's own output, so a chatty prelude cannot be
+/// read as the answer.
+pub(super) const DAEMON_MARK: &str = "pando-docker-daemon:";
+
+/// How long the daemon gets to answer. `docker info` against a daemon
+/// that is down fails at once; one that hangs is as good as down, and is
+/// not worth a login shell's whole deadline.
+pub(super) const DAEMON_WAIT_SECS: u64 = 5;
+
+/// What the Docker daemon said when asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Daemon {
+    Up,
+    /// Not answering, and what `docker info` said about it.
+    Down(String),
+    /// The probe itself did not report: nothing to claim.
+    Unknown,
+}
+
+/// Asks the Docker daemon whether it is up, when this project declares
+/// compose services and the client is there to ask.
+///
+/// `docker --version` answers without a daemon, so a tools line that only
+/// showed the client said nothing about whether `start --isolated` could
+/// work. Same shell as every other probe, behind the same prelude, and
+/// bounded by its own short watchdog.
+fn daemon_check(
+    paths: &PandoPaths,
+    config: &Config,
+    machine: &Machine<'_>,
+    prelude: &str,
+    tools: &mut [ToolReport],
+    findings: &mut Vec<Finding>,
+) {
+    let isolates = config
+        .services
+        .iter()
+        .any(|s| matches!(s, ServiceConfig::Compose { .. }));
+    let Some(docker) = tools.iter_mut().find(|t| t.name == "docker" && t.found) else {
+        return;
+    };
+    if !isolates {
+        return;
+    }
+    let program = services::docker_program(paths).display().to_string();
+    let answer = (machine.shell)(&daemon_script(&program, prelude))
+        .map(|text| parse_daemon(&text))
+        .unwrap_or(Daemon::Unknown);
+    let state = match &answer {
+        Daemon::Up => "daemon: running",
+        Daemon::Down(_) => "daemon: not running",
+        Daemon::Unknown => return,
+    };
+    docker.detail = Some(match docker.detail.take() {
+        Some(detail) => format!("{detail}, {state}"),
+        None => state.to_string(),
+    });
+    if let Daemon::Down(reason) = answer {
+        findings.push(Finding::problem(
+            Section::Tools,
+            format!(
+                "the Docker daemon is not running (`docker info`: {reason}) — this project \
+                 declares compose services, so `start --isolated` cannot bring them up"
+            ),
+            format!(
+                "start Docker; or run the services without it: set `[isolation] prefer = \
+                 \"native\"` in {} where pando has a recipe for them; or {}",
+                super::config::user_config_shown(paths),
+                crate::remedy::SHARED.cli
+            ),
+        ));
+    }
+}
+
+/// The daemon probe: `docker info` with a watchdog that kills it after
+/// [`DAEMON_WAIT_SECS`], then its exit status behind [`DAEMON_MARK`].
+///
+/// The watchdog's own output goes to /dev/null so it cannot hold the
+/// command substitution's pipe open after docker has answered.
+pub(super) fn daemon_script(program: &str, prelude: &str) -> String {
+    let program = proc::shell_quote(program);
+    let body = format!(
+        "__pando_d=$( {program} info --format '{{{{.ServerVersion}}}}' 2>&1 & __pando_p=$!; \
+         ( sleep {DAEMON_WAIT_SECS}; kill $__pando_p ) >/dev/null 2>&1 & __pando_w=$!; \
+         wait $__pando_p; __pando_s=$?; kill $__pando_w 2>/dev/null; \
+         echo \"{DAEMON_MARK}$__pando_s\" )\nprintf '%s\\n' \"$__pando_d\"\n"
+    );
+    match prelude {
+        "" => body,
+        prelude => format!("{prelude} && {{\n{body}}}"),
+    }
+}
+
+pub(super) fn parse_daemon(text: &str) -> Daemon {
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
+    let Some(at) = lines.iter().position(|l| l.starts_with(DAEMON_MARK)) else {
+        return Daemon::Unknown;
+    };
+    let status = lines[at][DAEMON_MARK.len()..].trim();
+    if status == "0" {
+        return Daemon::Up;
+    }
+    // 143 is SIGTERM: the watchdog's.
+    if status == "143" {
+        return Daemon::Down(format!("no answer within {DAEMON_WAIT_SECS}s"));
+    }
+    let reason = lines[..at]
+        .iter()
+        .rev()
+        .find(|l| !l.is_empty())
+        .copied()
+        .unwrap_or("it exited without saying why");
+    Daemon::Down(reason.to_string())
 }
 
 /// Every tool worth asking about: the ones pando itself runs, and the ones

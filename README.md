@@ -66,19 +66,48 @@ parsing English, and answers come back through one validated write path.
 pando                 open the TUI for the repo you are in
 pando new <branch>    create a worktree and branch from the default base
 pando start <name>    start its dev server; --isolated for private services
-pando stop [name]     stop one worktree, or all of them
+pando stop [name]     stop one worktree; --all for every one
 pando restart <name>  stop and start again, keeping the ports
-pando ls              list worktrees with ports and status
+pando ls              list worktrees: status, URL, ports, git; -l for paths
 pando rm <name>       stop everything, remove the worktree, wipe its data
 pando share <name>    expose it at a public URL
 pando unshare <name>  take the public URL down
+pando open <name>     open its URL in the browser; --public for the shared one
 pando logs <name>     tail its logs; --json for machines
-pando status          machine-readable state; --json
+pando status          what runs where, per process; --json
 pando path <name>     print the worktree's path
 pando init            answer every setup question now instead of as you go
 pando doctor          explain what was detected, why, and what is missing
 pando signals         dump detection signals as JSON, for humans or agents
+pando completions     print a completion script for bash, zsh, fish…
 ```
+
+A worktree is named by its branch (`feat/login`) or by its directory
+(`feat+login`). Inside a worktree, `start`, `stop`, `restart`, `logs`,
+`open`, `share` and `unshare` need no name.
+
+On a terminal, `start` and `restart` wait until every process answers,
+and when one does not they print the last lines of its log and why.
+From a script they return once everything is spawned; `--wait` and
+`--no-wait` choose either way.
+
+### In the TUI
+
+```
+⏎        open the logs when it runs, start it when it is stopped
+s i S    start it: as last time, isolated, or on the shared services
+x X      stop it, or stop everything
+r p      restart it, or only the selected process
+o O Y    open its URL, open the public one, copy the URL
+t        share it publicly, or stop sharing
+c e      a shell in it, or open it in your editor
+n d      new worktree, remove one
+m ?      what pando said in full, and every key
+```
+
+The log viewer has a tab per log, led by an `all` tab that merges every
+process's when there are several. `1`–`9` switch tabs, `/` searches, `f`
+filters by level, and `e`/`E` jump between errors.
 
 ## Install
 

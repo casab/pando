@@ -778,6 +778,56 @@ fn unknown_keys_are_rejected() {
     assert!(load(&f.paths).is_err(), "unknown section must be rejected");
 }
 
+// "unknown field `prots`, expected one of …" with "in `processes.api2`"
+// on a line of its own and " — in <file>" on a third, and no hint.
+#[test]
+fn a_mistyped_key_is_one_line_with_the_file_and_what_was_meant() {
+    let f = fixture();
+    write_home(
+        &f,
+        "[processes.api2]\ncmd = \"node api\"\nprots = { PORT = \"api\" }\n",
+    );
+    let err = format!("{:#}", load(&f.paths).unwrap_err());
+    assert!(!err.contains('\n'), "{err}");
+    assert!(
+        err.starts_with("unknown field `prots` in `processes.api2` of "),
+        "{err}"
+    );
+    assert!(
+        err.contains(&f.paths.config_file().display().to_string()),
+        "{err}"
+    );
+    assert!(err.contains("did you mean `ports`?"), "{err}");
+    assert!(err.contains("expected one of `cmd`"), "{err}");
+
+    // Nothing near enough: no guess, still one line.
+    write_home(&f, "[processes.api2]\ncmd = \"x\"\nzzzzzzzz = 1\n");
+    let err = format!("{:#}", load(&f.paths).unwrap_err());
+    assert!(
+        !err.contains('\n') && !err.contains("did you mean"),
+        "{err}"
+    );
+
+    // A committed layer is warned about, and the warning is one line too.
+    write_home(&f, "");
+    write_committed(&f, "[dev]\ncmd = \"x\"\nprots = 1\n");
+    let loaded = load(&f.paths).unwrap();
+    let warning = loaded.warnings.join("|");
+    assert!(warning.contains("did you mean `ports`?"), "{warning}");
+    assert!(!warning.contains('\n'), "{warning}");
+}
+
+#[test]
+fn a_typo_is_matched_to_the_nearest_name_and_nothing_far() {
+    assert_eq!(closest("prots", &["cmd", "ports", "cwd"]), Some("ports"));
+    assert_eq!(
+        closest("isntall", &["install", "provision"]),
+        Some("install")
+    );
+    assert_eq!(closest("banana", &["cmd", "ports"]), None);
+    assert_eq!(edit_distance("prots", "ports"), 2);
+}
+
 #[test]
 fn dev_and_processes_together_are_an_error() {
     let f = fixture();

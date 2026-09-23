@@ -28,15 +28,15 @@ pub use lifecycle::{
     stop_all_with,
 };
 pub use questions::{
-    Answer, Answering, Ask, NEW_SLOTS, NeedsAnswer, Question, START_SLOTS, Volunteered,
-    already_answered, question_for, resolve, resolve_for_new, resolve_on, resolve_process,
-    resolve_silencing,
+    Answer, Answering, Ask, NEW_SLOTS, NeedsAnswer, Question, RefusedAnswer, START_SLOTS,
+    Volunteered, already_answered, question_for, resolve, resolve_for_new, resolve_for_start,
+    resolve_on, resolve_process, resolve_silencing,
 };
-pub use refresh::{Refreshed, inspect, refresh};
+pub use refresh::{FAILURE_SHOWN_LINES, Refreshed, failure_tail, inspect, refresh};
 pub use runtime::{Machine, runtime_shell, user_home, with_prelude};
 pub use services::{
-    ServiceStatus, export_lines, resolved_env, service_statuses, shared_service_statuses,
-    worktree_url,
+    ServiceStatus, export_lines, recorded_service_statuses, resolved_env, service_statuses,
+    shared_service_statuses, worktree_url,
 };
 pub use share::{ENV_SHARE_PORT, ShareOutcome, SpawnProxy, share, share_with, unshare};
 pub use worktree::{

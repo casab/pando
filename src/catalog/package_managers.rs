@@ -12,6 +12,7 @@ pub enum Ecosystem {
     JavaScript,
     Python,
     Ruby,
+    Php,
     Elixir,
     Go,
     Rust,
@@ -69,7 +70,7 @@ pub struct PackageManager {
 /// is the order `signals` lists lockfiles in, and the first lockfile present
 /// decides which runner a proposal uses, so the JavaScript managers come
 /// first.
-pub const PACKAGE_MANAGERS: [PackageManager; 10] = [
+pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
     PackageManager {
         program: "pnpm",
         lockfiles: &["pnpm-lock.yaml"],
@@ -108,14 +109,18 @@ pub const PACKAGE_MANAGERS: [PackageManager; 10] = [
         ecosystem: Ecosystem::JavaScript,
         run_prefix: Some("yarn "),
         exec: Some("yarn"),
+        // `--frozen-lockfile`, not `--immutable`: Yarn 1 does not know
+        // `--immutable`, ignores it, and rewrites `yarn.lock`. Yarn 2 and
+        // later still honour `--frozen-lockfile` as `--immutable`, so it is
+        // the one spelling that is frozen on every Yarn.
         install: Some(FrozenInstall {
-            cmd: "yarn install --immutable",
+            cmd: "yarn install --frozen-lockfile",
             why: None,
         }),
         install_shape: Some(InstallShape {
             verbs: &["install"],
             frozen_markers: &["--immutable", "--frozen-lockfile"],
-            suggest: "yarn install --immutable",
+            suggest: "yarn install --frozen-lockfile",
         }),
     },
     PackageManager {
@@ -166,6 +171,24 @@ pub const PACKAGE_MANAGERS: [PackageManager; 10] = [
         install_shape: None,
     },
     PackageManager {
+        program: "pipenv",
+        lockfiles: &["Pipfile.lock"],
+        ecosystem: Ecosystem::Python,
+        run_prefix: Some("pipenv run "),
+        exec: None,
+        // `sync` installs exactly what the lockfile says and never writes
+        // it; `install` resolves again and can rewrite it.
+        install: Some(FrozenInstall {
+            cmd: "pipenv sync",
+            why: None,
+        }),
+        install_shape: Some(InstallShape {
+            verbs: &["install", "lock", "update"],
+            frozen_markers: &["--deploy", "--ignore-pipfile"],
+            suggest: "pipenv sync",
+        }),
+    },
+    PackageManager {
         program: "bundle",
         lockfiles: &["Gemfile.lock"],
         ecosystem: Ecosystem::Ruby,
@@ -181,6 +204,24 @@ pub const PACKAGE_MANAGERS: [PackageManager; 10] = [
             verbs: &["install"],
             frozen_markers: &["BUNDLE_FROZEN", "--deployment", "--frozen"],
             suggest: "BUNDLE_FROZEN=true bundle install",
+        }),
+    },
+    PackageManager {
+        program: "composer",
+        lockfiles: &["composer.lock"],
+        ecosystem: Ecosystem::Php,
+        run_prefix: None,
+        exec: None,
+        // With a lockfile present `install` installs exactly what it pins
+        // and never rewrites it; `update` is the verb that resolves again.
+        install: Some(FrozenInstall {
+            cmd: "composer install",
+            why: None,
+        }),
+        install_shape: Some(InstallShape {
+            verbs: &["update", "require"],
+            frozen_markers: &[],
+            suggest: "composer install",
         }),
     },
     PackageManager {

@@ -18,12 +18,98 @@ use crate::template;
 use super::lifecycle::{DEFAULT_READY_ROLE, STOP_GRACE, process_env, reset_log};
 use super::worktree::find_worktree;
 
+/// Stops the containers of every compose project named, leaving their
+/// volumes.
+///
+/// A Docker daemon that is not running is a note, not a failure: its
+/// containers cannot be running either, so there is nothing left to stop,
+/// and a `stop` that errors because Docker is off is a worktree the
+/// developer cannot stop. The records that name the projects are kept by
+/// every caller, so a later `stop` or `rm` can still find them.
+pub(super) fn stop_containers(
+    paths: &PandoPaths,
+    projects: &[String],
+    progress: &dyn Fn(&str),
+) -> Result<()> {
+    stop_compose_projects(
+        paths,
+        projects,
+        |compose| compose.stop(),
+        |project| {
+            format!(
+                "Docker is not running, so the services of {project} are not either — nothing \
+                 to stop"
+            )
+        },
+        progress,
+    )
+}
+
+/// Removes the containers, network and volumes of every compose project
+/// named — what `rm` does.
+///
+/// A daemon that is not running is a note here too, because `rm` must
+/// always be able to remove a worktree. It is a loud one: the volumes
+/// outlive the worktree, and the note is the only place the command that
+/// removes them is written down.
+pub(super) fn remove_containers(
+    paths: &PandoPaths,
+    projects: &[String],
+    progress: &dyn Fn(&str),
+) -> Result<()> {
+    stop_compose_projects(
+        paths,
+        projects,
+        |compose| compose.down_with_volumes(),
+        |project| {
+            format!(
+                "Docker is not running, so the services of {project} could not be removed — their \
+                 data volumes survive; once Docker is up, `docker compose -p {project} down -v` \
+                 removes them"
+            )
+        },
+        progress,
+    )
+}
+
+/// The first of these compose projects Docker cannot be asked about, if
+/// any, with how it failed: "is not running" for a daemon that is down,
+/// "is not answering" for one that did not reply in time. Any other
+/// failure is left to the command that follows to report, with its own
+/// words.
+///
+/// A hung daemon counts: the `down -v` that follows would hang the same
+/// way, under the state lock.
+pub(super) fn docker_down_for(
+    paths: &PandoPaths,
+    projects: &[String],
+) -> Option<(String, &'static str)> {
+    if projects.is_empty() {
+        return None;
+    }
+    let program = services::docker_program(paths);
+    projects.iter().find_map(|project| {
+        let e = services::Compose::by_project(&program, project.as_str())
+            .reachable()
+            .err()?;
+        let how = match () {
+            _ if services::is_daemon_down(&e) => "is not running",
+            _ if services::is_daemon_hung(&e) => "is not answering",
+            _ => return None,
+        };
+        Some((project.clone(), how))
+    })
+}
+
 /// Runs one compose verb against every project a worktree owns, reporting
-/// the failures together.
-pub(super) fn stop_compose_projects(
+/// the failures together. A daemon that is down is reported through
+/// `daemon_down` and `progress` instead of failing.
+fn stop_compose_projects(
     paths: &PandoPaths,
     projects: &[String],
     run: impl Fn(&services::Compose) -> Result<()>,
+    daemon_down: impl Fn(&str) -> String,
+    progress: &dyn Fn(&str),
 ) -> Result<()> {
     if projects.is_empty() {
         return Ok(());
@@ -32,8 +118,10 @@ pub(super) fn stop_compose_projects(
     let mut failures = Vec::new();
     for project in projects {
         let compose = services::Compose::by_project(&program, project.as_str());
-        if let Err(e) = run(&compose) {
-            failures.push(format!("{project}: {e:#}"));
+        match run(&compose) {
+            Ok(()) => {}
+            Err(e) if services::is_daemon_down(&e) => progress(&daemon_down(project)),
+            Err(e) => failures.push(format!("{project}: {e:#}")),
         }
     }
     if failures.is_empty() {
@@ -121,12 +209,9 @@ fn native_names(config: &Config) -> Vec<String> {
 /// only one of them would be telling the truth.
 pub(super) fn planned_services(
     config: &Config,
-    paths: &PandoPaths,
-    name: &str,
     ports: &BTreeMap<String, u16>,
     record: &WorktreeRecord,
 ) -> Vec<state::ServiceRecord> {
-    let project = crate::compose::project_name(paths.project_id(), name);
     let native = native_names(config);
     let mut out: Vec<state::ServiceRecord> = Vec::new();
     for service in service_roles(config) {
@@ -147,7 +232,15 @@ pub(super) fn planned_services(
             port: ports.get(&service).copied(),
             pid: existing.and_then(|s| s.pid),
             pgid: existing.and_then(|s| s.pgid),
-            compose_project: (!is_native).then(|| project.clone()),
+            // Not named until compose has been asked to create something
+            // under it — see `name_compose_project`. A record with no
+            // project is one whose containers were never brought up, so
+            // `stop` and `rm` have nothing to ask Docker about, and a
+            // failed start can drop it.
+            compose_project: match is_native {
+                true => None,
+                false => existing.and_then(|s| s.compose_project.clone()),
+            },
         });
     }
     for service in &record.services {
@@ -215,14 +308,44 @@ fn native_urls(
     for entry in native::Entry::all(config) {
         let recipe = native::resolve(&recipes, &entry).ok().map(|r| r.recipe);
         let (mapping, _) = entry.env_map(recipe.as_ref());
+        // Only the keys that address this service: an entry's env map can
+        // name another one, and its URL says nothing about this database.
+        let mapping: BTreeMap<String, String> = mapping
+            .into_iter()
+            .filter(|(_, service)| service == entry.name)
+            .collect();
         let Ok(resolved) = services::app_env(worktree, &mapping, ports) else {
             continue;
         };
-        if let Some(value) = resolved.into_values().next() {
+        if let Some(value) = identity_url(&resolved) {
             out.insert(entry.name.to_string(), value);
         }
     }
     out
+}
+
+/// Which of several values an app reads for one service says who it
+/// connects as and to which database.
+///
+/// A service reached through more than one variable — a `DATABASE_URL`
+/// beside a bare `PGPORT` — used to hand over whichever key sorted first,
+/// so renaming an unrelated variable changed which database the recipe
+/// created. The one that names the most wins: a database, then a user;
+/// among equals, the first key alphabetically, so two runs always agree.
+pub(super) fn identity_url(resolved: &BTreeMap<String, String>) -> Option<String> {
+    resolved
+        .iter()
+        .max_by_key(|(key, value)| {
+            let (user, database) = services::url_identity(value);
+            // `max_by_key` keeps the *last* maximum, so the key is
+            // reversed to make the first one alphabetically win a tie.
+            (
+                database.is_some(),
+                user.is_some(),
+                std::cmp::Reverse(key.as_str()),
+            )
+        })
+        .map(|(_, value)| value.clone())
 }
 
 /// Brings this worktree's private services up, of either kind, and waits
@@ -253,28 +376,41 @@ pub(super) fn bring_up_services(
     Err(e)
 }
 
-/// Brings this worktree's private *containers* up, waits for them, and
-/// starts a log pump in front of each one.
+/// Everything a compose bring-up needs, decided before anything runs.
+struct ComposePlan {
+    project: String,
+    program: PathBuf,
+    files: Vec<PathBuf>,
+    published: Vec<crate::compose::Published>,
+    wanted: Vec<services::Wanted>,
+    include: Vec<String>,
+    /// The image each included service runs, beside it, when the file
+    /// names one: what a native recipe could stand in for.
+    images: Vec<(String, Option<String>)>,
+    timeout: u64,
+}
+
+/// Reads the compose files, resolves the included services, and refuses
+/// what cannot be isolated — a bind mount into the repository, a service
+/// the file does not have — without writing or starting anything.
 ///
-/// The override that remaps the ports is regenerated every time: the
-/// ports can move, the compose file can change under a rebase, and a
-/// stale override would publish a port nothing is on.
-fn bring_up_compose_services(
+/// `None` when this project has no compose services to bring up.
+fn plan_compose(
     paths: &PandoPaths,
     config: &Config,
     name: &str,
     worktree: &Path,
     ports: &BTreeMap<String, u16>,
-    progress: &dyn Fn(&str),
-) -> Result<()> {
+) -> Result<Option<ComposePlan>> {
     let entries = compose_entries(config);
     if entries.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let mut files: Vec<PathBuf> = Vec::new();
     let mut published: Vec<crate::compose::Published> = Vec::new();
     let mut wanted: Vec<services::Wanted> = Vec::new();
     let mut include: Vec<String> = Vec::new();
+    let mut images: Vec<(String, Option<String>)> = Vec::new();
     let mut timeout = services::DEFAULT_READY_TIMEOUT_S;
     // Everywhere a bind mount must not land: the main checkout, the
     // directory every worktree lives under, and this worktree itself for
@@ -315,6 +451,7 @@ fn bring_up_compose_services(
                 container,
                 host,
             });
+            images.push((service.clone(), parsed.services[&service].image.clone()));
             include.push(service);
         }
         files.push(file);
@@ -329,8 +466,47 @@ fn bring_up_compose_services(
     // brings up *everything* in the file, on the ports the project
     // hardcoded, which is the opposite of what was asked for.
     if include.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
+    Ok(Some(ComposePlan {
+        project,
+        program,
+        files,
+        published,
+        wanted,
+        include,
+        images,
+        timeout,
+    }))
+}
+
+/// Brings this worktree's private *containers* up, waits for them, and
+/// starts a log pump in front of each one.
+///
+/// The override that remaps the ports is regenerated every time: the
+/// ports can move, the compose file can change under a rebase, and a
+/// stale override would publish a port nothing is on.
+fn bring_up_compose_services(
+    paths: &PandoPaths,
+    config: &Config,
+    name: &str,
+    worktree: &Path,
+    ports: &BTreeMap<String, u16>,
+    progress: &dyn Fn(&str),
+) -> Result<()> {
+    let Some(ComposePlan {
+        project,
+        program,
+        mut files,
+        published,
+        wanted,
+        include,
+        timeout,
+        ..
+    }) = plan_compose(paths, config, name, worktree, ports)?
+    else {
+        return Ok(());
+    };
 
     let override_file = paths.compose_override_file(name);
     if let Some(parent) = override_file.parent() {
@@ -344,49 +520,78 @@ fn bring_up_compose_services(
     files.push(override_file);
 
     let compose = services::Compose::new(&program, &project, files, worktree);
+    // Written down before compose is asked, not after: from here on there
+    // may be a container and a volume under this project, and the record
+    // is the only thing `rm` can find them by.
+    name_compose_project(paths, name, &project, &include)?;
     progress(&format!("starting services: {}", include.join(", ")));
-    compose.up(&include)?;
 
     // A service that never comes up leaves nothing running: the ones that
     // did are stopped again, so a failed start does not leave half an
-    // environment holding ports.
+    // environment holding ports. That covers an `up` that failed partway —
+    // it may have created some containers before the one that failed —
+    // and a log pump that could not be started in front of containers
+    // that are up.
     //
     // By project, not by files. `up -d <name>` enables that service's
     // profile implicitly; a `stop` with the same `-f` files does not, and
     // leaves a profiled container running on the port it was allocated.
     // Compose finds every container it created by label, which is why
     // `stop` and `rm` use this form too.
-    if let Err(e) = services::wait_ready(&compose, &wanted, Duration::from_secs(timeout), progress)
-    {
+    let brought_up = compose
+        .up(&include)
+        .and_then(|()| {
+            services::wait_ready(&compose, &wanted, Duration::from_secs(timeout), progress)
+        })
+        .and_then(|()| pump_service_logs(paths, name, &compose, &include, worktree));
+    if let Err(e) = brought_up {
         let _ = services::Compose::by_project(&program, &project).stop();
         return Err(e);
     }
-
-    pump_service_logs(paths, name, &compose, &include, worktree)
+    Ok(())
 }
 
-/// Brings this worktree's native services up: initialise once, spawn
-/// detached, wait for the recipe's own check, then let the recipe create
-/// whatever the app's own URL names.
-///
-/// Planned in full before anything is created or spawned, the way
-/// processes are: a second service whose recipe does not resolve, or
-/// whose engine is not installed, must not leave the first one's data
-/// directory behind a failed start. The engine check is part of planning
-/// for the same reason — a start that initialises a cluster and *then*
-/// discovers there is no server to run against it has done work for
-/// nothing.
-fn bring_up_native_services(
+/// Records the compose project on the service records it is about to
+/// create containers for.
+fn name_compose_project(
+    paths: &PandoPaths,
+    name: &str,
+    project: &str,
+    include: &[String],
+) -> Result<()> {
+    let _lock = state::lock(&paths.lock_file())?;
+    let mut store = state::load(&paths.state_file())?;
+    let Some(record) = store.worktrees.get_mut(name) else {
+        return Ok(());
+    };
+    let mut changed = false;
+    for service in record.services.iter_mut() {
+        if service.kind == state::ServiceKind::Compose
+            && include.contains(&service.name)
+            && service.compose_project.as_deref() != Some(project)
+        {
+            service.compose_project = Some(project.to_string());
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(());
+    }
+    state::save(&paths.state_file(), &store)
+}
+
+/// Every native service this project runs, resolved and planned, with
+/// its engine checked — nothing created or spawned.
+fn plan_native(
     paths: &PandoPaths,
     config: &Config,
     name: &str,
     worktree: &Path,
     ports: &BTreeMap<String, u16>,
-    progress: &dyn Fn(&str),
-) -> Result<Fresh> {
+) -> Result<Vec<native::Native>> {
     let entries = native::Entry::all(config);
     if entries.is_empty() {
-        return Ok(Fresh(false));
+        return Ok(Vec::new());
     }
     let recipes = crate::recipes::Recipes::load(&paths.recipes_dir());
     let urls = native_urls(paths, config, worktree, ports);
@@ -408,6 +613,289 @@ fn bring_up_native_services(
         if !missing.is_empty() {
             return Err(service.missing_binaries_error(&missing));
         }
+        planned.push(service);
+    }
+    Ok(planned)
+}
+
+/// Everything an isolated start needs that can be checked without
+/// changing anything: the env the app will be given, the compose files
+/// and what they include, every native recipe and its engine, and — last,
+/// because it is the one question that leaves the machine — whether the
+/// Docker daemon answers.
+///
+/// Asked *before* a start stops anything. A start that takes a running
+/// worktree down and only then discovers Docker is off has destroyed a
+/// working environment over a request that could never succeed. `roles`
+/// is every role the isolated worktree would have; the numbers are
+/// placeholders, because nothing here depends on which port is which.
+pub(super) fn preflight_isolation(
+    paths: &PandoPaths,
+    config: &Config,
+    name: &str,
+    worktree: &Path,
+    roles: &[String],
+) -> Result<()> {
+    let ports = placeholder_ports(roles);
+    resolve_service_env(paths, config, worktree, &ports)?;
+    plan_native(paths, config, name, worktree, &ports)?;
+    backends_reachable(paths, config, name, worktree, &ports)
+}
+
+/// The part of [`preflight_isolation`] that asks the machine rather than
+/// the config: whether Docker answers, for a project with compose
+/// services.
+///
+/// Also run before a start's questions, so a start that cannot happen
+/// asks nothing first — "which command brings the schema up?" answered,
+/// and only then "Docker is not running", is a question wasted on an
+/// impossible request.
+pub(super) fn backends_reachable(
+    paths: &PandoPaths,
+    config: &Config,
+    name: &str,
+    worktree: &Path,
+    ports: &BTreeMap<String, u16>,
+) -> Result<()> {
+    let Some(plan) = plan_compose(paths, config, name, worktree, ports)? else {
+        return Ok(());
+    };
+    match services::Compose::by_project(&plan.program, &plan.project).reachable() {
+        Err(e) if services::is_daemon_down(&e) => {
+            Err(match native_instead(paths, config, &plan.images) {
+                Some(offer) => anyhow::anyhow!("{e} — {offer}"),
+                None => e,
+            })
+        }
+        reached => reached,
+    }
+}
+
+/// Placeholder ports for the roles, for a check that plans the services
+/// without reserving anything.
+pub(super) fn placeholder_ports(roles: &[String]) -> BTreeMap<String, u16> {
+    roles
+        .iter()
+        .enumerate()
+        .map(|(i, role)| (role.clone(), ports::PORT_MIN.saturating_add(i as u16)))
+        .collect()
+}
+
+/// With Docker down, the other way this machine could isolate these
+/// services, when it has one: every one of them is something a recipe
+/// runs, and every recipe's engine is installed here.
+///
+/// Said, never done. Which mechanism a developer wants is a preference
+/// about their laptop, recorded once in the user layer, and a start that
+/// switched on its own because Docker happened to be off would write a
+/// decision nobody made. So this names the setting and the file it lives
+/// in — and the `[[services]]` entry to delete, because the services
+/// question is only asked while config has none, and the preference only
+/// decides it when it is asked.
+fn native_instead(
+    paths: &PandoPaths,
+    config: &Config,
+    images: &[(String, Option<String>)],
+) -> Option<String> {
+    let recipes = crate::recipes::Recipes::load(&paths.recipes_dir());
+    let mut names: Vec<String> = Vec::new();
+    for (service, image) in images {
+        // By image first — a service called `db` running `postgres:16` is
+        // a postgres — then by the service's own name.
+        let recipe = image
+            .as_deref()
+            .map(crate::catalog::images::image_name)
+            .into_iter()
+            .chain(std::iter::once(service.as_str()))
+            .find_map(|name| {
+                recipes
+                    .get(name)
+                    .ok()
+                    .filter(|l| l.recipe.service().is_some())
+            })?;
+        if !names.contains(&recipe.recipe.name) {
+            names.push(recipe.recipe.name.clone());
+        }
+    }
+    if names.is_empty() {
+        return None;
+    }
+    // One login shell, and only on this path: Docker is already known to
+    // be down, and the start is already failing.
+    let evidence = super::init::machine_evidence(paths, &recipes);
+    if !names
+        .iter()
+        .all(|name| evidence.can_run(name) == Some(true))
+    {
+        return None;
+    }
+    Some(format!(
+        "this machine can also run {} natively, and two edits switch it: set `[isolation] \
+         prefer = \"native\"` in {}, and delete {} from {} so the next isolated start asks again",
+        names.join(", "),
+        paths.user_config_file().display(),
+        compose_entries_named(config),
+        paths.config_file().display()
+    ))
+}
+
+/// The compose `[[services]]` entries, counted and named by the services
+/// each includes: what a developer has to find in the file to delete.
+pub(super) fn compose_entries_named(config: &Config) -> String {
+    // An entry that includes nothing is named by its file instead.
+    let named = |entry: &ComposeEntry<'_>| match entry.include.is_empty() {
+        true => entry.file.to_string(),
+        false => entry.include.join(", "),
+    };
+    match compose_entries(config).as_slice() {
+        [one] => format!("the compose `[[services]]` entry ({})", named(one)),
+        many => format!(
+            "the {} compose `[[services]]` entries ({})",
+            many.len(),
+            many.iter().map(named).collect::<Vec<_>>().join("; ")
+        ),
+    }
+}
+
+/// Forgets every service record whose service was never brought up: a
+/// compose record no compose project was ever named on, and a native
+/// record with no server behind it.
+///
+/// What a shared worktree and a failed isolated start both have to do. A
+/// record that points at nothing puts a `postgres down` row on the screen
+/// of a worktree that has no postgres of its own, and a port in its list
+/// it does not own. A compose record that *does* name a project is kept:
+/// its volume may exist, and only that record can take it down.
+pub(super) fn forget_unstarted_services(record: &mut WorktreeRecord) {
+    record.services.retain(|service| match service.kind {
+        state::ServiceKind::Compose => service.compose_project.is_some() || service.pid.is_some(),
+        state::ServiceKind::Native => service.pid.is_some(),
+    });
+}
+
+/// Undoes what a start that was switching a worktree to isolated wrote
+/// before it failed: the service records, and the service roles in its
+/// port list. The worktree goes back to looking like the shared one it
+/// still is, and the next plain start is a clean shared one.
+///
+/// And whatever came up is taken down again: the start may have failed
+/// *after* the services were ready — a migration hook, a probe, a command
+/// that would not render — and the worktree's processes, which kept
+/// running on the shared services all along, must not be left beside
+/// private copies nothing uses. Containers compose may have created keep
+/// their records — without a port — so `rm` can still take their volumes.
+///
+/// `shared_ports` is the port list from before the switch re-derived it:
+/// the processes kept serving through the switch are on those numbers, so
+/// the record says so again.
+pub(super) fn undo_failed_isolation(
+    paths: &PandoPaths,
+    config: &Config,
+    name: &str,
+    shared_ports: &BTreeMap<String, u16>,
+) {
+    let projects = forget_failed_isolation(paths, config, name, shared_ports);
+    // Outside the lock, like every other compose call. By project, so a
+    // container compose created before `up` itself failed is found too.
+    // Best effort: the error being reported is the start's, not this one.
+    if !projects.is_empty() {
+        let program = services::docker_program(paths);
+        for project in projects {
+            let _ = services::Compose::by_project(&program, project.as_str()).stop();
+        }
+    }
+}
+
+/// The record half of [`undo_failed_isolation`], under the lock. Returns
+/// the compose projects that still have to be stopped.
+fn forget_failed_isolation(
+    paths: &PandoPaths,
+    config: &Config,
+    name: &str,
+    shared_ports: &BTreeMap<String, u16>,
+) -> Vec<String> {
+    let Ok(_lock) = state::lock(&paths.lock_file()) else {
+        return Vec::new();
+    };
+    let Ok(mut store) = state::load(&paths.state_file()) else {
+        return Vec::new();
+    };
+    let Some(record) = store.worktrees.get_mut(name) else {
+        return Vec::new();
+    };
+    // Another start of this worktree finished the same switch while this
+    // one was failing: the record is isolated and its processes, spawned
+    // against those services, are live. Tearing the services down now
+    // would pull the database out from under a start that worked. A
+    // failing start never sets the flag itself — it is set only right
+    // before the spawn — so a set flag is always the other start's.
+    if switched_by_another_start(record) {
+        return Vec::new();
+    }
+    // Every log pump, and every native server — whose pid *is* the
+    // service — that came up before the failure.
+    let _ = stop_service_pumps(record, &|pgid| proc::stop(pgid, STOP_GRACE));
+    clear_native_sockets(paths, name, record);
+    let projects = compose_projects(record);
+    for service in record.services.iter_mut() {
+        service.port = None;
+    }
+    forget_unstarted_services(record);
+    let owned_by_processes: Vec<String> = config
+        .processes
+        .values()
+        .flat_map(|process| process.roles())
+        .collect();
+    let roles = service_roles(config);
+    record
+        .ports
+        .retain(|role, _| !roles.contains(role) || owned_by_processes.contains(role));
+    for role in &owned_by_processes {
+        if let Some(port) = shared_ports.get(role) {
+            record.ports.insert(role.clone(), *port);
+        }
+    }
+    record.isolated = false;
+    let _ = state::save(&paths.state_file(), &store);
+    projects
+}
+
+/// Whether a record is isolated with a live process running against its
+/// services — a switch some other start completed.
+fn switched_by_another_start(record: &WorktreeRecord) -> bool {
+    record.isolated
+        && record.processes.values().any(|p| {
+            matches!(
+                p.phase,
+                state::Phase::Starting { .. } | state::Phase::Running { .. }
+            ) && proc::is_alive(p.pid)
+        })
+}
+
+/// Brings this worktree's native services up: initialise once, spawn
+/// detached, wait for the recipe's own check, then let the recipe create
+/// whatever the app's own URL names.
+///
+/// Planned in full before anything is created or spawned, the way
+/// processes are: a second service whose recipe does not resolve, or
+/// whose engine is not installed, must not leave the first one's data
+/// directory behind a failed start. The engine check is part of planning
+/// for the same reason — a start that initialises a cluster and *then*
+/// discovers there is no server to run against it has done work for
+/// nothing.
+fn bring_up_native_services(
+    paths: &PandoPaths,
+    config: &Config,
+    name: &str,
+    worktree: &Path,
+    ports: &BTreeMap<String, u16>,
+    progress: &dyn Fn(&str),
+) -> Result<Fresh> {
+    let planned = plan_native(paths, config, name, worktree, ports)?;
+    if planned.is_empty() {
+        return Ok(Fresh(false));
+    }
+    for service in &planned {
         // Said before it is started, not after it fails: a recipe nobody
         // has run against a real server is the first thing to suspect,
         // and a developer cannot guess that from a timeout.
@@ -415,10 +903,9 @@ fn bring_up_native_services(
             progress(&format!(
                 "{}: the {:?} recipe has never been run against a real server — if this does \
                  not work, the recipe is the first thing to suspect",
-                entry.name, service.recipe.name
+                service.service, service.recipe.name
             ));
         }
-        planned.push(service);
     }
 
     // A server that is already running is left exactly as it is. Starting
@@ -629,30 +1116,6 @@ pub(super) fn forget_hooks_after_services(
     state::save(&paths.state_file(), &store)
 }
 
-/// Remembers that this worktree runs private services, once they are up.
-///
-/// Written *after* `bring_up_services` rather than with the rest of the
-/// record, because the flag is what a later plain `start` reads to keep
-/// using them: a start that failed before any container existed — a
-/// mapping the env rewriter cannot satisfy, a service the compose file
-/// cannot isolate — would otherwise leave the worktree unable to start at
-/// all, isolated or shared, until `pando.toml` was edited by hand.
-///
-/// A worktree that was already isolated keeps the flag through such a
-/// failure, because its containers are real and nothing here clears it.
-pub(super) fn remember_isolated(paths: &PandoPaths, name: &str) -> Result<()> {
-    let _lock = state::lock(&paths.lock_file())?;
-    let mut store = state::load(&paths.state_file())?;
-    let Some(record) = store.worktrees.get_mut(name) else {
-        return Ok(());
-    };
-    if record.isolated {
-        return Ok(());
-    }
-    record.isolated = true;
-    state::save(&paths.state_file(), &store)
-}
-
 /// One detached `docker compose logs -f` per service, writing into the
 /// worktree's log directory so the viewer has a tab for it.
 ///
@@ -722,6 +1185,15 @@ pub(super) fn stop_service_pumps(
     failures
 }
 
+/// Whether any of a worktree's service records has a live process behind
+/// it: a compose log pump, or a native server.
+pub(super) fn has_live_services(record: &WorktreeRecord) -> bool {
+    record
+        .services
+        .iter()
+        .any(|service| service.pid.is_some_and(proc::is_alive))
+}
+
 /// The compose projects a worktree's records name, each once.
 pub(super) fn compose_projects(record: &WorktreeRecord) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -760,7 +1232,30 @@ pub struct ServiceStatus {
 /// same reason: a bind probe would take the port from the container that
 /// owns it. It says nothing about *whose* listener answered, which is
 /// exactly as much as a status line needs to claim.
+///
+/// A worktree on the shared services runs none of its own, so a record it
+/// still carries with no port is not a service: it is what `start
+/// --shared`, a failed switch to isolated, or 0.2.0 left behind to name a
+/// compose project whose volumes `rm` has to take down. It is kept for
+/// that — pando cannot find those volumes again without it, and asking
+/// Docker from a read path to decide whether they exist is not a read
+/// path's job — and it is not shown, because a `postgres  no port` row on
+/// a worktree that has no postgres of its own is a service that is not
+/// there. A record that has a port is shown whatever the flag says: that
+/// is a start bringing the services up before it switches the worktree
+/// over to them.
 pub fn service_statuses(record: &WorktreeRecord) -> Vec<ServiceStatus> {
+    recorded_service_statuses(record)
+        .into_iter()
+        .filter(|status| record.isolated || status.port.is_some())
+        .collect()
+}
+
+/// Every service record a worktree carries, leftovers included — what
+/// `status --json` publishes. The shape was published with them in it, and
+/// a program reads `project` there to find the volumes; hiding a row is a
+/// decision about a screen, not about the contract.
+pub fn recorded_service_statuses(record: &WorktreeRecord) -> Vec<ServiceStatus> {
     record
         .services
         .iter()

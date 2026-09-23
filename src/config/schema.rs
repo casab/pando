@@ -310,6 +310,65 @@ pub struct HookConfig {
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<String>,
+    /// Which starts run it: `isolated`, `always`, or `never`. Unset means
+    /// `isolated` for a hook after `services` in a project with services,
+    /// and `always` for the rest — see [`HookConfig::scope`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on: Option<HookScope>,
+}
+
+/// Which starts a hook runs on.
+///
+/// A hook after `services` is almost always a migration, and on a start
+/// that is not isolating the services it runs after are the developer's
+/// shared ones: one branch's migrations applied to the database every
+/// other worktree uses. So such a hook runs on isolated starts only unless
+/// its entry says `on = "always"`. `never` is the recorded "no" to the
+/// schema question — the command pando found stays visible, switched off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HookScope {
+    Isolated,
+    Always,
+    Never,
+}
+
+impl HookScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HookScope::Isolated => "isolated",
+            HookScope::Always => "always",
+            HookScope::Never => "never",
+        }
+    }
+}
+
+impl HookConfig {
+    /// The scope in force: the entry's own `on`, or the default for its
+    /// lifecycle point.
+    ///
+    /// `has_services` is whether the project has any service pando can run
+    /// a private copy of. Without one, no start is ever isolated, and the
+    /// database a hook after `services` runs against is the only one there
+    /// is — an external one the project points at itself. Defaulting that
+    /// hook to isolated would mean it never runs at all, so it defaults to
+    /// `always`, which is what it did before scopes existed.
+    pub fn scope(&self, has_services: bool) -> HookScope {
+        self.on.unwrap_or(match self.after {
+            HookPoint::Services if has_services => HookScope::Isolated,
+            _ => HookScope::Always,
+        })
+    }
+
+    /// Whether a start that is (or is not) isolating runs this hook, in a
+    /// project that has (or has no) services — see [`HookConfig::scope`].
+    pub fn runs_on(&self, isolated: bool, has_services: bool) -> bool {
+        match self.scope(has_services) {
+            HookScope::Always => true,
+            HookScope::Isolated => isolated,
+            HookScope::Never => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

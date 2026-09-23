@@ -1,4 +1,5 @@
-//! The detail pane: status, processes, services, ports, and the log tail.
+//! The detail pane: status, processes, services, where it is reached, what
+//! it has checked out, and the log tail filling whatever height is left.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -8,11 +9,11 @@ use ratatui::widgets::{Block, BorderType, Paragraph};
 
 use crate::log_tail::LogLevel;
 use crate::state::{Aggregate, Phase, ProcessRecord};
-use crate::theme::{border, cyan, green, magenta, orange, red, text_dim, text_muted, yellow};
-use crate::tui::app::App;
+use crate::theme::{border, cyan, green, magenta, orange, red, text, text_dim, text_muted, yellow};
+use crate::tui::app::{App, compact_age};
 
-use super::list::{pr_color, run_marker};
-use super::truncate;
+use super::list::{pr_color, run_marker, signal_color, signal_text};
+use super::{home_relative, truncate, truncate_middle};
 
 // Detail rows, by how much they are worth keeping when the pane is short.
 // `KEEP_ALWAYS` rows are the pane's reason to exist and are never shed.
@@ -25,13 +26,22 @@ pub(super) const KEEP_URL: u8 = 1;
 /// pane is being looked at for.
 const KEEP_PROCESSES: u8 = 2;
 
+/// Uncommitted changes and drift: what a removal would lose and what a
+/// rebase would have to carry, kept before the branch and commit rows.
+const KEEP_GIT: u8 = 2;
+
 pub(super) const KEEP_PR: u8 = 3;
+
+/// Shared or isolated: only shown for a project that has services, and
+/// then worth about as much as the PR.
+const KEEP_MODE: u8 = 3;
 
 pub(super) const KEEP_HEAD: u8 = 4;
 
-const KEEP_AGE: u8 = 5;
-
 pub(super) const KEEP_PATH: u8 = 6;
+
+/// `" status "` — a space, then the label padded to seven.
+const LABEL_WIDTH: usize = 8;
 
 /// A blank line plus the log's header, and the fewest log lines worth the
 /// space they take.
@@ -67,16 +77,39 @@ fn detail_row<'a>(label: &str, value: Vec<Span<'a>>) -> Line<'a> {
     Line::from(spans)
 }
 
+/// A labelled value that is never cut: a URL somebody is about to copy.
+/// What does not fit on the row carries on under it, indented to the
+/// value's column.
+fn wrapped_rows<'a>(label: &str, value: &str, style: Style, width: usize) -> Vec<Line<'a>> {
+    let room = width.saturating_sub(LABEL_WIDTH).max(1);
+    let chars: Vec<char> = value.chars().collect();
+    chars
+        .chunks(room)
+        .enumerate()
+        .map(|(i, chunk)| {
+            let piece: String = chunk.iter().collect();
+            if i == 0 {
+                detail_row(label, vec![Span::styled(piece, style)])
+            } else {
+                Line::from(vec![
+                    Span::raw(" ".repeat(LABEL_WIDTH)),
+                    Span::styled(piece, style),
+                ])
+            }
+        })
+        .collect()
+}
+
 pub(super) fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
     let selected = app.selected_worktree().map(|w| w.name.clone());
     let title = match &selected {
-        Some(name) => format!(" {name} "),
+        Some(name) => format!(" {} ", app.label_of(name)),
         None => " detail ".to_string(),
     };
     let block = Block::bordered()
         .title(Span::styled(
-            truncate(&title, area.width.saturating_sub(2) as usize),
-            Style::new().fg(text_dim()),
+            truncate_middle(&title, area.width.saturating_sub(2) as usize),
+            Style::new().fg(text()).add_modifier(Modifier::BOLD),
         ))
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(if app.tail_scroll > 0 {
@@ -90,9 +123,11 @@ pub(super) fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
     let Some(name) = selected else {
+        // The list is not empty — the welcome covers that — so a filter
+        // is hiding everything.
         f.render_widget(
             Paragraph::new(Line::styled(
-                truncate(" nothing selected", inner.width as usize),
+                truncate(" no worktree matches the filter", inner.width as usize),
                 Style::new().fg(text_muted()),
             )),
             inner,
@@ -106,26 +141,14 @@ pub(super) fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
         .expect("a name means a worktree");
 
     let mut rows: Vec<(u8, Line)> = Vec::new();
-    rows.push((
-        KEEP_ALWAYS,
-        detail_row(
-            "branch",
-            vec![
-                Span::styled(
-                    truncate(
-                        wt.branch.as_deref().unwrap_or("(detached)"),
-                        width.saturating_sub(18),
-                    ),
-                    Style::new().fg(magenta()),
-                ),
-                Span::styled(
-                    format!("  {}", wt.head_sha.as_deref().unwrap_or("-")),
-                    Style::new().fg(text_muted()),
-                ),
-            ],
-        ),
-    ));
     rows.push((KEEP_ALWAYS, status_row(app, &name, width)));
+    for line in failure_rows(app, &name, width) {
+        rows.push((KEEP_URL, line));
+    }
+    for line in nothing_to_run_rows(app, &name, width) {
+        rows.push((KEEP_URL, line));
+    }
+
     // Below the worktree's own status, and shed before the URL: with one
     // process there are none of these at all.
     for line in process_rows(app, &name, width) {
@@ -137,35 +160,43 @@ pub(super) fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
     for line in service_rows(app, &name, width) {
         rows.push((KEEP_PROCESSES, line));
     }
-    if let Some(url) = app.url_of(&name) {
-        rows.push((
-            KEEP_URL,
-            detail_row(
-                "url",
-                vec![Span::styled(
-                    truncate(&url, width.saturating_sub(9)),
-                    Style::new().fg(cyan()).add_modifier(Modifier::UNDERLINED),
-                )],
-            ),
-        ));
+    // Never truncated, either of them: the URL is the thing that gets
+    // copied, and one missing its end is worse than none.
+    if let Some(phase) = app.phase_of(&name)
+        && let Some(url) = app.url_of(&name)
+    {
+        // A failed worktree's URL may still answer (another process can
+        // hold it), so it stays; but it is not drawn as a live link.
+        let style = if matches!(phase, Aggregate::Failed { .. }) {
+            Style::new().fg(text_dim())
+        } else {
+            Style::new().fg(cyan()).add_modifier(Modifier::UNDERLINED)
+        };
+        for line in wrapped_rows("url", &url, style, width) {
+            rows.push((KEEP_URL, line));
+        }
     }
     // Right under the local URL, and kept at the same priority: when a
     // worktree is shared, the public URL is the line somebody is here to
     // read.
     if let Some(public) = app.public_url_of(&name) {
-        rows.push((
-            KEEP_URL,
-            detail_row(
-                "public",
-                vec![Span::styled(
-                    truncate(&public, width.saturating_sub(9)),
-                    Style::new().fg(green()).add_modifier(Modifier::UNDERLINED),
-                )],
-            ),
-        ));
+        let style = Style::new().fg(green()).add_modifier(Modifier::UNDERLINED);
+        for line in wrapped_rows("public", &public, style, width) {
+            rows.push((KEEP_URL, line));
+        }
     }
     if let Some(ports) = ports_row(app, &name, width) {
         rows.push((KEEP_URL, ports));
+    }
+    if let Some(mode) = mode_row(app, &name, width) {
+        rows.push((KEEP_MODE, mode));
+    }
+    rows.push((KEEP_GIT, git_row(app, &wt, width)));
+    for line in branch_rows(&wt, width) {
+        rows.push((KEEP_HEAD, line));
+    }
+    if let Some(commit) = commit_row(app, &wt, width) {
+        rows.push((KEEP_HEAD, commit));
     }
     if let Some(pr) = app.pr_for(&wt) {
         rows.push((
@@ -182,41 +213,31 @@ pub(super) fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
             ),
         ));
     }
-    if let Some(subject) = &wt.head_subject {
-        rows.push((
-            KEEP_HEAD,
-            detail_row(
-                "head",
-                vec![Span::styled(
-                    truncate(subject, width.saturating_sub(9)),
-                    Style::new().fg(text_dim()),
-                )],
-            ),
-        ));
-    }
-    if let Some(age) = &wt.head_age {
-        rows.push((
-            KEEP_AGE,
-            detail_row(
-                "age",
-                vec![Span::styled(age.clone(), Style::new().fg(text_dim()))],
-            ),
-        ));
-    }
+    let adopted = !app.created_by_pando.get(&name).copied().unwrap_or(false);
+    let note = if adopted { "  adopted" } else { "" };
     rows.push((
         KEEP_PATH,
         detail_row(
             "path",
-            vec![Span::styled(
-                truncate(&wt.path.display().to_string(), width.saturating_sub(9)),
-                Style::new().fg(text_dim()),
-            )],
+            vec![
+                // The middle goes, not the end: the end is which worktree
+                // it is.
+                Span::styled(
+                    truncate_middle(
+                        &home_relative(&wt.path),
+                        width.saturating_sub(LABEL_WIDTH + note.len()),
+                    ),
+                    Style::new().fg(text_dim()),
+                ),
+                Span::styled(note, Style::new().fg(text_muted())),
+            ],
         ),
     ));
 
     let height = inner.height as usize;
     // The log only gets space once the rows that explain the worktree have
-    // theirs; a two-row pane is a status line, not a log viewer.
+    // theirs; a two-row pane is a status line, not a log viewer. Then it
+    // takes every row that is left.
     let tail_rows = height
         .saturating_sub(rows.len().min(height) + TAIL_CHROME)
         .min(height);
@@ -238,17 +259,182 @@ pub(super) fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+/// Shared or isolated, and the key that switches — for a project that has
+/// services to be shared or isolated at all.
+fn mode_row<'a>(app: &App, name: &str, width: usize) -> Option<Line<'a>> {
+    let isolated = app.record_for(name).is_some_and(|r| r.isolated);
+    if app.config.services.is_empty() && !isolated {
+        return None;
+    }
+    let (word, color, what) = if isolated {
+        ("isolated", magenta(), "  private services · S shares")
+    } else {
+        (
+            "shared",
+            text_dim(),
+            "  the project's services · i isolates",
+        )
+    };
+    Some(detail_row(
+        "mode",
+        vec![
+            Span::styled(word, Style::new().fg(color)),
+            Span::styled(
+                truncate(what, width.saturating_sub(LABEL_WIDTH + word.len())),
+                Style::new().fg(text_muted()),
+            ),
+        ],
+    ))
+}
+
+/// What git says about the working tree: uncommitted changes, and how far
+/// the branch stands from its base. The same facts `pando ls` prints in its
+/// GIT column, in words.
+fn git_row(app: &App, wt: &crate::worktree::Worktree, width: usize) -> Line<'static> {
+    let mut parts: Vec<(String, Style)> = Vec::new();
+    match wt.dirty {
+        Some(true) => parts.push((
+            "* uncommitted changes".to_string(),
+            Style::new().fg(yellow()).add_modifier(Modifier::BOLD),
+        )),
+        Some(false) => parts.push(("clean".to_string(), Style::new().fg(text_dim()))),
+        None => parts.push(("reading git…".to_string(), Style::new().fg(text_muted()))),
+    }
+    if let Some((ahead, behind)) = wt.ahead_behind {
+        let base = app
+            .default_base
+            .as_deref()
+            .map(|b| format!(" of {b}"))
+            .unwrap_or_default();
+        let drift = match (ahead, behind) {
+            (0, 0) => format!(
+                "even with {}",
+                app.default_base.as_deref().unwrap_or("the base")
+            ),
+            (a, 0) => format!("↑{a} ahead{base}"),
+            (0, b) => format!("↓{b} behind{base}"),
+            (a, b) => format!("↑{a} ahead, ↓{b} behind{base}"),
+        };
+        parts.push((drift, Style::new().fg(text_dim())));
+    }
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, (text, style)) in parts.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", Style::new().fg(text_muted())));
+        }
+        spans.push(Span::styled(text, style));
+    }
+    super::truncate_line(detail_row("git", spans), width)
+}
+
+/// The branch in full, and anything wrong with its entry.
+/// Whole, wrapped if it has to be: a long branch name differs from its
+/// siblings somewhere in the middle, and a cut there loses exactly that.
+fn branch_rows<'a>(wt: &crate::worktree::Worktree, width: usize) -> Vec<Line<'a>> {
+    let branch = wt.branch.as_deref().unwrap_or("(detached)");
+    let mut drift = Vec::new();
+    if wt.prunable || wt.locked {
+        drift.push(signal_text(wt));
+    }
+    let drift = if drift.is_empty() {
+        String::new()
+    } else {
+        format!("  {}", drift.join(" · "))
+    };
+    let room = width.saturating_sub(LABEL_WIDTH);
+    let drift_style = Style::new().fg(signal_color(wt));
+    if branch.chars().count() + drift.chars().count() <= room {
+        return vec![detail_row(
+            "branch",
+            vec![
+                Span::styled(branch.to_string(), Style::new().fg(magenta())),
+                Span::styled(drift, drift_style),
+            ],
+        )];
+    }
+    let mut rows = wrapped_rows("branch", branch, Style::new().fg(magenta()), width);
+    if !drift.is_empty() {
+        rows.push(Line::from(vec![
+            Span::raw(" ".repeat(LABEL_WIDTH)),
+            Span::styled(truncate(drift.trim_start(), room), drift_style),
+        ]));
+    }
+    rows
+}
+
+/// The checked-out commit: its sha, its subject, and how old it is — now,
+/// not when git was last asked.
+fn commit_row<'a>(app: &App, wt: &crate::worktree::Worktree, width: usize) -> Option<Line<'a>> {
+    let sha = wt.head_sha.clone()?;
+    let age = app
+        .commit_age(wt)
+        .map(|age| format!(" · {age}"))
+        .unwrap_or_default();
+    let subject = wt.head_subject.clone().unwrap_or_default();
+    let room = width.saturating_sub(LABEL_WIDTH + sha.len() + 1 + age.chars().count());
+    Some(detail_row(
+        "commit",
+        vec![
+            Span::styled(sha, Style::new().fg(text_muted())),
+            Span::raw(" "),
+            Span::styled(truncate(&subject, room), Style::new().fg(text_dim())),
+            Span::styled(age, Style::new().fg(text_muted())),
+        ],
+    ))
+}
+
 fn status_row<'a>(app: &App, name: &str, width: usize) -> Line<'a> {
-    let Some(phase) = app.phase_of(name) else {
+    // An action in flight is the status: a worktree being stopped is not
+    // `running`, and one whose start is waiting on a question is not
+    // `stopped`.
+    if let Some(pending) = app.pending_on(name) {
+        let (word, rest) = if app.awaiting_answer() {
+            ("? waiting for your answer".to_string(), String::new())
+        } else {
+            (
+                format!("◌ {}…", pending.kind.verb()),
+                pending
+                    .stage
+                    .as_ref()
+                    .map(|stage| format!("  {stage}"))
+                    .unwrap_or_default(),
+            )
+        };
+        let room = width.saturating_sub(LABEL_WIDTH + word.chars().count());
         return detail_row(
             "status",
-            vec![Span::styled(
-                "stopped — press s to start",
-                Style::new().fg(text_muted()),
-            )],
+            vec![
+                Span::styled(word, Style::new().fg(yellow()).add_modifier(Modifier::BOLD)),
+                Span::styled(truncate(&rest, room), Style::new().fg(text_muted())),
+            ],
+        );
+    }
+    let Some(phase) = app.phase_of(name) else {
+        // With nothing to run there is no key that starts it; the rows
+        // below say where to add something.
+        let hint = if app.nothing_to_run {
+            ""
+        } else {
+            "  ⏎ starts it · i isolated"
+        };
+        return detail_row(
+            "status",
+            vec![
+                Span::styled("○ stopped", Style::new().fg(text_dim())),
+                Span::styled(
+                    truncate(hint, width.saturating_sub(LABEL_WIDTH + 9)),
+                    Style::new().fg(text_muted()),
+                ),
+            ],
         );
     };
-    let age = uptime(chrono::Utc::now().signed_duration_since(phase.since()));
+    // Up since the oldest process that runs: `p` restarting one of three
+    // does not make the worktree two seconds old.
+    let since = match phase {
+        Aggregate::Running { .. } => app.up_since(name).unwrap_or(phase.since()),
+        _ => phase.since(),
+    };
+    let age = uptime(chrono::Utc::now().signed_duration_since(since));
     // A worktree running one process has no rows below to carry its pid,
     // and with several it would be the wrong one to show.
     let processes = app.processes_of(name);
@@ -276,6 +462,7 @@ fn status_row<'a>(app: &App, name: &str, width: usize) -> Line<'a> {
         ),
         // Named: `failed` on a worktree running three processes is a
         // question until it says which one.
+        // The reason is on the rows below, wrapped rather than cut.
         Aggregate::Failed { .. } => detail_row(
             "status",
             vec![
@@ -284,18 +471,59 @@ fn status_row<'a>(app: &App, name: &str, width: usize) -> Line<'a> {
                     Style::new().fg(red()).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    format!(
-                        "  {}",
-                        truncate(
-                            &phase.reason().unwrap_or_default(),
-                            width.saturating_sub(19)
-                        )
-                    ),
-                    Style::new().fg(text_dim()),
+                    truncate("  ⏎ shows the log", width.saturating_sub(LABEL_WIDTH + 8)),
+                    Style::new().fg(text_muted()),
                 ),
             ],
         ),
     }
+}
+
+/// Where to add a process, for a project that has none: wrapped, never
+/// cut, because the end of it is the path of the file to edit.
+fn nothing_to_run_rows<'a>(app: &App, name: &str, width: usize) -> Vec<Line<'a>> {
+    if !app.nothing_to_run || app.phase_of(name).is_some() || app.pending_on(name).is_some() {
+        return Vec::new();
+    }
+    let room = width.saturating_sub(LABEL_WIDTH).max(1);
+    super::wrap_text(&app.nothing_to_run_line(), room)
+        .into_iter()
+        .map(|row| {
+            Line::from(vec![
+                Span::raw(" ".repeat(LABEL_WIDTH)),
+                Span::styled(row, Style::new().fg(yellow())),
+            ])
+        })
+        .collect()
+}
+
+/// Why a worktree failed, wrapped under its status: the reason is usually
+/// a sentence that ends with what to do, and a cut one loses exactly that.
+fn failure_rows<'a>(app: &App, name: &str, width: usize) -> Vec<Line<'a>> {
+    /// A stack trace belongs in the log; the pane keeps a paragraph.
+    const MAX_REASON_ROWS: usize = 4;
+    let Some(reason) = app.phase_of(name).and_then(|phase| phase.reason()) else {
+        return Vec::new();
+    };
+    if app.pending_on(name).is_some() {
+        return Vec::new();
+    }
+    let room = width.saturating_sub(LABEL_WIDTH).max(1);
+    let mut rows = super::wrap_text(&reason, room);
+    if rows.len() > MAX_REASON_ROWS {
+        rows.truncate(MAX_REASON_ROWS);
+        if let Some(last) = rows.last_mut() {
+            *last = truncate(&format!("{last} …"), room);
+        }
+    }
+    rows.into_iter()
+        .map(|row| {
+            Line::from(vec![
+                Span::raw(" ".repeat(LABEL_WIDTH)),
+                Span::styled(row, Style::new().fg(text_dim())),
+            ])
+        })
+        .collect()
 }
 
 /// One row per process, under the worktree's own status: what each of them
@@ -444,6 +672,22 @@ fn ports_row<'a>(app: &App, name: &str, width: usize) -> Option<Line<'a>> {
 
 fn tail_header<'a>(app: &App, name: &str, width: usize) -> Line<'a> {
     let target = app.tail_target();
+    if target.is_none() {
+        // Nothing runs, so there is nothing live to count.
+        return Line::from(vec![
+            Span::styled(
+                " log",
+                Style::new().fg(text_dim()).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                truncate(
+                    "  not running · l opens its earlier logs",
+                    width.saturating_sub(4),
+                ),
+                Style::new().fg(text_muted()),
+            ),
+        ]);
+    }
     let count = target
         .as_ref()
         .and_then(|(key, _, _)| app.log_tails.get(key))
@@ -451,21 +695,25 @@ fn tail_header<'a>(app: &App, name: &str, width: usize) -> Line<'a> {
         .unwrap_or(0);
     let processes = app.processes_of(name).len();
     let label = match &target {
-        Some((_, process, _)) if processes > 1 => format!(" log {process}"),
+        Some((_, process, _)) if processes > 1 => format!(" log · {process}"),
         _ => " log".to_string(),
     };
     let hint = if app.tail_scroll > 0 {
-        "  PgDn for newer, l to open"
+        format!(" · scrolled back {} · PgDn newer", app.tail_scroll)
     } else if processes > 1 {
-        "  l to open, tab to switch"
+        " · l opens · tab switches · p restarts it".to_string()
     } else {
-        "  l to open"
+        " · l opens".to_string()
     };
+    let unit = if count == 1 { "line" } else { "lines" };
     Line::from(vec![
-        Span::styled(label.clone(), Style::new().fg(text_muted())),
+        Span::styled(
+            label.clone(),
+            Style::new().fg(text_dim()).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(
             truncate(
-                &format!("  {count} lines{hint}"),
+                &format!("  {count} {unit}{hint}"),
                 width.saturating_sub(label.chars().count()),
             ),
             Style::new().fg(text_muted()),
@@ -475,10 +723,12 @@ fn tail_header<'a>(app: &App, name: &str, width: usize) -> Line<'a> {
 
 /// The last lines of the dev log, coloured by level.
 fn tail_lines<'a>(app: &App, _name: &str, rows: usize, width: usize) -> Vec<Line<'a>> {
-    let Some(tail) = app
-        .tail_target()
-        .and_then(|(key, _, _)| app.log_tails.get(&key))
-    else {
+    // Not running: the header above already says so.
+    let target = app.tail_target();
+    if target.is_none() {
+        return Vec::new();
+    }
+    let Some(tail) = target.and_then(|(key, _, _)| app.log_tails.get(&key)) else {
         return vec![Line::styled(
             truncate(" (no log yet)", width),
             Style::new().fg(text_muted()),
@@ -515,15 +765,7 @@ pub(super) fn level_color(level: LogLevel) -> ratatui::style::Color {
     }
 }
 
+/// The pane's one duration style, shared with the commit age.
 fn uptime(d: chrono::TimeDelta) -> String {
-    let secs = d.num_seconds().max(0);
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m", secs / 60)
-    } else if secs < 86_400 {
-        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
-    } else {
-        format!("{}d", secs / 86_400)
-    }
+    compact_age(d.num_seconds())
 }

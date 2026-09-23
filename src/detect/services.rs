@@ -650,9 +650,11 @@ pub(super) fn schema_hook_proposal(root: &Path, signals: &Signals) -> Option<Pro
     if candidates.is_empty() {
         return None;
     }
-    // One candidate is one answer; several is a question.
-    let decided = candidates.len() == 1;
-    Some(Proposal::of(Slot::SchemaHook, candidates, decided))
+    // Always a question, even with one candidate: it is the one question
+    // that touches data, and a developer says yes or no to it once.
+    // `--yes` still takes the first option, and what it writes runs on
+    // isolated starts only — against this worktree's private services.
+    Some(Proposal::of(Slot::SchemaHook, candidates, false))
 }
 
 /// The name every proposed schema hook gets. One name, so a second run
@@ -672,6 +674,9 @@ fn schema_candidates(root: &Path, signals: &Signals) -> Vec<Candidate> {
                 cmd,
                 cwd: None,
                 fallback: None,
+                // Explicit rather than defaulted, so the entry shows how
+                // to change it.
+                on: Some(crate::config::HookScope::Isolated),
             }),
             ..Candidate::default()
         })

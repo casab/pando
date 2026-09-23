@@ -22,7 +22,7 @@ pub struct Signals {
     /// Which files that pin a runtime exist. What they *say* is
     /// `runtime_requirements`; this stays the list `doctor` shows.
     pub version_files: Vec<String>,
-    /// What those files, `.tool-versions`, `mise.toml` and `engines` in
+    /// What those files, `.tool-versions`, `mise.toml` (or `.mise.toml`) and `engines` in
     /// `package.json` actually ask for: one entry per (language, spec,
     /// source), a pin before a range.
     ///
@@ -63,11 +63,12 @@ const WORKSPACE_MARKERS: [&str; 3] = ["pnpm-workspace.yaml", "turbo.json", "nx.j
 /// config as `runtime.version_files`, and doctor compares that array in
 /// order: a reordering would call every config written before it stale. A
 /// test holds this list to the table instead.
-pub(super) const VERSION_FILES: [&str; 7] = [
+pub(super) const VERSION_FILES: [&str; 8] = [
     ".nvmrc",
     ".node-version",
     ".tool-versions",
     "mise.toml",
+    ".mise.toml",
     ".python-version",
     "rust-toolchain.toml",
     ".ruby-version",
@@ -434,11 +435,7 @@ pub(super) fn provision_seeds(root: &Path) -> Vec<(String, String)> {
 /// not run — means it is not, because only a definite yes may authorise a
 /// write.
 pub fn is_gitignored(root: &Path, rel: &str) -> bool {
-    Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["check-ignore", "-q", "--", rel])
-        .output()
+    crate::project::git(root, ["check-ignore", "-q", "--", rel])
         .map(|out| out.status.code() == Some(0))
         .unwrap_or(false)
 }

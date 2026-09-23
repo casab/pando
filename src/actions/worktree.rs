@@ -15,14 +15,10 @@ use crate::worktree::{self, Worktree};
 use super::hooks::{HookContext, run_hooks};
 use super::lifecycle::{MissingOnly, StopOutcome, stop_recorded, sweep_orphaned_groups};
 use super::refresh::refresh;
-use super::services::{clear_native_sockets, stop_compose_projects};
+use super::services::{clear_native_sockets, compose_projects, docker_down_for, remove_containers};
+use crate::remedy;
 
-/// Directory name for a branch: `feat/checkout` becomes `feat+checkout`.
-/// Slashes are the only thing that cannot appear in a directory name, and a
-/// plus reads as a join rather than an escape.
-pub fn sanitize_branch_to_dir(branch: &str) -> String {
-    branch.replace('/', "+")
-}
+pub use crate::worktree::sanitize_branch_to_dir;
 
 /// Which of the three shapes `new` is in. Mirrors the decision git itself
 /// would otherwise make implicitly.
@@ -130,7 +126,9 @@ pub fn new(
     // Past this point the worktree exists, so every failure has something to
     // undo before it is reported.
     let finish = (|| -> Result<()> {
-        progress("provisioning");
+        if !config.project.provision_paths().is_empty() {
+            progress("provisioning");
+        }
         provision_worktree_files(paths, config, &target, progress)?;
         let canonical = std::fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
         store
@@ -153,7 +151,20 @@ pub fn new(
     // No ports yet: they are allocated at `start`, so a create hook that
     // names one fails here by name rather than silently rendering the
     // wrong number. Almost none do; the install step never does.
-    progress("installing");
+    // Said only when there is something to install: a project with no
+    // install command and no create hook used to print it anyway.
+    let installs = config
+        .project
+        .install
+        .as_deref()
+        .is_some_and(|cmd| !cmd.trim().is_empty())
+        || config
+            .hooks
+            .iter()
+            .any(|hook| hook.after == config::HookPoint::Create);
+    if installs {
+        progress("installing");
+    }
     let no_ports: BTreeMap<String, u16> = BTreeMap::new();
     let no_services: BTreeMap<String, String> = BTreeMap::new();
     let ctx = HookContext {
@@ -162,9 +173,10 @@ pub fn new(
         worktree: &target,
         ports: &no_ports,
         service_env: &no_services,
+        isolated: false,
     };
     run_hooks(paths, config, config::HookPoint::Create, &ctx, progress)
-        .with_context(|| format!("{dir_name} was created, but its install step failed"))?;
+        .with_context(|| format!("{branch} was created, but its install step failed"))?;
     Ok(dir_name)
 }
 
@@ -174,22 +186,27 @@ pub fn new(
 ///
 /// A prunable worktree has no directory left to look in, and clearing its
 /// entry removes nothing, so there is nothing to refuse.
-fn dirty_entry(worktree: &Worktree) -> Option<String> {
+///
+/// A git that could not answer — timed out, failed, never ran — is an
+/// error, never "clean": `rm` acts on this answer by stopping processes
+/// and removing volumes, and only then finds out from `git worktree
+/// remove` that the tree was dirty after all.
+fn dirty_entry(worktree: &Worktree) -> Result<Option<String>> {
     if worktree.prunable {
-        return None;
+        return Ok(None);
     }
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(&worktree.path)
-        .args(["status", "--porcelain"])
-        .output()
-        .ok()?;
+    let out = crate::project::git(&worktree.path, ["status", "--porcelain"])?;
     if !out.status.success() {
-        return None;
+        bail!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    let entry = text.lines().find(|l| !l.trim().is_empty())?;
-    Some(entry.trim().to_string())
+    Ok(text
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .map(|entry| entry.trim().to_string()))
 }
 
 /// Undoes a `new` that failed after `git worktree add`. The worktree goes;
@@ -263,7 +280,10 @@ pub fn rm(
             .lock_reason
             .as_deref()
             .unwrap_or("no reason recorded");
-        bail!("{name} is locked ({reason}) — unlock it with `git worktree unlock` first");
+        bail!(
+            "{} is locked ({reason}) — unlock it with `git worktree unlock` first",
+            target.display_name()
+        );
     }
 
     // `rm` can be the first command a project ever sees (an adopted
@@ -280,10 +300,12 @@ pub fn rm(
         .worktrees
         .get(name)
         .is_some_and(|r| r.created_by_pando && record_is_for(r, target));
+    let shown = target.display_name();
     if !created_by_pando && !yes {
         bail!(
-            "pando did not create {name} ({}) — pass --yes to remove it anyway",
-            target.path.display()
+            "pando did not create {shown} ({}) — {}",
+            target.path.display(),
+            remedy::REMOVE_ANYWAY
         );
     }
 
@@ -292,10 +314,37 @@ pub fn rm(
     // that is gone, a worktree that is not, and a record blaming the
     // process for pando's kill. The question is the one git asks without
     // `--force`; ignored files never block a removal and do not show here.
-    if !force && let Some(entry) = dirty_entry(target) {
+    if !force {
+        match dirty_entry(target) {
+            Ok(None) => {}
+            Ok(Some(entry)) => bail!(
+                "{shown} contains modified or untracked files ({entry}) — commit or remove \
+                 them, or {}",
+                remedy::DISCARD_CHANGES
+            ),
+            // Before anything destructive: not knowing is not "clean".
+            Err(e) => bail!(
+                "could not tell whether {shown} has changes: {e:#} — nothing was stopped or \
+                 removed; check it with `git status`, or {}",
+                remedy::DISCARD_CHANGES
+            ),
+        }
+    }
+
+    // And Docker's, for the same reason. `rm` is what takes a worktree's
+    // compose volumes with it, and the record naming the project is about
+    // to go: removed while the daemon is down, the volumes survive with
+    // nothing in pando able to find them again. So that is refused unless
+    // forced, before anything is stopped — and forced, it goes ahead and
+    // says how to remove them by hand.
+    if !force
+        && let Some(record) = store.worktrees.get(name)
+        && let Some((project, how)) = docker_down_for(paths, &compose_projects(record))
+    {
         bail!(
-            "{name} contains modified or untracked files ({entry}) — commit or remove them, \
-             or pass --force to let git discard them"
+            "Docker {how}, so the services of {shown} cannot be removed with it — {}; \
+             its data volumes then stay until `docker compose -p {project} down -v`",
+            remedy::REMOVE_WITHOUT_DOCKER
         );
     }
 
@@ -303,6 +352,16 @@ pub fn rm(
     // has just been deleted is not a process anyone can do anything with,
     // and `rm` removes the record that is the only way to find it again.
     let mut projects: Vec<String> = Vec::new();
+    // Said before it happens: `rm` of a running worktree takes its dev
+    // server down, and a bare "removed" afterwards hid that it had.
+    let running: Vec<String> = store
+        .worktrees
+        .get(name)
+        .map(|record| record.processes.keys().cloned().collect())
+        .unwrap_or_default();
+    if !running.is_empty() {
+        progress(&format!("stopping {}", running.join(", ")));
+    }
     let stopped = stop_recorded(
         &mut store,
         name,
@@ -318,10 +377,9 @@ pub fn rm(
     // a retry of `rm` has the record it needs.
     if !projects.is_empty() {
         state::save(&paths.state_file(), &store)?;
-        stop_compose_projects(paths, &projects, |compose| compose.down_with_volumes())
-            .with_context(|| {
-                format!("{name} was left in place; its services could not be taken down")
-            })?;
+        remove_containers(paths, &projects, progress).with_context(|| {
+            format!("{shown} was left in place; its services could not be taken down")
+        })?;
     }
 
     // Nothing is unlinked first. Verified against git 2.51: an ignored file
@@ -546,9 +604,10 @@ fn resolve_create_source(
             }
             resolved
         }
-        None => worktree::resolve_base_branch(root).context(
-            "cannot work out a base branch (no origin/HEAD, main, or master) — pass --base",
-        )?,
+        None => worktree::resolve_base_branch(root).context(format!(
+            "cannot work out a base branch (no origin/HEAD, main, or master) — {}",
+            remedy::NAME_A_BASE
+        ))?,
     };
     Ok(CreateSource::Fork { base })
 }
@@ -567,11 +626,7 @@ fn validate_branch_name(root: &Path, branch: &str) -> Result<()> {
     if branch.trim().is_empty() {
         bail!("a branch name is required");
     }
-    let ok = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["check-ref-format", "--branch", branch])
-        .output()
+    let ok = crate::project::git(root, ["check-ref-format", "--branch", branch])
         .map(|o| o.status.success())
         .unwrap_or(false);
     if !ok {
@@ -585,12 +640,8 @@ fn validate_branch_name(root: &Path, branch: &str) -> Result<()> {
 /// last word: the main one for the pre-flight, the new worktree for the
 /// check that actually authorises a write.
 fn ensure_gitignored(dir: &Path, rel: &str) -> Result<()> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["check-ignore", "-q", "--", rel])
-        .output()
-        .context("spawn git check-ignore")?;
+    let out = crate::project::git(dir, ["check-ignore", "-q", "--", rel])
+        .context("run git check-ignore")?;
     match out.status.code() {
         Some(0) => Ok(()),
         Some(1) => bail!(
@@ -657,11 +708,23 @@ fn provision_worktree_files(
             false => config.project.provision_mode,
         };
         match mode {
-            ProvisionMode::Link => std::os::unix::fs::symlink(&src, &dst)
-                .with_context(|| format!("symlink {} → {}", src.display(), dst.display()))?,
+            ProvisionMode::Link => {
+                std::os::unix::fs::symlink(&src, &dst)
+                    .with_context(|| format!("symlink {} → {}", src.display(), dst.display()))?;
+                // Said per file, and said to be a link: an edit in the
+                // worktree edits the main checkout's file.
+                progress(&format!(
+                    "linked {rel} → {} (symlink; `provision_mode = \"copy\"` gives each \
+                     worktree its own)",
+                    src.display()
+                ));
+            }
             ProvisionMode::Copy => {
                 std::fs::copy(&src, &dst)
                     .with_context(|| format!("copy {} → {}", src.display(), dst.display()))?;
+                if !seeded {
+                    progress(&format!("copied {rel} from {}", src.display()));
+                }
             }
         }
     }
@@ -685,11 +748,7 @@ fn provision_source(paths: &PandoPaths, config: &Config, rel: &str) -> Option<(P
 }
 
 pub(super) fn ref_exists(root: &Path, refname: &str) -> bool {
-    Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["rev-parse", "--verify", "--quiet", refname])
-        .output()
+    crate::project::git(root, ["rev-parse", "--verify", "--quiet", refname])
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
@@ -703,11 +762,7 @@ fn has_any_remote(root: &Path) -> bool {
 }
 
 fn remotes(root: &Path) -> Vec<String> {
-    Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .arg("remote")
-        .output()
+    crate::project::git(root, ["remote"])
         .ok()
         .filter(|o| o.status.success())
         .map(|o| {

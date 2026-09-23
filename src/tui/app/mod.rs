@@ -12,25 +12,37 @@
 //! `App` and its core key dispatch live here; the rest of its methods are
 //! split by concern across the submodules, each adding its own `impl App`.
 
+mod ages;
 mod background;
 mod dialogs;
+mod keymap;
+mod launch;
 mod log_keys;
 mod log_view;
+mod merged;
 mod operations;
 mod pending;
+mod remedies;
 mod tails;
 
+pub use ages::{compact_age, parse_git_relative};
 pub use background::{AppEvent, Snapshot, snapshot};
-pub use dialogs::{BranchLoadState, CreateRow, Modal, RemoveBlocker, create_rows};
+pub use dialogs::{BranchLoadState, CreateRow, Modal, RemoveBlocker, base_choices, create_rows};
+pub use keymap::{INSPECT_LEGEND, KeyHelp, LIST_KEYS, LIST_LEGEND, LOG_KEYS, OVERLAY_KEYS};
+pub use launch::{
+    Launch, LaunchEnv, LaunchRequest, is_terminal_editor, plan_editor, plan_shell, said_after,
+};
 pub use log_view::{LOG_VIEWER_CAPACITY, LineInspect, LogFilter, LogView, SearchMode, SearchState};
+pub use merged::{ALL_SOURCE, MergedTail, SOURCE_SEPARATOR, ViewTail, strip_source};
 pub use pending::{PendingAction, PendingKind, PendingOutcome};
+pub use remedies::as_tui_remedy;
 pub use tails::LogTails;
 
 use anyhow::Result;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -41,11 +53,36 @@ use crate::state::{self, Aggregate, ProcessRecord, State, WorktreeRecord};
 use crate::worktree::{self, PrInfo, Worktree};
 
 /// How long a status message stays on the header before the counts return.
+/// An error stays longer than a confirmation: it is the one that has to be
+/// read to the end, and acted on.
 const STATUS_TTL: Duration = Duration::from_secs(6);
+
+const ERROR_TTL: Duration = Duration::from_secs(15);
+
+/// A result somebody may want to read twice — a public URL — stays longer
+/// again, and `m` has it after that.
+const LASTING_TTL: Duration = Duration::from_secs(30);
+
+/// Messages `m` keeps, newest last.
+const MESSAGE_HISTORY: usize = 50;
+
+/// Ticks between repaints that nothing asked for, so the uptimes on screen
+/// keep counting. A paint is a millisecond or two; a clock that says
+/// `up 16s` for a minute is a bug report.
+const CLOCK_EVERY: u32 = 4;
 
 /// Ticks between porcelain re-discoveries. The fs watcher only sees pando's
 /// own worktrees directory, so adopted worktrees elsewhere arrive here.
 pub const SLOW_TICK_EVERY: u32 = 20;
+
+/// Ticks between re-reads of the selected worktree's git state — whether
+/// it has uncommitted changes, how far it has drifted. Somebody editing a
+/// file in another pane expects the `*` to appear while they look.
+pub const GIT_SELECTED_EVERY: u32 = SLOW_TICK_EVERY;
+
+/// Ticks between re-reads of every worktree's git state. A `git status`
+/// apiece, so far rarer than the selected one's.
+pub const GIT_ALL_EVERY: u32 = SLOW_TICK_EVERY * 6;
 
 /// Ticks between process-state refreshes. Much faster than discovery,
 /// because a dev server that just died should turn red while the developer
@@ -74,10 +111,39 @@ pub struct ServiceHealth {
     pub worktrees: BTreeMap<String, Vec<actions::ServiceStatus>>,
 }
 
+/// What a status message is, which decides its mark, its colour and how
+/// long it stays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusKind {
+    /// A plain note: `refreshing…`, `log: api`.
+    Info,
+    /// Something finished and worked.
+    Success,
+    Error,
+    /// An action in flight. The spinner is in the message itself, and the
+    /// tick rewrites it until the action is done.
+    Progress,
+}
+
+#[derive(Debug, Clone)]
 pub struct Status {
     pub message: String,
-    pub is_error: bool,
+    pub kind: StatusKind,
     pub at: Instant,
+    pub ttl: Duration,
+    /// The worktree it is about, when it is about one: the log viewer of
+    /// another worktree does not show it.
+    pub about: Option<String>,
+}
+
+impl Status {
+    pub fn is_error(&self) -> bool {
+        self.kind == StatusKind::Error
+    }
+
+    fn fresh(&self) -> bool {
+        self.at.elapsed() < self.ttl
+    }
 }
 
 pub struct App {
@@ -128,14 +194,46 @@ pub struct App {
     pub mode: Mode,
     pub modal: Option<Modal>,
     pub help_scroll: usize,
+    /// The furthest help or messages can scroll on the screen it was last
+    /// painted on. Written by the paint, read by the scroll keys.
+    pub help_scroll_max: usize,
     pub status: Option<Status>,
+    /// Every message the header has shown, newest last, for `m`: a
+    /// one-row header cuts a long error off, and a flash that has expired
+    /// is otherwise gone.
+    pub messages: VecDeque<Status>,
+    /// A worktree to put the cursor on as soon as a discovery lists it —
+    /// the one `n` just created.
+    pub select_on_arrival: Option<String>,
     pub pending: Option<PendingAction>,
     pub enriching: bool,
+    /// A quiet re-read of git state is in flight: the periodic one, which
+    /// the header does not announce the way it does the first.
+    pub git_refreshing: bool,
+    /// What each worktree's commit age was when enrichment reported it, and
+    /// when that was, so the age on screen keeps counting: git's `%cr` is a
+    /// string, and a string does not age.
+    pub commit_seen: HashMap<String, (String, i64, Instant)>,
+    /// The project has nothing to run: a start already failed because the
+    /// config names no process. Never concluded from the config alone —
+    /// `new` writes a `pando.toml` with no process in it, and the start
+    /// is what asks for one. `⏎` then says where to add one instead of
+    /// pretending to start.
+    pub nothing_to_run: bool,
+    /// A worktree whose start returned before it was ready, and the URL
+    /// the start reported: the refresh that finds it running says so.
+    pub awaiting_ready: Option<(String, Option<String>)>,
     pub should_quit: bool,
     pub tick: u32,
     pub list_area: Option<Rect>,
     pub event_tx: Sender<AppEvent>,
     pub event_rx: Option<Receiver<AppEvent>>,
+    /// How `c` and `e` leave pando: inside tmux or not, which shell, which
+    /// editor. Read once at startup.
+    pub launch_env: LaunchEnv,
+    /// A shell or editor `c` or `e` asked for, waiting for the event loop,
+    /// which owns the terminal, to run it.
+    pub launch: Option<LaunchRequest>,
     /// Set instead of touching the terminal when tests drive the app.
     #[cfg(test)]
     pub clipboard: Option<String>,
@@ -173,14 +271,23 @@ impl App {
             mode: Mode::Normal,
             modal: None,
             help_scroll: 0,
+            help_scroll_max: usize::MAX,
             status: None,
+            messages: VecDeque::new(),
+            select_on_arrival: None,
             pending: None,
             enriching: false,
+            git_refreshing: false,
+            commit_seen: HashMap::new(),
+            nothing_to_run: false,
+            awaiting_ready: None,
             should_quit: false,
             tick: 0,
             list_area: None,
             event_tx,
             event_rx: Some(event_rx),
+            launch_env: LaunchEnv::from_env(),
+            launch: None,
             #[cfg(test)]
             clipboard: None,
             #[cfg(test)]
@@ -188,7 +295,7 @@ impl App {
         };
         // One synchronous read so the first frame has rows, hydrated from the
         // disk cache so those rows already carry sha, age, and dirty state.
-        app.apply_snapshot(snapshot(&app.paths)?);
+        app.apply_snapshot(snapshot(&app.paths, None, false)?);
         app.hydrate_from_cache();
         app.spawn_enrichment(None);
         app.spawn_pr_fetch();
@@ -214,7 +321,17 @@ impl App {
                 } else if self.tick.is_multiple_of(REFRESH_EVERY) {
                     self.spawn_refresh();
                 }
-                spinning || grew || self.expire_status()
+                if self.tick.is_multiple_of(GIT_ALL_EVERY) {
+                    self.refresh_git(None);
+                } else if self.tick.is_multiple_of(GIT_SELECTED_EVERY) {
+                    let selected = self.selected_worktree().map(|w| w.name.clone());
+                    if let Some(name) = selected {
+                        self.refresh_git(Some(vec![name]));
+                    }
+                }
+                let clock =
+                    self.tick.is_multiple_of(CLOCK_EVERY) && matches!(self.view, View::List);
+                spinning || grew || self.expire_status() || clock
             }
             AppEvent::FsChange => {
                 self.spawn_discovery();
@@ -235,13 +352,21 @@ impl App {
                 }
             },
             AppEvent::Enrich(update) => {
-                if let Some(wt) = self.worktrees.iter_mut().find(|w| w.name == update.name) {
-                    worktree::apply_update(wt, update);
-                }
-                true
+                self.note_commit_age(&update.name, update.head_age.as_deref());
+                let changed = match self.worktrees.iter_mut().find(|w| w.name == update.name) {
+                    Some(wt) => {
+                        let before = (wt.dirty, wt.ahead_behind, wt.head_age.clone());
+                        worktree::apply_update(wt, update);
+                        before != (wt.dirty, wt.ahead_behind, wt.head_age.clone())
+                    }
+                    None => false,
+                };
+                // A quiet re-read that found nothing new costs no paint.
+                changed || self.enriching
             }
             AppEvent::EnrichDone => {
                 self.enriching = false;
+                self.git_refreshing = false;
                 self.save_enrich_cache();
                 true
             }
@@ -267,7 +392,10 @@ impl App {
                 match *result {
                     Ok(state) => {
                         let changed = state != self.state;
-                        self.state = state;
+                        let before = std::mem::replace(&mut self.state, state);
+                        let died = self.deaths_since(&before);
+                        self.announce_ready(&died);
+                        self.announce_deaths(died);
                         changed
                     }
                     Err(e) => {
@@ -281,12 +409,23 @@ impl App {
                 self.service_health = *health;
                 changed
             }
+            AppEvent::LaunchFailed(message) => {
+                self.set_error(message);
+                true
+            }
             AppEvent::ConfigResolved(config) => {
                 // The one place the session's config changes while it runs.
                 // Without it the modal reopens on the next `s`, with the
                 // rule's first candidate preselected rather than the answer
                 // just given.
                 self.config = *config;
+                // Only ever cleared here, never concluded: a config file
+                // with no process in it is what `new` writes, and a start
+                // is what asks for the command. `nothing_to_run` is set by
+                // a start that failed for want of one, and nothing else.
+                if !self.config.processes.is_empty() {
+                    self.nothing_to_run = false;
+                }
                 false
             }
             AppEvent::AskQuestion(boxed) => {
@@ -296,8 +435,12 @@ impl App {
                 self.question_checked = question.checked.clone();
                 // No candidates to choose between means the answer can only
                 // be typed, so the input line opens straight away. Never
-                // for a set question, which has nothing to type.
-                let custom = (question.options.is_empty() && !question.multi).then(String::new);
+                // for a set question, which has nothing to type, nor for
+                // one that may be answered "none": the input line would
+                // take the `n` that says so.
+                let custom =
+                    (question.options.is_empty() && !question.multi && !question.allow_none)
+                        .then(String::new);
                 self.modal = Some(Modal::Question {
                     question,
                     selected,
@@ -315,35 +458,59 @@ impl App {
             return;
         }
         match self.modal.take() {
-            Some(Modal::Help) => {
-                // Any key dismisses help, except scrolling it.
-                match key.code {
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        self.help_scroll += 1;
-                        self.modal = Some(Modal::Help);
+            Some(modal @ (Modal::Help | Modal::Messages)) => {
+                // Any key dismisses either, except scrolling it. The paint
+                // clamps the scroll to what there is.
+                //
+                // `g` and `G` go to the top and the bottom. Every key here is
+                // a row of `keymap::OVERLAY_KEYS`, held to it by a test. The bottom is
+                // the furthest the last paint could scroll, so a `k` after
+                // `G` moves at once rather than working off an overshoot.
+                let bottom = self.help_scroll_max;
+                let scroll = match key.code {
+                    KeyCode::Down | KeyCode::Char('j') => Some(1),
+                    KeyCode::Up | KeyCode::Char('k') => Some(-1),
+                    KeyCode::PageDown | KeyCode::Char(' ') => Some(10),
+                    KeyCode::PageUp => Some(-10),
+                    KeyCode::Char('g') | KeyCode::Home => Some(isize::MIN),
+                    KeyCode::Char('G') | KeyCode::End => Some(isize::MAX),
+                    _ => None,
+                };
+                match scroll {
+                    Some(delta) => {
+                        self.help_scroll = self
+                            .help_scroll
+                            .min(bottom)
+                            .saturating_add_signed(delta)
+                            .min(bottom);
+                        self.modal = Some(modal);
                     }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        self.help_scroll = self.help_scroll.saturating_sub(1);
-                        self.modal = Some(Modal::Help);
-                    }
-                    _ => self.help_scroll = 0,
+                    None => self.help_scroll = 0,
                 }
                 return;
             }
             Some(Modal::Remove {
                 name,
-                blocker,
                 created_by_pando,
             }) => {
-                self.handle_remove_key(key, name, blocker, created_by_pando);
+                self.handle_remove_key(key, name, created_by_pando);
                 return;
             }
             Some(Modal::Create {
                 input,
                 branches,
                 selected,
+                base,
             }) => {
-                self.handle_create_key(key, input, branches, selected);
+                self.handle_create_key(key, input, branches, selected, base);
+                return;
+            }
+            Some(Modal::StopAll { names }) => {
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Enter => self.stop_everything(),
+                    KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {}
+                    _ => self.modal = Some(Modal::StopAll { names }),
+                }
                 return;
             }
             Some(Modal::Unshare { name, url }) => {
@@ -378,7 +545,15 @@ impl App {
             self.handle_filter_key(key);
             return;
         }
+        // Every key below is a row of `keymap::LIST_KEYS`, which help
+        // prints and a test holds to this match.
         match key.code {
+            // Esc unwinds a kept filter before it quits: the filter line
+            // says `esc clears`, and quitting instead loses the session.
+            KeyCode::Esc if !self.filter.is_empty() => {
+                self.filter.clear();
+                self.refilter();
+            }
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Char('j') | KeyCode::Down => self.move_cursor(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1),
@@ -390,13 +565,24 @@ impl App {
             KeyCode::Char('n') => self.open_create(),
             KeyCode::Char('d') => self.open_remove(),
             KeyCode::Char('y') => self.copy_selected_path(),
-            KeyCode::Char('s') | KeyCode::Enter => self.start_selected(),
+            KeyCode::Char('Y') => self.copy_selected_url(),
+            KeyCode::Char('s') => self.start_selected(),
+            // The key pressed on a row without thinking: the log of what
+            // is running (or failed), a start for what is not.
+            KeyCode::Enter => self.enter_selected(),
             // The isolated start. Its own key rather than a mode, because
             // isolation is remembered on the worktree: pressing it once is
-            // what turns it on, and `s` from then on keeps it.
+            // what turns it on, and `s` from then on keeps it. `S` is the
+            // way back.
             KeyCode::Char('i') => self.start_selected_isolated(),
+            KeyCode::Char('S') => self.start_selected_shared(),
             KeyCode::Char('x') => self.stop_selected(),
             KeyCode::Char('r') => self.restart_selected(),
+            // The one process the detail pane's `▸` marks, which tab moves.
+            KeyCode::Char('p') => self.restart_selected_process(),
+            KeyCode::Char('X') => self.confirm_stop_all(),
+            KeyCode::Char('c') => self.open_shell(),
+            KeyCode::Char('e') => self.open_editor(),
             KeyCode::Char('o') => self.open_selected_url(),
             // Shift-O, because the public one is the URL you give away and
             // `o` is the one you open fifty times a day.
@@ -414,6 +600,10 @@ impl App {
             KeyCode::Char('?') => {
                 self.help_scroll = 0;
                 self.modal = Some(Modal::Help);
+            }
+            KeyCode::Char('m') => {
+                self.help_scroll = 0;
+                self.modal = Some(Modal::Messages);
             }
             _ => {}
         }
@@ -469,6 +659,20 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// Since when a worktree has been up: its *oldest* running process.
+    /// Restarting one process of several does not make the worktree new —
+    /// the rest of it has been serving all along.
+    pub fn up_since(&self, name: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.record_for(name)?
+            .processes
+            .values()
+            .filter_map(|p| match p.phase {
+                state::Phase::Running { since } => Some(since),
+                _ => None,
+            })
+            .min()
+    }
+
     /// One worktree's private services as the last probe found them.
     ///
     /// From the probe rather than from the record, because "is it up" is
@@ -480,6 +684,18 @@ impl App {
             .get(name)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// What a worktree is called on screen: its branch, which is what a
+    /// developer knows it by. The directory name is derived from it
+    /// (`feat/x` lives in `feat+x`) and only shows where the branch is
+    /// missing — a detached checkout — or where a path needs it.
+    pub fn label_of(&self, name: &str) -> String {
+        self.worktrees
+            .iter()
+            .find(|w| w.name == name)
+            .and_then(|w| w.branch.clone())
+            .unwrap_or_else(|| name.to_string())
     }
 
     pub fn selected_worktree(&self) -> Option<&Worktree> {
@@ -510,6 +726,23 @@ impl App {
             self.list_state
                 .select(Some(index.min(self.filtered_indices.len() - 1)));
         }
+        self.drop_stale_flash();
+    }
+
+    /// An error about one worktree leaves the header once the cursor is on
+    /// another: read beside a different row it reads as that row's. `m`
+    /// still has it.
+    fn drop_stale_flash(&mut self) {
+        let selected = self.selected_worktree().map(|w| w.name.clone());
+        let stale = self.status.as_ref().is_some_and(|s| {
+            s.is_error()
+                && s.about
+                    .as_deref()
+                    .is_some_and(|about| Some(about) != selected.as_deref())
+        });
+        if stale {
+            self.status = None;
+        }
     }
 
     fn refilter(&mut self) {
@@ -537,6 +770,10 @@ impl App {
             })
             .map(|(i, _)| i)
             .collect();
+        // Discovery order, the one `pando ls` prints, and never re-sorted
+        // by what runs: a list whose rows jump when one starts is a list
+        // nobody can find anything in by position. The header counts what
+        // runs.
         // Keep the cursor on the same worktree when it survives the filter.
         let row = keep_name.and_then(|name| {
             self.filtered_indices
@@ -544,38 +781,217 @@ impl App {
                 .position(|&i| self.worktrees[i].name == name)
         });
         match row {
-            Some(r) => self.list_state.select(Some(r)),
+            Some(r) => {
+                self.list_state.select(Some(r));
+                self.drop_stale_flash();
+            }
             None => self.select_index(0),
         }
     }
 
     pub fn set_status(&mut self, message: impl Into<String>) {
+        self.post(message.into(), StatusKind::Info, STATUS_TTL);
+    }
+
+    pub fn set_success(&mut self, message: impl Into<String>) {
+        self.post(message.into(), StatusKind::Success, STATUS_TTL);
+    }
+
+    /// A success worth more than a glance: a public URL somebody is about
+    /// to read out or type.
+    pub fn set_lasting(&mut self, message: impl Into<String>) {
+        self.post(message.into(), StatusKind::Success, LASTING_TTL);
+    }
+
+    /// An error, with any CLI flag it recommends said as the key that
+    /// does the same here.
+    pub fn set_error(&mut self, message: impl Into<String>) {
+        let message = as_tui_remedy(&message.into());
+        self.post(message, StatusKind::Error, ERROR_TTL);
+    }
+
+    /// An error about one worktree: the log viewer of another one does not
+    /// show it.
+    pub fn set_error_about(&mut self, name: &str, message: impl Into<String>) {
+        self.set_error(message);
+        let about = Some(name.to_string());
+        if let Some(status) = self.status.as_mut() {
+            status.about = about.clone();
+        }
+        if let Some(last) = self.messages.back_mut() {
+            last.about = about;
+        }
+    }
+
+    /// The spinner line of an action in flight. Rewritten every tick, so
+    /// it stays out of the history `m` shows.
+    pub fn set_progress(&mut self, message: impl Into<String>) {
         self.status = Some(Status {
             message: message.into(),
-            is_error: false,
+            kind: StatusKind::Progress,
             at: Instant::now(),
+            ttl: STATUS_TTL,
+            about: None,
         });
     }
 
-    pub fn set_error(&mut self, message: impl Into<String>) {
-        self.status = Some(Status {
-            message: message.into(),
-            is_error: true,
+    fn post(&mut self, message: String, kind: StatusKind, ttl: Duration) {
+        let status = Status {
+            message,
+            kind,
             at: Instant::now(),
-        });
+            ttl,
+            about: None,
+        };
+        if self.messages.len() >= MESSAGE_HISTORY {
+            self.messages.pop_front();
+        }
+        self.messages.push_back(status.clone());
+        self.status = Some(status);
     }
 
     /// The status message while it is still fresh.
     pub fn active_status(&self) -> Option<(&str, bool)> {
-        let status = self.status.as_ref()?;
-        (status.at.elapsed() < STATUS_TTL).then_some((status.message.as_str(), status.is_error))
+        self.flash().map(|s| (s.message.as_str(), s.is_error()))
+    }
+
+    /// The same, with its kind, for the paint.
+    pub fn flash(&self) -> Option<&Status> {
+        self.status.as_ref().filter(|s| s.fresh())
+    }
+
+    /// The flash as a view of one worktree shows it: nothing that is about
+    /// a different worktree. `m` still has it.
+    pub fn flash_for(&self, name: &str) -> Option<&Status> {
+        self.flash()
+            .filter(|s| s.about.as_deref().is_none_or(|about| about == name))
+    }
+
+    // ---- git state -------------------------------------------------------
+
+    /// Re-reads git state off the UI thread: every worktree, or `only`
+    /// these. Quiet — the header's `reading git` is for the first read —
+    /// and never two at once.
+    pub fn refresh_git(&mut self, only: Option<Vec<String>>) {
+        if self.enriching || self.git_refreshing {
+            return;
+        }
+        self.spawn_enrichment(only);
+        // `spawn_enrichment` announces itself; a re-read should not, so the
+        // flag it set moves to the quiet one.
+        if self.enriching {
+            self.enriching = false;
+            self.git_refreshing = true;
+        }
+    }
+
+    /// Remembers what enrichment said a commit's age was, and when.
+    fn note_commit_age(&mut self, name: &str, age: Option<&str>) {
+        match age.and_then(|text| Some((text, parse_git_relative(text)?))) {
+            Some((text, secs)) => {
+                self.commit_seen
+                    .insert(name.to_string(), (text.to_string(), secs, Instant::now()));
+            }
+            None => {
+                self.commit_seen.remove(name);
+            }
+        }
+    }
+
+    /// How old the checked-out commit is now, compact: `82 seconds ago`
+    /// reported a minute back reads `2m ago`. Git's own words when they
+    /// cannot be read.
+    pub fn commit_age(&self, wt: &Worktree) -> Option<String> {
+        let text = wt.head_age.as_deref()?;
+        let secs = match self.commit_seen.get(&wt.name) {
+            Some((seen, secs, at)) if seen == text => *secs + at.elapsed().as_secs() as i64,
+            _ => match parse_git_relative(text) {
+                Some(secs) => secs,
+                None => return Some(text.to_string()),
+            },
+        };
+        Some(format!("{} ago", compact_age(secs)))
+    }
+
+    // ---- nothing to run --------------------------------------------------
+
+    /// The one line that says so, with the file to add it to.
+    pub fn nothing_to_run_line(&self) -> String {
+        format!(
+            "nothing to run: add a [dev] command in {}",
+            self.paths.config_file().display()
+        )
+    }
+
+    /// Every process that was starting or running before this refresh and
+    /// has failed since: the worktree, the process, and why.
+    fn deaths_since(&self, before: &State) -> Vec<(String, String, String)> {
+        let mut died = Vec::new();
+        for (name, record) in &self.state.worktrees {
+            for (process, now) in &record.processes {
+                let state::Phase::Failed { reason, .. } = &now.phase else {
+                    continue;
+                };
+                let was_up = before
+                    .worktrees
+                    .get(name)
+                    .and_then(|r| r.processes.get(process))
+                    .is_some_and(|p| !matches!(p.phase, state::Phase::Failed { .. }));
+                if was_up {
+                    died.push((name.clone(), process.clone(), reason.clone()));
+                }
+            }
+        }
+        died
+    }
+
+    /// Says so for each process that died, whenever it did: after a `p`, or
+    /// an hour into a run. Otherwise the last word on screen is the
+    /// `ready` that preceded it.
+    fn announce_deaths(&mut self, died: Vec<(String, String, String)>) {
+        for (name, process, reason) in died {
+            let label = self.label_of(&name);
+            let reason = reason.trim();
+            let message = if reason.is_empty() {
+                format!("{process} of {label} exited")
+            } else {
+                format!("{process} of {label} exited — {reason}")
+            };
+            self.set_error_about(&name, message);
+        }
+    }
+
+    /// A start that returned before its worktree was ready says so once
+    /// the refresh finds it running — or stops waiting when it failed or
+    /// went away. A failure that `died` already names is left to it.
+    fn announce_ready(&mut self, died: &[(String, String, String)]) {
+        let Some((name, url)) = self.awaiting_ready.clone() else {
+            return;
+        };
+        match self.phase_of(&name) {
+            Some(Aggregate::Running { .. }) => {
+                self.awaiting_ready = None;
+                let label = self.label_of(&name);
+                match url {
+                    Some(url) => self.set_success(format!("{label} is ready — {url}")),
+                    None => self.set_success(format!("{label} is ready")),
+                }
+            }
+            Some(Aggregate::Starting { .. }) => {}
+            Some(Aggregate::Failed { .. }) => {
+                self.awaiting_ready = None;
+                if died.iter().any(|(n, ..)| *n == name) {
+                    return;
+                }
+                let label = self.label_of(&name);
+                self.set_error_about(&name, format!("{label} failed — ⏎ shows the log"));
+            }
+            None => self.awaiting_ready = None,
+        }
     }
 
     fn expire_status(&mut self) -> bool {
-        let expired = self
-            .status
-            .as_ref()
-            .is_some_and(|s| s.at.elapsed() >= STATUS_TTL);
+        let expired = self.status.as_ref().is_some_and(|s| !s.fresh());
         if expired {
             self.status = None;
         }
@@ -611,14 +1027,23 @@ impl App {
             mode: Mode::Normal,
             modal: None,
             help_scroll: 0,
+            help_scroll_max: usize::MAX,
             status: None,
+            messages: VecDeque::new(),
+            select_on_arrival: None,
             pending: None,
             enriching: false,
+            git_refreshing: false,
+            commit_seen: HashMap::new(),
+            nothing_to_run: false,
+            awaiting_ready: None,
             should_quit: false,
             tick: 0,
             list_area: None,
             event_tx,
             event_rx: Some(event_rx),
+            launch_env: LaunchEnv::default(),
+            launch: None,
             clipboard: None,
             opened: None,
         };

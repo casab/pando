@@ -646,7 +646,14 @@ fn a_docker_whose_daemon_is_down_gets_the_hint_rather_than_the_command_line() {
         .unwrap_err()
     );
     assert!(err.contains("Docker daemon is not running"), "{err}");
-    assert!(err.contains("without --isolated"), "{err}");
+    // Said as what to do, not as a flag: the TUI shows this verbatim, and
+    // the CLI rewrites it into the flag.
+    assert!(!err.contains("--"), "{err}");
+    assert!(err.contains(pando::remedy::SHARED.neutral), "{err}");
+    assert!(
+        pando::remedy::for_cli(&err).contains("without --isolated"),
+        "{err}"
+    );
     assert!(
         !err.contains("compose -p"),
         "not the command line, which is not something to act on: {err}"
@@ -987,6 +994,13 @@ fn start_shared_stops_the_private_services_and_clears_the_mode() {
             service.name
         );
     }
+    // Kept for `rm`, and not shown: a shared worktree runs no service of
+    // its own, and a `postgres  no port` row said it did.
+    assert!(
+        actions::service_statuses(&record).is_empty(),
+        "{:?}",
+        actions::service_statuses(&record)
+    );
     assert_eq!(
         shared.ports["web"], isolated.ports["web"],
         "the application keeps the port it was bookmarked on"
@@ -1300,4 +1314,555 @@ fn only_still_works_when_the_mode_stays_as_it_is() {
     let after = f.record(&name);
     assert_eq!(after.processes["api"].pid, api, "the sibling was replaced");
     assert!(after.isolated);
+}
+
+// ---- a request that can never succeed must not cost what is running --------
+
+fn start_mode(f: &Iso, name: &str, mode: actions::Mode) -> anyhow::Result<actions::StartReport> {
+    actions::start(&f.paths, &f.config, name, None, mode, &|_| {})
+}
+
+// Seen in the TUI: `i` on a running worktree with Docker off stopped the
+// dev server first and only then failed on Docker. The environment was
+// lost to a request that could never succeed, and the failed attempt left
+// a `postgres` record and port behind that the next plain start kept
+// showing.
+#[test]
+fn an_isolated_start_with_docker_down_stops_nothing_and_leaves_nothing_behind() {
+    let f = iso_with(&config_toml("sleep 30"));
+    let name = new_worktree(&f, "feat/one");
+    let shared = start_mode(&f, &name, actions::Mode::Remembered).unwrap();
+    let dev = shared.started[0].record.pid;
+    let before = f.record(&name);
+    docker::daemon_down(&f.home);
+
+    let err = format!(
+        "{:#}",
+        start_mode(&f, &name, actions::Mode::Isolated).unwrap_err()
+    );
+    assert!(err.contains("Docker daemon is not running"), "{err}");
+
+    assert!(
+        process::is_alive(dev),
+        "the running dev server was stopped by a start that then refused"
+    );
+    let after = f.record(&name);
+    assert_eq!(after.processes, before.processes, "not one record touched");
+    assert!(after.services.is_empty(), "{:?}", after.services);
+    assert_eq!(after.ports, before.ports, "no service port reserved");
+    assert!(!after.isolated);
+    assert!(
+        docker::invocations(&f.home)
+            .iter()
+            .all(|line| !line.contains(" up ")),
+        "nothing was ever brought up: {:?}",
+        docker::invocations(&f.home)
+    );
+
+    // And `stop` works with Docker still down, because there is nothing of
+    // Docker's to stop.
+    let stopped = actions::stop(&f.paths, &name, None, &|_| {}).unwrap();
+    assert_eq!(
+        stopped,
+        actions::StopOutcome::Stopped(vec!["dev".to_string()])
+    );
+}
+
+// Docker is off, and every service the compose entry includes is one a
+// recipe runs with its engine installed here. The refusal says so, with
+// the setting and the files — and switches nothing on its own, because
+// which mechanism to prefer is the developer's call about their laptop.
+#[test]
+fn docker_down_with_every_engine_installed_offers_the_native_recipes() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = iso_with(&config_toml("sleep 30"));
+    let name = new_worktree(&f, "feat/one");
+    // Stand-ins for the engines, where the machine probe looks first.
+    for binary in [
+        "postgres",
+        "initdb",
+        "pg_isready",
+        "psql",
+        "createdb",
+        "redis-server",
+        "redis-cli",
+    ] {
+        let path = f.home.join("bin").join(binary);
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    docker::daemon_down(&f.home);
+
+    let err = format!(
+        "{:#}",
+        start_mode(&f, &name, actions::Mode::Isolated).unwrap_err()
+    );
+    assert!(err.contains("Docker daemon is not running"), "{err}");
+    assert!(err.contains("postgres, redis"), "{err}");
+    assert!(err.contains("[isolation] prefer = \"native\""), "{err}");
+    assert!(
+        err.contains(&f.paths.user_config_file().display().to_string()),
+        "{err}"
+    );
+    assert!(
+        err.contains(&f.paths.config_file().display().to_string()),
+        "{err}"
+    );
+    assert!(
+        err.contains("the compose `[[services]]` entry (postgres, redis)"),
+        "{err}"
+    );
+    assert!(!err.contains("--"), "the TUI shows this verbatim: {err}");
+    // Nothing was decided for the developer.
+    assert!(!f.paths.user_config_file().exists());
+    assert!(!f.record(&name).isolated);
+}
+
+// With Docker down an isolated start cannot happen, so it asks nothing:
+// "which command brings the schema up?" answered, and only then "Docker
+// is not running", is a question wasted on an impossible request.
+#[test]
+fn an_isolated_start_with_docker_down_refuses_before_asking_anything() {
+    let f = iso_with(&config_toml("sleep 30"));
+    let name = new_worktree(&f, "feat/one");
+    docker::daemon_down(&f.home);
+
+    let err = format!(
+        "{:#}",
+        actions::resolve_for_start(
+            &f.paths,
+            &f.config,
+            &name,
+            actions::Mode::Isolated,
+            &|q: &actions::Question| panic!("asked before the Docker check: {:?}", q.prompt),
+            &|_| {},
+        )
+        .unwrap_err()
+    );
+    assert!(err.contains("Docker daemon is not running"), "{err}");
+}
+
+// The same refusal on `restart --isolated`: its stop half must not run
+// when its start half cannot succeed.
+#[test]
+fn an_isolated_restart_with_docker_down_refuses_before_it_stops_anything() {
+    let f = iso_with(&config_toml("sleep 30"));
+    let name = new_worktree(&f, "feat/one");
+    let shared = start_mode(&f, &name, actions::Mode::Remembered).unwrap();
+    let dev = shared.started[0].record.pid;
+    docker::daemon_down(&f.home);
+
+    let err = format!(
+        "{:#}",
+        actions::restart(
+            &f.paths,
+            &f.config,
+            &name,
+            None,
+            actions::Mode::Isolated,
+            &|_| {}
+        )
+        .unwrap_err()
+    );
+    assert!(err.contains("Docker daemon is not running"), "{err}");
+    assert!(
+        process::is_alive(dev),
+        "restart stopped it and then refused"
+    );
+    assert!(f.record(&name).services.is_empty());
+}
+
+// A failure that preflight cannot see — the containers came up and never
+// became ready — still leaves a worktree that is the shared one it was:
+// no port for a service, no remembered mode. The compose record survives,
+// without a port, because only it can take the volume down.
+#[test]
+fn a_switch_to_isolated_that_fails_late_is_undone() {
+    let f = iso_with(&config_toml("sleep 30").replace(
+        "env = { DATABASE_URL = \"postgres\", REDIS_URL = \"redis\" }",
+        "env = { DATABASE_URL = \"postgres\", REDIS_URL = \"redis\" }\nready_timeout_s = 1",
+    ));
+    let name = new_worktree(&f, "feat/one");
+    let shared = start_mode(&f, &name, actions::Mode::Remembered).unwrap();
+    let dev = shared.started[0].record.pid;
+    let before = f.record(&name);
+    docker::never_ready(&f.home, &f.project(&name));
+
+    start_mode(&f, &name, actions::Mode::Isolated).unwrap_err();
+    let after = f.record(&name);
+    assert!(!after.isolated);
+    // The dev server the developer had is the one they still have: it was
+    // only ever going to be replaced once the services were ready.
+    assert!(
+        process::is_alive(dev),
+        "a switch that failed took the running dev server with it"
+    );
+    // The same process, whatever phase the start's own refresh moved it to.
+    assert_eq!(after.processes["dev"].pid, before.processes["dev"].pid);
+    assert_eq!(after.ports, before.ports, "the service roles are released");
+    for service in &after.services {
+        assert_eq!(
+            service.port, None,
+            "{}: a port it does not own",
+            service.name
+        );
+        assert_eq!(
+            service.compose_project.as_deref(),
+            Some(f.project(&name).as_str()),
+            "{}: kept only because compose was asked to create it",
+            service.name
+        );
+    }
+
+    // And the next plain start is a clean shared one.
+    let report = start_mode(&f, &name, actions::Mode::Remembered).unwrap();
+    assert_eq!(
+        report.ports.keys().collect::<Vec<_>>(),
+        vec!["web"],
+        "{:?}",
+        report.ports
+    );
+    assert!(f.record(&name).services.iter().all(|s| s.port.is_none()));
+}
+
+/// `config_toml("sleep 30")` with a migration hook that fails, which is
+/// the latest a switch to isolated can fail: after the services are up
+/// and ready, before any process is replaced.
+fn failing_migration() -> String {
+    format!(
+        "{}\n[[hooks]]\nname = \"migrate\"\nafter = \"services\"\ncmd = \"false\"\n",
+        config_toml("sleep 30")
+    )
+}
+
+// The services came up and were ready; the migration against them failed.
+// The worktree goes back to exactly what it was — the same dev server, on
+// the shared services — and the private containers are stopped again
+// rather than left holding ports beside an app that does not use them.
+#[test]
+fn a_switch_to_isolated_whose_migration_fails_keeps_the_dev_server_and_stops_the_services() {
+    let f = iso_with(&failing_migration());
+    let name = new_worktree(&f, "feat/one");
+    // The hook runs on the shared start too; its failure there is not
+    // what this test is about, so the first start runs without it.
+    let plain = config::load(&f.paths).unwrap().config;
+    let mut shared_config = plain.clone();
+    shared_config.hooks.clear();
+    let shared = actions::start(
+        &f.paths,
+        &shared_config,
+        &name,
+        None,
+        actions::Mode::Remembered,
+        &|_| {},
+    )
+    .unwrap();
+    let dev = shared.started[0].record.pid;
+    let before = f.record(&name);
+
+    let err = format!(
+        "{:#}",
+        actions::start(
+            &f.paths,
+            &plain,
+            &name,
+            None,
+            actions::Mode::Isolated,
+            &|_| {}
+        )
+        .unwrap_err()
+    );
+    assert!(err.contains("migrate"), "{err}");
+    assert!(
+        docker::invocations_for(&f.home, &f.project(&name))
+            .iter()
+            .any(|line| line.contains(" up ")),
+        "the services did come up before the hook failed"
+    );
+
+    assert!(process::is_alive(dev), "the dev server was lost");
+    let after = f.record(&name);
+    assert_eq!(after.processes["dev"].pid, before.processes["dev"].pid);
+    assert!(!after.isolated);
+    assert_eq!(after.ports, before.ports, "the service roles are released");
+    assert!(
+        docker::services_up(&f.home, &f.project(&name)).is_empty(),
+        "the private services were left running: {:?}",
+        docker::services_up(&f.home, &f.project(&name))
+    );
+    assert!(
+        after.services.iter().all(|s| s.pid.is_none()),
+        "a log pump outlived the failed switch: {:?}",
+        after.services
+    );
+}
+
+// `restart --isolated` is the same switch, and its stop half must not run
+// ahead of it: the processes are replaced by the start, once the services
+// are ready, or not at all.
+#[test]
+fn a_restart_into_isolated_that_fails_late_keeps_the_dev_server() {
+    let f = iso_with(&config_toml("sleep 30").replace(
+        "env = { DATABASE_URL = \"postgres\", REDIS_URL = \"redis\" }",
+        "env = { DATABASE_URL = \"postgres\", REDIS_URL = \"redis\" }\nready_timeout_s = 1",
+    ));
+    let name = new_worktree(&f, "feat/one");
+    let shared = start_mode(&f, &name, actions::Mode::Remembered).unwrap();
+    let dev = shared.started[0].record.pid;
+    docker::never_ready(&f.home, &f.project(&name));
+
+    actions::restart(
+        &f.paths,
+        &f.config,
+        &name,
+        None,
+        actions::Mode::Isolated,
+        &|_| {},
+    )
+    .unwrap_err();
+    assert!(process::is_alive(dev), "restart stopped it and then failed");
+    assert!(!f.record(&name).isolated);
+}
+
+// And when the switch works, every process is replaced — the old one is
+// gone, not left running on the shared database beside the new one.
+#[test]
+fn a_switch_to_isolated_replaces_the_running_processes_once_the_services_are_ready() {
+    let f = iso_with(&config_toml("sleep 30"));
+    let name = new_worktree(&f, "feat/one");
+    let shared = start_mode(&f, &name, actions::Mode::Remembered).unwrap();
+    let old = shared.started[0].record.pid;
+
+    let said = std::sync::Mutex::new(Vec::<String>::new());
+    let report = actions::start(
+        &f.paths,
+        &f.config,
+        &name,
+        None,
+        actions::Mode::Isolated,
+        &|m| said.lock().unwrap().push(m.to_string()),
+    )
+    .unwrap();
+    let said = said.into_inner().unwrap();
+    assert_eq!(report.started.len(), 1, "{report:?}");
+    let new = report.started[0].record.pid;
+    assert_ne!(new, old);
+    for _ in 0..50 {
+        if !process::is_alive(old) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!process::is_alive(old), "the shared-mode process survived");
+    assert!(process::is_alive(new));
+    assert!(f.record(&name).isolated);
+    // In that order: the services first, the processes after them.
+    let services_at = said
+        .iter()
+        .position(|m| m.starts_with("starting services"))
+        .unwrap_or_else(|| panic!("{said:?}"));
+    let restart_at = said
+        .iter()
+        .position(|m| m.contains("processes restart"))
+        .unwrap_or_else(|| panic!("{said:?}"));
+    assert!(services_at < restart_at, "{said:?}");
+}
+
+// A record whose containers were never brought up names no compose
+// project, so `stop` and `rm` never ask Docker about it.
+#[test]
+fn a_service_record_is_named_after_its_compose_project_only_once_compose_is_asked() {
+    let f = iso_with(&config_toml("sleep 30"));
+    let name = new_worktree(&f, "feat/one");
+    // Past preflight, failing before `up`: an install that fails.
+    std::fs::write(
+        f.paths.config_file(),
+        config_toml("sleep 30").replace("install = \"true\"", "install = \"false\""),
+    )
+    .unwrap();
+    let config = config::load(&f.paths).unwrap().config;
+    actions::start(
+        &f.paths,
+        &config,
+        &name,
+        None,
+        actions::Mode::Isolated,
+        &|_| {},
+    )
+    .unwrap_err();
+    let record = f.record(&name);
+    assert!(record.services.is_empty(), "{:?}", record.services);
+    assert!(!record.ports.contains_key("postgres"));
+    assert!(
+        docker::invocations(&f.home)
+            .iter()
+            .all(|line| !line.contains(" up ")),
+        "{:?}",
+        docker::invocations(&f.home)
+    );
+}
+
+// `rm` is what takes a worktree's volumes with it, and its record is the
+// only thing that names them. With Docker down it used to go ahead, drop
+// the record, and leave the volumes nothing could find again. Refused
+// now, before anything is stopped, unless forced.
+#[test]
+fn rm_with_docker_down_refuses_unless_forced() {
+    let f = iso_with(&config_toml("sleep 30"));
+    let name = new_worktree(&f, "feat/one");
+    let report = start_isolated(&f, &name);
+    let dev = report.started[0].record.pid;
+    docker::daemon_down(&f.home);
+
+    let err = format!(
+        "{:#}",
+        actions::rm(&f.paths, &name, false, false, &|_| {}).unwrap_err()
+    );
+    assert!(err.contains("Docker is not running"), "{err}");
+    assert!(
+        err.contains("feat/one"),
+        "the branch, as ls shows it: {err}"
+    );
+    assert!(
+        err.contains(&format!("docker compose -p {} down -v", f.project(&name))),
+        "{err}"
+    );
+    assert!(!err.contains("--"), "the TUI shows this verbatim: {err}");
+    assert!(
+        pando::remedy::for_cli(&err).contains("--force"),
+        "{}",
+        pando::remedy::for_cli(&err)
+    );
+    assert!(process::is_alive(dev), "nothing was stopped by a refusal");
+    let store = state::load(&f.paths.state_file()).unwrap();
+    assert!(store.worktrees.contains_key(&name), "the record is kept");
+
+    // Forced, it goes ahead and says how to remove the volumes later.
+    let said = std::sync::Mutex::new(Vec::<String>::new());
+    actions::rm(&f.paths, &name, false, true, &|m| {
+        said.lock().unwrap().push(m.to_string())
+    })
+    .unwrap();
+    assert!(
+        said.into_inner()
+            .unwrap()
+            .iter()
+            .any(|m| m.contains("down -v")),
+    );
+    let store = state::load(&f.paths.state_file()).unwrap();
+    assert!(!store.worktrees.contains_key(&name));
+}
+
+// Docker off, with an isolated worktree running: going back to shared,
+// stopping and removing all work, because a daemon that is down has no
+// containers running. `rm` says what it could not remove.
+#[test]
+fn stop_shared_and_rm_all_work_with_docker_down() {
+    if skip_without_python() {
+        return;
+    }
+    let f = iso();
+    let name = new_worktree(&f, "feat/one");
+    start_isolated(&f, &name);
+    docker::daemon_down(&f.home);
+
+    let said = std::sync::Mutex::new(Vec::<String>::new());
+    let note = |m: &str| said.lock().unwrap().push(m.to_string());
+    actions::start(
+        &f.paths,
+        &f.config,
+        &name,
+        None,
+        actions::Mode::Shared,
+        &note,
+    )
+    .unwrap();
+    assert!(!f.record(&name).isolated);
+    assert!(
+        said.lock()
+            .unwrap()
+            .iter()
+            .any(|m| m.contains("Docker is not running")),
+        "{:?}",
+        said.lock().unwrap()
+    );
+
+    actions::stop(&f.paths, &name, None, &note).unwrap();
+
+    said.lock().unwrap().clear();
+    actions::rm(&f.paths, &name, false, true, &note).unwrap();
+    let said = said.into_inner().unwrap();
+    assert!(
+        said.iter()
+            .any(|m| m.contains("down -v") && m.contains(&f.project(&name))),
+        "the command that removes the volumes later is written down: {said:?}"
+    );
+    let store = state::load(&f.paths.state_file()).unwrap();
+    assert!(!store.worktrees.contains_key(&name));
+}
+
+/// Waits until something accepts connections on `port`.
+fn wait_bound(port: u16) {
+    for _ in 0..200 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("nothing bound {port}");
+}
+
+// A live shared → isolated switch grows the role set, so the window is
+// re-derived while the dev server kept serving through the switch still
+// holds its port. Read as "somebody took it", every port moved a base up:
+// the URL changed on every switch, the CLI said the ports were taken, and
+// an active share's upstream died.
+#[test]
+fn a_switch_to_isolated_keeps_the_url_of_the_server_it_replaces() {
+    if skip_without_python() {
+        return;
+    }
+    let f = iso_with(&config_toml(&listener_on_port_env()));
+    let name = new_worktree(&f, "feat/one");
+    let shared = start_mode(&f, &name, actions::Mode::Remembered).unwrap();
+    let web = shared.ports["web"];
+    wait_bound(web);
+
+    let isolated = start_isolated(&f, &name);
+    assert_eq!(isolated.ports["web"], web, "{:?}", isolated.ports);
+    assert!(!isolated.reassigned, "nothing took the port");
+    assert_eq!(f.record(&name).ports["web"], web);
+}
+
+// And a switch that fails late, after the new window was written down,
+// leaves the record naming the port the kept dev server is really on.
+#[test]
+fn a_failed_switch_keeps_the_recorded_ports_equal_to_the_live_ones() {
+    if skip_without_python() {
+        return;
+    }
+    let text = config_toml(&listener_on_port_env())
+        + "\n[[hooks]]\nname = \"migrate\"\nafter = \"services\"\ncmd = \"false\"\n";
+    let f = iso_with(&text);
+    let name = new_worktree(&f, "feat/one");
+    let mut shared_config = f.config.clone();
+    shared_config.hooks.clear();
+    let shared = actions::start(
+        &f.paths,
+        &shared_config,
+        &name,
+        None,
+        actions::Mode::Remembered,
+        &|_| {},
+    )
+    .unwrap();
+    let web = shared.ports["web"];
+    let dev = shared.started[0].record.pid;
+    wait_bound(web);
+
+    start_mode(&f, &name, actions::Mode::Isolated).unwrap_err();
+    assert!(process::is_alive(dev));
+    let after = f.record(&name);
+    assert!(!after.isolated);
+    assert_eq!(after.ports.get("web"), Some(&web), "{:?}", after.ports);
 }

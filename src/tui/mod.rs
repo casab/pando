@@ -2,6 +2,7 @@
 //! that feed it. Like `cli`, a thin wrapper — behaviour lives in `actions`.
 
 pub mod app;
+mod handoff;
 mod modal;
 mod render;
 
@@ -10,6 +11,7 @@ use notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebouncedEvent, Debouncer, RecommendedCache, new_debouncer};
 use ratatui::crossterm::event;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
 use std::thread;
 use std::time::Duration;
@@ -17,9 +19,15 @@ use std::time::Duration;
 use crate::config::Config;
 use crate::paths::PandoPaths;
 use app::AppEvent;
+use handoff::InputGate;
 
 const TICK_INTERVAL: Duration = Duration::from_millis(250);
 const FS_DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// How long the input thread waits for a key before it checks whether a
+/// suspended program wants the terminal. Short enough that a suspend
+/// starts at once.
+const INPUT_POLL: Duration = Duration::from_millis(50);
 
 pub fn run(paths: PandoPaths, config: Config) -> Result<()> {
     // Before anything creates a directory under it: the watcher and the
@@ -44,7 +52,8 @@ fn main_loop(
         .take()
         .expect("event_rx is present until the loop takes it");
 
-    spawn_input_thread(app.event_tx.clone());
+    let gate = Arc::new(InputGate::default());
+    spawn_input_thread(app.event_tx.clone(), Arc::clone(&gate));
     spawn_tick_thread(app.event_tx.clone());
     // The watcher is an optimisation for pando's own worktrees; the slow
     // tick's porcelain refresh is the source of truth, and it sees adopted
@@ -66,6 +75,21 @@ fn main_loop(
                 Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
             }
         }
+        // A shell or editor `c` or `e` asked for. Run here because this is
+        // where the terminal is.
+        if let Some(request) = app.launch.take() {
+            match handoff::carry_out(request, terminal, &gate, &app.event_tx) {
+                Ok(Some(done)) => app.set_success(done),
+                Ok(None) => {}
+                Err(e) => app.set_error(e),
+            }
+            // Whatever changed while it ran — a commit, a server stopped
+            // from the shell, a file edited — shows at once rather than on
+            // the slow tick.
+            app.spawn_discovery();
+            app.refresh_git(None);
+            redraw = true;
+        }
         if redraw {
             terminal.draw(|f| render::render(f, app))?;
         }
@@ -75,9 +99,17 @@ fn main_loop(
     }
 }
 
-fn spawn_input_thread(tx: Sender<AppEvent>) {
+fn spawn_input_thread(tx: Sender<AppEvent>, gate: Arc<InputGate>) {
     thread::spawn(move || {
         loop {
+            // Polled rather than a bare `read`, so the thread comes back
+            // here often enough to step aside for a suspended program.
+            gate.wait_if_paused();
+            match event::poll(INPUT_POLL) {
+                Ok(false) => continue,
+                Ok(true) => {}
+                Err(_) => return,
+            }
             match event::read() {
                 Ok(ev) => {
                     if tx.send(AppEvent::Input(ev)).is_err() {

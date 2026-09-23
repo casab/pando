@@ -7,24 +7,106 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::theme::{blue, green, orange, red, surface, text, text_dim, text_muted};
-use crate::tui::app::{App, Mode};
+use crate::state::Aggregate;
+use crate::theme::{blue, green, orange, red, surface, text, text_dim, text_muted, yellow};
+use crate::tui::app::{App, Mode, Status, StatusKind};
 
-use super::{truncate, truncate_line};
+use super::{truncate, truncate_line, wrap_text};
+
+/// The most rows an error may take from the header before it is cut, with
+/// `m` offered for the rest.
+const MAX_ERROR_ROWS: usize = 3;
+
+/// On a screen shorter than this an error gets two rows, not three: at
+/// 80×24 a third row is a row of the list.
+const SHORT_SCREEN: u16 = 30;
+
+const SHORT_SCREEN_ERROR_ROWS: usize = 2;
+
+/// How many rows an error may wrap to on a screen this tall.
+pub(super) fn max_error_rows(height: u16) -> usize {
+    if height < SHORT_SCREEN {
+        SHORT_SCREEN_ERROR_ROWS
+    } else {
+        MAX_ERROR_ROWS
+    }
+}
+
+/// The mark a status message carries, and its colour: an error must never
+/// read like a success at a glance.
+pub(super) fn status_mark(status: &Status) -> (&'static str, ratatui::style::Color) {
+    match status.kind {
+        StatusKind::Success => ("✓ ", green()),
+        StatusKind::Error => ("✗ ", red()),
+        StatusKind::Info => ("› ", blue()),
+        // The spinner is already the message's first character.
+        StatusKind::Progress => ("", yellow()),
+    }
+}
+
+/// The header's rows as the flash wraps them: one for anything but an
+/// error that does not fit, up to `max_rows` for that one.
+pub(super) fn flash_rows(status: &Status, width: usize, max_rows: usize) -> Vec<String> {
+    let budget = width.saturating_sub(4).max(1);
+    if !status.is_error() || status.message.chars().count() <= budget {
+        return vec![truncate(&status.message, budget)];
+    }
+    let max_rows = max_rows.max(1);
+    let mut rows = wrap_text(&status.message, budget);
+    if rows.len() > max_rows {
+        rows.truncate(max_rows);
+        // The pointer to `m` is what survives: the row gives way to it,
+        // not the other way round.
+        const MORE: &str = " … m shows it all";
+        let last = rows.pop().unwrap_or_default();
+        let room = budget.saturating_sub(MORE.chars().count());
+        let kept: String = last.chars().take(room).collect();
+        rows.push(truncate(
+            &format!("{} {}", kept.trim_end(), MORE.trim_start()),
+            budget,
+        ));
+    }
+    rows
+}
+
+/// How many rows the header needs: one, unless an error has to wrap. Never
+/// more than a third of the screen.
+pub(super) fn header_height(app: &App, width: u16, height: u16) -> u16 {
+    let max_rows = max_error_rows(height).min((height / 3).max(1) as usize);
+    let rows = app
+        .flash()
+        .map(|status| flash_rows(status, width as usize, max_rows).len())
+        .unwrap_or(1) as u16;
+    rows.max(1)
+}
 
 pub(super) fn render_header(f: &mut Frame, area: Rect, app: &App) {
-    // A just-finished action takes over the whole bar for its few seconds;
-    // the footer keeps its key hints throughout.
-    if let Some((message, is_error)) = app.active_status() {
-        let color = if is_error { red() } else { green() };
-        let line = Line::from(vec![
-            Span::styled(" ● ", Style::new().fg(color)),
-            Span::styled(
-                truncate(message, area.width.saturating_sub(4) as usize),
-                Style::new().fg(text()),
-            ),
-        ]);
-        f.render_widget(Paragraph::new(line).style(Style::new().bg(surface())), area);
+    // A message takes over the whole bar for its few seconds; the footer
+    // keeps its key hints throughout.
+    if let Some(status) = app.flash() {
+        let (mark, color) = status_mark(status);
+        let message_style = if status.is_error() {
+            Style::new().fg(red())
+        } else {
+            Style::new().fg(text())
+        };
+        // The area is already as tall as `header_height` allowed.
+        let lines: Vec<Line> = flash_rows(status, area.width as usize, area.height as usize)
+            .into_iter()
+            .enumerate()
+            .map(|(i, row)| {
+                let lead = if i == 0 { mark } else { "  " };
+                Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(lead, Style::new().fg(color).add_modifier(Modifier::BOLD)),
+                    Span::styled(row, message_style),
+                ])
+            })
+            .collect();
+        f.render_widget(
+            Paragraph::new(lines).style(Style::new().bg(surface())),
+            area,
+        );
         return;
     }
 
@@ -35,6 +117,14 @@ pub(super) fn render_header(f: &mut Frame, area: Rect, app: &App) {
         .and_then(|m| m.branch.clone())
         .unwrap_or_else(|| "(detached)".to_string());
     let count = app.worktrees.len();
+    let (mut running, mut failed) = (0, 0);
+    for wt in &app.worktrees {
+        match app.phase_of(&wt.name) {
+            Some(Aggregate::Failed { .. }) => failed += 1,
+            Some(_) => running += 1,
+            None => {}
+        }
+    }
     let mut spans = vec![
         Span::styled(
             " pando ",
@@ -49,19 +139,39 @@ pub(super) fn render_header(f: &mut Frame, area: Rect, app: &App) {
             Style::new().fg(text_dim()),
         ),
     ];
+    if running > 0 {
+        spans.push(Span::styled(
+            format!(", {running} running"),
+            Style::new().fg(green()),
+        ));
+    }
+    if failed > 0 {
+        spans.push(Span::styled(
+            format!(", {failed} failed"),
+            Style::new().fg(red()),
+        ));
+    }
     // One chip per shared service, so a dev server that will not connect
-    // says whose fault it is before the developer reads a stack trace.
-    // Shed first: on a narrow pane the project and the branch matter more.
-    for service in &app.service_health.shared {
-        spans.push(Span::styled(" · ", Style::new().fg(text_muted())));
-        spans.push(Span::styled(
-            "●",
-            Style::new().fg(if service.up { green() } else { red() }),
-        ));
-        spans.push(Span::styled(
-            format!(" {}", service.name),
-            Style::new().fg(text_dim()),
-        ));
+    // says whose fault it is before the developer reads a stack trace —
+    // under a label that says what the dots are: the project's own
+    // services, probed at their default ports. Shed first: on a narrow
+    // pane the project and the branch matter more.
+    if !app.service_health.shared.is_empty() {
+        spans.push(Span::styled(" · shared:", Style::new().fg(text_muted())));
+        for service in &app.service_health.shared {
+            spans.push(Span::styled(
+                format!(" {} ", service.name),
+                Style::new().fg(text_dim()),
+            ));
+            // Said in a word as well: a dot that differs only in colour
+            // says nothing to somebody who cannot tell the two apart.
+            let (word, color) = if service.up {
+                ("● up", green())
+            } else {
+                ("● down", red())
+            };
+            spans.push(Span::styled(word, Style::new().fg(color)));
+        }
     }
     if app.enriching {
         spans.push(Span::styled(
@@ -76,36 +186,120 @@ pub(super) fn render_header(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-/// Key hints, most valuable first. The essential ones are never dropped.
-const HINTS: [(&str, &str, bool); 14] = [
+/// Key hints for a selected worktree that runs, most valuable first. The
+/// essential ones are never dropped.
+pub(super) const RUNNING_HINTS: [(&str, &str, bool); 13] = [
     ("j/k", "move", true),
-    ("s", "start", true),
+    ("⏎", "logs", true),
     ("x", "stop", true),
     ("r", "restart", false),
-    ("l", "logs", true),
-    ("tab", "log", false),
     ("o", "open", false),
     ("t", "share", false),
-    ("O", "public", false),
+    ("tab", "log", false),
+    ("c", "shell", false),
+    ("e", "edit", false),
+    ("n", "new", false),
+    ("/", "filter", false),
+    ("?", "help", true),
+    ("q", "quit", true),
+];
+
+/// And for one that is stopped: what starts it, in each mode.
+pub(super) const STOPPED_HINTS: [(&str, &str, bool); 11] = [
+    ("j/k", "move", true),
+    ("⏎", "start", true),
+    ("i", "isolated", false),
+    ("l", "logs", false),
+    ("c", "shell", false),
+    ("e", "edit", false),
     ("n", "new", false),
     ("d", "remove", false),
     ("/", "filter", false),
-    ("?", "help", false),
+    ("?", "help", true),
+    ("q", "quit", true),
+];
+
+/// For a stopped worktree of a project that has nothing to run: no start
+/// key is offered, because none would start anything.
+pub(super) const NOTHING_TO_RUN_HINTS: [(&str, &str, bool); 9] = [
+    ("j/k", "move", true),
+    ("l", "logs", false),
+    ("c", "shell", false),
+    ("e", "edit", false),
+    ("n", "new", false),
+    ("d", "remove", false),
+    ("/", "filter", false),
+    ("?", "help", true),
+    ("q", "quit", true),
+];
+
+/// With nothing to select, only what gets something onto the list.
+pub(super) const EMPTY_HINTS: [(&str, &str, bool); 3] = [
+    ("n", "new worktree", true),
+    ("?", "help", true),
     ("q", "quit", true),
 ];
 
 pub(super) fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     let width = area.width as usize;
+    let selected = app.selected_worktree().map(|w| w.name.clone());
+    // A worker blocked on the question dialog owns the keyboard: the
+    // selected row's keys would only be answered once it closes, so the
+    // footer says what is being waited for instead of offering them.
+    if app.awaiting_answer() {
+        let label = app
+            .pending
+            .as_ref()
+            .map(|p| p.label.clone())
+            .unwrap_or_default();
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" ? {label} is waiting for your answer"),
+                Style::new().fg(yellow()).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" · answer in the dialog", Style::new().fg(text_muted())),
+        ]);
+        f.render_widget(
+            Paragraph::new(truncate_line(line, width)).style(Style::new().bg(surface())),
+            area,
+        );
+        return;
+    }
     let line = match app.mode {
         Mode::Filter => hint_line(
             &[
                 ("↑↓", "move", true),
-                ("⏎", "accept", true),
+                ("⏎", "keep", true),
                 ("esc", "clear", true),
             ],
             width,
         ),
-        Mode::Normal => hint_line(&HINTS, width),
+        Mode::Normal => match selected {
+            None => hint_line(&EMPTY_HINTS, width),
+            // A shared worktree's public URL is what gets handed out, so
+            // its keys come right after the one that shared it.
+            Some(name) if app.public_url_of(&name).is_some() => {
+                let mut hints = RUNNING_HINTS.to_vec();
+                let at = hints
+                    .iter()
+                    .position(|(key, ..)| *key == "t")
+                    .map_or(0, |i| i + 1);
+                hints.splice(at..at, [("O", "public", false), ("Y", "copy URL", false)]);
+                hint_line(&hints, width)
+            }
+            Some(name) if app.phase_of(&name).is_some() => hint_line(&RUNNING_HINTS, width),
+            // Said first, in the footer's own row: what `⏎` would have
+            // done, and the pane beside it says where to fix it.
+            Some(_) if app.nothing_to_run => {
+                let mut line = hint_line(&NOTHING_TO_RUN_HINTS, width.saturating_sub(17));
+                line.spans.insert(
+                    0,
+                    Span::styled(" nothing to run ·", Style::new().fg(yellow())),
+                );
+                truncate_line(line, width)
+            }
+            Some(_) => hint_line(&STOPPED_HINTS, width),
+        },
     };
     f.render_widget(Paragraph::new(line).style(Style::new().bg(surface())), area);
 }

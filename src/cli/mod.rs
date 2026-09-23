@@ -10,12 +10,16 @@ use clap::{Parser, Subcommand};
 use std::io::Write;
 
 mod answers;
+mod completion;
 mod doctor;
 mod logs;
 mod ls;
+mod names;
+mod open;
 mod prompt;
 mod signals;
 mod status;
+mod wait;
 
 use self::answers::init_asker;
 use self::answers::read_answers;
@@ -26,7 +30,7 @@ use self::prompt::asker;
 pub use answers::{Answers, UsageError, render_needs_answer, slot_name};
 pub use doctor::{adopt_project, doctor};
 pub use logs::logs;
-pub use ls::{Col, keep_columns, ls_json, ls_text, ls_text_at};
+pub use ls::{Col, LsView, keep_columns, ls_json, ls_text, ls_text_at, ls_text_with};
 pub use signals::signals_json;
 pub use status::{status_json, status_text, status_text_at};
 
@@ -38,20 +42,34 @@ pub const JSON_VERSION: u32 = 2;
 const SHORT_SHA_LEN: usize = 7;
 
 /// Documented on `--help` because an agent driving pando needs to know that
-/// 3 is "ask the human", not "it broke".
-const EXIT_CODE_HELP: &str = "Exit codes:\n  \
-     0  ok\n  \
-     1  error\n  \
-     2  usage\n  \
-     3  needs an answer — the question is printed on stderr; --yes accepts \
-     pando's own recommendation";
+/// 3 is "ask the human", not "it broke". The examples come first: they are
+/// what a person opening `--help` for the first time is looking for.
+const MAIN_AFTER_HELP: &str = "\
+Examples:
+  pando                            open the TUI for the repository you are in
+  pando new feat/login             a worktree and branch, forked from the default base
+  pando start feat/login           start it; on a terminal, wait until it answers
+  pando open feat/login            its URL in the browser
+  pando logs -f                    follow the log of the worktree you are in
+  pando ls                         every worktree: status, URL, ports, git
+
+A worktree is named by its branch (feat/login) or its directory (feat+login).
+Inside a worktree, start, stop, restart, logs, open, share and unshare need
+no name: they act on the worktree you are in.
+
+Exit codes:
+  0  ok
+  1  error
+  2  usage
+  3  needs an answer — the question is printed on stderr; --yes accepts \
+pando's own recommendation";
 
 #[derive(Parser, Debug)]
 #[command(
     name = "pando",
     version,
     about = "One repo. Every branch alive.",
-    after_help = EXIT_CODE_HELP
+    after_help = MAIN_AFTER_HELP
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -61,73 +79,156 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Create a worktree and branch from the default base.
+    #[command(after_help = "\
+Examples:
+  pando new feat/login               a new branch, from origin's default branch
+  pando new feat/login --base dev    forked from dev instead
+  pando new fix/123                  an existing branch, local or on origin")]
+    #[command(display_order = 1)]
     New {
         /// Branch name. Slashes become plus signs in the directory name.
         branch: String,
         /// Accept pando's own recommendation for anything it would ask.
         #[arg(long)]
         yes: bool,
-        /// Base to fork a new branch from. A bare name prefers the
-        /// remote-tracking ref, so a stale local branch is never the fork
-        /// point.
+        /// Base to fork a new branch from.
+        ///
+        /// A bare name prefers the remote-tracking ref, so a stale local
+        /// branch is never the fork point.
         #[arg(long)]
         base: Option<String>,
     },
-    /// List worktrees with their git state.
+    /// List worktrees: what each one runs, its URL and ports, and its git
+    /// state.
+    ///
+    /// Fitted to the terminal: on a narrow one the least useful columns go
+    /// first, and the name, status and URL stay. MODE appears once a
+    /// worktree runs isolated services, PUBLIC once one is shared, and
+    /// BRANCH only for a worktree not named for its branch.
+    #[command(after_help = "\
+Examples:
+  pando ls           the table
+  pando ls -l        with each worktree's commit and path
+  pando ls --json    the documented machine-readable shape")]
+    #[command(display_order = 8)]
     Ls {
+        /// The documented machine-readable shape, for scripts and agents.
         #[arg(long)]
         json: bool,
+        /// Add each worktree's commit and its path.
+        #[arg(short, long, conflicts_with = "json")]
+        long: bool,
+        /// Worktree names, one per line, for shell completion.
+        ///
+        /// Not a documented shape.
+        #[arg(long, hide = true, conflicts_with_all = ["json", "long"])]
+        names: bool,
     },
     /// Remove a worktree and wipe its pando data. The branch is kept.
+    #[command(display_order = 12)]
     Rm {
+        /// The worktree, by branch or directory name.
+        #[arg(value_name = WORKTREE, value_hint = clap::ValueHint::Other)]
         name: String,
         /// Confirm removing a worktree pando did not create.
         #[arg(long)]
         yes: bool,
-        /// Let git discard modified or untracked files.
+        /// Remove it whatever is in the way.
+        ///
+        /// Lets git discard modified or untracked files, and goes ahead
+        /// with Docker not running — its services' data volumes then stay
+        /// behind, and the command that removes them is printed.
         #[arg(long)]
         force: bool,
     },
     /// Print a worktree's absolute path.
-    Path { name: String },
-    /// Start a worktree's processes.
-    Start {
+    #[command(after_help = "\
+Example:
+  cd \"$(pando path feat/login)\"")]
+    #[command(display_order = 11)]
+    Path {
+        /// The worktree, by branch or directory name.
+        #[arg(value_name = WORKTREE, value_hint = clap::ValueHint::Other)]
         name: String,
+    },
+    /// Start a worktree's processes.
+    ///
+    /// On a terminal it waits until every process is ready, and says why
+    /// when one is not. Anywhere else — a script, an agent, a pipe — it
+    /// returns as soon as everything is spawned unless `--wait` is given.
+    #[command(after_help = "\
+Examples:
+  pando start feat/login               start everything; on a terminal, wait until it is ready
+  pando start feat/login --no-wait     return as soon as everything is spawned
+  pando start feat/login --wait        wait, even from a script
+  pando start feat/login --isolated    with private copies of the services
+  pando start --only api               one process of the worktree you are in")]
+    #[command(display_order = 2)]
+    Start {
+        /// The worktree, by branch or directory name.
+        ///
+        /// The one you are in when left out.
+        #[arg(value_name = WORKTREE, value_hint = clap::ValueHint::Other)]
+        name: Option<String>,
         /// Accept pando's own recommendation for anything it would ask.
+        ///
         /// Without it, an unanswerable question exits 3.
         #[arg(long)]
         yes: bool,
-        /// One process by name, instead of every one config declares. The
-        /// rest are left exactly as they are, on the ports they have.
+        /// One process by name, instead of every one config declares.
+        ///
+        /// The rest are left exactly as they are, on the ports they have.
         #[arg(long)]
         only: Option<String>,
-        /// Run private copies of the project's services for this worktree,
-        /// on ports of its own. Remembered: a later plain `start` keeps
+        /// Run private copies of the project's services for this worktree.
+        ///
+        /// On ports of its own. Remembered: a later plain `start` keeps
         /// them.
         #[arg(long)]
         isolated: bool,
-        /// The way back: stop this worktree's private services and use the
-        /// project's shared ones. Its processes restart, so they see them.
+        /// Stop this worktree's private services and use the shared ones.
+        ///
+        /// The way back from `--isolated`. Its processes restart, so they
+        /// see them.
         #[arg(long, conflicts_with = "isolated")]
         shared: bool,
+        /// Wait until every process is ready; exit 1 if one fails.
+        ///
+        /// Narrates each process as it gets there, and exits 1 with the
+        /// reason if one fails. The default when stderr is a terminal.
+        /// A process with a port is ready once the port answers. One with
+        /// no port has nothing to check, so it is watched instead: ready if
+        /// it is still up 5s after it started, or after its own
+        /// `ready.timeout_s` when it declares one, capped at 10s.
+        #[arg(long)]
+        wait: bool,
+        /// Return as soon as everything is spawned.
+        ///
+        /// The default when stderr is not a terminal, so scripts and agents
+        /// see no change.
+        #[arg(long, conflicts_with = "wait")]
+        no_wait: bool,
     },
     /// Answer every question pando has about this project, in one pass.
     ///
     /// The batch form of the questions `new` and `start` ask just in time,
     /// through the same paths: nothing is started, nothing is written into
     /// the repository, and a second run asks nothing.
+    #[command(display_order = 13)]
     Init {
         /// Accept pando's own recommendation for anything it would ask.
+        ///
         /// Without it, an unanswerable question exits 3.
         #[arg(long)]
         yes: bool,
-        /// A JSON file of answers — `-` reads stdin. One key per question,
-        /// named as `pando signals` names it, whose value is the option's
-        /// own text, a command of your own, a list for a question whose
-        /// answer is a set, or null for "none of them". Every answer goes
-        /// through the same checks a person's does and is written down as
-        /// a program's.
-        #[arg(long, value_name = "PATH")]
+        /// A JSON file of answers — `-` reads stdin.
+        ///
+        /// One key per question, named as `pando signals` names it, whose
+        /// value is the option's own text, a command of your own, a list
+        /// for a question whose answer is a set, or null for "none of
+        /// them". Every answer goes through the same checks a person's
+        /// does and is written down as a program's.
+        #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
         answers: Option<String>,
         /// Print the config this would write, and write nothing.
         #[arg(long)]
@@ -137,38 +238,70 @@ pub enum Command {
     ///
     /// Read-only, and identical on two runs: the input an agent reads
     /// before deciding anything.
+    #[command(display_order = 15)]
     Signals,
     /// What pando found, from where, and what is wrong.
     ///
-    /// Read-only. Exits 0 when nothing found will break a command and 1
-    /// when something will — and everything it exits 1 for is printed
-    /// above, with what to do about it.
+    /// Read-only. Problems and notes come first, each with what to do
+    /// about it, then the facts section by section. Exits 0 when nothing
+    /// found will break a command and 1 when something will.
+    #[command(display_order = 14)]
     Doctor {
-        /// Move a project folder whose repository has moved under this
-        /// repository's current id, keeping its config, its state and its
-        /// worktrees. The one thing doctor does rather than reports, and
-        /// it asks first.
+        /// Move a moved repository's project folder under its current id.
+        ///
+        /// Keeps its config, its state and its worktrees. The one thing
+        /// doctor does rather than reports, and it asks first.
         #[arg(long, value_name = "OLD-ID")]
         adopt: Option<String>,
         /// Do not ask before adopting.
         #[arg(long, requires = "adopt")]
         yes: bool,
-        /// The whole report as one JSON object, versioned like the other
-        /// machine-readable shapes. The exit code is the same either way.
+        /// The whole report as one JSON object.
+        ///
+        /// Versioned like the other machine-readable shapes. The exit code
+        /// is the same either way.
         #[arg(long, conflicts_with = "adopt")]
         json: bool,
     },
-    /// Stop a worktree's processes, or every worktree's when given no name.
+    /// Stop a worktree's processes.
+    ///
+    /// With no name: the worktree you are in, or every worktree when you
+    /// are in none of them. `--all` stops every one from anywhere.
+    #[command(after_help = "\
+Examples:
+  pando stop feat/login               one worktree
+  pando stop feat/login --only api    one process; the others keep running
+  pando stop                          the worktree you are in
+  pando stop --all                    every worktree of this repository")]
+    #[command(display_order = 3)]
     Stop {
+        /// The worktree, by branch or directory name.
+        #[arg(
+            conflicts_with = "all",
+            value_name = WORKTREE,
+            value_hint = clap::ValueHint::Other
+        )]
         name: Option<String>,
         /// One process by name. The others keep running.
-        #[arg(long, requires = "name")]
+        #[arg(long, conflicts_with = "all")]
         only: Option<String>,
+        /// Every worktree, even from inside one.
+        #[arg(long)]
+        all: bool,
     },
     /// Stop and start again, keeping the ports.
+    ///
+    /// Waits for readiness on a terminal, like `start`, and not elsewhere
+    /// unless `--wait` is given.
+    #[command(display_order = 4)]
     Restart {
-        name: String,
+        /// The worktree, by branch or directory name.
+        ///
+        /// The one you are in when left out.
+        #[arg(value_name = WORKTREE, value_hint = clap::ValueHint::Other)]
+        name: Option<String>,
         /// Accept pando's own recommendation for anything it would ask.
+        ///
         /// Without it, an unanswerable question exits 3.
         #[arg(long)]
         yes: bool,
@@ -178,30 +311,102 @@ pub enum Command {
         /// Run private copies of the project's services for this worktree.
         #[arg(long)]
         isolated: bool,
+        /// Wait until every process is ready again; exit 1 if one fails.
+        ///
+        /// The default when stderr is a terminal. Readiness is judged as
+        /// `start --wait` judges it: a port that answers, or, for a process
+        /// with no port, still being up 5s later (its own `ready.timeout_s`,
+        /// capped at 10s, when it declares one).
+        #[arg(long)]
+        wait: bool,
+        /// Return as soon as everything is spawned. The default when
+        /// stderr is not a terminal.
+        #[arg(long, conflicts_with = "wait")]
+        no_wait: bool,
     },
     /// What is running, and on which ports.
+    #[command(after_help = "\
+Examples:
+  pando status                       every worktree, one line each and its processes
+  pando status feat/login --json     the documented machine-readable shape
+  eval \"$(pando status --env feat/login)\"   its environment, in this shell")]
+    #[command(display_order = 7)]
     Status {
+        /// The worktree, by branch or directory name.
+        ///
+        /// Every one when left out.
+        #[arg(value_name = WORKTREE, value_hint = clap::ValueHint::Other)]
         name: Option<String>,
         #[arg(long)]
         json: bool,
-        /// `export KEY=value` lines for this worktree's resolved
-        /// environment, so a shell can `eval "$(pando status --env <name>)"`
-        /// and run the project's own commands by hand.
+        /// `export KEY=value` lines for this worktree's environment.
+        ///
+        /// Its resolved environment, so a shell can
+        /// `eval "$(pando status --env <name>)"` and run the project's own
+        /// commands by hand.
         #[arg(long, requires = "name", conflicts_with = "json")]
         env: bool,
     },
     /// Publish a running worktree at a public URL.
-    Share { name: String },
+    #[command(display_order = 9)]
+    Share {
+        /// The worktree, by branch or directory name.
+        ///
+        /// The one you are in when left out.
+        #[arg(value_name = WORKTREE, value_hint = clap::ValueHint::Other)]
+        name: Option<String>,
+    },
     /// Take a worktree's public URL down.
-    Unshare { name: String },
+    #[command(display_order = 10)]
+    Unshare {
+        /// The worktree, by branch or directory name.
+        ///
+        /// The one you are in when left out.
+        #[arg(value_name = WORKTREE, value_hint = clap::ValueHint::Other)]
+        name: Option<String>,
+    },
+    /// Open a running worktree's URL in the browser.
+    ///
+    /// The TUI's `o` key, from a shell. The URL is printed too, so it
+    /// works over SSH where there is no browser to open.
+    #[command(after_help = "\
+Examples:
+  pando open feat/login           http://localhost:<port>
+  pando open feat/login --public  the URL `pando share` published")]
+    #[command(display_order = 5)]
+    Open {
+        /// The worktree, by branch or directory name.
+        ///
+        /// The one you are in when left out.
+        #[arg(value_name = WORKTREE, value_hint = clap::ValueHint::Other)]
+        name: Option<String>,
+        /// The public URL `share` published, instead of the local one.
+        #[arg(long)]
+        public: bool,
+    },
     /// Print a worktree's log.
+    #[command(after_help = "\
+Examples:
+  pando logs feat/login                 the last 50 lines of its dev log
+  pando logs feat/login --source api    one process's, a service's or a hook's log
+  pando logs -f                         follow the worktree you are in")]
+    #[command(display_order = 6)]
     Logs {
-        name: String,
-        /// Which log: `dev` by default, or a hook's name.
-        #[arg(long, default_value = "dev")]
-        source: String,
+        /// The worktree, by branch or directory name.
+        ///
+        /// The one you are in when left out.
+        #[arg(value_name = WORKTREE, value_hint = clap::ValueHint::Other)]
+        name: Option<String>,
+        /// Which log: a process, a service or a hook, by name.
+        ///
+        /// `dev` by default; with no `dev`, the only process, or every
+        /// process's log merged, each line prefixed with its source.
+        #[arg(short, long)]
+        source: Option<String>,
         /// How many lines from the end.
-        #[arg(long, default_value_t = DEFAULT_TAIL)]
+        ///
+        /// Of each log, when several are merged.
+        #[arg(short = 'n', long, default_value_t = DEFAULT_TAIL)]
         tail: usize,
         /// Keep printing as the log grows. Ends on Ctrl-C.
         #[arg(short = 'f', long)]
@@ -210,8 +415,21 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// The share proxy. Spawned by `share`, never run by hand: it reads its
-    /// cookie from the environment and would have nothing to inject.
+    /// Print a shell completion script.
+    #[command(after_help = "\
+Examples:
+  pando completions zsh > ~/.zfunc/_pando      then `fpath+=~/.zfunc` in .zshrc
+  pando completions bash > ~/.local/share/bash-completion/completions/pando
+  pando completions fish > ~/.config/fish/completions/pando.fish")]
+    #[command(display_order = 16)]
+    Completions {
+        /// The shell to complete for.
+        shell: clap_complete::Shell,
+    },
+    /// The share proxy, spawned by `share`.
+    ///
+    /// Never run by hand: it reads its cookie from the environment and
+    /// would have nothing to inject.
     #[command(name = share_proxy::SUBCOMMAND, hide = true)]
     ShareProxy {
         #[arg(long)]
@@ -253,33 +471,48 @@ impl Command {
 /// Lines `logs` prints when nothing else is asked for.
 const DEFAULT_TAIL: usize = 50;
 
+/// The value name every worktree argument carries: what completion looks
+/// for to offer worktree names there.
+const WORKTREE: &str = completion::WORKTREE;
+
+/// The log `logs` reads when no `--source` is given.
+const DEFAULT_SOURCE: &str = "dev";
+
 pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result<()> {
     let mut out = std::io::stdout();
     match command {
         Command::New { branch, base, yes } => {
             let config = &actions::resolve_for_new(paths, config, &asker(yes), &notice)?;
-            let name = actions::new(paths, config, &branch, base.as_deref(), &notice)?;
+            let name = actions::new(paths, config, &branch, base.as_deref(), &notice)
+                .map_err(|e| with_a_way_past(paths, e))?;
             // The canonical path, the one the state record and `pando path`
             // carry: the raw one differs on macOS (/var against /private/var)
             // and reads as a second, different location.
             let created = config.worktrees_dir(paths).join(&name);
             let created = std::fs::canonicalize(&created).unwrap_or(created);
             writeln!(out, "created {name} at {}", created.display())?;
+            // The next step, for a person; a script has what it needs above.
+            hint(&format!("`pando start {branch}` starts it"));
             Ok(())
         }
-        Command::Ls { json } => {
+        Command::Ls { json, long, names } => {
+            if names {
+                return completion::names(paths, &mut out);
+            }
             if json {
                 ls_json(paths, &mut out)
             } else {
-                ls_text(paths, &mut out)
+                ls_text(paths, &mut out, long)
             }
         }
         Command::Rm { name, yes, force } => {
+            let name = names::resolve(paths, &name)?;
             actions::rm(paths, &name, yes, force, &notice)?;
             writeln!(out, "removed {name}")?;
             Ok(())
         }
         Command::Path { name } => {
+            let name = names::resolve(paths, &name)?;
             writeln!(out, "{}", actions::path(paths, &name)?.display())?;
             Ok(())
         }
@@ -289,18 +522,40 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             only,
             isolated,
             shared,
+            wait,
+            no_wait,
         } => {
+            // Before any question: a misspelt name is worth knowing about
+            // before being asked which dev command to run.
+            let typed = name;
+            let name = names::target(paths, typed.as_deref(), "start")?;
+            let named = names::Named::of(paths, typed.as_deref(), &name);
             let mode = actions::Mode::of(isolated, shared);
-            let config = &actions::resolve_process(paths, config, mode, &asker(yes), &notice)?;
-            let report = actions::start(paths, config, &name, only.as_deref(), mode, &notice)?;
+            let config =
+                &actions::resolve_for_start(paths, config, &name, mode, &asker(yes), &notice)?;
+            let report = actions::start(paths, config, &name, only.as_deref(), mode, &notice)
+                .map_err(|e| with_a_way_past(paths, named.reword(e)))?;
             if report.reassigned {
-                eprintln!("pando: the ports {name} had were taken; it moved to new ones");
+                notice(&format!(
+                    "the ports {} had were taken; it moved to new ones",
+                    named.shown
+                ));
+            }
+            let wait = waits(wait, no_wait);
+            if wait {
+                wait::wait_ready(paths, &named, only.as_deref(), &notice)?;
             }
             let url = url_suffix(report.url.as_deref());
             if report.started_nothing() {
                 writeln!(out, "{name} is already running{url}")?;
             } else {
                 writeln!(out, "started {name}{url}")?;
+                if !wait {
+                    hint(&format!(
+                        "`pando status {}` shows when it is ready",
+                        named.typed
+                    ));
+                }
             }
             Ok(())
         }
@@ -356,38 +611,55 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             Some(old_id) => adopt_project(paths, &old_id, yes, &mut out),
             None => doctor(paths, json, &mut out),
         },
-        Command::Stop { name, only } => match name {
-            Some(name) => {
-                match actions::stop(paths, &name, only.as_deref(), &notice)? {
-                    actions::StopOutcome::Stopped(processes) => {
-                        // Empty when the worktree had only its services
-                        // left up, which is a real thing to stop and a
-                        // silly thing to narrate as "stopped ".
-                        if !processes.is_empty() {
-                            notice(&format!("stopped {}", processes.join(", ")));
-                        }
-                        writeln!(out, "stopped {name}")?;
+        Command::Stop { name, only, all } => {
+            let name = match (name, all) {
+                (_, true) => None,
+                (Some(name), false) => Some(names::resolve(paths, &name)?),
+                // No name: the worktree the shell is in, said out loud
+                // because `stop` alone used to mean every one.
+                (None, false) => {
+                    let cwd = std::env::current_dir()?;
+                    let here = names::containing(paths, &cwd)?;
+                    if let Some(here) = &here {
+                        notice(&format!(
+                            "stopping {}, the worktree you are in — `pando stop --all` \
+                             stops every one",
+                            names::shown(paths, here)
+                        ));
                     }
-                    actions::StopOutcome::NotRunning => writeln!(out, "{name} was not running")?,
+                    here
                 }
-                Ok(())
-            }
-            None => {
-                let stopped = actions::stop_all(paths, &notice)?;
-                if stopped.is_empty() {
-                    writeln!(out, "nothing was running")?;
-                } else {
-                    writeln!(out, "stopped {}", stopped.join(", "))?;
+            };
+            match name {
+                Some(name) => stop_one(paths, &name, only.as_deref(), &mut out),
+                None if only.is_some() => Err(UsageError(
+                    "--only needs a worktree: `pando stop <name> --only <process>`, or run it \
+                     from inside one"
+                        .to_string(),
+                )
+                .into()),
+                None => {
+                    let stopped = actions::stop_all(paths, &notice)?;
+                    if stopped.is_empty() {
+                        writeln!(out, "nothing was running")?;
+                    } else {
+                        writeln!(out, "stopped {}", stopped.join(", "))?;
+                    }
+                    Ok(())
                 }
-                Ok(())
             }
-        },
+        }
         Command::Restart {
             name,
             yes,
             only,
             isolated,
+            wait,
+            no_wait,
         } => {
+            let typed = name;
+            let name = names::target(paths, typed.as_deref(), "restart")?;
+            let named = names::Named::of(paths, typed.as_deref(), &name);
             // Resolved exactly as `start` resolves it: a project whose
             // process question has never been answered gets the question,
             // not a refusal.
@@ -395,12 +667,21 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             // `start --shared` already is, since changing the mode
             // restarts the processes anyway.
             let mode = actions::Mode::of(isolated, false);
-            let config = &actions::resolve_process(paths, config, mode, &asker(yes), &notice)?;
-            let report = actions::restart(paths, config, &name, only.as_deref(), mode, &notice)?;
+            let config =
+                &actions::resolve_for_start(paths, config, &name, mode, &asker(yes), &notice)?;
+            let report = actions::restart(paths, config, &name, only.as_deref(), mode, &notice)
+                .map_err(|e| with_a_way_past(paths, named.reword(e)))?;
+            if waits(wait, no_wait) {
+                wait::wait_ready(paths, &named, only.as_deref(), &notice)?;
+            }
             writeln!(out, "restarted {name}{}", url_suffix(report.url.as_deref()))?;
             Ok(())
         }
         Command::Status { name, json, env } => {
+            let name = name
+                .as_deref()
+                .map(|name| names::resolve(paths, name))
+                .transpose()?;
             if env {
                 let name = name.as_deref().expect("--env requires a name");
                 let resolved = actions::resolved_env(paths, config, name)?;
@@ -413,10 +694,13 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
                 status_text(paths, name.as_deref(), &mut out)
             }
         }
-        Command::Share { name } => {
-            let outcome = actions::share(paths, config, &name, &notice)?;
+        Command::Share { name: typed } => {
+            let name = names::target(paths, typed.as_deref(), "share")?;
+            let named = names::Named::of(paths, typed.as_deref(), &name);
+            let outcome =
+                actions::share(paths, config, &name, &notice).map_err(|e| named.reword(e))?;
             if outcome.already {
-                notice(&format!("{name} was already shared"));
+                notice(&format!("{} was already shared", named.shown));
             }
             if outcome.pre_authed {
                 notice("a proxy in front of it is injecting the Cookie header from auth_cmd");
@@ -425,10 +709,25 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             writeln!(out, "{}", outcome.public_url)?;
             Ok(())
         }
-        Command::Unshare { name } => {
-            actions::unshare(paths, &name)?;
+        Command::Unshare { name: typed } => {
+            let name = names::target(paths, typed.as_deref(), "unshare")?;
+            let named = names::Named::of(paths, typed.as_deref(), &name);
+            actions::unshare(paths, &name).map_err(|e| named.reword(e))?;
             writeln!(out, "unshared {name}")?;
             Ok(())
+        }
+        Command::Open {
+            name: typed,
+            public,
+        } => {
+            let name = names::target(paths, typed.as_deref(), "open")?;
+            let named = names::Named::of(paths, typed.as_deref(), &name);
+            let url = open::url_to_open(paths, config, &named, public)?;
+            // Printed first, so the URL is there to copy even when there is
+            // no browser to hand it to.
+            writeln!(out, "{url}")?;
+            out.flush()?;
+            open::launch(&url)
         }
         Command::Logs {
             name,
@@ -436,11 +735,60 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             tail,
             follow,
             json,
-        } => logs(paths, &name, &source, tail, follow, json, &mut out, &notice),
+        } => {
+            let name = names::target(paths, name.as_deref(), "logs")?;
+            let source = match source {
+                Some(source) => source,
+                None => match logs::default_sources(paths, &name, DEFAULT_SOURCE) {
+                    logs::Sources::One(source) => source,
+                    logs::Sources::Merged(sources) => {
+                        return logs::logs_merged(
+                            paths, &name, &sources, tail, follow, json, &mut out, &notice,
+                        );
+                    }
+                },
+            };
+            logs(paths, &name, &source, tail, follow, json, &mut out, &notice)
+        }
+        Command::Completions { shell } => completions(shell, &mut out),
         // Never reached: `main` runs the proxy before it goes looking for a
         // repository, because the proxy has none.
         Command::ShareProxy { listen, upstream } => run_share_proxy(listen, upstream),
     }
+}
+
+fn stop_one<W: Write>(
+    paths: &PandoPaths,
+    name: &str,
+    only: Option<&str>,
+    out: &mut W,
+) -> Result<()> {
+    match actions::stop(paths, name, only, &notice)? {
+        actions::StopOutcome::Stopped(processes) => {
+            // Empty when the worktree had only its services left up, which
+            // is a real thing to stop and a silly thing to narrate as
+            // "stopped ".
+            if !processes.is_empty() {
+                notice(&format!("stopped {}", processes.join(", ")));
+            }
+            writeln!(out, "stopped {name}")?;
+        }
+        actions::StopOutcome::NotRunning => writeln!(out, "{name} was not running")?,
+    }
+    Ok(())
+}
+
+/// The completion script for `shell`, generated from the same clap
+/// definition the binary parses, so it can never offer a flag that is not
+/// there — and, where the shell allows it, completing a worktree's name
+/// from the worktrees there are rather than from file names.
+pub fn completions<W: Write>(shell: clap_complete::Shell, out: &mut W) -> Result<()> {
+    use clap::CommandFactory;
+    let mut script = Vec::new();
+    clap_complete::generate(shell, &mut Cli::command(), "pando", &mut script);
+    let script = String::from_utf8(script).context("a completion script that is not UTF-8")?;
+    out.write_all(completion::with_worktree_names(shell, &script).as_bytes())?;
+    Ok(())
 }
 
 /// Runs the share proxy, reading its cookie from the environment.
@@ -459,10 +807,67 @@ pub fn run_share_proxy(listen: u16, upstream: u16) -> Result<()> {
     share_proxy::run_in_process(listen, upstream, &cookie)
 }
 
+/// What `actions` says when a config names no process to start.
+const NO_PROCESSES: &str = "no processes configured";
+
+/// What a failed install step's error carries, from `actions`.
+const INSTALL_FAILED: &str = "the install hook failed";
+
+/// An error from `new`, `start` or `restart`, with the way past it when
+/// `actions` could only say what went wrong: the file to edit, by its
+/// absolute path, and what to write there.
+///
+/// Anything else — a question, a usage error — is passed through as it
+/// is, so the exit code main reads off its type survives.
+fn with_a_way_past(paths: &PandoPaths, e: anyhow::Error) -> anyhow::Error {
+    let text = format!("{e:#}");
+    if text.starts_with(NO_PROCESSES) {
+        return anyhow::anyhow!(
+            "nothing to run: this project configures no process — {}",
+            crate::doctor::nothing_to_run_fix(&paths.config_file())
+        );
+    }
+    if text.contains(INSTALL_FAILED) {
+        return anyhow::anyhow!(
+            "{text} — `project.install` in {} is the command; fix it there, or set it to \"\" \
+             to skip installing",
+            crate::config::install_origin(paths).display()
+        );
+    }
+    e
+}
+
 /// Everything pando narrates goes to stderr, so a command's stdout stays
 /// exactly what a script asked for.
 fn notice(message: &str) {
     eprintln!("pando: {message}");
+}
+
+/// A next step, for a person at a terminal: printed only when stderr is
+/// one, so a script or an agent reading the output never sees it and a
+/// log of a CI run is not padded with advice.
+fn hint(message: &str) {
+    use std::io::IsTerminal;
+    if std::io::stderr().is_terminal() {
+        let style = crate::term::Style::for_stderr();
+        eprintln!(
+            "{}",
+            style.paint(&format!("pando: {message}"), crate::term::Paint::Faint)
+        );
+    }
+}
+
+/// Whether `start` or `restart` waits for readiness: when asked to, and by
+/// default when a person is watching — stderr a terminal. Anything else
+/// keeps the old contract, returning once everything is spawned, because
+/// scripts and agents were written against it.
+fn waits(wait: bool, no_wait: bool) -> bool {
+    use std::io::IsTerminal;
+    waits_on(wait, no_wait, std::io::stderr().is_terminal())
+}
+
+fn waits_on(wait: bool, no_wait: bool, terminal: bool) -> bool {
+    wait || (!no_wait && terminal)
 }
 
 fn url_suffix(url: Option<&str>) -> String {

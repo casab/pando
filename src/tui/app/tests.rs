@@ -155,6 +155,8 @@ fn a_question() -> actions::Question {
         multi: false,
         checked: Vec::new(),
         details: Vec::new(),
+        answer_file: None,
+        snippet: String::new(),
     }
 }
 
@@ -188,6 +190,8 @@ fn a_services_question() -> actions::Question {
         multi: true,
         checked: vec![1, 2],
         details: Vec::new(),
+        answer_file: None,
+        snippet: String::new(),
     }
 }
 
@@ -378,6 +382,22 @@ fn enter_leaves_filter_mode_but_keeps_the_filter() {
     assert_eq!(app.filtered_indices.len(), 1);
 }
 
+// The kept filter's line says `esc clears`; quitting instead would lose
+// the session to a key pressed to undo a search.
+#[test]
+fn escape_clears_a_kept_filter_before_it_quits() {
+    let mut app = test_app(&["feat+one", "fix+two"]);
+    press(&mut app, KeyCode::Char('/'));
+    type_str(&mut app, "fix");
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Esc);
+    assert!(!app.should_quit);
+    assert!(app.filter.is_empty());
+    assert_eq!(app.filtered_indices.len(), 2);
+    press(&mut app, KeyCode::Esc);
+    assert!(app.should_quit, "and then esc quits as before");
+}
+
 #[test]
 fn q_quits_and_ctrl_c_quits_from_anywhere() {
     let mut app = test_app(&["a"]);
@@ -424,22 +444,41 @@ fn the_create_modal_opens_accepts_typing_and_closes_on_escape() {
 }
 
 // Validation happens in the modal, before any worker starts, so a
-// colliding name is refused with what was typed still on screen.
+// colliding name is not an error: somebody typing the name of a branch
+// that already has a worktree wants that worktree, and gets it.
 #[test]
-fn the_create_modal_refuses_a_name_that_already_exists() {
-    let mut app = test_app(&["feat+one"]);
+fn the_create_modal_goes_to_a_worktree_that_already_exists() {
+    let mut app = test_app(&["feat+one", "feat+two"]);
+    assert_eq!(app.selected_worktree().unwrap().name, "feat+one");
     press(&mut app, KeyCode::Char('n'));
-    type_str(&mut app, "feat/one");
+    type_str(&mut app, "feat/two");
     press(&mut app, KeyCode::Enter);
 
-    assert!(
-        matches!(app.modal, Some(Modal::Create { .. })),
-        "modal stays open"
-    );
+    assert!(app.modal.is_none(), "the modal closes");
     assert!(app.pending.is_none(), "no worker should have started");
+    assert_eq!(app.selected_worktree().unwrap().name, "feat+two");
     let (message, is_error) = app.active_status().unwrap();
-    assert!(is_error);
-    assert!(message.contains("already exists"), "{message}");
+    assert!(!is_error);
+    assert!(message.contains("already has a worktree"), "{message}");
+}
+
+// And one `n` did create takes the cursor as soon as it is listed.
+#[test]
+fn a_created_worktree_is_selected_when_it_arrives() {
+    let mut app = test_app(&["feat+one"]);
+    app.select_on_arrival = Some("feat+new".to_string());
+    let listed = vec![wt("feat+one"), wt("feat+new")];
+    app.apply_snapshot(Snapshot {
+        main: wt("acme-shop"),
+        worktrees: listed,
+        created_by_pando: BTreeMap::new(),
+        state: State::new(),
+        warning: None,
+        notices: Vec::new(),
+        default_base: None,
+    });
+    assert_eq!(app.selected_worktree().unwrap().name, "feat+new");
+    assert!(app.select_on_arrival.is_none(), "and it is done with");
 }
 
 #[test]
@@ -474,9 +513,12 @@ fn the_remove_modal_names_its_target_and_closes_on_escape() {
     let mut app = test_app(&["feat+one"]);
     press(&mut app, KeyCode::Char('d'));
     match &app.modal {
-        Some(Modal::Remove { name, blocker, .. }) => {
+        Some(Modal::Remove { name, .. }) => {
             assert_eq!(name, "feat+one");
-            assert!(blocker.is_none(), "a clean pando worktree has no blocker");
+            assert!(
+                app.remove_blockers(name).is_empty(),
+                "a clean, stopped pando worktree has nothing to warn about"
+            );
         }
         other => panic!("expected the remove modal, got {other:?}"),
     }
@@ -492,34 +534,107 @@ fn the_remove_modal_states_why_a_removal_would_be_refused() {
     app.worktrees[1].dirty = Some(true);
     app.created_by_pando.insert("adopted+one".into(), false);
 
-    press(&mut app, KeyCode::Char('d'));
-    let blocker = match &app.modal {
-        Some(Modal::Remove { blocker, .. }) => blocker.clone().unwrap(),
-        other => panic!("expected the remove modal, got {other:?}"),
-    };
-    assert!(blocker.is_fatal(), "a locked worktree can never be removed");
-    assert!(blocker.line().contains("benchmarking"));
+    let locked = app.remove_blockers("locked+one");
+    assert!(
+        locked[0].is_fatal(),
+        "a locked worktree can never be removed"
+    );
+    assert!(locked[0].line().contains("benchmarking"));
 
-    press(&mut app, KeyCode::Esc);
-    press(&mut app, KeyCode::Char('j'));
-    press(&mut app, KeyCode::Char('d'));
-    match &app.modal {
-        Some(Modal::Remove { blocker, .. }) => {
-            assert_eq!(blocker, &Some(RemoveBlocker::Dirty));
-            assert!(!blocker.as_ref().unwrap().is_fatal());
-        }
-        other => panic!("expected the remove modal, got {other:?}"),
-    }
+    assert_eq!(app.remove_blockers("dirty+one"), vec![RemoveBlocker::Dirty]);
+    assert!(!RemoveBlocker::Dirty.is_fatal());
+    assert_eq!(
+        app.remove_blockers("adopted+one"),
+        vec![RemoveBlocker::NotOurs]
+    );
+}
 
-    press(&mut app, KeyCode::Esc);
-    press(&mut app, KeyCode::Char('j'));
+// All of it at once: a dirty, running worktree pando did not create says
+// all three, not just the first one found.
+#[test]
+fn the_remove_modal_states_dirty_running_and_adopted_together() {
+    let mut app = test_app(&["feat+tui"]);
+    app.worktrees[0].dirty = Some(true);
+    with_process(&mut app, "feat+tui", running_phase());
+    app.created_by_pando.insert("feat+tui".into(), false);
+    assert_eq!(
+        app.remove_blockers("feat+tui"),
+        vec![
+            RemoveBlocker::Dirty,
+            RemoveBlocker::Running,
+            RemoveBlocker::NotOurs
+        ]
+    );
+    // Git not read yet is said as such, not as clean.
+    app.worktrees[0].dirty = None;
+    assert!(
+        app.remove_blockers("feat+tui")
+            .contains(&RemoveBlocker::DirtyUnknown)
+    );
+}
+
+// `y` on a worktree known to be dirty would only be refused by git: the
+// dialog stays and names the key that works.
+#[test]
+fn y_on_a_dirty_worktree_keeps_the_dialog_and_points_at_f() {
+    let mut app = test_app(&["feat+tui"]);
+    app.worktrees[0].dirty = Some(true);
     press(&mut app, KeyCode::Char('d'));
-    match &app.modal {
-        Some(Modal::Remove { blocker, .. }) => {
-            assert_eq!(blocker, &Some(RemoveBlocker::NotOurs))
-        }
-        other => panic!("expected the remove modal, got {other:?}"),
-    }
+    press(&mut app, KeyCode::Char('y'));
+    assert!(app.pending.is_none(), "nothing git would refuse is started");
+    assert!(
+        matches!(app.modal, Some(Modal::Remove { .. })),
+        "the dialog stays open"
+    );
+    let (message, is_error) = app.active_status().unwrap();
+    assert!(is_error);
+    assert!(message.contains("F removes it anyway"), "{message}");
+}
+
+#[test]
+fn capital_f_in_the_remove_dialog_removes_with_force() {
+    let mut app = test_app(&["feat+tui"]);
+    app.worktrees[0].dirty = Some(true);
+    press(&mut app, KeyCode::Char('d'));
+    press(&mut app, KeyCode::Char('F'));
+    assert!(app.modal.is_none(), "the dialog closes");
+    let pending = app.pending.as_ref().expect("a removal is under way");
+    assert_eq!(pending.kind, PendingKind::Remove);
+    assert_eq!(pending.name, "feat+tui");
+}
+
+// A clean worktree removes on `y`, without force.
+#[test]
+fn y_on_a_clean_worktree_removes_it() {
+    let mut app = test_app(&["feat+one"]);
+    press(&mut app, KeyCode::Char('d'));
+    press(&mut app, KeyCode::Char('y'));
+    assert!(app.modal.is_none());
+    assert_eq!(
+        app.pending.as_ref().map(|p| p.kind),
+        Some(PendingKind::Remove)
+    );
+}
+
+// Git's refusal of a dirty removal names the key, not the CLI flag.
+#[test]
+fn a_dirty_removal_that_git_refused_says_press_f_not_force() {
+    let mut app = test_app(&["feat+tui"]);
+    app.spawn_pending("feat+tui".into(), PendingKind::Remove, || {
+        Err(
+            "feat+tui contains modified or untracked files (M package.json) — commit or \
+             remove them, or pass --force to let git discard them"
+                .to_string(),
+        )
+    });
+    wait_for_pending(&mut app);
+    let (message, is_error) = app.active_status().unwrap();
+    assert!(is_error);
+    assert!(!message.contains("--force"), "{message}");
+    assert!(
+        message.contains("press F in the remove dialog to remove it anyway"),
+        "{message}"
+    );
 }
 
 // Confirming a locked worktree must not start a worker that git would
@@ -757,6 +872,7 @@ fn the_process_keys_each_start_their_own_work() {
         (KeyCode::Char('r'), PendingKind::Restart),
     ] {
         let mut app = test_app(&["feat+one"]);
+        with_process(&mut app, "feat+one", running_phase());
         press(&mut app, key);
         let pending = app.pending.as_ref().expect("the key started something");
         assert_eq!(pending.kind, kind, "{key:?}");
@@ -1143,7 +1259,7 @@ fn an_empty_typed_answer_is_refused_rather_than_sent() {
     press(&mut app, KeyCode::Enter);
     assert!(rx.try_recv().is_err());
     assert!(app.modal.is_some());
-    assert!(app.active_status().unwrap().0.contains("type a command"));
+    assert!(app.active_status().unwrap().0.contains("type the command"));
 }
 
 // ---- several processes -----------------------------------------------
@@ -1388,6 +1504,7 @@ fn tabs_run_processes_first_then_hooks_then_whatever_is_left() {
         cmd: "true".to_string(),
         cwd: None,
         fallback: None,
+        on: None,
     });
     for source in ["tunnel", "migrate", "install", "web", "api"] {
         write_log(&app, "feat+one", source, &["x"]);
@@ -1395,8 +1512,8 @@ fn tabs_run_processes_first_then_hooks_then_whatever_is_left() {
     open_viewer(&mut app, 80, 20);
     assert_eq!(
         viewer(&app).available,
-        vec!["api", "web", "install", "migrate", "tunnel"],
-        "processes, then hooks, then the rest"
+        vec!["all", "api", "web", "install", "migrate", "tunnel"],
+        "the merged processes, then each process, then hooks, then the rest"
     );
 }
 
@@ -1498,7 +1615,7 @@ fn a_log_that_appears_after_the_viewer_opened_is_picked_up_on_the_next_tick() {
 }
 
 #[test]
-fn the_cursor_moves_by_a_count_and_never_leaves_the_log() {
+fn the_cursor_moves_and_never_leaves_the_log() {
     let (_dir, mut app) = app_with_logs(&["feat+one"]);
     let lines: Vec<String> = (0..20).map(|i| format!("line {i}")).collect();
     write_log(&app, "feat+one", "dev", &lines);
@@ -1509,21 +1626,18 @@ fn the_cursor_moves_by_a_count_and_never_leaves_the_log() {
     assert!(!viewer(&app).follow, "k breaks follow");
     assert_eq!(viewer(&app).cursor, 18);
 
-    type_str(&mut app, "5");
-    press(&mut app, KeyCode::Char('k'));
-    assert_eq!(viewer(&app).cursor, 13, "a count repeats the motion");
-    assert_eq!(viewer(&app).count_prefix, None, "and is consumed");
-
-    type_str(&mut app, "99");
-    press(&mut app, KeyCode::Char('j'));
+    for _ in 0..30 {
+        press(&mut app, KeyCode::Char('j'));
+    }
     assert_eq!(viewer(&app).cursor, 19, "clamped at the last line");
-    type_str(&mut app, "99");
-    press(&mut app, KeyCode::Char('k'));
+    for _ in 0..30 {
+        press(&mut app, KeyCode::Char('k'));
+    }
     assert_eq!(viewer(&app).cursor, 0, "and at the first");
 }
 
 #[test]
-fn g_goes_to_the_top_capital_g_follows_and_a_count_jumps_to_a_line() {
+fn g_goes_to_the_top_and_capital_g_follows() {
     let (_dir, mut app) = app_with_logs(&["feat+one"]);
     let lines: Vec<String> = (0..20).map(|i| format!("line {i}")).collect();
     write_log(&app, "feat+one", "dev", &lines);
@@ -1533,12 +1647,27 @@ fn g_goes_to_the_top_capital_g_follows_and_a_count_jumps_to_a_line() {
     assert_eq!(viewer(&app).cursor, 0);
     assert!(!viewer(&app).follow);
 
-    type_str(&mut app, "7");
     press(&mut app, KeyCode::Char('G'));
-    assert_eq!(viewer(&app).cursor, 6, "<n>G is one-based");
+    assert!(viewer(&app).follow, "G returns to the live tail");
+}
 
-    press(&mut app, KeyCode::Char('G'));
-    assert!(viewer(&app).follow, "bare G returns to the live tail");
+// The tabs are numbered, so the numbers are keys: `2` is what a reader
+// presses to see the second tab. A digit past the last tab does nothing.
+#[test]
+fn a_digit_switches_to_the_tab_it_numbers() {
+    let (_dir, mut app) = app_with_logs(&["feat+one"]);
+    write_log(&app, "feat+one", "dev", &["dev line"]);
+    write_log(&app, "feat+one", "install", &["install line"]);
+    open_viewer(&mut app, 80, 12);
+    let first = viewer(&app).source.clone();
+    let second = viewer(&app).available[1].clone();
+
+    press(&mut app, KeyCode::Char('2'));
+    assert_eq!(viewer(&app).source, second);
+    press(&mut app, KeyCode::Char('1'));
+    assert_eq!(viewer(&app).source, first);
+    press(&mut app, KeyCode::Char('9'));
+    assert_eq!(viewer(&app).source, first, "there is no ninth tab");
 }
 
 #[test]
@@ -1645,9 +1774,6 @@ fn n_and_capital_n_step_the_matches_and_wrap() {
     assert_eq!(viewer(&app).cursor, 0, "and it wraps");
     press(&mut app, KeyCode::Char('N'));
     assert_eq!(viewer(&app).cursor, 4, "backwards too");
-    type_str(&mut app, "2");
-    press(&mut app, KeyCode::Char('n'));
-    assert_eq!(viewer(&app).cursor, 2, "a count steps that many matches");
 }
 
 #[test]
@@ -1852,7 +1978,7 @@ fn matches_are_realigned_when_the_ring_buffer_evicts() {
     // A tail with room for three lines, so two more evict two.
     let path = app.paths.log_file("feat+one", "dev");
     let view = app.log_view_mut().expect("the viewer is open");
-    view.tail = LogTail::new(path.clone(), 3);
+    view.tail = LogTail::new(path.clone(), 3).into();
     view.tail.poll().unwrap();
     view.search.matches = vec![0, 2];
     view.follow = false;
@@ -2094,7 +2220,7 @@ fn leaving_the_viewer_closes_the_overlay_with_it() {
 // ---- error jumps -----------------------------------------------------
 
 #[test]
-fn capital_e_lands_on_the_first_line_of_each_error_block() {
+fn e_lands_on_the_first_line_of_each_error_block_and_capital_e_goes_back() {
     let (_dir, mut app) = app_with_logs(&["feat+one"]);
     write_log(
         &app,
@@ -2117,17 +2243,17 @@ fn capital_e_lands_on_the_first_line_of_each_error_block() {
     open_viewer(&mut app, 80, 24);
     press(&mut app, KeyCode::Char('g'));
 
-    press(&mut app, KeyCode::Char('E'));
+    press(&mut app, KeyCode::Char('e'));
     assert_eq!(viewer(&app).cursor, 1, "the first line of the first block");
-    press(&mut app, KeyCode::Char('E'));
+    press(&mut app, KeyCode::Char('e'));
     assert_eq!(
         viewer(&app).cursor,
         6,
         "not every line of it — the next block"
     );
-    press(&mut app, KeyCode::Char('E'));
-    assert_eq!(viewer(&app).cursor, 1, "and it wraps");
     press(&mut app, KeyCode::Char('e'));
+    assert_eq!(viewer(&app).cursor, 1, "and it wraps");
+    press(&mut app, KeyCode::Char('E'));
     assert_eq!(viewer(&app).cursor, 6, "backwards too");
 }
 
@@ -2154,13 +2280,13 @@ fn two_adjacent_error_blocks_are_two_jump_targets() {
         "back-to-back blocks must not merge into one run"
     );
     press(&mut app, KeyCode::Char('g'));
-    press(&mut app, KeyCode::Char('E'));
+    press(&mut app, KeyCode::Char('e'));
     assert_eq!(
         viewer(&app).cursor,
         3,
         "the cursor was already on the first"
     );
-    press(&mut app, KeyCode::Char('E'));
+    press(&mut app, KeyCode::Char('e'));
     assert_eq!(viewer(&app).cursor, 0, "and it wraps back to it");
 }
 
@@ -2182,9 +2308,9 @@ fn a_run_of_standalone_error_lines_is_one_target() {
     );
     open_viewer(&mut app, 80, 24);
     press(&mut app, KeyCode::Char('g'));
-    press(&mut app, KeyCode::Char('E'));
+    press(&mut app, KeyCode::Char('e'));
     assert_eq!(viewer(&app).cursor, 1);
-    press(&mut app, KeyCode::Char('E'));
+    press(&mut app, KeyCode::Char('e'));
     assert_eq!(viewer(&app).cursor, 5, "the run counts once");
 }
 
@@ -2194,7 +2320,7 @@ fn an_error_jump_with_no_errors_moves_nothing() {
     write_log(&app, "feat+one", "dev", &["all", "quite", "fine"]);
     open_viewer(&mut app, 80, 12);
     press(&mut app, KeyCode::Char('g'));
-    press(&mut app, KeyCode::Char('E'));
+    press(&mut app, KeyCode::Char('e'));
     assert_eq!(viewer(&app).cursor, 0);
     assert!(!viewer(&app).follow);
 }
@@ -2211,7 +2337,7 @@ fn an_error_jump_respects_the_level_filter() {
     open_viewer(&mut app, 80, 12);
     press(&mut app, KeyCode::Char('f')); // warn+, so two lines are shown
     press(&mut app, KeyCode::Char('g'));
-    press(&mut app, KeyCode::Char('E'));
+    press(&mut app, KeyCode::Char('e'));
     assert_eq!(
         viewer(&app).cursor,
         1,
@@ -2336,7 +2462,7 @@ fn a_single_line_confirmation_is_not_plural() {
     open_viewer(&mut app, 80, 20);
     press(&mut app, KeyCode::Char('J'));
     press(&mut app, KeyCode::Char('y'));
-    assert_eq!(app.active_status().unwrap().0, "✓ copied 1 line");
+    assert_eq!(app.active_status().unwrap().0, "copied 1 line");
 }
 
 #[test]
@@ -2361,8 +2487,8 @@ fn the_yank_confirmation_expires() {
 /// thousand lines.
 fn shrink_viewer_tail(app: &mut App, capacity: usize) {
     let view = app.log_view_mut().expect("the viewer is open");
-    let path = view.tail.path().to_path_buf();
-    view.tail = LogTail::new(path, capacity);
+    let path = view.tail.path().expect("one source").to_path_buf();
+    view.tail = LogTail::new(path, capacity).into();
     view.tail.poll().ok();
 }
 
@@ -2519,6 +2645,16 @@ fn the_tui_spawns_nothing_that_could_paint_over_the_screen() {
     // it here. Only these may spawn at all.
     let allowed_spawns = |file: &str| match file {
         "src/tui/app/operations.rs" => 2,
+        // `c` and `e`: one hand-off (tmux, a GUI editor) on a worker
+        // thread, and one suspend.
+        "src/tui/handoff.rs" => 2,
+        _ => 0,
+    };
+    // The suspend is the one child the UI thread waits on, on purpose:
+    // the TUI has left the screen and stopped reading keys first, and
+    // there is nothing else for it to do until the shell exits.
+    let allowed_waits = |file: &str| match file {
+        "src/tui/handoff.rs" => 1,
         _ => 0,
     };
     let mut files: Vec<String> = Vec::new();
@@ -2554,13 +2690,16 @@ fn the_tui_spawns_nothing_that_could_paint_over_the_screen() {
             .filter(|line| !line.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
-        for call in &blocking {
-            assert!(
-                !source.contains(call.as_str()),
-                "{file}: `{call}` blocks on a child, which belongs on a \
-                 worker thread and never in a key handler"
-            );
-        }
+        let waits: usize = blocking
+            .iter()
+            .map(|call| source.matches(call.as_str()).count())
+            .sum();
+        assert_eq!(
+            waits,
+            allowed_waits(file),
+            "{file}: a blocking wait on a child belongs on a worker thread \
+             and never in a key handler"
+        );
         assert_eq!(
             source.matches(&spawn).count(),
             allowed,
@@ -2577,4 +2716,1502 @@ fn the_viewer_keeps_ten_thousand_lines() {
     write_log(&app, "feat+one", "dev", &["one"]);
     open_viewer(&mut app, 80, 12);
     assert_eq!(viewer(&app).tail.capacity(), LOG_VIEWER_CAPACITY);
+}
+
+// ---- keys and help ---------------------------------------------------
+
+/// Every key a person might press bare: printable ASCII, and the keys
+/// with names.
+fn candidate_keys() -> Vec<KeyCode> {
+    let mut keys: Vec<KeyCode> = (' '..='~').map(KeyCode::Char).collect();
+    keys.extend([
+        KeyCode::Enter,
+        KeyCode::Tab,
+        KeyCode::BackTab,
+        KeyCode::Esc,
+        KeyCode::Up,
+        KeyCode::Down,
+        KeyCode::Left,
+        KeyCode::Right,
+        KeyCode::Home,
+        KeyCode::End,
+        KeyCode::PageUp,
+        KeyCode::PageDown,
+        KeyCode::Backspace,
+        KeyCode::Delete,
+        KeyCode::Insert,
+        KeyCode::F(1),
+    ]);
+    keys
+}
+
+/// Three worktrees, the cursor on the middle one, which runs two
+/// processes, has a log to scroll and a tail scrolled back one line — so
+/// every list key has something to act on.
+fn a_list_every_key_can_act_on() -> (tempfile::TempDir, App) {
+    let (dir, mut app) = app_with_logs(&["feat+one", "feat+two", "feat+three"]);
+    with_process(&mut app, "feat+one", running_phase());
+    let lines: Vec<String> = (0..10).map(|i| format!("line {i}")).collect();
+    write_log(&app, "feat+two", "dev", &lines);
+    tail_the_log(&mut app, "feat+two", "dev");
+    with_second_process(&mut app, "feat+two", "api", running_phase());
+    app.refilter();
+    app.select_index(1);
+    assert_eq!(app.selected_worktree().unwrap().name, "feat+two");
+    app.poll_logs();
+    app.tail_scroll = 1;
+    (dir, app)
+}
+
+/// What a key press can visibly change on the list.
+fn list_fingerprint(app: &App) -> String {
+    format!(
+        "{:?}|{:?}|{:?}|{:?}|{}|{}|{:?}|{:?}|{:?}|{}|{}|{}|{:?}",
+        app.modal.as_ref().map(std::mem::discriminant),
+        app.mode,
+        app.status.as_ref().map(|s| s.message.clone()),
+        app.pending.as_ref().map(|p| p.kind),
+        matches!(app.view, View::Log(_)),
+        app.should_quit,
+        app.list_state.selected(),
+        app.clipboard,
+        app.opened,
+        app.tail_index,
+        app.tail_scroll,
+        app.filter,
+        app.launch,
+    )
+}
+
+// Help is the list of keys a developer learns pando from. A key the
+// handler answers that help leaves out is a feature nobody finds; a key
+// help lists that nothing answers is a lie. Every bare key is pressed on a
+// list with something for each of them to do, and the ones that did
+// something have to be exactly the ones help lists.
+#[test]
+fn help_lists_exactly_the_keys_the_list_answers() {
+    let documented: Vec<KeyCode> = LIST_KEYS
+        .iter()
+        .flat_map(|k| k.codes.iter().copied())
+        .collect();
+    let mut answered = Vec::new();
+    for code in candidate_keys() {
+        let (_dir, mut app) = a_list_every_key_can_act_on();
+        let before = list_fingerprint(&app);
+        press(&mut app, code);
+        if list_fingerprint(&app) != before {
+            answered.push(code);
+        }
+    }
+    for code in &answered {
+        assert!(
+            documented.contains(code),
+            "{code:?} does something on the list, and help does not say so"
+        );
+    }
+    for code in &documented {
+        assert!(
+            answered.contains(code),
+            "help lists {code:?}, and pressing it on the list does nothing"
+        );
+    }
+}
+
+/// A viewer with a live search on two lines that carry URLs, errors either
+/// side of the cursor, and three sources.
+fn a_viewer_every_key_can_act_on() -> (tempfile::TempDir, App) {
+    let (dir, mut app) = app_with_logs(&["feat+one"]);
+    let mut lines: Vec<String> = vec!["start".into(), "ERROR first".into()];
+    lines.extend((0..4).map(|i| format!("line {i}")));
+    lines.push("see http://localhost:1/a".into());
+    lines.push("line".into());
+    lines.push("see http://localhost:2/b".into());
+    lines.push("ERROR second".into());
+    lines.extend((0..10).map(|i| format!("more {i}")));
+    write_log(&app, "feat+one", "dev", &lines);
+    write_log(&app, "feat+one", "install", &["installed"]);
+    write_log(&app, "feat+one", "extra", &["extra"]);
+    open_viewer(&mut app, 80, 12);
+    search_for(&mut app, "http");
+    paint(&mut app, 80, 12);
+    assert_eq!(viewer(&app).cursor, 6, "on the first match");
+    (dir, app)
+}
+
+fn viewer_fingerprint(app: &App) -> String {
+    let view = app.log_view();
+    format!(
+        "{:?}|{:?}|{}|{}|{:?}|{:?}|{:?}",
+        view.map(|v| (
+            v.source.clone(),
+            v.cursor,
+            v.follow,
+            v.wrap,
+            v.log_filter,
+            v.search_mode,
+            v.search.query.clone(),
+            v.search.cursor,
+            v.filter_to_matches,
+        )),
+        app.modal.as_ref().map(std::mem::discriminant),
+        app.inspect.is_some(),
+        app.should_quit,
+        app.clipboard,
+        app.status.as_ref().map(|s| s.message.clone()),
+        app.pending.as_ref().map(|p| p.kind),
+    )
+}
+
+// The same contract for the log viewer. Digits are left to their own
+// test: which of them does something depends on which tab is showing.
+#[test]
+fn help_lists_exactly_the_keys_the_viewer_answers() {
+    let documented: Vec<KeyCode> = LOG_KEYS
+        .iter()
+        .flat_map(|k| k.codes.iter().copied())
+        .filter(|code| !matches!(code, KeyCode::Char('1'..='9')))
+        .collect();
+    let mut answered = Vec::new();
+    for code in candidate_keys() {
+        if matches!(code, KeyCode::Char('1'..='9')) {
+            continue;
+        }
+        let (_dir, mut app) = a_viewer_every_key_can_act_on();
+        let before = viewer_fingerprint(&app);
+        press(&mut app, code);
+        if viewer_fingerprint(&app) != before {
+            answered.push(code);
+        }
+    }
+    for code in &answered {
+        assert!(
+            documented.contains(code),
+            "{code:?} does something in the viewer, and help does not say so"
+        );
+    }
+    for code in &documented {
+        assert!(
+            answered.contains(code),
+            "help lists {code:?}, and pressing it in the viewer does nothing"
+        );
+    }
+}
+
+// ---- enter, and the modes -------------------------------------------
+
+#[test]
+fn enter_opens_the_logs_of_a_running_worktree_and_starts_a_stopped_one() {
+    let mut app = test_app(&["feat+one"]);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(
+        app.pending.as_ref().map(|p| p.kind),
+        Some(PendingKind::Start),
+        "stopped: enter starts it"
+    );
+
+    let mut app = test_app(&["feat+one"]);
+    with_process(&mut app, "feat+one", running_phase());
+    press(&mut app, KeyCode::Enter);
+    assert!(app.pending.is_none(), "running: nothing is started");
+    assert!(app.log_view().is_some(), "the log viewer opens instead");
+}
+
+// The TUI's way back from `i`, as `start --shared` is the CLI's.
+#[test]
+fn capital_s_starts_the_selected_worktree_shared() {
+    let mut app = test_app(&["feat+one"]);
+    press(&mut app, KeyCode::Char('S'));
+    let pending = app.pending.as_ref().expect("the key started something");
+    assert_eq!(pending.kind, PendingKind::Start);
+}
+
+// A start of a worktree that is already up leaves its processes on the
+// services they were started against, so a mode key restarts instead.
+#[test]
+fn a_mode_key_on_a_running_worktree_restarts_it_in_that_mode() {
+    for key in ['i', 'S'] {
+        let mut app = test_app(&["feat+one"]);
+        with_process(&mut app, "feat+one", running_phase());
+        press(&mut app, KeyCode::Char(key));
+        assert_eq!(
+            app.pending.as_ref().map(|p| p.kind),
+            Some(PendingKind::Restart),
+            "{key}"
+        );
+    }
+}
+
+#[test]
+fn capital_y_copies_the_public_url_when_there_is_one_and_the_local_one_otherwise() {
+    let mut app = test_app(&["feat+one"]);
+    press(&mut app, KeyCode::Char('Y'));
+    assert_eq!(app.clipboard, None, "nothing runs, so there is no URL");
+    assert!(app.active_status().unwrap().1, "and it says so as an error");
+
+    with_process(&mut app, "feat+one", running_phase());
+    press(&mut app, KeyCode::Char('Y'));
+    assert_eq!(app.clipboard.as_deref(), Some("http://localhost:17342"));
+
+    with_share(&mut app, "feat+one", None);
+    press(&mut app, KeyCode::Char('Y'));
+    assert_eq!(
+        app.clipboard.as_deref(),
+        Some("https://fake-host.trycloudflare.com")
+    );
+}
+
+// ---- the list's order ------------------------------------------------
+
+#[test]
+fn the_list_keeps_discovery_order_when_a_worktree_starts() {
+    let mut app = test_app(&["feat+one", "feat+two", "feat+three"]);
+    app.select_index(2);
+    assert_eq!(app.selected_worktree().unwrap().name, "feat+three");
+    let mut state = app.state.clone();
+    let mut probe = test_app(&["feat+three"]);
+    with_process(&mut probe, "feat+three", running_phase());
+    state.worktrees.extend(probe.state.worktrees);
+    app.handle_event(AppEvent::Refreshed(Box::new(Ok(state))));
+
+    let order: Vec<&str> = app
+        .filtered_indices
+        .iter()
+        .map(|&i| app.worktrees[i].name.as_str())
+        .collect();
+    assert_eq!(
+        order,
+        vec!["feat+one", "feat+two", "feat+three"],
+        "the order `pando ls` prints, whatever runs"
+    );
+    assert_eq!(
+        app.selected_worktree().unwrap().name,
+        "feat+three",
+        "the cursor stays on its worktree"
+    );
+    assert_eq!(app.list_state.selected(), Some(2), "and on its row");
+}
+
+// ---- messages --------------------------------------------------------
+
+#[test]
+fn an_error_is_marked_as_one_and_stays_longer_than_a_confirmation() {
+    let mut app = test_app(&[]);
+    app.set_success("started feat+one");
+    let success = app.flash().unwrap();
+    assert_eq!(success.kind, StatusKind::Success);
+    let success_ttl = success.ttl;
+
+    app.set_error("could not start feat+one: docker is not running");
+    let error = app.flash().unwrap();
+    assert!(error.is_error());
+    assert!(
+        error.ttl > success_ttl,
+        "an error has to be read to its end"
+    );
+
+    // Past a confirmation's life, an error is still up.
+    app.status.as_mut().unwrap().at = Instant::now() - success_ttl - Duration::from_secs(1);
+    assert!(app.flash().is_some());
+}
+
+#[test]
+fn m_shows_everything_said_even_after_it_has_expired() {
+    let mut app = test_app(&["feat+one"]);
+    app.set_error("could not start feat+one: a long reason that ends in what to do");
+    app.set_success("copied /trees/feat+one");
+    app.status = None;
+    press(&mut app, KeyCode::Char('m'));
+    assert!(matches!(app.modal, Some(Modal::Messages)));
+    let said: Vec<&str> = app.messages.iter().map(|s| s.message.as_str()).collect();
+    assert_eq!(
+        said,
+        vec![
+            "could not start feat+one: a long reason that ends in what to do",
+            "copied /trees/feat+one"
+        ]
+    );
+    press(&mut app, KeyCode::Char('x'));
+    assert!(app.modal.is_none(), "any other key closes it");
+}
+
+#[test]
+fn a_spinner_is_not_kept_in_the_history() {
+    let mut app = test_app(&["feat+one"]);
+    app.set_progress("⠋ starting feat/one…");
+    assert!(app.flash().is_some());
+    assert!(app.messages.is_empty());
+}
+
+// A start blocked on a question is not starting anything: the status line
+// and the row say it is waiting, rather than counting seconds.
+#[test]
+fn a_start_waiting_on_a_question_says_so() {
+    let mut app = test_app(&["feat+one"]);
+    press(&mut app, KeyCode::Char('s'));
+    let _rx = open_question(&mut app, a_question());
+    app.poll_pending();
+    let (message, _) = app.active_status().unwrap();
+    assert!(message.contains("waiting for your answer"), "{message}");
+    assert!(app.awaiting_answer());
+}
+
+// ---- new -------------------------------------------------------------
+
+// `n` settles what `pando new` settles before it creates anything. It did
+// not: the TUI called `new` with the raw config, so a worktree made there
+// had nothing installed and its first start failed.
+#[test]
+fn n_resolves_what_new_needs_before_creating() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("acme-shop");
+    crate::testutil::init_repo(&root);
+    std::fs::write(
+        root.join("package.json"),
+        "{\n  \"name\": \"x\",\n  \"scripts\": { \"dev\": \"next dev\" }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+    let paths = PandoPaths::new(
+        dir.path().join("pando-home"),
+        crate::project::ProjectRef::from_root(&root).unwrap(),
+    );
+    let mut app = App::new_for_test(paths, Config::default(), Vec::new());
+    assert!(app.config.project.install.is_none(), "nothing is known yet");
+
+    press(&mut app, KeyCode::Char('n'));
+    type_str(&mut app, "feat/new");
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(
+        app.pending.as_ref().map(|p| p.kind),
+        Some(PendingKind::Create)
+    );
+    let rx = app.event_rx.take().expect("the app owns its receiver");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut applied = false;
+    while Instant::now() < deadline && !applied {
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(event) => {
+                let is_config = matches!(event, AppEvent::ConfigResolved(_));
+                app.handle_event(event);
+                applied = is_config;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    app.event_rx = Some(rx);
+    assert!(applied, "the create worker never resolved the new slots");
+    assert_eq!(
+        app.config.project.install.as_deref(),
+        Some("pnpm install --frozen-lockfile"),
+        "the install step `pando new` would have run"
+    );
+}
+
+// ---- leaving pando: a shell, an editor --------------------------------
+
+fn env(tmux: bool, shell: Option<&str>, visual: Option<&str>, editor: Option<&str>) -> LaunchEnv {
+    LaunchEnv {
+        tmux,
+        shell: shell.map(str::to_string),
+        visual: visual.map(str::to_string),
+        editor: editor.map(str::to_string),
+    }
+}
+
+#[test]
+fn c_outside_tmux_suspends_for_a_shell_in_the_worktree() {
+    let mut app = test_app(&["feat+one"]);
+    app.launch_env = env(false, Some("/bin/zsh"), None, None);
+    press(&mut app, KeyCode::Char('c'));
+    let request = app.launch.clone().expect("c asks for a shell");
+    assert_eq!(
+        request.launch,
+        Launch::Suspend {
+            program: "/bin/zsh".into(),
+            args: Vec::new(),
+            cwd: PathBuf::from("/trees/feat+one"),
+        }
+    );
+    assert_eq!(request.done, "back from the shell in feat/one");
+    // The message comes on the way back, not before the screen goes.
+    assert!(app.status.is_none());
+    assert!(!app.should_quit, "the TUI keeps running");
+}
+
+#[test]
+fn c_without_a_shell_falls_back_to_sh() {
+    let mut app = test_app(&["feat+one"]);
+    app.launch_env = env(false, None, None, None);
+    press(&mut app, KeyCode::Char('c'));
+    assert!(matches!(
+        app.launch.map(|r| r.launch),
+        Some(Launch::Suspend { program, .. }) if program == "/bin/sh"
+    ));
+}
+
+#[test]
+fn c_inside_tmux_opens_a_window_named_for_the_branch() {
+    let mut app = test_app(&["feat+one"]);
+    app.launch_env = env(true, Some("/bin/zsh"), None, None);
+    press(&mut app, KeyCode::Char('c'));
+    assert_eq!(
+        app.launch.clone().map(|r| r.launch),
+        Some(Launch::Tmux {
+            args: vec![
+                "new-window".into(),
+                "-c".into(),
+                "/trees/feat+one".into(),
+                "-n".into(),
+                "feat/one".into(),
+            ]
+        })
+    );
+    let (message, error) = app.active_status().expect("it says what it did");
+    assert!(!error);
+    assert!(message.contains("tmux window feat/one"), "{message}");
+    // Said once: the key says it, and the event loop that hands the
+    // window off to tmux has nothing more to add.
+    assert_eq!(
+        app.messages
+            .iter()
+            .filter(|m| m.message.contains("opened a shell"))
+            .count(),
+        1
+    );
+    let request = app.launch.clone().expect("a launch waits for the loop");
+    assert_eq!(super::launch::said_after(&request), None);
+}
+
+// A suspend is the other way round: nothing is said until the shell
+// returns, and then once.
+#[test]
+fn a_suspended_shell_says_so_only_on_the_way_back() {
+    let mut app = test_app(&["feat+one"]);
+    app.launch_env = env(false, Some("/bin/zsh"), None, None);
+    press(&mut app, KeyCode::Char('c'));
+    assert!(
+        app.messages.is_empty(),
+        "nothing yet: the shell has not run"
+    );
+    let request = app.launch.clone().expect("a launch waits for the loop");
+    assert_eq!(
+        super::launch::said_after(&request).as_deref(),
+        Some("back from the shell in feat/one")
+    );
+}
+
+#[test]
+fn e_with_no_editor_set_says_so_rather_than_guessing() {
+    let mut app = test_app(&["feat+one"]);
+    app.launch_env = env(false, Some("/bin/zsh"), None, None);
+    press(&mut app, KeyCode::Char('e'));
+    assert!(app.launch.is_none());
+    let (message, error) = app.active_status().expect("an error");
+    assert!(error);
+    assert!(
+        message.contains("$VISUAL") && message.contains("$EDITOR"),
+        "{message}"
+    );
+}
+
+#[test]
+fn e_prefers_visual_and_suspends_for_a_terminal_editor() {
+    let mut app = test_app(&["feat+one"]);
+    app.launch_env = env(false, None, Some("nvim"), Some("code -w"));
+    press(&mut app, KeyCode::Char('e'));
+    assert_eq!(
+        app.launch.clone().map(|r| r.launch),
+        Some(Launch::Suspend {
+            program: "nvim".into(),
+            args: vec!["/trees/feat+one".into()],
+            cwd: PathBuf::from("/trees/feat+one"),
+        })
+    );
+}
+
+#[test]
+fn e_inside_tmux_puts_a_terminal_editor_in_its_own_window() {
+    let mut app = test_app(&["feat+one"]);
+    app.launch_env = env(true, None, None, Some("/usr/local/bin/hx"));
+    press(&mut app, KeyCode::Char('e'));
+    assert_eq!(
+        app.launch.clone().map(|r| r.launch),
+        Some(Launch::Tmux {
+            args: vec![
+                "new-window".into(),
+                "-c".into(),
+                "/trees/feat+one".into(),
+                "-n".into(),
+                "feat/one".into(),
+                "/usr/local/bin/hx".into(),
+                "/trees/feat+one".into(),
+            ]
+        })
+    );
+}
+
+#[test]
+fn e_hands_a_gui_editor_off_with_its_arguments() {
+    for tmux in [false, true] {
+        let mut app = test_app(&["feat+one"]);
+        app.launch_env = env(tmux, None, None, Some("code -w"));
+        press(&mut app, KeyCode::Char('e'));
+        assert_eq!(
+            app.launch.clone().map(|r| r.launch),
+            Some(Launch::Detached {
+                program: "code".into(),
+                args: vec!["-w".into(), "/trees/feat+one".into()],
+                cwd: PathBuf::from("/trees/feat+one"),
+            }),
+            "tmux: {tmux}"
+        );
+        let (message, _) = app.active_status().expect("it says what it did");
+        assert!(message.contains("opened feat/one in code"), "{message}");
+    }
+}
+
+#[test]
+fn terminal_editors_are_told_from_gui_ones() {
+    for editor in [
+        "vim",
+        "nvim",
+        "/opt/homebrew/bin/hx",
+        "nano",
+        "emacs -nw",
+        "micro",
+    ] {
+        assert!(is_terminal_editor(editor), "{editor}");
+    }
+    for editor in ["code", "code -w", "/usr/local/bin/subl -w", "zed", "cursor"] {
+        assert!(!is_terminal_editor(editor), "{editor}");
+    }
+}
+
+#[test]
+fn a_tmux_window_is_named_for_the_whole_branch() {
+    // `m` alone could be `feat/m` or `fix/m`; tmux takes the `/`.
+    assert_eq!(super::launch::window_name("feat/m"), "feat/m");
+    assert_eq!(super::launch::window_name("main"), "main");
+    let long = super::launch::window_name("feature/a-very-long-branch-name-that-goes-on");
+    assert_eq!(long.chars().count(), 30);
+    assert!(long.starts_with("feature/a-very"), "{long}");
+    assert!(long.ends_with('…'), "{long}");
+}
+
+#[test]
+fn a_hand_off_that_failed_says_why() {
+    let mut app = test_app(&["feat+one"]);
+    app.handle_event(AppEvent::LaunchFailed("tmux failed: no server".into()));
+    assert_eq!(app.active_status(), Some(("tmux failed: no server", true)));
+}
+
+// ---- restart one process, stop everything -----------------------------
+
+#[test]
+fn r_on_a_stopped_worktree_starts_it() {
+    let mut app = test_app(&["feat+one"]);
+    press(&mut app, KeyCode::Char('r'));
+    assert_eq!(
+        app.pending.as_ref().map(|p| p.kind),
+        Some(PendingKind::Start)
+    );
+}
+
+#[test]
+fn p_restarts_only_the_process_the_detail_pane_marks() {
+    let mut app = test_app(&["feat+one"]);
+    with_process(&mut app, "feat+one", running_phase());
+    with_second_process(&mut app, "feat+one", "api", running_phase());
+    // Tab moves the `▸`; `p` follows it.
+    press(&mut app, KeyCode::Tab);
+    let (_, marked, _) = app.tail_target().expect("a process is marked");
+    press(&mut app, KeyCode::Char('p'));
+    let pending = app.pending.as_ref().expect("p started something");
+    assert_eq!(pending.kind, PendingKind::Restart);
+    assert_eq!(pending.name, "feat+one");
+    assert_eq!(pending.label, format!("{marked} of feat/one"));
+}
+
+#[test]
+fn p_on_one_process_restarts_the_worktree_and_on_none_says_so() {
+    let mut app = test_app(&["feat+one"]);
+    with_process(&mut app, "feat+one", running_phase());
+    press(&mut app, KeyCode::Char('p'));
+    let pending = app.pending.as_ref().expect("p started something");
+    assert_eq!(pending.kind, PendingKind::Restart);
+    assert_eq!(pending.label, "feat/one");
+
+    let mut app = test_app(&["feat+one"]);
+    press(&mut app, KeyCode::Char('p'));
+    assert!(app.pending.is_none());
+    let (message, error) = app.active_status().expect("an error");
+    assert!(error && message.contains("running nothing"), "{message}");
+}
+
+#[test]
+fn x_with_nothing_running_says_so() {
+    let mut app = test_app(&["feat+one"]);
+    press(&mut app, KeyCode::Char('X'));
+    assert!(app.modal.is_none());
+    assert_eq!(app.active_status(), Some(("nothing is running", false)));
+}
+
+#[test]
+fn x_asks_first_and_esc_keeps_everything_up() {
+    let mut app = test_app(&["feat+one", "feat+two", "feat+three"]);
+    with_process(&mut app, "feat+one", running_phase());
+    // A failed process beside a running one: something is still up.
+    with_process(&mut app, "feat+three", running_phase());
+    with_second_process(
+        &mut app,
+        "feat+three",
+        "worker",
+        Phase::Failed {
+            reason: "exit 1".into(),
+            at: Utc::now(),
+        },
+    );
+    press(&mut app, KeyCode::Char('X'));
+    match &app.modal {
+        Some(Modal::StopAll { names }) => {
+            assert_eq!(
+                names,
+                &vec!["feat+one".to_string(), "feat+three".to_string()]
+            )
+        }
+        _ => panic!("X opens the confirmation"),
+    }
+    press(&mut app, KeyCode::Char('j'));
+    assert!(
+        matches!(app.modal, Some(Modal::StopAll { .. })),
+        "other keys keep it"
+    );
+    press(&mut app, KeyCode::Esc);
+    assert!(app.modal.is_none());
+    assert!(app.pending.is_none());
+}
+
+#[test]
+fn x_confirmed_stops_everything_and_every_running_row_says_so() {
+    let mut app = test_app(&["feat+one", "feat+two", "feat+three"]);
+    with_process(&mut app, "feat+one", running_phase());
+    with_process(&mut app, "feat+three", running_phase());
+    press(&mut app, KeyCode::Char('X'));
+    press(&mut app, KeyCode::Char('y'));
+    assert!(app.modal.is_none());
+    assert_eq!(
+        app.pending.as_ref().map(|p| p.kind),
+        Some(PendingKind::StopAll)
+    );
+    assert!(app.pending_on("feat+one").is_some());
+    assert!(app.pending_on("feat+three").is_some());
+    assert!(
+        app.pending_on("feat+two").is_none(),
+        "a stopped row is not stopping"
+    );
+}
+
+// ---- CLI remedies said as keys ----------------------------------------
+
+#[test]
+fn a_dirty_removal_points_at_the_remove_dialog_not_a_flag() {
+    let message = "could not remove feat/tui: feat+tui contains modified or untracked \
+                   files (M package.json) — commit or remove them, or pass --force to \
+                   let git discard them";
+    let said = remedies::as_tui_remedy(message);
+    assert!(!said.contains("--force"), "{said}");
+    assert!(said.contains("press F in the remove dialog"), "{said}");
+    assert!(said.contains("M package.json"), "the facts survive: {said}");
+}
+
+#[test]
+fn an_isolation_remedy_names_the_shared_start_key() {
+    let said = remedies::as_tui_remedy(
+        "docker is not running — isolated mode needs Docker; install it, or start without --isolated",
+    );
+    assert!(said.ends_with("press S to start it shared"), "{said}");
+}
+
+#[test]
+fn a_message_without_a_flag_is_left_alone() {
+    let message = "feat+x is locked (benchmarking) — unlock it with `git worktree unlock` first";
+    assert_eq!(remedies::as_tui_remedy(message), message);
+    // Already neutral at the source: nothing to rewrite, nothing broken.
+    let neutral = "feat+x has uncommitted changes — commit or remove them first";
+    assert_eq!(remedies::as_tui_remedy(neutral), neutral);
+}
+
+#[test]
+fn a_bare_flag_is_still_translated() {
+    assert_eq!(
+        remedies::as_tui_remedy("retry with --force"),
+        "retry with F in the remove dialog"
+    );
+}
+
+/// Polls the worker until it has reported, or fails the test.
+fn wait_for_pending(app: &mut App) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.pending.is_some() {
+        assert!(Instant::now() < deadline, "the worker never reported");
+        app.poll_pending();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+// ---- errors about one worktree ---------------------------------------
+
+// An error raised by feat/db's start does not follow the reader into
+// feat/login's log viewer. `m` still has it.
+#[test]
+fn another_worktrees_error_stays_out_of_the_log_viewer() {
+    let (_dir, mut app) = app_with_logs(&["feat+db", "feat+login"]);
+    write_log(&app, "feat+login", "dev", &["login up"]);
+    press(&mut app, KeyCode::Char('j'));
+    open_viewer(&mut app, 80, 24);
+    assert_eq!(viewer(&app).name, "feat+login");
+    app.spawn_pending("feat+db".into(), PendingKind::Start, || {
+        Err("docker is not running".to_string())
+    });
+    wait_for_pending(&mut app);
+    assert!(app.flash().is_some_and(|s| s.is_error()));
+
+    assert!(
+        app.flash_for("feat+login").is_none(),
+        "feat/db's error is not feat/login's"
+    );
+    assert!(
+        app.flash_for("feat+db").is_some(),
+        "and it is still feat/db's"
+    );
+    assert!(
+        app.messages.iter().any(|m| m.message.contains("docker")),
+        "m keeps it"
+    );
+}
+
+// A message about nothing in particular shows in any viewer.
+#[test]
+fn an_error_about_no_worktree_shows_everywhere() {
+    let mut app = test_app(&["feat+one"]);
+    app.set_error("refresh failed: disk full");
+    assert!(app.flash_for("feat+one").is_some());
+}
+
+// ---- nothing to run --------------------------------------------------
+
+#[test]
+fn enter_on_a_project_with_nothing_to_run_says_where_to_add_it() {
+    let mut app = test_app(&["main-lib"]);
+    app.nothing_to_run = true;
+    press(&mut app, KeyCode::Enter);
+    assert!(app.pending.is_none(), "enter does not pretend to start");
+    let (message, is_error) = app.active_status().unwrap();
+    assert!(!is_error);
+    assert!(
+        message.starts_with("nothing to run: add a [dev] command in "),
+        "{message}"
+    );
+    assert!(
+        message.ends_with(&app.paths.config_file().display().to_string()),
+        "the absolute path of the file to edit: {message}"
+    );
+    for code in [KeyCode::Char('s'), KeyCode::Char('i'), KeyCode::Char('r')] {
+        press(&mut app, code);
+        assert!(app.pending.is_none(), "{code:?} does not start anything");
+    }
+}
+
+// A start that fails for want of a process teaches the session: the next
+// enter says so up front.
+#[test]
+fn a_start_that_found_no_process_turns_on_nothing_to_run() {
+    let mut app = test_app(&["main-lib"]);
+    app.spawn_pending("main-lib".into(), PendingKind::Start, || {
+        Err("no processes configured; add [dev] to pando.toml".to_string())
+    });
+    wait_for_pending(&mut app);
+    assert!(app.nothing_to_run);
+    let (message, _) = app.active_status().unwrap();
+    assert!(
+        message.starts_with("nothing to run: add a [dev] command in "),
+        "{message}"
+    );
+}
+
+// ---- ready, not just started -----------------------------------------
+
+#[test]
+fn a_start_that_returns_before_ready_waits_to_say_so() {
+    let mut app = test_app(&["feat+one"]);
+    with_process(&mut app, "feat+one", Phase::Starting { since: Utc::now() });
+    app.spawn_pending("feat+one".into(), PendingKind::Start, || {
+        Ok(PendingOutcome::Started(
+            "feat+one".into(),
+            Some("http://localhost:17342".into()),
+        ))
+    });
+    wait_for_pending(&mut app);
+    let status = app.flash().unwrap();
+    assert_ne!(status.kind, StatusKind::Success, "not ✓ while it starts");
+    assert!(
+        status.message.contains("waiting for it to be ready"),
+        "{}",
+        status.message
+    );
+
+    let mut state = app.state.clone();
+    state
+        .worktrees
+        .get_mut("feat+one")
+        .unwrap()
+        .processes
+        .get_mut("dev")
+        .unwrap()
+        .phase = running_phase();
+    app.handle_event(AppEvent::Refreshed(Box::new(Ok(state))));
+    let status = app.flash().unwrap();
+    assert_eq!(status.kind, StatusKind::Success);
+    assert_eq!(status.message, "feat/one is ready — http://localhost:17342");
+    assert!(app.awaiting_ready.is_none());
+}
+
+// ---- commit age ------------------------------------------------------
+
+#[test]
+fn git_relative_dates_are_read_and_written_compactly() {
+    assert_eq!(parse_git_relative("82 seconds ago"), Some(82));
+    assert_eq!(parse_git_relative("1 minute ago"), Some(60));
+    assert_eq!(parse_git_relative("3 hours ago"), Some(3 * 3600));
+    assert_eq!(
+        parse_git_relative("2 years, 4 months ago"),
+        Some(2 * 365 * 86_400 + 4 * 30 * 86_400)
+    );
+    assert_eq!(parse_git_relative("yesterday"), None);
+    assert_eq!(compact_age(82), "1m");
+    assert_eq!(compact_age(59), "59s");
+    assert_eq!(compact_age(3 * 3600 + 59 * 60), "3h");
+    assert_eq!(compact_age(2 * 86_400), "2d");
+    assert_eq!(compact_age(30 * 86_400), "4w");
+    assert_eq!(compact_age(90 * 86_400), "3mo");
+    assert_eq!(compact_age(800 * 86_400), "2y");
+}
+
+// The age keeps counting from when enrichment reported it, instead of
+// saying `82 seconds ago` for as long as the TUI is open.
+#[test]
+fn a_commit_age_keeps_counting_after_git_reported_it() {
+    let mut app = test_app(&["feat+one"]);
+    app.worktrees[0].head_age = Some("82 seconds ago".into());
+    assert_eq!(app.commit_age(&app.worktrees[0]).as_deref(), Some("1m ago"));
+    app.commit_seen.insert(
+        "feat+one".into(),
+        (
+            "82 seconds ago".into(),
+            82,
+            Instant::now() - Duration::from_secs(3 * 3600),
+        ),
+    );
+    assert_eq!(app.commit_age(&app.worktrees[0]).as_deref(), Some("3h ago"));
+    // Words it cannot read are shown as git wrote them.
+    app.worktrees[0].head_age = Some("in the future".into());
+    assert_eq!(
+        app.commit_age(&app.worktrees[0]).as_deref(),
+        Some("in the future")
+    );
+}
+
+// ---- git state stays fresh -------------------------------------------
+
+// The selected worktree's git state is read again on the slow tick, and
+// quietly: the header's `reading git` is for the first read only.
+#[test]
+fn the_slow_tick_re_reads_the_selected_worktrees_git_quietly() {
+    let mut app = test_app(&["feat+one"]);
+    app.tick = GIT_SELECTED_EVERY - 1;
+    app.handle_event(AppEvent::Tick);
+    assert!(app.git_refreshing, "a re-read is in flight");
+    assert!(!app.enriching, "and the header does not announce it");
+}
+
+// A worktree that became dirty after the TUI opened shows its `*` once
+// the re-read lands.
+#[test]
+fn an_enrichment_that_finds_changes_marks_the_worktree_dirty() {
+    let mut app = test_app(&["feat+one"]);
+    let update = crate::worktree::EnrichUpdate {
+        name: "feat+one".into(),
+        branch: Some("feat/one".into()),
+        prunable: false,
+        head_sha: Some("abc1234".into()),
+        head_subject: Some("do the thing".into()),
+        head_age: Some("5 minutes ago".into()),
+        dirty: Some(true),
+        ahead_behind: Some((1, 0)),
+    };
+    assert!(
+        app.handle_event(AppEvent::Enrich(update.clone())),
+        "repaints"
+    );
+    assert_eq!(app.worktrees[0].dirty, Some(true));
+    assert!(
+        !app.handle_event(AppEvent::Enrich(update)),
+        "the same answer again costs no paint"
+    );
+}
+
+// ---- the create modal ------------------------------------------------
+
+fn open_create_with(app: &mut App, branches: &[(&str, BranchSource)]) {
+    press(app, KeyCode::Char('n'));
+    let entries = branches
+        .iter()
+        .map(|(name, source)| BranchEntry {
+            name: name.to_string(),
+            source: source.clone(),
+        })
+        .collect();
+    app.handle_event(AppEvent::BranchesReady(entries));
+}
+
+// `main` is the main checkout's branch: git will not check it out twice,
+// so enter says so instead of starting a create that fails.
+#[test]
+fn the_main_checkouts_branch_cannot_be_created_from_the_picker() {
+    let mut app = test_app(&["feat+one"]);
+    let mut main = wt("acme-shop");
+    main.branch = Some("main".into());
+    app.main = Some(main);
+    open_create_with(&mut app, &[("main", BranchSource::Local)]);
+    type_str(&mut app, "main");
+    press(&mut app, KeyCode::Enter);
+    assert!(app.pending.is_none(), "nothing started");
+    assert!(
+        matches!(app.modal, Some(Modal::Create { .. })),
+        "still open"
+    );
+    let (message, is_error) = app.active_status().unwrap();
+    assert!(is_error);
+    assert!(
+        message.contains("checked out in the main checkout"),
+        "{message}"
+    );
+}
+
+// Tab walks the base a new branch forks from: the default first, then
+// every branch, and round again.
+#[test]
+fn tab_in_the_create_modal_cycles_the_base() {
+    let mut app = test_app(&["feat+one"]);
+    app.default_base = Some("origin/main".into());
+    open_create_with(
+        &mut app,
+        &[
+            ("develop", BranchSource::Local),
+            ("release", BranchSource::Remote),
+        ],
+    );
+    let base = |app: &App| match &app.modal {
+        Some(Modal::Create { base, .. }) => base.clone(),
+        other => panic!("expected the create modal, got {other:?}"),
+    };
+    assert_eq!(base(&app), None, "the default to begin with");
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(base(&app).as_deref(), Some("develop"));
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(base(&app).as_deref(), Some("origin/release"));
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(base(&app), None, "and back to the default");
+    press(&mut app, KeyCode::BackTab);
+    assert_eq!(base(&app).as_deref(), Some("origin/release"));
+}
+
+#[test]
+fn base_choices_lead_with_the_default_and_name_each_branch_once() {
+    let branches = vec![
+        BranchEntry {
+            name: "main".into(),
+            source: BranchSource::Local,
+        },
+        BranchEntry {
+            name: "main".into(),
+            source: BranchSource::Remote,
+        },
+    ];
+    assert_eq!(
+        base_choices(Some("origin/main"), &branches),
+        vec!["origin/main", "main"]
+    );
+    assert_eq!(base_choices(None, &[]), Vec::<String>::new());
+}
+
+// ---- the all tab -----------------------------------------------------
+
+fn two_process_app() -> (tempfile::TempDir, App) {
+    let (dir, mut app) = app_with_logs(&["feat+one"]);
+    app.config.processes.clear();
+    for process in ["api", "web"] {
+        app.config
+            .processes
+            .insert(process.to_string(), crate::config::ProcessConfig::default());
+    }
+    (dir, app)
+}
+
+fn append_log(app: &App, worktree: &str, source: &str, line: &str) {
+    use std::io::Write as _;
+    let path = app.paths.log_file(worktree, source);
+    let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    writeln!(file, "{line}").unwrap();
+}
+
+#[test]
+fn two_processes_get_an_all_tab_first_and_one_does_not() {
+    let (_dir, mut app) = two_process_app();
+    write_log(&app, "feat+one", "api", &["api up"]);
+    write_log(&app, "feat+one", "web", &["web up"]);
+    write_log(&app, "feat+one", "install", &["installed"]);
+    open_viewer(&mut app, 80, 20);
+    assert_eq!(
+        viewer(&app).available,
+        vec!["all", "api", "web", "install"],
+        "all first; a hook is not merged into it, but keeps its tab"
+    );
+    assert_eq!(
+        viewer(&app).source,
+        "api",
+        "the viewer still opens on one log"
+    );
+
+    let (_dir, mut app) = app_with_logs(&["feat+one"]);
+    write_log(&app, "feat+one", "dev", &["up"]);
+    write_log(&app, "feat+one", "install", &["installed"]);
+    open_viewer(&mut app, 80, 20);
+    assert_eq!(viewer(&app).available, vec!["dev", "install"]);
+}
+
+// Every process's lines, each marked with its source, and what arrives
+// afterwards in the order it arrives.
+#[test]
+fn the_all_tab_merges_every_process_with_a_source_prefix() {
+    let (_dir, mut app) = two_process_app();
+    write_log(&app, "feat+one", "api", &["api up"]);
+    write_log(&app, "feat+one", "web", &["web up"]);
+    open_viewer(&mut app, 100, 20);
+    press(&mut app, KeyCode::Char('1'));
+    assert_eq!(viewer(&app).source, "all");
+    let plain = |app: &App| -> Vec<String> {
+        viewer(app)
+            .tail
+            .lines()
+            .iter()
+            .map(|p| p.plain.clone())
+            .collect()
+    };
+    assert_eq!(plain(&app), vec!["api │ api up", "web │ web up"]);
+
+    append_log(&app, "feat+one", "web", "GET / 200");
+    app.handle_event(AppEvent::Tick);
+    append_log(&app, "feat+one", "api", "query took 3ms");
+    app.handle_event(AppEvent::Tick);
+    assert_eq!(
+        plain(&app),
+        vec![
+            "api │ api up",
+            "web │ web up",
+            "web │ GET / 200",
+            "api │ query took 3ms"
+        ],
+        "in the order the lines arrived"
+    );
+
+    // `y` copies the line as the process wrote it.
+    press(&mut app, KeyCode::Char('y'));
+    assert_eq!(app.clipboard.as_deref(), Some("query took 3ms"));
+
+    // Search sees the prefix too, so `/web` finds the web server's lines.
+    search_for(&mut app, "web │");
+    assert_eq!(viewer(&app).search.matches.len(), 2);
+}
+
+#[test]
+fn a_json_block_in_the_all_tab_still_inspects_as_json() {
+    let (_dir, mut app) = two_process_app();
+    write_log(
+        &app,
+        "feat+one",
+        "api",
+        &["{", "  \"level\": \"error\",", "  \"msg\": \"boom\"", "}"],
+    );
+    write_log(&app, "feat+one", "web", &["web up"]);
+    open_viewer(&mut app, 100, 30);
+    press(&mut app, KeyCode::Char('1'));
+    press(&mut app, KeyCode::Char('g'));
+    press(&mut app, KeyCode::Char('J'));
+    let inspect = app.inspect.as_ref().expect("the overlay is open");
+    assert!(
+        inspect.text.contains("\"msg\": \"boom\""),
+        "{}",
+        inspect.text
+    );
+    assert!(!inspect.text.contains("api │"), "{}", inspect.text);
+}
+
+// ---- dogfood: a fresh project after `n` ------------------------------
+
+// `new` writes a `pando.toml` with only `[project]` in it. That file
+// existing, with no process named, was taken to mean "nothing to run",
+// and every start of the fresh worktree was refused before it could ask
+// for the command.
+#[test]
+fn a_config_file_with_no_process_still_lets_enter_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = PandoPaths::new(
+        dir.path().join("home"),
+        ProjectRef {
+            id: "acme-shop-3f9a2c1d".into(),
+            root: dir.path().join("acme-shop"),
+            display_name: "acme-shop".into(),
+        },
+    );
+    std::fs::create_dir_all(paths.config_file().parent().unwrap()).unwrap();
+    std::fs::write(paths.config_file(), "[project]\nname = \"acme-shop\"\n").unwrap();
+    let mut app = App::new_for_test(paths, Config::default(), vec![wt("feat+x")]);
+    // What `n` sends once `new` has resolved: the config, still with no
+    // process in it.
+    app.handle_event(AppEvent::ConfigResolved(Box::default()));
+    assert!(!app.nothing_to_run, "a file alone concludes nothing");
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(
+        app.pending.as_ref().map(|p| p.kind),
+        Some(PendingKind::Start),
+        "enter runs the start, and with it the question that finds the command"
+    );
+}
+
+// Once a start has said so, a config that gains a process clears it.
+#[test]
+fn a_resolved_config_with_a_process_clears_nothing_to_run() {
+    let mut app = test_app(&["feat+x"]);
+    app.nothing_to_run = true;
+    let mut config = Config::default();
+    config.processes.insert(
+        "dev".to_string(),
+        toml::from_str("cmd = \"pnpm dev\"").unwrap(),
+    );
+    app.handle_event(AppEvent::ConfigResolved(Box::new(config)));
+    assert!(!app.nothing_to_run);
+}
+
+// ---- dogfood: "none" in the question dialog --------------------------
+
+fn a_question_that_allows_none() -> actions::Question {
+    actions::Question {
+        slot: crate::detect::Slot::SchemaHook,
+        prompt: "Which command sets up the database schema?".to_string(),
+        options: vec![("pnpm db:push".to_string(), "package.json".to_string())],
+        preselect: Some(0),
+        allow_custom: true,
+        allow_none: true,
+        multi: false,
+        checked: Vec::new(),
+        details: Vec::new(),
+        answer_file: None,
+        snippet: String::new(),
+    }
+}
+
+#[test]
+fn n_answers_none_when_the_question_allows_it() {
+    let mut app = test_app(&["feat+one"]);
+    let rx = open_question(&mut app, a_question_that_allows_none());
+    press(&mut app, KeyCode::Char('n'));
+    assert_eq!(rx.try_recv().unwrap(), Ok(actions::Answer::None));
+    assert!(app.modal.is_none());
+}
+
+#[test]
+fn n_does_nothing_when_the_question_has_no_none() {
+    let mut app = test_app(&["feat+one"]);
+    let rx = open_question(&mut app, a_question());
+    press(&mut app, KeyCode::Char('n'));
+    assert!(rx.try_recv().is_err(), "no answer was sent");
+    assert!(matches!(app.modal, Some(Modal::Question { .. })));
+}
+
+// With nothing to suggest the input line used to open at once, and it
+// would take the `n` that says "none" as the first letter of a command.
+#[test]
+fn a_question_with_no_options_that_allows_none_waits_for_n_or_c() {
+    let mut app = test_app(&["feat+one"]);
+    let mut question = a_question_that_allows_none();
+    question.options.clear();
+    let rx = open_question(&mut app, question);
+    assert!(matches!(
+        app.modal,
+        Some(Modal::Question { custom: None, .. })
+    ));
+    press(&mut app, KeyCode::Char('n'));
+    assert_eq!(rx.try_recv().unwrap(), Ok(actions::Answer::None));
+}
+
+// ---- dogfood: X lists only what is up --------------------------------
+
+#[test]
+fn x_leaves_out_worktrees_with_nothing_up() {
+    let mut app = test_app(&["feat+m", "feat+second", "feat+db"]);
+    // Only a failed process: nothing of it runs.
+    with_process(
+        &mut app,
+        "feat+m",
+        Phase::Failed {
+            reason: "exit 1".into(),
+            at: Utc::now(),
+        },
+    );
+    // A record left behind by a stop.
+    app.state.worktrees.insert(
+        "feat+second".to_string(),
+        WorktreeRecord::new("/trees/feat+second", true),
+    );
+    press(&mut app, KeyCode::Char('X'));
+    assert!(app.modal.is_none(), "nothing to confirm");
+    assert_eq!(app.active_status(), Some(("nothing is running", false)));
+
+    // A database still up behind a crashed dev server is something.
+    let mut record = WorktreeRecord::new("/trees/feat+db", true);
+    record.services.push(crate::state::ServiceRecord {
+        name: "postgres".into(),
+        kind: crate::state::ServiceKind::Native,
+        port: Some(17_004),
+        pid: Some(1),
+        pgid: Some(1),
+        compose_project: None,
+    });
+    app.state.worktrees.insert("feat+db".to_string(), record);
+    assert_eq!(app.stop_all_targets(), vec!["feat+db".to_string()]);
+}
+
+// ---- dogfood: a process that dies says so ----------------------------
+
+fn fail_process(state: &mut State, name: &str, process: &str, reason: &str) {
+    state
+        .worktrees
+        .get_mut(name)
+        .unwrap()
+        .processes
+        .get_mut(process)
+        .unwrap()
+        .phase = Phase::Failed {
+        at: Utc::now(),
+        reason: reason.into(),
+    };
+}
+
+#[test]
+fn a_process_that_dies_after_ready_says_so() {
+    let mut app = test_app(&["feat+m"]);
+    with_process(&mut app, "feat+m", running_phase());
+    with_second_process(&mut app, "feat+m", "api", running_phase());
+    app.set_success("feat/m is ready");
+    let mut state = app.state.clone();
+    fail_process(&mut state, "feat+m", "api", "exited with status 1");
+    app.handle_event(AppEvent::Refreshed(Box::new(Ok(state.clone()))));
+    let status = app.flash().expect("a flash");
+    assert!(status.is_error());
+    assert_eq!(
+        status.message,
+        "api of feat/m exited — exited with status 1"
+    );
+    assert_eq!(status.about.as_deref(), Some("feat+m"));
+
+    // Said once: the next refresh finds it already failed.
+    let before = app.messages.len();
+    app.handle_event(AppEvent::Refreshed(Box::new(Ok(state))));
+    assert_eq!(app.messages.len(), before);
+}
+
+// A start waiting to say "ready" that sees a process die says which, and
+// only once.
+#[test]
+fn a_death_during_a_start_is_said_once_by_name() {
+    let mut app = test_app(&["feat+m"]);
+    with_process(&mut app, "feat+m", Phase::Starting { since: Utc::now() });
+    app.awaiting_ready = Some(("feat+m".into(), None));
+    let mut state = app.state.clone();
+    fail_process(&mut state, "feat+m", "dev", "boom");
+    let before = app.messages.len();
+    app.handle_event(AppEvent::Refreshed(Box::new(Ok(state))));
+    assert_eq!(app.messages.len(), before + 1);
+    assert_eq!(app.flash().unwrap().message, "dev of feat/m exited — boom");
+    assert!(app.awaiting_ready.is_none());
+}
+
+// ---- dogfood: an error about one worktree leaves with the cursor ------
+
+#[test]
+fn an_error_about_a_worktree_clears_when_the_cursor_leaves_it() {
+    let mut app = test_app(&["feat+m", "feat+second"]);
+    press(&mut app, KeyCode::Char('j'));
+    app.set_error_about("feat+second", "could not start feat/second: boom");
+    press(&mut app, KeyCode::Char('j'));
+    assert!(app.flash().is_some(), "still on feat/second: it stays");
+    press(&mut app, KeyCode::Char('k'));
+    assert!(app.flash().is_none(), "feat/second's error is not feat/m's");
+    assert!(
+        app.messages.iter().any(|m| m.message.contains("boom")),
+        "m keeps it"
+    );
+    // An error about nothing in particular stays wherever the cursor goes.
+    app.set_error("refresh failed: disk full");
+    press(&mut app, KeyCode::Char('j'));
+    assert!(app.flash().is_some());
+}
+
+// ---- dogfood: help scrolls with g and G ------------------------------
+
+#[test]
+fn g_and_capital_g_scroll_help_rather_than_closing_it() {
+    let mut app = test_app(&["feat+one"]);
+    press(&mut app, KeyCode::Char('?'));
+    app.help_scroll_max = 20;
+    press(&mut app, KeyCode::Char('G'));
+    assert!(matches!(app.modal, Some(Modal::Help)), "G keeps help open");
+    assert_eq!(app.help_scroll, 20, "at the bottom");
+    press(&mut app, KeyCode::Char('k'));
+    assert_eq!(app.help_scroll, 19, "and k moves at once from there");
+    press(&mut app, KeyCode::Char('g'));
+    assert_eq!(app.help_scroll, 0);
+    assert!(matches!(app.modal, Some(Modal::Help)));
+}
+
+// The overlay's scroll keys are a table too: each keeps help open, and
+// every other key closes it.
+#[test]
+fn the_overlay_answers_exactly_the_scroll_keys_it_documents() {
+    let documented: Vec<KeyCode> = OVERLAY_KEYS
+        .iter()
+        .flat_map(|k| k.codes.iter().copied())
+        .collect();
+    for code in candidate_keys() {
+        let mut app = test_app(&["feat+one"]);
+        press(&mut app, KeyCode::Char('?'));
+        press(&mut app, code);
+        let open = matches!(app.modal, Some(Modal::Help));
+        assert_eq!(open, documented.contains(&code), "{code:?}");
+    }
+}
+
+// ---- dogfood: uptime from the oldest process -------------------------
+
+#[test]
+fn a_worktree_is_up_since_its_oldest_running_process() {
+    let mut app = test_app(&["feat+m"]);
+    let two_minutes_ago = Utc::now() - chrono::Duration::minutes(2);
+    with_process(
+        &mut app,
+        "feat+m",
+        Phase::Running {
+            since: two_minutes_ago,
+        },
+    );
+    // `p` just restarted the other one.
+    with_second_process(&mut app, "feat+m", "worker", running_phase());
+    assert_eq!(app.up_since("feat+m"), Some(two_minutes_ago));
+}
+
+// ---- the one-second refresh skips the socket scan when it cannot matter --
+
+#[test]
+fn a_refresh_with_everything_running_and_alive_has_nothing_to_advance() {
+    let mut app = test_app(&["feat+a", "feat+b"]);
+    with_process(&mut app, "feat+a", running_phase());
+    with_second_process(&mut app, "feat+a", "api", running_phase());
+    with_process(&mut app, "feat+b", running_phase());
+    with_share(&mut app, "feat+b", Some(18_000));
+    assert!(!background::needs_advance(&app.state, |_| true));
+}
+
+#[test]
+fn a_starting_process_always_takes_the_full_refresh() {
+    // The scan is how a starting process becomes running.
+    let mut app = test_app(&["feat+a"]);
+    with_process(&mut app, "feat+a", Phase::Starting { since: Utc::now() });
+    assert!(background::needs_advance(&app.state, |_| true));
+}
+
+#[test]
+fn any_dead_pid_the_state_vouches_for_takes_the_full_refresh() {
+    let mut app = test_app(&["feat+a"]);
+    with_process(&mut app, "feat+a", running_phase());
+    with_second_process(&mut app, "feat+a", "api", running_phase());
+    // The second process (4343) died.
+    assert!(background::needs_advance(&app.state, |pid| pid != 4343));
+
+    let mut app = test_app(&["feat+a"]);
+    with_process(&mut app, "feat+a", running_phase());
+    with_share(&mut app, "feat+a", Some(18_000));
+    assert!(background::needs_advance(&app.state, |pid| pid != 5151));
+    assert!(background::needs_advance(&app.state, |pid| pid != 5252));
+
+    let mut app = test_app(&["feat+a"]);
+    with_process(&mut app, "feat+a", running_phase());
+    let record = app.state.worktrees.get_mut("feat+a").unwrap();
+    record.services.push(crate::state::ServiceRecord {
+        name: "postgres".into(),
+        kind: crate::state::ServiceKind::Native,
+        port: Some(15_432),
+        pid: Some(6161),
+        pgid: Some(6161),
+        compose_project: None,
+    });
+    assert!(!background::needs_advance(&app.state, |_| true));
+    assert!(background::needs_advance(&app.state, |pid| pid != 6161));
+}
+
+#[test]
+fn a_failed_process_whose_pid_is_gone_is_not_a_reason_to_scan() {
+    // Failed is the phase that outlives its process; nothing advances it.
+    let mut app = test_app(&["feat+a"]);
+    with_process(
+        &mut app,
+        "feat+a",
+        Phase::Failed {
+            at: Utc::now(),
+            reason: "exited".into(),
+        },
+    );
+    assert!(!background::needs_advance(&app.state, |_| false));
+}
+
+#[test]
+fn the_gated_refresh_reads_a_quiet_state_as_is_and_advances_a_death() {
+    let (_dir, mut app) = app_with_logs(&["feat+a"]);
+    // A pid that is certainly this test's own, and one past any pid a
+    // system hands out.
+    let alive = std::process::id();
+    let dead = i32::MAX as u32 - 1;
+
+    with_process(&mut app, "feat+a", running_phase());
+    let record = app.state.worktrees.get_mut("feat+a").unwrap();
+    let process = record.processes.get_mut("dev").unwrap();
+    process.pid = alive;
+    // No group of that id: were the full refresh taken, nothing would
+    // answer for it, which is what makes the skip visible.
+    process.pgid = i32::MAX - 11;
+    std::fs::create_dir_all(app.paths.state_file().parent().unwrap()).unwrap();
+    crate::state::save(&app.paths.state_file(), &app.state).unwrap();
+    let quiet = background::refresh_if_needed(&app.paths);
+    assert_eq!(quiet.state, app.state);
+    assert!(quiet.warning.is_none());
+
+    let record = app.state.worktrees.get_mut("feat+a").unwrap();
+    record.processes.get_mut("dev").unwrap().pid = dead;
+    crate::state::save(&app.paths.state_file(), &app.state).unwrap();
+    let advanced = background::refresh_if_needed(&app.paths);
+    assert!(matches!(
+        advanced.state.worktrees["feat+a"].processes["dev"].phase,
+        Phase::Failed { .. }
+    ));
 }

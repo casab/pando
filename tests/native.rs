@@ -307,6 +307,48 @@ fn a_database_that_dies_comes_back_on_the_next_start_with_its_data() {
     assert_eq!(postgres::initdb_runs(&datadir), 1);
 }
 
+// A crashed database used to linger in state until the next mutation, so
+// `status` and the TUI went on reporting a service that was gone — on a
+// pid the kernel may since have handed to something else. The read path
+// forgets it, and says so once.
+#[test]
+fn a_database_that_dies_is_forgotten_by_the_next_read() {
+    let f = nat();
+    let name = new_worktree(&f, "feat/one");
+    start_isolated(&f, &name);
+    let before = f.service(&name, "postgres");
+    process::stop(before.pgid.unwrap(), Duration::from_secs(5)).unwrap();
+
+    let refreshed = actions::refresh(&f.paths);
+    let record = &refreshed.state.worktrees[&name];
+    assert!(
+        record.services.iter().all(|s| s.name != "postgres"),
+        "a dead database is still reported: {:?}",
+        record.services
+    );
+    assert!(
+        refreshed
+            .notices
+            .iter()
+            .any(|n| n.contains("postgres") && n.contains("exited")),
+        "{:?}",
+        refreshed.notices
+    );
+    assert!(
+        f.record(&name).services.is_empty(),
+        "and the forgetting is saved"
+    );
+    assert!(record.isolated, "the worktree is still an isolated one");
+    assert!(
+        actions::refresh(&f.paths).notices.is_empty(),
+        "said once, not on every tick"
+    );
+
+    // And the next start brings it back, as it always did.
+    start_isolated(&f, &name);
+    assert!(process::is_alive(f.service(&name, "postgres").pid.unwrap()));
+}
+
 // ---- what goes wrong ------------------------------------------------------
 
 #[test]
@@ -405,11 +447,20 @@ fn a_server_that_never_becomes_ready_fails_the_start_and_leaves_nothing_running(
     );
     assert!(e.contains("did not become ready"), "{e}");
     // The server it started is gone, and so is the claim that one is
-    // there. The data directory stays: it was initialised, and the next
-    // start adopts it rather than making a second one.
-    let service = f.service(&name, "db");
-    assert_eq!(service.pid, None);
-    assert_eq!(service.pgid, None);
+    // there: the worktree was switching to its own services and never got
+    // there, so it is left as the shared one it still is — no record of a
+    // service, no port for it, no remembered mode. The data directory
+    // stays: it was initialised, and the next start adopts it rather than
+    // making a second one.
+    let record = f.record(&name);
+    assert!(
+        record.services.is_empty(),
+        "no record of a service that is not there: {:?}",
+        record.services
+    );
+    assert!(!record.ports.contains_key("db"), "{:?}", record.ports);
+    assert!(!record.isolated);
+    assert!(f.datadir(&name, "db").exists());
     assert!(
         f.record(&name).processes.is_empty(),
         "the dev process was started behind a failed service"

@@ -87,9 +87,12 @@ Two traps worth knowing:
   command. The report is on stdout and is complete — there is no extra
   sentence on stderr. `doctor --json` exits the same way and puts the same
   verdict in `ok`, so a program never has to count severities.
-- `pando init --answers` can exit **1** rather than 2 for one kind of bad
-  answer: a `prelude` that fails its probe on this machine. It is a machine
-  fact rather than a shape error, and stderr says so.
+- `pando start` and `pando restart` wait for readiness only when stderr
+  is a terminal. From a script or an agent they return as soon as
+  everything is spawned, so exit 0 means "spawned", not "ready". Pass
+  `--wait` to block until every process is ready; a process that fails
+  while it waits exits **1**, with its reason and the closing lines of its
+  log on stderr.
 
 ## `pando signals`
 
@@ -367,8 +370,23 @@ UTC, and `null` when the line has none — it is not the time pando read it.
 `line` is the text with ANSI colour removed. `level` is pando's reading of
 the line, not the writer's: a line containing no level word is `info`.
 
-`--source` picks the log: `dev` by default, or a process name, a service
-name, or a hook name. `status --json` names every one a worktree has.
+`--source` picks the log: a process name, a service name, or a hook name.
+Without it, `dev` — or, for a worktree with no `dev` log and exactly one
+process, that process. A worktree with no `dev` log and several processes
+gets all of their logs merged into one stream, and then every line
+carries one more key, `source`, naming the process it came from:
+
+```jsonc
+{ "version": 2, "ts": null, "level": "info", "line": "listening on 17008", "source": "api" }
+```
+
+A read of one log — any `--source` — has no `source` key. `status --json`
+names every log a worktree has; pass `--source` rather than relying on
+the default.
+
+Every command that takes a worktree name also takes its branch: `feat/one`
+and `feat+one` name the same worktree. The JSON always carries the
+directory form, `feat+one`, in `name`.
 
 ## The decisions log
 
@@ -437,7 +455,7 @@ One JSON object. Keys are the question names above. Values:
 | `"some text"` | the option whose `value` is exactly that text, **or**, if nothing matches — or there were no options at all — a command of your own (where `allow_custom` is true) |
 | `["a", "b"]` | the set answer, at the one question where `multi` is true; every element must name an option |
 | `["a", "b"]` | the whole list, at `version_files` and `provision`, whose single answer is a list of files |
-| `null` | "none of them", where `allow_none` is true |
+| `null` | "none of them", where `allow_none` is true. At `schema_hook` it is "no": the step is written with `on = "never"` |
 | `[]` | "none of them" at the set question. A usage error anywhere else — `null` is how you say none |
 
 **Answers are by value, never by index.** An index breaks the day a rule
@@ -448,7 +466,8 @@ env key, the hook entry.
 
 Refusals, all exit 2 and all naming the key: a name that is not a question;
 a shape the question cannot take; a value that is not one of the options at
-a question that has them; an empty string. An answer for a slot that was
+a question that has them; an empty string; a `prelude` that fails its own
+probe on this machine, which is never written down. An answer for a slot that was
 already answered, or that nothing asked about, is **reported on stderr and
 not applied** — it is not an error, and the run still exits 0. A slot with
 no proposal at all is not "nothing asked about": it takes a custom answer,
@@ -456,4 +475,5 @@ except at `services` and `prelude`. See the three-state table above.
 
 `--dry-run` runs the same pass against copies of the files it would write
 and prints them on stdout, config first. Use it to show a diff before
-writing.
+writing. A question nothing answers is not a failure there: the slot is
+listed as `(unanswered)` and the dry run still exits 0.

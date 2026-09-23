@@ -226,22 +226,35 @@ fn app_default_port(
     from_example.or_else(|| rule.map(|r| r.default_port))
 }
 
-/// The env variable an app reads its port from, when its framework uses
-/// one: the rule's own name, else a `<APP>_PORT` key in the env example.
-fn app_port_env(signals: &Signals, app: &WorkspaceApp) -> Option<String> {
+/// The env variables an app reads its port from: a `<APP>_PORT` key the
+/// env example declares for it, and its framework's own variable.
+///
+/// The env example first, as the single-process rule has it — a project
+/// that wrote `WEB_PORT=3000` beside its web app has said how that app
+/// takes its port, and handing it `PORT` alone ignores that. Both are
+/// given when both exist: they carry the same port, so there is nothing
+/// for them to disagree about, and an app that reads either one works.
+fn app_port_env(signals: &Signals, app: &WorkspaceApp) -> Vec<String> {
+    let wanted = format!("{}_PORT", app.name.to_uppercase().replace('-', "_"));
+    let declared = signals.env_keys().any(|key| key == wanted);
+    let mut out: Vec<String> = Vec::new();
     match app.port {
-        PortMechanism::Env(name) => Some(name.to_string()),
         // The command already carries the port. A second way of saying it
         // is a second thing that can disagree.
-        PortMechanism::InCommand => None,
+        PortMechanism::InCommand => return out,
+        PortMechanism::Env(name) => {
+            if declared && wanted != name {
+                out.push(wanted);
+            }
+            out.push(name.to_string());
+        }
         PortMechanism::Ask => {
-            let wanted = format!("{}_PORT", app.name.to_uppercase().replace('-', "_"));
-            signals
-                .env_keys()
-                .any(|key| key == wanted)
-                .then_some(wanted)
+            if declared {
+                out.push(wanted);
+            }
         }
     }
+    out
 }
 
 /// Cross-references between apps, read out of the root env example.
@@ -318,18 +331,17 @@ pub(super) fn processes_proposal(root: &Path, signals: &Signals) -> Option<Propo
     // handed a reserved port it never hears about, and `advance_phases`
     // would wait thirty seconds for it to bind before calling a perfectly
     // healthy process failed — and the whole worktree with it.
-    let port_envs: Vec<Option<String>> =
-        apps.iter().map(|app| app_port_env(signals, app)).collect();
+    let port_envs: Vec<Vec<String>> = apps.iter().map(|app| app_port_env(signals, app)).collect();
     let owns_role: Vec<bool> = apps
         .iter()
         .zip(&port_envs)
-        .map(|(app, port_env)| app.port == PortMechanism::InCommand || port_env.is_some())
+        .map(|(app, port_env)| app.port == PortMechanism::InCommand || !port_env.is_empty())
         .collect();
     let references = cross_references(signals, &apps, &owns_role);
     let mut processes: BTreeMap<String, ProcessConfig> = BTreeMap::new();
     for ((app, port_env), owns_role) in apps.iter().zip(&port_envs).zip(&owns_role) {
         let mut env: BTreeMap<String, String> = BTreeMap::new();
-        if let Some(var) = port_env {
+        for var in port_env {
             env.insert(var.clone(), format!("{{port:{}}}", app.name));
         }
         for (target, key, template) in &references {
@@ -364,9 +376,20 @@ pub(super) fn processes_proposal(root: &Path, signals: &Signals) -> Option<Propo
         .map(|app| format!("{}: {} in {}", app.name, app.cmd, app.dir))
         .collect::<Vec<_>>()
         .join("; ");
+    // The env example's own port variables, named in the evidence, so the
+    // question says where they came from.
+    let declared: Vec<String> = apps
+        .iter()
+        .map(|app| format!("{}_PORT", app.name.to_uppercase().replace('-', "_")))
+        .filter(|key| signals.env_keys().any(|k| k == key))
+        .collect();
+    let mut why = format!("a dev script in each of {} workspace apps", apps.len());
+    if !declared.is_empty() {
+        why.push_str(&format!("; {} in the env example", declared.join(" and ")));
+    }
     let mut candidates = vec![Candidate {
         value: summary,
-        why: format!("a dev script in each of {} workspace apps", apps.len()),
+        why,
         processes: Some(processes),
         ..Candidate::default()
     }];

@@ -122,7 +122,8 @@ pub fn share_with(
     // Outside the lock, because `refresh` takes it: a worktree `start`
     // returned from a moment ago is still `Starting`, and refusing it is
     // refusing the first thing anyone types.
-    await_share_target(paths, name, progress);
+    let shown = worktree.display_name();
+    await_share_target(paths, name, &shown, progress);
 
     // Every refusal first, and the proxy's port, under the lock.
     let (target_port, share_port) = {
@@ -137,7 +138,7 @@ pub fn share_with(
         let record = store
             .worktrees
             .get(name)
-            .with_context(|| format!("pando has no record of {name} — start it first"))?;
+            .with_context(|| format!("pando has no record of {shown} — start it first"))?;
         if let Some(existing) = &record.share {
             return Ok(ShareOutcome {
                 name: name.to_string(),
@@ -146,7 +147,7 @@ pub fn share_with(
                 already: true,
             });
         }
-        let target_port = share_target_port(name, record)?;
+        let target_port = share_target_port(&shown, record)?;
         // Only when something will actually listen on it. A worktree that
         // is shared without an auth command needs no proxy and no port.
         let share_port = match config.share.auth_cmd {
@@ -220,7 +221,7 @@ pub fn share_with(
     let mut store = state::load(&paths.state_file())?;
     let Some(existing_record) = store.worktrees.get(name) else {
         let _ = tunnel::stop_share(&record);
-        bail!("{name} was removed while its tunnel was starting; the tunnel was closed again");
+        bail!("{shown} was removed while its tunnel was starting; the tunnel was closed again");
     };
     if let Some(won) = &existing_record.share {
         let public_url = won.public_url.clone();
@@ -233,10 +234,10 @@ pub fn share_with(
             already: true,
         });
     }
-    if let Err(e) = share_target_port(name, existing_record) {
+    if let Err(e) = share_target_port(&shown, existing_record) {
         let _ = tunnel::stop_share(&record);
         return Err(e.context(format!(
-            "{name} stopped while its tunnel was starting; the tunnel was closed again"
+            "{shown} stopped while its tunnel was starting; the tunnel was closed again"
         )));
     }
     store.worktrees.get_mut(name).expect("just read").share = Some(record.clone());
@@ -356,12 +357,12 @@ const SHARE_READY_POLL: Duration = Duration::from_millis(250);
 /// budget runs out, and whatever the state is then goes through the same
 /// refusals as before. `refresh` is a read path — it signals, it never
 /// spawns — so polling it is safe from here.
-fn await_share_target(paths: &PandoPaths, name: &str, progress: &dyn Fn(&str)) {
+fn await_share_target(paths: &PandoPaths, name: &str, shown: &str, progress: &dyn Fn(&str)) {
     let Some(budget) = share_ready_budget(&refresh(paths).state, name) else {
         return;
     };
     progress(&format!(
-        "waiting up to {}s for {name} to be ready",
+        "waiting up to {}s for {shown} to be ready",
         budget.as_secs().max(1)
     ));
     let deadline = Instant::now() + budget;
@@ -378,7 +379,7 @@ fn await_share_target(paths: &PandoPaths, name: &str, progress: &dyn Fn(&str)) {
 ///
 /// The budget `advance_phases` itself uses, so the wait ends when that
 /// function gives up rather than a moment before or a minute after.
-fn share_ready_budget(store: &state::State, name: &str) -> Option<Duration> {
+pub(super) fn share_ready_budget(store: &state::State, name: &str) -> Option<Duration> {
     let record = store.worktrees.get(name)?;
     let starting = |p: &state::ProcessRecord| match p.phase {
         Phase::Starting { since } => Some((p.ready_timeout_s, since)),
@@ -397,9 +398,16 @@ fn share_ready_budget(store: &state::State, name: &str) -> Option<Duration> {
             record.processes.values().find_map(starting)?
         }
     };
-    let budget = timeout_s
-        .map(|s| s as i64)
-        .unwrap_or(state::START_TIMEOUT_SECS);
+    // The window *and* the grace an unanswerable port scan earns, because
+    // that is how long the phase can really stay `Starting`. The wait still
+    // ends as soon as the phase changes, so a conclusive scan costs
+    // nothing extra; the window alone gave up on a healthy server whose
+    // scan was merely slow.
+    let budget = state::longest_starting_secs(
+        timeout_s
+            .map(|s| s as i64)
+            .unwrap_or(state::START_TIMEOUT_SECS),
+    );
     let left = budget - Utc::now().signed_duration_since(since).num_seconds();
     Some(Duration::from_secs(left.max(0) as u64) + SHARE_READY_POLL)
 }

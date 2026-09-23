@@ -5,12 +5,14 @@ use super::JSON_VERSION;
 use super::ellipsize;
 use super::ls::COL_GAP;
 use super::ls::ProjectOut;
+use super::ls::display_name;
 use super::ls::terminal_width;
 use super::report_refresh;
 use crate::actions;
 use crate::actions::worktree_url;
 use crate::paths::PandoPaths;
 use crate::state::{Phase, ProcessRecord, WorktreeRecord};
+use crate::term::{Paint, Style};
 use crate::worktree::Worktree;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -151,7 +153,7 @@ pub fn status_json<W: Write>(paths: &PandoPaths, only: Option<&str>, out: &mut W
                         proxy_port: share.proxy_port,
                         since: share.started_at,
                     }),
-                    services: actions::service_statuses(record)
+                    services: actions::recorded_service_statuses(record)
                         .into_iter()
                         .map(|status| {
                             let recorded = record.services.iter().find(|s| s.name == status.name);
@@ -208,7 +210,7 @@ pub fn status_json<W: Write>(paths: &PandoPaths, only: Option<&str>, out: &mut W
 }
 
 pub fn status_text<W: Write>(paths: &PandoPaths, only: Option<&str>, out: &mut W) -> Result<()> {
-    status_text_at(paths, only, out, terminal_width())
+    status_text_with(paths, only, out, terminal_width(), &Style::for_stdout())
 }
 
 /// [`status_text`] at a given terminal width, so the shedding is testable
@@ -219,9 +221,68 @@ pub fn status_text_at<W: Write>(
     out: &mut W,
     width: usize,
 ) -> Result<()> {
+    status_text_with(paths, only, out, width, &Style::plain())
+}
+
+/// The phase words, and what each looks like on a terminal. Painted after
+/// a line is fitted, so colour never counts against its width.
+const PAINTED_WORDS: [(&str, Paint); 7] = [
+    ("running", Paint::Good),
+    ("up", Paint::Good),
+    ("public", Paint::Good),
+    ("starting", Paint::Warn),
+    ("failed", Paint::Bad),
+    ("down", Paint::Bad),
+    ("stopped", Paint::Faint),
+];
+
+/// `line` with its phase words and its URLs painted, token by token.
+fn paint_line(line: &str, style: &Style) -> String {
+    if !style.color() {
+        return line.to_string();
+    }
+    line.split(' ')
+        .map(|token| {
+            if token.starts_with("http://") || token.starts_with("https://") {
+                return style.paint(token, Paint::Link);
+            }
+            match PAINTED_WORDS.iter().find(|(word, _)| *word == token) {
+                Some((_, paint)) => style.paint(token, *paint),
+                None => token.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn status_text_with<W: Write>(
+    paths: &PandoPaths,
+    only: Option<&str>,
+    out: &mut W,
+    width: usize,
+    style: &Style,
+) -> Result<()> {
+    let mut plain: Vec<u8> = Vec::new();
+    status_lines(paths, only, &mut plain, width)?;
+    for line in String::from_utf8_lossy(&plain).lines() {
+        writeln!(out, "{}", paint_line(line, style))?;
+    }
+    Ok(())
+}
+
+fn status_lines<W: Write>(
+    paths: &PandoPaths,
+    only: Option<&str>,
+    out: &mut W,
+    width: usize,
+) -> Result<()> {
     let refreshed = actions::refresh(paths);
     report_refresh(&refreshed);
-    let worktrees = actions::ls(paths)?;
+    // Only the worktrees that will be shown are enriched: a `git status`
+    // apiece, and `status <name>` shows one.
+    let mut worktrees = crate::worktree::discover(&paths.project)?;
+    worktrees.retain(|w| only.is_none_or(|name| w.name == name));
+    crate::worktree::enrich_from_git(&mut worktrees, paths.root()).ok();
     let shown: Vec<&Worktree> = worktrees
         .iter()
         .filter(|w| only.is_none_or(|name| w.name == name))
@@ -233,9 +294,11 @@ pub fn status_text_at<W: Write>(
         }
         return Ok(());
     }
+    // Named as `ls` names them: by branch, where the directory is the
+    // branch spelled for a filesystem.
     let names = shown
         .iter()
-        .map(|w| w.name.chars().count())
+        .map(|w| display_name(w).chars().count())
         .max()
         .unwrap_or(4);
     for w in shown {
@@ -243,7 +306,7 @@ pub fn status_text_at<W: Write>(
         writeln!(
             out,
             "{:<names$}  {}",
-            w.name,
+            display_name(w),
             worktree_line(record, width.saturating_sub(names + COL_GAP))
         )?;
         // One line per process under it, so a worktree that is `failed`

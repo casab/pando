@@ -309,10 +309,28 @@ pub fn prelude_origin(paths: &PandoPaths) -> Option<PathBuf> {
 }
 
 fn declares_prelude(path: &Path) -> bool {
+    declares(path, "runtime", "prelude")
+}
+
+/// Which layer's file sets `[project].install`, highest precedence first:
+/// the file a failed install has to be fixed in. pando's own when none of
+/// them says, since that is where an answer would be written.
+pub fn install_origin(paths: &PandoPaths) -> PathBuf {
+    [
+        Layer::Project.file(paths),
+        Layer::User.file(paths),
+        paths.root().join("pando.toml"),
+    ]
+    .into_iter()
+    .find(|path| declares(path, "project", "install"))
+    .unwrap_or_else(|| Layer::Project.file(paths))
+}
+
+fn declares(path: &Path, table: &str, key: &str) -> bool {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|text| toml::from_str::<Table>(&text).ok())
-        .and_then(|table| Some(table.get("runtime")?.get("prelude").is_some()))
+        .and_then(|t| Some(t.get(table)?.get(key).is_some()))
         .unwrap_or(false)
 }
 

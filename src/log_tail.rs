@@ -850,7 +850,22 @@ impl LogTail {
 
         let added = !parts.is_empty();
         let mut cursor = self.line_start_offset;
-        for line in parts {
+        // Lines that could not survive this very poll — more arrived than
+        // the buffer holds — are counted but never parsed: parsing is the
+        // whole cost of opening a large log, and they would be evicted
+        // before anything could show them. Everything already buffered
+        // goes with them, as pushing would have evicted it.
+        let unseen = parts.len().saturating_sub(self.capacity);
+        if unseen > 0 {
+            self.evicted_levels
+                .extend(self.buffer.drain(..).map(|line| line.level));
+            self.open_block = None;
+            for line in &parts[..unseen] {
+                cursor += line.len() as u64 + 1;
+            }
+            self.lines_seen += unseen as u64;
+        }
+        for line in parts.into_iter().skip(unseen) {
             self.push_line(line, cursor);
             cursor += line.len() as u64 + 1;
         }

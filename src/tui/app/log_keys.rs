@@ -4,13 +4,14 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::text::Line;
 
 use crate::actions;
-use crate::log_tail::{LogLevel, colorize_json};
+use crate::log_tail::{LogLevel, LogTail, colorize_json};
 
 use super::dialogs::Modal;
 use super::log_view::{
     LineInspect, LogView, SearchMode, SearchState, block_bounds, error_ranks, filtered_rank,
     first_url, inspect_content, joined_block, recompute_matches, step_match,
 };
+use super::merged::{ALL_SOURCE, MergedTail, ViewTail};
 use super::{App, View};
 
 impl App {
@@ -49,6 +50,33 @@ impl App {
         ordered
     }
 
+    /// The viewer's tabs: [`App::log_sources`], led by `all` when more
+    /// than one process has a log to merge.
+    pub fn viewer_sources(&self, name: &str) -> Vec<String> {
+        let mut sources = self.log_sources(name);
+        if self.process_sources(name, &sources).len() > 1
+            && !sources.iter().any(|s| s == ALL_SOURCE)
+        {
+            sources.insert(0, ALL_SOURCE.to_string());
+        }
+        sources
+    }
+
+    /// Which of `sources` are processes — configured, or running under a
+    /// record — rather than hooks or a tunnel: what `all` merges.
+    fn process_sources(&self, name: &str, sources: &[String]) -> Vec<String> {
+        let running = self.record_for(name).map(|r| &r.processes);
+        sources
+            .iter()
+            .filter(|s| s.as_str() != ALL_SOURCE)
+            .filter(|s| {
+                self.config.processes.contains_key(s.as_str())
+                    || running.is_some_and(|p| p.contains_key(s.as_str()))
+            })
+            .cloned()
+            .collect()
+    }
+
     /// The sources config accounts for, in the order they belong in:
     /// processes, then hooks (pando's own install hook first).
     fn known_sources(&self) -> Vec<String> {
@@ -85,21 +113,39 @@ impl App {
         let Some(name) = self.selected_name() else {
             return;
         };
-        let available = self.log_sources(&name);
+        let available = self.viewer_sources(&name);
         let tailed = self.tail_target().map(|(_, process, _)| process);
         let source = tailed
             .clone()
             .filter(|process| available.contains(process))
-            .or_else(|| available.first().cloned())
+            .or_else(|| {
+                // Not `all` by default: it is the first tab, one key away,
+                // and a single process's log is what a reader coming from
+                // one row expects.
+                available.iter().find(|s| s.as_str() != ALL_SOURCE).cloned()
+            })
             .or(tailed)
             .unwrap_or_else(|| crate::detect::DEV.to_string());
         self.open_log_source(name, source, available);
     }
 
     fn open_log_source(&mut self, name: String, source: String, available: Vec<String>) {
-        let path = self.paths.log_file(&name, &source);
+        let tail = if source == ALL_SOURCE {
+            let merged = self
+                .process_sources(&name, &available)
+                .into_iter()
+                .map(|process| {
+                    let path = self.paths.log_file(&name, &process);
+                    (process, path)
+                })
+                .collect();
+            ViewTail::All(MergedTail::new(merged, super::LOG_VIEWER_CAPACITY))
+        } else {
+            let path = self.paths.log_file(&name, &source);
+            ViewTail::One(LogTail::new(path, super::LOG_VIEWER_CAPACITY))
+        };
         self.inspect = None;
-        self.view = View::Log(Box::new(LogView::new(name, source, available, path)));
+        self.view = View::Log(Box::new(LogView::new(name, source, available, tail)));
     }
 
     pub fn close_log_viewer(&mut self) {
@@ -109,6 +155,25 @@ impl App {
 
     /// Next (or previous) tab. The list is the one the last paint read off
     /// disk, so no key handler goes to the filesystem.
+    /// The tab a digit names, counted from one as the tabs are labelled.
+    /// A digit past the last tab does nothing.
+    fn jump_to_log_source(&mut self, number: usize) {
+        let Some(view) = self.log_view() else { return };
+        let Some(source) = number
+            .checked_sub(1)
+            .and_then(|at| view.available.get(at))
+            .cloned()
+        else {
+            return;
+        };
+        if source == view.source {
+            return;
+        }
+        let name = view.name.clone();
+        let available = view.available.clone();
+        self.open_log_source(name, source, available);
+    }
+
     fn switch_log_source(&mut self, delta: isize) {
         let Some(view) = self.log_view() else { return };
         if view.available.len() < 2 {
@@ -149,25 +214,12 @@ impl App {
             return;
         }
 
-        // A digit builds a count prefix and does nothing else. A leading
-        // zero is not a count, so `0` stays free.
-        if let KeyCode::Char(c @ '0'..='9') = key.code {
-            if let Some(view) = self.log_view_mut() {
-                let digit = c as usize - '0' as usize;
-                if digit > 0 || view.count_prefix.is_some() {
-                    let current = view.count_prefix.unwrap_or(0);
-                    view.count_prefix = Some((current * 10 + digit).min(99_999));
-                }
-            }
+        // A digit is a tab: the tabs are numbered, and `2` is what a
+        // reader presses to see the second one.
+        if let KeyCode::Char(c @ '1'..='9') = key.code {
+            self.jump_to_log_source(c as usize - '0' as usize);
             return;
         }
-        let (has_count, count) = match self.log_view_mut() {
-            Some(view) => {
-                let taken = view.count_prefix.take();
-                (taken.is_some(), taken.unwrap_or(1))
-            }
-            None => return,
-        };
 
         // Keys that act on the app rather than on the viewport.
         match key.code {
@@ -213,7 +265,7 @@ impl App {
                     // The viewer paints full screen, so the header that
                     // normally carries a confirmation is not there: the
                     // footer says it instead, and expires like any status.
-                    self.set_status("✓ copied line");
+                    self.set_success("copied line");
                 }
                 return;
             }
@@ -221,7 +273,7 @@ impl App {
                 match self.current_log_line().as_deref().and_then(first_url) {
                     Some(url) => {
                         self.copy_to_clipboard(&url);
-                        self.set_status(format!("✓ copied {url}"));
+                        self.set_success(format!("copied {url}"));
                     }
                     None => self.set_status("no URL on this line"),
                 }
@@ -248,7 +300,7 @@ impl App {
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
                 if !view.follow {
-                    view.cursor = view.cursor.saturating_add(count).min(last_rank);
+                    view.cursor = view.cursor.saturating_add(1).min(last_rank);
                 }
             }
             KeyCode::Char('k') | KeyCode::Up => {
@@ -256,22 +308,22 @@ impl App {
                     // Breaking follow puts the cursor where it visibly was:
                     // on the last line, moving up from there.
                     view.follow = false;
-                    view.cursor = last_rank.saturating_sub(count);
+                    view.cursor = last_rank.saturating_sub(1);
                 } else {
-                    view.cursor = view.cursor.saturating_sub(count);
+                    view.cursor = view.cursor.saturating_sub(1);
                 }
             }
             KeyCode::Char('d') if ctrl => {
                 if !view.follow {
-                    view.cursor = view.cursor.saturating_add(count * page).min(last_rank);
+                    view.cursor = view.cursor.saturating_add(page).min(last_rank);
                 }
             }
             KeyCode::Char('u') if ctrl => {
                 if view.follow {
                     view.follow = false;
-                    view.cursor = last_rank.saturating_sub(count * page);
+                    view.cursor = last_rank.saturating_sub(page);
                 } else {
-                    view.cursor = view.cursor.saturating_sub(count * page);
+                    view.cursor = view.cursor.saturating_sub(page);
                 }
             }
             KeyCode::Char('g') | KeyCode::Home => {
@@ -279,27 +331,17 @@ impl App {
                 view.scroll = 0;
                 view.follow = false;
             }
-            KeyCode::Char('G') => {
-                if has_count {
-                    // `<n>G` is vim's "go to line n", one-based.
-                    view.cursor = count.saturating_sub(1).min(last_rank);
-                    view.scroll = view.cursor;
-                    view.follow = false;
-                } else {
-                    view.follow = true;
-                    view.new_below = 0;
-                }
-            }
-            // An alias of bare G, because the list binds End to "last".
-            KeyCode::End => {
+            // `End` too, because the list binds it to "last".
+            KeyCode::Char('G') | KeyCode::End => {
                 view.follow = true;
                 view.new_below = 0;
             }
-            // Jump to the next (E) or previous (e) error, relative to the
-            // cursor, so repeated presses walk the list rather than
-            // re-finding the same line.
-            KeyCode::Char('E') | KeyCode::Char('e') => {
-                let forward = matches!(key.code, KeyCode::Char('E'));
+            // Jump to the next (e) or previous (E) error — lowercase
+            // forward, as `n`/`N` are — relative to the cursor, so
+            // repeated presses walk the list rather than re-finding the
+            // same line.
+            KeyCode::Char('e') | KeyCode::Char('E') => {
+                let forward = matches!(key.code, KeyCode::Char('e'));
                 let targets = error_ranks(view);
                 if !targets.is_empty() {
                     let from = if view.follow { last_rank } else { view.cursor };
@@ -333,13 +375,13 @@ impl App {
             // Any modifier: ctrl-n is the same "next match" as n, which is
             // what a reader's fingers reach for either way.
             KeyCode::Char('n') if view.search_mode == SearchMode::Active => {
-                step_match(view, true, count, viewer_height);
+                step_match(view, true, viewer_height);
             }
             KeyCode::Char('N') if view.search_mode == SearchMode::Active => {
-                step_match(view, false, count, viewer_height);
+                step_match(view, false, viewer_height);
             }
             KeyCode::Char('p') if ctrl && view.search_mode == SearchMode::Active => {
-                step_match(view, false, count, viewer_height);
+                step_match(view, false, viewer_height);
             }
             KeyCode::Char('f') => {
                 view.log_filter = view.log_filter.cycle();
@@ -403,7 +445,7 @@ impl App {
             let count = text.lines().count();
             self.copy_to_clipboard(&text);
             let unit = if count == 1 { "line" } else { "lines" };
-            self.set_status(format!("✓ copied {count} {unit}"));
+            self.set_success(format!("copied {count} {unit}"));
         }
     }
 
@@ -422,7 +464,7 @@ impl App {
         let (text, lines) = match parsed.block_id {
             Some(id) => {
                 let (start, end) = block_bounds(buffer, at, id);
-                let joined = joined_block(buffer, start, end);
+                let joined = joined_block(buffer, start, end, |plain| view.tail.unprefixed(plain));
                 match serde_json::from_str::<serde_json::Value>(&joined)
                     .ok()
                     .and_then(|value| serde_json::to_string_pretty(&value).ok())
@@ -461,7 +503,11 @@ impl App {
     fn current_log_line(&self) -> Option<String> {
         let at = self.current_log_index()?;
         let view = self.log_view()?;
-        view.tail.lines().get(at).map(|parsed| parsed.plain.clone())
+        // Without the `all` tab's `api │ `: what is copied is the line.
+        view.tail
+            .lines()
+            .get(at)
+            .map(|parsed| view.tail.unprefixed(&parsed.plain).to_string())
     }
 
     /// The buffer index of the line the viewer calls "current": the one
@@ -526,7 +572,7 @@ impl App {
         // turns that into a live tail the moment the process writes its
         // first line, instead of a pane that says `no log file for this
         // source yet` until it is reopened.
-        let exists = view.tail.path().exists();
+        let exists = view.tail.exists();
         let mut changed = false;
         if view.missing {
             if !exists {

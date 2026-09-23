@@ -115,6 +115,7 @@ pub fn custom(slot: Slot, value: &str) -> Candidate {
             cmd: value.to_string(),
             cwd: None,
             fallback: None,
+            on: Some(crate::config::HookScope::Isolated),
         }),
         preselected: false,
         // A list the developer typed is a list of files they have. Seeding
@@ -339,6 +340,9 @@ pub fn array_edits(
                 ));
             }
             entries.push(("cmd".to_string(), hook.cmd.clone().into()));
+            if let Some(on) = hook.on {
+                entries.push(("on".to_string(), on.as_str().into()));
+            }
         }
         _ => return None,
     }
@@ -545,4 +549,58 @@ pub(super) fn dedup_by_value(candidates: &mut Vec<Candidate>) {
         seen.push(c.value.clone());
         true
     });
+}
+
+/// The TOML an answer would be, ready to paste: what pando would write for
+/// the first option, or the slot's key with a placeholder when the rules
+/// offered nothing.
+///
+/// Built from [`edits`] and [`array_edits`] — the same functions that
+/// write the answer — so the snippet a question prints cannot drift from
+/// the file an answer produces.
+pub fn snippet(slot: Slot, chosen: &[&Candidate]) -> String {
+    let mut doc = toml_edit::DocumentMut::new();
+    if let Some((array, entries)) = array_edits(slot, chosen) {
+        let mut table = toml_edit::Table::new();
+        for (key, value) in entries {
+            table.insert(&key, toml_edit::value(value));
+        }
+        let mut tables = toml_edit::ArrayOfTables::new();
+        tables.push(table);
+        doc.insert(array, toml_edit::Item::ArrayOfTables(tables));
+        return doc.to_string();
+    }
+    let edits: Vec<Edit> = match chosen.first() {
+        Some(candidate) => edits(slot, candidate),
+        None => match slot.key() {
+            Some((table, key)) => vec![Edit {
+                table: table.iter().map(|t| t.to_string()).collect(),
+                key: key.to_string(),
+                value: match slot.is_list() {
+                    true => toml_edit::Value::Array(toml_edit::Array::from_iter([format!(
+                        "<{}>",
+                        slot.custom_noun()
+                    )])),
+                    false => format!("<{}>", slot.custom_noun()).into(),
+                },
+            }],
+            None => Vec::new(),
+        },
+    };
+    for edit in edits {
+        let mut table = doc.as_table_mut();
+        for (depth, name) in edit.table.iter().enumerate() {
+            let item = table
+                .entry(name)
+                .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+            let next = item
+                .as_table_mut()
+                .expect("every table on an edit's path is a table");
+            // `[processes.web]` rather than an empty `[processes]` above it.
+            next.set_implicit(depth + 1 < edit.table.len());
+            table = next;
+        }
+        table.insert(&edit.key, toml_edit::value(edit.value));
+    }
+    doc.to_string()
 }

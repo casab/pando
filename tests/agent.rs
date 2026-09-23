@@ -550,7 +550,22 @@ fn a_recorded_answers_file_configures_every_hard_shape() {
             );
         }
 
-        // And then the proof, which is the point of the whole pass.
+        // And then the proof, which is the point of the whole pass. doctor
+        // asks the Docker daemon whether it is up, and whether this
+        // laptop's is running is not what the corpus is about: the shim
+        // pando runs in place of docker answers `info` itself and hands
+        // everything else to the real one.
+        let shim = fx.home.join("bin").join("docker");
+        std::fs::create_dir_all(shim.parent().unwrap()).unwrap();
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\n[ \"$1\" = info ] && { echo 27.0.0; exit 0; }\nexec docker \"$@\"\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let doctor = fx.pando(&["doctor", "--json"], None);
         let report: serde_json::Value =
             serde_json::from_str(&String::from_utf8_lossy(&doctor.stdout))

@@ -1,33 +1,64 @@
 //! `ls`: the worktree table, fitted to the terminal, and its JSON.
 
 use super::JSON_VERSION;
-use super::ellipsize;
 use super::report_refresh;
 use super::short_head;
 use super::warn_about;
 use crate::actions;
+use crate::actions::worktree_url;
 use crate::cache;
 use crate::paths::PandoPaths;
-use crate::state::WorktreeRecord;
+use crate::state::{Aggregate, WorktreeRecord};
+use crate::term::{Paint, Style, ellipsize_distinct};
 use crate::worktree::{PrState, Worktree};
 use anyhow::Result;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::io::Write;
 
-pub fn ls_text<W: Write>(paths: &PandoPaths, out: &mut W) -> Result<()> {
-    ls_text_at(paths, out, terminal_width())
+/// How the text listing is drawn.
+#[derive(Debug, Clone)]
+pub struct LsView {
+    /// Columns available; `usize::MAX` when stdout is not a terminal.
+    pub width: usize,
+    /// `-l`: add the sha and the full path.
+    pub long: bool,
+    pub style: Style,
+}
+
+impl LsView {
+    /// No colour, no `~`, the default columns: what the tests read.
+    pub fn plain(width: usize) -> Self {
+        Self {
+            width,
+            long: false,
+            style: Style::plain(),
+        }
+    }
+}
+
+/// The listing for a person at a terminal: its width, its colour, `~`.
+pub fn ls_text<W: Write>(paths: &PandoPaths, out: &mut W, long: bool) -> Result<()> {
+    let view = LsView {
+        width: terminal_width(),
+        long,
+        style: Style::for_stdout(),
+    };
+    ls_text_with(paths, out, &view)
 }
 
 /// Columns of the text listing, in the order they are printed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Col {
     Name,
+    Status,
+    Url,
+    Ports,
+    Mode,
+    Public,
+    Git,
     Branch,
     Head,
-    State,
-    Ports,
-    Status,
     Path,
 }
 
@@ -35,58 +66,130 @@ impl Col {
     fn header(self) -> &'static str {
         match self {
             Col::Name => "NAME",
+            Col::Status => "STATUS",
+            Col::Url => "URL",
+            Col::Ports => "PORTS",
+            Col::Mode => "MODE",
+            Col::Public => "PUBLIC",
+            Col::Git => "GIT",
             Col::Branch => "BRANCH",
             Col::Head => "HEAD",
-            Col::State => "STATE",
-            Col::Ports => "PORTS",
-            Col::Status => "STATUS",
             Col::Path => "PATH",
         }
     }
 }
 
-/// Every column except the name, in the order they are dropped as the
-/// terminal narrows. The name is the identifier, so it never goes; what a
-/// worktree is *doing* outlives what git thinks of it, because that is the
-/// question this listing exists to answer.
-const SHED_ORDER: [Col; 6] = [
+pub(super) const ORDER: [Col; 10] = [
+    Col::Name,
+    Col::Status,
+    Col::Url,
+    Col::Ports,
+    Col::Mode,
+    Col::Public,
+    Col::Git,
+    Col::Branch,
     Col::Head,
     Col::Path,
-    Col::Branch,
-    Col::State,
-    Col::Ports,
-    Col::Status,
 ];
 
-pub(super) const ORDER: [Col; 7] = [
-    Col::Name,
-    Col::Branch,
-    Col::Head,
-    Col::State,
-    Col::Ports,
-    Col::Status,
-    Col::Path,
+/// What a narrowing terminal gives up, in order. The name is the
+/// identifier and the status is the question the listing exists to
+/// answer, so neither ever goes; the URL is what somebody came to copy, so
+/// it outlives everything but them. A public URL is first shortened to
+/// `yes` rather than dropped: that it is public is the fact that matters,
+/// and `pando status` has the address. A long name is cut to a readable
+/// width before the ports and the URL go, and only cut further after.
+const SHED_ORDER: [Shed; 12] = [
+    Shed::Drop(Col::Path),
+    Shed::Drop(Col::Head),
+    Shed::Compact(Col::Public),
+    Shed::Drop(Col::Branch),
+    Shed::Drop(Col::Mode),
+    Shed::Drop(Col::Git),
+    Shed::NameTo(NAME_READABLE),
+    Shed::Drop(Col::Ports),
+    Shed::Drop(Col::Public),
+    Shed::NameTo(NAME_SHORT),
+    Shed::Drop(Col::Url),
+    Shed::NameTo(NAME_FLOOR),
 ];
+
+/// One step of fitting the listing to a terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shed {
+    Drop(Col),
+    /// Swap the column for its short form.
+    Compact(Col),
+    /// Cut the name column by as much as the row is over, to no less than
+    /// this.
+    NameTo(usize),
+}
 
 /// Two spaces between columns, so a value with a space in it still reads as
 /// one cell.
 pub(super) const COL_GAP: usize = 2;
 
-/// Which columns fit in `width`. Dropping is all-or-nothing per column, so
-/// every column keeps one straight edge.
+/// How far a name is cut before anything that matters goes: enough of a
+/// branch name to tell it from its neighbours.
+const NAME_READABLE: usize = 24;
+
+/// How far a name is cut to keep the URL.
+const NAME_SHORT: usize = 16;
+
+/// The narrowest a name is ever cut to.
+const NAME_FLOOR: usize = 12;
+
+/// Which columns fit in `width`, given each column's width. Dropping is
+/// all-or-nothing per column, so every column keeps one straight edge.
 pub fn keep_columns(width: usize, widths: &BTreeMap<Col, usize>) -> Vec<Col> {
-    let mut kept: Vec<Col> = ORDER
-        .iter()
-        .copied()
-        .filter(|c| widths.contains_key(c))
-        .collect();
-    for candidate in SHED_ORDER {
-        if row_width(&kept, widths) <= width {
+    fit(width, widths, &BTreeMap::new()).kept
+}
+
+/// What fitting decided.
+#[derive(Debug)]
+struct Fit {
+    kept: Vec<Col>,
+    /// Columns swapped for their short form.
+    compacted: Vec<Col>,
+    /// Every column's width, with the short forms and the name's cut in.
+    widths: BTreeMap<Col, usize>,
+}
+
+/// [`keep_columns`], with the short forms some columns have, and the name
+/// allowed to be cut.
+fn fit(width: usize, widths: &BTreeMap<Col, usize>, compact: &BTreeMap<Col, usize>) -> Fit {
+    let mut fit = Fit {
+        kept: ORDER
+            .iter()
+            .copied()
+            .filter(|c| widths.contains_key(c))
+            .collect(),
+        compacted: Vec::new(),
+        widths: widths.clone(),
+    };
+    for step in SHED_ORDER {
+        let over = row_width(&fit.kept, &fit.widths).saturating_sub(width);
+        if over == 0 {
             break;
         }
-        kept.retain(|c| *c != candidate);
+        match step {
+            Shed::Drop(col) => fit.kept.retain(|c| *c != col),
+            Shed::Compact(col) => {
+                if let Some(short) = compact.get(&col)
+                    && fit.kept.contains(&col)
+                {
+                    fit.compacted.push(col);
+                    fit.widths.insert(col, *short);
+                }
+            }
+            Shed::NameTo(floor) => {
+                if let Some(name) = fit.widths.get_mut(&Col::Name) {
+                    *name = (*name).min(name.saturating_sub(over).max(floor));
+                }
+            }
+        }
     }
-    kept
+    fit
 }
 
 fn row_width(kept: &[Col], widths: &BTreeMap<Col, usize>) -> usize {
@@ -110,9 +213,44 @@ pub(super) fn terminal_width() -> usize {
         .unwrap_or(80)
 }
 
+/// One cell: its text, and how it is painted on a terminal.
+#[derive(Debug, Clone)]
+struct Cell {
+    text: String,
+    paint: Option<Paint>,
+}
+
+impl Cell {
+    fn new(text: impl Into<String>, paint: Option<Paint>) -> Self {
+        Self {
+            text: text.into(),
+            paint,
+        }
+    }
+
+    fn dash() -> Self {
+        Self::new("-", Some(Paint::Faint))
+    }
+
+    fn width(&self) -> usize {
+        self.text.chars().count()
+    }
+}
+
+/// [`ls_text_with`] in the plain view at `width`.
 pub fn ls_text_at<W: Write>(paths: &PandoPaths, out: &mut W, width: usize) -> Result<()> {
-    let worktrees = actions::ls(paths)?;
-    let refreshed = actions::refresh(paths);
+    ls_text_with(paths, out, &LsView::plain(width))
+}
+
+pub fn ls_text_with<W: Write>(paths: &PandoPaths, out: &mut W, view: &LsView) -> Result<()> {
+    // The listing forks git and the refresh scans sockets; neither needs
+    // the other, so they run side by side.
+    let (worktrees, refreshed) = std::thread::scope(|scope| {
+        let refreshing = scope.spawn(|| actions::refresh(paths));
+        let worktrees = actions::ls(paths);
+        (worktrees, refreshing.join().unwrap_or_default())
+    });
+    let worktrees = worktrees?;
     report_refresh(&refreshed);
     let owned = actions::ownership(&refreshed.state, &worktrees);
     if worktrees.is_empty() {
@@ -120,118 +258,230 @@ pub fn ls_text_at<W: Write>(paths: &PandoPaths, out: &mut W, width: usize) -> Re
         return Ok(());
     }
 
-    let rows: Vec<BTreeMap<Col, String>> = worktrees
+    let records: Vec<Option<&WorktreeRecord>> = worktrees
         .iter()
-        .map(|w| {
-            let record = refreshed.state.worktrees.get(&w.name);
-            BTreeMap::from([
-                (Col::Name, ellipsize(&w.name, 32)),
-                (
-                    Col::Branch,
-                    ellipsize(w.branch.as_deref().unwrap_or("(detached)"), 32),
-                ),
-                (Col::Head, w.head_sha.as_deref().unwrap_or("-").to_string()),
-                (
-                    Col::State,
-                    state_word(w, owned.get(&w.name).copied().unwrap_or(false)).to_string(),
-                ),
-                (Col::Ports, ports_cell(record)),
-                (Col::Status, status_cell(record)),
-                (Col::Path, w.path.display().to_string()),
-            ])
-        })
+        .map(|w| refreshed.state.worktrees.get(&w.name))
         .collect();
+    // A column earns its place when some row has something to say in it:
+    // a project that never isolates has no MODE, one with nothing shared
+    // has no PUBLIC, and one whose every worktree is named for its branch
+    // has no BRANCH — the name already said it.
+    let any_isolated = records.iter().flatten().any(|r| r.isolated);
+    let any_shared = records.iter().flatten().any(|r| r.share.is_some());
+    let any_renamed = worktrees.iter().any(|w| !named_for_branch(w));
 
-    let mut widths: BTreeMap<Col, usize> = BTreeMap::new();
-    for col in ORDER {
-        let content = rows
-            .iter()
-            .map(|r| r[&col].chars().count())
-            .max()
-            .unwrap_or(0);
-        widths.insert(col, content.max(col.header().chars().count()));
+    let mut rows: Vec<BTreeMap<Col, Cell>> = Vec::new();
+    let mut compact_rows: Vec<BTreeMap<Col, Cell>> = Vec::new();
+    for (w, record) in worktrees.iter().zip(records.iter().copied()) {
+        let created = owned.get(&w.name).copied().unwrap_or(false);
+        let aggregate = record.and_then(crate::state::aggregate_phase);
+        let mut row = BTreeMap::from([
+            (Col::Name, Cell::new(display_name(w), None)),
+            (Col::Status, status_cell(record, aggregate.as_ref())),
+            (Col::Url, url_cell(record, aggregate.as_ref())),
+            (Col::Ports, ports_cell(record, aggregate.as_ref())),
+            (Col::Git, git_cell(w, created)),
+        ]);
+        if any_isolated {
+            row.insert(Col::Mode, mode_cell(record));
+        }
+        let mut compact = BTreeMap::new();
+        if any_shared {
+            let share = record.and_then(|r| r.share.as_ref());
+            let (full, short) = match share {
+                Some(share) => (
+                    Cell::new(&share.public_url, Some(Paint::Link)),
+                    Cell::new("yes", Some(Paint::Good)),
+                ),
+                None => (Cell::dash(), Cell::dash()),
+            };
+            row.insert(Col::Public, full);
+            compact.insert(Col::Public, short);
+        }
+        if any_renamed {
+            let branch = match (named_for_branch(w), &w.branch) {
+                (true, _) => Cell::new("", None),
+                (false, Some(branch)) => Cell::new(branch, None),
+                (false, None) => Cell::new("(detached)", Some(Paint::Warn)),
+            };
+            row.insert(Col::Branch, branch);
+        }
+        if view.long {
+            let head = match &w.head_sha {
+                Some(sha) => Cell::new(sha, None),
+                None => Cell::dash(),
+            };
+            row.insert(Col::Head, head);
+            let path = view.style.tilde(&w.path.display().to_string());
+            row.insert(Col::Path, Cell::new(path, None));
+        }
+        rows.push(row);
+        compact_rows.push(compact);
     }
-    let kept = keep_columns(width, &widths);
 
-    writeln!(
-        out,
-        "{}",
-        render_row(&kept, &widths, |col| col.header().to_string())
-    )?;
+    let widths_of = |rows: &[BTreeMap<Col, Cell>]| {
+        let mut widths: BTreeMap<Col, usize> = BTreeMap::new();
+        for col in ORDER {
+            let widest = rows
+                .iter()
+                .filter_map(|r| r.get(&col).map(Cell::width))
+                .max();
+            if let Some(widest) = widest {
+                widths.insert(col, widest.max(col.header().chars().count()));
+            }
+        }
+        widths
+    };
+    let Fit {
+        kept,
+        compacted,
+        widths,
+    } = fit(view.width, &widths_of(&rows), &widths_of(&compact_rows));
+    for col in &compacted {
+        for (row, compact) in rows.iter_mut().zip(&compact_rows) {
+            row.insert(*col, compact[col].clone());
+        }
+    }
+    // A name cut to fit is cut where it differs from its neighbours, so two
+    // long branch names that share a prefix still read as two names. Never
+    // when stdout is not a terminal, whose width is unbounded.
+    let all_names: Vec<String> = rows.iter().map(|r| r[&Col::Name].text.clone()).collect();
+    for row in &mut rows {
+        let cell = row.get_mut(&Col::Name).expect("every row has a name");
+        cell.text = ellipsize_distinct(&cell.text, &all_names, widths[&Col::Name]);
+    }
+
+    let header = |col: Col| Cell::new(col.header(), Some(Paint::Heading));
+    writeln!(out, "{}", render_row(&kept, &widths, &view.style, header))?;
     for row in &rows {
-        writeln!(
-            out,
-            "{}",
-            render_row(&kept, &widths, |col| row[&col].clone())
-        )?;
+        let line = render_row(&kept, &widths, &view.style, |col| row[&col].clone());
+        writeln!(out, "{line}")?;
     }
     Ok(())
 }
 
 /// Pads every cell but the last, so a trailing column never carries spaces
-/// to the end of the line.
-fn render_row(kept: &[Col], widths: &BTreeMap<Col, usize>, cell: impl Fn(Col) -> String) -> String {
-    let mut parts: Vec<String> = Vec::with_capacity(kept.len());
+/// to the end of the line. Padding is measured on the text and colour goes
+/// around the text only, so an escape never skews a column.
+fn render_row(
+    kept: &[Col],
+    widths: &BTreeMap<Col, usize>,
+    style: &Style,
+    cell: impl Fn(Col) -> Cell,
+) -> String {
+    let mut line = String::new();
     for (i, col) in kept.iter().enumerate() {
-        let text = cell(*col);
-        if i + 1 == kept.len() {
-            parts.push(text);
-        } else {
+        let cell = cell(*col);
+        match cell.paint {
+            Some(paint) => line.push_str(&style.paint(&cell.text, paint)),
+            None => line.push_str(&cell.text),
+        }
+        if i + 1 < kept.len() {
             let width = widths.get(col).copied().unwrap_or(0);
-            let pad = width.saturating_sub(text.chars().count());
-            parts.push(format!("{text}{}", " ".repeat(pad)));
+            line.push_str(&" ".repeat(width.saturating_sub(cell.width()) + COL_GAP));
         }
     }
-    parts.join(&" ".repeat(COL_GAP))
+    line.trim_end().to_string()
 }
 
-/// The ports column: bare numbers for a single role, `role:port` once there
-/// is more than one to tell apart.
-fn ports_cell(record: Option<&WorktreeRecord>) -> String {
-    let Some(record) = record else {
-        return "-".to_string();
-    };
-    if record.ports.is_empty() {
-        return "-".to_string();
-    }
-    if record.ports.len() == 1 {
-        return record.ports.values().next().expect("one").to_string();
-    }
-    record
-        .ports
-        .iter()
-        .map(|(role, port)| format!("{role}:{port}"))
-        .collect::<Vec<_>>()
-        .join(" ")
+/// Whether the worktree's directory is its branch spelled as a directory:
+/// then the branch *is* the name, and the listing says it once.
+fn named_for_branch(w: &Worktree) -> bool {
+    w.named_for_branch()
+}
+
+/// The name a person knows a worktree by — see [`Worktree::display_name`].
+pub(super) fn display_name(w: &Worktree) -> String {
+    w.display_name()
 }
 
 /// One word for a whole worktree, however many processes it runs: the
 /// aggregate, so a row never reads `running` while one of its processes is
-/// dead.
-fn status_cell(record: Option<&WorktreeRecord>) -> String {
-    let Some(record) = record else {
-        return "-".to_string();
-    };
-    match crate::state::aggregate_phase(record) {
-        Some(aggregate) => aggregate.word().to_string(),
-        None => "-".to_string(),
+/// dead — and, for a failed one that runs several, which of them.
+fn status_cell(record: Option<&WorktreeRecord>, aggregate: Option<&Aggregate>) -> Cell {
+    match aggregate {
+        None => Cell::new("stopped", Some(Paint::Faint)),
+        Some(Aggregate::Running { .. }) => Cell::new("running", Some(Paint::Good)),
+        Some(Aggregate::Starting { .. }) => Cell::new("starting", Some(Paint::Warn)),
+        Some(Aggregate::Failed { process, .. }) => {
+            match record.is_some_and(|r| r.processes.len() > 1) {
+                true => Cell::new(format!("failed ({process})"), Some(Paint::Bad)),
+                false => Cell::new("failed", Some(Paint::Bad)),
+            }
+        }
     }
 }
 
-/// One word per worktree for the text listing, ordered by how much it should
-/// stop you: a gone or locked entry first, then dirty, then ownership.
-fn state_word(w: &Worktree, created_by_pando: bool) -> &'static str {
-    if w.prunable {
-        "gone"
-    } else if w.locked {
-        "locked"
-    } else if w.dirty == Some(true) {
-        "dirty"
-    } else if created_by_pando {
-        "pando"
-    } else {
-        "adopted"
+/// The URL, while something is up to answer it. A stopped worktree keeps
+/// its ports and so could name one, but a link that goes nowhere is not
+/// worth the column.
+fn url_cell(record: Option<&WorktreeRecord>, aggregate: Option<&Aggregate>) -> Cell {
+    let up = matches!(
+        aggregate,
+        Some(Aggregate::Running { .. } | Aggregate::Starting { .. })
+    );
+    match record.and_then(worktree_url) {
+        Some(url) if up => Cell::new(url, Some(Paint::Link)),
+        _ => Cell::dash(),
     }
+}
+
+/// The ports column: `role:port` for each, one or many — a lone bare
+/// number beside another row's `api:29496 web:29497` read as a different
+/// kind of thing. Faint when nothing runs on them: they are still this
+/// worktree's, and will be again on the next start.
+fn ports_cell(record: Option<&WorktreeRecord>, aggregate: Option<&Aggregate>) -> Cell {
+    let Some(record) = record.filter(|r| !r.ports.is_empty()) else {
+        return Cell::dash();
+    };
+    let text = record
+        .ports
+        .iter()
+        .map(|(role, port)| format!("{role}:{port}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Cell::new(text, aggregate.is_none().then_some(Paint::Faint))
+}
+
+/// Whether the worktree runs private copies of the project's services, in
+/// the words `start --isolated` and `start --shared` use.
+fn mode_cell(record: Option<&WorktreeRecord>) -> Cell {
+    match record {
+        Some(r) if r.isolated => Cell::new("isolated", None),
+        Some(_) => Cell::new("shared", Some(Paint::Faint)),
+        None => Cell::dash(),
+    }
+}
+
+/// What git has to say, ordered by how much it should stop you — a gone or
+/// locked entry, then dirty — then how far it is ahead of and behind the
+/// base branch, and
+/// whether pando made it: `rm` asks before removing one it did not.
+fn git_cell(w: &Worktree, created_by_pando: bool) -> Cell {
+    let (word, paint) = if w.prunable {
+        ("gone", Paint::Bad)
+    } else if w.locked {
+        ("locked", Paint::Bad)
+    } else {
+        match w.dirty {
+            Some(true) => ("dirty", Paint::Warn),
+            Some(false) => ("clean", Paint::Faint),
+            None => ("?", Paint::Faint),
+        }
+    };
+    let mut text = word.to_string();
+    if let Some((ahead, behind)) = w.ahead_behind {
+        if ahead > 0 {
+            text.push_str(&format!(" ↑{ahead}"));
+        }
+        if behind > 0 {
+            text.push_str(&format!(" ↓{behind}"));
+        }
+    }
+    if !created_by_pando {
+        text.push_str(" adopted");
+    }
+    Cell::new(text, Some(paint))
 }
 
 #[derive(Serialize)]

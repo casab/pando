@@ -1,7 +1,9 @@
-//! The report as text: one block per section, the findings, and the summary
-//! line.
+//! The report as text: the verdict, every finding with its fix, one block
+//! per section, and the verdict again.
 
 use std::fmt::Write as _;
+
+use crate::term::{Paint, Style};
 
 use super::adopt::Adoptable;
 use super::report::{
@@ -31,36 +33,63 @@ impl Report {
         out
     }
 
+    /// The report as plain text: no colour, paths as they are.
     pub fn render(&self) -> String {
+        self.render_with(&Style::plain())
+    }
+
+    /// The report for a reader: what is wrong first, each finding tagged
+    /// with its section and carrying its fix, then the facts section by
+    /// section, then, when anything was found, the verdict again as the
+    /// last line — the one left on screen after a long report scrolls.
+    pub fn render_with(&self, style: &Style) -> String {
         let mut out = String::new();
+        render_summary(&mut out, &self.findings, style);
+        for (severity, title) in [(Severity::Problem, "problems"), (Severity::Note, "notes")] {
+            let findings: Vec<&Finding> = Section::ALL
+                .iter()
+                .flat_map(|section| self.of(*section))
+                .filter(|f| f.severity == severity)
+                .collect();
+            if findings.is_empty() {
+                continue;
+            }
+            let _ = writeln!(out, "\n{}", style.paint(title, Paint::Heading));
+            for finding in findings {
+                render_finding(&mut out, finding, style);
+            }
+        }
         for section in Section::ALL {
-            let _ = writeln!(out, "{}", section.title());
+            let _ = writeln!(out, "\n{}", style.paint(section.title(), Paint::Heading));
             match section {
-                Section::Project => render_project(&mut out, &self.project),
-                Section::Config => render_config(&mut out, &self.config),
+                Section::Project => render_project(&mut out, &self.project, style),
+                Section::Config => render_config(&mut out, &self.config, style),
                 Section::Runtime => render_runtime(&mut out, &self.runtime),
-                Section::Tools => render_tools(&mut out, &self.tools),
-                Section::Worktrees => render_worktrees(&mut out, &self.worktrees),
+                Section::Tools => render_tools(&mut out, &self.tools, style),
+                Section::Worktrees => render_worktrees(&mut out, &self.worktrees, style),
                 Section::Services => render_services(&mut out, &self.services),
                 Section::Hooks => render_hooks(&mut out, &self.hooks),
-                Section::Adoption => render_adoption(&mut out, &self.adoption),
+                Section::Adoption => render_adoption(&mut out, &self.adoption, style),
             }
-            for finding in self.of(section) {
-                render_finding(&mut out, finding);
-            }
-            out.push('\n');
         }
-        render_summary(&mut out, &self.findings);
+        // The verdict again only when there is one worth scrolling back
+        // to: "nothing to report" at both ends of a report that reported
+        // nothing read as two reports.
+        if !self.findings.is_empty() {
+            out.push('\n');
+            render_summary(&mut out, &self.findings, style);
+        }
         out
     }
 }
 
-fn render_finding(out: &mut String, finding: &Finding) {
+fn render_finding(out: &mut String, finding: &Finding, style: &Style) {
     let mark = match finding.severity {
-        Severity::Problem => '!',
-        Severity::Note => '-',
+        Severity::Problem => style.paint("!", Paint::Bad),
+        Severity::Note => style.paint("-", Paint::Warn),
     };
-    let _ = writeln!(out, "  {mark} {}", finding.message);
+    let section = style.paint(&format!("[{}]", finding.section.title()), Paint::Faint);
+    let _ = writeln!(out, "  {mark} {section} {}", finding.message);
     let Some(fix) = &finding.fix else { return };
     // A fix can be several lines — the prelude candidates for a runtime
     // mismatch are one line each — and each of them is a line a developer
@@ -68,7 +97,7 @@ fn render_finding(out: &mut String, finding: &Finding) {
     for (index, line) in fix.lines().enumerate() {
         match index {
             0 => {
-                let _ = writeln!(out, "      fix: {line}");
+                let _ = writeln!(out, "      {} {line}", style.paint("fix:", Paint::Good));
             }
             _ => {
                 let _ = writeln!(out, "           {line}");
@@ -77,22 +106,22 @@ fn render_finding(out: &mut String, finding: &Finding) {
     }
 }
 
-fn render_summary(out: &mut String, findings: &[Finding]) {
+fn render_summary(out: &mut String, findings: &[Finding], style: &Style) {
     let problems = findings
         .iter()
         .filter(|f| f.severity == Severity::Problem)
         .count();
     let notes = findings.len() - problems;
     if problems == 0 && notes == 0 {
-        let _ = writeln!(out, "nothing to report");
+        let _ = writeln!(out, "{}", style.paint("nothing to report", Paint::Good));
         return;
     }
-    let _ = writeln!(
-        out,
-        "{problems} {}, {notes} {}",
-        plural(problems, "problem"),
-        plural(notes, "note")
-    );
+    let problems_text = format!("{problems} {}", plural(problems, "problem"));
+    let problems_text = match problems {
+        0 => style.paint(&problems_text, Paint::Good),
+        _ => style.paint(&problems_text, Paint::Bad),
+    };
+    let _ = writeln!(out, "{problems_text}, {notes} {}", plural(notes, "note"));
 }
 
 pub(super) fn plural(n: usize, word: &str) -> String {
@@ -118,11 +147,11 @@ fn row(out: &mut String, label: &str, value: &str) {
     }
 }
 
-fn render_project(out: &mut String, project: &ProjectReport) {
+fn render_project(out: &mut String, project: &ProjectReport, style: &Style) {
     row(out, "id", &project.id);
-    row(out, "root", &project.root);
-    row(out, "home", &project.home);
-    row(out, "worktrees", &project.worktrees_dir);
+    row(out, "root", &style.tilde(&project.root));
+    row(out, "home", &style.tilde(&project.home));
+    row(out, "worktrees", &style.tilde(&project.worktrees_dir));
     row(
         out,
         "home mode",
@@ -149,15 +178,20 @@ fn render_project(out: &mut String, project: &ProjectReport) {
 /// and start pushing the line over a terminal's edge.
 const KEY_COLUMN_MAX: usize = 56;
 
-fn render_config(out: &mut String, config: &ConfigReport) {
+fn render_config(out: &mut String, config: &ConfigReport, style: &Style) {
     for layer in &config.layers {
         let suffix = match (&layer.error, layer.present) {
-            (Some(e), _) => format!(" — {e}"),
-            (None, false) => " — not there".to_string(),
+            (Some(e), _) => style.paint(&format!(" — {e}"), Paint::Bad),
+            (None, false) => style.paint(" — not there", Paint::Faint),
             (None, true) if layer.keys.is_empty() => " — empty".to_string(),
             (None, true) => String::new(),
         };
-        let _ = writeln!(out, "  {:<10}{}{suffix}", layer.layer, layer.path);
+        let _ = writeln!(
+            out,
+            "  {:<10}{}{suffix}",
+            layer.layer,
+            style.tilde(&layer.path)
+        );
         let width = layer
             .keys
             .iter()
@@ -243,7 +277,7 @@ fn render_runtime(out: &mut String, runtime: &RuntimeReport) {
     }
 }
 
-fn render_tools(out: &mut String, tools: &[ToolReport]) {
+fn render_tools(out: &mut String, tools: &[ToolReport], style: &Style) {
     if tools.is_empty() {
         row(out, "", "nothing to look for");
         return;
@@ -262,9 +296,9 @@ fn render_tools(out: &mut String, tools: &[ToolReport]) {
             // `command -v` prints a bare word for a shell builtin, which
             // is not a path and is not a version to ask for either.
             (_, Some(path)) if !path.starts_with('/') => format!("a shell builtin ({path})"),
-            (Some(version), Some(path)) => format!("{version}  ({path})"),
-            (None, Some(path)) => format!("found, and said nothing  ({path})"),
-            _ => format!("not found — {}", tool.needed_for),
+            (Some(version), Some(path)) => format!("{version}  ({})", style.tilde(path)),
+            (None, Some(path)) => format!("found, and said nothing  ({})", style.tilde(path)),
+            _ => style.paint(&format!("not found — {}", tool.needed_for), Paint::Warn),
         };
         if let Some(detail) = &tool.detail {
             text.push_str(&format!("  {detail}"));
@@ -273,7 +307,7 @@ fn render_tools(out: &mut String, tools: &[ToolReport]) {
     }
 }
 
-fn render_worktrees(out: &mut String, worktrees: &[WorktreeReport]) {
+fn render_worktrees(out: &mut String, worktrees: &[WorktreeReport], style: &Style) {
     if worktrees.is_empty() {
         row(out, "", "none — `pando new <branch>` makes one");
         return;
@@ -298,9 +332,13 @@ fn render_worktrees(out: &mut String, worktrees: &[WorktreeReport]) {
         row(
             out,
             &worktree.name,
-            &format!("{}  [{}]", worktree.phase, flags.join(", ")),
+            &format!(
+                "{}  [{}]",
+                style.paint(worktree.phase, phase_paint(worktree.phase)),
+                flags.join(", ")
+            ),
         );
-        row(out, "", &worktree.path);
+        row(out, "", &style.tilde(&worktree.path));
         for process in &worktree.processes {
             row(
                 out,
@@ -526,13 +564,13 @@ fn render_hooks(out: &mut String, hooks: &[HookReport]) {
     }
 }
 
-fn render_adoption(out: &mut String, adoption: &[Adoptable]) {
+fn render_adoption(out: &mut String, adoption: &[Adoptable], style: &Style) {
     if adoption.is_empty() {
         row(out, "", "nothing to adopt");
         return;
     }
     for entry in adoption {
-        row(out, &entry.id, &entry.path);
+        row(out, &entry.id, &style.tilde(&entry.path));
         row(
             out,
             "",
@@ -553,6 +591,17 @@ fn render_adoption(out: &mut String, adoption: &[Adoptable]) {
                 ),
             );
         }
+    }
+}
+
+/// How a worktree's phase word looks: the same colours `ls` and `status`
+/// use for the same words.
+fn phase_paint(phase: &str) -> Paint {
+    match phase {
+        "running" => Paint::Good,
+        "starting" => Paint::Warn,
+        "failed" => Paint::Bad,
+        _ => Paint::Faint,
     }
 }
 

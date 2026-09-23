@@ -64,13 +64,8 @@ pub(super) fn hooks_report(
     out
 }
 
-/// The schema question has no way to record "this project has no schema
-/// step", so an undecided one comes back on every start.
-///
-/// Reported, not fixed: giving the slot an empty form is the same piece of
-/// design the services and provision slots each had done for them, and it
-/// belongs to whoever owns that question rather than to the command that
-/// noticed it.
+/// The schema question is always a question — it touches data — and only
+/// an isolated start asks it, so an unanswered one is worth a note.
 fn schema_slot_finding(paths: &PandoPaths, config: &Config, findings: &mut Vec<Finding>) {
     if actions::already_answered(detect::Slot::SchemaHook, config) {
         return;
@@ -85,14 +80,13 @@ fn schema_slot_finding(paths: &PandoPaths, config: &Config, findings: &mut Vec<F
     findings.push(
         Finding::note(
             Section::Hooks,
-            "pando has a question about the schema step that its rules cannot settle, and no \
-             way to record \"this project has none\" — so it comes back on every start until a \
-             hook is written down"
+            "the schema step is still a question — the next isolated start asks whether to \
+             run it against that worktree's private services"
                 .to_string(),
         )
         .with_fix(
-            "answer it once with `pando init`, or write a `[[hooks]]` entry by hand — one whose \
-             `cmd` is `true` is the shape that means \"nothing to do\"",
+            "answer it now with `pando init`; \"no\" is recorded as the step with \
+             `on = \"never\"`",
         ),
     );
 }

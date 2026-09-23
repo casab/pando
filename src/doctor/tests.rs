@@ -126,7 +126,10 @@ fn a_project_with_no_config_at_all_is_healthy_and_says_where_everything_is() {
     assert_eq!(report.project.home, fx.home.display().to_string());
     assert_eq!(report.project.id, fx.paths.project_id());
     let text = report.render();
-    assert!(text.contains("nothing to report"), "{text}");
+    // An empty repository has nothing to run, and that is the one thing
+    // worth saying about it.
+    assert!(text.starts_with("0 problems, 1 note"), "{text}");
+    assert!(text.contains("nothing to run"), "{text}");
     assert!(text.contains("not there"), "every layer is named: {text}");
 }
 
@@ -245,17 +248,21 @@ fn a_key_a_committed_layer_may_not_set_is_marked_ignored_and_warned_about() {
         "{:?}",
         messages(&report)
     );
-    // In the config section, below the layer it names.
+    // With the findings, at the top, tagged with the section it is about.
     let text = report.render();
     let layer_line = text
         .lines()
-        .position(|l| l.contains("committed"))
+        .position(|l| l.trim_start().starts_with("committed"))
         .expect("the committed line");
     let warning_line = text
         .lines()
         .position(|l| l.contains("ignoring project.root"))
         .expect("the warning");
-    assert!(warning_line > layer_line, "{text}");
+    assert!(warning_line < layer_line, "{text}");
+    assert!(
+        text.lines().nth(warning_line).unwrap().contains("[config]"),
+        "{text}"
+    );
     assert_eq!(
         text.matches("ignoring project.root").count(),
         1,
@@ -536,7 +543,7 @@ fn an_install_command_that_can_rewrite_a_lockfile_is_a_problem() {
     for (install, expected) in [
         ("pnpm install", "pnpm install --frozen-lockfile"),
         ("npm install", "npm ci"),
-        ("yarn install", "yarn install --immutable"),
+        ("yarn install", "yarn install --frozen-lockfile"),
         ("uv sync", "uv sync --frozen"),
         ("bundle install", "BUNDLE_FROZEN=true bundle install"),
     ] {
@@ -2018,4 +2025,218 @@ fn the_report_renders_every_section_even_when_it_has_nothing_to_say() {
             section.title()
         );
     }
+}
+
+// Problems first, then notes, then the facts: a reader who stops after
+// the first screen has read everything that is wrong.
+#[test]
+fn problems_come_first_then_notes_then_the_sections_and_the_verdict_last() {
+    let fx = fixture();
+    let mut report = report(&fx);
+    report.findings = vec![
+        Finding::note(Section::Services, "a note about services").with_fix("do a thing"),
+        Finding::problem(Section::Tools, "a problem with tools", "install it"),
+    ];
+    let text = report.render();
+    let at = |needle: &str| {
+        text.lines()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} missing from:\n{text}"))
+    };
+    assert!(text.starts_with("1 problem, 1 note\n"), "{text}");
+    assert!(at("problems") < at("a problem with tools"), "{text}");
+    assert!(at("a problem with tools") < at("notes"), "{text}");
+    assert!(at("notes") < at("a note about services"), "{text}");
+    assert!(at("a note about services") < at("project"), "{text}");
+    assert!(text.contains("  ! [tools] a problem with tools"), "{text}");
+    assert!(text.contains("      fix: install it"), "{text}");
+    assert!(text.trim_end().ends_with("1 problem, 1 note"), "{text}");
+    assert_eq!(
+        text.matches("a problem with tools").count(),
+        1,
+        "said once: {text}"
+    );
+    assert!(!text.contains('\x1b'), "plain means plain");
+
+    let painted = report.render_with(&crate::term::Style::with(true, None));
+    assert!(painted.contains('\x1b'), "{painted:?}");
+    let home = PathBuf::from(&report.project.home);
+    let tilded = report.render_with(&crate::term::Style::with(
+        false,
+        Some(home.parent().unwrap().to_path_buf()),
+    ));
+    assert!(tilded.contains("home          ~/"), "{tilded}");
+}
+
+/// `every_tool`, on a machine whose Docker daemon answers `docker info`
+/// with `status` and `said`.
+fn daemon_says(status: u8, said: &'static str) -> impl Fn(&str) -> Option<String> {
+    move |script: &str| {
+        if script.contains(DAEMON_MARK) {
+            return Some(format!("{said}\n{DAEMON_MARK}{status}\n"));
+        }
+        every_tool(script)
+    }
+}
+
+// "0 problems, 3 notes" on a project whose compose services could not
+// start: `docker --version` answers without a daemon.
+#[test]
+fn a_docker_daemon_that_is_down_is_a_problem_naming_the_way_around_it() {
+    let fx = fixture();
+    write_project_config(
+        &fx,
+        "[dev]\ncmd = \"true\"\n\n[[services]]\nkind = \"compose\"\n\
+         file = \"docker-compose.yml\"\ninclude = [\"postgres\"]\n",
+    );
+    write_compose(
+        &fx,
+        "services:\n  postgres:\n    image: postgres:16\n    healthcheck:\n      test: x\n",
+    );
+    let down = report_of(
+        &fx,
+        &daemon_says(1, "Cannot connect to the Docker daemon at unix:///x.sock"),
+    );
+    assert!(!down.healthy(), "{:?}", messages(&down));
+    let problem = down
+        .findings
+        .iter()
+        .find(|f| f.message.contains("Docker daemon is not running"))
+        .unwrap_or_else(|| panic!("{:?}", messages(&down)));
+    assert_eq!(problem.severity, Severity::Problem);
+    assert!(
+        problem.message.contains("Cannot connect"),
+        "{}",
+        problem.message
+    );
+    let fix = problem.fix.as_deref().unwrap();
+    assert!(fix.contains("start Docker"), "{fix}");
+    assert!(fix.contains("prefer = \"native\""), "{fix}");
+    // The file this run reads, under PANDO_HOME — not `~/.pando`.
+    assert!(
+        fix.contains(&fx.paths.user_config_file().display().to_string()),
+        "{fix}"
+    );
+    let docker = tool(&down, "docker");
+    assert!(
+        docker
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("daemon: not running"),
+        "{docker:?}"
+    );
+
+    let up = report_of(&fx, &daemon_says(0, "27.3.1"));
+    assert!(!mentions(&up, "Docker daemon"), "{:?}", messages(&up));
+    assert!(
+        tool(&up, "docker")
+            .detail
+            .unwrap()
+            .contains("daemon: running")
+    );
+
+    // A watchdog kill is a daemon that did not answer.
+    assert_eq!(
+        parse_daemon(&format!("{DAEMON_MARK}143\n")),
+        Daemon::Down(format!("no answer within {DAEMON_WAIT_SECS}s"))
+    );
+}
+
+#[test]
+fn the_daemon_is_not_asked_about_when_no_compose_service_needs_it() {
+    let fx = fixture();
+    write_project_config(&fx, "[dev]\ncmd = \"true\"\n");
+    let asked = std::cell::Cell::new(false);
+    let shell = |script: &str| {
+        if script.contains(DAEMON_MARK) {
+            asked.set(true);
+        }
+        every_tool(script)
+    };
+    let report = report_of(&fx, &shell);
+    assert!(!asked.get());
+    assert!(!mentions(&report, "Docker daemon"));
+}
+
+// The probe script itself, run by a real bash against a fake docker: an
+// answer, a refusal, and the exit status behind the mark.
+#[test]
+fn the_daemon_script_reports_the_exit_status_and_what_docker_said() {
+    let dir = TempDir::new().unwrap();
+    let fake = |name: &str, body: &str| {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.path().join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.display().to_string()
+    };
+    let run = |program: &str| {
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(daemon_script(program, ""))
+            .output()
+            .unwrap();
+        parse_daemon(&String::from_utf8_lossy(&out.stdout))
+    };
+    assert_eq!(run(&fake("up", "echo 27.3.1")), Daemon::Up);
+    assert_eq!(
+        run(&fake(
+            "down",
+            "echo 'Cannot connect to the Docker daemon' >&2; exit 1"
+        )),
+        Daemon::Down("Cannot connect to the Docker daemon".to_string())
+    );
+}
+
+// Doctor said "set `[isolation] prefer = \"native\"` in ~/.pando/config.toml"
+// with PANDO_HOME somewhere else.
+#[test]
+fn doctor_names_the_machine_config_this_run_reads() {
+    let fx = fixture();
+    std::fs::write(
+        fx.root.join(".env.example"),
+        "DATABASE_URL=postgres://acme:acme@localhost:5432/acme\n",
+    )
+    .unwrap();
+    write_compose(&fx, "services:\n  postgres:\n    image: postgres:16\n");
+    let report = report_of(&fx, &shell_with(&["docker", "postgres"]));
+    let said = report.services.isolation.evidence.join(" | ");
+    let real = fx.paths.user_config_file().display().to_string();
+    assert!(said.contains(&real), "{said}");
+    let text = report.render();
+    assert!(!text.contains("~/.pando"), "{text}");
+}
+
+#[test]
+fn nothing_to_report_is_said_once() {
+    let fx = fixture();
+    write_project_config(&fx, "[dev]\ncmd = \"true\"\n");
+    let report = report(&fx);
+    let text = report.render();
+    assert_eq!(text.matches("nothing to report").count(), 1, "{text}");
+}
+
+// A library with nothing to run was "nothing to report", and `start` then
+// said "no processes configured" with no path and no example.
+#[test]
+fn a_project_with_nothing_to_run_gets_a_note_with_the_file_and_the_lines() {
+    let fx = fixture();
+    let report = report(&fx);
+    assert!(report.healthy());
+    let note = report
+        .findings
+        .iter()
+        .find(|f| f.message.starts_with("nothing to run"))
+        .unwrap_or_else(|| panic!("{:?}", messages(&report)));
+    assert_eq!(note.severity, Severity::Note);
+    let fix = note.fix.as_deref().unwrap();
+    assert!(
+        fix.contains(&fx.paths.config_file().display().to_string()),
+        "{fix}"
+    );
+    assert!(fix.contains("[dev]\ncmd = \""), "{fix}");
+
+    write_project_config(&fx, "[dev]\ncmd = \"true\"\n");
+    assert!(!mentions(&report_of(&fx, &every_tool), "nothing to run"));
 }

@@ -10,7 +10,8 @@ use crate::paths::PandoPaths;
 use crate::process as proc;
 
 use super::questions::{
-    Answer, Ask, Pending, answered_by, pending_decision, pick, question_for, slot_label,
+    Answer, Answerer, Ask, Pending, RefusedAnswer, answered_by, pending_decision, pick,
+    question_for, slot_label,
 };
 
 /// What the runtime check needs from outside this process: a shell to ask,
@@ -84,7 +85,7 @@ pub(super) fn resolve_runtime(
         None => "",
     };
     let requirements = crate::runtime::requirements(paths.root());
-    let Some(check) = first_mismatch(paths, &requirements, prelude, machine.shell)? else {
+    let Some(check) = first_mismatch(paths, config, &requirements, prelude, machine.shell)? else {
         return Ok(RuntimeOutcome::Fine);
     };
     if prelude.is_empty() {
@@ -109,6 +110,7 @@ pub(super) fn resolve_runtime(
 /// anyway, so there is no spawn to save by keeping it.
 fn first_mismatch(
     paths: &PandoPaths,
+    config: &Config,
     requirements: &[crate::runtime::Requirement],
     prelude: &str,
     shell: crate::runtime::Shell<'_>,
@@ -128,6 +130,9 @@ fn first_mismatch(
         };
         let fingerprint = crate::runtime::fingerprint(requirement, prelude);
         if cache.holds(&fingerprint) {
+            continue;
+        }
+        if runs_through_runner(paths.root(), config, &language, prelude, shell) {
             continue;
         }
         let check = crate::runtime::check(requirement, prelude, shell);
@@ -157,6 +162,55 @@ fn first_mismatch(
         crate::runtime::save_cache(&cache_file, &cache)?;
     }
     Ok(mismatch)
+}
+
+/// Whether every command this project runs in `language` goes through a
+/// runner that resolves the interpreter itself, and this shell has it.
+///
+/// `uv run` reads `.python-version` and finds or installs that Python, so
+/// what `bash -lc` resolves on its own is beside the point — and asking
+/// for a prelude line to fix it was a dead end on any machine with no
+/// pyenv. Only when the project uses the runner (its lockfile is there),
+/// every configured process and hook goes through it (nothing configured yet counts,
+/// since detection proposes the runner's form), and the shell finds it.
+fn runs_through_runner(
+    root: &Path,
+    config: &Config,
+    language: &crate::runtime::Language,
+    prelude: &str,
+    shell: crate::runtime::Shell<'_>,
+) -> bool {
+    let Some(runner) = language.runner(root) else {
+        return false;
+    };
+    let Some(prefix) = runner.run_prefix.map(str::trim) else {
+        return false;
+    };
+    // Hooks too, fallbacks included: a migration hook that runs `python`
+    // bare gets whatever interpreter the shell resolves, exactly as a
+    // process would, and it runs first.
+    let hooks = config
+        .hooks
+        .iter()
+        .flat_map(|hook| std::iter::once(hook.cmd.as_str()).chain(hook.fallback.as_deref()));
+    let through = config
+        .processes
+        .values()
+        .map(|process| process.cmd.as_str())
+        .chain(hooks)
+        .map(str::trim)
+        .filter(|cmd| !cmd.is_empty())
+        .all(|cmd| cmd.starts_with(prefix));
+    if !through {
+        return false;
+    }
+    const OK: &str = "pando-runner-ok";
+    let probe = format!("command -v {} >/dev/null && echo {OK}", runner.program);
+    let probe = match prelude {
+        "" => probe,
+        prelude => format!("{prelude} && {probe}"),
+    };
+    shell(&probe).is_some_and(|out| out.lines().any(|line| line.trim() == OK))
 }
 
 /// The lines that make a mismatch answerable.
@@ -277,7 +331,7 @@ pub(super) fn answer_prelude(
     ask: Ask<'_>,
     machine: &Machine<'_>,
 ) -> Result<Option<Pending>> {
-    let question = question_for(proposal, report);
+    let question = question_for(proposal, report).at(paths);
     let offered = question.options.len();
     let (answer, by) = answered_by(ask(&question)?);
     // Before the match takes it apart. The caller writes it down once the
@@ -309,6 +363,11 @@ pub(super) fn answer_prelude(
         let mut proposed = config.clone();
         proposed.runtime.prelude = Some(line.clone());
         if let RuntimeOutcome::Broken(report) = resolve_runtime(paths, &proposed, machine)? {
+            // A program handed this line in, so it is the program's input
+            // that is wrong: the usage-error shape, not a failure.
+            if by == Answerer::Program {
+                return Err(anyhow::Error::new(RefusedAnswer(report.to_string())));
+            }
             bail!("{report}");
         }
     }

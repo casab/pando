@@ -141,7 +141,7 @@ Four more facts that are not visible in the shape:
 | `dev_cmd` | rules | ask only when several scripts are plausible dev servers |
 | `port_env` | rules | which variables carry the ports. The env example beats a framework convention |
 | `services` | rules + **human** | which services get a private copy — see §5 for the mechanism |
-| `schema_hook` | rules | the command that brings a fresh database to the schema |
+| `schema_hook` | rules + **human** | the command that brings a fresh database to the schema. Always a question — it touches data — and only an isolated start asks it. The hook runs on isolated starts only unless its entry says `on = "always"`; `null` answers "no" and writes it with `on = "never"` |
 | `provision` | rules, mostly | which local files a worktree needs. Seeding from an example needs a human |
 
 ## 4. Writing: `pando init --answers`, and nothing else
@@ -364,9 +364,10 @@ Absolute. None of these has an exception worth taking.
   one, or reaching for the non-frozen form because the slot looked empty,
   is not.
 - **Never run a mutating pando command against a repository the developer
-  did not point you at.** `new`, `start`, `stop`, `rm`, `share`, `init`
-  are mutating. `ls`, `status`, `path`, `logs`, `doctor`, `signals` are
-  not. Check the working directory is the repository they asked about.
+  did not point you at.** `new`, `start`, `stop`, `restart`, `rm`,
+  `share`, `unshare`, `init` are mutating. `ls`, `status`, `path`, `logs`,
+  `doctor`, `signals` are not; `open` changes nothing but launches a
+  browser, which is the developer's to ask for. Check the working directory is the repository they asked about.
 - **Never install a toolchain or a database engine.** Not node, not a
   version manager, not Postgres, not docker. Report what is missing, with
   what pando said about it.
@@ -506,12 +507,25 @@ pando ls --json                  # the worktrees and their git state
 pando logs <name> --json         # a log, one JSON object per line
 pando logs <name> --source <s> --json
 pando new <branch>               # create a worktree
-pando start <name>               # start it
+pando start <name>               # start it; returns once spawned
+pando start <name> --wait        # …and block until it is ready
 pando start <name> --isolated    # …with private copies of its services
 pando stop <name>
 pando share <name>               # publish it at a public URL
 pando unshare <name>
 ```
+
+`<name>` is the worktree's branch (`feat/one`) or its directory
+(`feat+one`); both name the same worktree, and the JSON always says
+`feat+one`. A name pando does not know is exit 1, with the likely names
+on stderr. A string that is one worktree's directory and another's branch
+is exit 2: name it the other way. Inside a worktree most verbs take no
+name, but always pass one. Without it, `stop` stops only the worktree the
+shell is in, or **every** worktree when the shell is in none of them.
+
+`logs` without `--source` reads `dev`. A worktree with no `dev` log and
+several processes gets them all merged, and each `--json` line then carries
+a `source` key. Pass `--source` when you know which log you want.
 
 ### The exit-code discipline
 
@@ -527,9 +541,15 @@ which is a decision you are making on the developer's behalf with no
 evidence you did not already have. Use it only when the developer asked for
 it.
 
-One trap: `init --answers` exits **1**, not 2, when a `prelude` you
-supplied fails its probe on this machine. stderr says so. It is a fact
-about the laptop, not a shape error.
+A `prelude` you supplied that fails its probe on this machine is exit
+**2**, like any other bad value in the answers file, and nothing is
+written. stderr says which probe failed. Fix the value, not the machine.
+
+`start` and `restart` return as soon as everything is spawned when their
+stderr is not a terminal, which is how you run them. Exit 0 then means
+"spawned", not "ready". Add `--wait` when the next thing you do needs the
+server up: it blocks until every process is ready, and a failure exits 1
+with the process, its reason and the last lines of its log on stderr.
 
 ### Reading a failure
 

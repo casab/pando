@@ -35,7 +35,7 @@ mod workspaces;
 
 pub use apply::{
     DEV, Edit, apply, apply_native_services, apply_services, array_edits, custom, edits,
-    fills_one_dev_process, join_list, may_fill_dev, native_entry, roles_in, service_entry,
+    fills_one_dev_process, join_list, may_fill_dev, native_entry, roles_in, service_entry, snippet,
     still_needed,
 };
 pub use frameworks::framework;

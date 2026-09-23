@@ -29,11 +29,13 @@ pando status --json          # what is running, on which ports, with which URL
 pando ls --json              # the worktrees and their git state
 pando logs <name> --json     # one JSON object per line
 pando new <branch>
-pando start <name>           # --isolated for private copies of the services
-pando stop <name>
+pando start <name> --wait    # blocks until ready; without it, exit 0 is only "spawned"
+pando stop <name>            # always name it: bare `stop` outside a worktree stops all
 pando share <name>           # publishes on the public internet — only when asked
 pando unshare <name>
 ```
+
+`<name>` is the branch (`feat/one`) or the directory (`feat+one`).
 
 ## Diagnosing
 

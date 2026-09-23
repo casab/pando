@@ -40,10 +40,84 @@ const CHECK_EVERY: u32 = 8;
 /// What docker says when the binary is present and the daemon is not. Two
 /// spellings, because the classic Unix-socket message and the newer one
 /// differ, and both mean the same thing to the developer.
-const DAEMON_DOWN: [&str; 2] = [
+const DAEMON_DOWN: [&str; 3] = [
     "Cannot connect to the Docker daemon",
     "docker daemon is not running",
+    // Newer clients, and OrbStack's socket: "failed to connect to the
+    // docker API at unix://…; check if the path is correct and if the
+    // daemon is running".
+    "failed to connect to the docker API",
 ];
+
+/// Docker answered, and the answer was that its daemon is not running.
+///
+/// Its own type because the right response depends on who is asking. A
+/// start that needs containers has to stop and say so; a `stop` or an
+/// `rm` of containers a daemon that is down cannot be running has nothing
+/// left to do, and failing there turns "Docker is off" into "pando cannot
+/// stop my worktree".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DaemonDown;
+
+impl std::fmt::Display for DaemonDown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "isolated mode needs Docker, and the Docker daemon is not running — start Docker, \
+             or {}",
+            crate::remedy::SHARED
+        )
+    }
+}
+
+impl std::error::Error for DaemonDown {}
+
+/// How long a compose question that only reads may take: `ps`, and
+/// `config`. Docker Desktop can wedge with its socket still accepting, and
+/// then `docker compose ps` waits for ever — while `rm` holds the state
+/// lock around it, which freezes `pando ls` and the TUI's tick with it.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long `stop` and `down -v` may take. Generous, because compose gives
+/// each container its own grace period and a project can have several;
+/// bounded, because `rm` runs them under the state lock too.
+pub const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Docker was asked and did not answer in time: a daemon that is up but
+/// wedged, which is not the same as one that is not running. Its
+/// containers may well be running, so nothing that acts on "Docker is
+/// off" may act on this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonHung {
+    pub verb: String,
+    pub timeout: Duration,
+}
+
+impl std::fmt::Display for DaemonHung {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Docker did not answer `docker compose {}` in {}s — it looks hung; restarting \
+             Docker usually clears it",
+            self.verb,
+            self.timeout.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for DaemonHung {}
+
+/// Whether an error is, underneath its context, a daemon that did not
+/// answer in time.
+pub fn is_daemon_hung(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<DaemonHung>().is_some()
+}
+
+/// Whether an error is, underneath whatever context it gathered, a
+/// daemon that is not running.
+pub fn is_daemon_down(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<DaemonDown>().is_some()
+}
 
 /// The docker executable pando runs.
 ///
@@ -129,18 +203,34 @@ impl Compose {
         args
     }
 
-    fn run(&self, rest: &[&str]) -> Result<String> {
+    /// Runs one compose verb, bounded by `timeout` when there is one. `up`
+    /// has none: pulling an image takes as long as the network does, and
+    /// a start is never run under the state lock.
+    fn run(&self, rest: &[&str], timeout: Option<Duration>) -> Result<String> {
         let args = self.args(rest);
         let mut command = Command::new(&self.program);
         command.args(&args).stdin(Stdio::null());
         if let Some(dir) = &self.dir {
             command.current_dir(dir);
         }
-        let out = command.output().with_context(|| {
+        let out = match timeout {
+            Some(timeout) => crate::project::output_within(command, timeout),
+            None => command.output(),
+        };
+        if let (Err(e), Some(timeout)) = (&out, timeout)
+            && e.kind() == std::io::ErrorKind::TimedOut
+        {
+            return Err(anyhow::Error::new(DaemonHung {
+                verb: rest.first().copied().unwrap_or_default().to_string(),
+                timeout,
+            }));
+        }
+        let out = out.with_context(|| {
             format!(
-                "run {} {} — isolated mode needs Docker; install it, or start without --isolated",
+                "run {} {} — isolated mode needs Docker; install it, or {}",
                 self.program.display(),
-                args.join(" ")
+                args.join(" "),
+                crate::remedy::SHARED
             )
         })?;
         if !out.status.success() {
@@ -149,10 +239,7 @@ impl Compose {
             // to do about it, and a compose command line with two `-f`
             // paths in it is not how to say so.
             if DAEMON_DOWN.iter().any(|needle| stderr.contains(needle)) {
-                bail!(
-                    "isolated mode needs Docker, and the Docker daemon is not running — start \
-                     Docker, or start without --isolated"
-                );
+                return Err(anyhow::Error::new(DaemonDown));
             }
             let reason = stderr
                 .lines()
@@ -176,7 +263,7 @@ impl Compose {
     /// is filled in — none of which pando's own reader does. Nothing is
     /// created or started: `config` only prints.
     pub fn config(&self) -> Result<crate::compose::ComposeFile> {
-        let text = self.run(&["config", "--format", "json"])?;
+        let text = self.run(&["config", "--format", "json"], Some(PROBE_TIMEOUT))?;
         crate::compose::parse_config_json(&text)
     }
 
@@ -186,27 +273,38 @@ impl Compose {
     pub fn up(&self, services: &[String]) -> Result<()> {
         let mut rest = vec!["up", "-d"];
         rest.extend(services.iter().map(String::as_str));
-        self.run(&rest)?;
+        self.run(&rest, None)?;
+        Ok(())
+    }
+
+    /// Whether the daemon answers at all, asked the cheapest way compose
+    /// has: `ps` of this project, which creates and starts nothing.
+    ///
+    /// What an isolated start asks *before* it stops anything, so "Docker
+    /// is not running" is a refusal rather than the end of a start that
+    /// already took the running environment down.
+    pub fn reachable(&self) -> Result<()> {
+        self.run(&["ps", "--all", "--format", "json"], Some(PROBE_TIMEOUT))?;
         Ok(())
     }
 
     /// What compose says about every container of this project.
     pub fn ps(&self) -> Result<Vec<Status>> {
-        let text = self.run(&["ps", "--all", "--format", "json"])?;
+        let text = self.run(&["ps", "--all", "--format", "json"], Some(PROBE_TIMEOUT))?;
         parse_ps(&text)
     }
 
     /// Stops the containers and leaves the volumes. What `stop` does: the
     /// data survives, and the next start brings the same database back.
     pub fn stop(&self) -> Result<()> {
-        self.run(&["stop"])?;
+        self.run(&["stop"], Some(TEARDOWN_TIMEOUT))?;
         Ok(())
     }
 
     /// Removes the containers, the network, and the named volumes. What
     /// `rm` does: the worktree is going, and its database goes with it.
     pub fn down_with_volumes(&self) -> Result<()> {
-        self.run(&["down", "-v"])?;
+        self.run(&["down", "-v"], Some(TEARDOWN_TIMEOUT))?;
         Ok(())
     }
 
@@ -742,6 +840,56 @@ mod tests {
         assert!(err.contains("exited 14"), "{err}");
         assert!(err.contains("no such service: nope"), "{err}");
         assert!(err.contains("compose -p pando-x-y up -d nope"), "{err}");
+    }
+
+    // A daemon that is down is its own error, so a `stop` can tell it from
+    // a failure without reading the sentence.
+    #[test]
+    fn a_daemon_that_is_down_is_recognisable_through_any_context() {
+        let (_dir, paths) = home_with_shim(
+            "#!/bin/sh\necho 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock.' >&2\nexit 1\n",
+        );
+        let compose = Compose::by_project(docker_program(&paths), "pando-x-y");
+        let err = compose.stop().unwrap_err().context("stopping x");
+        assert!(is_daemon_down(&err), "{err:#}");
+        assert!(format!("{err:#}").contains("Docker daemon is not running"));
+        let err = compose.reachable().unwrap_err();
+        assert!(is_daemon_down(&err), "{err:#}");
+    }
+
+    // OrbStack's socket, and newer docker clients, say it another way; read
+    // as a generic failure it made `stop` and `rm` fail where a daemon that
+    // is down has nothing to stop.
+    #[test]
+    fn a_daemon_down_in_the_newer_wording_is_recognised() {
+        let (_dir, paths) = home_with_shim(
+            "#!/bin/sh\necho 'failed to connect to the docker API at unix:///x/docker.sock; check if the path is correct and if the daemon is running: dial unix /x/docker.sock: connect: no such file or directory' >&2\nexit 1\n",
+        );
+        let compose = Compose::by_project(docker_program(&paths), "pando-x-y");
+        let err = compose.reachable().unwrap_err();
+        assert!(is_daemon_down(&err), "{err:#}");
+    }
+
+    // A wedged Docker Desktop accepts the connection and never answers, and
+    // `rm` asked it under the state lock: every other pando froze with it.
+    // The read-only probe is bounded, and a timeout is its own error, told
+    // apart from a daemon that is down because its containers may be up.
+    #[test]
+    fn a_docker_that_never_answers_is_given_up_on() {
+        let (_dir, paths) = home_with_shim("#!/bin/sh\nexec sleep 30\n");
+        let compose = Compose::by_project(docker_program(&paths), "pando-x-y");
+        let began = Instant::now();
+        let err = compose
+            .run(
+                &["ps", "--all", "--format", "json"],
+                Some(Duration::from_millis(300)),
+            )
+            .unwrap_err()
+            .context("asking about x");
+        assert!(began.elapsed() < Duration::from_secs(10), "it waited");
+        assert!(is_daemon_hung(&err), "{err:#}");
+        assert!(!is_daemon_down(&err), "{err:#}");
+        assert!(format!("{err:#}").contains("docker compose ps"), "{err:#}");
     }
 
     #[test]

@@ -41,12 +41,17 @@ pub struct FrameworkRule {
     pub binary_only: bool,
 }
 
-/// The ten rules v1 ships with. Order matters: the first match wins, so the
+/// The rules pando ships with. Order matters: the first match wins, so the
 /// specific frameworks come before the conventions they are built on.
-pub const RULES: [FrameworkRule; 10] = [
+pub const RULES: [FrameworkRule; 12] = [
     FrameworkRule {
         name: "Next.js",
-        markers: &["next.config.js", "next.config.mjs", "next.config.ts"],
+        markers: &[
+            "next.config.js",
+            "next.config.mjs",
+            "next.config.cjs",
+            "next.config.ts",
+        ],
         script_markers: &["next dev"],
         port: PortMechanism::Env("PORT"),
         default_port: 3000,
@@ -56,7 +61,7 @@ pub const RULES: [FrameworkRule; 10] = [
     },
     FrameworkRule {
         name: "Nuxt",
-        markers: &["nuxt.config.ts"],
+        markers: &["nuxt.config.ts", "nuxt.config.js", "nuxt.config.mjs"],
         script_markers: &["nuxt dev"],
         port: PortMechanism::Env("PORT"),
         default_port: 3000,
@@ -64,10 +69,45 @@ pub const RULES: [FrameworkRule; 10] = [
         port_flag: Some("--port {port}"),
         binary_only: false,
     },
+    // Astro sits on Vite but has its own CLI, its own default port and its
+    // own command, so it comes before the Vite row that would claim it.
+    FrameworkRule {
+        name: "Astro",
+        markers: &["astro.config.mjs", "astro.config.ts", "astro.config.js"],
+        script_markers: &["astro dev"],
+        port: PortMechanism::InCommand,
+        default_port: 4321,
+        command: Some("npx astro dev --port {port:web}"),
+        port_flag: Some("--port {port}"),
+        binary_only: false,
+    },
+    FrameworkRule {
+        name: "Angular",
+        markers: &["angular.json"],
+        script_markers: &["ng serve"],
+        port: PortMechanism::InCommand,
+        default_port: 4200,
+        command: Some("npx ng serve --port {port:web}"),
+        port_flag: Some("--port {port}"),
+        binary_only: false,
+    },
     FrameworkRule {
         name: "Vite",
-        markers: &["vite.config.ts", "vite.config.js"],
-        script_markers: &["vite", "astro dev", "svelte-kit dev"],
+        markers: &[
+            "vite.config.ts",
+            "vite.config.js",
+            "vite.config.mjs",
+            "vite.config.mts",
+            "vite.config.cjs",
+        ],
+        // React Router and Remix's Vite mode are Vite underneath and take
+        // the same `--port` flag.
+        script_markers: &[
+            "vite",
+            "svelte-kit dev",
+            "react-router dev",
+            "remix vite:dev",
+        ],
         // Vite reads PORT only through its config, so the flag is the
         // reliable route — and it is one pando can put in the command.
         port: PortMechanism::InCommand,

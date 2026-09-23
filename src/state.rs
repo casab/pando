@@ -15,6 +15,50 @@ pub const STATE_VERSION: u32 = 2;
 /// How long a process may sit in `Starting` before it is called failed.
 pub const START_TIMEOUT_SECS: i64 = 30;
 
+/// What one look at a watched port could say.
+///
+/// Three answers, not two. "Nothing is bound there" and "pando could not
+/// find out" are different facts: the scan of a group's sockets runs
+/// behind a deadline, and on a loaded machine it can miss it again and
+/// again while the server is perfectly healthy. Folding the second into
+/// the first failed healthy servers with "nothing bound port N" — the
+/// opposite of what had happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortCheck {
+    Bound,
+    NotBound,
+    /// The scan could not run, or ran out of time, and nothing else
+    /// could say either way.
+    Unknown,
+}
+
+impl From<bool> for PortCheck {
+    fn from(bound: bool) -> Self {
+        match bound {
+            true => PortCheck::Bound,
+            false => PortCheck::NotBound,
+        }
+    }
+}
+
+/// How much longer than its own window a process may stay `Starting`
+/// while pando cannot get an answer about its port: the window again, and
+/// never less than [`START_TIMEOUT_SECS`]. Bounded, because a machine
+/// with no working scan at all must still end the wait some time.
+pub fn unconfirmed_grace_secs(timeout_secs: i64) -> i64 {
+    timeout_secs.max(START_TIMEOUT_SECS)
+}
+
+/// The longest a process with this readiness window can stay `Starting`:
+/// its window, plus the grace an unanswerable port scan earns it.
+///
+/// What anything that *waits* for readiness — `start --wait`, `share` —
+/// has to wait for. A wait bounded by the window alone gives up while the
+/// phase machine is still, correctly, waiting on a healthy server.
+pub fn longest_starting_secs(timeout_secs: i64) -> i64 {
+    timeout_secs + unconfirmed_grace_secs(timeout_secs)
+}
+
 /// The reason written for a process that is simply gone.
 ///
 /// A constant because it is half a sentence: this is what the phase knows,
@@ -346,6 +390,39 @@ pub fn reconcile(
     changed
 }
 
+/// Forgets every native service whose server is gone, group and all,
+/// returning `(worktree, service)` for each one forgotten.
+///
+/// The read path's half of what [`reconcile`] does for native services.
+/// A native service *is* its process, so a dead server is a service that
+/// is not there — and between it dying and the next mutation, `status`
+/// and the TUI used to go on reporting a database that was gone, on a
+/// pid the kernel is free to hand to something else.
+///
+/// Only once the whole group is gone. A leader that died while its group
+/// lives on — a database's own children still holding the socket — is the
+/// orphan sweep's to signal, on the next mutation, and dropping the record
+/// here would leave that group with nothing able to find it again.
+pub fn forget_dead_native_services(
+    state: &mut State,
+    is_alive: impl Fn(u32) -> bool,
+    group_alive: impl Fn(i32) -> bool,
+) -> Vec<(String, String)> {
+    let mut forgotten = Vec::new();
+    for (name, rec) in state.worktrees.iter_mut() {
+        rec.services.retain(|service| {
+            let gone = service.kind == ServiceKind::Native
+                && service.pid.is_some_and(|pid| !is_alive(pid))
+                && !service.pgid.is_some_and(&group_alive);
+            if gone {
+                forgotten.push((name.clone(), service.name.clone()));
+            }
+            !gone
+        });
+    }
+    forgotten
+}
+
 /// A share is only useful while both halves live: a tunnel whose proxy died
 /// serves the wrong thing, and a proxy whose tunnel died is unreachable.
 fn sweep_dead_shares(state: &mut State, is_alive: &impl Fn(u32) -> bool) -> bool {
@@ -370,11 +447,11 @@ fn sweep_dead_shares(state: &mut State, is_alive: &impl Fn(u32) -> bool) -> bool
 /// port to find out, which would hand the server being waited for an
 /// `EADDRINUSE`. A process that declared no `ready_port` is Running as soon
 /// as it is alive.
-pub fn advance_phases(
+pub fn advance_phases<R: Into<PortCheck>>(
     state: &mut State,
     is_alive: impl Fn(u32) -> bool,
     group_alive: impl Fn(i32) -> bool,
-    port_bound: impl Fn(i32, u16) -> bool,
+    port_bound: impl Fn(i32, u16) -> R,
 ) -> bool {
     let now = Utc::now();
     let mut changed = false;
@@ -398,14 +475,12 @@ pub fn advance_phases(
                             reason: EXITED.into(),
                         };
                         changed = true;
-                    } else if proc
-                        .ready_port
-                        .map(|p| port_bound(proc.pgid, p))
-                        .unwrap_or(true)
-                    {
-                        proc.phase = Phase::Running { since: now };
-                        changed = true;
-                    } else if now.signed_duration_since(*since).num_seconds() > timeout {
+                    } else {
+                        let check = proc
+                            .ready_port
+                            .map(|p| port_bound(proc.pgid, p).into())
+                            .unwrap_or(PortCheck::Bound);
+                        let elapsed = now.signed_duration_since(*since).num_seconds();
                         // The watched port is the whole content of this
                         // failure: "timeout" alone tells nobody what pando
                         // was waiting for.
@@ -413,11 +488,32 @@ pub fn advance_phases(
                             .ready_port
                             .map(|p| p.to_string())
                             .unwrap_or_else(|| "?".to_string());
-                        proc.phase = Phase::Failed {
-                            at: now,
-                            reason: format!("timeout: nothing bound port {port} in {timeout}s"),
+                        let failed = match check {
+                            PortCheck::Bound => {
+                                proc.phase = Phase::Running { since: now };
+                                changed = true;
+                                None
+                            }
+                            PortCheck::NotBound if elapsed > timeout => {
+                                Some(format!("timeout: nothing bound port {port} in {timeout}s"))
+                            }
+                            // Not an answer, so not a reason to give up at
+                            // the window's end: the wait goes on while the
+                            // next scan might still say. Past the grace, the
+                            // failure says what really happened.
+                            PortCheck::Unknown if elapsed > longest_starting_secs(timeout) => {
+                                Some(format!(
+                                    "timeout: pando could not confirm port {port} was bound in \
+                                     {elapsed}s — the scan of the process's sockets kept failing \
+                                     or timing out, and nothing answered on the port"
+                                ))
+                            }
+                            PortCheck::NotBound | PortCheck::Unknown => None,
                         };
-                        changed = true;
+                        if let Some(reason) = failed {
+                            proc.phase = Phase::Failed { at: now, reason };
+                            changed = true;
+                        }
                     }
                 }
                 Phase::Running { .. } => {
@@ -1016,6 +1112,25 @@ mod tests {
     }
 
     #[test]
+    fn a_read_path_forgets_a_native_service_whose_whole_group_is_gone() {
+        let mut state = full_state();
+        // Alive: nothing happens.
+        assert!(forget_dead_native_services(&mut state, |_| true, |_| true).is_empty());
+        // Leader dead, group alive: the sweep's, not this function's.
+        assert!(forget_dead_native_services(&mut state, |_| false, |_| true).is_empty());
+        assert_eq!(state.worktrees["feat+x"].services.len(), 2);
+        // Gone entirely: forgotten, and said.
+        let forgotten = forget_dead_native_services(&mut state, |pid| pid != 5150, |_| false);
+        assert_eq!(forgotten, vec![("feat+x".to_string(), "redis".to_string())]);
+        let services = &state.worktrees["feat+x"].services;
+        assert_eq!(
+            services.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["postgres"],
+            "a compose record is a container, not a process, and stays"
+        );
+    }
+
+    #[test]
     fn reconcile_clears_observed_ports_once_nothing_runs() {
         let mut state = full_state();
         reconcile(&mut state, |_| false, |_| false);
@@ -1167,6 +1282,59 @@ mod tests {
         assert!(
             matches!(phase, Phase::Failed { reason, .. } if reason.contains("1s")),
             "the reason names the window it ran out of: {phase:?}"
+        );
+    }
+
+    // A scan that cannot run is not a scan that found nothing. Under load
+    // `lsof` can miss its deadline tick after tick while the server is
+    // fine, and that used to fail it with "nothing bound port N".
+    #[test]
+    fn a_port_pando_cannot_check_is_waited_on_past_the_window_and_then_named_honestly() {
+        let mut state = State::new();
+        let mut rec = WorktreeRecord::new("/abs/w", true);
+        let just_past = Utc::now() - chrono::Duration::seconds(START_TIMEOUT_SECS + 1);
+        rec.processes.insert("dev".into(), starting(100, just_past));
+        state.worktrees.insert("w".into(), rec);
+
+        assert!(
+            !advance_phases(&mut state, |_| true, |_| false, |_, _| PortCheck::Unknown),
+            "no answer is not a failure yet"
+        );
+        assert!(matches!(
+            state.worktrees["w"].processes["dev"].phase,
+            Phase::Starting { .. }
+        ));
+        // And a scan that does work, a tick later, is believed at once.
+        assert!(advance_phases(
+            &mut state,
+            |_| true,
+            |_| false,
+            |_, _| PortCheck::Bound
+        ));
+        assert!(matches!(
+            state.worktrees["w"].processes["dev"].phase,
+            Phase::Running { .. }
+        ));
+
+        let mut rec = WorktreeRecord::new("/abs/w", true);
+        let long_ago = Utc::now()
+            - chrono::Duration::seconds(
+                START_TIMEOUT_SECS + unconfirmed_grace_secs(START_TIMEOUT_SECS) + 1,
+            );
+        rec.processes.insert("dev".into(), starting(100, long_ago));
+        state.worktrees.insert("w".into(), rec);
+        assert!(advance_phases(
+            &mut state,
+            |_| true,
+            |_| false,
+            |_, _| PortCheck::Unknown
+        ));
+        let phase = &state.worktrees["w"].processes["dev"].phase;
+        assert!(
+            matches!(phase, Phase::Failed { reason, .. }
+                if reason.contains("could not confirm port 17000")
+                    && !reason.contains("nothing bound")),
+            "the failure says pando could not tell, not that nothing bound: {phase:?}"
         );
     }
 

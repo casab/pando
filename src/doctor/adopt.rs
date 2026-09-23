@@ -342,11 +342,7 @@ fn repair_worktrees(paths: &PandoPaths, project_dir: &Path) -> Vec<String> {
             .display()
             .to_string()
     }));
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(paths.root())
-        .args(&args)
-        .output();
+    let out = crate::project::git(paths.root(), &args);
     match out {
         Ok(out) if out.status.success() => {
             let mut notices = vec![format!(

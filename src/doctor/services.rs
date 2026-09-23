@@ -161,7 +161,11 @@ fn isolation_report(
         mechanism: choice.mechanism.map(str::to_string),
         prefer: config.isolation.prefer.clone(),
         answered,
-        evidence: choice.evidence,
+        evidence: choice
+            .evidence
+            .iter()
+            .map(|line| super::config::with_real_user_config(paths, line))
+            .collect(),
     }
 }
 

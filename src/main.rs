@@ -34,8 +34,11 @@ fn main() -> ExitCode {
         // And a question that was answered *wrongly* is not a failure
         // either: it is the same class of mistake as a misspelled flag,
         // and it gets the same code.
-        Err(e) if e.downcast_ref::<pando::cli::UsageError>().is_some() => {
-            eprintln!("pando: {e:#}");
+        Err(e)
+            if e.downcast_ref::<pando::cli::UsageError>().is_some()
+                || e.downcast_ref::<actions::RefusedAnswer>().is_some() =>
+        {
+            eprintln!("pando: {}", pando::remedy::for_cli(&format!("{e:#}")));
             ExitCode::from(EXIT_USAGE)
         }
         // `doctor` has already printed every problem it found, with what
@@ -48,7 +51,7 @@ fn main() -> ExitCode {
         Err(e) => {
             // `{:#}` flattens the context chain onto one line: a CLI failure
             // is one sentence, not a stack.
-            eprintln!("pando: {e:#}");
+            eprintln!("pando: {}", pando::remedy::for_cli(&format!("{e:#}")));
             ExitCode::from(EXIT_ERROR)
         }
     }
@@ -60,6 +63,11 @@ fn run(cli: Cli) -> Result<()> {
     // guard — one environment variable and two ports are all it has.
     if let Some(pando::cli::Command::ShareProxy { listen, upstream }) = cli.command {
         return pando::cli::run_share_proxy(listen, upstream);
+    }
+    // A completion script is about pando, not about any repository, and
+    // it is typically generated from a dotfiles setup that is in none.
+    if let Some(pando::cli::Command::Completions { shell }) = cli.command {
+        return pando::cli::completions(shell, &mut std::io::stdout());
     }
     let cwd = std::env::current_dir().context(
         "cannot read the current directory — it may have been deleted; cd somewhere that exists",

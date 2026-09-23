@@ -7,7 +7,7 @@ use std::path::Path;
 use crate::paths::PandoPaths;
 use crate::ports;
 use crate::process as proc;
-use crate::state::{self, Phase};
+use crate::state::{self, Phase, PortCheck};
 
 use super::share::sweep_dead_shares;
 
@@ -74,6 +74,20 @@ pub fn refresh(paths: &PandoPaths) -> Refreshed {
     // One scan of every live group, used for both questions this pass
     // answers: whether a starting process has opened its port yet, and what
     // every group is really listening on.
+    let mut notices = notices;
+    // A native service is pando's own child, so a crashed one is a
+    // database that is gone: forgotten here rather than reported as up
+    // until the next mutation. Its socket directory goes with it, the one
+    // thing a server that died without cleaning up leaves outside the home.
+    for (name, service) in
+        state::forget_dead_native_services(&mut store, proc::is_alive, proc::group_alive)
+    {
+        let _ = std::fs::remove_dir_all(paths.service_socket_dir(&name, &service));
+        notices.push(format!(
+            "{name}: its {service} exited — `pando start {name}` brings it back"
+        ));
+    }
+
     let scans = scan_groups(&store);
     let mut changed = !notices.is_empty();
     changed |= advance_with(&mut store, &scans);
@@ -118,6 +132,9 @@ pub fn inspect(paths: &PandoPaths) -> Refreshed {
             };
         }
     };
+    // The same forgetting the read path does, on the copy: a report that
+    // listed a database whose server is gone would contradict `status`.
+    state::forget_dead_native_services(&mut store, proc::is_alive, proc::group_alive);
     let scans = scan_groups(&store);
     advance_with(&mut store, &scans);
     capture_observed_ports(&mut store, &scans);
@@ -181,18 +198,14 @@ fn failed_processes(store: &state::State) -> Vec<(String, String)> {
 /// not run — no `lsof`, denied, or timed out — which is a different answer
 /// from "listening on nothing".
 pub(super) fn scan_groups(store: &state::State) -> BTreeMap<i32, Option<Vec<u16>>> {
-    let mut scans: BTreeMap<i32, Option<Vec<u16>>> = BTreeMap::new();
-    for record in store.worktrees.values() {
-        for p in record.processes.values() {
-            if !matches!(p.phase, Phase::Starting { .. } | Phase::Running { .. }) {
-                continue;
-            }
-            scans
-                .entry(p.pgid)
-                .or_insert_with(|| crate::observe::observed_ports_checked(p.pgid));
-        }
-    }
-    scans
+    let pgids: Vec<i32> = store
+        .worktrees
+        .values()
+        .flat_map(|record| record.processes.values())
+        .filter(|p| matches!(p.phase, Phase::Starting { .. } | Phase::Running { .. }))
+        .map(|p| p.pgid)
+        .collect();
+    crate::observe::observed_ports_by_group(&pgids)
 }
 
 /// Whether the process group has opened `port` yet.
@@ -202,10 +215,20 @@ pub(super) fn scan_groups(store: &state::State) -> BTreeMap<i32, Option<Vec<u16>
 /// waiting for, and it answers about the port rather than about *this*
 /// process. The scan of the group's own sockets answers both properly; a
 /// connection is the fallback for a machine where the scan cannot run.
-pub(super) fn port_is_bound(scans: &BTreeMap<i32, Option<Vec<u16>>>, pgid: i32, port: u16) -> bool {
+///
+/// A scan that could not run is not a scan that found nothing: when the
+/// fallback connect gets no answer either, the honest reply is
+/// [`PortCheck::Unknown`], which keeps the process waiting rather than
+/// failing it with "nothing bound" — see [`state::PortCheck`].
+pub(super) fn port_is_bound(
+    scans: &BTreeMap<i32, Option<Vec<u16>>>,
+    pgid: i32,
+    port: u16,
+) -> PortCheck {
     match scans.get(&pgid) {
-        Some(Some(ports)) => ports.contains(&port),
-        _ => ports::something_is_listening(port),
+        Some(Some(ports)) => ports.contains(&port).into(),
+        _ if ports::something_is_listening(port) => PortCheck::Bound,
+        _ => PortCheck::Unknown,
     }
 }
 
@@ -322,6 +345,29 @@ fn explain_new_failures(store: &mut state::State, failed_before: &[(String, Stri
 /// looks identical from the leader's exit status, and is not the wrong
 /// command. Read after the phases are advanced, so the leader has already
 /// been reaped and a zombie cannot hold its own group open.
+/// How many lines of a failed process's log a front end shows under its
+/// reason: enough for a stack trace's closing frames, not a screenful.
+pub const FAILURE_SHOWN_LINES: usize = 10;
+
+/// The closing lines of a failed process's log, blank lines dropped, for a
+/// front end to show under the reason `status` already carries.
+///
+/// The reason says what pando made of the failure — the exit status, and
+/// the hint the classifier matched — and these are what it made it from,
+/// so a developer can check the diagnosis without opening the file. The
+/// CLI prints them when a `--wait` fails; the TUI can put them under its
+/// error line the same way.
+pub fn failure_tail(log_path: &Path) -> Vec<String> {
+    let lines = crate::log_tail::snapshot(log_path, crate::log_tail::FAILURE_TAIL_LINES)
+        .unwrap_or_default();
+    let kept: Vec<String> = lines
+        .into_iter()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let skip = kept.len().saturating_sub(FAILURE_SHOWN_LINES);
+    kept.into_iter().skip(skip).collect()
+}
+
 pub(super) fn explain_failure(reason: &str, log_path: &Path, group_alive: bool) -> String {
     let mut out = reason.to_string();
     let code = proc::recorded_exit_status(&crate::paths::exit_status_file(log_path));

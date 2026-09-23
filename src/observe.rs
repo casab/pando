@@ -13,7 +13,7 @@
 //! the assigned port is always a usable fallback, and a failure to observe
 //! must never fail a command.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -59,6 +59,9 @@ pub fn listening_ports(pids: &[u32]) -> Vec<(u32, u16)> {
 
 /// [`listening_ports`], distinguishing "nothing is listening" from "the
 /// scan could not run".
+// The Linux block's `return` is needed on macOS, where the other block
+// follows it; on Linux it is the last expression and clippy says so.
+#[allow(clippy::needless_return)]
 pub fn listening_ports_checked(pids: &[u32]) -> Option<Vec<(u32, u16)>> {
     if pids.is_empty() {
         return Some(Vec::new());
@@ -122,6 +125,73 @@ pub fn observed_ports_checked(pgid: i32) -> Option<Vec<u16>> {
     Some(ports.into_iter().collect())
 }
 
+/// [`observed_ports_checked`] for several groups at once: one process
+/// listing and one socket scan however many groups there are, rather than
+/// two spawns apiece. Each group's answer means what the single-group
+/// call's would: `None` when a scan could not run, an empty list when the
+/// group listens on nothing.
+pub fn observed_ports_by_group(pgids: &[i32]) -> BTreeMap<i32, Option<Vec<u16>>> {
+    let wanted: BTreeSet<i32> = pgids.iter().copied().filter(|g| *g > 0).collect();
+    let mut out: BTreeMap<i32, Option<Vec<u16>>> = pgids
+        .iter()
+        .map(|g| (*g, (*g <= 0).then(Vec::new)))
+        .collect();
+    if wanted.is_empty() {
+        return out;
+    }
+    let Some(members) = all_group_pids(&wanted) else {
+        return out;
+    };
+    let pids: Vec<u32> = members.values().flatten().copied().collect();
+    let Some(listening) = listening_ports_checked(&pids) else {
+        return out;
+    };
+    for (pgid, group) in &members {
+        let ports: BTreeSet<u16> = listening
+            .iter()
+            .filter(|(pid, _)| group.contains(pid))
+            .map(|(_, port)| *port)
+            .collect();
+        out.insert(*pgid, Some(ports.into_iter().collect()));
+    }
+    out
+}
+
+/// The members of each wanted group, from one listing. A wanted group with
+/// no members maps to an empty list.
+fn all_group_pids(wanted: &BTreeSet<i32>) -> Option<BTreeMap<i32, Vec<u32>>> {
+    let mut members: BTreeMap<i32, Vec<u32>> = wanted.iter().map(|g| (*g, Vec::new())).collect();
+    #[cfg(target_os = "linux")]
+    if std::path::Path::new("/proc").is_dir() {
+        for pgid in wanted {
+            if let Some(pids) = proc_group_pids(*pgid) {
+                members.insert(*pgid, pids);
+            }
+        }
+        return Some(members);
+    }
+    let mut cmd = Command::new("ps");
+    cmd.args(["-axo", "pid=,pgid="]);
+    let text = run_capturing(cmd, SCAN_TIMEOUT)?;
+    for (pid, group) in parse_ps_rows(&text) {
+        if let Some(list) = members.get_mut(&group) {
+            list.push(pid);
+        }
+    }
+    Some(members)
+}
+
+/// Every `pid pgid` row of `ps -axo pid=,pgid=`; rows that do not parse
+/// are skipped.
+fn parse_ps_rows(text: &str) -> impl Iterator<Item = (u32, i32)> + '_ {
+    text.lines().filter_map(|line| {
+        let mut fields = line.split_whitespace();
+        let pid = fields.next()?.parse::<u32>().ok()?;
+        let group = fields.next()?.parse::<i32>().ok()?;
+        Some((pid, group))
+    })
+}
+
 /// `ps -axo pid=,pgid=` filtered to one group. Rows that do not parse are
 /// skipped rather than failing the scan.
 fn parse_ps_pgid(text: &str, pgid: i32) -> Vec<u32> {
@@ -179,6 +249,10 @@ fn proc_group_pids(pgid: i32) -> Option<Vec<u32>> {
 /// `lsof -F pn` output: `p<pid>` starts a process block, `n<host>:<port>`
 /// names one of its sockets. Other field letters (`f` for the descriptor)
 /// appear whether or not they were asked for, and are ignored.
+///
+/// Compiled on Linux too, where `/proc` answers instead, for the same
+/// reason as [`parse_proc_stat_pgid`] the other way round.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 fn parse_lsof(text: &str) -> Vec<(u32, u16)> {
     let mut out = Vec::new();
     let mut current: Option<u32> = None;
@@ -278,6 +352,21 @@ pub fn classify_failure(last_lines: &[String]) -> Option<Hint> {
                     .to_string(),
             });
         }
+        // A shell's own words for a program that is not there: `sh: 1:
+        // next: not found`, `bash: vite: command not found`, zsh's
+        // `command not found: vite`. Almost always a tool the project's
+        // dependencies provide, before they were installed.
+        if lower.contains("command not found")
+            || (lower.contains("sh:") && lower.ends_with(": not found"))
+        {
+            return Some(Hint {
+                cause: "a command is not installed",
+                hint: "a command it runs is not on PATH here — if it comes from the project's \
+                       dependencies, the install step has not run; check `install` under \
+                       [project] in pando.toml"
+                    .to_string(),
+            });
+        }
         if lower.contains("module_not_found")
             || lower.contains("cannot find module")
             || lower.contains("modulenotfounderror")
@@ -312,19 +401,29 @@ pub fn classify_failure(last_lines: &[String]) -> Option<Hint> {
 /// while the server it started is up. Saying "wrong command" there would
 /// be a confident lie; saying what is actually true is more use than
 /// either.
+///
+/// The note follows the reason its caller already wrote — "process
+/// exited with status 0" — so it never restates the status: the two
+/// joined used to say "exited with status 0" twice in one line.
 pub fn exit_note(
     code: Option<i32>,
     printed_anything: bool,
     left_something_running: bool,
 ) -> Option<String> {
     if printed_anything {
-        return None;
+        // A clean exit is the one ending a log cannot explain: nothing in
+        // it failed. A dev server stays up, so a command that exits 0 on
+        // its own is not one — a build, a one-shot script, a guard line.
+        return (code == Some(0) && !left_something_running).then(|| {
+            "a dev server stays up, so this command is probably not the one that starts it"
+                .to_string()
+        });
     }
     Some(
         if left_something_running {
             "it printed nothing at all, and something it started is still running"
         } else if code == Some(0) {
-            "it printed nothing at all; a dev server stays up, so a command that exits 0 \
+            "it printed nothing at all; a dev server stays up, so a command that ends \
              straight away is usually not the one that starts it"
         } else {
             "it printed nothing at all, so there is no log to read"
@@ -564,14 +663,14 @@ mod tests {
         let zero = exit_note(Some(0), false, false).expect("a silent exit 0 is worth saying");
         assert!(zero.contains("printed nothing"), "{zero}");
         assert!(
-            zero.contains("exits 0"),
+            zero.contains("ends straight away"),
             "and says why that is a signal: {zero}"
         );
 
         let one = exit_note(Some(1), false, false).expect("a silent failure is still worth saying");
         assert!(one.contains("printed nothing"), "{one}");
         assert!(
-            !one.contains("exits 0"),
+            !one.contains("straight away"),
             "a command that failed loudly is not evidence about the command: {one}"
         );
 
@@ -597,13 +696,60 @@ mod tests {
 
     #[test]
     fn a_process_that_printed_something_gets_no_note() {
-        assert_eq!(exit_note(Some(0), true, false), None);
         assert_eq!(exit_note(Some(1), true, false), None);
         assert_eq!(
             exit_note(None, true, true),
             None,
             "the log is the answer whenever there is one"
         );
+    }
+
+    // Except for a clean exit: nothing in the log failed, and a dev server
+    // does not exit on its own.
+    #[test]
+    fn a_clean_exit_is_said_even_when_it_printed_something() {
+        let note = exit_note(Some(0), true, false).expect("an exit 0 is worth saying");
+        assert!(note.contains("dev server stays up"), "{note}");
+        assert_eq!(
+            exit_note(Some(0), true, true),
+            None,
+            "not over a group that is still up"
+        );
+    }
+
+    // "process exited with status 0 — it exited with status 0 on its own —
+    // …" in start, `ls`, status and doctor: the note follows a reason that
+    // already names the status, and must not name it again.
+    #[test]
+    fn an_exit_note_never_restates_the_status_its_reason_carries() {
+        for (code, printed, alive) in [
+            (Some(0), true, false),
+            (Some(0), false, false),
+            (Some(0), false, true),
+            (Some(1), false, false),
+            (None, false, false),
+        ] {
+            let Some(note) = exit_note(code, printed, alive) else {
+                continue;
+            };
+            let joined = format!("{} with status {} — {note}", crate::state::EXITED, 0);
+            assert_eq!(joined.matches("status").count(), 1, "{joined}");
+            assert!(!note.contains("exit"), "{note}");
+        }
+    }
+
+    #[test]
+    fn a_missing_command_points_at_the_install_step() {
+        for line in [
+            "sh: 1: next: not found",
+            "bash: vite: command not found",
+            "zsh: command not found: vite",
+        ] {
+            let hint = classify_failure(&[line.to_string()])
+                .unwrap_or_else(|| panic!("no hint for {line:?}"));
+            assert_eq!(hint.cause, "a command is not installed", "{line}");
+            assert!(hint.hint.contains("install"), "{}", hint.hint);
+        }
     }
 
     // ---- against real processes -----------------------------------------
@@ -660,6 +806,31 @@ mod tests {
                 .any(|&(pid, p)| p == port && pids.contains(&pid)),
             "the listening pid must belong to the group: {owners:?} vs {pids:?}"
         );
+    }
+
+    #[test]
+    fn one_batched_scan_answers_each_group_as_the_single_scan_does() {
+        if !python3_available() {
+            eprintln!("skipping: python3 is not installed");
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let port = {
+            let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let child: Detached =
+            spawn_guarded(&python_listener(port), dir.path(), &dir.path().join("log"));
+        assert!(wait_until(Duration::from_secs(15), || {
+            observed_ports(child.pgid).contains(&port)
+        }));
+        // A pgid nothing holds: an empty answer, not a failed one.
+        let gone = i32::MAX - 7;
+        let scans = observed_ports_by_group(&[child.pgid, gone, 0, child.pgid]);
+        assert_eq!(scans.len(), 3);
+        assert_eq!(scans[&child.pgid], observed_ports_checked(child.pgid));
+        assert_eq!(scans[&gone], Some(Vec::new()));
+        assert_eq!(scans[&0], Some(Vec::new()));
     }
 
     #[test]

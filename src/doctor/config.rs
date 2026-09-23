@@ -55,6 +55,35 @@ pub(super) fn project_report(
     }
 }
 
+/// How the default spelling of the machine-wide config is written in text
+/// pando's lower layers compose, before they know which home is in use.
+const DEFAULT_USER_CONFIG: &str = "~/.pando/config.toml";
+
+/// The machine-wide config file as doctor names it: the one this run
+/// actually reads — under `PANDO_HOME` when that is set — with the
+/// developer's home written as `~`.
+pub(super) fn user_config_shown(paths: &PandoPaths) -> String {
+    let file = paths.user_config_file().display().to_string();
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() => {
+            let home = home.trim_end_matches('/');
+            match file.strip_prefix(home) {
+                Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+                _ => file,
+            }
+        }
+        _ => file,
+    }
+}
+
+/// `text` with the default spelling of the machine-wide config replaced by
+/// the file this run reads: a line composed below doctor says
+/// `~/.pando/config.toml` whatever `PANDO_HOME` is, and a fix pointing at
+/// a file pando will not read is no fix.
+pub(super) fn with_real_user_config(paths: &PandoPaths, text: &str) -> String {
+    text.replace(DEFAULT_USER_CONFIG, &user_config_shown(paths))
+}
+
 fn mode_of(path: &Path) -> Option<String> {
     use std::os::unix::fs::PermissionsExt;
     let meta = std::fs::metadata(path).ok()?;

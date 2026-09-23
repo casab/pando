@@ -172,13 +172,20 @@ pub fn derive_base(project_id: &str, name: &str) -> u16 {
 /// state for other worktrees of the project: a stopped worktree still owns
 /// its ports, and the OS probe alone would hand them to someone else.
 pub fn reserve(base: u16, n: usize, is_free: impl Fn(u16) -> bool) -> Option<Vec<u16>> {
+    reserve_window(base, n, |window| window.iter().all(|&p| is_free(p)))
+}
+
+/// [`reserve`], judging a whole candidate window at once rather than port
+/// by port, for a caller whose answer depends on which role a port would
+/// be given.
+fn reserve_window(base: u16, n: usize, fits: impl Fn(&[u16]) -> bool) -> Option<Vec<u16>> {
     if n == 0 {
         return Some(Vec::new());
     }
     let mut candidate = align_to_grid(base);
     for _ in 0..MAX_PROBE_ATTEMPTS {
         if let Some(window) = window_at(candidate, n)
-            && window.iter().all(|&p| is_free(p))
+            && fits(&window)
         {
             return Some(window);
         }
@@ -336,8 +343,22 @@ pub fn assign_with(
     let previous = record.ports.clone();
     let own_share_port = record.share_port;
     let base = derive_base(paths.project_id(), name);
-    let window = reserve(base, roles.len(), |port| {
-        is_free(port) && !taken_by_others.contains(&port) && own_share_port != Some(port)
+    // A port this worktree's own live process is holding is free *for the
+    // role it already has*, and for no other. A shared worktree switching
+    // to isolated grows service roles, so the fast path above is skipped —
+    // but roles are processes first, so the same base gives the processes
+    // the same numbers, and the server kept serving through the switch
+    // keeps its URL. Only for the same role: under any other, a kept port
+    // still has to pass the probe, so a service is never handed a port a
+    // live process is on. One that was kept but is not held any more (a
+    // stopped container's) is simply free.
+    let window = reserve_window(base, roles.len(), |window| {
+        roles.iter().zip(window).all(|(role, &port)| {
+            let own = keep.contains(&port) && previous.get(role) == Some(&port);
+            (own || is_free(port))
+                && !taken_by_others.contains(&port)
+                && own_share_port != Some(port)
+        })
     })
     .with_context(|| {
         format!(
@@ -1189,6 +1210,58 @@ mod tests {
             "the ports stay exactly where they were"
         );
         assert!(!told.reassigned);
+    }
+
+    // A live shared → isolated switch adds service roles, so the reuse
+    // path is skipped and the window is re-derived while the dev server
+    // kept serving through the switch still holds its port. Its own port
+    // is free for its own role, so the same base comes back and the URL
+    // does not move; a service role is never handed a port a live process
+    // is on.
+    #[test]
+    fn growing_service_roles_keeps_the_port_a_live_process_holds() {
+        let (_dir, paths) = assign_fixture();
+        let mut store = crate::state::State::new();
+        with_record(&mut store, "feat+one");
+        let shared = assign_with(
+            &paths,
+            &mut store,
+            "feat+one",
+            &roles(&["web"]),
+            &[],
+            all_free,
+        )
+        .unwrap();
+        let web = shared.ports["web"];
+        let web_is_busy = move |port: u16| port != web;
+
+        let isolated = assign_with(
+            &paths,
+            &mut store,
+            "feat+one",
+            &roles(&["web", "postgres"]),
+            &[web],
+            web_is_busy,
+        )
+        .unwrap();
+        assert_eq!(isolated.ports["web"], web, "the URL stays where it was");
+        assert_eq!(isolated.ports["postgres"], web + 1);
+        assert!(!isolated.reassigned, "nothing was taken");
+
+        // The same kept port under another role is not free: the window
+        // moves rather than giving the database the dev server's port.
+        let mut other = crate::state::State::new();
+        with_record(&mut other, "feat+one");
+        let moved = assign_with(
+            &paths,
+            &mut other,
+            "feat+one",
+            &roles(&["web", "postgres"]),
+            &[web],
+            web_is_busy,
+        )
+        .unwrap();
+        assert!(!moved.ports.values().any(|&p| p == web));
     }
 
     #[test]

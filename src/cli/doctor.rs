@@ -100,7 +100,11 @@ pub fn doctor<W: Write>(paths: &PandoPaths, json: bool, out: &mut W) -> Result<(
                 report: &report,
             })?
         )?,
-        false => write!(out, "{}", report.render())?,
+        false => write!(
+            out,
+            "{}",
+            report.render_with(&crate::term::Style::for_stdout())
+        )?,
     }
     match healthy {
         true => Ok(()),

@@ -11,7 +11,7 @@ use crate::actions;
 use crate::cache;
 use crate::config::Config;
 use crate::paths::PandoPaths;
-use crate::state::State;
+use crate::state::{self, State};
 use crate::worktree::{self, BranchEntry, EnrichUpdate, PrInfo, Worktree};
 
 use super::{App, ServiceHealth};
@@ -42,6 +42,8 @@ pub enum AppEvent {
     /// answer is on disk by then, so the UI thread's copy has to match
     /// whether or not the start that followed worked.
     ConfigResolved(Box<Config>),
+    /// A shell or editor handed to tmux or the desktop did not start.
+    LaunchFailed(String),
 }
 
 /// One consistent read of the repository, taken off the UI thread.
@@ -85,20 +87,86 @@ pub(super) fn ask_through_ui(
 }
 
 /// One consistent read of the repository: the worktrees, who owns them, and
-/// the base a new branch would fork from. Runs off the UI thread.
-pub fn snapshot(paths: &PandoPaths) -> Result<Snapshot> {
-    let discovery = worktree::discover_all(&paths.project)?;
-    // One read of state for both answers, so the list's ownership dots and
-    // its status column cannot come from two different moments.
-    let refreshed = actions::refresh(paths);
-    Ok(Snapshot {
-        created_by_pando: actions::ownership(&refreshed.state, &discovery.worktrees),
-        main: discovery.main,
-        worktrees: discovery.worktrees,
-        state: refreshed.state,
-        warning: refreshed.warning,
-        notices: refreshed.notices,
-        default_base: worktree::resolve_base_branch(paths.root()),
+/// the base a new branch would fork from. Runs off the UI thread, except
+/// once before the first frame.
+///
+/// `known_base` is the base the last snapshot resolved: three git calls
+/// to find again an answer that almost never changes, so it is reused and
+/// re-resolved only on the slow git tick. `scan` asks for the full refresh,
+/// sockets and all; without it the refresh is [`refresh_if_needed`]'s,
+/// which is what keeps the first frame from waiting on a socket scan of
+/// every running worktree.
+pub fn snapshot(paths: &PandoPaths, known_base: Option<String>, scan: bool) -> Result<Snapshot> {
+    thread::scope(|scope| {
+        // Beside the listing rather than after it: on the first frame the
+        // two are most of the wait.
+        let resolving = known_base
+            .is_none()
+            .then(|| scope.spawn(|| worktree::resolve_base_branch(paths.root())));
+        let discovery = worktree::discover_all(&paths.project)?;
+        // One read of state for both answers, so the list's ownership dots
+        // and its status column cannot come from two different moments.
+        let refreshed = if scan {
+            actions::refresh(paths)
+        } else {
+            refresh_if_needed(paths)
+        };
+        let default_base =
+            known_base.or_else(|| resolving.and_then(|handle| handle.join().ok().flatten()));
+        Ok(Snapshot {
+            created_by_pando: actions::ownership(&refreshed.state, &discovery.worktrees),
+            main: discovery.main,
+            worktrees: discovery.worktrees,
+            state: refreshed.state,
+            warning: refreshed.warning,
+            notices: refreshed.notices,
+            default_base,
+        })
+    })
+}
+
+/// The one-second refresh, without the socket scan when it cannot matter.
+///
+/// [`actions::refresh`] scans every live process group's listening sockets
+/// (a `ps` and an `lsof` apiece), which with a few worktrees running costs
+/// far more than everything else the idle TUI does. The scan only moves a
+/// process forward while it is `Starting`; a `Running` one changes phase
+/// when its process dies, which a signal probe sees without spawning
+/// anything. So when nothing is starting and every recorded pid is alive,
+/// the state file is read as it stands. The full refresh still runs with
+/// every discovery, so ports a running server opens later are captured
+/// within one slow tick.
+pub(super) fn refresh_if_needed(paths: &PandoPaths) -> actions::Refreshed {
+    match state::load(&paths.state_file()) {
+        Ok(store) if !needs_advance(&store, crate::process::is_alive) => actions::Refreshed {
+            state: store,
+            ..Default::default()
+        },
+        _ => actions::refresh(paths),
+    }
+}
+
+/// Whether a refresh could change anything: a process still starting, or
+/// any pid the state vouches for gone. Deliberately wider than what
+/// advancing checks — a dead leader whose group lives on still takes the
+/// full path — so skipping is only ever done when it is certainly a no-op
+/// for phases.
+pub(super) fn needs_advance(store: &State, is_alive: impl Fn(u32) -> bool) -> bool {
+    store.worktrees.values().any(|record| {
+        let process = record.processes.values().any(|p| match p.phase {
+            state::Phase::Starting { .. } => true,
+            state::Phase::Running { .. } => !is_alive(p.pid),
+            state::Phase::Failed { .. } => false,
+        });
+        let share = record
+            .share
+            .as_ref()
+            .is_some_and(|s| !is_alive(s.tunnel_pid) || s.proxy_pid.is_some_and(|p| !is_alive(p)));
+        let service = record
+            .services
+            .iter()
+            .any(|s| s.pid.is_some_and(|p| !is_alive(p)));
+        process || share || service
     })
 }
 
@@ -151,6 +219,22 @@ impl App {
         if !snapshot.notices.is_empty() {
             self.set_error(snapshot.notices.join(" · "));
         }
+        // A worktree `n` just made takes the cursor the moment it is
+        // listed. A filter that would hide it is cleared, or the cursor
+        // has nowhere to go.
+        let arrived = self
+            .select_on_arrival
+            .take_if(|name| self.worktrees.iter().any(|w| w.name == *name));
+        let keep = match arrived {
+            Some(name) => {
+                self.filter.clear();
+                self.mode = super::Mode::Normal;
+                self.tail_index = 0;
+                self.tail_scroll = 0;
+                Some(name)
+            }
+            None => keep,
+        };
         self.refilter_keeping(keep);
         fresh
     }
@@ -216,7 +300,7 @@ impl App {
         let config = self.config.clone();
         let tx = self.event_tx.clone();
         thread::spawn(move || {
-            let refreshed = actions::refresh(&paths);
+            let refreshed = refresh_if_needed(&paths);
             // Before the state is handed over: probing is a TCP connect
             // per service, and it has no business on the UI thread or in
             // a paint.
@@ -235,17 +319,23 @@ impl App {
                 None => Ok(refreshed.state),
             };
             let _ = tx.send(AppEvent::Refreshed(Box::new(result)));
-            if !health.shared.is_empty() || !health.worktrees.is_empty() {
-                let _ = tx.send(AppEvent::ServiceHealth(Box::new(health)));
-            }
+            // Sent when empty too: a worktree whose private services were
+            // just taken down must lose their rows, and an answer that is
+            // the same as the last one costs no repaint.
+            let _ = tx.send(AppEvent::ServiceHealth(Box::new(health)));
         });
     }
 
     pub fn spawn_discovery(&self) {
         let paths = self.paths.clone();
         let tx = self.event_tx.clone();
+        let known_base = if self.tick.is_multiple_of(super::GIT_ALL_EVERY) {
+            None
+        } else {
+            self.default_base.clone()
+        };
         thread::spawn(move || {
-            let result = snapshot(&paths).map_err(|e| format!("{e:#}"));
+            let result = snapshot(&paths, known_base, true).map_err(|e| format!("{e:#}"));
             let _ = tx.send(AppEvent::Discovered(Box::new(result)));
         });
     }

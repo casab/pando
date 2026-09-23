@@ -1,0 +1,182 @@
+//! Carrying out a [`Launch`]: the one place the TUI gives its terminal away.
+//!
+//! A tmux window and a GUI editor are handed off on a worker thread with
+//! every stream redirected, like the browser opener. A suspend is the
+//! exception to "never block on a child": the TUI leaves the alternate
+//! screen, stops reading keys, and waits for the shell or editor on the UI
+//! thread — there is nothing else for that thread to do while somebody
+//! else owns the screen — then takes the terminal back.
+
+use std::io::stdout;
+use std::process::{Command, Stdio};
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
+
+use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+
+use super::app::{AppEvent, Launch, LaunchRequest, said_after};
+
+/// Lets the event loop stop the input thread reading the terminal while a
+/// suspended program owns it: crossterm's poll reads the tty, and a
+/// keystroke it took would never reach the shell.
+#[derive(Default)]
+pub struct InputGate {
+    state: Mutex<GateState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct GateState {
+    paused: bool,
+    parked: bool,
+}
+
+impl InputGate {
+    /// Called by the input thread between polls: blocks while paused.
+    pub fn wait_if_paused(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.paused {
+            return;
+        }
+        state.parked = true;
+        self.changed.notify_all();
+        while state.paused {
+            state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        state.parked = false;
+    }
+
+    /// Stops the input thread, and returns once it has stopped — or after
+    /// a second, in case it has already gone and will never park.
+    fn pause(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.paused = true;
+        let _ = self
+            .changed
+            .wait_timeout_while(state, std::time::Duration::from_secs(1), |s| !s.parked);
+    }
+
+    fn resume(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.paused = false;
+        self.changed.notify_all();
+    }
+}
+
+/// Runs `request`. Returns what to say once it is done — nothing for a
+/// hand-off, which the key already announced — or the error to show for a
+/// suspend that could not run; a handed-off launch reports its own failure
+/// as an event.
+pub fn carry_out(
+    request: LaunchRequest,
+    terminal: &mut ratatui::DefaultTerminal,
+    gate: &Arc<InputGate>,
+    tx: &Sender<AppEvent>,
+) -> Result<Option<String>, String> {
+    let said = said_after(&request);
+    match request.launch {
+        Launch::Tmux { args } => {
+            hand_off("tmux".to_string(), args, None, tx.clone());
+            Ok(said)
+        }
+        Launch::Detached { program, args, cwd } => {
+            hand_off(program, args, Some(cwd), tx.clone());
+            Ok(said)
+        }
+        Launch::Suspend { program, args, cwd } => {
+            gate.pause();
+            let _ = disable_raw_mode();
+            let _ = execute!(stdout(), LeaveAlternateScreen);
+            let ran = Command::new(&program)
+                .args(&args)
+                .current_dir(&cwd)
+                .status();
+            let _ = enable_raw_mode();
+            let _ = execute!(stdout(), EnterAlternateScreen);
+            let _ = terminal.clear();
+            gate.resume();
+            match ran {
+                Ok(_) => Ok(said),
+                Err(e) => Err(format!("could not run {program} in {}: {e}", cwd.display())),
+            }
+        }
+    }
+}
+
+/// Starts `program` off the UI thread with its streams redirected, and
+/// reports a failure — including a non-zero exit, which is how tmux says a
+/// window could not be made — back as an event.
+fn hand_off(
+    program: String,
+    args: Vec<String>,
+    cwd: Option<std::path::PathBuf>,
+    tx: Sender<AppEvent>,
+) {
+    thread::spawn(move || {
+        let mut command = Command::new(&program);
+        command
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        if let Some(cwd) = &cwd {
+            command.current_dir(cwd);
+        }
+        let failure = match command.output() {
+            Ok(out) if out.status.success() => None,
+            Ok(out) => Some(format!(
+                "{program} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )),
+            Err(e) => Some(format!("could not run {program}: {e}")),
+        };
+        if let Some(message) = failure {
+            let _ = tx.send(AppEvent::LaunchFailed(message));
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    // The input thread has to be out of crossterm's poll for the whole of
+    // a suspend, or it steals the shell's keystrokes.
+    #[test]
+    fn a_paused_gate_holds_the_input_thread_until_resumed() {
+        let gate = Arc::new(InputGate::default());
+        let polls = Arc::new(AtomicUsize::new(0));
+        let (g, p) = (Arc::clone(&gate), Arc::clone(&polls));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let s = Arc::clone(&stop);
+        let reader = thread::spawn(move || {
+            while !s.load(Ordering::SeqCst) {
+                g.wait_if_paused();
+                p.fetch_add(1, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+        gate.pause();
+        let held = polls.load(Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(60));
+        assert_eq!(polls.load(Ordering::SeqCst), held, "it read while paused");
+        gate.resume();
+        thread::sleep(Duration::from_millis(60));
+        assert!(polls.load(Ordering::SeqCst) > held, "it never came back");
+        stop.store(true, Ordering::SeqCst);
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn pausing_a_gate_nobody_reads_does_not_hang() {
+        let gate = InputGate::default();
+        gate.pause();
+        gate.resume();
+    }
+}

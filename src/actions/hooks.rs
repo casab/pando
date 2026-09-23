@@ -12,6 +12,7 @@ use crate::state::{self, WorktreeRecord};
 use crate::template;
 
 use super::runtime::with_prelude;
+use super::services::service_roles;
 
 /// The name of the built-in install hook, and of its log file.
 ///
@@ -41,6 +42,7 @@ fn install_hook(config: &Config) -> Option<config::HookConfig> {
         cmd: install.to_string(),
         cwd: None,
         fallback: None,
+        on: None,
     })
 }
 
@@ -68,6 +70,11 @@ pub struct HookContext<'a> {
     /// Service addresses, so a migration talks to this worktree's own
     /// database rather than the shared one.
     pub service_env: &'a BTreeMap<String, String>,
+    /// Whether this start runs private services. A hook scoped to
+    /// isolated starts — every hook after `services`, unless its entry
+    /// says otherwise — is skipped when it is not, because the services
+    /// it would run against are the developer's shared ones.
+    pub isolated: bool,
 }
 
 /// Runs every hook at one lifecycle point whose fingerprint has changed.
@@ -83,10 +90,37 @@ pub fn run_hooks(
     ctx: &HookContext<'_>,
     progress: &dyn Fn(&str),
 ) -> Result<()> {
+    let has_services = !service_roles(config).is_empty();
     for hook in hooks_at(config, point) {
+        if !hook.runs_on(ctx.isolated, has_services) {
+            if let Some(note) = skipped(&hook, has_services) {
+                progress(&note);
+            }
+            continue;
+        }
         run_hook(paths, config, &hook, ctx, progress)?;
     }
     Ok(())
+}
+
+/// Why a hook did not run, when that is worth a line: one that only runs
+/// on isolated starts, on a start that is not. `never` is the developer's
+/// own answer and says nothing.
+pub(super) fn skipped(hook: &config::HookConfig, has_services: bool) -> Option<String> {
+    // Only an explicit `on = "isolated"` reaches here in a project with
+    // no services, and there is no "shared services" to speak of: nothing
+    // in the project can be isolated at all.
+    let why = match has_services {
+        true => "this start uses the shared services",
+        false => "this project has no services pando can isolate, so no start is isolated",
+    };
+    (hook.scope(has_services) == config::HookScope::Isolated).then(|| {
+        format!(
+            "{}: not run — it runs on isolated starts only, and {why} (set `on = \"always\"` \
+             in its [[hooks]] entry to run it here too)",
+            hook.name
+        )
+    })
 }
 
 fn run_hook(
@@ -121,13 +155,14 @@ fn run_hook(
     // what a hook runs is a reason to run it again, and keying on the
     // files alone meant a corrected migration command never ran.
     let current = hooks::fingerprint(ctx.worktree, &hook.fingerprint, &cmd);
-    let recorded = state::load(&paths.state_file()).ok().and_then(|store| {
+    let last_run = state::load(&paths.state_file()).ok().and_then(|store| {
         store
             .worktrees
             .get(ctx.name)
             .and_then(|r| r.hooks.get(&hook.name))
-            .and_then(|h| h.fingerprint.clone())
+            .cloned()
     });
+    let recorded = last_run.as_ref().and_then(|h| h.fingerprint.clone());
     // No fingerprint at all means nothing here can say the inputs are
     // unchanged, so the hook runs every time.
     if current.is_some() && current == recorded {
@@ -137,11 +172,28 @@ fn run_hook(
     // same thing by accident: `fingerprint = ["prisma/migrations"]` instead
     // of `["prisma/migrations/**"]` is the natural typo and costs a full
     // migration on every start. Every guess is visible; so is this.
-    if !hook.fingerprint.is_empty() && current.is_none() {
-        progress(&matched_nothing(ctx.worktree, hook));
+    //
+    // Once per worktree, the first time the hook runs there: after that
+    // the recorded run is the proof it was said, and a notice repeated on
+    // every `new` and `start` is one nobody reads. `doctor` goes on
+    // reporting a `[[hooks]]` entry at rest.
+    if !hook.fingerprint.is_empty() && current.is_none() && last_run.is_none() {
+        progress(&match hook.name == INSTALL_HOOK {
+            // Its globs are pando's list of every lockfile it knows, not
+            // anything the developer wrote, so the typo advice is noise.
+            true => format!(
+                "{INSTALL_HOOK}: there is no lockfile here to key it on, so it runs on every start"
+            ),
+            false => matched_nothing(ctx.worktree, hook),
+        });
     }
 
-    progress(&format!("{}: {cmd}", hook.name));
+    // "running the install step: true" rather than "install: true", which
+    // read as a setting being reported rather than a command being run.
+    progress(&match hook.name.as_str() {
+        INSTALL_HOOK => format!("running the install step: {cmd}"),
+        name => format!("running the {name} hook: {cmd}"),
+    });
     let mut env = pando_env(paths, ctx.name, ctx.branch, ctx.worktree);
     env.extend(ctx.service_env.iter().map(|(k, v)| (k.clone(), v.clone())));
     // What the worktree looked like before, so anything the hook leaves

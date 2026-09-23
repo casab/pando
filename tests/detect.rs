@@ -77,10 +77,12 @@ fn the_common_case_resolves_every_slot_with_no_question() {
     let (_dir, root) = fixture(Kind::NextPnpmCompose);
     let (config, asked) = detected(&root);
     assert_eq!(config, Kind::NextPnpmCompose.expected_config());
-    assert!(
-        asked.is_empty(),
-        "the common case must need no answers: {:?}",
-        asked.iter().map(|p| p.slot).collect::<Vec<_>>()
+    // The schema step is the one question the common case still has: it
+    // touches data, so it is asked even with a single candidate.
+    assert_eq!(
+        asked.iter().map(|p| p.slot).collect::<Vec<_>>(),
+        vec![Slot::SchemaHook],
+        "the common case must need no other answers"
     );
 }
 
@@ -91,7 +93,10 @@ fn a_python_project_gets_its_port_on_the_command_line() {
     let (_dir, root) = fixture(Kind::DjangoUvPostgres);
     let (config, asked) = detected(&root);
     assert_eq!(config, Kind::DjangoUvPostgres.expected_config());
-    assert!(asked.is_empty(), "{asked:?}");
+    assert!(
+        asked.iter().all(|p| p.slot == Slot::SchemaHook),
+        "only the schema step is a question: {asked:?}"
+    );
     assert!(
         config.processes["dev"].cmd.contains("{port:web}"),
         "the port has to reach the process somehow"
@@ -260,13 +265,18 @@ fn a_schema_hook_carries_the_files_it_is_keyed_on() {
             .into_iter()
             .find(|p| p.slot == Slot::SchemaHook)
             .unwrap_or_else(|| panic!("{} has a schema step", kind.dir_name()));
-        assert!(hook.decided, "{}", kind.dir_name());
+        // Always a question: it is the one that touches data.
+        assert!(!hook.decided, "{}", kind.dir_name());
         let candidate = hook.preferred().unwrap();
         assert_eq!(candidate.value, cmd);
         let hook = candidate.hook.as_ref().unwrap();
         assert_eq!(hook.name, "migrate");
         assert_eq!(hook.after, pando::config::HookPoint::Services);
         assert_eq!(hook.fingerprint, vec![glob.to_string()]);
+        // Written explicitly, so the entry shows how to change it, and
+        // isolated: a shared start never migrates the shared database.
+        assert_eq!(hook.on, Some(pando::config::HookScope::Isolated));
+        assert!(!hook.runs_on(false, true) && hook.runs_on(true, true));
     }
 }
 

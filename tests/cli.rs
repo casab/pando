@@ -158,7 +158,8 @@ fn env_isolated() -> Env {
          [dev]\ncmd = '''{}'''\nports = {{ PORT = \"web\" }}\n\n\
          [[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
          include = [\"postgres\", \"redis\"]\n\
-         env = {{ DATABASE_URL = \"postgres\", REDIS_URL = \"redis\" }}\n",
+         env = {{ DATABASE_URL = \"postgres\", REDIS_URL = \"redis\" }}\n\n\
+         [[hooks]]\nname = \"migrate\"\nafter = \"services\"\ncmd = \"true\"\n",
         common::listener_on_port_env()
     ));
     e
@@ -199,7 +200,7 @@ fn the_full_new_path_rm_cycle_works_from_the_cli() {
 
     let out = e.pando(&["ls"]);
     assert_eq!(code(&out), EXIT_OK);
-    assert!(stdout(&out).contains("feat+one"));
+    assert!(stdout(&out).contains("feat/one"));
 
     let out = e.pando(&["path", "feat+one"]);
     assert_eq!(code(&out), EXIT_OK);
@@ -1066,8 +1067,21 @@ fn a_project_with_no_dev_process_fails_with_exit_one_and_a_hint() {
     assert_eq!(code(&out), EXIT_ERROR);
     assert_eq!(
         stderr(&out).trim(),
-        "pando: no processes configured; add [dev] to pando.toml"
+        format!(
+            "pando: nothing to run: this project configures no process — add a dev command to \
+             {}:\n[dev]\ncmd = \"…\"   # the command that runs it, e.g. \"cargo run\"",
+            e.config_file().display()
+        )
     );
+    // And `open` does not send it to a `start` that cannot work.
+    let out = e.pando(&["open", "feat/one"]);
+    assert_eq!(code(&out), EXIT_ERROR);
+    let said = stderr(&out);
+    assert!(
+        said.starts_with("pando: feat/one is not running, and this project has nothing to run"),
+        "{said}"
+    );
+    assert!(!said.contains("pando start"), "{said}");
 }
 
 #[test]
@@ -1081,9 +1095,250 @@ fn stopping_nothing_is_not_an_error() {
         stdout(&out)
     );
 
-    let out = e.pando(&["stop", "nope"]);
+    // A worktree that exists and is not running: still not an error.
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+    let out = e.pando(&["stop", "feat+one"]);
     assert_eq!(code(&out), EXIT_OK);
     assert!(stdout(&out).contains("was not running"), "{}", stdout(&out));
+}
+
+// It used to say "nope was not running" and exit 0, which is true of a
+// typo and tells nobody it was one.
+#[test]
+fn a_name_that_matches_nothing_fails_and_says_what_was_meant() {
+    let e = env();
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+    for verb in [
+        "stop", "start", "restart", "logs", "path", "rm", "status", "open",
+    ] {
+        let out = e.pando(&[verb, "feat+on"]);
+        assert_eq!(code(&out), EXIT_ERROR, "{verb}: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("no worktree named \"feat+on\"")
+                && stderr(&out).contains("did you mean feat/one?"),
+            "{verb}: {}",
+            stderr(&out)
+        );
+    }
+    let out = e.pando(&["stop", "zzz"]);
+    assert_eq!(code(&out), EXIT_ERROR);
+    assert!(
+        stderr(&out).contains("this project has feat/one"),
+        "nothing close: every name, since there are few: {}",
+        stderr(&out)
+    );
+}
+
+// The `+` is how a branch becomes a directory name; a person types the
+// branch.
+#[test]
+fn every_verb_takes_the_branch_name_as_well_as_the_directory_name() {
+    let e = env();
+    e.write_config(SLEEPER);
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+    let by_dir = e.pando(&["path", "feat+one"]);
+    let by_branch = e.pando(&["path", "feat/one"]);
+    assert_eq!(code(&by_branch), EXIT_OK, "{}", stderr(&by_branch));
+    assert_eq!(stdout(&by_dir), stdout(&by_branch));
+
+    let out = e.pando(&["start", "feat/one"]);
+    assert_eq!(code(&out), EXIT_OK, "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("started feat+one"),
+        "{}",
+        stdout(&out)
+    );
+    let out = e.pando(&["stop", "feat/one"]);
+    assert_eq!(code(&out), EXIT_OK, "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("stopped feat+one"),
+        "{}",
+        stdout(&out)
+    );
+}
+
+// Inside a worktree, `stop` means that worktree — and says so, since it
+// used to mean every one — while `--all` still means every one.
+#[test]
+fn stop_with_no_name_inside_a_worktree_stops_only_that_one() {
+    let e = env();
+    e.write_config(SLEEPER);
+    for branch in ["feat/one", "feat/two"] {
+        assert_eq!(code(&e.pando(&["new", branch])), EXIT_OK);
+        assert_eq!(code(&e.pando(&["start", branch])), EXIT_OK);
+    }
+    let inside = std::path::PathBuf::from(stdout(&e.pando(&["path", "feat/one"])).trim());
+
+    let out = e.pando_in(&inside, &["stop"]);
+    assert_eq!(code(&out), EXIT_OK, "{}", stderr(&out));
+    assert_eq!(stdout(&out).trim(), "stopped feat+one");
+    assert!(
+        stderr(&out).contains("the worktree you are in") && stderr(&out).contains("--all"),
+        "{}",
+        stderr(&out)
+    );
+    let status: serde_json::Value =
+        serde_json::from_str(&stdout(&e.pando(&["status", "feat/two", "--json"]))).unwrap();
+    assert_eq!(
+        status["worktrees"][0]["processes"]["dev"]["phase"]
+            .as_str()
+            .map(|p| p != "failed"),
+        Some(true),
+        "the other worktree is untouched: {status}"
+    );
+
+    // The same verbs with no name act on the worktree the shell is in.
+    let out = e.pando_in(&inside, &["logs", "--tail", "1"]);
+    assert_eq!(code(&out), EXIT_OK, "{}", stderr(&out));
+
+    let out = e.pando_in(&inside, &["stop", "--all"]);
+    assert_eq!(code(&out), EXIT_OK, "{}", stderr(&out));
+    assert!(stdout(&out).contains("feat+two"), "{}", stdout(&out));
+}
+
+#[test]
+fn a_verb_that_needs_a_worktree_and_gets_none_is_a_usage_error() {
+    let e = env();
+    for args in [
+        vec!["start"],
+        vec!["logs"],
+        vec!["open"],
+        vec!["stop", "--only", "web"],
+    ] {
+        let out = e.pando(&args);
+        assert_eq!(code(&out), EXIT_USAGE, "{args:?}: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("run it from inside one"),
+            "{args:?}: {}",
+            stderr(&out)
+        );
+    }
+}
+
+#[test]
+fn start_wait_returns_once_ready_and_open_hands_the_url_to_the_browser() {
+    let e = env();
+    e.write_config(&format!(
+        "[dev]\ncmd = '''{}'''\nports = {{ PORT = \"web\" }}\n",
+        common::listener_on_port_env()
+    ));
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+
+    let out = e.pando(&["start", "feat/one", "--wait"]);
+    assert_eq!(code(&out), EXIT_OK, "{}", stderr(&out));
+    assert!(stderr(&out).contains("dev is ready"), "{}", stderr(&out));
+    let status: serde_json::Value =
+        serde_json::from_str(&stdout(&e.pando(&["status", "--json"]))).unwrap();
+    let url = status["worktrees"][0]["url"].as_str().unwrap().to_string();
+    assert_eq!(
+        status["worktrees"][0]["processes"]["dev"]["phase"],
+        "running"
+    );
+
+    // `$BROWSER` is the opener when set; here it records what it was given.
+    let opened = e.home.join("opened");
+    let browser = e.home.join("browser.sh");
+    std::fs::write(
+        &browser,
+        format!("#!/bin/sh\necho \"$1\" > '{}'\n", opened.display()),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&browser, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_pando"))
+        .env("PANDO_HOME", &e.home)
+        .env("BROWSER", &browser)
+        .current_dir(&e.root)
+        .args(["open", "feat/one"])
+        .output()
+        .unwrap();
+    assert_eq!(code(&out), EXIT_OK, "{}", stderr(&out));
+    assert_eq!(stdout(&out).trim(), url);
+    assert_eq!(std::fs::read_to_string(&opened).unwrap().trim(), url);
+
+    let out = e.pando(&["open", "feat/one", "--public"]);
+    assert_eq!(code(&out), EXIT_ERROR);
+    assert!(stderr(&out).contains("is not shared"), "{}", stderr(&out));
+
+    e.pando(&["stop", "--all"]);
+    let out = e.pando(&["open", "feat/one"]);
+    assert_eq!(code(&out), EXIT_ERROR);
+    assert!(stderr(&out).contains("pando start"), "{}", stderr(&out));
+}
+
+#[test]
+fn start_wait_fails_with_the_reason_when_the_process_dies() {
+    let e = env();
+    e.write_config("[dev]\ncmd = \"echo boom; exit 3\"\nports = { PORT = \"web\" }\n");
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+    let out = e.pando(&["start", "feat/one", "--wait"]);
+    assert_eq!(code(&out), EXIT_ERROR, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("dev failed") && stderr(&out).contains("pando logs"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+// A process with no port is "running" as soon as it is alive, so `--wait`
+// returned 0 for a dev command that exited a second later, and `status`
+// then said it had failed. It is watched for a few seconds now; and the
+// closing lines of its log come with the reason.
+#[test]
+fn start_wait_fails_when_a_portless_process_exits_at_once() {
+    let e = env();
+    e.write_config("[dev]\ncmd = \"echo compiled; sleep 1\"\nports = []\n");
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+    let out = e.pando(&["start", "feat/one", "--wait"]);
+    assert_eq!(code(&out), EXIT_ERROR, "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("dev failed"), "{err}");
+    assert!(
+        err.contains("status 0"),
+        "a clean exit is named as the likely cause: {err}"
+    );
+    assert!(err.contains("compiled"), "the log's last lines: {err}");
+    assert!(
+        err.contains("pando logs feat/one"),
+        "the branch, not the directory: {err}"
+    );
+}
+
+#[test]
+fn logs_with_no_source_reads_the_only_process_when_there_is_no_dev() {
+    let e = env();
+    e.write_config(
+        "[processes.web]\ncmd = \"echo from-web && sleep 30\"\nports = [\"web\"]\n\
+         env = { PORT = \"{port:web}\" }\n",
+    );
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+    assert_eq!(code(&e.pando(&["start", "feat/one"])), EXIT_OK);
+    let found = poll_until(|| stdout(&e.pando(&["logs", "feat/one"])).contains("from-web"));
+    e.pando(&["stop", "--all"]);
+    assert!(found, "`logs` with no --source read the only process's log");
+}
+
+// Completions are generated from a dotfiles setup, which is in no
+// repository, so they work outside one.
+#[test]
+fn completions_print_a_script_outside_any_repository() {
+    let dir = TempDir::new().unwrap();
+    for shell in ["bash", "zsh", "fish"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_pando"))
+            .current_dir(dir.path())
+            .args(["completions", shell])
+            .output()
+            .unwrap();
+        assert_eq!(code(&out), EXIT_OK, "{shell}: {}", stderr(&out));
+        assert!(stdout(&out).contains("pando"), "{shell}");
+        assert!(stdout(&out).contains("unshare"), "{shell}: every verb");
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_pando"))
+        .current_dir(dir.path())
+        .args(["completions", "tcsh"])
+        .output()
+        .unwrap();
+    assert_eq!(code(&out), EXIT_USAGE);
 }
 
 #[test]
@@ -1093,7 +1348,7 @@ fn logs_for_a_worktree_that_has_never_run_says_where_they_would_be() {
     let out = e.pando(&["logs", "feat+one"]);
     assert_eq!(code(&out), EXIT_ERROR);
     assert!(
-        stderr(&out).contains("no logs for feat+one"),
+        stderr(&out).contains("no logs for feat/one"),
         "{}",
         stderr(&out)
     );
@@ -1227,9 +1482,11 @@ fn a_library_is_never_asked_about_a_dev_server() {
     assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
     let out = e.pando(&["start", "feat+one"]);
     assert_eq!(code(&out), EXIT_ERROR, "stderr: {}", stderr(&out));
-    assert_eq!(
-        stderr(&out).trim(),
-        "pando: no processes configured; add [dev] to pando.toml"
+    let said = stderr(&out);
+    assert!(said.starts_with("pando: nothing to run: "), "{said}");
+    assert!(
+        said.contains(&format!("{}:\n[dev]\ncmd = \"", e.config_file().display())),
+        "{said}"
     );
 }
 
@@ -1675,8 +1932,9 @@ fn a_runtime_this_machine_does_not_resolve_is_a_question_not_a_dead_process() {
         "the shell pando actually uses is named: {printed}"
     );
     assert!(
-        printed.contains("~/.pando/config.toml"),
-        "and the file the answer belongs in, which is not the project's own: {printed}"
+        printed.contains(&e.home.join("config.toml").display().to_string()),
+        "and the file the answer belongs in, absolutely, which is not the project's own: \
+         {printed}"
     );
     assert!(
         !e.log_file("feat+one", "dev").exists(),
@@ -1729,6 +1987,24 @@ fn a_prelude_that_works_is_written_to_the_user_layer_and_the_start_proceeds() {
     );
     assert_eq!(code(&e.pando(&["stop"])), EXIT_OK);
     assert_eq!(status_porcelain(&e.root), "");
+}
+
+// A prelude a program supplied, which this machine then proves does not
+// work, is a bad value in the file the program wrote: exit 2, the code
+// every other refused answer gets, and nothing written.
+#[test]
+fn a_program_supplied_prelude_that_fails_its_probe_exits_as_a_usage_error() {
+    let e = env_pinning_an_impossible_runtime();
+    let out = e.pando_stdin(&["init", "--answers", "-"], r#"{"prelude": "true"}"#);
+    assert_eq!(code(&out), EXIT_USAGE, "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("does not work"), "{}", stderr(&out));
+    assert!(
+        !e.home.join("config.toml").exists()
+            || !std::fs::read_to_string(e.home.join("config.toml"))
+                .unwrap()
+                .contains("prelude = \"true\""),
+        "a line that does not work is not written down"
+    );
 }
 
 // ---- init -----------------------------------------------------------------
@@ -2669,6 +2945,8 @@ fn status_says_when_a_service_is_up_with_no_log_pump() {
 #[test]
 fn doctor_on_a_project_with_nothing_wrong_exits_zero_and_names_every_layer() {
     let e = env();
+    // Something to run: a project with nothing is a note, not a clean bill.
+    e.write_config("[dev]\ncmd = \"true\"\n");
     let out = e.pando(&["doctor"]);
     assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
     let text = stdout(&out);
@@ -2682,15 +2960,32 @@ fn doctor_on_a_project_with_nothing_wrong_exits_zero_and_names_every_layer() {
     assert!(text.contains("user"), "{text}");
     assert!(
         text.contains(&e.config_file().display().to_string()),
-        "the project layer is named even when it is not there:\n{text}"
+        "the project layer is named:\n{text}"
     );
-    assert!(text.contains("nothing to report"), "{text}");
+    // Said once: at the top, not again at the bottom.
+    assert_eq!(text.matches("nothing to report").count(), 1, "{text}");
+}
+
+// A library: nothing detected, nothing configured. doctor says so, with
+// the file and the lines that would fix it, and `start` says the same.
+#[test]
+fn doctor_and_start_say_a_project_has_nothing_to_run() {
+    let e = env_of(Kind::RustLib);
+    let out = e.pando(&["doctor"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("nothing to run"), "{text}");
+    assert!(
+        text.contains(&e.config_file().display().to_string()),
+        "{text}"
+    );
+    assert!(!text.contains("nothing to report"), "{text}");
 }
 
 #[test]
 fn doctor_exits_one_for_a_problem_it_printed_and_says_nothing_else() {
     let e = env();
-    e.write_config("[project]\ninstall = \"pnpm install\"\n");
+    e.write_config("[project]\ninstall = \"pnpm install\"\n\n[dev]\ncmd = \"true\"\n");
     let out = e.pando(&["doctor"]);
     assert_eq!(code(&out), EXIT_ERROR, "stdout: {}", stdout(&out));
     let text = stdout(&out);
@@ -3064,7 +3359,7 @@ fn doctor_adopts_the_project_folder_of_a_repository_that_moved() {
     // And pando finds it again from the repository's new home.
     let ls = e.pando_in(&moved, &["ls"]);
     assert_eq!(code(&ls), EXIT_OK, "stderr: {}", stderr(&ls));
-    assert!(stdout(&ls).contains("feat+one"), "{}", stdout(&ls));
+    assert!(stdout(&ls).contains("feat/one"), "{}", stdout(&ls));
     let path = e.pando_in(&moved, &["path", "feat+one"]);
     assert_eq!(code(&path), EXIT_OK, "stderr: {}", stderr(&path));
     assert!(stdout(&path).contains(&new_id), "{}", stdout(&path));

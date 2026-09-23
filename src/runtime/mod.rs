@@ -60,8 +60,11 @@ impl Requirement {
 
 /// Files that state several languages at once, read once each.
 const TOOL_VERSIONS: &str = ".tool-versions";
-const MISE_FILE: &str = "mise.toml";
-pub const SHARED_VERSION_FILES: [&str; 2] = [TOOL_VERSIONS, MISE_FILE];
+/// mise reads both spellings, and the dot-prefixed one is the common one in
+/// the wild. Where both exist, mise itself lets `mise.toml` win, so it is
+/// read first and its entries sort first.
+const MISE_FILES: [&str; 2] = ["mise.toml", ".mise.toml"];
+pub const SHARED_VERSION_FILES: [&str; 3] = [TOOL_VERSIONS, MISE_FILES[0], MISE_FILES[1]];
 const MANIFEST: &str = "package.json";
 
 /// Everything the repository says about the runtimes it needs.
@@ -76,7 +79,10 @@ const MANIFEST: &str = "package.json";
 /// one that explains itself.
 pub fn requirements(root: &Path) -> Vec<Requirement> {
     let tool_versions = read_tool_versions(root);
-    let mise = read_mise(root);
+    let mise: Vec<(&str, Vec<(String, String)>)> = MISE_FILES
+        .iter()
+        .map(|file| (*file, read_mise(root, file)))
+        .collect();
     let engines = read_engines(root);
     let mut out: Vec<Requirement> = Vec::new();
 
@@ -91,7 +97,9 @@ pub fn requirements(root: &Path) -> Vec<Requirement> {
                 ));
             }
         }
-        for (file, entries) in [(TOOL_VERSIONS, &tool_versions), (MISE_FILE, &mise)] {
+        let shared = std::iter::once((TOOL_VERSIONS, &tool_versions))
+            .chain(mise.iter().map(|(file, entries)| (*file, entries)));
+        for (file, entries) in shared {
             for (tool, spec) in entries {
                 if language.owns(tool) {
                     found.push(Requirement::new(language.name, spec, file.to_string()));
@@ -186,10 +194,10 @@ fn read_tool_versions(root: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
-/// `[tools]` in `mise.toml`, whose values are a string, a list, or a table
-/// with a `version` key.
-fn read_mise(root: &Path) -> Vec<(String, String)> {
-    let Ok(text) = std::fs::read_to_string(root.join(MISE_FILE)) else {
+/// `[tools]` in `mise.toml` or `.mise.toml`, whose values are a string, a
+/// list, or a table with a `version` key.
+fn read_mise(root: &Path, file: &str) -> Vec<(String, String)> {
+    let Ok(text) = std::fs::read_to_string(root.join(file)) else {
         return Vec::new();
     };
     let Ok(table) = toml::from_str::<toml::Table>(&text) else {

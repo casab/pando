@@ -43,7 +43,37 @@ pub struct Worktree {
     pub ahead_behind: Option<(u32, u32)>,
 }
 
+/// Directory name for a branch: `feat/checkout` becomes `feat+checkout`.
+/// Slashes are the only thing that cannot appear in a directory name, and a
+/// plus reads as a join rather than an escape.
+pub fn sanitize_branch_to_dir(branch: &str) -> String {
+    branch.replace('/', "+")
+}
+
 impl Worktree {
+    /// Whether the directory is its branch spelled as a directory: then
+    /// the branch *is* the name.
+    pub fn named_for_branch(&self) -> bool {
+        self.branch
+            .as_deref()
+            .is_some_and(|branch| sanitize_branch_to_dir(branch) == self.name)
+    }
+
+    /// The name a person knows this worktree by: its branch when the
+    /// directory was named for it — `feat/one`, which every command
+    /// accepts, rather than the `feat+one` it became on disk — and the
+    /// directory's own name otherwise.
+    ///
+    /// For text a person reads. Anything a program parses — the stdout
+    /// lines of `new`, `start`, `stop` and `rm`, and every JSON shape —
+    /// carries the directory name, which is the published contract.
+    pub fn display_name(&self) -> String {
+        match (self.named_for_branch(), &self.branch) {
+            (true, Some(branch)) => branch.clone(),
+            _ => self.name.clone(),
+        }
+    }
+
     fn from_entry(entry: PorcelainEntry) -> Self {
         let name = entry
             .path
@@ -120,12 +150,8 @@ pub fn discover_all(project: &ProjectRef) -> Result<Discovery> {
 }
 
 fn porcelain_text(root: &Path) -> Result<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["worktree", "list", "--porcelain"])
-        .output()
-        .context("spawn git worktree list")?;
+    let out = crate::project::git(root, ["worktree", "list", "--porcelain"])
+        .context("run git worktree list")?;
     if !out.status.success() {
         anyhow::bail!(
             "git worktree list failed in {}: {}",
@@ -397,16 +423,14 @@ fn batch_commit_meta(root: &Path, shas: &[&str]) -> HashMap<String, (String, Str
     if shas.is_empty() {
         return HashMap::new();
     }
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args([
-            "log",
-            "--no-walk=unsorted",
-            "--format=%H%x1f%h%x1f%s%x1f%cr",
-        ])
-        .args(shas)
-        .output();
+    let args = [
+        "log",
+        "--no-walk=unsorted",
+        "--format=%H%x1f%h%x1f%s%x1f%cr",
+    ]
+    .into_iter()
+    .chain(shas.iter().copied());
+    let out = crate::project::git(root, args);
     let out = match out {
         Ok(o) if o.status.success() => o,
         _ => return HashMap::new(),
@@ -433,11 +457,10 @@ fn batch_ahead_behind(root: &Path, base: Option<&str>) -> HashMap<String, (u32, 
         return HashMap::new();
     };
     let format = format!("%(refname:short)\x1f%(ahead-behind:{base})");
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["for-each-ref", "refs/heads", &format!("--format={format}")])
-        .output();
+    let out = crate::project::git(
+        root,
+        ["for-each-ref", "refs/heads", &format!("--format={format}")],
+    );
     let out = match out {
         Ok(o) if o.status.success() => o,
         _ => return HashMap::new(),
@@ -523,11 +546,7 @@ pub fn apply_update(wt: &mut Worktree, u: EnrichUpdate) {
 }
 
 fn last_commit(path: &Path) -> Result<(String, String, String)> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(["log", "-1", "--format=%h%x1f%s%x1f%cr", "HEAD"])
-        .output()?;
+    let out = crate::project::git(path, ["log", "-1", "--format=%h%x1f%s%x1f%cr", "HEAD"])?;
     if !out.status.success() {
         anyhow::bail!("git log failed at {}", path.display());
     }
@@ -560,17 +579,16 @@ pub fn resolve_base_branch(root: &Path) -> Option<String> {
 }
 
 fn origin_head(root: &Path) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args([
+    let out = crate::project::git(
+        root,
+        [
             "symbolic-ref",
             "--short",
             "--quiet",
             "refs/remotes/origin/HEAD",
-        ])
-        .output()
-        .ok()?;
+        ],
+    )
+    .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -586,29 +604,27 @@ fn first_existing_ref(root: &Path, candidates: &[&str]) -> Option<String> {
 }
 
 fn ref_resolves(root: &Path, refname: &str) -> bool {
-    Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args([
+    crate::project::git(
+        root,
+        [
             "rev-parse",
             "--verify",
             "--quiet",
             &format!("{refname}^{{commit}}"),
-        ])
-        .output()
-        .map(|o| o.status.success() && !o.stdout.is_empty())
-        .unwrap_or(false)
+        ],
+    )
+    .map(|o| o.status.success() && !o.stdout.is_empty())
+    .unwrap_or(false)
 }
 
 /// `--no-optional-locks` so a status probe never writes an index lock into
 /// the worktree — invariant 1 covers `.git` too.
 fn is_dirty(wt_path: &Path) -> Option<bool> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(wt_path)
-        .args(["--no-optional-locks", "status", "--porcelain", "-z"])
-        .output()
-        .ok()?;
+    let out = crate::project::git(
+        wt_path,
+        ["--no-optional-locks", "status", "--porcelain", "-z"],
+    )
+    .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -616,17 +632,16 @@ fn is_dirty(wt_path: &Path) -> Option<bool> {
 }
 
 fn ahead_behind(wt_path: &Path, base: &str) -> Option<(u32, u32)> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(wt_path)
-        .args([
+    let out = crate::project::git(
+        wt_path,
+        [
             "rev-list",
             "--left-right",
             "--count",
             &format!("HEAD...{base}"),
-        ])
-        .output()
-        .ok()?;
+        ],
+    )
+    .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -652,16 +667,15 @@ pub struct BranchEntry {
 /// Local branches, then remote-only branches on `origin`, each alphabetical.
 /// Empty on any git failure — the create modal degrades to typing a name.
 pub fn list_branches(root: &Path) -> Vec<BranchEntry> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args([
+    let out = crate::project::git(
+        root,
+        [
             "for-each-ref",
             "--format=%(refname)",
             "refs/heads",
             "refs/remotes/origin",
-        ])
-        .output();
+        ],
+    );
     let out = match out {
         Ok(o) if o.status.success() => o,
         _ => return Vec::new(),
@@ -1275,6 +1289,21 @@ bare
     fn parse_pr_list_rejects_malformed_json_with_context() {
         let err = parse_pr_list("not json").unwrap_err();
         assert!(format!("{err:#}").contains("parse gh pr list JSON"));
+    }
+
+    // Every git question this module asks is read-only, and each one used
+    // to be a bare `Command::output`: a git that hung on a lock or a
+    // network filesystem hung `ls` and the TUI's enrichment with it. They
+    // all go through `project::git`, which has a deadline. A new bare call
+    // is the regression, so it is what this looks for.
+    #[test]
+    fn every_git_call_here_is_bounded() {
+        let source = include_str!("worktree.rs");
+        let body = source.split("#[cfg(test)]").next().unwrap();
+        assert!(
+            !body.contains(concat!("Command::new(", "\"git\")")),
+            "a git call in worktree.rs bypasses project::git's deadline"
+        );
     }
 
     // git C-quotes a reason with non-ASCII, a quote, or a control character

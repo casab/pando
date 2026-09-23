@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::config::{self, Config};
@@ -12,6 +12,7 @@ use crate::paths::PandoPaths;
 use crate::process as proc;
 
 use super::questions::{Answering, already_answered, resolve_silencing, slot_label};
+use super::services::service_roles;
 // Only for the intra-doc links above `ALL_SLOTS` and `init_dry_run`.
 #[cfg(doc)]
 use super::questions::resolve;
@@ -88,11 +89,23 @@ pub fn init(
     answers: &Answering<'_>,
     progress: &dyn Fn(&str),
 ) -> Result<InitReport> {
+    init_slots(paths, config, &ALL_SLOTS, answers, progress)
+}
+
+/// [`init`] over some of the slots: the dry run leaves out the ones
+/// nobody could answer.
+fn init_slots(
+    paths: &PandoPaths,
+    config: &Config,
+    slots: &[Slot],
+    answers: &Answering<'_>,
+    progress: &dyn Fn(&str),
+) -> Result<InitReport> {
     let before: Vec<bool> = ALL_SLOTS
         .iter()
         .map(|slot| already_answered(*slot, config))
         .collect();
-    resolve_silencing(paths, config, &ALL_SLOTS, &[], answers, progress)?;
+    resolve_silencing(paths, config, slots, &[], answers, progress)?;
     // Read back from disk rather than reported from memory. The summary is
     // then a statement about the file that exists, and a file pando cannot
     // read again is a failure worth having at the end of `init` rather
@@ -137,7 +150,59 @@ pub fn init_dry_run(
         }
         std::fs::write(to, text).with_context(|| format!("write {}", to.display()))?;
     }
-    let report = init(&previewed, config, answers, progress)?;
+    // A question nobody here can answer — no terminal, no `--yes` that
+    // may take it — is not a reason for a preview to fail. It is part of
+    // the answer to "what would you write": that slot, unanswered. So the
+    // pass is run again without it, and the preview says so.
+    let mut slots: Vec<Slot> = ALL_SLOTS.to_vec();
+    let mut open: Vec<super::questions::Question> = Vec::new();
+    let mut waiting = false;
+    // A pass run again says what the first one said; once is enough.
+    let said = std::cell::RefCell::new(std::collections::HashSet::<String>::new());
+    let progress = |line: &str| {
+        if said.borrow_mut().insert(line.to_string()) {
+            progress(line);
+        }
+    };
+    let progress: &dyn Fn(&str) = &progress;
+    let mut report = loop {
+        match init_slots(&previewed, config, &slots, answers, progress) {
+            Ok(report) => break report,
+            Err(e) => {
+                let Some(needs) = e.downcast_ref::<super::questions::NeedsAnswer>() else {
+                    return Err(e);
+                };
+                let slot = needs.question.slot;
+                if !slots.contains(&slot) {
+                    return Err(e);
+                }
+                slots.retain(|s| *s != slot);
+                open.push(needs.question.clone());
+                // The single-process slots wait on the shape: filling the
+                // `[dev]` fallback here would preview an answer nobody
+                // gave.
+                if slot == Slot::Processes {
+                    slots.retain(|s| !matches!(s, Slot::DevCmd | Slot::PortEnv));
+                    waiting = true;
+                }
+            }
+        }
+    };
+    for question in &open {
+        if let Some(summary) = report.slots.iter_mut().find(|s| s.slot == question.slot) {
+            summary.value = Some(format!("(unanswered) {}", question.prompt));
+            summary.answered_now = false;
+        }
+    }
+    if waiting {
+        for summary in report
+            .slots
+            .iter_mut()
+            .filter(|s| matches!(s.slot, Slot::DevCmd | Slot::PortEnv) && s.value.is_none())
+        {
+            summary.value = Some("(unanswered) waits on the process list".to_string());
+        }
+    }
     // Only the files this pass would *change*. A machine-wide config the
     // run never touched is not part of the answer to "what would you
     // write", and printing it back is noise in front of the thing that is.
@@ -165,10 +230,25 @@ pub fn init_dry_run(
 /// when the pass it was made for failed partway through.
 struct Scratch {
     dir: PathBuf,
+    /// The directories this preview had to create to hold the scratch
+    /// copy, innermost first, so they go with it. A dry run promises to
+    /// write nothing, and an empty project directory left in the home is
+    /// a write all the same.
+    created: Vec<PathBuf>,
 }
 
 impl Scratch {
     fn new(paths: &PandoPaths) -> Result<Scratch> {
+        let project_dir = paths.project_dir();
+        let created: Vec<PathBuf> = [
+            Some(project_dir.clone()),
+            project_dir.parent().map(Path::to_path_buf),
+            Some(paths.home.clone()),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|dir| !dir.exists())
+        .collect();
         // Through the one function that makes the home 0700 and refuses it
         // inside the repository, rather than beside it with a `create_dir`
         // that knows neither rule.
@@ -179,7 +259,7 @@ impl Scratch {
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
         std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-        Ok(Scratch { dir })
+        Ok(Scratch { dir, created })
     }
 }
 
@@ -191,6 +271,12 @@ impl Drop for Scratch {
         // beside this one keeps it.
         if let Some(parent) = self.dir.parent() {
             let _ = std::fs::remove_dir(parent);
+        }
+        // Then whatever the home did not have before this preview. Only
+        // ever an empty directory: a concurrent real run that wrote into
+        // one of them keeps it.
+        for dir in &self.created {
+            let _ = std::fs::remove_dir(dir);
         }
     }
 }
@@ -261,7 +347,10 @@ pub(super) fn slot_value(config: &Config, slot: Slot) -> Option<String> {
             config
                 .hooks
                 .iter()
-                .map(|hook| format!("{}: {}", hook.name, hook.cmd))
+                .map(|hook| match hook.scope(!service_roles(config).is_empty()) {
+                    config::HookScope::Always => format!("{}: {}", hook.name, hook.cmd),
+                    scope => format!("{}: {} (on {})", hook.name, hook.cmd, scope.as_str()),
+                })
                 .collect::<Vec<_>>()
                 .join("; ")
         }),

@@ -83,7 +83,7 @@ fn every_point(sink: &Path) -> String {
          cmd = \"echo create >> '{sink}'\"\n\n\
          [[hooks]]\nname = \"on-install\"\nafter = \"install\"\n\
          cmd = \"echo install >> '{sink}'\"\n\n\
-         [[hooks]]\nname = \"on-services\"\nafter = \"services\"\n\
+         [[hooks]]\nname = \"on-services\"\nafter = \"services\"\non = \"always\"\n\
          cmd = \"echo services >> '{sink}'\"\n\n\
          [[hooks]]\nname = \"on-dev\"\nafter = \"dev\"\n\
          cmd = \"echo dev >> '{sink}'\"\n"
@@ -573,6 +573,45 @@ fn a_fingerprint_that_matches_nothing_is_said_out_loud() {
         "a fingerprint that matched says nothing: {said:?}"
     );
     let _ = actions::stop(&f.paths, &name, None, &|_| {});
+
+    // Said once per worktree, not on every start: the recorded run is
+    // proof it was said, and `doctor` keeps it at rest.
+    let again = start_saying(&f, &name);
+    assert!(
+        again.iter().all(|m| !m.contains("matches nothing")),
+        "{again:?}"
+    );
+    let _ = actions::stop(&f.paths, &name, None, &|_| {});
+}
+
+// A project with no lockfile and an install command: the built-in install
+// hook is keyed on every lockfile pando knows, which match nothing here.
+// That used to be a ~200-character warning, listing a dozen lockfiles
+// nobody wrote, on every `new` and every `start`.
+#[test]
+fn an_install_with_no_lockfile_is_said_once_and_briefly() {
+    let f = hx(Kind::Plain, |_| {
+        "[project]\ninstall = \"true\"\n\n[dev]\ncmd = \"sleep 30\"\nports = []\n".to_string()
+    });
+    let said = std::sync::Mutex::new(Vec::<String>::new());
+    let name = actions::new(&f.paths, &f.config, "feat/one", None, &|m| {
+        said.lock().unwrap().push(m.to_string())
+    })
+    .unwrap();
+    let first = said.into_inner().unwrap();
+    let about: Vec<&String> = first.iter().filter(|m| m.contains("lockfile")).collect();
+    assert_eq!(about.len(), 1, "{first:?}");
+    assert!(about[0].len() < 100, "{about:?}");
+    assert!(!about[0].contains("pnpm-lock.yaml"), "{about:?}");
+
+    let again = start_saying(&f, &name);
+    assert!(
+        again
+            .iter()
+            .all(|m| !m.contains("lockfile") && !m.contains("matches nothing")),
+        "{again:?}"
+    );
+    let _ = actions::stop(&f.paths, &name, None, &|_| {});
 }
 
 // A hook and a service both write `logs/<worktree>/<name>.log`: the pump
@@ -633,7 +672,7 @@ fn gated_with_services(sink: &Path) -> String {
          [dev]\ncmd = \"sleep 30\"\nports = []\n\n\
          [[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
          include = [\"postgres\"]\nenv = {{ DATABASE_URL = \"postgres\" }}\n\n\
-         [[hooks]]\nname = \"migrate\"\nafter = \"services\"\n\
+         [[hooks]]\nname = \"migrate\"\nafter = \"services\"\non = \"always\"\n\
          fingerprint = [\"seed.sql\"]\n\
          cmd = \"echo migrated >> '{sink}'\"\n"
     )
@@ -704,7 +743,7 @@ fn a_mode_change_does_not_run_the_hooks_that_come_before_the_services() {
              include = [\"postgres\"]\nenv = {{ DATABASE_URL = \"postgres\" }}\n\n\
              [[hooks]]\nname = \"deps\"\nafter = \"install\"\n\
              fingerprint = [\"seed.sql\"]\ncmd = \"echo deps >> '{sink}'\"\n\n\
-             [[hooks]]\nname = \"migrate\"\nafter = \"services\"\n\
+             [[hooks]]\nname = \"migrate\"\nafter = \"services\"\non = \"always\"\n\
              fingerprint = [\"seed.sql\"]\ncmd = \"echo migrated >> '{sink}'\"\n"
         )
     });
@@ -759,6 +798,140 @@ fn doctor_agrees_with_what_the_next_start_will_do() {
     assert!(
         f.ran().is_empty(),
         "and it really is skipped: {:?}",
+        f.ran()
+    );
+}
+
+// ---- which starts a hook runs on ------------------------------------------
+
+/// The same compose project, with the migration hook as detection writes
+/// it: no `on` means the default for `after = "services"`, isolated only.
+fn scoped(on: Option<&str>) -> impl Fn(&Path) -> String {
+    let on = on.map(|on| format!("on = \"{on}\"\n")).unwrap_or_default();
+    move |sink: &Path| {
+        let sink = sink.display();
+        format!(
+            "[project]\ninstall = \"true\"\n\n\
+             [dev]\ncmd = \"sleep 30\"\nports = []\n\n\
+             [[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
+             include = [\"postgres\"]\nenv = {{ DATABASE_URL = \"postgres\" }}\n\n\
+             [[hooks]]\nname = \"migrate\"\nafter = \"services\"\n{on}\
+             cmd = \"echo migrated >> '{sink}'\"\n"
+        )
+    }
+}
+
+// A branch's migrations applied to the database every other worktree
+// shares is the one thing a start must never do unasked. A hook after the
+// services runs on isolated starts only, unless its entry says `always`.
+#[test]
+fn a_hook_after_the_services_does_not_run_on_a_shared_start() {
+    for on in [None, Some("isolated")] {
+        let f = hx(Kind::NextPnpmCompose, scoped(on));
+        let name = new_worktree(&f, "feat/one");
+        let said = std::cell::RefCell::new(Vec::new());
+        actions::start(
+            &f.paths,
+            &f.config,
+            &name,
+            None,
+            actions::Mode::Shared,
+            &|m: &str| said.borrow_mut().push(m.to_string()),
+        )
+        .unwrap();
+        assert!(f.ran().is_empty(), "{on:?}: {:?}", f.ran());
+        assert!(
+            said.borrow()
+                .iter()
+                .any(|m| m.contains("migrate: not run") && m.contains("on = \"always\"")),
+            "{on:?}: the skip is said out loud: {:?}",
+            said.borrow()
+        );
+        actions::stop(&f.paths, &name, None, &|_| {}).unwrap();
+        start_in(&f, &name, actions::Mode::Isolated);
+        assert_eq!(f.ran(), vec!["migrated"], "{on:?}: isolated runs it");
+    }
+}
+
+// A project with no services pando can isolate (an external database the
+// app points at itself) has no isolated starts at all. Its migration hook,
+// written before scopes existed with no `on`, ran on every start; the
+// isolated-only default would have switched it off silently, with a notice
+// blaming "the shared services" the project does not have.
+#[test]
+fn a_hook_after_the_services_runs_on_every_start_of_a_project_with_none() {
+    let f = hx(Kind::Plain, |sink| {
+        let sink = sink.display();
+        format!(
+            "[project]\ninstall = \"true\"\n\n\
+             [dev]\ncmd = \"sleep 30\"\nports = []\n\n\
+             [[hooks]]\nname = \"migrate\"\nafter = \"services\"\n\
+             cmd = \"echo migrated >> '{sink}'\"\n"
+        )
+    });
+    let name = new_worktree(&f, "feat/one");
+    let said = std::cell::RefCell::new(Vec::new());
+    actions::start(
+        &f.paths,
+        &f.config,
+        &name,
+        None,
+        actions::Mode::Remembered,
+        &|m: &str| said.borrow_mut().push(m.to_string()),
+    )
+    .unwrap();
+    assert_eq!(f.ran(), vec!["migrated"]);
+    assert!(
+        !said.borrow().iter().any(|m| m.contains("not run")),
+        "{:?}",
+        said.borrow()
+    );
+
+    // An explicit `on = "isolated"` there is honoured, and the notice
+    // does not claim shared services the project does not have.
+    let f = hx(Kind::Plain, |sink| {
+        let sink = sink.display();
+        format!(
+            "[project]\ninstall = \"true\"\n\n\
+             [dev]\ncmd = \"sleep 30\"\nports = []\n\n\
+             [[hooks]]\nname = \"migrate\"\nafter = \"services\"\non = \"isolated\"\n\
+             cmd = \"echo migrated >> '{sink}'\"\n"
+        )
+    });
+    let name = new_worktree(&f, "feat/one");
+    let said = std::cell::RefCell::new(Vec::new());
+    actions::start(
+        &f.paths,
+        &f.config,
+        &name,
+        None,
+        actions::Mode::Remembered,
+        &|m: &str| said.borrow_mut().push(m.to_string()),
+    )
+    .unwrap();
+    assert!(f.ran().is_empty());
+    let said = said.borrow();
+    let note = said
+        .iter()
+        .find(|m| m.contains("migrate: not run"))
+        .unwrap_or_else(|| panic!("{said:?}"));
+    assert!(!note.contains("shared services"), "{note}");
+    assert!(note.contains("no services"), "{note}");
+}
+
+#[test]
+fn a_hook_scoped_always_runs_shared_and_never_runs_nowhere() {
+    let f = hx(Kind::NextPnpmCompose, scoped(Some("always")));
+    let name = new_worktree(&f, "feat/one");
+    start_in(&f, &name, actions::Mode::Shared);
+    assert_eq!(f.ran(), vec!["migrated"], "`always` opts a shared start in");
+
+    let f = hx(Kind::NextPnpmCompose, scoped(Some("never")));
+    let name = new_worktree(&f, "feat/one");
+    start_in(&f, &name, actions::Mode::Isolated);
+    assert!(
+        f.ran().is_empty(),
+        "`never` is the recorded no: {:?}",
         f.ran()
     );
 }

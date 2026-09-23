@@ -264,7 +264,15 @@ impl Kind {
                             cmd: "npm run dev".to_string(),
                             ports: Some(PortsSpec::List(strings(&[app]))),
                             cwd: Some(format!("apps/{app}")),
-                            env: BTreeMap::from([("PORT".to_string(), format!("{{port:{app}}}"))]),
+                            // The env example's `<APP>_PORT` beside the
+                            // Node convention: both carry the one port.
+                            env: BTreeMap::from([
+                                ("PORT".to_string(), format!("{{port:{app}}}")),
+                                (
+                                    format!("{}_PORT", app.to_uppercase()),
+                                    format!("{{port:{app}}}"),
+                                ),
+                            ]),
                             ready: Some(ReadySpec {
                                 role: Some(app.to_string()),
                                 timeout_s: None,
@@ -431,10 +439,12 @@ impl Kind {
                         cmd: "pnpm dev".to_string(),
                         cwd: Some("apps/api".to_string()),
                         ports: Some(PortsSpec::List(strings(&["api"]))),
-                        env: std::collections::BTreeMap::from([(
-                            "PORT".to_string(),
-                            "{port:api}".to_string(),
-                        )]),
+                        // `API_PORT` from the env example, beside the
+                        // Node convention the app itself reads.
+                        env: std::collections::BTreeMap::from([
+                            ("PORT".to_string(), "{port:api}".to_string()),
+                            ("API_PORT".to_string(), "{port:api}".to_string()),
+                        ]),
                         ready: Some(ReadySpec {
                             role: Some("api".to_string()),
                             timeout_s: None,
@@ -1033,6 +1043,7 @@ fn migrate_hook(fingerprint: &[&str], cmd: &str) -> HookConfig {
         cmd: cmd.to_string(),
         cwd: None,
         fallback: None,
+        on: Some(pando::config::HookScope::Isolated),
     }
 }
 

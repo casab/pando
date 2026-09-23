@@ -8,8 +8,15 @@ use std::time::Instant;
 use crate::actions;
 
 use super::App;
+use super::background::{AppEvent, ask_through_ui};
+use super::dialogs::Modal;
 
 const SPINNER_FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+
+/// What a start says when the config names no process. Matched loosely:
+/// the wording after it may change, and a miss only means the TUI learns
+/// it on the next start instead.
+const NO_PROCESSES: &str = "no processes configured";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingKind {
@@ -20,10 +27,12 @@ pub enum PendingKind {
     Restart,
     Share,
     Unshare,
+    StopAll,
 }
 
 impl PendingKind {
-    fn verb(self) -> &'static str {
+    /// What the row and the status line say while it runs.
+    pub fn verb(self) -> &'static str {
         match self {
             PendingKind::Create => "creating",
             PendingKind::Remove => "removing",
@@ -32,6 +41,21 @@ impl PendingKind {
             PendingKind::Restart => "restarting",
             PendingKind::Share => "sharing",
             PendingKind::Unshare => "unsharing",
+            PendingKind::StopAll => "stopping",
+        }
+    }
+
+    /// What it was trying to do, for the line that says it did not.
+    fn noun(self) -> &'static str {
+        match self {
+            PendingKind::Create => "create",
+            PendingKind::Remove => "remove",
+            PendingKind::Start => "start",
+            PendingKind::Stop => "stop",
+            PendingKind::Restart => "restart",
+            PendingKind::Share => "share",
+            PendingKind::Unshare => "unshare",
+            PendingKind::StopAll => "stop",
         }
     }
 }
@@ -45,6 +69,8 @@ pub enum PendingOutcome {
     /// header in front of it.
     Shared(String, String, bool),
     Unshared(String),
+    /// Every worktree `X` stopped.
+    StoppedAll(Vec<String>),
 }
 
 pub struct PendingAction {
@@ -55,26 +81,41 @@ pub struct PendingAction {
     pub spinner_frame: u8,
     pub progress_rx: Option<Receiver<String>>,
     pub stage: Option<String>,
+    /// What the messages call it: the branch, which is what a developer
+    /// knows it by, rather than the directory name derived from it.
+    pub label: String,
 }
 
 impl App {
     /// Returns whether the action started; the create modal only closes (and
     /// throws away what was typed) once it did.
-    pub(super) fn spawn_create(&mut self, branch: String) -> bool {
+    pub(super) fn spawn_create(&mut self, branch: String, base: Option<String>) -> bool {
         let dir_name = actions::sanitize_branch_to_dir(&branch);
+        let label = branch.clone();
         let paths = self.paths.clone();
         let config = self.config.clone();
+        let tx = self.event_tx.clone();
         let (ptx, prx) = mpsc::channel::<String>();
         let started = self.spawn_pending(dir_name, PendingKind::Create, move || {
             let progress = |msg: &str| {
                 let _ = ptx.send(msg.to_string());
             };
-            actions::new(&paths, &config, &branch, None, &progress)
+            // What `pando new` settles before it creates anything — the
+            // install command, the files to provision, the version files —
+            // settled here the same way, asking through the modal where
+            // detection cannot decide. Without it a worktree made with `n`
+            // has no dependencies installed and its first start fails.
+            let ask = |question: &actions::Question| ask_through_ui(&tx, question);
+            let config = actions::resolve_for_new(&paths, &config, &ask, &progress)
+                .map_err(|e| format!("{e:#}"))?;
+            let _ = tx.send(AppEvent::ConfigResolved(Box::new(config.clone())));
+            actions::new(&paths, &config, &branch, base.as_deref(), &progress)
                 .map(PendingOutcome::Created)
                 .map_err(|e| format!("{e:#}"))
         });
         if started && let Some(p) = self.pending.as_mut() {
             p.progress_rx = Some(prx);
+            p.label = label;
         }
         started
     }
@@ -112,8 +153,10 @@ impl App {
         thread::spawn(move || {
             let _ = tx.send(work());
         });
-        self.set_status(format!("{} {} {name}…", SPINNER_FRAMES[0], kind.verb()));
+        let label = self.label_of(&name);
+        self.set_progress(format!("{} {} {label}…", SPINNER_FRAMES[0], kind.verb()));
         self.pending = Some(PendingAction {
+            label,
             name,
             kind,
             rx,
@@ -125,7 +168,24 @@ impl App {
         true
     }
 
+    /// The action in flight on `name`, if there is one — so its row and
+    /// its detail pane say `creating…` or `waiting for your answer` rather
+    /// than `stopped` while it runs.
+    ///
+    /// A stop-all is on every worktree that has anything up.
+    pub fn pending_on(&self, name: &str) -> Option<&PendingAction> {
+        self.pending
+            .as_ref()
+            .filter(|p| p.name == name || (p.kind == PendingKind::StopAll && self.is_live(name)))
+    }
+
+    /// Whether the action in flight is blocked on the question modal.
+    pub fn awaiting_answer(&self) -> bool {
+        self.pending.is_some() && matches!(self.modal, Some(Modal::Question { .. }))
+    }
+
     pub fn poll_pending(&mut self) {
+        let asking = self.awaiting_answer();
         let Some(pending) = self.pending.as_mut() else {
             return;
         };
@@ -140,20 +200,41 @@ impl App {
         }
         match pending.rx.try_recv() {
             Ok(Ok(outcome)) => {
+                let label = pending.label.clone();
                 self.pending = None;
                 match outcome {
                     PendingOutcome::Created(name) => {
-                        self.set_status(format!("created {name}"));
+                        self.set_success(format!("created {label} — s starts it"));
+                        // The cursor goes to it as soon as discovery lists
+                        // it: the next key is almost always meant for it.
+                        self.select_on_arrival = Some(name);
                         self.spawn_discovery();
                     }
-                    PendingOutcome::Removed(name) => {
-                        self.set_status(format!("removed {name}"));
+                    PendingOutcome::Removed(_) => {
+                        self.set_success(format!("removed {label}"));
                         self.spawn_discovery();
                     }
                     PendingOutcome::Started(name, url) => {
-                        match url {
-                            Some(url) => self.set_status(format!("started {name} — {url}")),
-                            None => self.set_status(format!("started {name}")),
+                        // A start returns once the processes are spawned,
+                        // which is not the same as ready: a `✓ started`
+                        // beside a row that still says `starting` is a
+                        // claim the row contradicts. Ready is announced by
+                        // the refresh that sees it.
+                        let ready = matches!(
+                            self.phase_of(&name),
+                            Some(crate::state::Aggregate::Running { .. })
+                        );
+                        let at = url
+                            .as_ref()
+                            .map(|url| format!(" — {url}"))
+                            .unwrap_or_default();
+                        if ready {
+                            self.set_success(format!("{label} is ready{at}"));
+                        } else {
+                            self.set_status(format!(
+                                "started {label}, waiting for it to be ready{at}"
+                            ));
+                            self.awaiting_ready = Some((name.clone(), url));
                         }
                         // The log is new, so whatever was tailed for this
                         // worktree is about the run that just ended.
@@ -161,29 +242,57 @@ impl App {
                         self.tail_scroll = 0;
                         self.spawn_refresh();
                     }
-                    PendingOutcome::Stopped(name) => {
-                        self.set_status(format!("stopped {name}"));
+                    PendingOutcome::Stopped(_) => {
+                        self.set_success(format!("stopped {label}"));
                         self.spawn_refresh();
                     }
-                    PendingOutcome::Shared(name, url, pre_authed) => {
+                    PendingOutcome::Shared(_, url, pre_authed) => {
                         let how = if pre_authed { " (pre-authed)" } else { "" };
-                        self.set_status(format!("{name} is at {url}{how} — O opens it"));
+                        // Long enough to read out; `m` keeps it after that.
+                        self.set_lasting(format!(
+                            "{label} is public at {url}{how} — O opens it, Y copies it"
+                        ));
                         self.spawn_refresh();
                     }
-                    PendingOutcome::Unshared(name) => {
-                        self.set_status(format!("{name} is no longer public"));
+                    PendingOutcome::StoppedAll(names) => {
+                        match names.len() {
+                            0 => self.set_success("nothing was running"),
+                            1 => self.set_success(format!("stopped {}", self.label_of(&names[0]))),
+                            n => self.set_success(format!("stopped {n} worktrees")),
+                        }
+                        self.spawn_refresh();
+                    }
+                    PendingOutcome::Unshared(_) => {
+                        self.set_success(format!("{label} is no longer public"));
                         self.spawn_refresh();
                     }
                 }
             }
             Ok(Err(e)) => {
+                let (kind, label, name) =
+                    (pending.kind, pending.label.clone(), pending.name.clone());
                 self.pending = None;
-                self.set_error(e);
+                // The one start failure that is not about this worktree but
+                // about the project: from now on `⏎` says so up front.
+                if matches!(kind, PendingKind::Start | PendingKind::Restart)
+                    && e.contains(NO_PROCESSES)
+                {
+                    self.nothing_to_run = true;
+                    self.set_error_about(&name, self.nothing_to_run_line());
+                    return;
+                }
+                self.set_error_about(&name, format!("could not {} {label}: {e}", kind.noun()));
+            }
+            // A worker blocked on the question modal is not doing anything
+            // a spinner could stand for, and its clock is the reader's.
+            Err(mpsc::TryRecvError::Empty) if asking => {
+                let message = format!("? {} is waiting for your answer", pending.label);
+                self.set_progress(message);
             }
             Err(mpsc::TryRecvError::Empty) => {
                 pending.spinner_frame = pending.spinner_frame.wrapping_add(1);
                 let glyph = SPINNER_FRAMES[pending.spinner_frame as usize % SPINNER_FRAMES.len()];
-                let label = format!("{} {}", pending.kind.verb(), pending.name);
+                let label = format!("{} {}", pending.kind.verb(), pending.label);
                 let elapsed = pending.started_at.elapsed().as_secs();
                 let suffix = if elapsed >= 3 {
                     format!(" {elapsed}s")
@@ -194,7 +303,7 @@ impl App {
                     Some(stage) => format!("{glyph} {label} · {stage}{suffix}"),
                     None => format!("{glyph} {label}…{suffix}"),
                 };
-                self.set_status(message);
+                self.set_progress(message);
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 let kind = pending.kind;

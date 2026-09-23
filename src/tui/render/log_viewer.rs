@@ -14,33 +14,82 @@ use crate::theme::{
     blue, border, green, highlight_bg, orange, red, search_cursor_bg, search_match_bg, surface,
     text, text_dim, text_muted, yellow,
 };
-use crate::tui::app::{App, LogFilter, LogView, SearchMode};
+use crate::tui::app::{App, LogFilter, LogView, SearchMode, Status};
 
-use super::chrome::hint_line;
+use super::chrome::{hint_line, status_mark};
 use super::{centered_rect, truncate, truncate_line};
 
 /// Key hints for the viewer's footer. The counters and the position badge
 /// claim their width first; these collapse into whatever is left.
-const LOG_HINTS: [(&str, &str, bool); 7] = [
+pub(super) const LOG_HINTS: [(&str, &str, bool); 8] = [
     ("j/k", "move", true),
     ("g/G", "top/live", false),
     ("/", "search", true),
     ("f", "filter", false),
     ("w", "wrap", false),
-    ("tab", "source", false),
+    ("1-9", "source", false),
+    ("?", "help", false),
     ("q", "back", true),
 ];
+
+/// What the title says after `branch · source`: the state of the *source*
+/// on screen — a process's own phase, not the worktree's — and, when the
+/// worktree has failed because of a different process, which one.
+pub(super) fn viewer_title_suffix(
+    app: &App,
+    name: &str,
+    source: &str,
+    missing: bool,
+    gone: bool,
+) -> String {
+    if missing {
+        return " (no log yet)".to_string();
+    }
+    if gone {
+        return " (log deleted)".to_string();
+    }
+    let aggregate = app.phase_of(name);
+    let failed_elsewhere = match &aggregate {
+        Some(crate::state::Aggregate::Failed { process, .. }) if process != source => {
+            format!(" · {process} failed")
+        }
+        _ => String::new(),
+    };
+    let own = app
+        .record_for(name)
+        .and_then(|record| record.processes.get(source));
+    match own {
+        Some(process) => {
+            let word = match process.phase {
+                crate::state::Phase::Running { .. } => "running",
+                crate::state::Phase::Starting { .. } => "starting",
+                crate::state::Phase::Failed { .. } => "failed",
+            };
+            format!(" ({word}){failed_elsewhere}")
+        }
+        // Not a process: the merged tab, a hook, the tunnel. Its state is
+        // the worktree's.
+        None => match aggregate {
+            None => " (not running)".to_string(),
+            Some(crate::state::Aggregate::Starting { .. }) => " (starting)".to_string(),
+            Some(crate::state::Aggregate::Running { .. }) => String::new(),
+            Some(crate::state::Aggregate::Failed { .. }) => failed_elsewhere,
+        },
+    }
+}
 
 /// One worktree's log, full screen: a tab per source, the lines the filter
 /// shows, and a footer that says where the cursor is.
 pub(super) fn render_log_viewer(f: &mut Frame, area: Rect, app: &mut App) {
-    let status = app.active_status().map(|(m, e)| (m.to_string(), e));
     let Some(view) = app.log_view() else { return };
+    // Only what is about this worktree, or about none: an error another
+    // worktree's start raised does not follow the reader in here.
+    let status = app.flash_for(&view.name).cloned();
 
     // The tab list is read here, every frame, so a hook that has just run
     // gets a tab and one that never ran never does. It is a `read_dir` of
     // pando's own log directory: no git, no network, nothing forked.
-    let mut sources = app.log_sources(&view.name);
+    let mut sources = app.viewer_sources(&view.name);
     // The file behind the current tab can go away while the viewer is on
     // it — a `rm`, a `start` that has not written yet, a stray `rm -rf`.
     // The source stays in the list either way, because that list is what
@@ -51,14 +100,8 @@ pub(super) fn render_log_viewer(f: &mut Frame, area: Rect, app: &mut App) {
         sources.push(view.source.clone());
     }
 
-    let suffix = match app.phase_of(&view.name).map(|p| p.word()) {
-        _ if view.missing => " (no log yet)",
-        _ if gone => " (log deleted)",
-        Some("running") => "",
-        Some(_) => " (not running)",
-        None => " (not running)",
-    };
-    let title = format!(" {} · {}{suffix} ", view.name, view.source);
+    let suffix = viewer_title_suffix(app, &view.name, &view.source, view.missing, gone);
+    let title = format!(" {} · {}{suffix} ", app.label_of(&view.name), view.source);
     let block = Block::bordered()
         .title(Span::styled(
             truncate(&title, area.width.saturating_sub(2) as usize),
@@ -277,6 +320,11 @@ fn viewer_rows(
         rows.truncate(body_height);
     }
 
+    // Nothing but blank lines is no output, and a lone gutter mark on an
+    // empty row reads as a broken paint.
+    if !view.collapsed() && lines.iter().all(|line| line.plain.trim().is_empty()) {
+        rows.clear();
+    }
     // An empty body looks the same whether there is no output, the filter
     // hid everything, or the paint is broken. Say which.
     if rows.is_empty() {
@@ -288,8 +336,16 @@ fn viewer_rows(
                 "  no line matches `{}` — & expands, esc clears",
                 view.search.query
             )
-        } else if view.tail.lines().is_empty() {
-            "  waiting for output…".to_string()
+        } else if view
+            .tail
+            .lines()
+            .iter()
+            .all(|line| line.plain.trim().is_empty())
+        {
+            // A source that has written only blank lines — an install
+            // with nothing to say — reads the same as one that has
+            // written nothing.
+            "  (no output yet)".to_string()
         } else {
             format!(
                 "  nothing at level {} — press f to change the filter",
@@ -310,7 +366,10 @@ const INSPECT_MIN_WIDTH: u16 = 48;
 /// The overlay: one log line (or one JSON block) pretty-printed, wrapped to
 /// the popup width, scrollable.
 pub(super) fn render_inspect(f: &mut Frame, area: Rect, app: &mut App) {
-    let status = app.active_status().map(|(m, e)| (m.to_string(), e));
+    let status = app
+        .log_view()
+        .and_then(|view| app.flash_for(&view.name))
+        .cloned();
     let Some(inspect) = &app.inspect else { return };
     let height = area
         .height
@@ -326,16 +385,14 @@ pub(super) fn render_inspect(f: &mut Frame, area: Rect, app: &mut App) {
             Style::new().fg(blue()).add_modifier(Modifier::BOLD),
         ))
         .title_bottom(Line::from(match &status {
-            Some((message, is_error)) => Span::styled(
+            Some(status) => Span::styled(
                 truncate(
-                    &format!(" {message} "),
+                    &format!(" {}{} ", status_mark(status).0, status.message),
                     popup.width.saturating_sub(2) as usize,
                 ),
-                if *is_error {
-                    Style::new().fg(red()).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::new().fg(green()).add_modifier(Modifier::BOLD)
-                },
+                Style::new()
+                    .fg(status_mark(status).1)
+                    .add_modifier(Modifier::BOLD),
             ),
             None => Span::styled(
                 truncate(
@@ -698,7 +755,7 @@ fn viewer_footer(
     view: &LogView,
     counts: ViewerCounts,
     cursor: usize,
-    status: Option<(String, bool)>,
+    status: Option<Status>,
     has_tabs: bool,
     width: usize,
 ) -> Line<'static> {
@@ -750,12 +807,7 @@ fn viewer_footer(
     let new_below = view
         .new_below
         .min(counts.visible.saturating_sub(cursor + 1));
-    let (badge, badge_style) = if let Some(count) = view.count_prefix {
-        (
-            count.to_string(),
-            Style::new().fg(yellow()).add_modifier(Modifier::BOLD),
-        )
-    } else if view.follow {
+    let (badge, badge_style) = if view.follow {
         (
             "FOLLOW ●".to_string(),
             Style::new().fg(green()).add_modifier(Modifier::BOLD),
@@ -808,14 +860,19 @@ fn viewer_footer(
         .sum::<usize>();
     let hint_budget = width.saturating_sub(tail_width + badge_width + 1);
     let mut spans = match &status {
-        Some((message, is_error)) => vec![Span::styled(
-            format!(" {}", truncate(message, hint_budget.saturating_sub(1))),
-            if *is_error {
-                Style::new().fg(red()).add_modifier(Modifier::BOLD)
-            } else {
-                Style::new().fg(green()).add_modifier(Modifier::BOLD)
-            },
-        )],
+        Some(status) => {
+            let (mark, color) = status_mark(status);
+            vec![Span::styled(
+                format!(
+                    " {mark}{}",
+                    truncate(
+                        &status.message,
+                        hint_budget.saturating_sub(1 + mark.chars().count())
+                    )
+                ),
+                Style::new().fg(color).add_modifier(Modifier::BOLD),
+            )]
+        }
         None => log_hint_spans(has_tabs, hint_budget),
     };
     spans.extend(tail);
@@ -834,7 +891,7 @@ fn viewer_footer(
 fn log_hint_spans(has_tabs: bool, width: usize) -> Vec<Span<'static>> {
     let shown: Vec<(&str, &str, bool)> = LOG_HINTS
         .iter()
-        .filter(|(key, _, _)| has_tabs || *key != "tab")
+        .filter(|(key, _, _)| has_tabs || *key != "1-9")
         .copied()
         .collect();
     truncate_line(hint_line(&shown, width), width).spans

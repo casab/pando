@@ -47,6 +47,12 @@ pub struct Language {
     /// Who can satisfy this language on a machine, in the order a
     /// question offers them.
     pub managers: &'static [Manager],
+    /// Package managers whose run prefix picks the interpreter itself, by
+    /// program name — the row in `catalog::package_managers` holds their
+    /// lockfile and prefix. `uv run` reads `.python-version` and finds or
+    /// installs that Python, so a project run through it needs no prelude
+    /// whatever `bash -lc` resolves on its own.
+    pub runners: &'static [&'static str],
 }
 
 impl Language {
@@ -81,6 +87,7 @@ pub const LANGUAGES: [Language; 6] = [
         binaries: &["node"],
         version_flag: "-v",
         managers: &[VOLTA, MISE, ASDF, NVM, FNM],
+        runners: &[],
     },
     Language {
         name: "python",
@@ -93,6 +100,7 @@ pub const LANGUAGES: [Language; 6] = [
         binaries: &["python3", "python"],
         version_flag: "-V",
         managers: &[PYENV, MISE, ASDF],
+        runners: &["uv"],
     },
     Language {
         name: "ruby",
@@ -105,6 +113,7 @@ pub const LANGUAGES: [Language; 6] = [
         binaries: &["ruby"],
         version_flag: "-v",
         managers: &[RBENV, MISE, ASDF, RVM],
+        runners: &[],
     },
     Language {
         name: "rust",
@@ -117,6 +126,7 @@ pub const LANGUAGES: [Language; 6] = [
         binaries: &["rustc"],
         version_flag: "-V",
         managers: &[RUSTUP, MISE, ASDF],
+        runners: &[],
     },
     Language {
         name: "go",
@@ -126,6 +136,7 @@ pub const LANGUAGES: [Language; 6] = [
         binaries: &["go"],
         version_flag: "version",
         managers: &[MISE, ASDF],
+        runners: &[],
     },
     Language {
         name: "java",
@@ -135,8 +146,25 @@ pub const LANGUAGES: [Language; 6] = [
         binaries: &["java"],
         version_flag: "-version",
         managers: &[JENV, MISE, ASDF, SDKMAN],
+        runners: &[],
     },
 ];
+
+impl Language {
+    /// The runner this project uses for this language, when it has one:
+    /// a row of `runners` whose lockfile is in the repository.
+    pub fn runner(
+        &self,
+        root: &Path,
+    ) -> Option<&'static crate::catalog::package_managers::PackageManager> {
+        self.runners.iter().find_map(|program| {
+            crate::catalog::package_managers::PACKAGE_MANAGERS
+                .iter()
+                .find(|row| row.program == *program)
+                .filter(|row| row.lockfiles.iter().any(|l| root.join(l).is_file()))
+        })
+    }
+}
 
 /// The table entry for a language, by name.
 pub fn language(name: &str) -> Option<&'static Language> {

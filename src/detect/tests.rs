@@ -626,14 +626,16 @@ fn every_file_the_runtime_reads_is_a_version_file_signal() {
 
 #[test]
 fn every_install_command_is_a_frozen_one() {
-    const KNOWN_FROZEN: [&str; 7] = [
+    const KNOWN_FROZEN: [&str; 9] = [
         "pnpm install --frozen-lockfile",
         "npm ci",
-        "yarn install --immutable",
+        "yarn install --frozen-lockfile",
         "bun install --frozen-lockfile",
         "uv sync --frozen",
         "poetry install --sync",
         "BUNDLE_FROZEN=true bundle install",
+        "pipenv sync",
+        "composer install",
     ];
     for lock in package_managers::lockfiles() {
         let Some((cmd, _)) = package_managers::install_for(lock) else {

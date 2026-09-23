@@ -20,8 +20,9 @@ use super::refresh::advance_before_reconcile;
 use super::runtime::with_prelude;
 use super::services::{
     Fresh, bring_up_services, clear_native_sockets, compose_projects, forget_hooks_after_services,
-    planned_services, remember_isolated, resolve_service_env, service_roles, stop_compose_projects,
-    stop_service_pumps, worktree_url,
+    forget_unstarted_services, has_live_services, planned_services, preflight_isolation,
+    resolve_service_env, service_roles, stop_containers, stop_service_pumps, undo_failed_isolation,
+    worktree_url,
 };
 use super::share::{sweep_dead_shares_with, take_share_down};
 // Only for the intra-doc link above `sweep_orphaned_groups`.
@@ -163,6 +164,21 @@ pub fn start(
     mode: Mode,
     progress: &dyn Fn(&str),
 ) -> Result<StartReport> {
+    start_checked(paths, config, name, only, mode, false, progress)
+}
+
+/// [`start`], told whether its caller has already run
+/// [`preflight_isolation`] — `restart` has to, before its stop, and asking
+/// Docker twice in one command buys nothing.
+fn start_checked(
+    paths: &PandoPaths,
+    config: &Config,
+    name: &str,
+    only: Option<&str>,
+    mode: Mode,
+    mut preflighted: bool,
+    progress: &dyn Fn(&str),
+) -> Result<StartReport> {
     let worktree = find_worktree(paths, name)?;
     // Before anything is installed, signalled or spawned: a `--only` naming
     // a process that does not exist must have no side effects at all.
@@ -184,6 +200,25 @@ pub fn start(
     // be skipped", and the authoritative one is made under the lock below.
     let mut everything_up = every_process_running(paths, name, &selection);
 
+    // A start that switches this worktree to its own services replaces
+    // every process it is running. So everything that switch needs —
+    // Docker answering, the compose files, the recipes and their engines,
+    // the env the app will be given — is checked first, while there is
+    // still nothing to lose: a start that stopped a working dev server and
+    // *then* found Docker was off had destroyed an environment over a
+    // request that could never succeed. Read without the lock, like
+    // `mode_would_change`; the decision is made again under it below.
+    if !preflighted && would_switch_to_isolated(paths, config, name, mode) {
+        preflight_isolation(
+            paths,
+            config,
+            name,
+            &canonical,
+            &worktree_roles(config, true),
+        )?;
+        preflighted = true;
+    }
+
     paths.ensure_home()?;
     let _lock = state::lock(&paths.lock_file())?;
     let mut store = state::load(&paths.state_file())?;
@@ -198,13 +233,19 @@ pub fn start(
             != crate::paths::resolve_for_compare(&canonical)
     });
     if stale {
-        let groups: Vec<i32> = store.worktrees[name]
-            .processes
-            .values()
-            .map(|p| p.pgid)
-            .collect();
+        let record = store.worktrees.get_mut(name).expect("just read");
+        let groups: Vec<i32> = record.processes.values().map(|p| p.pgid).collect();
         for pgid in groups {
             proc::stop(pgid, STOP_GRACE)?;
+        }
+        // Its native servers, log pumps and share are process groups too,
+        // and a public tunnel onto a worktree that is not there any more is
+        // the worst of them to leave with no record.
+        let stop = |pgid| proc::stop(pgid, STOP_GRACE);
+        let mut failures = stop_service_pumps(record, &stop);
+        take_share_down(record, &stop, &mut failures);
+        if !failures.is_empty() {
+            bail!("{name}: {}", failures.join("; "));
         }
         store.worktrees.remove(name);
     }
@@ -223,19 +264,47 @@ pub fn start(
         };
     let mode_changed = was_isolated != isolate;
     if mode_changed {
-        refuse_only_across_a_mode_change(name, only, isolate)?;
+        refuse_only_across_a_mode_change(only, isolate)?;
+    }
+    // The mode flipped under a concurrent command between the lock-free
+    // read above and this one. Rare, so checked here, under the lock,
+    // rather than not at all.
+    if mode_changed && isolate && !preflighted {
+        preflight_isolation(
+            paths,
+            config,
+            name,
+            &canonical,
+            &worktree_roles(config, true),
+        )?;
     }
     // And the lifecycle runs again for it: a worktree whose services are
     // being swapped underneath it is not one where "everything is already
     // up" means there is nothing to do.
     everything_up = everything_up && !mode_changed;
 
+    // A worktree becoming isolated in this start. Anything it writes down
+    // for that before the services are really up is undone if the start
+    // fails first — see `undo_failed_isolation`.
+    let becoming_isolated = isolate && !was_isolated;
+
     // Decided before anything is touched. A process that is alive is
     // reported and left exactly as it is; one whose leader is gone is
     // signalled before its record goes, because a dead leader is not a dead
     // process group and its child may still hold the port.
+    //
+    // A live process of a worktree becoming isolated is the exception to
+    // both. It has to be replaced, since it talks to the shared services,
+    // but not yet: it keeps serving while the private services come up and
+    // the hooks run against them, and is replaced only once all of that
+    // has worked. A start that fails there — a container that never gets
+    // ready, a migration that fails — then costs nothing: the dev server
+    // the developer had is still the one they have. Nothing fights over a
+    // port meanwhile, because the services get roles of their own after
+    // the processes' and the processes keep the ports they hold.
     let mut already: Vec<String> = Vec::new();
     let mut clear: Vec<(String, i32)> = Vec::new();
+    let mut kept_serving: Vec<String> = Vec::new();
     if let Some(record) = store.worktrees.get(name) {
         for (process, existing) in &record.processes {
             let selected = selection.iter().any(|(n, _)| n == process);
@@ -245,6 +314,8 @@ pub fn start(
             ) && proc::is_alive(existing.pid);
             if selected && live && !mode_changed {
                 already.push(process.clone());
+            } else if selected && live && becoming_isolated {
+                kept_serving.push(process.clone());
             } else if selected || only.is_none() {
                 // Selected and not live: this start replaces it. Not
                 // selected, with nothing asking for a subset: a name config
@@ -265,6 +336,12 @@ pub fn start(
     }
     for process in &already {
         progress(&format!("{process} is already running"));
+    }
+    if !kept_serving.is_empty() {
+        progress(&format!(
+            "{} keeps running on the shared services until this worktree's own are ready",
+            kept_serving.join(", ")
+        ));
     }
     if !clear.is_empty() {
         progress(match mode_changed {
@@ -303,12 +380,23 @@ pub fn start(
     // the services it already has rather than quietly pointing its
     // processes back at the shared database.
     //
-    // Turned *on* only once the containers exist — see `remember_isolated`
-    // below. Turned off here and now, because a worktree pando can no
-    // longer isolate is one whose next start is a shared one, and there is
-    // no container to contradict that.
+    // Turned *on* only once the services are up and ready, right before
+    // the processes that use them are spawned: a start that failed before
+    // then — a mapping the env rewriter cannot satisfy, a container that
+    // never got ready — must leave a worktree that still starts, shared,
+    // with no edit to `pando.toml`. Turned off here and now, because a
+    // worktree pando can no longer isolate is one whose next start is a
+    // shared one, and there is no container to contradict that.
     if !isolate {
         record.isolated = false;
+        // A worktree on the shared services owns no service ports: the
+        // window this start re-derives has no room for them. And a record
+        // whose service was never brought up — what a failed isolated
+        // start used to leave behind — is forgotten, rather than shown as
+        // a database that is down on a port nothing reserved.
+        for service in record.services.iter_mut() {
+            service.port = None;
+        }
     }
     // `--shared` is the way back, and taking it means taking the private
     // copies down. The records stay: they carry the compose project, which
@@ -317,17 +405,26 @@ pub fn start(
     // to re-derive no longer has room for them, and a status line claiming
     // a service is on a port another worktree now owns is worse than one
     // that says nothing.
+    //
+    // A record that is not isolated but has live service pumps or native
+    // servers is the same case: a switch to isolated interrupted between
+    // its services coming up and its second lock — Ctrl-C, a crash —
+    // whose undo never ran. Its containers and servers are orphans, and
+    // this start, which is a shared one, is the one that has to take them
+    // down; dropping their ports while they run leaves them unfindable.
     let mut going_shared: Vec<String> = Vec::new();
-    if mode == Mode::Shared && was_isolated {
+    if !isolate && (was_isolated || has_live_services(record)) {
         let failures = stop_service_pumps(record, &|pgid| proc::stop(pgid, STOP_GRACE));
         if !failures.is_empty() {
             bail!("{name}: {}", failures.join("; "));
         }
-        for service in record.services.iter_mut() {
-            service.port = None;
-        }
         clear_native_sockets(paths, name, record);
         going_shared = compose_projects(record);
+    }
+    if !isolate {
+        // After the pumps and native servers above are stopped, so a
+        // native record that was live is only dropped once it is not.
+        forget_unstarted_services(record);
     }
     // Service roles are reserved with the process roles, in one window, so
     // `{port:postgres}` resolves in any template and the number is the
@@ -350,6 +447,10 @@ pub fn start(
     if isolate {
         keep.extend(record.services.iter().filter_map(|service| service.port));
     }
+    // The shared window, as it was before this start re-derives it. A
+    // switch that fails puts it back: the processes kept serving through
+    // it are still on these numbers, whatever the new window said.
+    let shared_ports = record.ports.clone();
 
     let assignment = ports::assign_keeping(paths, &mut store, name, &roles, &keep)?;
 
@@ -368,7 +469,7 @@ pub fn start(
     if let Some(record) = store.worktrees.get_mut(name) {
         record.roles = owners;
         if isolate {
-            record.services = planned_services(config, paths, name, &assignment.ports, record);
+            record.services = planned_services(config, &assignment.ports, record);
         }
     }
     // Written down before anything is brought up: a start that fails
@@ -385,17 +486,35 @@ pub fn start(
     // stop` takes seconds, and holding the state lock through it would
     // freeze `pando ls` and the TUI's tick.
     if !going_shared.is_empty() {
-        progress(&format!(
-            "{name} is going back to the project's shared services — stopping its own"
-        ));
-        stop_compose_projects(paths, &going_shared, |compose| compose.stop())?;
+        progress(&match was_isolated {
+            true => format!(
+                "{} is going back to the project's shared services — stopping its own",
+                worktree.display_name()
+            ),
+            false => format!(
+                "{} runs on the project's shared services — stopping the private ones an \
+                 interrupted start left running",
+                worktree.display_name()
+            ),
+        });
+        stop_containers(paths, &going_shared, progress)?;
     }
+
+    // Every failure between here and the services being up leaves a
+    // worktree that is still the shared one it was: nothing of the
+    // isolated attempt may outlive it.
+    let undo = |e: anyhow::Error| -> anyhow::Error {
+        if becoming_isolated {
+            undo_failed_isolation(paths, config, name, &shared_ports);
+        }
+        e
+    };
 
     // Everything the app is told about where its services are. Computed
     // from the allocated ports alone, so a hook that runs before the
     // containers exist sees exactly what the processes will.
     let service_env = if isolate {
-        resolve_service_env(paths, config, &canonical, &assignment.ports)?
+        resolve_service_env(paths, config, &canonical, &assignment.ports).map_err(undo)?
     } else {
         BTreeMap::new()
     };
@@ -414,6 +533,7 @@ pub fn start(
         worktree: &canonical,
         ports: &assignment.ports,
         service_env: &service_env,
+        isolated: isolate,
     };
     if !everything_up {
         run_hooks(
@@ -422,20 +542,22 @@ pub fn start(
             config::HookPoint::Create,
             &hook_ctx,
             progress,
-        )?;
+        )
+        .map_err(undo)?;
         run_hooks(
             paths,
             config,
             config::HookPoint::Install,
             &hook_ctx,
             progress,
-        )?;
+        )
+        .map_err(undo)?;
     }
 
     let mut fresh = Fresh(false);
     if isolate {
-        fresh = bring_up_services(paths, config, name, &canonical, &assignment.ports, progress)?;
-        remember_isolated(paths, name)?;
+        fresh = bring_up_services(paths, config, name, &canonical, &assignment.ports, progress)
+            .map_err(undo)?;
     }
 
     // The database the hooks after this point run against has changed, and
@@ -453,7 +575,7 @@ pub fn start(
         _ => None,
     };
     if let Some(why) = why {
-        forget_hooks_after_services(paths, config, name, why, progress)?;
+        forget_hooks_after_services(paths, config, name, why, progress).map_err(undo)?;
         everything_up = false;
     }
 
@@ -464,62 +586,102 @@ pub fn start(
             config::HookPoint::Services,
             &hook_ctx,
             progress,
-        )?;
+        )
+        .map_err(undo)?;
         // The last gate before anything is spawned: a probe that
         // recognises the failure stops the start and says how to fix it,
         // rather than letting the dev server die of it thirty seconds
         // later with the reason buried in a log.
-        run_probes(paths, config, &hook_ctx, progress)?;
+        run_probes(paths, config, &hook_ctx, progress).map_err(undo)?;
     }
 
-    let _lock = state::lock(&paths.lock_file())?;
-    let mut store = state::load(&paths.state_file())?;
+    let _lock = state::lock(&paths.lock_file()).map_err(undo)?;
+    let mut store = state::load(&paths.state_file()).map_err(undo)?;
     // The record this call left behind, unless something removed the
     // worktree while the services were coming up.
-    store
+    let record = store
         .worktrees
         .entry(name.to_string())
         .or_insert_with(|| WorktreeRecord::new(canonical.clone(), false));
 
-    let mut planned: Vec<Planned> = Vec::new();
-    for (process_name, process) in &selection {
+    // The lock was let go for the hooks and the services, and another start
+    // of this worktree — the TUI's key pressed twice, or the TUI and the
+    // CLI at once — may have spawned a process in the meantime. Spawning a
+    // second one would overwrite that record, and the first group would go
+    // on holding the port with nothing in pando able to find it again.
+    //
+    // But only a process running in *this* start's mode is one to keep. A
+    // worktree's processes always run in the mode its record says — the
+    // flag is set, under this lock, right before any of them is spawned —
+    // so a live process under a flag that disagrees with this start talks
+    // to the other services: the ones this start kept serving while it
+    // brought its own up, or a plain start's that raced it through the
+    // unlocked window. Those are replaced, never adopted, or an isolated
+    // worktree would be running an application on the shared database.
+    let running_isolated = record.isolated;
+    let mut replace: Vec<(String, i32)> = Vec::new();
+    for (process_name, _) in &selection {
         if already.contains(process_name) {
             continue;
         }
-        let process_roles = process.roles();
-        let ready_role = ready_role(process, &process_roles)
-            .with_context(|| format!("in process {process_name}"))?;
-        let ready_port = ready_role
-            .as_deref()
-            .and_then(|r| assignment.ports.get(r))
-            .copied();
-        let log_file = paths.log_file(name, process_name);
-        let ctx = template::Context {
-            name,
-            branch: worktree.branch.as_deref(),
-            worktree: &canonical,
-            root: paths.root(),
-            project: paths.project_id(),
-            // Every role of the worktree, not only this process's own:
-            // `{port:api}` inside the web process's env is how one process
-            // is told where another one is listening.
-            ports: &assignment.ports,
-            default_role: ready_role.as_deref(),
-            log: Some(&log_file),
+        let Some(p) = record.processes.get(process_name) else {
+            continue;
         };
-        let cmd = template::render(&process.cmd, &ctx)
-            .with_context(|| format!("in the command for process {process_name}"))?;
-        let cwd = process_cwd(&canonical, process_name, process, &ctx)?;
-        let env = process_env(paths, name, &worktree, process, &service_env, &ctx)?;
-        planned.push(Planned {
-            process: process_name.clone(),
-            shell_cmd: with_prelude(config, &cmd),
-            cwd,
-            env,
-            log_file,
-            ready_port,
-            ready_timeout_s: process.ready.as_ref().and_then(|r| r.timeout_s),
+        let live = matches!(p.phase, Phase::Starting { .. } | Phase::Running { .. })
+            && proc::is_alive(p.pid);
+        if !live {
+            continue;
+        }
+        if running_isolated == isolate {
+            progress(&format!("{process_name} is already running"));
+            already.push(process_name.clone());
+        } else {
+            replace.push((process_name.clone(), p.pgid));
+        }
+    }
+
+    // Planned in full before anything is stopped: a command that does not
+    // render must not cost the processes this start was about to replace.
+    let planned = match plan_processes(
+        paths,
+        config,
+        name,
+        &worktree,
+        &canonical,
+        &selection,
+        &already,
+        &assignment.ports,
+        &service_env,
+    ) {
+        Ok(planned) => planned,
+        Err(e) => {
+            drop(_lock);
+            return Err(undo(e));
+        }
+    };
+
+    if !replace.is_empty() {
+        progress(match isolate {
+            true => "its own services are ready, so its processes restart against them",
+            false => "the services this worktree talks to changed, so its processes restart",
         });
+    }
+    for (process_name, pgid) in &replace {
+        if let Err(e) = proc::stop(*pgid, STOP_GRACE) {
+            drop(_lock);
+            return Err(undo(e.context(format!("stopping {process_name}"))));
+        }
+        if let Some(record) = store.worktrees.get_mut(name) {
+            record.processes.remove(process_name);
+        }
+    }
+    // Isolation is remembered from here on: the services are up and ready,
+    // and every process spawned below is given their addresses. Set only
+    // now, not when the services came up, because a worktree's processes
+    // run in the mode this flag says — see above — and until this point
+    // they were the shared ones.
+    if let Some(record) = store.worktrees.get_mut(name) {
+        record.isolated = isolate;
     }
 
     let mut started: Vec<StartedProcess> = Vec::new();
@@ -607,6 +769,61 @@ pub fn start(
     })
 }
 
+/// Renders every process a start is about to spawn — its command, its
+/// directory, its environment — without spawning anything. `already` are
+/// the ones left as they are.
+#[allow(clippy::too_many_arguments)]
+fn plan_processes(
+    paths: &PandoPaths,
+    config: &Config,
+    name: &str,
+    worktree: &Worktree,
+    canonical: &Path,
+    selection: &[(String, &ProcessConfig)],
+    already: &[String],
+    ports: &BTreeMap<String, u16>,
+    service_env: &BTreeMap<String, String>,
+) -> Result<Vec<Planned>> {
+    let mut planned: Vec<Planned> = Vec::new();
+    for (process_name, process) in selection {
+        if already.contains(process_name) {
+            continue;
+        }
+        let process_roles = process.roles();
+        let ready_role = ready_role(process, &process_roles)
+            .with_context(|| format!("in process {process_name}"))?;
+        let ready_port = ready_role.as_deref().and_then(|r| ports.get(r)).copied();
+        let log_file = paths.log_file(name, process_name);
+        let ctx = template::Context {
+            name,
+            branch: worktree.branch.as_deref(),
+            worktree: canonical,
+            root: paths.root(),
+            project: paths.project_id(),
+            // Every role of the worktree, not only this process's own:
+            // `{port:api}` inside the web process's env is how one process
+            // is told where another one is listening.
+            ports,
+            default_role: ready_role.as_deref(),
+            log: Some(&log_file),
+        };
+        let cmd = template::render(&process.cmd, &ctx)
+            .with_context(|| format!("in the command for process {process_name}"))?;
+        let cwd = process_cwd(canonical, process_name, process, &ctx)?;
+        let env = process_env(paths, name, worktree, process, service_env, &ctx)?;
+        planned.push(Planned {
+            process: process_name.clone(),
+            shell_cmd: with_prelude(config, &cmd),
+            cwd,
+            env,
+            log_file,
+            ready_port,
+            ready_timeout_s: process.ready.as_ref().and_then(|r| r.timeout_s),
+        });
+    }
+    Ok(planned)
+}
+
 /// Whether every process a start was asked for is already up. Best effort
 /// and lock-free: every caller re-decides under the lock.
 fn every_process_running(
@@ -684,7 +901,7 @@ fn stop_missing(
     // containers take to shut down, and the records that name the project
     // are already saved, so a failure here is recoverable by running
     // `stop` again.
-    stop_compose_projects(paths, &projects, |compose| compose.stop())?;
+    stop_containers(paths, &projects, progress)?;
     Ok(outcome)
 }
 
@@ -762,7 +979,7 @@ pub fn stop_all_with(
     if let Some(e) = sweep_failed {
         return Err(e);
     }
-    stop_compose_projects(paths, &projects, |compose| compose.stop())?;
+    stop_containers(paths, &projects, progress)?;
     Ok(stopped)
 }
 
@@ -797,7 +1014,6 @@ pub(super) fn stop_recorded(
 /// would read as "nothing to do" for a typo — and a typo must never be
 /// answered by taking the database down.
 fn missing_only(
-    name: &str,
     only: Option<&str>,
     missing: MissingOnly,
     record: &WorktreeRecord,
@@ -807,7 +1023,7 @@ fn missing_only(
     }
     let running: Vec<&str> = record.processes.keys().map(String::as_str).collect();
     bail!(
-        "{name} is not running a process named {:?} — it is running: {}",
+        "this worktree is not running a process named {:?} — it is running: {}",
         only.unwrap_or_default(),
         if running.is_empty() {
             "nothing".to_string()
@@ -837,7 +1053,7 @@ pub(super) fn stop_recorded_with(
     // something *is* running, not a silent whole-worktree stop.
     if record.processes.is_empty() {
         if only.is_some() {
-            return missing_only(name, only, missing, record);
+            return missing_only(only, missing, record);
         }
         // Read before anything is signalled: a native service *is* its
         // process, so a worktree whose only service is a database has
@@ -869,7 +1085,7 @@ pub(super) fn stop_recorded_with(
         .map(|(process, p)| (process.clone(), p.pgid))
         .collect();
     if groups.is_empty() {
-        return missing_only(name, only, missing, record);
+        return missing_only(only, missing, record);
     }
     let mut stopped = Vec::new();
     let mut failures = Vec::new();
@@ -1019,15 +1235,40 @@ pub fn restart(
     // Before the stop below, not after it: a refusal that has already
     // taken the process down is not a refusal.
     if mode_would_change(paths, config, name, mode) {
-        refuse_only_across_a_mode_change(name, only, mode == Mode::Isolated)?;
+        refuse_only_across_a_mode_change(only, mode == Mode::Isolated)?;
+    }
+    // And every precondition of the isolated start that follows, for the
+    // same reason: a restart whose start half cannot succeed must not get
+    // to run its stop half. Asked of every isolated restart, not only a
+    // mode change, because the stop takes the containers down too.
+    let preflighted = would_isolate(paths, config, name, mode);
+    if preflighted {
+        let worktree = find_worktree(paths, name)?;
+        let canonical =
+            std::fs::canonicalize(&worktree.path).unwrap_or_else(|_| worktree.path.clone());
+        preflight_isolation(
+            paths,
+            config,
+            name,
+            &canonical,
+            &worktree_roles(config, true),
+        )?;
     }
     // And a name config does know, whose process is simply not up, is a
     // no-op to stop rather than a refusal. Bringing a stopped process back
     // is the one thing `restart --only` exists for, and it used to be the
     // one thing it could not do — but only while a sibling was still
     // running, which made the failure look random.
-    stop_missing(paths, name, only, MissingOnly::IsNothingToDo, progress)?;
-    start(paths, config, name, only, mode, progress)
+    //
+    // Except on the way to isolated: that start replaces every process
+    // anyway, and only once the worktree's own services are ready. A stop
+    // first would throw that away — a restart whose services then failed
+    // to come up would have cost the developer the dev server it could not
+    // replace.
+    if !would_switch_to_isolated(paths, config, name, mode) {
+        stop_missing(paths, name, only, MissingOnly::IsNothingToDo, progress)?;
+    }
+    start_checked(paths, config, name, only, mode, preflighted, progress)
 }
 
 /// Refuses `--only` on a start that would change which services the
@@ -1044,14 +1285,10 @@ pub fn restart(
 ///
 /// Checked before anything is stopped or spawned, and again under the
 /// lock where the decision is actually made.
-fn refuse_only_across_a_mode_change(
-    name: &str,
-    only: Option<&str>,
-    going_isolated: bool,
-) -> Result<()> {
+fn refuse_only_across_a_mode_change(only: Option<&str>, going_isolated: bool) -> Result<()> {
     let Some(only) = only else { return Ok(()) };
     bail!(
-        "{name} is switching to {} services, and `--only {only}` cannot do that for one \
+        "this worktree is switching to {} services, and `--only {only}` cannot do that for one \
          process: the others would keep talking to the services that are going away. Run it \
          without `--only`, or leave the mode as it is",
         match going_isolated {
@@ -1079,6 +1316,34 @@ fn mode_would_change(paths: &PandoPaths, config: &Config, name: &str, mode: Mode
         .unwrap_or(false);
     let isolate = !service_roles(config).is_empty() && mode == Mode::Isolated;
     was_isolated != isolate
+}
+
+/// Whether a start in this mode would run this worktree on its own
+/// services, read without the lock.
+pub(super) fn would_isolate(paths: &PandoPaths, config: &Config, name: &str, mode: Mode) -> bool {
+    if service_roles(config).is_empty() {
+        return false;
+    }
+    match mode {
+        Mode::Isolated => true,
+        Mode::Shared => false,
+        Mode::Remembered => state::load(&paths.state_file())
+            .ok()
+            .and_then(|store| store.worktrees.get(name).map(|r| r.isolated))
+            .unwrap_or(false),
+    }
+}
+
+/// Whether a start in this mode would move a shared worktree onto its own
+/// services — the one start that replaces every running process for the
+/// sake of services that do not exist yet. Read without the lock.
+fn would_switch_to_isolated(paths: &PandoPaths, config: &Config, name: &str, mode: Mode) -> bool {
+    mode == Mode::Isolated
+        && would_isolate(paths, config, name, mode)
+        && !state::load(&paths.state_file())
+            .ok()
+            .and_then(|store| store.worktrees.get(name).map(|r| r.isolated))
+            .unwrap_or(false)
 }
 
 /// The processes a start, stop or restart acts on: every one config
@@ -1142,7 +1407,7 @@ fn selected_processes<'a>(
 /// switches from shared to isolated keeps the web port it already had and
 /// simply grows the window — no bookmarked URL changes for turning
 /// isolation on.
-fn worktree_roles(config: &Config, isolated: bool) -> Vec<String> {
+pub(super) fn worktree_roles(config: &Config, isolated: bool) -> Vec<String> {
     let mut roles: Vec<String> = Vec::new();
     for process in config.processes.values() {
         for role in process.roles() {

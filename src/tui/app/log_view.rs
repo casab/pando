@@ -4,7 +4,9 @@
 use ratatui::text::Line;
 use std::collections::VecDeque;
 
-use crate::log_tail::{LogLevel, LogTail, ParsedLine, colorize_json};
+use crate::log_tail::{LogLevel, ParsedLine, colorize_json};
+
+use super::merged::ViewTail;
 
 /// Lines the full-screen viewer keeps for the log it has open. Two orders
 /// of magnitude more than the detail pane's glance, because the viewer is
@@ -80,7 +82,8 @@ pub struct LogView {
     /// from disk each time the tab bar is drawn, so a hook that ran once
     /// appears and a source that never existed does not.
     pub available: Vec<String>,
-    pub tail: LogTail,
+    /// One source's log, or every process's merged for the `all` tab.
+    pub tail: ViewTail,
     /// Viewport top, as a position in the *filtered* list.
     pub scroll: usize,
     /// The highlighted line, also a filtered position. The viewport follows
@@ -90,7 +93,6 @@ pub struct LogView {
     /// Lines the filter shows that arrived below the viewport while it was
     /// scrolled up. Cleared by any jump back to the live tail.
     pub new_below: usize,
-    pub count_prefix: Option<usize>,
     pub search_mode: SearchMode,
     pub search: SearchState,
     /// The file was not there when the viewer opened.
@@ -114,10 +116,9 @@ impl LogView {
         name: String,
         source: String,
         available: Vec<String>,
-        path: std::path::PathBuf,
+        mut tail: ViewTail,
     ) -> Self {
-        let missing = !path.exists();
-        let mut tail = LogTail::new(path, LOG_VIEWER_CAPACITY);
+        let missing = !tail.exists();
         if !missing {
             tail.poll().ok();
         }
@@ -132,7 +133,6 @@ impl LogView {
             cursor: usize::MAX,
             follow: !missing,
             new_below: 0,
-            count_prefix: None,
             search_mode: SearchMode::Inactive,
             search: SearchState::default(),
             missing,
@@ -238,10 +238,17 @@ pub(super) fn block_bounds(buffer: &VecDeque<ParsedLine>, at: usize, id: u64) ->
     (start, end)
 }
 
-pub(super) fn joined_block(buffer: &VecDeque<ParsedLine>, start: usize, end: usize) -> String {
+/// The block's lines rejoined, each passed through `text` first — which
+/// takes the `all` tab's source prefix off, so the JSON parses again.
+pub(super) fn joined_block<'a>(
+    buffer: &'a VecDeque<ParsedLine>,
+    start: usize,
+    end: usize,
+    text: impl Fn(&'a str) -> &'a str,
+) -> String {
     buffer
         .range(start..=end)
-        .map(|parsed| parsed.plain.as_str())
+        .map(|parsed| text(parsed.plain.as_str()))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -311,18 +318,19 @@ pub(super) fn filtered_rank(view: &LogView, at: usize) -> usize {
         .count()
 }
 
-/// Moves to the next (or previous) match, `count` of them along, wrapping
-/// at both ends, and centres the viewport on it.
-pub(super) fn step_match(view: &mut LogView, forward: bool, count: usize, viewer_height: usize) {
+/// Moves to the next (or previous) match, wrapping at both ends, and
+/// centres the viewport on it.
+pub(super) fn step_match(view: &mut LogView, forward: bool, viewer_height: usize) {
     let len = view.search.matches.len();
     if len == 0 {
         return;
     }
     view.search.cursor = if forward {
-        (view.search.cursor + count) % len
+        (view.search.cursor + 1) % len
     } else {
-        (view.search.cursor + len - (count % len)) % len
+        (view.search.cursor + len - 1) % len
     };
+
     let at = view.search.matches[view.search.cursor];
     // Collapsed, the visible list *is* the match list, so the ordinal is
     // already the rank.

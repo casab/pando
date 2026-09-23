@@ -4087,6 +4087,29 @@ fn the_env_examples_own_port_variables_become_this_projects_roles() {
 
 // The batch form asks the same questions, through the same resolver:
 // a project whose rules all decide is configured without a prompt.
+// A preview promises to write nothing. It used to leave the project's
+// own directory behind in pando's home — empty, but a write all the same.
+#[test]
+fn a_dry_run_leaves_no_directory_behind_in_pandos_home() {
+    let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");
+    assert!(!fx.paths.home.exists(), "the fixture starts with no home");
+    let (_, preview) =
+        init_dry_run(&fx.paths, &fx.config, &Answering::asking(&refuse), &noop).unwrap();
+    assert!(!preview.is_empty(), "it previewed something");
+    assert!(
+        !fx.paths.project_dir().exists(),
+        "no project directory: {}",
+        fx.paths.project_dir().display()
+    );
+    assert!(!fx.paths.home.exists(), "and no home either");
+
+    // A home that already existed is left exactly where it was.
+    fx.paths.ensure_home().unwrap();
+    init_dry_run(&fx.paths, &fx.config, &Answering::asking(&refuse), &noop).unwrap();
+    assert!(fx.paths.project_dir().is_dir());
+    assert!(!fx.paths.config_file().exists());
+}
+
 #[test]
 fn init_takes_every_slot_a_rule_decided_and_asks_nothing() {
     let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");
@@ -4609,7 +4632,16 @@ fn new_resolves_install_version_files_and_provision() {
     git(&fx.root, &["add", ".nvmrc"]);
     git(&fx.root, &["commit", "--quiet", "-m", "nvmrc"]);
 
-    let config = resolve_for_new(&fx.paths, &fx.config, &refuse, &noop).unwrap();
+    // A machine that already resolves what `.nvmrc` asks for: with an
+    // install to run, `new` checks the runtime, and this one needs nothing.
+    let machine = FakeMachine::with_nvm();
+    let shell = machine.shell("22.11.0", "", "");
+    let m = Machine {
+        shell: &shell,
+        home: machine.home.path().to_path_buf(),
+    };
+    let config =
+        super::questions::resolve_for_new_on(&fx.paths, &fx.config, &refuse, &noop, &m).unwrap();
     assert_eq!(
         config.project.install.as_deref(),
         Some("pnpm install --frozen-lockfile")
@@ -5782,7 +5814,7 @@ fn rm_refuses_an_adopted_worktree_without_yes() {
 
     let err = rm(&fx.paths, "adopted", false, false).unwrap_err();
     assert!(
-        format!("{err:#}").contains("--yes"),
+        crate::remedy::for_cli(&format!("{err:#}")).contains("--yes"),
         "unexpected error: {err:#}"
     );
     assert_eq!(fx.names(), vec!["adopted"]);
@@ -5800,7 +5832,10 @@ fn rm_refuses_a_dirty_worktree_without_force() {
     let err = rm(&fx.paths, &name, false, false).unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.contains("modified or untracked"), "{msg}");
-    assert!(msg.contains("--force"), "{msg}");
+    assert!(
+        crate::remedy::for_cli(&msg).contains("--force") && !msg.contains("--"),
+        "{msg}"
+    );
     assert!(
         msg.contains("scratch.txt"),
         "it names what is in the way: {msg}"
@@ -5809,6 +5844,31 @@ fn rm_refuses_a_dirty_worktree_without_force() {
 
     rm(&fx.paths, &name, false, true).unwrap();
     assert!(fx.names().is_empty());
+}
+
+// A `git status` that cannot answer (a timeout, a broken gitfile) read as
+// "clean": `rm` stopped the dev server and took the volumes down, and only
+// then did `git worktree remove` refuse a dirty tree. Not knowing has to
+// stop it before anything is touched.
+#[test]
+fn rm_refuses_before_stopping_anything_when_git_cannot_say_whether_it_is_dirty() {
+    let mut fx = fixture();
+    with_dev(&mut fx, dev("sleep 30"));
+    let name = worktree_named(&fx, "feat/one");
+    let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+    let _guard = guard(&outcome);
+    let pid = outcome.started[0].record.pid;
+    let gitfile = fx.worktrees_dir().join(&name).join(".git");
+    let saved = std::fs::read_to_string(&gitfile).unwrap();
+    std::fs::write(&gitfile, "gitdir: /does/not/exist\n").unwrap();
+
+    let err = rm(&fx.paths, &name, false, false).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("could not tell whether"), "{msg}");
+    assert!(crate::remedy::for_cli(&msg).contains("--force"), "{msg}");
+    assert!(proc::is_alive(pid), "the dev server was stopped first");
+    std::fs::write(&gitfile, saved).unwrap();
+    assert_eq!(fx.names(), vec![name.clone()]);
 }
 
 // An ignored, provisioned file is pando's own doing and must never be
@@ -6011,7 +6071,10 @@ fn a_stale_record_does_not_make_an_unrelated_worktree_ours() {
     assert!(owned.warning.is_none(), "{:?}", owned.warning);
 
     let err = rm(&fx.paths, &name, false, false).unwrap_err();
-    assert!(format!("{err:#}").contains("--yes"), "{err:#}");
+    assert!(
+        crate::remedy::for_cli(&format!("{err:#}")).contains("--yes"),
+        "{err:#}"
+    );
     assert!(
         elsewhere.is_dir(),
         "the adopted worktree must still be there"
@@ -6360,6 +6423,35 @@ fn a_prelude_that_does_not_work_is_refused_rather_than_written() {
     );
 }
 
+// The same refusal, when a program handed the line in, is a mistake in
+// its input rather than a failure: the usage-error shape, exit 2, so a
+// program can tell "my answer was bad" from "the command broke". A person
+// at a prompt still gets the ordinary error above.
+#[test]
+fn a_program_supplied_prelude_that_does_not_work_is_a_refused_answer() {
+    let fx = fixture_pinning(".nvmrc", "22");
+    let machine = FakeMachine::with_nvm();
+    let shell = machine.shell("24.21.0", "", "");
+    let (ask, _asked) = scripted(vec![Answer::Program(Box::new(Answer::Custom(
+        "true".to_string(),
+    )))]);
+
+    let err = resolve_runtime_slot(&fx, &fx.config, &ask, &shell, machine.home.path()).unwrap_err();
+    assert!(
+        err.downcast_ref::<RefusedAnswer>().is_some(),
+        "a refused answer, not a plain failure: {err:#}"
+    );
+    assert!(format!("{err:#}").contains("does not work"), "{err:#}");
+    assert!(!fx.paths.user_config_file().exists());
+
+    let (ask, _asked) = scripted(vec![Answer::Custom("true".to_string())]);
+    let err = resolve_runtime_slot(&fx, &fx.config, &ask, &shell, machine.home.path()).unwrap_err();
+    assert!(
+        err.downcast_ref::<RefusedAnswer>().is_none(),
+        "a person's typed answer is an ordinary error"
+    );
+}
+
 // The case that is invisible without this check: a prelude is set, and
 // it is not doing anything.
 #[test]
@@ -6478,4 +6570,711 @@ fn the_slots_new_fills_never_probe_the_runtime() {
     )
     .unwrap();
     drop(shell);
+}
+
+// ---- which URL a native service's create step reads --------------------
+
+// A service the app reaches through more than one variable used to hand
+// its recipe whichever key sorted first — so a bare `APP_DB_PORT` beside
+// `DATABASE_URL` meant the recipe created the default database, not the
+// app's. The value that names the most wins, and ties go to the first key.
+#[test]
+fn the_url_a_native_service_is_created_from_is_the_one_that_names_the_most() {
+    let url = "postgres://acme:secret@localhost:17001/acme_dev";
+    let resolved = BTreeMap::from([
+        ("APP_DB_PORT".to_string(), "17001".to_string()),
+        ("DATABASE_URL".to_string(), url.to_string()),
+        (
+            "PG_ADMIN_URL".to_string(),
+            "postgres://localhost:17001".to_string(),
+        ),
+    ]);
+    assert_eq!(
+        super::services::identity_url(&resolved).as_deref(),
+        Some(url)
+    );
+
+    // Two that name as much as each other: the first key, every time.
+    let tie = BTreeMap::from([
+        (
+            "B_URL".to_string(),
+            "postgres://b@localhost:1/b".to_string(),
+        ),
+        (
+            "A_URL".to_string(),
+            "postgres://a@localhost:1/a".to_string(),
+        ),
+    ]);
+    for _ in 0..3 {
+        assert_eq!(
+            super::services::identity_url(&tie).as_deref(),
+            Some("postgres://a@localhost:1/a")
+        );
+    }
+    assert_eq!(super::services::identity_url(&BTreeMap::new()), None);
+}
+
+// ---- two starts of one worktree at once --------------------------------
+
+// The TUI's start key pressed twice, or the TUI and the CLI together: both
+// starts decide "nothing is running" before either spawns, the lock is let
+// go for the install, and each then spawned its own dev process — the
+// second record overwrote the first, whose group went on running with
+// nothing in pando able to find or stop it.
+#[test]
+fn two_concurrent_starts_of_one_worktree_spawn_one_process() {
+    let mut fx = installable_fixture("sleep 1");
+    with_dev(&mut fx, dev("sleep 30"));
+    let name = worktree_named(&fx, "feat/one");
+
+    let (a, b) = std::thread::scope(|s| {
+        let one = s.spawn(|| start(&fx.paths, &fx.config, &name, None, &noop));
+        let two = s.spawn(|| start(&fx.paths, &fx.config, &name, None, &noop));
+        (one.join().unwrap().unwrap(), two.join().unwrap().unwrap())
+    });
+    let _guards: Vec<Detached> = guard(&a).into_iter().chain(guard(&b)).collect();
+
+    let spawned: Vec<u32> = a
+        .started
+        .iter()
+        .chain(b.started.iter())
+        .map(|p| p.record.pid)
+        .collect();
+    assert_eq!(
+        spawned.len(),
+        1,
+        "one of them found the other's process and left it alone: {spawned:?}"
+    );
+    let recorded = fx.state().worktrees[&name].processes["dev"].pid;
+    assert_eq!(recorded, spawned[0], "and the record is the one that runs");
+    stop(&fx.paths, &name, None).unwrap();
+}
+
+// A record left by a worktree removed outside pando, now replaced by a
+// new one of the same name, is dropped by the next start. Its processes
+// were signalled first; its native server was not, and nothing could
+// find it again once the record was gone.
+#[test]
+fn a_stale_records_native_server_is_signalled_before_the_record_goes() {
+    let mut fx = fixture();
+    with_dev(&mut fx, dev("sleep 30"));
+    let name = worktree_named(&fx, "feat/one");
+
+    let log = fx.paths.log_file(&name, "db");
+    let server = crate::testutil::spawn_guarded("sleep 30", &fx.root, &log);
+    let mut store = fx.state();
+    let record = store.worktrees.get_mut(&name).unwrap();
+    record.path = fx.root.join("somewhere-else");
+    record.services.push(state::ServiceRecord {
+        name: "db".to_string(),
+        kind: state::ServiceKind::Native,
+        port: Some(17_999),
+        pid: Some(server.pid),
+        pgid: Some(server.pgid),
+        compose_project: None,
+    });
+    state::save(&fx.paths.state_file(), &store).unwrap();
+
+    let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+    let _guard = guard(&outcome);
+    assert!(
+        wait_until(Duration::from_secs(5), || !crate::process::group_alive(
+            server.pgid
+        )),
+        "the stale record's server is left running with no record of it"
+    );
+    assert!(fx.state().worktrees[&name].services.is_empty());
+}
+
+// 0.2.0 could leave a compose record with a project and no port on a
+// worktree that is not isolated — a failed isolated start. `status` and
+// the TUI showed it as `postgres  no port` for ever. It is still what `rm`
+// needs to take the volumes down, so it stays in state; it is not shown.
+#[test]
+fn a_shared_worktrees_leftover_compose_record_is_kept_but_not_shown() {
+    let mut record = WorktreeRecord::new("/tmp/nowhere", true);
+    record.services.push(state::ServiceRecord {
+        name: "postgres".to_string(),
+        kind: state::ServiceKind::Compose,
+        port: None,
+        pid: None,
+        pgid: None,
+        compose_project: Some("pando-acme-feat-one".to_string()),
+    });
+    assert!(service_statuses(&record).is_empty());
+    assert_eq!(
+        super::services::compose_projects(&record),
+        vec!["pando-acme-feat-one".to_string()],
+        "rm can still find the project"
+    );
+
+    // An isolated worktree's stopped service is a real row.
+    record.isolated = true;
+    assert_eq!(service_statuses(&record).len(), 1);
+
+    // And so is a service a switch to isolated is bringing up: it has its
+    // port before the worktree is flagged.
+    record.isolated = false;
+    record.services[0].port = Some(17_010);
+    assert_eq!(service_statuses(&record).len(), 1);
+}
+
+// `new` narrated "provisioning" and "installing" for a project with
+// nothing to provision and nothing to install.
+#[test]
+fn new_says_nothing_about_steps_it_has_nothing_to_do_for() {
+    let fx = fixture();
+    let said = std::sync::Mutex::new(Vec::<String>::new());
+    new(&fx.paths, &fx.config, "feat/one", None, &|m| {
+        said.lock().unwrap().push(m.to_string())
+    })
+    .unwrap();
+    let said = said.into_inner().unwrap();
+    assert!(
+        !said
+            .iter()
+            .any(|m| m == "provisioning" || m == "installing"),
+        "{said:?}"
+    );
+}
+
+// `rm` of a running worktree printed only "removed": that it stopped the
+// dev server first went unsaid.
+#[test]
+fn rm_of_a_running_worktree_says_what_it_stops() {
+    let mut fx = fixture();
+    with_dev(&mut fx, dev("sleep 30"));
+    let name = worktree_named(&fx, "feat/one");
+    let report = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+    let _guard = guard(&report);
+    let said = std::sync::Mutex::new(Vec::<String>::new());
+    super::rm(&fx.paths, &name, false, false, &|m| {
+        said.lock().unwrap().push(m.to_string())
+    })
+    .unwrap();
+    let said = said.into_inner().unwrap();
+    assert!(said.iter().any(|m| m == "stopping dev"), "{said:?}");
+}
+
+// `share` waits for a starting worktree. The phase machine keeps a
+// process `Starting` past its window while the port scan cannot answer;
+// a share that waited for the window alone gave up on a healthy server
+// the phase machine was still, correctly, waiting on.
+#[test]
+fn share_waits_as_long_as_the_phase_can_stay_starting() {
+    let mut record = WorktreeRecord::new("/tmp/nowhere", true);
+    let mut dev = fake_record(1);
+    dev.ready_timeout_s = Some(10);
+    dev.phase = Phase::Starting { since: Utc::now() };
+    record.processes.insert("dev".to_string(), dev);
+    let mut store = state::State {
+        version: state::STATE_VERSION,
+        worktrees: BTreeMap::new(),
+    };
+    store.worktrees.insert("feat+one".to_string(), record);
+
+    let budget = share_ready_budget(&store, "feat+one").unwrap();
+    let longest = state::longest_starting_secs(10) as u64;
+    assert!(
+        budget.as_secs() + 1 >= longest && budget.as_secs() <= longest + 1,
+        "{budget:?} against {longest}s"
+    );
+}
+
+// An interrupted pass writes nothing about the dev process. A start with
+// no terminal used to stop at the port question with `[dev].cmd` already
+// on disk, and a `[dev]` on disk reads as a developer's own — so the port
+// question was never asked again, and the next start "succeeded" with no
+// port and no URL.
+#[test]
+fn a_pass_stopped_at_the_port_question_leaves_the_dev_command_unwritten() {
+    let fx = detectable_fixture(
+        r#"{ "dev": "node server.js" }"#,
+        "WEB_PORT=3000\nADMIN_PORT=3001\n",
+    );
+    let stop_at_ports = |q: &Question| -> Result<Answer> {
+        Err(NeedsAnswer {
+            question: q.clone(),
+        }
+        .into())
+    };
+    let err = resolve_process(&fx.paths, &fx.config, &stop_at_ports, &noop).unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<NeedsAnswer>().map(|n| n.question.slot),
+        Some(Slot::PortEnv)
+    );
+    // And it says where its answer goes: this project's file, absolutely.
+    assert_eq!(
+        err.downcast_ref::<NeedsAnswer>()
+            .and_then(|n| n.question.answer_file.clone()),
+        Some(fx.paths.config_file())
+    );
+    let written = std::fs::read_to_string(fx.paths.config_file()).unwrap_or_default();
+    assert!(
+        !written.contains("[dev]"),
+        "the dev command waits for its ports: {written}"
+    );
+
+    // The next pass asks the port question again, and writes both.
+    let loaded = crate::config::load(&fx.paths).unwrap();
+    let (ask, asked) = scripted(vec![Answer::Auto(0)]);
+    let config = resolve_process(&fx.paths, &loaded.config, &ask, &noop).unwrap();
+    assert_eq!(
+        asked.borrow().iter().map(|q| q.slot).collect::<Vec<_>>(),
+        vec![Slot::PortEnv]
+    );
+    assert_eq!(config.processes["dev"].roles(), vec!["admin", "web"]);
+    let reloaded = crate::config::load(&fx.paths).unwrap().config;
+    assert_eq!(reloaded.processes["dev"].cmd, "pnpm dev");
+    assert_eq!(reloaded.processes["dev"].roles(), vec!["admin", "web"]);
+}
+
+// The schema step is the one question that touches data. A start that is
+// not isolating neither asks it nor takes it — the hook would run against
+// the developer's shared database — and an isolated one asks it even with
+// a single candidate, with "no" recorded so it is never asked again.
+#[test]
+fn the_schema_step_is_asked_only_on_an_isolated_start_and_no_is_recorded() {
+    let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");
+    std::fs::create_dir_all(fx.root.join("prisma")).unwrap();
+    std::fs::write(fx.root.join("prisma/schema.prisma"), "// schema\n").unwrap();
+    git(&fx.root, &["add", "."]);
+    git(&fx.root, &["commit", "--quiet", "-m", "prisma"]);
+
+    let shared = resolve_process(&fx.paths, &fx.config, &refuse, &noop).unwrap();
+    assert!(
+        shared.hooks.is_empty(),
+        "a shared start takes no schema step"
+    );
+
+    let loaded = crate::config::load(&fx.paths).unwrap().config;
+    let (ask, asked) = scripted(vec![Answer::None]);
+    let isolated = super::resolve_process(&fx.paths, &loaded, Mode::Isolated, &ask, &noop).unwrap();
+    let asked = asked.borrow();
+    assert_eq!(
+        asked.iter().map(|q| q.slot).collect::<Vec<_>>(),
+        vec![Slot::SchemaHook]
+    );
+    assert!(asked[0].allow_none, "\"no\" is an answer");
+    assert_eq!(isolated.hooks.len(), 1);
+    assert_eq!(isolated.hooks[0].on, Some(crate::config::HookScope::Never));
+    let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+    assert!(written.contains("on = \"never\""), "{written}");
+
+    // Answered, so asked never again.
+    let reloaded = crate::config::load(&fx.paths).unwrap().config;
+    super::resolve_process(&fx.paths, &reloaded, Mode::Isolated, &refuse, &noop).unwrap();
+}
+
+// A plain start of a worktree that is already isolated keeps its own
+// services, so it is an isolating start too: the schema question is
+// about the mode it is in, and silencing it there left the private
+// database with no schema step ever proposed.
+#[test]
+fn a_plain_start_of_an_isolated_worktree_asks_the_schema_question() {
+    let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");
+    std::fs::create_dir_all(fx.root.join("prisma")).unwrap();
+    std::fs::write(fx.root.join("prisma/schema.prisma"), "// schema\n").unwrap();
+    git(&fx.root, &["add", "."]);
+    git(&fx.root, &["commit", "--quiet", "-m", "prisma"]);
+    resolve_process(&fx.paths, &fx.config, &refuse, &noop).unwrap();
+    let mut text = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+    text.push_str("\n[[services]]\nkind = \"native\"\nname = \"postgres\"\n");
+    std::fs::write(fx.paths.config_file(), text).unwrap();
+    let loaded = crate::config::load(&fx.paths).unwrap().config;
+    let name = new(&fx.paths, &loaded, "feat/one", None, &noop).unwrap();
+
+    // Not isolated yet: a plain start stays silent about it.
+    super::resolve_for_start(&fx.paths, &loaded, &name, Mode::Remembered, &refuse, &noop).unwrap();
+
+    let mut store = fx.state();
+    store.worktrees.get_mut(&name).unwrap().isolated = true;
+    state::save(&fx.paths.state_file(), &store).unwrap();
+    let (ask, asked) = scripted(vec![Answer::None]);
+    super::resolve_for_start(&fx.paths, &loaded, &name, Mode::Remembered, &ask, &noop).unwrap();
+    assert_eq!(
+        asked.borrow().iter().map(|q| q.slot).collect::<Vec<_>>(),
+        vec![Slot::SchemaHook]
+    );
+}
+
+// The Docker-down offer said "delete the compose `[[services]]` entry"
+// whatever the file held. Counted, and named by what each entry includes,
+// so a developer with two knows there are two to find.
+#[test]
+fn the_compose_entries_to_delete_are_counted_and_named() {
+    let entry = |file: &str, include: &[&str]| crate::config::ServiceConfig::Compose {
+        file: file.to_string(),
+        include: include.iter().map(|s| s.to_string()).collect(),
+        env: BTreeMap::new(),
+        ready_timeout_s: None,
+    };
+    let mut config = Config {
+        services: vec![entry("docker-compose.yml", &["postgres", "redis"])],
+        ..Default::default()
+    };
+    assert_eq!(
+        super::services::compose_entries_named(&config),
+        "the compose `[[services]]` entry (postgres, redis)"
+    );
+    config
+        .services
+        .push(entry("compose.search.yml", &["meilisearch"]));
+    assert_eq!(
+        super::services::compose_entries_named(&config),
+        "the 2 compose `[[services]]` entries (postgres, redis; meilisearch)"
+    );
+}
+
+// `--yes` takes the step pando found, scoped to isolated starts.
+#[test]
+fn yes_takes_the_schema_step_scoped_to_isolated_starts() {
+    let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");
+    std::fs::create_dir_all(fx.root.join("prisma")).unwrap();
+    std::fs::write(fx.root.join("prisma/schema.prisma"), "// schema\n").unwrap();
+    git(&fx.root, &["add", "."]);
+    git(&fx.root, &["commit", "--quiet", "-m", "prisma"]);
+    let (ask, _) = scripted(vec![Answer::Auto(0)]);
+    let config =
+        super::resolve_process(&fx.paths, &fx.config, Mode::Isolated, &ask, &noop).unwrap();
+    assert_eq!(config.hooks[0].cmd, "pnpm prisma migrate deploy");
+    assert_eq!(config.hooks[0].on, Some(crate::config::HookScope::Isolated));
+    let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+    assert!(written.contains("on = \"isolated\""), "{written}");
+}
+
+// A uv project runs every command through `uv run`, which reads
+// `.python-version` and finds or installs that Python itself. What
+// `bash -lc` resolves on its own is beside the point, and asking for a
+// prelude line was a dead end on a machine with no pyenv — `--yes`
+// included, because there was nothing to take.
+#[test]
+fn a_uv_project_needs_no_prelude_when_its_commands_go_through_uv_run() {
+    let fx = fixture_pinning(".python-version", "3.12");
+    std::fs::write(fx.root.join("uv.lock"), "version = 1\n").unwrap();
+    let home = tempdir().unwrap();
+    let shell = |command: &str| -> Option<String> {
+        if command.contains("command -v uv") {
+            return Some("pando-runner-ok\n".to_string());
+        }
+        Some(crate::runtime::probe_reply("/usr/bin/python3", "3.11.5"))
+    };
+    let mut config = fx.config.clone();
+    config.processes.insert(
+        "dev".to_string(),
+        dev("uv run python manage.py runserver 127.0.0.1:{port:web}"),
+    );
+    let resolved = resolve_runtime_slot(&fx, &config, &refuse, &shell, home.path()).unwrap();
+    assert_eq!(
+        resolved.runtime.prelude, None,
+        "nothing asked, nothing written"
+    );
+
+    // A process that does not go through the runner gets the interpreter
+    // the shell resolves, so the mismatch is still a question.
+    config
+        .processes
+        .insert("worker".to_string(), dev("python worker.py"));
+    let err = resolve_runtime_slot(&fx, &config, &asks_nothing_answerable, &shell, home.path())
+        .unwrap_err();
+    assert!(err.downcast_ref::<NeedsAnswer>().is_some(), "{err:#}");
+
+    // …and so is a machine with no uv at all.
+    config.processes.remove("worker");
+    let no_uv = |command: &str| -> Option<String> {
+        if command.contains("command -v uv") {
+            return Some(String::new());
+        }
+        Some(crate::runtime::probe_reply("/usr/bin/python3", "3.11.5"))
+    };
+    let err = resolve_runtime_slot(&fx, &config, &asks_nothing_answerable, &no_uv, home.path())
+        .unwrap_err();
+    assert!(err.downcast_ref::<NeedsAnswer>().is_some(), "{err:#}");
+}
+
+// A hook runs in the same shell a process does, and before it: a
+// migration that runs `python` bare gets whatever interpreter the shell
+// resolves. Only processes were checked, so the mismatch went unasked and
+// the hook ran under the wrong Python. Its fallback counts as well.
+#[test]
+fn a_hook_that_does_not_go_through_uv_run_keeps_the_runtime_question() {
+    let fx = fixture_pinning(".python-version", "3.12");
+    std::fs::write(fx.root.join("uv.lock"), "version = 1\n").unwrap();
+    let home = tempdir().unwrap();
+    let shell = |command: &str| -> Option<String> {
+        if command.contains("command -v uv") {
+            return Some("pando-runner-ok\n".to_string());
+        }
+        Some(crate::runtime::probe_reply("/usr/bin/python3", "3.11.5"))
+    };
+    let mut config = fx.config.clone();
+    config.processes.insert(
+        "dev".to_string(),
+        dev("uv run python manage.py runserver 127.0.0.1:{port:web}"),
+    );
+    let hook = |cmd: &str, fallback: Option<&str>| crate::config::HookConfig {
+        name: "migrate".to_string(),
+        after: crate::config::HookPoint::Services,
+        fingerprint: Vec::new(),
+        cmd: cmd.to_string(),
+        cwd: None,
+        fallback: fallback.map(str::to_string),
+        on: None,
+    };
+
+    config.hooks = vec![hook("uv run python manage.py migrate", None)];
+    let resolved = resolve_runtime_slot(&fx, &config, &refuse, &shell, home.path()).unwrap();
+    assert_eq!(resolved.runtime.prelude, None, "through the runner");
+
+    for (cmd, fallback) in [
+        ("python manage.py migrate", None),
+        (
+            "uv run python manage.py migrate",
+            Some("python manage.py migrate"),
+        ),
+    ] {
+        config.hooks = vec![hook(cmd, fallback)];
+        let err = resolve_runtime_slot(&fx, &config, &asks_nothing_answerable, &shell, home.path())
+            .unwrap_err();
+        assert!(
+            err.downcast_ref::<NeedsAnswer>().is_some(),
+            "{cmd} / {fallback:?}: {err:#}"
+        );
+    }
+}
+
+fn asks_nothing_answerable(q: &Question) -> Result<Answer> {
+    Err(NeedsAnswer {
+        question: q.clone(),
+    }
+    .into())
+}
+
+// `new` runs the install step, and an install under the wrong runtime
+// builds for the wrong one. With an install to run, the runtime question
+// comes before it — not at the first `start`, after the damage.
+#[test]
+fn new_asks_the_runtime_question_before_an_install_runs() {
+    let fx = fixture_pinning(".nvmrc", "22");
+    std::fs::write(fx.root.join("package-lock.json"), "{}\n").unwrap();
+    let machine = FakeMachine::with_nvm();
+    let shell = machine.shell("24.21.0", "nvm use", "22.11.0");
+    let m = Machine {
+        shell: &shell,
+        home: machine.home.path().to_path_buf(),
+    };
+    let (ask, asked) = scripted(vec![Answer::Choice(0)]);
+    let config =
+        super::questions::resolve_for_new_on(&fx.paths, &fx.config, &ask, &noop, &m).unwrap();
+    assert_eq!(config.project.install.as_deref(), Some("npm ci"));
+    assert_eq!(
+        asked.borrow().iter().map(|q| q.slot).collect::<Vec<_>>(),
+        vec![Slot::Prelude]
+    );
+    assert!(
+        config
+            .runtime
+            .prelude
+            .as_deref()
+            .is_some_and(|p| p.contains("nvm use")),
+        "{:?}",
+        config.runtime.prelude
+    );
+}
+
+// One `[[services]]` entry per native service, and each cites its own
+// evidence. Redis found from `CACHE_URL` used to be written as "detected:
+// DATABASE_URL…", because the first service's reason went on every entry.
+#[test]
+fn each_native_service_entry_cites_its_own_evidence() {
+    let fx = fixture();
+    let native = |name: &str, key: &str, why: &str| crate::detect::Candidate {
+        value: name.to_string(),
+        why: why.to_string(),
+        service: Some(crate::detect::ServiceHint {
+            source: crate::detect::ServiceSource::Native {
+                recipe: name.to_string(),
+            },
+            env_key: Some(key.to_string()),
+        }),
+        preselected: true,
+        ..Default::default()
+    };
+    let postgres = native("postgres", "DATABASE_URL", "from DATABASE_URL");
+    let redis = native("redis", "CACHE_URL", "from CACHE_URL");
+    let mut config = fx.config.clone();
+    super::questions::apply_native_service_answer(
+        &fx.paths,
+        &mut config,
+        &[&postgres, &redis],
+        crate::config::Note::Detected(postgres.why.clone()),
+    )
+    .unwrap();
+    let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+    assert_eq!(
+        written.matches("# detected: from DATABASE_URL").count(),
+        1,
+        "{written}"
+    );
+    assert_eq!(
+        written.matches("# detected: from CACHE_URL").count(),
+        1,
+        "{written}"
+    );
+}
+
+// A preview is not a place to stop. A question nobody here can answer is
+// part of what the dry run reports — that slot, unanswered — and the rest
+// of the proposal is still rendered, with nothing written.
+#[test]
+fn a_dry_run_with_an_open_question_renders_it_unanswered() {
+    let fx = detectable_fixture(
+        r#"{ "dev": "node server.js" }"#,
+        "WEB_PORT=3000\nADMIN_PORT=3001\n",
+    );
+    let (report, preview) = init_dry_run(
+        &fx.paths,
+        &fx.config,
+        &Answering::asking(&asks_nothing_answerable),
+        &noop,
+    )
+    .unwrap();
+    let ports = report
+        .slots
+        .iter()
+        .find(|s| s.slot == Slot::PortEnv)
+        .unwrap();
+    assert!(
+        ports
+            .value
+            .as_deref()
+            .is_some_and(|v| v.starts_with("(unanswered)")),
+        "{ports:?}"
+    );
+    let dev = report
+        .slots
+        .iter()
+        .find(|s| s.slot == Slot::DevCmd)
+        .unwrap();
+    assert_eq!(dev.value.as_deref(), Some("pnpm dev"));
+    assert!(!preview.is_empty(), "the rest is still previewed");
+    assert!(!fx.paths.config_file().exists(), "and nothing is written");
+}
+
+// "provisioning" alone hid that `.env` in the worktree is a link to the
+// main checkout's: an edit there edits main. Each file is named, with
+// where it points and that it is a link.
+#[test]
+fn new_says_which_files_it_linked_and_where_they_point() {
+    let mut fx = fixture();
+    fx.config.project.provision = Some(vec![".env".into()]);
+    let said = std::cell::RefCell::new(Vec::<String>::new());
+    new(&fx.paths, &fx.config, "feat/link", None, &|m: &str| {
+        said.borrow_mut().push(m.to_string())
+    })
+    .unwrap();
+    let main_env = fx.paths.root().join(".env");
+    assert!(
+        said.borrow().iter().any(|m| m.starts_with("linked .env → ")
+            && m.contains(&main_env.display().to_string())
+            && m.contains("symlink")),
+        "{:?}",
+        said.borrow()
+    );
+
+    fx.config.project.provision_mode = ProvisionMode::Copy;
+    said.borrow_mut().clear();
+    new(&fx.paths, &fx.config, "feat/copy", None, &|m: &str| {
+        said.borrow_mut().push(m.to_string())
+    })
+    .unwrap();
+    assert!(
+        said.borrow()
+            .iter()
+            .any(|m| m.starts_with("copied .env from ")),
+        "{:?}",
+        said.borrow()
+    );
+}
+
+// Two starts switching the same worktree to isolated: one finishes the
+// switch and spawns against the new services, the other fails late. The
+// loser's undo must not tear those services down, or the winner's live
+// application loses its database. A failing start never sets the flag —
+// it is set right before the spawn — so an isolated record with a live
+// process is always the other start's.
+#[test]
+fn a_failed_switchs_undo_leaves_a_switch_another_start_completed() {
+    let fx = fixture();
+    fx.paths.ensure_home().unwrap();
+    let live = crate::testutil::spawn_guarded(
+        "exec sleep 300",
+        &std::env::temp_dir(),
+        &fx.paths.log_file("feat+one", "dev"),
+    );
+    let mut store = state::State::new();
+    let mut record = WorktreeRecord::new(fx.root.clone(), false);
+    record.isolated = true;
+    record.processes.insert(
+        "dev".to_string(),
+        ProcessRecord {
+            pid: live.pid,
+            ..fake_record(live.pgid)
+        },
+    );
+    record.services.push(state::ServiceRecord {
+        name: "postgres".to_string(),
+        kind: state::ServiceKind::Native,
+        port: Some(17_001),
+        pid: None,
+        pgid: None,
+        compose_project: None,
+    });
+    store
+        .worktrees
+        .insert("feat+one".to_string(), record.clone());
+    state::save(&fx.paths.state_file(), &store).unwrap();
+
+    super::services::undo_failed_isolation(&fx.paths, &fx.config, "feat+one", &BTreeMap::new());
+
+    let after = &fx.state().worktrees["feat+one"];
+    assert!(after.isolated, "the other start's switch was undone");
+    assert_eq!(after.services, record.services);
+}
+
+// A switch to isolated interrupted between its services coming up and its
+// second lock (Ctrl-C, a crash) never runs its undo: the record is not
+// isolated, and its native server is live. The next plain start is a
+// shared one, so it is the one that takes the orphan down, rather than
+// blanking its port and leaving a server nothing can find.
+#[test]
+fn a_plain_start_takes_down_the_services_an_interrupted_switch_left_running() {
+    let mut fx = fixture();
+    with_dev(&mut fx, dev("sleep 30"));
+    let name = worktree_named(&fx, "feat/one");
+    let orphan = crate::testutil::spawn_guarded(
+        "exec sleep 300",
+        &std::env::temp_dir(),
+        &fx.paths.log_file(&name, "postgres"),
+    );
+    let mut store = fx.state();
+    let record = store.worktrees.get_mut(&name).expect("new wrote a record");
+    assert!(!record.isolated);
+    record.services.push(state::ServiceRecord {
+        name: "postgres".to_string(),
+        kind: state::ServiceKind::Native,
+        port: Some(17_001),
+        pid: Some(orphan.pid),
+        pgid: Some(orphan.pgid),
+        compose_project: None,
+    });
+    state::save(&fx.paths.state_file(), &store).unwrap();
+
+    let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+    let _guard = guard(&outcome);
+    assert!(
+        wait_until(Duration::from_secs(5), || !proc::is_alive(orphan.pid)),
+        "the orphaned server is still running"
+    );
+    assert!(fx.state().worktrees[&name].services.is_empty());
 }
