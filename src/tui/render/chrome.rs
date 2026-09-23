@@ -10,6 +10,7 @@ use ratatui::widgets::Paragraph;
 use crate::state::Aggregate;
 use crate::theme::{blue, green, orange, red, surface, text, text_dim, text_muted, yellow};
 use crate::tui::app::{App, Mode, Status, StatusKind};
+use crate::worktree::GhAccount;
 
 use super::{text_width, truncate, truncate_line, wrap_text};
 
@@ -133,12 +134,17 @@ pub(super) fn render_header(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(project.clone(), Style::new().fg(text())),
         Span::styled(" · ", Style::new().fg(text_muted())),
         Span::styled(branch, Style::new().fg(blue())),
+    ];
+    // Right after the branch, so a narrow header sheds it last: which
+    // GitHub account this project's pushes and pull requests go out as.
+    spans.extend(gh_account_spans(app.gh_account.as_ref()));
+    spans.extend([
         Span::styled(" · ", Style::new().fg(text_muted())),
         Span::styled(
             format!("{count} worktree{}", if count == 1 { "" } else { "s" }),
             Style::new().fg(text_dim()),
         ),
-    ];
+    ]);
     if running > 0 {
         spans.push(Span::styled(
             format!(", {running} running"),
@@ -184,6 +190,29 @@ pub(super) fn render_header(f: &mut Frame, area: Rect, app: &App) {
             .style(Style::new().bg(surface())),
         area,
     );
+}
+
+/// The header's account chip: ` · gh @login`, or why there is none.
+///
+/// Asked of `gh` from the project's directory, so a `gh` that picks its
+/// account per directory shows the one this project gets, which is the one
+/// worth checking before a push goes out as somebody else.
+pub(super) fn gh_account_spans(account: Option<&GhAccount>) -> Vec<Span<'static>> {
+    let dot = Span::styled(" · ", Style::new().fg(text_muted()));
+    let label = Span::styled("gh ", Style::new().fg(text_muted()));
+    let (text_of, style) = match account {
+        None => ("…".to_string(), Style::new().fg(text_muted())),
+        Some(GhAccount::Login(login)) => (
+            format!("@{login}"),
+            Style::new().fg(text()).add_modifier(Modifier::BOLD),
+        ),
+        Some(GhAccount::SignedOut) => ("not signed in".to_string(), Style::new().fg(orange())),
+        Some(GhAccount::Missing) => ("not installed".to_string(), Style::new().fg(text_dim())),
+        // The reason is a stderr line and can be long; the chip says only
+        // that `gh` could not tell, and `R` asks again.
+        Some(GhAccount::Unknown(_)) => ("unknown".to_string(), Style::new().fg(text_dim())),
+    };
+    vec![dot, label, Span::styled(text_of, style)]
 }
 
 /// Key hints for a selected worktree that runs, most valuable first. The

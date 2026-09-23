@@ -766,6 +766,75 @@ pub fn list_prs(root: &Path) -> Result<Vec<PrInfo>> {
     parse_pr_list(&String::from_utf8_lossy(&out.stdout))
 }
 
+/// Which GitHub account `gh` acts as for a checkout.
+///
+/// Asked from the checkout itself, because that is where it can differ: a
+/// `gh` that picks its account by directory — a wrapper, `GH_TOKEN` set
+/// per project, a `GH_CONFIG_DIR` from direnv — answers for this project
+/// and not for the shell pando was started from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GhAccount {
+    /// Signed in, as this login.
+    Login(String),
+    /// `gh` is installed and has no account to act as here.
+    SignedOut,
+    /// No `gh` on PATH.
+    Missing,
+    /// `gh` could not say: offline, no answer in time, an API error.
+    Unknown(String),
+}
+
+/// A network round trip to the API; a slow link is not a hung `gh`.
+const GH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// What `gh` prints when it has no account to use.
+const GH_SIGNED_OUT: [&str; 3] = ["auth login", "not logged in", "authentication required"];
+
+/// The account `gh` acts as from `root`. One API call, bounded; never
+/// prompts.
+pub fn gh_account(root: &Path) -> GhAccount {
+    gh_account_with(Path::new("gh"), root)
+}
+
+/// [`gh_account`] with the program named, for a test's stand-in.
+pub fn gh_account_with(program: &Path, root: &Path) -> GhAccount {
+    let mut command = Command::new(program);
+    command
+        .current_dir(root)
+        .args(["api", "user", "--jq", ".login"])
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1");
+    let out = match crate::project::output_within(command, GH_TIMEOUT) {
+        Ok(out) => out,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return GhAccount::Missing,
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            return GhAccount::Unknown(format!("gh did not answer in {}s", GH_TIMEOUT.as_secs()));
+        }
+        Err(e) => return GhAccount::Unknown(format!("gh: {e}")),
+    };
+    if out.status.success() {
+        let login = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        return if login.is_empty() {
+            GhAccount::Unknown("gh named no account".to_string())
+        } else {
+            GhAccount::Login(login)
+        };
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let lower = stderr.to_lowercase();
+    if GH_SIGNED_OUT.iter().any(|needle| lower.contains(needle)) {
+        return GhAccount::SignedOut;
+    }
+    let reason = stderr
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("gh failed")
+        .trim()
+        .to_string();
+    GhAccount::Unknown(reason)
+}
+
 fn parse_pr_list(json: &str) -> Result<Vec<PrInfo>> {
     #[derive(serde::Deserialize)]
     struct RawAuthor {
@@ -1283,6 +1352,59 @@ bare
         assert_eq!(prs[0].state, PrState::Open);
         assert_eq!(prs[1].state, PrState::Merged);
         assert_eq!(prs[2].state, PrState::Closed);
+    }
+
+    /// A stand-in `gh` that prints `stdout` and `stderr` and exits `code`,
+    /// and records the directory it was asked from.
+    fn fake_gh(dir: &Path, stdout: &str, stderr: &str, code: i32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let program = dir.join("gh");
+        let script = format!(
+            "#!/bin/sh\npwd > '{}'\nprintf '%s' '{stdout}'\nprintf '%s' '{stderr}' >&2\nexit {code}\n",
+            dir.join("asked-from").display()
+        );
+        std::fs::write(&program, script).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        program
+    }
+
+    // Asked from the project, so a `gh` that picks its account by
+    // directory answers for this project.
+    #[test]
+    fn the_gh_account_is_asked_from_the_project_and_read_as_a_login() {
+        let bin = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let gh = fake_gh(bin.path(), "someone\n", "", 0);
+        assert_eq!(
+            gh_account_with(&gh, project.path()),
+            GhAccount::Login("someone".to_string())
+        );
+        let asked = std::fs::read_to_string(bin.path().join("asked-from")).unwrap();
+        assert_eq!(
+            Path::new(asked.trim()).canonicalize().unwrap(),
+            project.path().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_gh_with_no_account_is_signed_out_and_no_gh_is_missing() {
+        let bin = tempdir().unwrap();
+        let gh = fake_gh(
+            bin.path(),
+            "",
+            "To get started with GitHub CLI, please run:  gh auth login",
+            4,
+        );
+        assert_eq!(gh_account_with(&gh, bin.path()), GhAccount::SignedOut);
+        assert_eq!(
+            gh_account_with(&bin.path().join("no-such-gh"), bin.path()),
+            GhAccount::Missing
+        );
+        let gh = fake_gh(bin.path(), "", "error connecting to api.github.com", 1);
+        assert_eq!(
+            gh_account_with(&gh, bin.path()),
+            GhAccount::Unknown("error connecting to api.github.com".to_string())
+        );
     }
 
     #[test]

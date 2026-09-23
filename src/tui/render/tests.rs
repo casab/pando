@@ -2712,3 +2712,34 @@ fn a_wide_log_line_wraps_without_losing_what_passes_the_edge() {
         assert!(painted.contains(c), "{c} was cut off:\n{}", text_of(&buf));
     }
 }
+
+// ---- the GitHub account ----------------------------------------------
+
+// Which account `gh` acts as for this project sits right after the
+// branch, and says why when there is none.
+#[test]
+fn the_header_names_the_gh_account_of_this_project() {
+    use crate::worktree::GhAccount;
+    let header = |account: Option<GhAccount>, width: u16| {
+        let mut app = test_app(&["feat+one"]);
+        app.gh_account = account;
+        let rendered = text_of(&draw(&mut app, width, 12));
+        rendered.lines().next().unwrap().to_string()
+    };
+    let line = header(Some(GhAccount::Login("octocat".into())), 120);
+    assert!(line.contains("gh @octocat"), "{line}");
+    assert!(
+        line.find("@octocat").unwrap() < line.find("worktree").unwrap(),
+        "right after the branch: {line}"
+    );
+    assert!(header(None, 120).contains("gh …"));
+    assert!(header(Some(GhAccount::SignedOut), 120).contains("gh not signed in"));
+    assert!(header(Some(GhAccount::Missing), 120).contains("gh not installed"));
+    assert!(
+        header(Some(GhAccount::Unknown("x".into())), 120).contains("gh unknown"),
+        "a stderr line is not spliced into the header"
+    );
+    // A narrow header drops the counts before the account.
+    let narrow = header(Some(GhAccount::Login("octocat".into())), 50);
+    assert!(narrow.contains("@octocat"), "{narrow}");
+}

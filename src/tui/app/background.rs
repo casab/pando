@@ -12,7 +12,7 @@ use crate::cache;
 use crate::config::Config;
 use crate::paths::PandoPaths;
 use crate::state::{self, State};
-use crate::worktree::{self, BranchEntry, EnrichUpdate, PrInfo, Worktree};
+use crate::worktree::{self, BranchEntry, EnrichUpdate, GhAccount, PrInfo, Worktree};
 
 use super::{App, ServiceHealth};
 
@@ -27,6 +27,8 @@ pub enum AppEvent {
     EnrichDone,
     BranchesReady(Vec<BranchEntry>),
     PrsReady(Result<Vec<PrInfo>, String>),
+    /// Which GitHub account `gh` acts as for this project.
+    GhAccountReady(GhAccount),
     /// Process state, advanced and saved off the UI thread.
     Refreshed(Box<Result<State, String>>),
     /// Whether the project's services are answering — the shared ones for
@@ -390,6 +392,21 @@ impl App {
         thread::spawn(move || {
             let result = worktree::list_prs(&root).map_err(|e| format!("{e:#}"));
             let _ = tx.send(AppEvent::PrsReady(result));
+        });
+    }
+
+    /// Asks `gh` which account it is, from the project's own directory —
+    /// a network round trip, so never on the UI thread.
+    pub fn spawn_gh_account_check(&self) {
+        // The key tests press `R` like any other key; they must neither
+        // reach the network nor learn whose laptop they run on.
+        if cfg!(test) {
+            return;
+        }
+        let root = self.paths.root().to_path_buf();
+        let tx = self.event_tx.clone();
+        thread::spawn(move || {
+            let _ = tx.send(AppEvent::GhAccountReady(worktree::gh_account(&root)));
         });
     }
 

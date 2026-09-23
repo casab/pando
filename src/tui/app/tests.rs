@@ -4627,3 +4627,17 @@ fn the_gated_refresh_reads_a_quiet_state_as_is_and_advances_a_death() {
         Phase::Failed { .. }
     ));
 }
+
+// The answer arrives from a worker; a repeat of the same answer is not a
+// reason to repaint.
+#[test]
+fn the_gh_account_answer_is_kept_and_repaints_only_on_a_change() {
+    use crate::worktree::GhAccount;
+    let mut app = test_app(&["feat+one"]);
+    assert_eq!(app.gh_account, None, "unknown until gh answers");
+    let login = GhAccount::Login("octocat".into());
+    assert!(app.handle_event(AppEvent::GhAccountReady(login.clone())));
+    assert_eq!(app.gh_account, Some(login.clone()));
+    assert!(!app.handle_event(AppEvent::GhAccountReady(login)));
+    assert!(app.handle_event(AppEvent::GhAccountReady(GhAccount::SignedOut)));
+}

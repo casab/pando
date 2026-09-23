@@ -50,7 +50,7 @@ use crate::actions;
 use crate::config::Config;
 use crate::paths::PandoPaths;
 use crate::state::{self, Aggregate, ProcessRecord, State, WorktreeRecord};
-use crate::worktree::{self, PrInfo, Worktree};
+use crate::worktree::{self, GhAccount, PrInfo, Worktree};
 
 /// How long a status message stays on the header before the counts return.
 /// An error stays longer than a confirmation: it is the one that has to be
@@ -194,6 +194,9 @@ pub struct App {
     /// it appears or changes rather than on every refresh.
     pub state_warning: Option<String>,
     pub prs: HashMap<String, PrInfo>,
+    /// Which GitHub account `gh` acts as for this project; `None` while
+    /// the first answer is on its way.
+    pub gh_account: Option<GhAccount>,
     pub list_state: ListState,
     pub filter: String,
     pub filtered_indices: Vec<usize>,
@@ -277,6 +280,7 @@ impl App {
             viewer_height: 0,
             state_warning: None,
             prs: HashMap::new(),
+            gh_account: None,
             list_state: ListState::default(),
             filter: String::new(),
             filtered_indices: Vec::new(),
@@ -313,6 +317,7 @@ impl App {
         app.hydrate_from_cache();
         app.spawn_enrichment(None);
         app.spawn_pr_fetch();
+        app.spawn_gh_account_check();
         Ok(app)
     }
 
@@ -406,6 +411,11 @@ impl App {
             }
             // A missing or unauthenticated `gh` just means no chips.
             AppEvent::PrsReady(Err(_)) => false,
+            AppEvent::GhAccountReady(account) => {
+                let changed = self.gh_account.as_ref() != Some(&account);
+                self.gh_account = Some(account);
+                changed
+            }
             AppEvent::Refreshed(result) => {
                 self.refreshing = false;
                 match *result {
@@ -655,6 +665,8 @@ impl App {
             KeyCode::Tab => self.cycle_tail(),
             KeyCode::Char('R') => {
                 self.spawn_discovery();
+                // An account switched in another terminal shows here too.
+                self.spawn_gh_account_check();
                 self.set_status("refreshing…");
             }
             KeyCode::Char('?') => {
@@ -1111,6 +1123,7 @@ impl App {
             viewer_height: 0,
             state_warning: None,
             prs: HashMap::new(),
+            gh_account: None,
             list_state: ListState::default(),
             filter: String::new(),
             filtered_indices: Vec::new(),

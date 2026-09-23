@@ -139,6 +139,10 @@ pub const LIST_LEGEND: &[(&str, &str)] = &[
     ("↑n ↓n", "commits ahead of / behind the base branch"),
     ("adopted", "a worktree pando did not create"),
     (
+        "gh @login",
+        "the GitHub account gh uses in this project's directory; R asks again",
+    ),
+    (
         "shared: pg ● up",
         "the project's shared services at their default ports: up answers, down does not",
     ),
