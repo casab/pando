@@ -12,7 +12,9 @@ built for a single project.
 Implementation ran 2026-09-20 to 2026-09-22 and every phase in
 `plans/00-master.md` is done: worktrees, start and stop, multiple processes,
 the log viewer, compose isolation, share, `init`/`doctor`/`signals`, native
-service recipes, and the agent layer.
+service recipes, and the agent layer. On 2026-09-23 the code was
+restructured for maintainability with no behaviour change
+(`plans/refactor-maintainability.md`), and 0.2.0 was built and tagged.
 
 What is left is not a phase. `plans/open-follow-ups.md` carries the known
 edges, each with who found it and where it belongs, and the release
@@ -24,6 +26,34 @@ The working rules do not change. One conventional commit per work item, with
 `cargo fmt --check` clean before every commit. Do not start a phase that has
 no plan file. The repo is local-only: never push, never add a remote, never
 open a PR. No attribution lines in commit messages.
+
+## Code layout
+
+`src/lib.rs` is the map: the dependency direction, and a table of where to
+add each kind of thing. Keep to its shape:
+
+- **One fact, one row.** What pando knows about the ecosystem is data in
+  `src/catalog/` (package managers, frameworks, service images), in
+  `runtime/languages.rs` (languages, version managers), or in
+  `recipes/builtin/*.toml` (native services). Never add a second list of
+  the same fact. Where two lists must differ in order because one is
+  published or stored, keep both and add a test holding them to one set.
+- **A module with more than one concern is a directory.** Its `mod.rs`
+  holds the module doc and `pub use` re-exports, so callers never name a
+  file; each file below it is one concern with a `//!` line; tests go in
+  `tests.rs`. Items shared between sibling files are `pub(super)`, no
+  wider.
+- **Contracts have tests.** A string `agent/json.md` documents, a slot
+  name, a CLI verb in the list below: each is held to the code by a test.
+  Adding one without its test is not done.
+
+## Releases
+
+A release is local: bump `version` in `Cargo.toml` and in
+`agent/.claude-plugin/plugin.json` together, commit it as
+`chore(release): X.Y.Z`, tag `vX.Y.Z` with `git tag -a`, and
+`cargo build --release`. Publishing anything is the launch checklist's job,
+not a release's.
 
 ## Docs and plans are never committed
 
@@ -58,6 +88,10 @@ database, a prod schema dump, and cookie auth."
   during development.
 - dwt's origin project is never used, not even read-only. Its path is in
   `CLAUDE.local.md` only so it can be recognised and avoided.
+- Never run two `cargo test`s at once. Two tests are load-sensitive
+  (`plans/open-follow-ups.md`); under a parallel build they fail for
+  reasons that have nothing to do with the change. Rerun a readiness or
+  timeout failure alone before concluding anything.
 - The maintainer's own repositories are off limits to pando sessions, which
   has a consequence worth stating plainly: **the fixture corpus is the only
   validation pando gets.** A corpus of tidy shapes therefore proves very
