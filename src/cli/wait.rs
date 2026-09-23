@@ -112,18 +112,24 @@ pub(super) fn verdict(record: &WorktreeRecord, only: Option<&str>, now: DateTime
 /// a little more.
 pub(super) fn limit(record: &WorktreeRecord, only: Option<&str>) -> Duration {
     watched(record, only)
-        .map(|(_, p)| {
-            let starting = state::longest_starting_secs(
-                p.ready_timeout_s
-                    .map(|s| s as i64)
-                    .unwrap_or(state::START_TIMEOUT_SECS),
-            );
-            Duration::from_secs(starting.max(0) as u64).max(no_port_watch(p))
-        })
+        .map(|(_, p)| Duration::from_secs(longest_starting(p)).max(no_port_watch(p)))
         .max()
         .unwrap_or_default()
         .max(NO_PORT_WATCH)
-        + GRACE
+        .saturating_add(GRACE)
+}
+
+/// [`state::longest_starting_secs`] for `p`, saturating. `ready.timeout_s`
+/// is any number config takes, and the window plus its grace is twice it:
+/// past half of `i64::MAX` that overflowed — a panic in a debug build, and
+/// in a release build a negative sum that capped the wait at 20 seconds
+/// while the process was, correctly, still starting.
+fn longest_starting(p: &state::ProcessRecord) -> u64 {
+    let timeout = p.ready_timeout_s.map_or(state::START_TIMEOUT_SECS, |s| {
+        i64::try_from(s).unwrap_or(i64::MAX)
+    });
+    let grace = state::unconfirmed_grace_secs(timeout);
+    u64::try_from(timeout.saturating_add(grace)).unwrap_or(0)
 }
 
 /// The line a wait narrates once `p` is ready at `now`, or `None` while it

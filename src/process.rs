@@ -356,7 +356,12 @@ pub fn shell_quote(word: &str) -> String {
 /// and skipping the signal is exactly how a backgrounded child outlives the
 /// tool that started it.
 pub fn stop(pgid: i32, grace: Duration) -> Result<()> {
-    if pgid <= 1 {
+    // Nor the group pando itself runs in. Nothing pando spawns is in it —
+    // every spawn leads a session of its own — so a record naming it is a
+    // number that has been handed out again, and the shell that ran this
+    // pando leads its job's group: signalling it is pando killing itself,
+    // and its terminal's job with it, halfway through a mutation.
+    if pgid <= 1 || pgid == nix::unistd::getpgrp().as_raw() {
         return Ok(());
     }
     let group = Pid::from_raw(pgid);
@@ -628,6 +633,10 @@ mod tests {
         stop(0, Duration::from_millis(10)).unwrap();
         stop(1, Duration::from_millis(10)).unwrap();
         stop(-1, Duration::from_millis(10)).unwrap();
+        // Our own group, which no spawn is ever in: a record naming it
+        // is a reused number, and the signal would land on this process
+        // and the job that ran it.
+        stop(nix::unistd::getpgrp().as_raw(), Duration::from_millis(10)).unwrap();
         // Still here, and still runnable: we did not signal ourselves.
         assert!(is_alive(std::process::id()));
     }

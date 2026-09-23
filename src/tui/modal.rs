@@ -15,7 +15,7 @@ use super::app::{
     App, BranchLoadState, CreateRow, INSPECT_LEGEND, KeyHelp, LIST_KEYS, LIST_LEGEND, LOG_KEYS,
     Modal, RemoveBlocker, StatusKind, create_rows,
 };
-use super::render::{centered_box, truncate, truncate_middle, wrap_text};
+use super::render::{centered_box, chunk_cells, text_width, truncate, truncate_middle, wrap_text};
 use crate::theme::{
     blue, border, cyan, green, highlight_bg, magenta, orange, red, surface, text, text_dim,
     text_muted, yellow,
@@ -147,7 +147,7 @@ fn popup(
 fn widest(lines: &[Line]) -> usize {
     lines
         .iter()
-        .map(|line| line.spans.iter().map(|s| s.content.chars().count()).sum())
+        .map(|line| line.spans.iter().map(|s| text_width(&s.content)).sum())
         .max()
         .unwrap_or(0)
 }
@@ -216,13 +216,13 @@ fn render_question(
     // The natural width: whatever the longest unbroken thing needs, capped
     // at what the screen has.
     let cap = max_content_width(area);
-    let natural = std::iter::once(question.prompt.chars().count())
-        .chain(question.details.iter().map(|d| d.chars().count()))
+    let natural = std::iter::once(text_width(&question.prompt))
+        .chain(question.details.iter().map(|d| text_width(d)))
         .chain(
             question
                 .options
                 .iter()
-                .flat_map(|(value, why)| [value.chars().count() + 6, why.chars().count() + 6]),
+                .flat_map(|(value, why)| [text_width(value) + 6, text_width(why) + 6]),
         )
         .chain(std::iter::once(widest(std::slice::from_ref(&footer_line))))
         .max()
@@ -258,7 +258,7 @@ fn render_question(
             (false, true) => "▸ ".to_string(),
             (false, false) => "  ".to_string(),
         };
-        let indent = marker.chars().count();
+        let indent = text_width(&marker);
         let start = body.len();
         let value_style = if cursor {
             Style::new()
@@ -471,13 +471,11 @@ fn render_create(
                     },
                 }
             };
-            let tag_width = tag.chars().count() + 2;
-            let label_width = width.saturating_sub(marker.chars().count() + tag_width);
+            let tag_width = text_width(tag) + 2;
+            let label_width = width.saturating_sub(text_width(marker) + tag_width);
             let shown = truncate_middle(&label, label_width);
             let gap = width
-                .saturating_sub(
-                    marker.chars().count() + shown.chars().count() + tag.chars().count(),
-                )
+                .saturating_sub(text_width(marker) + text_width(&shown) + text_width(tag))
                 .max(1);
             // Not a choice: git keeps one checkout per branch.
             let label_style = if app.is_main_branch(&label) {
@@ -509,17 +507,13 @@ fn render_create(
 /// being taken away is exactly the thing somebody may have open in another
 /// window.
 fn render_unshare(f: &mut Frame, area: Rect, label: &str, url: &str) {
-    let width = (url.chars().count().max(40)).min(max_content_width(area));
+    let width = (text_width(url).max(40)).min(max_content_width(area));
     let mut lines = vec![Line::styled(
         truncate(&format!("stop sharing {label}?"), width),
         Style::new().fg(text()).add_modifier(Modifier::BOLD),
     )];
-    let chars: Vec<char> = url.chars().collect();
-    for chunk in chars.chunks(width.max(1)) {
-        lines.push(Line::styled(
-            chunk.iter().collect::<String>(),
-            Style::new().fg(cyan()),
-        ));
+    for chunk in chunk_cells(url, width) {
+        lines.push(Line::styled(chunk, Style::new().fg(cyan())));
     }
     lines.push(Line::styled(
         truncate("anyone with that link loses it at once", width),
@@ -670,8 +664,8 @@ fn render_help(
     // runs into what it does.
     let key_width = keys
         .iter()
-        .map(|k| k.keys.chars().count())
-        .chain(legend.iter().map(|(mark, _)| mark.chars().count()))
+        .map(|k| text_width(k.keys))
+        .chain(legend.iter().map(|(mark, _)| text_width(mark)))
         .max()
         .unwrap_or(0)
         + 2;

@@ -178,6 +178,7 @@ impl App {
         // Captured before the list is replaced: after that, the old row
         // index points at whatever worktree the refresh moved into it.
         let keep = self.selected_worktree().map(|w| w.name.clone());
+        let row = self.list_state.selected().unwrap_or(0);
         let known: HashMap<String, Worktree> = self
             .worktrees
             .drain(..)
@@ -204,7 +205,10 @@ impl App {
         self.main = Some(snapshot.main);
         self.default_base = snapshot.default_base;
         self.created_by_pando = snapshot.created_by_pando;
-        self.state = snapshot.state;
+        // Through the same door as the refresh: the full refresh a
+        // discovery runs is as likely as the quick one to be the read
+        // that first finds a process dead.
+        self.adopt_state(snapshot.state);
         if snapshot.warning != self.state_warning {
             if let Some(message) = snapshot.warning.clone() {
                 self.set_error(message);
@@ -235,7 +239,15 @@ impl App {
             }
             None => keep,
         };
-        self.refilter_keeping(keep);
+        self.refilter_keeping(keep.clone(), row);
+        // The worktree under the cursor went away, and the cursor is on
+        // its neighbour now: whose tail it shows starts over, as a move
+        // would start it.
+        let after = self.selected_worktree().map(|w| w.name.clone());
+        if keep.is_some() && after != keep {
+            self.tail_index = 0;
+            self.tail_scroll = 0;
+        }
         fresh
     }
 

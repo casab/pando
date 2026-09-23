@@ -1803,6 +1803,19 @@ fn a_service_record_the_config_no_longer_includes_is_reported_with_its_volume() 
 
 // ---- adoption ---------------------------------------------------
 
+// The notice was one string literal whose line continuations had lost
+// their backslashes, so it carried two runs of eighteen spaces into the
+// middle of a sentence.
+#[test]
+fn the_records_left_behind_notice_is_one_clean_sentence() {
+    let text = super::adopt::records_left_behind(&anyhow::anyhow!("state.json is read-only"));
+    assert!(!text.contains("  "), "{text:?}");
+    assert!(
+        text.contains(": state.json is read-only — `pando rm`"),
+        "{text}"
+    );
+}
+
 /// A project folder for a repository that is not where it was: the
 /// shape a move leaves behind, built by hand because making one for
 /// real means moving a repository.

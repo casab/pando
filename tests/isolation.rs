@@ -1713,6 +1713,7 @@ fn rm_with_docker_down_refuses_unless_forced() {
     let report = start_isolated(&f, &name);
     let dev = report.started[0].record.pid;
     docker::daemon_down(&f.home);
+    let _containers = docker::down_on_drop(&f.home, &f.project(&name));
 
     let err = format!(
         "{:#}",
@@ -1753,6 +1754,40 @@ fn rm_with_docker_down_refuses_unless_forced() {
     assert!(!store.worktrees.contains_key(&name));
 }
 
+// A daemon that is up and wedged is the other way Docker cannot be asked.
+// The refusal names it, and names `--force` as the way through — which then
+// asked it anyway: `down -v` sat under the state lock for the whole
+// teardown deadline, five minutes of a frozen TUI, and failed the removal
+// it had been forced to make.
+#[test]
+fn rm_forced_past_a_hung_docker_does_not_wait_on_it() {
+    let f = iso_with(&config_toml("sleep 30"));
+    let name = new_worktree(&f, "feat/one");
+    start_isolated(&f, &name);
+    docker::daemon_hung(&f.home);
+    let _containers = docker::down_on_drop(&f.home, &f.project(&name));
+
+    let said = std::sync::Mutex::new(Vec::<String>::new());
+    let began = std::time::Instant::now();
+    actions::rm(&f.paths, &name, false, true, &|m| {
+        said.lock().unwrap().push(m.to_string())
+    })
+    .unwrap();
+    assert!(
+        began.elapsed() < pando::services::PROBE_TIMEOUT * 3,
+        "rm waited {:?} on a daemon that does not answer",
+        began.elapsed()
+    );
+    let said = said.into_inner().unwrap();
+    assert!(
+        said.iter()
+            .any(|m| m.contains("not answering") && m.contains("down -v")),
+        "{said:?}"
+    );
+    let store = state::load(&f.paths.state_file()).unwrap();
+    assert!(!store.worktrees.contains_key(&name));
+}
+
 // Docker off, with an isolated worktree running: going back to shared,
 // stopping and removing all work, because a daemon that is down has no
 // containers running. `rm` says what it could not remove.
@@ -1765,6 +1800,7 @@ fn stop_shared_and_rm_all_work_with_docker_down() {
     let name = new_worktree(&f, "feat/one");
     start_isolated(&f, &name);
     docker::daemon_down(&f.home);
+    let _containers = docker::down_on_drop(&f.home, &f.project(&name));
 
     let said = std::sync::Mutex::new(Vec::<String>::new());
     let note = |m: &str| said.lock().unwrap().push(m.to_string());

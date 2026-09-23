@@ -11,7 +11,7 @@ use crate::state::Aggregate;
 use crate::theme::{blue, green, orange, red, surface, text, text_dim, text_muted, yellow};
 use crate::tui::app::{App, Mode, Status, StatusKind};
 
-use super::{truncate, truncate_line, wrap_text};
+use super::{text_width, truncate, truncate_line, wrap_text};
 
 /// The most rows an error may take from the header before it is cut, with
 /// `m` offered for the rest.
@@ -48,7 +48,7 @@ pub(super) fn status_mark(status: &Status) -> (&'static str, ratatui::style::Col
 /// error that does not fit, up to `max_rows` for that one.
 pub(super) fn flash_rows(status: &Status, width: usize, max_rows: usize) -> Vec<String> {
     let budget = width.saturating_sub(4).max(1);
-    if !status.is_error() || status.message.chars().count() <= budget {
+    if !status.is_error() || text_width(&status.message) <= budget {
         return vec![truncate(&status.message, budget)];
     }
     let max_rows = max_rows.max(1);
@@ -59,8 +59,8 @@ pub(super) fn flash_rows(status: &Status, width: usize, max_rows: usize) -> Vec<
         // not the other way round.
         const MORE: &str = " … m shows it all";
         let last = rows.pop().unwrap_or_default();
-        let room = budget.saturating_sub(MORE.chars().count());
-        let kept: String = last.chars().take(room).collect();
+        let room = budget.saturating_sub(text_width(MORE));
+        let kept = &last[..super::fitting_prefix(&last, room)];
         rows.push(truncate(
             &format!("{} {}", kept.trim_end(), MORE.trim_start()),
             budget,
@@ -308,11 +308,9 @@ pub(super) fn hint_line(hints: &[(&str, &str, bool)], width: usize) -> Line<'sta
     const SEPARATOR: &str = " · ";
     let items: Vec<(usize, bool)> = hints
         .iter()
-        .map(|(key, label, essential)| {
-            (key.chars().count() + 1 + label.chars().count(), *essential)
-        })
+        .map(|(key, label, essential)| (text_width(key) + 1 + text_width(label), *essential))
         .collect();
-    let keep = keep_hints(&items, SEPARATOR.chars().count(), width.saturating_sub(1));
+    let keep = keep_hints(&items, text_width(SEPARATOR), width.saturating_sub(1));
 
     let mut spans = vec![Span::raw(" ")];
     let mut first = true;

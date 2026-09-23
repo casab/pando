@@ -233,7 +233,8 @@ pub fn resolve(recipes: &crate::recipes::Recipes, entry: &Entry<'_>) -> Result<R
     let name = recipe.name.clone();
     let service = recipe.service_mut().with_context(|| {
         format!(
-            "the service {:?} names the recipe {name:?}, which is a language recipe — a              [[services]] entry needs one that starts a server",
+            "the service {:?} names the recipe {name:?}, which is a language recipe — a \
+             [[services]] entry needs one that starts a server",
             entry.name
         )
     })?;
@@ -260,7 +261,8 @@ pub fn resolve(recipes: &crate::recipes::Recipes, entry: &Entry<'_>) -> Result<R
     }
     if service.cmd.trim().is_empty() {
         bail!(
-            "the service {:?} has no command to start: name a `preset`, or give the entry its              own `cmd`",
+            "the service {:?} has no command to start: name a `preset`, or give the entry its \
+             own `cmd`",
             entry.name
         );
     }
@@ -960,6 +962,47 @@ mod tests {
         // file the developer is trying to fix.
         let e = format!("{:#}", resolve(&recipes, &entry).unwrap_err());
         assert!(e.contains("does not load"), "{e}");
+    }
+
+    // Both refusals are one sentence broken over two source lines. The
+    // continuation had lost its backslash, so each message carried the
+    // next line's indentation — a run of spaces mid-sentence.
+    #[test]
+    fn a_recipe_that_cannot_start_a_server_is_refused_in_one_clean_sentence() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("node.toml"),
+            "kind = \"language\"\nname = \"node\"\n\n[language]\nmanagers = [\"nvm\"]\n",
+        )
+        .unwrap();
+        let recipes = Recipes::load(dir.path());
+        let env = std::collections::BTreeMap::new();
+        let language = Entry {
+            name: "node",
+            preset: None,
+            port_env: None,
+            init: None,
+            cmd: None,
+            ready: None,
+            ready_timeout_s: None,
+            env: &env,
+        };
+        // A recipe's own empty `cmd` is refused when the file loads, so
+        // the one way to an empty command is an entry blanking it.
+        let blanked = Entry {
+            name: "db",
+            preset: Some("postgres"),
+            cmd: Some("  "),
+            ..language
+        };
+        for (entry, says) in [
+            (language, "language recipe"),
+            (blanked, "no command to start"),
+        ] {
+            let e = format!("{:#}", resolve(&recipes, &entry).unwrap_err());
+            assert!(e.contains(says), "{e}");
+            assert!(!e.contains("  "), "{e:?}");
+        }
     }
 
     // ---- the socket path ------------------------------------------------

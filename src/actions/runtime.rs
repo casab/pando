@@ -189,9 +189,13 @@ fn runs_through_runner(
     // Hooks too, fallbacks included: a migration hook that runs `python`
     // bare gets whatever interpreter the shell resolves, exactly as a
     // process would, and it runs first.
+    // Not one switched off: `on = "never"` is how the schema question's
+    // "no" is written down, and a command that never runs needs no
+    // interpreter.
     let hooks = config
         .hooks
         .iter()
+        .filter(|hook| hook.on != Some(config::HookScope::Never))
         .flat_map(|hook| std::iter::once(hook.cmd.as_str()).chain(hook.fallback.as_deref()));
     let through = config
         .processes
@@ -384,7 +388,11 @@ pub(super) fn answer_prelude(
 /// `bash -lc`, so `.bash_profile` is read and `.zshrc` is not.
 pub fn with_prelude(config: &Config, cmd: &str) -> String {
     match config.runtime.prelude.as_deref().map(str::trim) {
-        Some(prelude) if !prelude.is_empty() => format!("{prelude} && {cmd}"),
+        // Grouped, so the `&&` guards the whole command: `a; b` after a
+        // failed prelude ran `b` anyway. The newline before `}` lets a
+        // command end in a comment. A group, not a subshell, so `exec`
+        // still replaces the shell pando records.
+        Some(prelude) if !prelude.is_empty() => format!("{prelude} && {{\n{cmd}\n}}"),
         _ => cmd.to_string(),
     }
 }

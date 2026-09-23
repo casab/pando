@@ -293,6 +293,26 @@ fn a_wait_lasts_as_long_as_the_phase_can_stay_starting() {
     );
 }
 
+// `ready.timeout_s` takes any number TOML can write. The window plus its
+// grace overflowed past half of `i64::MAX`: a debug build panicked, and a
+// release build wrapped negative and gave up after 20 seconds on a
+// process the phase machine was still, correctly, waiting for.
+#[test]
+fn a_huge_ready_timeout_makes_a_long_wait_and_not_an_overflow() {
+    let now = Utc::now();
+    for timeout in [i64::MAX as u64, u64::MAX, i64::MAX as u64 / 2 + 1] {
+        let mut record = WorktreeRecord::new("/tmp/nowhere", true);
+        let mut web = fake_process(now);
+        web.ready_timeout_s = Some(timeout);
+        record.processes.insert("web".into(), web);
+        let limit = super::wait::limit(&record, None);
+        assert!(
+            limit > std::time::Duration::from_secs(1 << 40),
+            "{timeout}: {limit:?}"
+        );
+    }
+}
+
 fn fake_process(started_at: chrono::DateTime<Utc>) -> ProcessRecord {
     ProcessRecord {
         pid: 1,
@@ -326,6 +346,88 @@ fn a_name_resolves_by_directory_by_branch_or_by_the_directory_it_is_run_in() {
         Some(name.clone())
     );
     assert_eq!(super::names::containing(&fx.paths, &fx.root).unwrap(), None);
+}
+
+// The main checkout is a place `path` can go, and nothing else pando
+// does. It used to resolve like a worktree for every verb: `status
+// acme-shop` printed "no worktree named" and exited 0, `stop` said it
+// "was not running", and `open` suggested a `start` that refuses it.
+#[test]
+fn the_main_checkout_resolves_for_path_only_and_an_empty_name_is_a_usage_error() {
+    let fx = fixture();
+    let name = actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
+    for typed in ["acme-shop", "main"] {
+        let err = super::names::resolve(&fx.paths, typed).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("is the main checkout"),
+            "{typed}: {err:#}"
+        );
+        assert_eq!(
+            super::names::resolve_or_main(&fx.paths, typed).unwrap(),
+            "acme-shop",
+            "{typed}"
+        );
+    }
+    assert_eq!(super::names::resolve(&fx.paths, "feat/one").unwrap(), name);
+
+    let err = super::names::resolve(&fx.paths, "").unwrap_err();
+    assert!(err.downcast_ref::<UsageError>().is_some(), "{err:#}");
+    assert!(!format!("{err:#}").contains("did you mean"), "{err:#}");
+}
+
+// A pty nobody sized reports zero columns, and `ls` fitted its table to
+// that: every column but NAME and STATUS shed and the name cut to its
+// floor. COLUMNS, when it is a number, is what a person asked for.
+#[test]
+fn the_listing_width_survives_a_zero_sized_terminal_and_reads_columns() {
+    use super::ls::width_from;
+    assert_eq!(width_from(true, None, Some(0)), 80);
+    assert_eq!(width_from(true, None, None), 80);
+    assert_eq!(width_from(true, None, Some(120)), 120);
+    assert_eq!(width_from(true, Some("60"), Some(120)), 60);
+    for garbage in ["", "0", "wide", "-5"] {
+        assert_eq!(
+            width_from(true, Some(garbage), Some(120)),
+            120,
+            "{garbage:?}"
+        );
+    }
+    assert_eq!(
+        width_from(false, Some("60"), Some(120)),
+        usize::MAX,
+        "a pipe"
+    );
+}
+
+// `BROWSER="firefox --new-window"` was run as a program of that whole
+// name: "No such file or directory", for a setting every other tool reads.
+#[test]
+fn browser_is_a_list_of_commands_with_arguments() {
+    use super::open::openers;
+    let url = "http://localhost:3000";
+    let words = |v: &[&str]| v.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        openers(Some("firefox --new-window"), url),
+        vec![words(&["firefox", "--new-window", url])]
+    );
+    assert_eq!(
+        openers(Some("w3m:lynx -dump %s"), url),
+        vec![words(&["w3m", url]), words(&["lynx", "-dump", url])]
+    );
+    let dir = tempdir().unwrap();
+    let spaced = dir.path().join("My Browser");
+    std::fs::write(&spaced, "").unwrap();
+    let spaced = spaced.to_str().unwrap();
+    assert_eq!(
+        openers(Some(spaced), url),
+        vec![words(&[spaced, url])],
+        "a path with a space in it"
+    );
+    for unset in [None, Some(""), Some(" : ")] {
+        let default = openers(unset, url);
+        assert_eq!(default.len(), 1, "{unset:?}");
+        assert_eq!(default[0].last().map(String::as_str), Some(url));
+    }
 }
 
 #[test]
@@ -692,9 +794,12 @@ fn ls_names_lists_what_a_worktree_argument_accepts() {
     let text = capture(|b| super::completion::names(&fx.paths, b));
     let names: Vec<&str> = text.lines().collect();
     assert_eq!(names, ["acme-shop", "feat/one"], "{text}");
-    for name in names {
-        super::names::resolve(&fx.paths, name).unwrap();
+    // The main checkout is offered for `path`, the one verb it is a place
+    // for; every worktree resolves for all of them.
+    for name in &names {
+        super::names::resolve_or_main(&fx.paths, name).unwrap();
     }
+    super::names::resolve(&fx.paths, names[1]).unwrap();
 }
 
 // A menu entry is a line: the long `--help` paragraph belongs to `--help`.
@@ -1687,6 +1792,25 @@ fn an_empty_log_says_that_it_is_empty() {
             .any(|n| n.contains("dev") && n.contains("feat+one")),
         "and it names what was read: {notes:?}"
     );
+}
+
+/// `-n 0` asks for no lines, and gets none — without being told that a
+/// log full of them is empty. And a `-n` far past the file is the whole
+/// file, not a buffer sized for it up front: `usize::MAX` panicked with
+/// "capacity overflow".
+#[test]
+fn a_tail_of_zero_or_of_everything_reads_the_log_as_it_is() {
+    let fx = fixture();
+    write_log(&fx, "feat+one", "dev", "one\ntwo\n");
+    let (text, notes) =
+        capture_both(|b, n| logs(&fx.paths, "feat+one", "dev", 0, false, false, b, n));
+    assert_eq!(text, "");
+    assert!(notes.is_empty(), "the log is not empty: {notes:?}");
+
+    let (text, notes) =
+        capture_both(|b, n| logs(&fx.paths, "feat+one", "dev", usize::MAX, false, false, b, n));
+    assert_eq!(text, "one\ntwo\n");
+    assert!(notes.is_empty(), "{notes:?}");
 }
 
 /// A process killed mid-line leaves its last words without a newline.
@@ -2786,4 +2910,31 @@ fn the_port_question_asks_for_variable_names_and_echoes_the_choice() {
     assert_eq!(answer.unwrap(), actions::Answer::Choice(1));
     assert!(printed.contains("type the variable names"), "{printed}");
     assert!(printed.contains("→ PORT"), "{printed}");
+}
+
+// A CJK branch takes two columns a character; sized by characters, its
+// row pushed STATUS and everything after it out of line.
+#[test]
+fn a_wide_branch_name_keeps_the_ls_columns_straight() {
+    let fx = fixture();
+    actions::new(
+        &fx.paths,
+        &fx.config,
+        "feat/日本語のブランチ",
+        None,
+        &|_| {},
+    )
+    .unwrap();
+    actions::new(&fx.paths, &fx.config, "feat/ascii-branch", None, &|_| {}).unwrap();
+    let text = capture(|b| ls_text_at(&fx.paths, b, usize::MAX));
+    let status_column = |needle: &str| {
+        let line = text.lines().find(|l| l.contains(needle)).unwrap();
+        let at = line.find("stopped").unwrap();
+        crate::term::text_width(&line[..at])
+    };
+    assert_eq!(
+        status_column("日本語"),
+        status_column("ascii-branch"),
+        "{text}"
+    );
 }

@@ -563,9 +563,29 @@ impl App {
     /// and lines arriving below a scrolled-back viewport are what the
     /// `↓ N new` badge counts.
     pub(super) fn poll_viewer(&mut self) -> bool {
+        // The `all` tab merges every process the worktree has *now*: one
+        // started since the tab opened would otherwise get a tab of its
+        // own and never appear in the merge. The tab list is the one the
+        // last paint read, so this touches no directory.
+        let joining: Vec<(String, std::path::PathBuf)> = match self.log_view() {
+            Some(view) if view.source == ALL_SOURCE => self
+                .process_sources(&view.name, &view.available)
+                .into_iter()
+                .map(|process| {
+                    let path = self.paths.log_file(&view.name, &process);
+                    (process, path)
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
         let Some(view) = self.log_view_mut() else {
             return false;
         };
+        if let Some(merged) = view.tail.merged_mut() {
+            for (process, path) in joining {
+                merged.add_source(process, path);
+            }
+        }
         // One `exists` per tick, in both directions. The viewer is most
         // often opened on a source whose file does not exist yet — before
         // `start`, or while it is still installing — and this is what
@@ -590,10 +610,27 @@ impl App {
             changed = true;
         }
         let before = view.tail.lines().len();
-        let grew = view.tail.poll().unwrap_or(false);
+        let (grew, restarted) = view.tail.poll_for_restart();
+        if restarted {
+            // A new run: whatever the viewport, the cursor and the search
+            // pointed at belonged to the old one. Back to the live tail.
+            view.follow = true;
+            view.scroll = usize::MAX;
+            view.cursor = usize::MAX;
+            view.new_below = 0;
+            if view.search_mode == SearchMode::Active {
+                recompute_matches(view);
+            }
+            self.set_status("the log started over — this is the new run");
+            return true;
+        }
         let evicted: Vec<LogLevel> = view.tail.evicted_levels().to_vec();
         if !evicted.is_empty() {
             let count = evicted.len();
+            // Collapsed to the matches, the visible list *is* the match
+            // list, so what it lost is the matches that were evicted — not
+            // every evicted line the level filter passes.
+            let matches_evicted = view.search.matches.iter().filter(|&&at| at < count).count();
             // Absolute buffer indices all shift down by `count`.
             view.search.matches.retain_mut(|at| {
                 if *at < count {
@@ -610,10 +647,14 @@ impl App {
             // so only the evicted lines the filter was showing move them.
             // While following, the paint re-pins them anyway.
             if !view.follow {
-                let visible_evicted = evicted
-                    .iter()
-                    .filter(|level| view.log_filter.passes(**level))
-                    .count();
+                let visible_evicted = if view.collapsed() {
+                    matches_evicted
+                } else {
+                    evicted
+                        .iter()
+                        .filter(|level| view.log_filter.passes(**level))
+                        .count()
+                };
                 view.scroll = view.scroll.saturating_sub(visible_evicted);
                 view.cursor = view.cursor.saturating_sub(visible_evicted);
             }
@@ -642,13 +683,20 @@ impl App {
             view.scroll = usize::MAX;
         } else if grew {
             let added = view.tail.lines().len() + evicted.len() - before;
+            // What the viewer will show of them: collapsed, only the ones
+            // that match.
+            let query = view.search.query.to_lowercase();
+            let collapsed = view.collapsed();
             view.new_below += view
                 .tail
                 .lines()
                 .iter()
                 .rev()
                 .take(added)
-                .filter(|parsed| view.log_filter.passes(parsed.level))
+                .filter(|parsed| {
+                    view.log_filter.passes(parsed.level)
+                        && (!collapsed || parsed.plain_lower.contains(&query))
+                })
                 .count();
         }
         grew || changed

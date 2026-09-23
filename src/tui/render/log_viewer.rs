@@ -17,7 +17,7 @@ use crate::theme::{
 use crate::tui::app::{App, LogFilter, LogView, SearchMode, Status};
 
 use super::chrome::{hint_line, status_mark};
-use super::{centered_rect, truncate, truncate_line};
+use super::{centered_rect, text_width, truncate, truncate_line};
 
 /// Key hints for the viewer's footer. The counters and the position badge
 /// claim their width first; these collapse into whatever is left.
@@ -618,14 +618,34 @@ pub(super) fn wrap_line_to_rows(line: Line<'static>, width: usize) -> Vec<Line<'
     let text: String = cells.iter().map(|(c, _)| *c).collect();
     let protected = protected_ranges(&text);
 
+    // Rows are measured in terminal cells, not characters: a line of CJK
+    // cut every `width` characters is twice as wide as the viewport, and
+    // the half past the edge is never painted.
+    let span_width = |from: usize, to: usize| -> usize {
+        cells[from..to]
+            .iter()
+            .map(|(c, _)| super::char_width(*c))
+            .sum()
+    };
     let mut rows: Vec<Line<'static>> = Vec::new();
     let mut start = 0usize;
     while start < cells.len() {
-        let mut end = (start + width).min(cells.len());
+        let mut end = start;
+        let mut used = 0usize;
+        while end < cells.len() {
+            let w = super::char_width(cells[end].0);
+            // At least one character a row, or a glyph wider than the
+            // whole viewport would never leave.
+            if used + w > width && end > start {
+                break;
+            }
+            used += w;
+            end += 1;
+        }
         if end < cells.len()
             && let Some(&(from, to)) = protected.iter().find(|&&(from, to)| from < end && end < to)
             && from > start
-            && to - from <= width
+            && span_width(from, to) <= width
         {
             end = from;
         }
@@ -693,7 +713,7 @@ fn cursor_highlight_rows(rows: Vec<Line<'static>>, width: usize) -> Vec<Line<'st
                 .spans
                 .into_iter()
                 .map(|span| {
-                    used += span.content.chars().count();
+                    used += text_width(&span.content);
                     if span.style.bg.is_none() {
                         let style = span.style.bg(highlight_bg());
                         Span::styled(span.content, style)
@@ -739,10 +759,7 @@ pub(super) fn source_tabs(sources: &[String], active: &str, width: usize) -> Lin
             .collect()
     };
     let labelled = tabs(true);
-    let labelled_width: usize = labelled
-        .iter()
-        .map(|span| span.content.chars().count())
-        .sum();
+    let labelled_width: usize = labelled.iter().map(|span| text_width(&span.content)).sum();
     if labelled_width <= width {
         return Line::from(labelled);
     }
@@ -853,10 +870,10 @@ fn viewer_footer(
         ));
     }
 
-    let badge_width = badge.chars().count();
+    let badge_width = text_width(&badge);
     let tail_width: usize = tail
         .iter()
-        .map(|span| span.content.chars().count())
+        .map(|span| text_width(&span.content))
         .sum::<usize>();
     let hint_budget = width.saturating_sub(tail_width + badge_width + 1);
     let mut spans = match &status {
@@ -867,7 +884,7 @@ fn viewer_footer(
                     " {mark}{}",
                     truncate(
                         &status.message,
-                        hint_budget.saturating_sub(1 + mark.chars().count())
+                        hint_budget.saturating_sub(1 + text_width(mark))
                     )
                 ),
                 Style::new().fg(color).add_modifier(Modifier::BOLD),
@@ -879,7 +896,7 @@ fn viewer_footer(
 
     let used: usize = spans
         .iter()
-        .map(|span| span.content.chars().count())
+        .map(|span| text_width(&span.content))
         .sum::<usize>();
     spans.push(Span::raw(
         " ".repeat(width.saturating_sub(used + badge_width)),

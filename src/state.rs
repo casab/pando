@@ -56,7 +56,7 @@ pub fn unconfirmed_grace_secs(timeout_secs: i64) -> i64 {
 /// has to wait for. A wait bounded by the window alone gives up while the
 /// phase machine is still, correctly, waiting on a healthy server.
 pub fn longest_starting_secs(timeout_secs: i64) -> i64 {
-    timeout_secs + unconfirmed_grace_secs(timeout_secs)
+    timeout_secs.saturating_add(unconfirmed_grace_secs(timeout_secs))
 }
 
 /// The reason written for a process that is simply gone.
@@ -267,18 +267,136 @@ pub fn load(path: &Path) -> Result<State> {
             );
         }
     };
-    let state: State = serde_json::from_str(&text)
-        .with_context(|| format!("parse state file {}", path.display()))?;
-    if state.version != STATE_VERSION {
+    // The version first, on its own: a file another version of pando wrote
+    // may not have this version's shape at all, and "could not parse" is
+    // not the sentence that says what to do about it.
+    #[derive(Deserialize)]
+    struct Versioned {
+        version: u32,
+    }
+    if let Ok(Versioned { version }) = serde_json::from_str::<Versioned>(&text)
+        && version != STATE_VERSION
+    {
         anyhow::bail!(
-            "state file {} is version {}, this pando speaks version {STATE_VERSION} — upgrade \
-             pando, or move that file aside to start over (worktrees pando created will then \
-             read as adopted)",
+            "state file {} is version {version}, this pando speaks version {STATE_VERSION} — \
+             upgrade pando, or move that file aside to start over (worktrees pando created will \
+             then read as adopted)",
             path.display(),
-            state.version
         );
     }
+    let OnDisk { mut state, boot } = serde_json::from_str(&text)
+        .with_context(|| format!("parse state file {}", path.display()))?;
+    forget_previous_boot(&mut state, boot.as_deref(), boot_id());
     Ok(state)
+}
+
+/// The state file as it is written: the state, and the boot it was
+/// written during.
+#[derive(Deserialize)]
+struct OnDisk {
+    #[serde(flatten)]
+    state: State,
+    #[serde(default)]
+    boot: Option<String>,
+}
+
+#[derive(Serialize)]
+struct Saving<'a> {
+    #[serde(flatten)]
+    state: &'a State,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    boot: Option<&'a str>,
+}
+
+/// An identifier of this boot of the machine: the same for every process
+/// until it restarts, and different after. `None` where the system does
+/// not say.
+pub fn boot_id() -> Option<&'static str> {
+    static BOOT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    BOOT.get_or_init(read_boot_id).as_deref()
+}
+
+#[cfg(target_os = "macos")]
+fn read_boot_id() -> Option<String> {
+    let name = c"kern.bootsessionuuid";
+    let mut len: libc::size_t = 0;
+    // SAFETY: a null buffer asks for the length only.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || len == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; len];
+    // SAFETY: `buf` is `len` bytes long, which is what the kernel is told.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    buf.truncate(len);
+    let id = String::from_utf8_lossy(&buf)
+        .trim_end_matches('\0')
+        .trim()
+        .to_string();
+    (!id.is_empty()).then_some(id)
+}
+
+#[cfg(target_os = "linux")]
+fn read_boot_id() -> Option<String> {
+    let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let id = id.trim().to_string();
+    (!id.is_empty()).then_some(id)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn read_boot_id() -> Option<String> {
+    None
+}
+
+/// Forgets every pid a state file recorded during an earlier boot.
+///
+/// Nothing pando started survives a restart of the machine, but the file
+/// does — and the numbers in it are handed out again from the bottom on
+/// the next boot. Trusted, a dev server's pid then names whatever process
+/// got that number: `status` calls it running, `start` leaves it "already
+/// running", and `stop` sends SIGTERM and then SIGKILL to the process group
+/// of a stranger (a terminal's shell leads a group of its own). So a file
+/// written during another boot keeps what outlives a restart — ports,
+/// roles, hooks, the compose projects that name containers and volumes,
+/// the isolation mode — and loses every pid.
+///
+/// A file with no boot recorded, or a system that cannot say, keeps them:
+/// not knowing is not evidence of a restart.
+fn forget_previous_boot(state: &mut State, written: Option<&str>, now: Option<&str>) {
+    let (Some(written), Some(now)) = (written, now) else {
+        return;
+    };
+    if written == now {
+        return;
+    }
+    for record in state.worktrees.values_mut() {
+        record.processes.clear();
+        record.observed_ports.clear();
+        record.share = None;
+        for service in record.services.iter_mut() {
+            service.pid = None;
+            service.pgid = None;
+        }
+    }
 }
 
 pub fn save(path: &Path, state: &State) -> Result<()> {
@@ -286,7 +404,11 @@ pub fn save(path: &Path, state: &State) -> Result<()> {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     let tmp = path.with_extension("json.tmp");
-    let json = serde_json::to_string_pretty(state).context("serialize state")?;
+    let json = serde_json::to_string_pretty(&Saving {
+        state,
+        boot: boot_id(),
+    })
+    .context("serialize state")?;
     std::fs::write(&tmp, json).with_context(|| format!("write tmp state {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("rename tmp → {}", path.display()))?;
     Ok(())
@@ -461,7 +583,7 @@ pub fn advance_phases<R: Into<PortCheck>>(
                 Phase::Starting { since } => {
                     let timeout = proc
                         .ready_timeout_s
-                        .map(|s| s as i64)
+                        .map(|s| i64::try_from(s).unwrap_or(i64::MAX))
                         .unwrap_or(START_TIMEOUT_SECS);
                     if !record_alive(
                         proc.pid,
@@ -1008,6 +1130,65 @@ mod tests {
         );
     }
 
+    // A version this pando does not speak may not have this version's shape
+    // either, and the parse error it used to get said nothing about what to
+    // do. The version is read first, whatever else the file holds.
+    #[test]
+    fn another_versions_file_of_another_shape_still_says_which_version_it_is() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(
+            &path,
+            r#"{"version":3,"worktrees":{"w":{"somewhere":"else"}},"new":true}"#,
+        )
+        .unwrap();
+        let err = format!("{:#}", load(&path).unwrap_err());
+        assert!(err.contains("version 3"), "{err}");
+    }
+
+    // After a restart every pid in the file names whatever process the new
+    // boot handed that number to. Trusted, `stop` signals a stranger's
+    // process group and `start` calls a dead dev server "already running".
+    #[test]
+    fn a_state_file_from_an_earlier_boot_keeps_what_outlives_a_restart_and_no_pid() {
+        let Some(now) = boot_id() else {
+            return; // A system that cannot say which boot this is.
+        };
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let state = full_state();
+        save(&path, &state).unwrap();
+        assert_eq!(load(&path).unwrap(), state, "this boot's pids are kept");
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(now), "the boot is written down: {text}");
+        std::fs::write(&path, text.replace(now, "an-earlier-boot")).unwrap();
+        let loaded = load(&path).unwrap();
+        let rec = &loaded.worktrees["feat+x"];
+        assert!(rec.processes.is_empty(), "{:?}", rec.processes);
+        assert!(rec.share.is_none());
+        assert!(rec.observed_ports.is_empty());
+        assert!(
+            rec.services
+                .iter()
+                .all(|s| s.pid.is_none() && s.pgid.is_none())
+        );
+        let before = &state.worktrees["feat+x"];
+        assert_eq!(rec.ports, before.ports);
+        assert_eq!(rec.hooks, before.hooks);
+        assert_eq!(rec.services.len(), before.services.len());
+        assert_eq!(
+            rec.services[0].compose_project, before.services[0].compose_project,
+            "the compose project still names the volumes"
+        );
+
+        // A file that never recorded a boot is not evidence of a restart.
+        let mut unmarked: serde_json::Value = serde_json::from_str(&text).unwrap();
+        unmarked.as_object_mut().unwrap().remove("boot");
+        std::fs::write(&path, unmarked.to_string()).unwrap();
+        assert_eq!(load(&path).unwrap(), state);
+    }
+
     #[test]
     fn reconcile_drops_dead_process_records_and_keeps_live_ones() {
         let mut state = State::new();
@@ -1241,6 +1422,34 @@ mod tests {
                 if reason.contains("timeout") && reason.contains("17000")),
             "got {phase:?}"
         );
+    }
+
+    // A window past `i64::MAX` seconds wrapped to a negative one when it was
+    // cast, failing the process at once with "in -1s"; and the grace on top
+    // of a large window overflowed, a panic in a debug build. Both saturate:
+    // a window that large is "never", not "already over".
+    #[test]
+    fn a_window_too_large_to_count_is_never_rather_than_already_over() {
+        assert_eq!(longest_starting_secs(i64::MAX), i64::MAX);
+        assert_eq!(longest_starting_secs(i64::MAX / 2 + 1), i64::MAX);
+        for check in [PortCheck::NotBound, PortCheck::Unknown] {
+            let mut state = State::new();
+            let mut rec = WorktreeRecord::new("/abs/w", true);
+            let mut proc = starting(100, Utc::now() - chrono::Duration::seconds(3600));
+            proc.ready_port = Some(17_000);
+            proc.ready_timeout_s = Some(u64::MAX);
+            rec.processes.insert("dev".into(), proc);
+            state.worktrees.insert("w".into(), rec);
+            advance_phases(&mut state, |_| true, |_| false, |_, _| check);
+            assert!(
+                matches!(
+                    state.worktrees["w"].processes["dev"].phase,
+                    Phase::Starting { .. }
+                ),
+                "{check:?}: {:?}",
+                state.worktrees["w"].processes["dev"].phase
+            );
+        }
     }
 
     // A first build can take minutes; a project that says so must not be

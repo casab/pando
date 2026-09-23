@@ -142,13 +142,44 @@ pub fn centered_rect(percent_x: u16, min_width: u16, height: u16, area: Rect) ->
     popup
 }
 
+/// How many terminal cells `c` takes: two for a CJK ideograph or an
+/// emoji, none for a combining mark, and none for a control character —
+/// the paint drops those rather than drawing them.
+pub fn char_width(c: char) -> usize {
+    if c.is_control() {
+        return 0;
+    }
+    let mut buf = [0u8; 4];
+    Span::raw(&*c.encode_utf8(&mut buf)).width()
+}
+
+/// How many terminal cells `s` takes. Every budget in the TUI is in cells:
+/// counting characters lets a CJK branch name run twice as far as the
+/// room it was given, past the column beside it or off the pane.
+pub fn text_width(s: &str) -> usize {
+    s.chars().map(char_width).sum()
+}
+
+/// The longest prefix of `s` that fits in `cells`, as a byte index.
+fn fitting_prefix(s: &str, cells: usize) -> usize {
+    let mut used = 0usize;
+    for (at, c) in s.char_indices() {
+        let w = char_width(c);
+        if used + w > cells {
+            return at;
+        }
+        used += w;
+    }
+    s.len()
+}
+
 pub fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
+    if text_width(s) <= max {
         s.to_string()
     } else if max == 0 {
         String::new()
     } else {
-        let head: String = s.chars().take(max.saturating_sub(1)).collect();
+        let head = &s[..fitting_prefix(s, max - 1)];
         format!("{head}…")
     }
 }
@@ -156,18 +187,27 @@ pub fn truncate(s: &str, max: usize) -> String {
 /// Cuts the middle out of a string that does not fit, keeping both ends:
 /// the start of a path says where it is, the end says what it is.
 pub fn truncate_middle(s: &str, max: usize) -> String {
-    let len = s.chars().count();
-    if len <= max {
+    if text_width(s) <= max {
         return s.to_string();
     }
     if max < 5 {
         return truncate(s, max);
     }
-    let tail = (max - 1) / 2;
-    let head = max - 1 - tail;
-    let head: String = s.chars().take(head).collect();
-    let tail: String = s.chars().skip(len - tail).collect();
-    format!("{head}…{tail}")
+    let tail_room = (max - 1) / 2;
+    let head_room = max - 1 - tail_room;
+    let head = &s[..fitting_prefix(s, head_room)];
+    // The tail, walked from the end for as many cells as it may have.
+    let mut used = 0usize;
+    let mut tail_at = s.len();
+    for (at, c) in s.char_indices().rev() {
+        let w = char_width(c);
+        if used + w > tail_room {
+            break;
+        }
+        used += w;
+        tail_at = at;
+    }
+    format!("{head}…{}", &s[tail_at..])
 }
 
 /// A path as a person writes it: `~` for the home directory.
@@ -195,7 +235,9 @@ pub fn truncate_distinct(s: &str, max: usize, distinct_from: usize) -> String {
     /// reads as a number and not as a stray `12`.
     const CONTEXT: usize = 8;
     let len = s.chars().count();
-    if len <= max || max < 4 || distinct_from + 1 < max {
+    // The offsets are in characters, which is a cell apiece only when
+    // nothing in the label is wide: a label that is not is cut plainly.
+    if text_width(s) <= max || max < 4 || distinct_from + 1 < max || text_width(s) != len {
         return truncate(s, max);
     }
     // A short leading segment — `feature/` — is kept: it is the kind of
@@ -239,8 +281,8 @@ pub fn distinct_offsets(labels: &[String]) -> Vec<usize> {
     offsets
 }
 
-/// Word-wraps plain text to `width`, breaking a word only when it is wider
-/// than a whole row. Always at least one row.
+/// Word-wraps plain text to `width` cells, breaking a word only when it is
+/// wider than a whole row. Always at least one row.
 pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut rows = Vec::new();
@@ -250,10 +292,11 @@ pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
         for word in paragraph.split(' ') {
             let mut word: Vec<char> = word.chars().collect();
             loop {
+                let word_len = cells(&word);
                 let needed = if row_len == 0 {
-                    word.len()
+                    word_len
                 } else {
-                    row_len + 1 + word.len()
+                    row_len + 1 + word_len
                 };
                 if needed <= width {
                     if row_len > 0 {
@@ -267,7 +310,7 @@ pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
                 // whole. One wider than any row — a path, usually — breaks
                 // after a `/` where it can, filling what is left of this
                 // row first, and is only cut mid-name when it has none.
-                let fits_alone = word.len() <= width;
+                let fits_alone = word_len <= width;
                 let room = if row_len > 0 {
                     width.saturating_sub(row_len + 1)
                 } else {
@@ -295,8 +338,15 @@ pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
                     continue;
                 }
                 // Wider than the row, and nowhere to break it: cut it,
-                // carry the rest.
-                let rest = word.split_off(width);
+                // carry the rest. At least one character goes, or a glyph
+                // wider than the whole row would never leave.
+                let rest = word.split_off(fitting_chars(&word, width).max(1));
+                if rest.is_empty() {
+                    // The last piece is the row the next word joins.
+                    row.extend(word.iter());
+                    row_len = cells(&word);
+                    break;
+                }
                 rows.push(word.iter().collect());
                 word = rest;
             }
@@ -306,16 +356,51 @@ pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
     rows
 }
 
-/// Where to break `word` so its first part fits in `room`: just after the
-/// last `/` that leaves a part that fits. `None` when there is no such
-/// `/`, or it would leave nothing on the row.
+/// `s` cut into rows of at most `width` cells, anywhere — for a value
+/// that is never truncated, a URL or a branch, where a word wrap has no
+/// words to break at. Always at least one row.
+pub fn chunk_cells(s: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = vec![String::new()];
+    let mut used = 0usize;
+    for c in s.chars() {
+        let w = char_width(c);
+        if used + w > width && used > 0 {
+            rows.push(String::new());
+            used = 0;
+        }
+        used += w;
+        rows.last_mut().expect("never empty").push(c);
+    }
+    rows
+}
+
+fn cells(chars: &[char]) -> usize {
+    chars.iter().copied().map(char_width).sum()
+}
+
+/// How many of `chars` fit in `room` cells.
+fn fitting_chars(chars: &[char], room: usize) -> usize {
+    let mut used = 0usize;
+    for (at, &c) in chars.iter().enumerate() {
+        used += char_width(c);
+        if used > room {
+            return at;
+        }
+    }
+    chars.len()
+}
+
+/// Where to break `word` so its first part fits in `room` cells: just
+/// after the last `/` that leaves a part that fits. `None` when there is
+/// no such `/`, or it would leave nothing on the row.
 fn slash_break(word: &[char], room: usize) -> Option<usize> {
-    let limit = room.min(word.len());
+    let limit = fitting_chars(word, room);
     (1..=limit).rev().find(|&at| word[at - 1] == '/')
 }
 
 fn pad(s: &str, width: usize) -> String {
-    let len = s.chars().count();
+    let len = text_width(s);
     if len >= width {
         s.to_string()
     } else {
@@ -326,7 +411,7 @@ fn pad(s: &str, width: usize) -> String {
 /// Cuts a styled line to `width` cells, keeping the styling of the spans
 /// that survive.
 pub fn truncate_line(line: Line<'static>, width: usize) -> Line<'static> {
-    let total: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+    let total: usize = line.spans.iter().map(|s| text_width(&s.content)).sum();
     if total <= width {
         return line;
     }
@@ -336,7 +421,7 @@ pub fn truncate_line(line: Line<'static>, width: usize) -> Line<'static> {
         if remaining == 0 {
             break;
         }
-        let len = span.content.chars().count();
+        let len = text_width(&span.content);
         if len <= remaining {
             remaining -= len;
             spans.push(span);

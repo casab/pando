@@ -236,6 +236,18 @@ fn validate_processes(config: &Config) -> Result<()> {
         crate::paths::validate_owned_log_source("process name", name)?;
         let roles = process.roles();
         for role in &roles {
+            // What `{port:<role>}` can spell: anything else is not read as a
+            // placeholder at all, and the app is handed the braces verbatim.
+            let spellable = !role.is_empty()
+                && role
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+            if !spellable {
+                bail!(
+                    "process {name:?} names the role {role:?}, which `{{port:<role>}}` cannot \
+                     spell — use letters, digits, `_`, `-` and `.` only"
+                );
+            }
             if let Some(first) = owner.get(role) {
                 bail!(
                     "processes {first:?} and {name:?} both claim the role {role:?} — a role \

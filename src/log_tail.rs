@@ -81,8 +81,54 @@ fn spans_join_to(line: &Line<'static>, plain: &str) -> bool {
     rest.is_empty()
 }
 
+/// Tabs to spaces at stops of eight columns. An escape sequence takes no
+/// column, so a coloured prefix does not push the stops along.
+fn expand_tabs(raw: &str) -> String {
+    const STOP: usize = 8;
+    let mut out = String::with_capacity(raw.len() + 8);
+    let mut column = 0;
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\t' => {
+                let pad = STOP - column % STOP;
+                out.extend(std::iter::repeat_n(' ', pad));
+                column += pad;
+            }
+            '\x1b' => {
+                out.push(c);
+                // CSI: ESC [ … final byte in @..~.
+                if chars.peek() == Some(&'[') {
+                    out.push(chars.next().unwrap_or('['));
+                    for next in chars.by_ref() {
+                        out.push(next);
+                        if ('@'..='~').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+            }
+            _ => {
+                out.push(c);
+                column += 1;
+            }
+        }
+    }
+    out
+}
+
 fn parse_line(raw: &str, file_offset: u64) -> ParsedLine {
     use ansi_to_tui::IntoText;
+    // A terminal draws a tab as a jump to the next stop; ratatui drops it
+    // as a control character, so `\tat com.Foo` lost its indent. Expanded
+    // here, once, so the text searched and the text drawn stay the same.
+    let expanded;
+    let raw = if raw.contains('\t') {
+        expanded = expand_tabs(raw);
+        expanded.as_str()
+    } else {
+        raw
+    };
     let has_ansi = has_ansi_codes(raw);
     let plain = if has_ansi {
         strip_ansi(raw)
@@ -642,6 +688,36 @@ fn find_pattern(s: &str) -> Option<PatternMatch> {
 /// dev logs grow to hundreds of MB and the first poll runs on the UI thread.
 const MAX_INITIAL_BYTES_PER_LINE: u64 = 512;
 
+/// The most lines a new tail reserves room for before it has read any:
+/// past this the buffer grows as lines arrive, up to its capacity.
+const PREALLOCATE_LINES: usize = 4096;
+
+/// How many bytes at the end of `raw` are the start of a UTF-8 character
+/// whose rest has not been written yet.
+///
+/// A process writing to a file rather than a terminal flushes in blocks,
+/// and a block boundary lands inside a multi-byte character as readily as
+/// anywhere else. Decoding each read on its own turned every such
+/// character into two replacement characters; holding its first bytes
+/// back until the next read decodes it whole.
+fn incomplete_utf8_suffix(raw: &[u8]) -> usize {
+    // A character is at most four bytes, so an unfinished one started in
+    // the last three.
+    let from = raw.len().saturating_sub(3);
+    for start in (from..raw.len()).rev() {
+        // Continuation bytes are 0b10xx_xxxx; anything else starts one.
+        if raw[start] & 0xC0 != 0x80 {
+            return match std::str::from_utf8(&raw[start..]) {
+                // `error_len` is `None` exactly when the input ended
+                // partway through a character that could still be valid.
+                Err(e) if e.error_len().is_none() => raw.len() - start,
+                _ => 0,
+            };
+        }
+    }
+    0
+}
+
 /// Bookkeeping for a multi-line JSON block currently being ingested.
 struct OpenBlock {
     id: u64,
@@ -713,7 +789,9 @@ impl LogTail {
         assert!(capacity > 0, "LogTail capacity must be > 0");
         Self {
             path,
-            buffer: VecDeque::with_capacity(capacity),
+            // A bound, not a size: `logs -n` takes any number, and
+            // reserving `usize::MAX` lines up front panics.
+            buffer: VecDeque::with_capacity(capacity.min(PREALLOCATE_LINES)),
             capacity,
             offset: 0,
             leftover: String::new(),
@@ -816,8 +894,10 @@ impl LogTail {
         file.seek(SeekFrom::Start(self.offset))
             .context("seek log")?;
         let mut raw = Vec::new();
-        let read_bytes = file.read_to_end(&mut raw).context("read log")?;
-        self.offset += read_bytes as u64;
+        file.read_to_end(&mut raw).context("read log")?;
+        // Left in the file, to be read again whole on the next poll.
+        raw.truncate(raw.len() - incomplete_utf8_suffix(&raw));
+        self.offset += raw.len() as u64;
         self.remember_anchor(&raw);
         let mut chunk = String::from_utf8_lossy(&raw).into_owned();
         if skip_partial_first_line {
@@ -929,6 +1009,9 @@ impl LogTail {
         {
             self.evicted_levels.push(evicted.level);
         }
+        // A CRLF log's lines end in `\r` once split on `\n`: carried into
+        // `--json` as text, and onto the screen as a control character.
+        let raw = raw.strip_suffix('\r').unwrap_or(raw);
         let mut parsed = parse_line(raw, file_offset);
         self.track_block(&mut parsed);
         self.buffer.push_back(parsed);
@@ -990,6 +1073,29 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::tempdir;
+
+    // A stack trace's `\tat` lines kept no indent at all: ratatui drops
+    // the tab as a control character.
+    #[test]
+    fn a_tab_is_drawn_as_the_spaces_to_the_next_stop() {
+        let line = parse_line("Exception\n".trim_end(), 0);
+        assert_eq!(line.plain, "Exception");
+        let line = parse_line("\tat com.Foo(Foo.java:1)", 0);
+        assert_eq!(line.plain, "        at com.Foo(Foo.java:1)");
+        let drawn: String = line
+            .styled
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(drawn, line.plain);
+        assert_eq!(expand_tabs("ab\tc"), "ab      c");
+        assert_eq!(
+            expand_tabs("\x1b[31mab\x1b[0m\tc"),
+            "\x1b[31mab\x1b[0m      c",
+            "escape sequences take no column"
+        );
+    }
 
     fn write_all(path: &Path, data: &str) {
         std::fs::write(path, data).unwrap();
@@ -1641,5 +1747,57 @@ mod tests {
         // keyword_colorize tags an error line with a line-level red style;
         // a plain Line::raw would leave fg unset — proving colorize ran at ingest.
         assert_eq!(line.styled.style.fg, Some(red()));
+    }
+
+    // A block-buffered writer splits a multi-byte character across two
+    // flushes as readily as anything else. Each read was decoded alone,
+    // so "café" became "caf\u{FFFD}\u{FFFD}" for good.
+    #[test]
+    fn a_character_split_across_two_writes_is_read_whole() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("log.txt");
+        std::fs::write(&path, b"caf\xC3").unwrap();
+        let mut tail = LogTail::new(path.clone(), 10);
+        tail.poll().unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(b"\xA9 \xE2\x82").unwrap();
+        tail.poll().unwrap();
+        f.write_all(b"\xAC\nnext\n").unwrap();
+        tail.poll().unwrap();
+        assert_eq!(plain_lines(&tail), vec!["café €", "next"]);
+        assert_eq!(tail.lines()[1].file_offset, 10, "offsets are still bytes");
+
+        // Bytes that are simply invalid are not held back for ever.
+        assert_eq!(incomplete_utf8_suffix(b"ok\xFF"), 0);
+        assert_eq!(incomplete_utf8_suffix(b"ok\xF0\x9F\x98"), 3);
+        assert_eq!(incomplete_utf8_suffix("ok😀".as_bytes()), 0);
+        assert_eq!(incomplete_utf8_suffix(b""), 0);
+    }
+
+    #[test]
+    fn crlf_line_endings_leave_no_carriage_return_behind() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("log.txt");
+        write_all(&path, "one\r\ntwo\r\nthree\r");
+        let mut tail = LogTail::new(path.clone(), 10);
+        tail.poll().unwrap();
+        tail.flush_pending();
+        assert_eq!(plain_lines(&tail), vec!["one", "two", "three"]);
+        let offsets: Vec<u64> = tail.lines().iter().map(|l| l.file_offset).collect();
+        assert_eq!(offsets, vec![0, 5, 10], "offsets count the \\r");
+    }
+
+    // `pando logs -n <huge>` builds a tail with that capacity.
+    #[test]
+    fn a_huge_capacity_is_a_bound_and_not_an_allocation() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("log.txt");
+        write_all(&path, "a\nb\n");
+        let mut tail = LogTail::new(path, usize::MAX);
+        tail.poll().unwrap();
+        assert_eq!(plain_lines(&tail), vec!["a", "b"]);
     }
 }

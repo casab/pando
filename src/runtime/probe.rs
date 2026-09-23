@@ -65,7 +65,7 @@ pub struct Check {
 /// Asks the shell what it resolves, and compares it to what the project
 /// asked for.
 ///
-/// The composition mirrors a real spawn — `<prelude> && <command>`, as
+/// The composition mirrors a real spawn — `<prelude> && { <command> }`, as
 /// `actions::with_prelude` writes it — because a prelude that fails in
 /// front of a dev server fails in front of this too, and that is exactly
 /// what has to be reported.

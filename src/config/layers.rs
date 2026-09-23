@@ -2,7 +2,7 @@
 //! what each lower layer is and is not allowed to decide.
 
 use super::schema::Config;
-use super::suggest::KeyError;
+use super::suggest::{KeyError, toml_error_line};
 use super::validate::normalize;
 use super::validate::validate;
 use crate::paths::PandoPaths;
@@ -195,8 +195,9 @@ fn read_home_table(path: &Path) -> Result<Option<Table>> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Ok(None);
     };
-    let table =
-        toml::from_str::<Table>(&text).with_context(|| format!("parse {}", path.display()))?;
+    let table = toml::from_str::<Table>(&text)
+        .map_err(|e| anyhow::anyhow!("{}", toml_error_line(&e.to_string())))
+        .with_context(|| format!("parse {}", path.display()))?;
     Ok(Some(table))
 }
 
@@ -207,7 +208,11 @@ fn read_table(path: &Path, warnings: &mut Vec<String>) -> Option<Table> {
         Err(e) => {
             // A broken file — ours or the project's — must not brick every
             // command; it is reported and skipped.
-            warnings.push(format!("ignoring {}: {e}", path.display()));
+            warnings.push(format!(
+                "ignoring {}: {}",
+                path.display(),
+                toml_error_line(&e.to_string())
+            ));
             None
         }
     }

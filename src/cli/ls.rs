@@ -205,11 +205,28 @@ fn row_width(kept: &[Col], widths: &BTreeMap<Col, usize>) -> usize {
 /// because the window happened to be narrow.
 pub(super) fn terminal_width() -> usize {
     use std::io::IsTerminal;
-    if !std::io::stdout().is_terminal() {
+    width_from(
+        std::io::stdout().is_terminal(),
+        std::env::var("COLUMNS").ok().as_deref(),
+        crossterm::terminal::size().ok().map(|(cols, _)| cols),
+    )
+}
+
+/// The width decision, with what it reads passed in. `COLUMNS`, when it
+/// is a number, is the width a person asked for, as it is for `ls`. A
+/// terminal that reports zero columns — a pty nobody sized, which some
+/// CI runners and `script` hand out — is not a zero-wide screen: fitting
+/// to it shed every column but the name and status and cut the name to
+/// its floor.
+pub(super) fn width_from(terminal: bool, columns: Option<&str>, reported: Option<u16>) -> usize {
+    if !terminal {
         return usize::MAX;
     }
-    crossterm::terminal::size()
-        .map(|(cols, _)| cols as usize)
+    let asked = columns
+        .and_then(|c| c.trim().parse::<usize>().ok())
+        .filter(|c| *c > 0);
+    asked
+        .or(reported.filter(|c| *c > 0).map(usize::from))
         .unwrap_or(80)
 }
 
@@ -233,7 +250,7 @@ impl Cell {
     }
 
     fn width(&self) -> usize {
-        self.text.chars().count()
+        crate::term::text_width(&self.text)
     }
 }
 
@@ -327,7 +344,7 @@ pub fn ls_text_with<W: Write>(paths: &PandoPaths, out: &mut W, view: &LsView) ->
                 .filter_map(|r| r.get(&col).map(Cell::width))
                 .max();
             if let Some(widest) = widest {
-                widths.insert(col, widest.max(col.header().chars().count()));
+                widths.insert(col, widest.max(crate::term::text_width(col.header())));
             }
         }
         widths

@@ -375,11 +375,27 @@ pub fn rm(
     // to be dropped, and a `down -v` that failed after the worktree was
     // gone would leave a database nothing could ever find. Saved first, so
     // a retry of `rm` has the record it needs.
+    //
+    // Forced past a Docker that cannot be asked, it is not asked again: a
+    // wedged daemon would hold `down -v` — under the state lock — for the
+    // whole teardown deadline and then fail the removal `--force` was
+    // passed to get. Said instead, with the command that finishes it.
     if !projects.is_empty() {
         state::save(&paths.state_file(), &store)?;
-        remove_containers(paths, &projects, progress).with_context(|| {
-            format!("{shown} was left in place; its services could not be taken down")
-        })?;
+        match force.then(|| docker_down_for(paths, &projects)).flatten() {
+            Some((_, how)) => {
+                for project in &projects {
+                    progress(&format!(
+                        "Docker {how}, so the services of {project} could not be removed — \
+                         their data volumes survive; once Docker is up, `docker compose -p \
+                         {project} down -v` removes them"
+                    ));
+                }
+            }
+            None => remove_containers(paths, &projects, progress).with_context(|| {
+                format!("{shown} was left in place; its services could not be taken down")
+            })?,
+        }
     }
 
     // Nothing is unlinked first. Verified against git 2.51: an ignored file
@@ -577,13 +593,7 @@ fn resolve_create_source(
         // opened since the last fetch. A failure here just means it does not
         // exist there either, so this falls through to a new branch.
         progress(&format!("looking for origin/{branch}"));
-        let fetched = Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(["fetch", "--quiet", "origin", branch])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+        let fetched = fetch_branch(root, branch, crate::project::GIT_TIMEOUT)?;
         if fetched && ref_exists(root, &format!("refs/remotes/origin/{branch}")) {
             return Ok(CreateSource::Remote);
         }
@@ -610,6 +620,36 @@ fn resolve_create_source(
         ))?,
     };
     Ok(CreateSource::Fork { base })
+}
+
+/// `git fetch origin <branch>`: whether it fetched.
+///
+/// Bounded, and never allowed to ask for anything. A remote that wants a
+/// password used to prompt on the terminal — over the TUI, whose keys
+/// then went nowhere — and one that never answered held `new` for ever.
+/// A fetch that *fails* is still "not on the remote", as before; one that
+/// runs out of time is not an answer, and forking a new branch under a
+/// name the remote may well have is worse than saying so.
+pub(super) fn fetch_branch(
+    root: &Path,
+    branch: &str,
+    timeout: std::time::Duration,
+) -> Result<bool> {
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(root)
+        .args(["fetch", "--quiet", "origin", branch])
+        .env("GIT_TERMINAL_PROMPT", "0");
+    match crate::project::output_within(command, timeout) {
+        Ok(out) => Ok(out.status.success()),
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => bail!(
+            "`git fetch origin {branch}` did not answer in {}s, so pando cannot tell whether \
+             origin already has {branch} — fetch it yourself, then run this again",
+            timeout.as_secs()
+        ),
+        Err(_) => Ok(false),
+    }
 }
 
 /// A bare base name would fork from the possibly stale local branch, so a

@@ -34,6 +34,33 @@ pub fn closest<'a>(typed: &str, options: &[&'a str]) -> Option<&'a str> {
         .map(|(_, option)| option)
 }
 
+/// A TOML parse error as one line: where, then what —
+/// "TOML parse error at line 11, column 15: unclosed array, expected `]`".
+///
+/// toml renders it over five lines, the middle three a copy of the source
+/// line with a caret under the column, and it reached the terminal that
+/// way: a warning spread over a paragraph, with "— carrying on without it"
+/// stranded on a line of its own after a blank one. The line and column
+/// say the same thing as the caret, and they are kept.
+pub fn toml_error_line(text: &str) -> String {
+    let is_gutter = |line: &str| {
+        let digits = line.trim_start_matches(|c: char| c.is_ascii_digit());
+        line.starts_with('|') || (digits.len() < line.len() && digits.trim_start().starts_with('|'))
+    };
+    let mut lines = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !is_gutter(l));
+    let Some(head) = lines.next() else {
+        return String::new();
+    };
+    let rest: Vec<&str> = lines.collect();
+    match rest.is_empty() {
+        true => head.to_string(),
+        false => format!("{head}: {}", rest.join(" ")),
+    }
+}
+
 /// A key or a value a config table does not take, as serde found it, with
 /// where it was and what was probably meant.
 ///

@@ -90,6 +90,12 @@ pub const GIT_ALL_EVERY: u32 = SLOW_TICK_EVERY * 6;
 /// rather than forking git.
 pub const REFRESH_EVERY: u32 = 4;
 
+/// A process that died: its worktree, its name, why, and when.
+type Death = (String, String, String, chrono::DateTime<chrono::Utc>);
+
+/// A question a worker is blocked on, and where its answer goes.
+pub type QueuedQuestion = Box<(actions::Question, Sender<Result<actions::Answer, String>>)>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Normal,
@@ -205,6 +211,9 @@ pub struct App {
     /// A worktree to put the cursor on as soon as a discovery lists it —
     /// the one `n` just created.
     pub select_on_arrival: Option<String>,
+    /// A worker's question that arrived while somebody was typing, held
+    /// until they are done so their keystrokes do not answer it.
+    pub queued_question: Option<QueuedQuestion>,
     pub pending: Option<PendingAction>,
     pub enriching: bool,
     /// A quiet re-read of git state is in flight: the periodic one, which
@@ -223,6 +232,9 @@ pub struct App {
     /// A worktree whose start returned before it was ready, and the URL
     /// the start reported: the refresh that finds it running says so.
     pub awaiting_ready: Option<(String, Option<String>)>,
+    /// The failure last announced for each worktree's process, by when it
+    /// failed, so the same death is never announced twice.
+    pub deaths_told: HashMap<(String, String), chrono::DateTime<chrono::Utc>>,
     pub should_quit: bool,
     pub tick: u32,
     pub list_area: Option<Rect>,
@@ -275,12 +287,14 @@ impl App {
             status: None,
             messages: VecDeque::new(),
             select_on_arrival: None,
+            queued_question: None,
             pending: None,
             enriching: false,
             git_refreshing: false,
             commit_seen: HashMap::new(),
             nothing_to_run: false,
             awaiting_ready: None,
+            deaths_told: HashMap::new(),
             should_quit: false,
             tick: 0,
             list_area: None,
@@ -304,6 +318,11 @@ impl App {
 
     /// Returns whether the frame needs repainting.
     pub fn handle_event(&mut self, ev: AppEvent) -> bool {
+        let repaint = self.dispatch_event(ev);
+        self.open_queued_question() || repaint
+    }
+
+    fn dispatch_event(&mut self, ev: AppEvent) -> bool {
         match ev {
             AppEvent::Input(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                 self.handle_key(key);
@@ -390,14 +409,7 @@ impl App {
             AppEvent::Refreshed(result) => {
                 self.refreshing = false;
                 match *result {
-                    Ok(state) => {
-                        let changed = state != self.state;
-                        let before = std::mem::replace(&mut self.state, state);
-                        let died = self.deaths_since(&before);
-                        self.announce_ready(&died);
-                        self.announce_deaths(died);
-                        changed
-                    }
+                    Ok(state) => self.adopt_state(state),
                     Err(e) => {
                         self.set_error(format!("refresh failed: {e}"));
                         true
@@ -429,27 +441,75 @@ impl App {
                 false
             }
             AppEvent::AskQuestion(boxed) => {
-                let (question, reply) = *boxed;
-                let selected = question.preselect.unwrap_or(0);
-                // The rules' own answer, ticked, so enter accepts it.
-                self.question_checked = question.checked.clone();
-                // No candidates to choose between means the answer can only
-                // be typed, so the input line opens straight away. Never
-                // for a set question, which has nothing to type, nor for
-                // one that may be answered "none": the input line would
-                // take the `n` that says so.
-                let custom =
-                    (question.options.is_empty() && !question.multi && !question.allow_none)
-                        .then(String::new);
-                self.modal = Some(Modal::Question {
-                    question,
-                    selected,
-                    custom,
-                    reply,
-                });
+                // Somebody typing — a branch name, a filter, a search —
+                // would otherwise have their next keystrokes answer it:
+                // `n` says "none", enter takes the highlighted option.
+                // It waits until they are done; the status line says a
+                // question is waiting meanwhile.
+                if self.busy_typing() {
+                    self.queued_question = Some(boxed);
+                    return true;
+                }
+                self.open_question(*boxed);
                 true
             }
         }
+    }
+
+    /// Whether the keyboard belongs to something being typed or confirmed,
+    /// which a question arriving now would take it from.
+    fn busy_typing(&self) -> bool {
+        let modal = matches!(
+            self.modal,
+            Some(
+                Modal::Create { .. }
+                    | Modal::Remove { .. }
+                    | Modal::Unshare { .. }
+                    | Modal::StopAll { .. }
+                    | Modal::Question { .. }
+            )
+        );
+        let filtering = self.mode == Mode::Filter && matches!(self.view, View::List);
+        let searching = self
+            .log_view()
+            .is_some_and(|view| view.search_mode == SearchMode::Typing);
+        modal || filtering || searching
+    }
+
+    /// A question that arrived while somebody was typing, opened once they
+    /// are not.
+    fn open_queued_question(&mut self) -> bool {
+        if self.queued_question.is_none() || self.busy_typing() {
+            return false;
+        }
+        match self.queued_question.take() {
+            Some(boxed) => {
+                self.open_question(*boxed);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn open_question(
+        &mut self,
+        (question, reply): (actions::Question, Sender<Result<actions::Answer, String>>),
+    ) {
+        let selected = question.preselect.unwrap_or(0);
+        // The rules' own answer, ticked, so enter accepts it.
+        self.question_checked = question.checked.clone();
+        // No candidates to choose between means the answer can only be
+        // typed, so the input line opens straight away. Never for a set
+        // question, which has nothing to type, nor for one that may be
+        // answered "none": the input line would take the `n` that says so.
+        let custom = (question.options.is_empty() && !question.multi && !question.allow_none)
+            .then(String::new);
+        self.modal = Some(Modal::Question {
+            question,
+            selected,
+            custom,
+            reply,
+        });
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
@@ -747,14 +807,18 @@ impl App {
 
     fn refilter(&mut self) {
         let keep = self.selected_worktree().map(|w| w.name.clone());
-        self.refilter_keeping(keep);
+        self.refilter_keeping(keep, 0);
     }
 
     /// `keep` is the worktree the cursor was on, passed in rather than read
     /// here: `apply_snapshot` has already replaced the list by the time it
     /// refilters, and resolving the old row against the new list would pick
     /// whichever worktree now happens to sit at that index.
-    fn refilter_keeping(&mut self, keep: Option<String>) {
+    ///
+    /// `fallback` is the row the cursor goes to when `keep` is gone: the
+    /// first match while a filter is typed, and for a worktree that went
+    /// away, the row it was on — its neighbour, not the top of the list.
+    fn refilter_keeping(&mut self, keep: Option<String>, fallback: usize) {
         let needle = self.filter.to_lowercase();
         let keep_name = keep;
         self.filtered_indices = self
@@ -785,7 +849,7 @@ impl App {
                 self.list_state.select(Some(r));
                 self.drop_stale_flash();
             }
-            None => self.select_index(0),
+            None => self.select_index(fallback),
         }
     }
 
@@ -904,7 +968,9 @@ impl App {
     pub fn commit_age(&self, wt: &Worktree) -> Option<String> {
         let text = wt.head_age.as_deref()?;
         let secs = match self.commit_seen.get(&wt.name) {
-            Some((seen, secs, at)) if seen == text => *secs + at.elapsed().as_secs() as i64,
+            Some((seen, secs, at)) if seen == text => {
+                secs.saturating_add(at.elapsed().as_secs() as i64)
+            }
             _ => match parse_git_relative(text) {
                 Some(secs) => secs,
                 None => return Some(text.to_string()),
@@ -923,13 +989,32 @@ impl App {
         )
     }
 
+    /// Takes a fresh read of process state — from the one-second refresh
+    /// or from a discovery, which runs the full refresh itself — and says
+    /// what it changed. Both paths, because either can be the one that
+    /// first sees a process dead: a death only the discovery saw was
+    /// never announced, and on one tick in five that is the discovery.
+    /// Returns whether anything changed.
+    pub(super) fn adopt_state(&mut self, state: State) -> bool {
+        let changed = state != self.state;
+        let before = std::mem::replace(&mut self.state, state);
+        let died = self.deaths_since(&before);
+        self.announce_ready(&died);
+        self.announce_deaths(died);
+        changed
+    }
+
     /// Every process that was starting or running before this refresh and
     /// has failed since: the worktree, the process, and why.
-    fn deaths_since(&self, before: &State) -> Vec<(String, String, String)> {
+    ///
+    /// A failure already announced is not announced again: a discovery
+    /// that read state before the last refresh can arrive after it, and
+    /// the older read it brings shows the process still up.
+    fn deaths_since(&self, before: &State) -> Vec<Death> {
         let mut died = Vec::new();
         for (name, record) in &self.state.worktrees {
             for (process, now) in &record.processes {
-                let state::Phase::Failed { reason, .. } = &now.phase else {
+                let state::Phase::Failed { reason, at } = &now.phase else {
                     continue;
                 };
                 let was_up = before
@@ -937,8 +1022,12 @@ impl App {
                     .get(name)
                     .and_then(|r| r.processes.get(process))
                     .is_some_and(|p| !matches!(p.phase, state::Phase::Failed { .. }));
-                if was_up {
-                    died.push((name.clone(), process.clone(), reason.clone()));
+                let told = self
+                    .deaths_told
+                    .get(&(name.clone(), process.clone()))
+                    .is_some_and(|told| told == at);
+                if was_up && !told {
+                    died.push((name.clone(), process.clone(), reason.clone(), *at));
                 }
             }
         }
@@ -948,8 +1037,9 @@ impl App {
     /// Says so for each process that died, whenever it did: after a `p`, or
     /// an hour into a run. Otherwise the last word on screen is the
     /// `ready` that preceded it.
-    fn announce_deaths(&mut self, died: Vec<(String, String, String)>) {
-        for (name, process, reason) in died {
+    fn announce_deaths(&mut self, died: Vec<Death>) {
+        for (name, process, reason, at) in died {
+            self.deaths_told.insert((name.clone(), process.clone()), at);
             let label = self.label_of(&name);
             let reason = reason.trim();
             let message = if reason.is_empty() {
@@ -964,7 +1054,7 @@ impl App {
     /// A start that returned before its worktree was ready says so once
     /// the refresh finds it running — or stops waiting when it failed or
     /// went away. A failure that `died` already names is left to it.
-    fn announce_ready(&mut self, died: &[(String, String, String)]) {
+    fn announce_ready(&mut self, died: &[Death]) {
         let Some((name, url)) = self.awaiting_ready.clone() else {
             return;
         };
@@ -1031,12 +1121,14 @@ impl App {
             status: None,
             messages: VecDeque::new(),
             select_on_arrival: None,
+            queued_question: None,
             pending: None,
             enriching: false,
             git_refreshing: false,
             commit_seen: HashMap::new(),
             nothing_to_run: false,
             awaiting_ready: None,
+            deaths_told: HashMap::new(),
             should_quit: false,
             tick: 0,
             list_area: None,

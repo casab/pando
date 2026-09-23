@@ -1748,6 +1748,46 @@ fn stop_all_keeps_a_record_whose_group_it_could_not_signal() {
     );
 }
 
+// A worktree whose processes are all gone can still be shared: the tunnel
+// outlives them. `stop` with no name is "nothing of pando's left running",
+// and it chose the worktrees to stop by their processes and services alone
+// — so a public URL onto nothing stayed up through it.
+#[test]
+fn stop_all_takes_down_a_share_whose_processes_are_all_gone() {
+    let fx = fixture();
+    let name = worktree_named(&fx, "feat/shared");
+    let tunnel = crate::testutil::spawn_guarded(
+        "exec sleep 300",
+        &std::env::temp_dir(),
+        &fx.paths.log_file(&name, "tunnel"),
+    );
+    let mut store = fx.state();
+    let record = store.worktrees.get_mut(&name).expect("new wrote a record");
+    assert!(record.processes.is_empty() && record.services.is_empty());
+    record.share = Some(state::ShareRecord {
+        tunnel_pid: tunnel.pid,
+        tunnel_pgid: tunnel.pgid,
+        public_url: "https://x.trycloudflare.com".into(),
+        local_port: 17_000,
+        started_at: chrono::Utc::now(),
+        log_path: fx.paths.log_file(&name, "tunnel"),
+        proxy_pid: None,
+        proxy_pgid: None,
+        proxy_port: None,
+    });
+    state::save(&fx.paths.state_file(), &store).unwrap();
+
+    let signalled = std::cell::RefCell::new(Vec::<i32>::new());
+    let stopped = stop_all_with(&fx.paths, |pgid| {
+        signalled.borrow_mut().push(pgid);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(stopped, vec![name.clone()]);
+    assert!(signalled.borrow().contains(&tunnel.pgid), "{signalled:?}");
+    assert!(fx.state().worktrees[&name].share.is_none());
+}
+
 // Phase 2c review, finding 2. A `Failed` record survives `reconcile`
 // until its own worktree is acted on, and the sweep used to re-signal
 // its pgid on every mutation anywhere in the project — which, once
@@ -5111,7 +5151,37 @@ fn the_prelude_is_prefixed_to_the_command() {
         "a blank prelude adds nothing"
     );
     config.runtime.prelude = Some("nvm use 22".to_string());
-    assert_eq!(with_prelude(&config, "pnpm dev"), "nvm use 22 && pnpm dev");
+    assert_eq!(
+        with_prelude(&config, "pnpm dev"),
+        "nvm use 22 && {\npnpm dev\n}"
+    );
+}
+
+// `prelude && a; b` ran `b` when the prelude failed: the `&&` bound only
+// the first command of the line.
+#[test]
+fn a_failed_prelude_runs_no_part_of_the_command() {
+    let mut config = Config::default();
+    config.runtime.prelude = Some("false".to_string());
+    let out = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(with_prelude(
+            &config,
+            "echo one; echo two # trailing comment",
+        ))
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    config.runtime.prelude = Some("true".to_string());
+    let out = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(with_prelude(
+            &config,
+            "echo one; exec echo two # trailing comment",
+        ))
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "one\ntwo\n");
 }
 
 /// A repo with one commit, a gitignore listing `.env`, and an untracked
@@ -7041,6 +7111,16 @@ fn a_hook_that_does_not_go_through_uv_run_keeps_the_runtime_question() {
             "{cmd} / {fallback:?}: {err:#}"
         );
     }
+
+    // …but not one that is switched off. `on = "never"` is the schema
+    // question's recorded "no", and a command that never runs needs no
+    // interpreter at all — asking for a prelude line over it is a question
+    // about nothing.
+    let mut declined = hook("python manage.py migrate", None);
+    declined.on = Some(crate::config::HookScope::Never);
+    config.hooks = vec![declined];
+    let resolved = resolve_runtime_slot(&fx, &config, &refuse, &shell, home.path()).unwrap();
+    assert_eq!(resolved.runtime.prelude, None, "a hook that never runs");
 }
 
 fn asks_nothing_answerable(q: &Question) -> Result<Answer> {
@@ -7277,4 +7357,36 @@ fn a_plain_start_takes_down_the_services_an_interrupted_switch_left_running() {
         "the orphaned server is still running"
     );
     assert!(fx.state().worktrees[&name].services.is_empty());
+}
+
+// `new` of a branch it cannot find locally asks origin for it. That fetch
+// had no deadline: a remote that accepts the connection and never answers
+// held `new` — and the TUI worker running it — for ever.
+#[test]
+fn a_fetch_from_an_origin_that_never_answers_is_bounded_and_says_so() {
+    let fx = fixture();
+    // Accepts, in the kernel's backlog, and never says a word: what a
+    // wedged server looks like to the client.
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = silent.local_addr().unwrap().port();
+    git(
+        &fx.root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &format!("git://127.0.0.1:{port}/acme.git"),
+        ],
+    );
+    let began = std::time::Instant::now();
+    let err = super::worktree::fetch_branch(&fx.root, "feat/x", Duration::from_secs(2))
+        .expect_err("a fetch that never answered is not an answer");
+    assert!(
+        began.elapsed() < Duration::from_secs(15),
+        "{:?}",
+        began.elapsed()
+    );
+    let err = format!("{err:#}");
+    assert!(err.contains("did not answer"), "{err}");
+    drop(silent);
 }

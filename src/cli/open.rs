@@ -57,19 +57,64 @@ pub(super) fn url_to_open(
 /// Hands `url` to the browser: `$BROWSER` when it is set, the desktop's
 /// own opener otherwise — `open` on macOS, `xdg-open` elsewhere.
 pub(super) fn launch(url: &str) -> Result<()> {
-    let opener = match std::env::var("BROWSER") {
-        Ok(browser) if !browser.trim().is_empty() => browser,
-        _ if cfg!(target_os = "macos") => "open".to_string(),
-        _ => "xdg-open".to_string(),
-    };
-    let status = std::process::Command::new(&opener)
-        .arg(url)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .status()
-        .with_context(|| format!("could not run {opener:?} to open {url} — open it by hand"))?;
-    if !status.success() {
-        bail!("{opener} could not open {url} ({status}) — open it by hand");
+    let browser = std::env::var("BROWSER").ok();
+    let mut failure = String::new();
+    for command in openers(browser.as_deref(), url) {
+        let Some((program, args)) = command.split_first() else {
+            continue;
+        };
+        let ran = std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .status();
+        failure = match ran {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => format!("{program} could not open {url} ({status}) — open it by hand"),
+            Err(e) => format!("could not run {program:?} to open {url} — open it by hand: {e}"),
+        };
     }
-    Ok(())
+    bail!("{failure}")
+}
+
+/// The commands `launch` tries, in order, to open `url`.
+///
+/// `$BROWSER` is read the way other tools read it: a `:`-separated list
+/// of browsers, tried until one works, each a command with arguments —
+/// `firefox --new-window` — where `%s` stands for the URL, which goes
+/// last when there is no `%s`. It used to be run as one program name, so
+/// any argument made it "No such file or directory". An entry that is a
+/// file as written is one program, even with a space in its path.
+pub(super) fn openers(browser: Option<&str>, url: &str) -> Vec<Vec<String>> {
+    let entries: Vec<&str> = browser
+        .unwrap_or_default()
+        .split(':')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    if entries.is_empty() {
+        let opener = match cfg!(target_os = "macos") {
+            true => "open",
+            false => "xdg-open",
+        };
+        return vec![vec![opener.to_string(), url.to_string()]];
+    }
+    entries
+        .into_iter()
+        .map(|entry| {
+            let mut words: Vec<String> = match std::path::Path::new(entry).is_file() {
+                true => vec![entry.to_string()],
+                false => entry.split_whitespace().map(str::to_string).collect(),
+            };
+            match words.iter().any(|w| w.contains("%s")) {
+                true => {
+                    for word in &mut words {
+                        *word = word.replace("%s", url);
+                    }
+                }
+                false => words.push(url.to_string()),
+            }
+            words
+        })
+        .collect()
 }

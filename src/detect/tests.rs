@@ -772,6 +772,57 @@ fn a_workspace_proposes_one_process_per_app() {
     }
 }
 
+/// Adds an app with a Node dev script to the `workspace` fixture.
+fn add_app(dir: &Path, name: &str) {
+    let app = dir.join("apps").join(name);
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(
+        app.join("package.json"),
+        r#"{ "scripts": { "dev": "node --watch src/index.js" } }"#,
+    )
+    .unwrap();
+}
+
+// An env name is letters, digits and underscores, so `apps/admin.v2`
+// declares its port as `ADMIN_V2_PORT`. Only the dash was translated, so
+// the key the env example has for it was never found, and the app got no
+// role at all.
+#[test]
+fn an_app_with_a_dot_in_its_name_finds_its_port_variable() {
+    let dir = tempdir().unwrap();
+    workspace(dir.path());
+    add_app(dir.path(), "admin.v2");
+    std::fs::write(
+        dir.path().join(".env.example"),
+        "WEB_PORT=5173\nAPI_PORT=4000\nADMIN_V2_PORT=4100\n",
+    )
+    .unwrap();
+    let processes = proposed_processes(dir.path()).candidates[0]
+        .processes
+        .clone()
+        .unwrap();
+    let admin = &processes["admin.v2"];
+    assert_eq!(admin.roles(), vec!["admin.v2"]);
+    assert_eq!(admin.env["ADMIN_V2_PORT"], "{port:admin.v2}");
+}
+
+// A per-app answer is written and then loaded back. An app whose name a
+// placeholder cannot spell, one named after a log pando keeps for itself,
+// or two whose port variables collide would fail there — so the per-app
+// form is not offered for them, as for two apps of one name.
+#[test]
+fn apps_whose_names_cannot_be_roles_get_no_per_app_form() {
+    for names in [&["my app"][..], &["proxy"], &["web-app", "web_app"]] {
+        let dir = tempdir().unwrap();
+        workspace(dir.path());
+        for name in names {
+            add_app(dir.path(), name);
+        }
+        let signals = signals(dir.path());
+        assert!(workspace_apps(dir.path(), &signals).is_empty(), "{names:?}");
+    }
+}
+
 #[test]
 fn the_root_script_is_offered_beside_the_per_app_form() {
     let dir = tempdir().unwrap();

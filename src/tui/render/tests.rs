@@ -2564,3 +2564,151 @@ fn a_failed_worktrees_url_is_not_drawn_as_a_live_link() {
             .contains(ratatui::style::Modifier::UNDERLINED)
     );
 }
+
+// Every budget is in terminal cells. Counted in characters, a CJK name
+// is given twice the room it has: it runs over the column beside it, and
+// whatever passes the pane's edge is never painted.
+#[test]
+fn the_text_helpers_measure_terminal_cells_not_characters() {
+    assert_eq!(text_width("日本語"), 6);
+    assert_eq!(text_width("e\u{0301}"), 1);
+    let cut = truncate("日本語のブランチ", 7);
+    assert_eq!(cut, "日本語…");
+    // A glyph wider than the room is not half-painted.
+    assert_eq!(truncate("日本", 2), "…");
+    let middle = truncate_middle("日本語/のブランチ/名前", 11);
+    assert!(text_width(&middle) <= 11, "{middle}");
+    assert!(
+        middle.starts_with('日') && middle.ends_with('前'),
+        "{middle}"
+    );
+    assert_eq!(text_width(&pad("日本", 6)), 6);
+    for row in wrap_text("日本語のエラー 日本語のエラーが起きました", 10) {
+        assert!(text_width(&row) <= 10, "{row:?}");
+    }
+    // A glyph wider than the whole row still makes progress.
+    assert_eq!(wrap_text("日本", 1), vec!["日", "本"]);
+    let line = truncate_line(Line::from(vec![Span::raw("ab"), Span::raw("日本語")]), 5);
+    assert!(line.width() <= 5, "{line:?}");
+    for row in chunk_cells("日本語のブランチ", 5) {
+        assert!(text_width(&row) <= 5, "{row:?}");
+    }
+    assert_eq!(chunk_cells("", 5), vec![String::new()]);
+    let distinct = truncate_distinct("日本語/とても長いブランチの名前-1", 12, 20);
+    assert!(text_width(&distinct) <= 12, "{distinct}");
+}
+
+/// The cell column where `needle` starts on row `y`, reading the buffer
+/// cell by cell so a wide glyph counts as the two cells it takes.
+fn column_of(buf: &Buffer, y: u16, needle: &str) -> Option<u16> {
+    let width = buf.area().width;
+    (0..width).find(|&x| {
+        needle.chars().enumerate().all(|(i, c)| {
+            buf.cell((x + i as u16, y))
+                .is_some_and(|cell| cell.symbol() == c.to_string())
+        })
+    })
+}
+
+#[test]
+fn a_wide_branch_name_keeps_the_list_columns_straight() {
+    let mut app = test_app(&["feat+one", "日本語のブランチ名前がとても長い+x"]);
+    with_process(&mut app, "feat+one", running_phase());
+    with_process(
+        &mut app,
+        "日本語のブランチ名前がとても長い+x",
+        running_phase(),
+    );
+    for width in [60u16, 100] {
+        let buf = draw(&mut app, width, 14);
+        // The list's two rows, under the header and the border.
+        let columns: Vec<u16> = (2..4)
+            .filter_map(|y| column_of(&buf, y, "running"))
+            .collect();
+        assert_eq!(columns.len(), 2, "{}", text_of(&buf));
+        assert_eq!(columns[0], columns[1], "{}", text_of(&buf));
+    }
+}
+
+// Wide names everywhere a name is painted — the list, the detail pane,
+// the header's error, every modal — at every size, including widths
+// narrower than one glyph.
+#[test]
+fn wide_names_paint_at_any_terminal_size() {
+    let names = [
+        "日本語のブランチ名前がとても長い+x",
+        "feat+🎉🎉🎉-party",
+        "e\u{0301}e\u{0301}+z",
+    ];
+    let (reply, _rx) = std::sync::mpsc::channel();
+    let modals = [
+        None,
+        Some(Modal::Help),
+        Some(Modal::Messages),
+        Some(Modal::Create {
+            input: "日本語".into(),
+            branches: BranchLoadState::Ready(vec![crate::worktree::BranchEntry {
+                name: "ブランチ".into(),
+                source: crate::worktree::BranchSource::Local,
+            }]),
+            selected: 1,
+            base: Some("起動".into()),
+        }),
+        Some(Modal::Remove {
+            name: names[0].into(),
+            created_by_pando: false,
+        }),
+        Some(Modal::StopAll {
+            names: names.iter().map(|n| n.to_string()).collect(),
+        }),
+        Some(Modal::Question {
+            question: crate::actions::Question {
+                slot: crate::detect::Slot::DevCmd,
+                prompt: "どのコマンドで開発サーバーを起動しますか？".into(),
+                options: vec![("pnpm 開発".into(), "package.json の scripts".into())],
+                preselect: Some(0),
+                allow_custom: true,
+                allow_none: true,
+                multi: false,
+                checked: Vec::new(),
+                details: vec!["日本語の説明".repeat(5)],
+                answer_file: None,
+                snippet: String::new(),
+            },
+            selected: 0,
+            custom: None,
+            reply,
+        }),
+    ];
+    for modal in modals {
+        let mut app = test_app(&names);
+        app.main = Some(wt("日本語"));
+        with_process(&mut app, names[0], running_phase());
+        with_second_process(&mut app, names[0], "起動", running_phase());
+        app.set_error(format!("{} 失敗しました", names[0]).repeat(4));
+        app.modal = modal;
+        for width in [1u16, 2, 3, 4, 5, 7, 10, 15, 21, 33, 41, 60, 71, 72, 90, 300] {
+            for height in [1u16, 2, 3, 6, 14, 30] {
+                draw(&mut app, width, height);
+            }
+        }
+    }
+}
+
+#[test]
+fn a_wide_log_line_wraps_without_losing_what_passes_the_edge() {
+    let (_dir, mut app) = app_with_logs(&["feat+one"]);
+    // Twenty distinct ideographs, forty cells: at a width of twenty-odd
+    // columns every one of them has to land on some row.
+    let line = "一二三四五六七八九十百千万億兆京垓秭穣溝".to_string();
+    write_log(&app, "feat+one", "dev", std::slice::from_ref(&line));
+    app.open_log_viewer();
+    let buf = draw(&mut app, 24, 12);
+    let painted: String = (0..buf.area().height)
+        .flat_map(|y| (0..buf.area().width).map(move |x| (x, y)))
+        .filter_map(|at| buf.cell(at).map(|cell| cell.symbol().to_string()))
+        .collect();
+    for c in line.chars() {
+        assert!(painted.contains(c), "{c} was cut off:\n{}", text_of(&buf));
+    }
+}

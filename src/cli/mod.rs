@@ -512,7 +512,7 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             Ok(())
         }
         Command::Path { name } => {
-            let name = names::resolve(paths, &name)?;
+            let name = names::resolve_or_main(paths, &name)?;
             writeln!(out, "{}", actions::path(paths, &name)?.display())?;
             Ok(())
         }

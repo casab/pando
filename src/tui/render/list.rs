@@ -26,7 +26,7 @@ use crate::theme::{
 use crate::tui::app::{App, Mode};
 use crate::worktree::{PrInfo, PrState, Worktree};
 
-use super::{distinct_offsets, pad, truncate, truncate_distinct, truncate_line};
+use super::{distinct_offsets, pad, text_width, truncate, truncate_distinct, truncate_line};
 
 /// `"● "` — what the worktree is doing. Never shed: it is the question
 /// this list exists to answer, and the one column that still answers it
@@ -343,7 +343,7 @@ pub(super) fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
             let widest = rows
                 .iter()
                 .filter_map(|row| row.cell(col))
-                .map(|(_, text, _)| text.chars().count())
+                .map(|(_, text, _)| text_width(text))
                 .max()
                 .unwrap_or(0);
             // Every row has a status, so the floor only ever widens it.
@@ -362,7 +362,7 @@ pub(super) fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
     // between the branch and whether it runs.
     let widest_label = rows
         .iter()
-        .map(|row| row.label.chars().count())
+        .map(|row| text_width(&row.label))
         .max()
         .unwrap_or(0);
     let label_room = |shown: &[Col]| {

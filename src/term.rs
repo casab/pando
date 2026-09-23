@@ -138,27 +138,56 @@ pub fn visible_width(text: &str) -> usize {
             }
             continue;
         }
-        width += 1;
+        width += char_width(c);
     }
     width
+}
+
+/// How many terminal columns `c` takes: two for a wide CJK character or
+/// most emoji, none for a combining mark or a control character.
+fn char_width(c: char) -> usize {
+    unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
+}
+
+/// How many columns uncoloured `text` takes.
+pub fn text_width(text: &str) -> usize {
+    text.chars().map(char_width).sum()
 }
 
 /// `text` cut to at most `max` columns by taking out its middle, so both
 /// the start and the end survive: two long branch names that share a
 /// prefix still read as two different names.
 pub fn ellipsize_middle(text: &str, max: usize) -> String {
-    let count = text.chars().count();
-    if count <= max {
+    if text_width(text) <= max {
         return text.to_string();
     }
     if max <= 1 {
         return "…".chars().take(max).collect();
     }
+    // Budgets in columns, so a wide character is never cut in half and
+    // never pushes the result past `max`.
     let keep = max - 1;
-    let tail = keep / 2;
-    let head = keep - tail;
-    let start: String = text.chars().take(head).collect();
-    let end: String = text.chars().skip(count - tail).collect();
+    let tail_room = keep / 2;
+    let head_room = keep - tail_room;
+    let mut start = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        if used + char_width(c) > head_room {
+            break;
+        }
+        used += char_width(c);
+        start.push(c);
+    }
+    let mut end: Vec<char> = Vec::new();
+    let mut used = 0;
+    for c in text.chars().rev() {
+        if used + char_width(c) > tail_room {
+            break;
+        }
+        used += char_width(c);
+        end.push(c);
+    }
+    let end: String = end.into_iter().rev().collect();
     format!("{start}…{end}")
 }
 
@@ -173,8 +202,14 @@ pub fn ellipsize_middle(text: &str, max: usize) -> String {
 /// otherwise it is [`ellipsize_middle`].
 pub fn ellipsize_distinct(text: &str, others: &[String], max: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= max {
+    if text_width(text) <= max {
         return text.to_string();
+    }
+    // The window below counts characters, which is columns for the
+    // branch names this is written for; a name with wide characters in it
+    // is cut by columns instead, so it can never overrun its cell.
+    if chars.iter().any(|&c| char_width(c) != 1) {
+        return ellipsize_middle(text, max);
     }
     let shared = others
         .iter()
@@ -207,6 +242,24 @@ pub fn ellipsize_distinct(text: &str, others: &[String], max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Cut by columns: a wide character is never split and never pushes
+    // the result past the budget.
+    #[test]
+    fn wide_characters_are_cut_by_the_columns_they_take() {
+        assert_eq!(text_width("日本語"), 6);
+        for max in 1..12 {
+            let cut = ellipsize_middle("feat/日本語のブランチ名", max);
+            assert!(text_width(&cut) <= max, "{cut:?} at {max}");
+            let names = vec![
+                "feat/日本語のブランチ名".to_string(),
+                "feat/日本語のもう一つ".to_string(),
+            ];
+            let cut = ellipsize_distinct(&names[0], &names, max);
+            assert!(text_width(&cut) <= max, "{cut:?} at {max}");
+        }
+        assert_eq!(visible_width("\x1b[31m日本\x1b[0m"), 4);
+    }
 
     #[test]
     fn plain_text_carries_no_escapes() {

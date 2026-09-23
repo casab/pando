@@ -29,6 +29,25 @@ const LIST_ALL_UP_TO: usize = 6;
 /// and a name that means one worktree today and another tomorrow is not
 /// one to delete by.
 pub(super) fn resolve(paths: &PandoPaths, typed: &str) -> Result<String> {
+    resolve_in(paths, typed, false)
+}
+
+/// [`resolve`], where the main checkout is a place too: `path` is the one
+/// verb for which it is a fine answer — by its directory's name or by the
+/// branch it has checked out.
+pub(super) fn resolve_or_main(paths: &PandoPaths, typed: &str) -> Result<String> {
+    resolve_in(paths, typed, true)
+}
+
+fn resolve_in(paths: &PandoPaths, typed: &str, main_ok: bool) -> Result<String> {
+    // Every name starts with "", so the suggestions for it were every
+    // worktree there is, offered as if they were near misses.
+    if typed.trim().is_empty() {
+        return Err(UsageError(
+            "a worktree name cannot be empty — `pando ls` lists them".to_string(),
+        )
+        .into());
+    }
     let discovery = worktree::discover_all(&paths.project)?;
     // One worktree's directory and another's branch can be the same
     // string — a branch literally called `a+b` beside the directory `a+b`
@@ -44,8 +63,22 @@ pub(super) fn resolve(paths: &PandoPaths, typed: &str) -> Result<String> {
     {
         return Err(ambiguous(typed, dir, branch).into());
     }
-    if discovery.main.name == typed || by_dir.is_some() {
+    if by_dir.is_some() {
         return Ok(typed.to_string());
+    }
+    // The main checkout used to be passed through like a worktree, and
+    // every verb but `path` then did something odd with it: `status`
+    // printed "no worktree named" and exited 0, `stop` said it "was not
+    // running", `open` suggested a `start` that refuses it.
+    let main = &discovery.main;
+    if main.name == typed || (by_branch_name.is_none() && main.branch.as_deref() == Some(typed)) {
+        if main_ok {
+            return Ok(main.name.clone());
+        }
+        anyhow::bail!(
+            "{typed:?} is the main checkout, not a worktree — pando runs worktrees; \
+             `pando ls` lists them"
+        );
     }
     if let Some(w) = by_branch(&discovery.worktrees, typed) {
         return Ok(w.name.clone());

@@ -181,7 +181,9 @@ impl App {
 
     /// Whether the action in flight is blocked on the question modal.
     pub fn awaiting_answer(&self) -> bool {
-        self.pending.is_some() && matches!(self.modal, Some(Modal::Question { .. }))
+        self.pending.is_some()
+            && (matches!(self.modal, Some(Modal::Question { .. }))
+                || self.queued_question.is_some())
     }
 
     pub fn poll_pending(&mut self) {

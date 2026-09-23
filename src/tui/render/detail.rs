@@ -13,7 +13,7 @@ use crate::theme::{border, cyan, green, magenta, orange, red, text, text_dim, te
 use crate::tui::app::{App, compact_age};
 
 use super::list::{pr_color, run_marker, signal_color, signal_text};
-use super::{home_relative, truncate, truncate_middle};
+use super::{chunk_cells, home_relative, text_width, truncate, truncate_middle};
 
 // Detail rows, by how much they are worth keeping when the pane is short.
 // `KEEP_ALWAYS` rows are the pane's reason to exist and are never shed.
@@ -82,12 +82,10 @@ fn detail_row<'a>(label: &str, value: Vec<Span<'a>>) -> Line<'a> {
 /// value's column.
 fn wrapped_rows<'a>(label: &str, value: &str, style: Style, width: usize) -> Vec<Line<'a>> {
     let room = width.saturating_sub(LABEL_WIDTH).max(1);
-    let chars: Vec<char> = value.chars().collect();
-    chars
-        .chunks(room)
+    chunk_cells(value, room)
+        .into_iter()
         .enumerate()
-        .map(|(i, chunk)| {
-            let piece: String = chunk.iter().collect();
+        .map(|(i, piece)| {
             if i == 0 {
                 detail_row(label, vec![Span::styled(piece, style)])
             } else {
@@ -343,7 +341,7 @@ fn branch_rows<'a>(wt: &crate::worktree::Worktree, width: usize) -> Vec<Line<'a>
     };
     let room = width.saturating_sub(LABEL_WIDTH);
     let drift_style = Style::new().fg(signal_color(wt));
-    if branch.chars().count() + drift.chars().count() <= room {
+    if text_width(branch) + text_width(&drift) <= room {
         return vec![detail_row(
             "branch",
             vec![
@@ -371,7 +369,7 @@ fn commit_row<'a>(app: &App, wt: &crate::worktree::Worktree, width: usize) -> Op
         .map(|age| format!(" · {age}"))
         .unwrap_or_default();
     let subject = wt.head_subject.clone().unwrap_or_default();
-    let room = width.saturating_sub(LABEL_WIDTH + sha.len() + 1 + age.chars().count());
+    let room = width.saturating_sub(LABEL_WIDTH + sha.len() + 1 + text_width(&age));
     Some(detail_row(
         "commit",
         vec![
@@ -400,7 +398,7 @@ fn status_row<'a>(app: &App, name: &str, width: usize) -> Line<'a> {
                     .unwrap_or_default(),
             )
         };
-        let room = width.saturating_sub(LABEL_WIDTH + word.chars().count());
+        let room = width.saturating_sub(LABEL_WIDTH + text_width(&word));
         return detail_row(
             "status",
             vec![
@@ -539,7 +537,7 @@ fn process_rows<'a>(app: &App, name: &str, width: usize) -> Vec<Line<'a>> {
     let shown = app.tail_target().map(|(_, process, _)| process);
     let label_width = processes
         .iter()
-        .map(|(process, _)| process.chars().count())
+        .map(|(process, _)| text_width(process))
         .max()
         .unwrap_or(0);
     processes
@@ -592,7 +590,7 @@ fn service_rows<'a>(app: &App, name: &str, width: usize) -> Vec<Line<'a>> {
     }
     let label_width = services
         .iter()
-        .map(|s| s.name.chars().count())
+        .map(|s| text_width(&s.name))
         .max()
         .unwrap_or(0);
     services
@@ -714,7 +712,7 @@ fn tail_header<'a>(app: &App, name: &str, width: usize) -> Line<'a> {
         Span::styled(
             truncate(
                 &format!("  {count} {unit}{hint}"),
-                width.saturating_sub(label.chars().count()),
+                width.saturating_sub(text_width(&label)),
             ),
             Style::new().fg(text_muted()),
         ),

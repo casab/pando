@@ -596,7 +596,16 @@ fn start_checked(
     }
 
     let _lock = state::lock(&paths.lock_file()).map_err(undo)?;
-    let mut store = state::load(&paths.state_file()).map_err(undo)?;
+    // The undo takes this same lock, and a second `flock` from this process
+    // on a second descriptor waits for the first one: undoing with it held
+    // is a start that never returns. Every undo below lets go first.
+    let mut store = match state::load(&paths.state_file()) {
+        Ok(store) => store,
+        Err(e) => {
+            drop(_lock);
+            return Err(undo(e));
+        }
+    };
     // The record this call left behind, unless something removed the
     // worktree while the services were coming up.
     let record = store
@@ -618,6 +627,40 @@ fn start_checked(
     // brought its own up, or a plain start's that raced it through the
     // unlocked window. Those are replaced, never adopted, or an isolated
     // worktree would be running an application on the shared database.
+    //
+    // And the services this start brought up have to still be the ones on
+    // record. A start on the shared services that ran through the unlocked
+    // window — the TUI and the CLI at once — takes down whatever private
+    // services it finds on a worktree that is not isolated yet, and blanks
+    // their ports. Spawning past that would set the flag on a worktree
+    // with no services at all, its application pointed at a database that
+    // had just been stopped. Nothing is undone: the start that took them
+    // down left a consistent shared worktree — its own ports, its own
+    // processes — and an undo would write this start's older picture over it.
+    if isolate {
+        let lost: Vec<String> = service_roles(config)
+            .into_iter()
+            .filter(|role| {
+                let wanted = assignment.ports.get(role).copied();
+                !record
+                    .services
+                    .iter()
+                    .any(|s| &s.name == role && s.port.is_some() && s.port == wanted)
+            })
+            .collect();
+        if !lost.is_empty() {
+            return Err(anyhow::anyhow!(
+                "another start of this worktree took down or moved {} while this one was \
+                 waiting on {} — so nothing was started here; start it again with the mode you \
+                 want",
+                lost.join(", "),
+                match lost.len() {
+                    1 => "it",
+                    _ => "them",
+                }
+            ));
+        }
+    }
     let running_isolated = record.isolated;
     let mut replace: Vec<(String, i32)> = Vec::new();
     for (process_name, _) in &selection {
@@ -922,11 +965,12 @@ pub fn stop_all_with(
     let mut store = state::load(&paths.state_file())?;
     // Services as well as processes: a worktree whose dev server crashed
     // still has a database up, and `stop` with no name is how you make
-    // sure nothing of pando's is left running.
+    // sure nothing of pando's is left running. A share too: its tunnel
+    // outlives the processes it pointed at.
     let names: Vec<String> = store
         .worktrees
         .iter()
-        .filter(|(_, r)| !r.processes.is_empty() || !r.services.is_empty())
+        .filter(|(_, r)| !r.processes.is_empty() || !r.services.is_empty() || r.share.is_some())
         .map(|(name, _)| name.clone())
         .collect();
     let mut stopped = Vec::new();

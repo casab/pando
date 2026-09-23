@@ -58,13 +58,52 @@ const REMEDIES: &[(&str, &str)] = &[
 ];
 
 /// `message` with every CLI remedy it contains said as a TUI key.
+///
+/// Two things are never rewritten. A command in backticks is one to type
+/// in a shell — `` `git worktree remove --force` `` — and a key in the
+/// middle of it would make it nonsense. And a phrase only matches whole:
+/// `start --shared` is not inside `restart --shared`, nor `--force` inside
+/// `--force-with-lease`.
 pub fn as_tui_remedy(message: &str) -> String {
-    let mut out = message.to_string();
-    for (phrase, key) in REMEDIES {
-        if out.contains(phrase) {
-            out = out.replace(phrase, key);
+    message
+        .split('`')
+        .enumerate()
+        .map(|(i, part)| {
+            if i % 2 == 1 {
+                return part.to_string();
+            }
+            REMEDIES
+                .iter()
+                .fold(part.to_string(), |text, (phrase, key)| {
+                    replace_whole(&text, phrase, key)
+                })
+        })
+        .collect::<Vec<_>>()
+        .join("`")
+}
+
+/// `text` with every occurrence of `phrase` that is not part of a longer
+/// word or flag replaced by `with`.
+fn replace_whole(text: &str, phrase: &str, with: &str) -> String {
+    let joins = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '-' || c == '_');
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(phrase) {
+        let before = if at > 0 {
+            rest[..at].chars().next_back()
+        } else {
+            out.chars().next_back()
+        };
+        let after = rest[at + phrase.len()..].chars().next();
+        out.push_str(&rest[..at]);
+        if joins(before) || joins(after) {
+            out.push_str(phrase);
+        } else {
+            out.push_str(with);
         }
+        rest = &rest[at + phrase.len()..];
     }
+    out.push_str(rest);
     out
 }
 

@@ -481,6 +481,36 @@ fn a_created_worktree_is_selected_when_it_arrives() {
     assert!(app.select_on_arrival.is_none(), "and it is done with");
 }
 
+// A worktree removed while the cursor is on it — by `d`, or from the CLI —
+// leaves the cursor on its neighbour, not back at the top of a long list.
+#[test]
+fn a_selected_worktree_that_goes_away_leaves_the_cursor_on_its_neighbour() {
+    let names = ["feat+a", "feat+b", "feat+c", "feat+d"];
+    let mut app = test_app(&names);
+    press(&mut app, KeyCode::Char('j'));
+    press(&mut app, KeyCode::Char('j'));
+    assert_eq!(app.selected_worktree().unwrap().name, "feat+c");
+    app.tail_index = 1;
+    let snapshot = |listed: &[&str]| Snapshot {
+        main: wt("acme-shop"),
+        worktrees: listed.iter().map(|n| wt(n)).collect(),
+        created_by_pando: BTreeMap::new(),
+        state: State::new(),
+        warning: None,
+        notices: Vec::new(),
+        default_base: None,
+    };
+    app.apply_snapshot(snapshot(&["feat+a", "feat+b", "feat+d"]));
+    assert_eq!(app.selected_worktree().unwrap().name, "feat+d");
+    assert_eq!(app.tail_index, 0, "a different worktree's tail starts over");
+    // The last row going away leaves the cursor on the new last row.
+    app.apply_snapshot(snapshot(&["feat+a", "feat+b"]));
+    assert_eq!(app.selected_worktree().unwrap().name, "feat+b");
+    // And a worktree that stays keeps the cursor wherever it moved to.
+    app.apply_snapshot(snapshot(&["feat+new", "feat+a", "feat+b"]));
+    assert_eq!(app.selected_worktree().unwrap().name, "feat+b");
+}
+
 #[test]
 fn enter_on_an_empty_create_modal_asks_for_a_name() {
     let mut app = test_app(&[]);
@@ -589,6 +619,31 @@ fn y_on_a_dirty_worktree_keeps_the_dialog_and_points_at_f() {
     let (message, is_error) = app.active_status().unwrap();
     assert!(is_error);
     assert!(message.contains("F removes it anyway"), "{message}");
+}
+
+// Removed from the CLI while the dialog was open: its blockers read as
+// "nothing", and `y` sent a worker after a worktree that is not there.
+#[test]
+fn confirming_the_removal_of_a_worktree_already_gone_starts_nothing() {
+    let mut app = test_app(&["feat+a", "feat+b"]);
+    press(&mut app, KeyCode::Char('d'));
+    app.apply_snapshot(Snapshot {
+        main: wt("acme-shop"),
+        worktrees: vec![wt("feat+b")],
+        created_by_pando: BTreeMap::new(),
+        state: State::new(),
+        warning: None,
+        notices: Vec::new(),
+        default_base: None,
+    });
+    press(&mut app, KeyCode::Char('y'));
+    assert!(
+        app.pending.is_none(),
+        "no worker for a worktree that is gone"
+    );
+    assert!(app.modal.is_none());
+    let (message, is_error) = app.active_status().unwrap();
+    assert!(!is_error && message.contains("already gone"), "{message}");
 }
 
 #[test]
@@ -849,6 +904,39 @@ fn the_status_message_expires() {
     assert!(app.active_status().is_none());
     assert!(app.expire_status());
     assert!(app.status.is_none());
+}
+
+// `o` and `O` ignored `$BROWSER`, which `pando open` honours: the same
+// variable, read the same way, or the key and the command open two
+// different browsers.
+#[test]
+fn o_reads_browser_the_way_pando_open_does() {
+    let url = "http://localhost:17000";
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    assert_eq!(browser_commands(None, url), vec![vec![opener, url]]);
+    assert_eq!(browser_commands(Some(" : "), url), vec![vec![opener, url]]);
+    assert_eq!(
+        browser_commands(Some("firefox --new-window"), url),
+        vec![vec!["firefox", "--new-window", url]]
+    );
+    assert_eq!(
+        browser_commands(Some("lynx -dump %s:w3m"), url),
+        vec![vec!["lynx", "-dump", url], vec!["w3m", url]],
+        "a list, tried in order, with %s standing for the URL"
+    );
+    // A file as written is one program, space and all.
+    let dir = tempfile::tempdir().unwrap();
+    let program = dir.path().join("my browser");
+    std::fs::write(&program, "").unwrap();
+    let program = program.display().to_string();
+    assert_eq!(
+        browser_commands(Some(&program), url),
+        vec![vec![program.as_str(), url]]
+    );
 }
 
 #[test]
@@ -2536,6 +2624,37 @@ fn scrolling_tracks_only_the_evictions_the_filter_was_showing() {
     assert_eq!(viewer(&app).visible_len(), 2);
 }
 
+// Collapsed to the matches (`&`), the visible list is the match list: an
+// evicted line that did not match was never on screen, and moving the
+// cursor for it put the reader on a different match than the one they
+// were reading. Nor is a new line that does not match "new below".
+#[test]
+fn a_collapsed_search_tracks_only_the_evictions_that_matched() {
+    let (_dir, mut app) = app_with_logs(&["feat+one"]);
+    let first = ["miss a", "miss b", "hit one", "hit two", "hit three"];
+    write_log(&app, "feat+one", "dev", &first);
+    open_viewer(&mut app, 80, 12);
+    shrink_viewer_tail(&mut app, 5);
+    press(&mut app, KeyCode::Char('/'));
+    for c in "hit".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char('&'));
+    press(&mut app, KeyCode::Char('j'));
+    press(&mut app, KeyCode::Char('j'));
+    assert_eq!(viewer(&app).cursor, 2, "on hit three");
+
+    let mut more = first.to_vec();
+    more.extend(["miss c", "miss d"]);
+    write_log(&app, "feat+one", "dev", &more);
+    app.handle_event(AppEvent::Tick);
+    let view = viewer(&app);
+    assert_eq!(view.visible_len(), 3, "every match is still there");
+    assert_eq!(view.cursor, 2, "still on hit three");
+    assert_eq!(view.new_below, 0, "neither new line is shown");
+}
+
 #[test]
 fn motions_on_a_log_that_evicts_while_it_is_open_stay_in_range() {
     let (_dir, mut app) = app_with_logs(&["feat+one"]);
@@ -3116,6 +3235,7 @@ fn env(tmux: bool, shell: Option<&str>, visual: Option<&str>, editor: Option<&st
         shell: shell.map(str::to_string),
         visual: visual.map(str::to_string),
         editor: editor.map(str::to_string),
+        browser: None,
     }
 }
 
@@ -3442,6 +3562,80 @@ fn a_message_without_a_flag_is_left_alone() {
     assert_eq!(remedies::as_tui_remedy(neutral), neutral);
 }
 
+fn type_key(app: &mut App, code: KeyCode) {
+    app.handle_event(AppEvent::Input(ratatui::crossterm::event::Event::Key(
+        KeyEvent::new(code, KeyModifiers::NONE),
+    )));
+}
+
+// A start's question landing while a branch name is being typed took the
+// keyboard mid-word: the next `n` answered "none", the next enter took the
+// highlighted option, and the create modal and its text were thrown away.
+#[test]
+fn a_question_waits_until_the_create_modal_is_done_with_the_keyboard() {
+    let mut app = test_app(&["feat+one"]);
+    press(&mut app, KeyCode::Char('n'));
+    type_key(&mut app, KeyCode::Char('f'));
+    let rx = open_question(&mut app, a_question());
+    assert!(
+        matches!(app.modal, Some(Modal::Create { .. })),
+        "the modal being typed in stays"
+    );
+    type_key(&mut app, KeyCode::Char('i'));
+    type_key(&mut app, KeyCode::Char('x'));
+    match &app.modal {
+        Some(Modal::Create { input, .. }) => assert_eq!(input, "fix"),
+        other => panic!("expected the create modal, got {other:?}"),
+    }
+    assert!(rx.try_recv().is_err(), "nothing answered it");
+    // Done typing: the question takes its turn.
+    type_key(&mut app, KeyCode::Esc);
+    assert!(matches!(app.modal, Some(Modal::Question { .. })));
+    type_key(&mut app, KeyCode::Enter);
+    assert!(matches!(rx.try_recv(), Ok(Ok(actions::Answer::Choice(0)))));
+}
+
+#[test]
+fn a_question_waits_for_a_filter_being_typed() {
+    let mut app = test_app(&["feat+one"]);
+    type_key(&mut app, KeyCode::Char('/'));
+    let rx = open_question(&mut app, a_question());
+    type_key(&mut app, KeyCode::Char('c'));
+    assert_eq!(app.filter, "c", "the key went to the filter");
+    assert!(app.modal.is_none());
+    type_key(&mut app, KeyCode::Enter);
+    assert!(matches!(app.modal, Some(Modal::Question { .. })));
+    assert!(rx.try_recv().is_err());
+}
+
+// A command in backticks is one to type in a shell, and a key spliced
+// into it is a command that does not exist.
+#[test]
+fn a_quoted_command_keeps_its_flags() {
+    let message = "could not create feat/x — the partial worktree at /t/feat+x could not be \
+                   removed; remove it with `git worktree remove --force` and delete the \
+                   branch if it is new";
+    assert_eq!(remedies::as_tui_remedy(message), message);
+    let doctor = "`start --isolated` cannot run it, though a plain `start` still can";
+    assert_eq!(remedies::as_tui_remedy(doctor), doctor);
+    // Outside the quotes the rewrite still happens.
+    assert_eq!(
+        remedies::as_tui_remedy("run `pando rm x`, or retry with --force"),
+        "run `pando rm x`, or retry with F in the remove dialog"
+    );
+}
+
+// A phrase matches whole, never as the tail of a longer word or flag.
+#[test]
+fn a_phrase_inside_a_longer_word_is_left_alone() {
+    let message = "git push --force-with-lease is not this";
+    assert_eq!(remedies::as_tui_remedy(message), message);
+    // `start --shared` is not inside `restart --shared`: the word stays a
+    // word, and only the flag is said as its key.
+    let said = remedies::as_tui_remedy("restart --shared puts it back");
+    assert_eq!(said, "restart S puts it back");
+}
+
 #[test]
 fn a_bare_flag_is_still_translated() {
     assert_eq!(
@@ -3589,6 +3783,15 @@ fn git_relative_dates_are_read_and_written_compactly() {
         Some(2 * 365 * 86_400 + 4 * 30 * 86_400)
     );
     assert_eq!(parse_git_relative("yesterday"), None);
+    // Git's own words for a commit dated ahead of the clock.
+    assert_eq!(parse_git_relative("in the future"), None);
+    // A number no date can mean — a corrupt cache entry — is no date, not
+    // an overflow panic in the paint.
+    assert_eq!(parse_git_relative("99999999999999999 years ago"), None);
+    assert_eq!(
+        parse_git_relative("9000000000000000000 seconds, 9000000000000000000 seconds ago"),
+        None
+    );
     assert_eq!(compact_age(82), "1m");
     assert_eq!(compact_age(59), "59s");
     assert_eq!(compact_age(3 * 3600 + 59 * 60), "3h");
@@ -3727,6 +3930,53 @@ fn tab_in_the_create_modal_cycles_the_base() {
     assert_eq!(base(&app).as_deref(), Some("origin/release"));
 }
 
+// A repository with no default base is the one where tab matters most —
+// `new` refuses without a base there — and its first choice must be
+// reachable in one press, not only after going all the way round.
+#[test]
+fn with_no_default_base_the_first_tab_picks_the_first_branch() {
+    let mut app = test_app(&["feat+one"]);
+    app.default_base = None;
+    open_create_with(
+        &mut app,
+        &[
+            ("develop", BranchSource::Local),
+            ("release", BranchSource::Local),
+        ],
+    );
+    let base = |app: &App| match &app.modal {
+        Some(Modal::Create { base, .. }) => base.clone(),
+        other => panic!("expected the create modal, got {other:?}"),
+    };
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(base(&app).as_deref(), Some("develop"));
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(base(&app).as_deref(), Some("release"));
+
+    let mut app = test_app(&["feat+one"]);
+    app.default_base = None;
+    open_create_with(
+        &mut app,
+        &[
+            ("develop", BranchSource::Local),
+            ("release", BranchSource::Local),
+        ],
+    );
+    press(&mut app, KeyCode::BackTab);
+    assert_eq!(
+        base(&app).as_deref(),
+        Some("release"),
+        "back from nothing is the last"
+    );
+    // No branches and no default: tab has nothing to walk, and says nothing
+    // wrong by staying put.
+    let mut app = test_app(&["feat+one"]);
+    app.default_base = None;
+    open_create_with(&mut app, &[]);
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(base(&app), None);
+}
+
 #[test]
 fn base_choices_lead_with_the_default_and_name_each_branch_once() {
     let branches = vec![
@@ -3833,6 +4083,125 @@ fn the_all_tab_merges_every_process_with_a_source_prefix() {
     // Search sees the prefix too, so `/web` finds the web server's lines.
     search_for(&mut app, "web │");
     assert_eq!(viewer(&app).search.matches.len(), 2);
+}
+
+// A process started while the `all` tab is open got a tab of its own on
+// the next paint and never appeared in the merge.
+#[test]
+fn a_process_that_starts_while_the_all_tab_is_open_joins_the_merge() {
+    let (_dir, mut app) = two_process_app();
+    write_log(&app, "feat+one", "api", &["api up"]);
+    write_log(&app, "feat+one", "web", &["web up"]);
+    open_viewer(&mut app, 100, 20);
+    press(&mut app, KeyCode::Char('1'));
+    assert_eq!(viewer(&app).source, "all");
+
+    app.config.processes.insert(
+        "worker".to_string(),
+        crate::config::ProcessConfig::default(),
+    );
+    write_log(&app, "feat+one", "worker", &["worker up"]);
+    paint(&mut app, 100, 20);
+    app.handle_event(AppEvent::Tick);
+    let plain: Vec<String> = viewer(&app)
+        .tail
+        .lines()
+        .iter()
+        .map(|p| p.plain.clone())
+        .collect();
+    assert!(
+        plain.iter().any(|line| line.ends_with("│ worker up")),
+        "{plain:?}"
+    );
+    // And what it writes next arrives like anybody else's.
+    append_log(&app, "feat+one", "worker", "job done");
+    app.handle_event(AppEvent::Tick);
+    let last = viewer(&app).tail.lines().back().unwrap().plain.clone();
+    assert_eq!(last, "worker │ job done");
+}
+
+// A restart empties the log in place. The tail keeps what it read of the
+// old run, so the viewer showed the old run's lines above the new ones as
+// if they were one log.
+#[test]
+fn a_log_that_starts_over_shows_only_the_new_run() {
+    let (_dir, mut app) = app_with_logs(&["feat+one"]);
+    write_log(
+        &app,
+        "feat+one",
+        "dev",
+        &["old run 1", "old run 2", "old crash"],
+    );
+    open_viewer(&mut app, 80, 20);
+    press(&mut app, KeyCode::Char('g'));
+    write_log(&app, "feat+one", "dev", &["new run 1"]);
+    app.handle_event(AppEvent::Tick);
+    let plain: Vec<String> = viewer(&app)
+        .tail
+        .lines()
+        .iter()
+        .map(|p| p.plain.clone())
+        .collect();
+    assert_eq!(plain, vec!["new run 1"]);
+    assert!(viewer(&app).follow, "back on the live tail");
+    let (message, _) = app.active_status().expect("it says so");
+    assert!(message.contains("started over"), "{message}");
+    // And lines appended after that are an ordinary poll again.
+    append_log(&app, "feat+one", "dev", "new run 2");
+    app.handle_event(AppEvent::Tick);
+    assert_eq!(viewer(&app).tail.lines().len(), 2);
+}
+
+// The all tab keeps the other processes' lines, so it marks where one
+// process's log started over instead of dropping anything.
+#[test]
+fn the_all_tab_marks_where_a_process_log_started_over() {
+    let (_dir, mut app) = two_process_app();
+    write_log(&app, "feat+one", "api", &["api old"]);
+    write_log(&app, "feat+one", "web", &["web up"]);
+    open_viewer(&mut app, 100, 20);
+    press(&mut app, KeyCode::Char('1'));
+    write_log(&app, "feat+one", "api", &["api new run"]);
+    app.handle_event(AppEvent::Tick);
+    let plain: Vec<String> = viewer(&app)
+        .tail
+        .lines()
+        .iter()
+        .map(|p| p.plain.clone())
+        .collect();
+    assert_eq!(
+        plain,
+        vec![
+            "api │ api old",
+            "web │ web up",
+            &format!("api │ {}", super::merged::RESTART_MARKER),
+            "api │ api new run",
+        ]
+    );
+}
+
+// Block ids are made unique per source; one that depended on how many
+// sources there were collided once the count changed.
+#[test]
+fn merged_block_ids_stay_distinct_when_a_source_joins() {
+    let dir = tempfile::tempdir().unwrap();
+    let write = |name: &str, lines: &[&str]| {
+        let path = dir.path().join(format!("{name}.log"));
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        path
+    };
+    let block = ["{", "  \"a\": 1", "}"];
+    let a = write("a", &block.repeat(3));
+    let mut merged = MergedTail::new(vec![("a".into(), a)], 100);
+    merged.poll().unwrap();
+    let b = write("b", &["x"]);
+    let c = write("c", &block);
+    merged.add_source("b".into(), b);
+    merged.add_source("c".into(), c);
+    merged.poll().unwrap();
+    let ids: std::collections::BTreeSet<u64> =
+        merged.lines().iter().filter_map(|p| p.block_id).collect();
+    assert_eq!(ids.len(), 4, "one id per block: {ids:?}");
 }
 
 #[test]
@@ -4030,6 +4399,49 @@ fn a_process_that_dies_after_ready_says_so() {
     let before = app.messages.len();
     app.handle_event(AppEvent::Refreshed(Box::new(Ok(state))));
     assert_eq!(app.messages.len(), before);
+}
+
+// A discovery runs the full refresh itself, so on the ticks it replaces
+// the quick one it is the read that finds a process dead. It replaced the
+// state without a word, and the refresh after it saw nothing change.
+#[test]
+fn a_death_that_a_discovery_finds_is_said_too() {
+    let mut app = test_app(&["feat+m"]);
+    with_process(&mut app, "feat+m", running_phase());
+    let mut state = app.state.clone();
+    fail_process(&mut state, "feat+m", "dev", "exited with status 1");
+    let snapshot = |state: State| Snapshot {
+        main: wt("acme-shop"),
+        worktrees: vec![wt("feat+m")],
+        created_by_pando: BTreeMap::from([("feat+m".to_string(), true)]),
+        state,
+        warning: None,
+        notices: Vec::new(),
+        default_base: Some("main".into()),
+    };
+    app.handle_event(AppEvent::Discovered(Box::new(Ok(snapshot(state.clone())))));
+    let status = app.flash().expect("a flash");
+    assert_eq!(
+        status.message,
+        "dev of feat/m exited — exited with status 1"
+    );
+
+    // And once: neither the refresh after it, nor an older discovery that
+    // lands late with the process still up, says it again.
+    let before = app.messages.len();
+    app.handle_event(AppEvent::Refreshed(Box::new(Ok(state.clone()))));
+    let mut stale = state.clone();
+    stale
+        .worktrees
+        .get_mut("feat+m")
+        .unwrap()
+        .processes
+        .get_mut("dev")
+        .unwrap()
+        .phase = running_phase();
+    app.handle_event(AppEvent::Discovered(Box::new(Ok(snapshot(stale)))));
+    app.handle_event(AppEvent::Refreshed(Box::new(Ok(state))));
+    assert_eq!(app.messages.len(), before, "{:?}", app.messages);
 }
 
 // A start waiting to say "ready" that sees a process die says which, and

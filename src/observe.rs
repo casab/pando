@@ -44,12 +44,28 @@ pub fn group_pids_checked(pgid: i32) -> Option<Vec<u32>> {
     if let Some(pids) = proc_group_pids(pgid) {
         return Some(pids);
     }
-    let mut cmd = Command::new("ps");
-    // `-axo pid=,pgid=` over `-g <pgid>`: one spelling that works on BSD and
-    // GNU `ps` alike, and the filtering is ours rather than the tool's.
-    cmd.args(["-axo", "pid=,pgid="]);
-    let text = run_capturing(cmd, SCAN_TIMEOUT)?;
+    let text = ps_listing()?;
     Some(parse_ps_pgid(&text, pgid))
+}
+
+/// `ps -axo pid=,pgid=`, when it can be believed.
+///
+/// `-axo pid=,pgid=` over `-g <pgid>`: one spelling that works on BSD and
+/// GNU `ps` alike, and the filtering is ours rather than the tool's.
+fn ps_listing() -> Option<String> {
+    let mut cmd = Command::new("ps");
+    cmd.args(["-axo", "pid=,pgid="]);
+    let (succeeded, text) = run_capturing_status(cmd, SCAN_TIMEOUT)?;
+    trusted_ps(succeeded, text)
+}
+
+/// A listing only when `ps` succeeded and listed somebody: it always lists
+/// itself, so an empty one is a `ps` that could not look — denied by a
+/// sandbox, say — and not a machine with no processes. Taken at its word,
+/// it said every group was empty, which reads as "nothing bound" rather
+/// than as a scan that could not run.
+fn trusted_ps(succeeded: bool, text: String) -> Option<String> {
+    (succeeded && parse_ps_rows(&text).next().is_some()).then_some(text)
 }
 
 /// The TCP ports `pids` are listening on, paired with the pid that owns each.
@@ -164,15 +180,13 @@ fn all_group_pids(wanted: &BTreeSet<i32>) -> Option<BTreeMap<i32, Vec<u32>>> {
     #[cfg(target_os = "linux")]
     if std::path::Path::new("/proc").is_dir() {
         for pgid in wanted {
-            if let Some(pids) = proc_group_pids(*pgid) {
-                members.insert(*pgid, pids);
-            }
+            // A `/proc` that cannot be listed is a scan that could not
+            // run, not a group with nobody in it.
+            members.insert(*pgid, proc_group_pids(*pgid)?);
         }
         return Some(members);
     }
-    let mut cmd = Command::new("ps");
-    cmd.args(["-axo", "pid=,pgid="]);
-    let text = run_capturing(cmd, SCAN_TIMEOUT)?;
+    let text = ps_listing()?;
     for (pid, group) in parse_ps_rows(&text) {
         if let Some(list) = members.get_mut(&group) {
             list.push(pid);
@@ -435,7 +449,26 @@ pub fn exit_note(
 /// The first port-looking number in a line, for the address-in-use hint.
 /// Bounded to the ephemeral-and-above range so a timestamp or a pid is not
 /// reported as a port.
+///
+/// A number written as a port — after a `:` (`:::3000`, `127.0.0.1:3000`)
+/// or after the word `port` — is preferred to the first one on the line:
+/// most logs open with a date, and the year passes every other test.
 fn port_in_text(text: &str) -> Option<u16> {
+    let addressed = ["port ", "port: ", "port=", ":"].iter().find_map(|mark| {
+        text.match_indices(mark).find_map(|(at, _)| {
+            let digits: String = text[at + mark.len()..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            // At least 1024, as below: `10:05:07` is a time.
+            digits.parse::<u16>().ok().filter(|port| *port >= 1024)
+        })
+    });
+    addressed.or_else(|| first_port_like(text))
+}
+
+/// The first run of four or more digits on the line that fits a port.
+fn first_port_like(text: &str) -> Option<u16> {
     let mut chars = text.char_indices().peekable();
     while let Some((i, c)) = chars.next() {
         if !c.is_ascii_digit() {
@@ -446,7 +479,10 @@ fn port_in_text(text: &str) -> Option<u16> {
         for _ in 1..digits.len() {
             chars.next();
         }
-        if digits.len() >= 4
+        // `2026-09-23`, `2026/09/23`: a date's year, not a port.
+        let dated = text[i + digits.len()..].starts_with(['-', '/']);
+        if !dated
+            && digits.len() >= 4
             && let Ok(port) = digits.parse::<u16>()
             && port >= 1024
         {
@@ -462,7 +498,14 @@ fn port_in_text(text: &str) -> Option<u16> {
 /// A scan must never outlive its usefulness: the child is killed at the
 /// deadline rather than waited on, so a stuck `lsof` (a hung network mount
 /// is the classic cause) costs one tick and not the session.
-fn run_capturing(mut cmd: Command, timeout: Duration) -> Option<String> {
+fn run_capturing(cmd: Command, timeout: Duration) -> Option<String> {
+    run_capturing_status(cmd, timeout).map(|(_, text)| text)
+}
+
+/// [`run_capturing`], with whether the command exited successfully. Its
+/// output is decoded leniently: a stray invalid byte in one line used to
+/// cost the whole listing, which `read_to_string` then leaves empty.
+fn run_capturing_status(mut cmd: Command, timeout: Duration) -> Option<(bool, String)> {
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -474,17 +517,18 @@ fn run_capturing(mut cmd: Command, timeout: Duration) -> Option<String> {
     // Read on a thread: a child that fills the pipe while we wait on it, and
     // a wait that never returns, are the two ways this deadlocks otherwise.
     let reader = thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = stdout.read_to_string(&mut buf);
-        let _ = tx.send(buf);
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
     });
     let text = rx.recv_timeout(timeout).ok();
     if text.is_none() {
         let _ = child.kill();
     }
-    let _ = child.wait();
+    let status = child.wait();
     let _ = reader.join();
-    text
+    let succeeded = status.is_ok_and(|s| s.success());
+    text.map(|text| (succeeded, text))
 }
 
 #[cfg(test)]
@@ -654,6 +698,21 @@ mod tests {
         assert_eq!(port_in_text("listen eaddrinuse :::17342"), Some(17_342));
         assert_eq!(port_in_text("errno 48 address already in use"), None);
         assert_eq!(port_in_text("no numbers at all"), None);
+    }
+
+    // Most logs open with a date, and the year passed every test a port
+    // had to: the hint said "something else is listening on port 2026".
+    #[test]
+    fn a_timestamp_in_front_is_not_read_as_the_port() {
+        for line in [
+            "2026-09-23 10:05:07 error: listen eaddrinuse: address already in use :::3000",
+            "[2026-09-23t10:05:07.123z] eaddrinuse 127.0.0.1:3000",
+            "2026/09/23 10:05:07 port 3000 is in use: address already in use",
+            "10:05:07 error while attempting to bind on address ('127.0.0.1', 3000): \
+             address already in use",
+        ] {
+            assert_eq!(port_in_text(line), Some(3000), "{line}");
+        }
     }
 
     // ---- the exit note ---------------------------------------------------
@@ -831,6 +890,27 @@ mod tests {
         assert_eq!(scans[&child.pgid], observed_ports_checked(child.pgid));
         assert_eq!(scans[&gone], Some(Vec::new()));
         assert_eq!(scans[&0], Some(Vec::new()));
+    }
+
+    // A `ps` that was denied prints nothing to stdout and exits non-zero.
+    // Its empty listing used to be read as every group being empty —
+    // "nothing bound" — when what it means is that nobody could look.
+    #[test]
+    fn a_ps_that_could_not_look_is_a_failed_scan_not_an_empty_one() {
+        assert_eq!(trusted_ps(false, String::new()), None);
+        assert_eq!(trusted_ps(true, String::new()), None, "ps lists itself");
+        assert_eq!(trusted_ps(true, "garbage\n".into()), None);
+        assert_eq!(trusted_ps(false, "  1  1\n".into()), None);
+        assert_eq!(
+            trusted_ps(true, "  1  1\n 42 42\n".into()).as_deref(),
+            Some("  1  1\n 42 42\n")
+        );
+        let mut failing = Command::new("sh");
+        failing.args(["-c", "echo '1 1'; exit 1"]);
+        assert_eq!(
+            run_capturing_status(failing, Duration::from_secs(5)),
+            Some((false, "1 1\n".to_string()))
+        );
     }
 
     #[test]

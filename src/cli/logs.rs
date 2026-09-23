@@ -109,12 +109,12 @@ pub fn logs<W: Write>(
         tailer.flush_pending();
     }
     let first = tailer.lines().len().saturating_sub(tail);
-    let mut printed = 0usize;
     for line in tailer.lines().iter().skip(first) {
         write_log_line(out, &line.plain, line.level, json)?;
-        printed += 1;
     }
-    if printed == 0 {
+    // Whether the log has a line, not whether one was printed: `-n 0`
+    // prints none by request, and used to be told the log was empty.
+    if tailer.lines().is_empty() {
         for line in silence_notes(paths, name, source, &path) {
             notice(&line);
         }
@@ -174,9 +174,10 @@ pub(super) fn silence_notes(
     path: &std::path::Path,
 ) -> Vec<String> {
     let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let shown = super::names::shown(paths, name);
     let mut out = vec![match size {
-        0 => format!("the {source} log for {name} is empty — nothing was ever written to it"),
-        n => format!("the {source} log for {name} holds {n} bytes and not one complete line yet"),
+        0 => format!("the {source} log for {shown} is empty — nothing was ever written to it"),
+        n => format!("the {source} log for {shown} holds {n} bytes and not one complete line yet"),
     }];
     // `inspect`, not `refresh`: reading a log may not signal anything or
     // write state.

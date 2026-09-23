@@ -139,12 +139,17 @@ where
         // A file pando cannot parse is a file someone is editing. Overwriting
         // it with a document built from the half of it that parsed would lose
         // their work; refusing costs them one fix.
-        Some(text) => text.parse().with_context(|| {
-            format!(
-                "{} is not valid TOML — fix it, or move it aside, and run again",
-                path.display()
-            )
-        })?,
+        Some(text) => text
+            .parse()
+            .map_err(|e: toml_edit::TomlError| {
+                anyhow::anyhow!("{}", super::suggest::toml_error_line(&e.to_string()))
+            })
+            .with_context(|| {
+                format!(
+                    "{} is not valid TOML — fix it, or move it aside, and run again",
+                    path.display()
+                )
+            })?,
         None => DocumentMut::new(),
     };
     // What the document looks like before the edit, not what the file's own

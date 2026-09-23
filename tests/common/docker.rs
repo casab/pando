@@ -80,6 +80,41 @@ pub fn daemon_down(home: &Path) {
     std::fs::write(dir.join("daemon-down"), "1").unwrap();
 }
 
+/// Brings the daemon back and takes a project's containers down when
+/// dropped, pass or fail. A test that makes Docker unreachable leaves the
+/// shim's "containers" — real listeners — running on purpose, since that
+/// is what `rm` and `stop` then have to say; the test still owns them.
+pub struct DownOnDrop {
+    home: PathBuf,
+    project: String,
+}
+
+impl Drop for DownOnDrop {
+    fn drop(&mut self) {
+        let dir = state_dir(&self.home);
+        let _ = std::fs::remove_file(dir.join("daemon-down"));
+        let _ = std::fs::remove_file(dir.join("daemon-hung"));
+        let _ = std::process::Command::new(self.home.join("bin").join("docker"))
+            .args(["compose", "-p", &self.project, "down", "-v"])
+            .output();
+    }
+}
+
+pub fn down_on_drop(home: &Path, project: &str) -> DownOnDrop {
+    DownOnDrop {
+        home: home.to_path_buf(),
+        project: project.to_string(),
+    }
+}
+
+/// Tells the shim to behave like a daemon that is up and wedged: every
+/// invocation that needs the daemon waits and never answers.
+pub fn daemon_hung(home: &Path) {
+    let dir = state_dir(home);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("daemon-hung"), "1").unwrap();
+}
+
 /// Tells the shim to publish the ports with nothing behind them: the
 /// container runs, the connect succeeds, and the connection is closed at
 /// once. That is what Docker's port proxy does in front of a container
@@ -388,6 +423,8 @@ if os.path.exists(os.path.join(ROOT, "daemon-down")):
         " Is the docker daemon running?\n"
     )
     sys.exit(1)
+if os.path.exists(os.path.join(ROOT, "daemon-hung")):
+    time.sleep(3600)
 if VERB == "up":
     do_up()
 elif VERB == "ps":

@@ -1341,6 +1341,47 @@ fn completions_print_a_script_outside_any_repository() {
     assert_eq!(code(&out), EXIT_USAGE);
 }
 
+// The worktree-name completion is spliced into clap's script by text, so
+// a change on either side can leave a script the shell refuses to load.
+// Each shell that is installed parses its own; one that is not is skipped.
+#[test]
+fn completion_scripts_parse_in_their_own_shells() {
+    let dir = TempDir::new().unwrap();
+    for (shell, check) in [
+        ("zsh", &["-f", "-n"][..]),
+        ("bash", &["--norc", "-n"][..]),
+        ("fish", &["--no-config", "-n"][..]),
+    ] {
+        let installed = Command::new(shell)
+            .args(["-c", "exit 0"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !installed {
+            continue;
+        }
+        let out = Command::new(env!("CARGO_BIN_EXE_pando"))
+            .current_dir(dir.path())
+            .args(["completions", shell])
+            .output()
+            .unwrap();
+        assert_eq!(code(&out), EXIT_OK, "{shell}: {}", stderr(&out));
+        let script = dir.path().join(format!("pando.{shell}"));
+        std::fs::write(&script, &out.stdout).unwrap();
+        let parsed = Command::new(shell)
+            .args(check)
+            .arg(&script)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            parsed.status.success(),
+            "{shell} rejects its completion script: {}",
+            stderr(&parsed)
+        );
+    }
+}
+
 #[test]
 fn logs_for_a_worktree_that_has_never_run_says_where_they_would_be() {
     let e = env();

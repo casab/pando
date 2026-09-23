@@ -1218,6 +1218,53 @@ fn a_broken_file_is_reported_and_skipped() {
     assert!(loaded.warnings[0].contains("ignoring"));
 }
 
+// toml's parse error is five lines, three of them a copy of the source
+// with a caret. Each warning is printed as `pando: <warning>`, so the
+// committed and user layers' came out as a paragraph, and the project
+// layer's left "— carrying on without it" on a line of its own. The line
+// and the column are what the caret says, and they stay.
+#[test]
+fn a_toml_syntax_error_is_one_line_that_keeps_its_line_and_column() {
+    let f = fixture();
+    write_committed(&f, "x = \n[processes.dev]\ncmd = \"1\"\n");
+    write_user(&f, "[processes.dev]\ncmd = \"1\"\nports = [\"web\"\n");
+    let loaded = load(&f.paths).unwrap();
+    assert_eq!(loaded.warnings.len(), 2, "{:?}", loaded.warnings);
+    for (warning, at) in loaded.warnings.iter().zip(["line 1, column 5", "line 3"]) {
+        assert!(!warning.contains('\n'), "{warning:?}");
+        assert!(warning.contains(at), "{warning}");
+        assert!(!warning.contains(" | "), "no source gutter: {warning}");
+    }
+    assert!(
+        loaded.warnings[1].contains("unclosed array"),
+        "{:?}",
+        loaded.warnings
+    );
+
+    write_home(&f, "[project\nbase = \"main\"\n");
+    let err = format!("{:#}", load(&f.paths).unwrap_err());
+    assert!(!err.contains('\n'), "{err:?}");
+    assert!(
+        err.contains("line 1") && err.contains("pando.toml"),
+        "{err}"
+    );
+
+    let err = set_detected(
+        &f.paths,
+        Layer::Project,
+        &["dev"],
+        "cmd",
+        "x",
+        Note::Answered,
+    );
+    let err = format!("{:#}", err.unwrap_err());
+    assert!(!err.contains('\n'), "{err:?}");
+    assert!(
+        err.contains("not valid TOML") && err.contains("line 1"),
+        "{err}"
+    );
+}
+
 // A committed file is someone else's work, and often a newer pando's.
 // A key this build does not know, or a value it will not accept, must
 // not stop `pando ls` for everyone who pulled it — the layer is dropped
@@ -1505,4 +1552,13 @@ fn branch_rules_win_over_the_project_base_and_first_match_wins() {
     ];
     assert_eq!(config.base_for_branch("release/1.2"), Some("release"));
     assert_eq!(config.base_for_branch("feat/x"), Some("catch-all"));
+}
+
+// `ports = ["my web"]` loaded, and `{port:my web}` reached the app as
+// literal braces: the placeholder cannot spell a space.
+#[test]
+fn a_role_the_placeholder_cannot_spell_is_refused() {
+    let msg = refusal("[processes.web]\ncmd = \"x --port {port:my web}\"\nports = [\"my web\"]\n");
+    assert!(msg.contains("cannot"), "{msg}");
+    assert!(msg.contains("\"my web\""), "{msg}");
 }

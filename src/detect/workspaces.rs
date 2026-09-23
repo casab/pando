@@ -207,7 +207,45 @@ pub fn workspace_apps(root: &Path, signals: &Signals) -> Vec<WorkspaceApp> {
         // Two apps with the same directory name would claim the same role.
         return Vec::new();
     }
+    // Two names that differ only in punctuation — `web-app` and `web.app` —
+    // would read one `WEB_APP_PORT` between them.
+    let mut vars: Vec<String> = apps.iter().map(|a| app_port_var(&a.name)).collect();
+    vars.sort_unstable();
+    vars.dedup();
+    if vars.len() != unique {
+        return Vec::new();
+    }
+    // And a name that cannot be a process and a role at all: one a
+    // `{port:…}` placeholder cannot spell renders as literal braces, and a
+    // name pando keeps for its own logs is refused by the loader — either
+    // way the answer would fail once taken, rather than never be offered.
+    if apps.iter().any(|a| !usable_as_role(&a.name)) {
+        return Vec::new();
+    }
     apps
+}
+
+/// The env variable an app's port is declared under in the env example:
+/// `apps/admin-v2` reads `ADMIN_V2_PORT`. An env name is letters, digits
+/// and underscores, so every other character becomes an underscore — a dot
+/// as much as a dash.
+fn app_port_var(name: &str) -> String {
+    let stem: String = name
+        .chars()
+        .map(|c| match c.is_ascii_alphanumeric() {
+            true => c.to_ascii_uppercase(),
+            false => '_',
+        })
+        .collect();
+    format!("{stem}_PORT")
+}
+
+/// Whether an app's directory name can be its process name and its role:
+/// what `{port:<role>}` can spell, and not one of pando's own log names.
+fn usable_as_role(name: &str) -> bool {
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        && crate::paths::validate_owned_log_source("process name", name).is_ok()
 }
 
 /// The port an app listens on by default: what the root env example says
@@ -217,7 +255,7 @@ fn app_default_port(
     name: &str,
     rule: Option<&'static FrameworkRule>,
 ) -> Option<u16> {
-    let wanted = format!("{}_PORT", name.to_uppercase().replace('-', "_"));
+    let wanted = app_port_var(name);
     let from_example = signals
         .env_example
         .iter()
@@ -235,7 +273,7 @@ fn app_default_port(
 /// given when both exist: they carry the same port, so there is nothing
 /// for them to disagree about, and an app that reads either one works.
 fn app_port_env(signals: &Signals, app: &WorkspaceApp) -> Vec<String> {
-    let wanted = format!("{}_PORT", app.name.to_uppercase().replace('-', "_"));
+    let wanted = app_port_var(&app.name);
     let declared = signals.env_keys().any(|key| key == wanted);
     let mut out: Vec<String> = Vec::new();
     match app.port {
@@ -380,7 +418,7 @@ pub(super) fn processes_proposal(root: &Path, signals: &Signals) -> Option<Propo
     // question says where they came from.
     let declared: Vec<String> = apps
         .iter()
-        .map(|app| format!("{}_PORT", app.name.to_uppercase().replace('-', "_")))
+        .map(|app| app_port_var(&app.name))
         .filter(|key| signals.env_keys().any(|k| k == key))
         .collect();
     let mut why = format!("a dev script in each of {} workspace apps", apps.len());

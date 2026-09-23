@@ -250,9 +250,7 @@ pub fn adopt(
     let rewritten = match rewrite_recorded_paths(paths, &from, &to) {
         Ok(rewritten) => rewritten,
         Err(e) => {
-            notices.push(format!(
-                "the folder moved, and pando's own records still point inside the old one:                  {e:#} — `pando rm` and `pando start` will not find those worktrees until the                  state file is fixed or moved aside"
-            ));
+            notices.push(records_left_behind(&e));
             0
         }
     };
@@ -263,6 +261,15 @@ pub fn adopt(
         rewritten,
         notices,
     })
+}
+
+/// The notice for a move whose records could not be rewritten after it.
+pub(super) fn records_left_behind(e: &anyhow::Error) -> String {
+    format!(
+        "the folder moved, and pando's own records still point inside the old one: {e:#} — \
+         `pando rm` and `pando start` will not find those worktrees until the state file is \
+         fixed or moved aside"
+    )
 }
 
 /// Every recorded path that pointed inside the old folder, pointed inside

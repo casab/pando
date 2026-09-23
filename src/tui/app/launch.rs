@@ -20,6 +20,8 @@ pub struct LaunchEnv {
     pub shell: Option<String>,
     pub visual: Option<String>,
     pub editor: Option<String>,
+    /// `$BROWSER`: what `o` and `O` open a URL with, as `pando open` does.
+    pub browser: Option<String>,
 }
 
 impl LaunchEnv {
@@ -30,6 +32,7 @@ impl LaunchEnv {
             shell: var("SHELL"),
             visual: var("VISUAL"),
             editor: var("EDITOR"),
+            browser: var("BROWSER"),
         }
     }
 }

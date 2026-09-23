@@ -798,3 +798,125 @@ fn the_preference_is_read_from_the_machine_wide_layer() {
     );
     assert_eq!(loaded.config.isolation.preferred(), None);
 }
+
+// ---- two starts at once -----------------------------------------------------
+
+// A switch to isolated lets go of the lock while its services come up and
+// its hooks run. A plain start that runs in that window — the TUI and the
+// CLI at once — finds a worktree that is not isolated with a live server on
+// it, reads that as an interrupted switch, and takes the server down. The
+// switch then carried on regardless: it replaced the plain start's process,
+// set the worktree isolated, and spawned its application against a database
+// that had just been stopped, on a worktree with no service left on record.
+#[test]
+fn a_switch_whose_services_another_start_took_down_starts_nothing() {
+    let mut f =
+        nat_with("[project]\ninstall = \"true\"\n\n[dev]\ncmd = \"sleep 30\"\nports = []\n");
+    std::fs::write(
+        f.paths.config_file(),
+        format!(
+            "[project]\ninstall = \"true\"\n\n\
+             [runtime]\nprelude = \"\"\n\n\
+             [dev]\ncmd = \"sleep 30\"\nports = []\n\n\
+             [[services]]\nkind = \"native\"\nname = \"db\"\n\
+             cmd = '''exec python3 -c \"import socket,time;s=socket.socket();\
+             s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);\
+             s.bind(('127.0.0.1',{{port}}));s.listen(5);time.sleep(300)\"'''\n\n\
+             [[hooks]]\nname = \"a-plain-start-meanwhile\"\nafter = \"services\"\n\
+             cmd = \"PANDO_HOME='{home}' '{bin}' start feat+one --no-wait\"\n",
+            home = f.home.display(),
+            bin = env!("CARGO_BIN_EXE_pando"),
+        ),
+    )
+    .unwrap();
+    f.config = config::load(&f.paths).unwrap().config;
+    let name = new_worktree(&f, "feat/one");
+    assert_eq!(name, "feat+one");
+
+    let err = format!(
+        "{:#}",
+        actions::start(
+            &f.paths,
+            &f.config,
+            &name,
+            None,
+            actions::Mode::Isolated,
+            &|_| {},
+        )
+        .unwrap_err()
+    );
+    assert!(
+        err.contains("another start of this worktree took down"),
+        "{err}"
+    );
+    let record = f.record(&name);
+    assert!(
+        !record.isolated,
+        "a worktree with no services is not isolated"
+    );
+    let dev = &record.processes["dev"];
+    assert!(
+        process::is_alive(dev.pid),
+        "the plain start's process is the one running"
+    );
+}
+
+// ---- a state file that breaks under a start ---------------------------------
+
+// The second lock of a switch to isolated used to hand a state file it could
+// not read straight to the undo — with that lock still held. The undo takes
+// the same lock, and a second `flock` from one process on a second
+// descriptor waits for the first: the start never returned, and every other
+// pando command on the machine queued behind it.
+#[test]
+fn a_state_file_that_cannot_be_read_after_the_services_fails_the_start_rather_than_hanging_it() {
+    let mut f =
+        nat_with("[project]\ninstall = \"true\"\n\n[dev]\ncmd = \"sleep 30\"\nports = []\n");
+    let state_file = f.paths.state_file();
+    let backup = state_file.with_extension("json.bak");
+    std::fs::write(
+        f.paths.config_file(),
+        format!(
+            "[project]\ninstall = \"true\"\n\n\
+             [dev]\ncmd = \"sleep 30\"\nports = []\n\n\
+             [[services]]\nkind = \"native\"\nname = \"db\"\n\
+             cmd = '''exec python3 -c \"import socket,time;s=socket.socket();\
+             s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);\
+             s.bind(('127.0.0.1',{{port}}));s.listen(5);time.sleep(300)\"'''\n\n\
+             [[probes]]\nname = \"breaks-state\"\nmatch = \"never printed\"\nhint = \"\"\n\
+             cmd = \"cp '{state}' '{backup}' && echo broken > '{state}'\"\n",
+            state = state_file.display(),
+            backup = backup.display(),
+        ),
+    )
+    .unwrap();
+    f.config = config::load(&f.paths).unwrap().config;
+    let name = new_worktree(&f, "feat/one");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let paths = f.paths.clone();
+        let config = f.config.clone();
+        let name = name.clone();
+        std::thread::spawn(move || {
+            let outcome = actions::start(
+                &paths,
+                &config,
+                &name,
+                None,
+                actions::Mode::Isolated,
+                &|_| {},
+            );
+            let _ = tx.send(outcome.map(|_| ()).map_err(|e| format!("{e:#}")));
+        });
+    }
+    let Ok(outcome) = rx.recv_timeout(Duration::from_secs(60)) else {
+        // The fixture's own teardown would queue behind the held lock too.
+        std::mem::forget(f);
+        panic!("the start never returned");
+    };
+    // Put the state back, so the fixture can stop what started.
+    std::fs::copy(&backup, &state_file).unwrap();
+    let err = outcome.expect_err("a state file that cannot be read is an error");
+    assert!(err.contains("parse state file"), "{err}");
+}

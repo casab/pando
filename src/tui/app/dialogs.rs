@@ -181,11 +181,20 @@ impl App {
                     let current = base
                         .as_ref()
                         .or(self.default_base.as_ref())
-                        .and_then(|b| choices.iter().position(|c| c == b))
-                        .unwrap_or(0);
-                    let step: isize = if key.code == KeyCode::Tab { 1 } else { -1 };
-                    let next = (current as isize + step).rem_euclid(choices.len() as isize);
-                    let chosen = choices[next as usize].clone();
+                        .and_then(|b| choices.iter().position(|c| c == b));
+                    let forward = key.code == KeyCode::Tab;
+                    // With no base yet — no default the repository could
+                    // name — the first tab lands on the first choice, not
+                    // the second.
+                    let next = match current {
+                        Some(at) => {
+                            let step: isize = if forward { 1 } else { -1 };
+                            (at as isize + step).rem_euclid(choices.len() as isize) as usize
+                        }
+                        None if forward => 0,
+                        None => choices.len() - 1,
+                    };
+                    let chosen = choices[next].clone();
                     base = (Some(&chosen) != self.default_base.as_ref()).then_some(chosen);
                 }
             }
@@ -234,7 +243,7 @@ impl App {
                 if let Some(existing) = self.worktree_for_branch(&branch) {
                     self.filter.clear();
                     self.mode = super::Mode::Normal;
-                    self.refilter_keeping(Some(existing));
+                    self.refilter_keeping(Some(existing), 0);
                     self.tail_index = 0;
                     self.tail_scroll = 0;
                     self.set_status(format!("{branch} already has a worktree — selected it"));
@@ -284,6 +293,14 @@ impl App {
             KeyCode::Char('F') => true,
             _ => return,
         };
+        // Removed from under the dialog — by `pando rm` in another pane, or
+        // by hand. There is nothing left to confirm, and a worker sent
+        // after it would only come back with git's complaint.
+        if !self.worktrees.iter().any(|w| w.name == name) {
+            let label = self.label_of(&name);
+            self.set_status(format!("{label} is already gone"));
+            return;
+        }
         let blockers = self.remove_blockers(&name);
         if let Some(fatal) = blockers.iter().find(|b| b.is_fatal()) {
             let label = self.label_of(&name);

@@ -40,6 +40,48 @@ pub(super) fn base64(input: &[u8]) -> String {
     out
 }
 
+/// The commands `o` and `O` try, in order, to open `url`.
+///
+/// `$BROWSER` is read the way `pando open` and other tools read it: a
+/// `:`-separated list of browsers, tried until one works, each a command
+/// with arguments where `%s` stands for the URL — which goes last when
+/// there is no `%s`. An entry that is a file as written is one program,
+/// even with a space in its path. Unset or empty, the desktop's opener.
+pub(super) fn browser_commands(browser: Option<&str>, url: &str) -> Vec<Vec<String>> {
+    let entries: Vec<&str> = browser
+        .unwrap_or_default()
+        .split(':')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    if entries.is_empty() {
+        let opener = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        return vec![vec![opener.to_string(), url.to_string()]];
+    }
+    entries
+        .into_iter()
+        .map(|entry| {
+            let mut words: Vec<String> = if std::path::Path::new(entry).is_file() {
+                vec![entry.to_string()]
+            } else {
+                entry.split_whitespace().map(str::to_string).collect()
+            };
+            if words.iter().any(|word| word.contains("%s")) {
+                for word in &mut words {
+                    *word = word.replace("%s", url);
+                }
+            } else {
+                words.push(url.to_string());
+            }
+            words
+        })
+        .collect()
+}
+
 impl App {
     /// The URL a worktree serves on.
     ///
@@ -391,24 +433,35 @@ impl App {
         self.set_success(format!("opened {url}"));
     }
 
-    /// Hands a URL to the desktop, on a worker thread with every stream
-    /// captured: a browser launcher that writes to the terminal would paint
-    /// over the alternate screen.
+    /// Hands a URL to the browser — `$BROWSER` when it is set, as
+    /// `pando open` reads it, the desktop's opener otherwise — on a worker
+    /// thread with every stream captured: a browser launcher that writes
+    /// to the terminal would paint over the alternate screen. One that
+    /// fails says so, rather than leaving `opened …` on screen alone.
     #[cfg(not(test))]
     fn open_url(&mut self, url: &str) {
+        let commands = browser_commands(self.launch_env.browser.as_deref(), url);
         let url = url.to_string();
+        let tx = self.event_tx.clone();
         thread::spawn(move || {
-            let opener = if cfg!(target_os = "macos") {
-                "open"
-            } else {
-                "xdg-open"
-            };
-            let _ = std::process::Command::new(opener)
-                .arg(&url)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .output();
+            let mut failure = String::new();
+            for command in commands {
+                let Some((program, args)) = command.split_first() else {
+                    continue;
+                };
+                let ran = std::process::Command::new(program)
+                    .args(args)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .output();
+                failure = match ran {
+                    Ok(out) if out.status.success() => return,
+                    Ok(out) => format!("{program} could not open {url} ({})", out.status),
+                    Err(e) => format!("could not run {program} to open {url}: {e}"),
+                };
+            }
+            let _ = tx.send(AppEvent::LaunchFailed(failure));
         });
     }
 

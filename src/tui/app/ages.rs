@@ -48,7 +48,10 @@ pub fn parse_git_relative(text: &str) -> Option<i64> {
             "year" => 365 * 86_400,
             _ => return None,
         };
-        total += count * per;
+        // Checked: the text comes from git or from the enrichment cache
+        // on disk, and a number past what a date can mean is no date —
+        // not an overflow panic in the paint.
+        total = total.checked_add(count.checked_mul(per)?)?;
         any = true;
     }
     any.then_some(total)
