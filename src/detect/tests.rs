@@ -1880,3 +1880,62 @@ fn signals_looks_for_every_file_name_compose_does() {
     compose.sort();
     assert_eq!(ours, compose);
 }
+
+// ---- schema hooks from the project's own scripts ----------------------
+
+// A migration runner no rule knows by its files is still spelled as a
+// package script. Offered after the tools pando does know, never one
+// that writes migration files, and keyed on the migrations it applies.
+#[test]
+fn a_projects_own_schema_script_is_offered_after_the_known_tools() {
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{ "scripts": {
+            "dev": "node server.js",
+            "db:migrate": "prisma migrate dev",
+            "db:init": "node scripts/init-db.js",
+            "db:seed": "node scripts/seed.js"
+        } }"#,
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("package-lock.json"), "{}").unwrap();
+    std::fs::create_dir_all(dir.path().join("migrations")).unwrap();
+    let signals = signals(dir.path());
+    let proposal = schema_hook_proposal(dir.path(), &signals).expect("a schema question");
+    assert_eq!(
+        values(&proposal),
+        vec!["npm run db:init"],
+        "a generating script is not a hook, and a seed is not the schema"
+    );
+    assert!(!proposal.decided, "it touches data, so it is always asked");
+    let hook = proposal.candidates[0].hook.clone().unwrap();
+    assert_eq!(hook.fingerprint, vec!["migrations/**"]);
+    assert_eq!(hook.after, crate::config::HookPoint::Services);
+
+    // A known tool comes first; the script is still offered beside it.
+    std::fs::create_dir_all(dir.path().join("prisma")).unwrap();
+    std::fs::write(dir.path().join("prisma/schema.prisma"), "").unwrap();
+    let proposal = schema_hook_proposal(dir.path(), &signals).unwrap();
+    assert_eq!(
+        values(&proposal),
+        vec!["npx prisma migrate deploy", "npm run db:init"]
+    );
+}
+
+#[test]
+fn a_schema_script_with_no_migrations_directory_is_keyed_on_the_manifest() {
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{ "scripts": { "migrate": "knex migrate:latest" } }"#,
+    )
+    .unwrap();
+    let signals = signals(dir.path());
+    let proposal = schema_hook_proposal(dir.path(), &signals).unwrap();
+    assert_eq!(values(&proposal), vec!["npm run migrate"]);
+    assert_eq!(
+        proposal.candidates[0].hook.clone().unwrap().fingerprint,
+        vec!["package.json"]
+    );
+}

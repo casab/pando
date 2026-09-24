@@ -8,7 +8,7 @@ use crate::catalog::images::{self, Role};
 use crate::catalog::package_managers;
 use crate::config::Config;
 
-use super::dev::{listed, lockfiles, python_runner};
+use super::dev::{listed, lockfiles, python_runner, script_runner};
 use super::proposal::{Candidate, ComposeResolver, Proposal, ServiceHint, Slot};
 use super::signals::Signals;
 
@@ -719,7 +719,74 @@ fn schema_candidates(root: &Path, signals: &Signals) -> Vec<Candidate> {
             "config/database.yml",
         );
     }
+    // Last, after every tool pando knows by its files: the project's own
+    // name for the step. A migration runner nobody has a rule for — knex,
+    // a hand-written script over a directory of SQL — is still spelled as
+    // a package script, and that spelling is the project saying what it
+    // runs against a fresh database.
+    let watched: Vec<String> = MIGRATION_DIRS
+        .iter()
+        .filter(|dir| root.join(dir).is_dir())
+        .map(|dir| format!("{dir}/**"))
+        .collect();
+    let watched: Vec<&str> = if watched.is_empty() {
+        vec!["package.json"]
+    } else {
+        watched.iter().map(String::as_str).collect()
+    };
+    for name in SCHEMA_SCRIPTS {
+        let Some(body) = signals.scripts.get(name) else {
+            continue;
+        };
+        if generates_files(body) {
+            continue;
+        }
+        push(
+            format!("{}{name}", script_runner(signals)),
+            &watched,
+            &format!("package.json scripts.{name}"),
+        );
+    }
     out
+}
+
+/// Package scripts that bring a database to its schema, in the order a
+/// project most likely means them. Seeding and resetting are not on it:
+/// neither is the schema, and a reset on every isolated start would be a
+/// hook that destroys what the last one made.
+const SCHEMA_SCRIPTS: [&str; 7] = [
+    "db:migrate",
+    "migrate",
+    "db:deploy",
+    "migrate:deploy",
+    "db:setup",
+    "db:init",
+    "db:push",
+];
+
+/// Where a project keeps its migrations, when it is not an ORM pando has a
+/// rule for. What a script-named schema hook is keyed on, so it runs again
+/// when a migration is added rather than on every start.
+const MIGRATION_DIRS: [&str; 5] = [
+    "migrations",
+    "db/migrations",
+    "database/migrations",
+    "src/migrations",
+    "db/migrate",
+];
+
+/// A script that writes migration files rather than applying them — the
+/// generating variants principles forbid in a hook.
+fn generates_files(body: &str) -> bool {
+    [
+        "migrate dev",
+        "generate",
+        "makemigrations",
+        "migrate:make",
+        "--create-only",
+    ]
+    .iter()
+    .any(|marker| body.contains(marker))
 }
 
 /// How this project runs a binary from its dependencies: the first
