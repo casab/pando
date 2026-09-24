@@ -778,13 +778,23 @@ fn provision_worktree_files(
 /// clone that has none, and the moment the developer writes their real one
 /// it is what every new worktree gets. `None` when there is nothing to copy
 /// from, which is skipped rather than invented.
+///
+/// A source that is itself a gitignored local file — the root `.env` given
+/// to a workspace app — is not a seed: it is the developer's own file under
+/// another path, and it is linked or copied as the mode says, like the
+/// root one is.
 fn provision_source(paths: &PandoPaths, config: &Config, rel: &str) -> Option<(PathBuf, bool)> {
     let src = paths.root().join(rel);
     if src.exists() {
         return Some((src, false));
     }
-    let seed = paths.root().join(config.project.provision_from.get(rel)?);
-    seed.exists().then_some((seed, true))
+    let from = config.project.provision_from.get(rel)?;
+    let seed = paths.root().join(from);
+    if !seed.exists() {
+        return None;
+    }
+    let seeded = !crate::detect::is_gitignored(paths.root(), from);
+    Some((seed, seeded))
 }
 
 pub(super) fn ref_exists(root: &Path, refname: &str) -> bool {

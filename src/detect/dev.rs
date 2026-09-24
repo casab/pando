@@ -423,7 +423,17 @@ fn roles_from_env(declared: &[&str], framework: Option<&str>) -> Option<Candidat
 /// never decided, and the question below it is the plain answer: only what
 /// is already here.
 pub(super) fn provision_proposal(signals: &Signals) -> Option<Proposal> {
-    let present = &signals.ignored_present;
+    let links = &signals.workspace_env_links;
+    // The root's own files, then the same `.env` given to each app that
+    // reads one from its own directory. Linked like the root file, not
+    // seeded: it is the developer's local file, not a tracked example.
+    let present: Vec<String> = signals
+        .ignored_present
+        .iter()
+        .cloned()
+        .chain(links.iter().map(|(destination, _)| destination.clone()))
+        .collect();
+    let present = &present;
     let seeds = &signals.provision_seeds;
     if present.is_empty() && seeds.is_empty() {
         return None;
@@ -431,9 +441,24 @@ pub(super) fn provision_proposal(signals: &Signals) -> Option<Proposal> {
     let mut candidates: Vec<Candidate> = Vec::new();
     // The files that are already here lead, and are what `--yes` takes.
     if !present.is_empty() {
+        let mut why = "gitignored and present in the main checkout".to_string();
+        if !links.is_empty() {
+            why.push_str(&format!(
+                "; the root .env also given to {}, which have no env file of their own",
+                listed(
+                    &links
+                        .iter()
+                        .map(|(destination, _)| {
+                            destination.trim_end_matches("/.env").to_string()
+                        })
+                        .collect::<Vec<_>>()
+                )
+            ));
+        }
         candidates.push(Candidate {
             value: present.join(","),
-            why: "gitignored and present in the main checkout".to_string(),
+            why,
+            provision_from: links.iter().cloned().collect(),
             ..Candidate::default()
         });
     }
@@ -459,7 +484,7 @@ pub(super) fn provision_proposal(signals: &Signals) -> Option<Proposal> {
                 true => format!("{seeded} — this clone has none of its own"),
                 false => format!("the same, plus {seeded}"),
             },
-            provision_from: seeds.iter().cloned().collect(),
+            provision_from: seeds.iter().chain(links.iter()).cloned().collect(),
             needs_a_human: true,
             ..Candidate::default()
         });

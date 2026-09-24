@@ -538,6 +538,30 @@ fn agent_json_documents_the_merged_logs_source_key() {
     assert!(section.contains("merged"), "{section}");
 }
 
+// Every key `pando signals` publishes is one an agent reads, so the
+// contract names each of them.
+#[test]
+fn agent_json_documents_every_signals_key() {
+    let doc = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("agent/json.md"),
+    )
+    .unwrap();
+    let section = doc
+        .split("## `pando signals`")
+        .nth(1)
+        .expect("the signals section")
+        .split("\n## ")
+        .next()
+        .unwrap();
+    let published = serde_json::to_value(crate::detect::Signals::default()).unwrap();
+    for key in published.as_object().unwrap().keys() {
+        assert!(
+            section.contains(&format!("\"{key}\"")),
+            "agent/json.md never documents signals.{key}"
+        );
+    }
+}
+
 #[test]
 fn start_waits_on_a_terminal_unless_told_not_to() {
     assert!(super::waits_on(false, false, true), "a terminal waits");

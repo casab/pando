@@ -256,7 +256,13 @@ impl Kind {
             // and with no lockfile there is no frozen install to
             // propose, so the slot stays silent rather than guessing.
             Kind::WorkspaceNoLock => {
-                config.project.provision = Some(strings(&[".env"]));
+                // The root `.env` for each app too: neither has its own.
+                config.project.provision =
+                    Some(strings(&[".env", "apps/api/.env", "apps/web/.env"]));
+                config.project.provision_from = BTreeMap::from([
+                    ("apps/api/.env".to_string(), ".env".to_string()),
+                    ("apps/web/.env".to_string(), ".env".to_string()),
+                ]);
                 for app in ["api", "web"] {
                     config.processes.insert(
                         app.to_string(),
@@ -406,7 +412,15 @@ impl Kind {
             }
             Kind::MonoWebApi => {
                 config.project.install = Some("pnpm install --frozen-lockfile".to_string());
-                config.project.provision = Some(strings(&[".env"]));
+                // The root `.env` for each app as well: neither has an env
+                // file of its own, and an app that loads `.env` from its
+                // working directory would find none.
+                config.project.provision =
+                    Some(strings(&[".env", "apps/api/.env", "apps/web/.env"]));
+                config.project.provision_from = std::collections::BTreeMap::from([
+                    ("apps/api/.env".to_string(), ".env".to_string()),
+                    ("apps/web/.env".to_string(), ".env".to_string()),
+                ]);
                 // Two processes, each in its own directory, with the web
                 // one told the api's port. The root `dev` script is a
                 // `pnpm -r` wrapper, which works but gives one log and one

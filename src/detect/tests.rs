@@ -1939,3 +1939,70 @@ fn a_schema_script_with_no_migrations_directory_is_keyed_on_the_manifest() {
         vec!["package.json"]
     );
 }
+
+// ---- the root env file, for workspace apps with none -------------------
+
+/// A workspace whose apps load `.env` from their own directory, with one
+/// `.env` at the root: the monorepo shape dotenv's default meets.
+fn workspace_with_root_env() -> TempDir {
+    let dir = seed_fixture(&[
+        (".gitignore", ".env\nnode_modules/\n"),
+        (".env", "PORT=3000\n"),
+        (
+            "package.json",
+            r#"{ "workspaces": ["apps/*"], "scripts": { "dev": "node dev.js" } }"#,
+        ),
+    ]);
+    for (app, script) in [
+        ("api", "tsx watch src/server.ts"),
+        ("web", "node src/server.js"),
+    ] {
+        let path = dir.path().join("apps").join(app);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(
+            path.join("package.json"),
+            format!(r#"{{ "scripts": {{ "dev": "{script}" }} }}"#),
+        )
+        .unwrap();
+    }
+    dir
+}
+
+#[test]
+fn workspace_apps_with_no_env_file_are_given_the_root_one() {
+    let dir = workspace_with_root_env();
+    // An app that has an env file of its own has said what it reads.
+    std::fs::write(dir.path().join("apps/web/.env.example"), "X=1\n").unwrap();
+    let signals = signals(dir.path());
+    assert_eq!(
+        signals.workspace_env_links,
+        vec![("apps/api/.env".to_string(), ".env".to_string())]
+    );
+    let proposal = provision_proposal(&signals).unwrap();
+    assert!(
+        proposal.decided,
+        "the developer's own file, under an ignored path"
+    );
+    assert_eq!(values(&proposal), vec![".env,apps/api/.env"]);
+    let answer = &proposal.candidates[0];
+    assert_eq!(
+        answer.provision_from,
+        BTreeMap::from([("apps/api/.env".to_string(), ".env".to_string())])
+    );
+    assert!(!answer.needs_a_human);
+    assert!(answer.why.contains("apps/api"), "{}", answer.why);
+}
+
+#[test]
+fn the_root_env_is_given_only_where_the_repository_ignores_the_path() {
+    let dir = workspace_with_root_env();
+    // Only the root `.env` is ignored: `apps/api/.env` would show as
+    // untracked, so it is never offered.
+    std::fs::write(dir.path().join(".gitignore"), "/.env\n").unwrap();
+    assert!(signals(dir.path()).workspace_env_links.is_empty());
+
+    // And with no root `.env` at all there is nothing to give.
+    let dir = workspace_with_root_env();
+    std::fs::remove_file(dir.path().join(".env")).unwrap();
+    assert!(signals(dir.path()).workspace_env_links.is_empty());
+}

@@ -5632,6 +5632,52 @@ fn provisioned_files_are_symlinked_by_default_and_copied_on_request() {
     assert_eq!(std::fs::read_to_string(&copied).unwrap(), "SECRET=1\n");
 }
 
+// A workspace app given the root `.env` is given the developer's own
+// file under another path — linked like the root one, not seeded like an
+// example, and still only because the repository ignores that path.
+#[test]
+fn the_root_env_given_to_a_workspace_app_is_linked_not_seeded() {
+    let mut fx = fixture();
+    std::fs::create_dir_all(fx.root.join("apps/api")).unwrap();
+    std::fs::write(fx.root.join("apps/api/package.json"), "{}\n").unwrap();
+    git(&fx.root, &["add", "."]);
+    git(&fx.root, &["commit", "--quiet", "-m", "an app"]);
+    fx.config.project.provision = Some(vec![".env".into(), "apps/api/.env".into()]);
+    fx.config.project.provision_from =
+        BTreeMap::from([("apps/api/.env".to_string(), ".env".to_string())]);
+    let said = std::cell::RefCell::new(Vec::<String>::new());
+    let name = new(
+        &fx.paths,
+        &fx.config,
+        "feat/app-env",
+        None,
+        &|line: &str| said.borrow_mut().push(line.to_string()),
+    )
+    .unwrap();
+    let linked = fx.worktrees_dir().join(&name).join("apps/api/.env");
+    assert!(
+        std::fs::symlink_metadata(&linked)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the developer's own file is linked, as the mode says"
+    );
+    assert_eq!(std::fs::read_to_string(&linked).unwrap(), "SECRET=1\n");
+    assert!(
+        !said.borrow().iter().any(|line| line.starts_with("seeding")),
+        "it is not a seed: {:?}",
+        said.borrow()
+    );
+    // Nothing shows in the worktree's status: the path is ignored.
+    let status = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(fx.worktrees_dir().join(&name))
+        .output()
+        .unwrap();
+    let status = String::from_utf8_lossy(&status.stdout);
+    assert!(status.trim().is_empty(), "{status}");
+}
+
 #[test]
 fn a_missing_provision_source_is_skipped_rather_than_invented() {
     let mut fx = fixture();

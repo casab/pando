@@ -225,6 +225,37 @@ pub fn workspace_apps(root: &Path, signals: &Signals) -> Vec<WorkspaceApp> {
     apps
 }
 
+/// The root's local `.env`, for each workspace app that has no env file of
+/// its own: `(destination, source)`. See `Signals::workspace_env_links`.
+pub(super) fn workspace_env_links(root: &Path, signals: &Signals) -> Vec<(String, String)> {
+    const ROOT_ENV: &str = ".env";
+    if !signals.ignored_present.iter().any(|path| path == ROOT_ENV) {
+        return Vec::new();
+    }
+    let apps = workspace_apps(root, signals);
+    if apps.len() < MIN_WORKSPACE_APPS {
+        return Vec::new();
+    }
+    apps.iter()
+        .filter(|app| !has_env_file(&root.join(&app.dir)))
+        .map(|app| (format!("{}/{ROOT_ENV}", app.dir), ROOT_ENV.to_string()))
+        .filter(|(destination, _)| super::signals::is_gitignored(root, destination))
+        .collect()
+}
+
+/// Whether a directory has any env file of its own, local or example: an
+/// app that has one has said which environment it reads, and it is not
+/// the root's.
+fn has_env_file(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().starts_with(".env"))
+        })
+        .unwrap_or(false)
+}
+
 /// The env variable an app's port is declared under in the env example:
 /// `apps/admin-v2` reads `ADMIN_V2_PORT`. An env name is letters, digits
 /// and underscores, so every other character becomes an underscore — a dot

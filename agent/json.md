@@ -118,7 +118,8 @@ repository, which is what makes it safe to read before deciding anything.
     "markers": [],              // framework and toolchain markers
     "compose_files": [],
     "ignored_present": [],      // gitignored files that exist in the checkout
-    "provision_seeds": []       // examples a worktree file could be copied from
+    "provision_seeds": [],      // examples a worktree file could be copied from
+    "workspace_env_links": []   // [app/.env, .env]: the root .env for apps with none
   },
   "compose": [                  // one entry per compose file, as pando's own reader sees it
     {

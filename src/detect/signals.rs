@@ -54,6 +54,18 @@ pub struct Signals {
     /// still deserialises.
     #[serde(default)]
     pub provision_seeds: Vec<(String, String)>,
+    /// Workspace apps that would read an env file from their own directory
+    /// and have none: `(destination, source)`, the root's local `.env`
+    /// given to `apps/<app>/.env`.
+    ///
+    /// A monorepo commonly keeps one `.env` at the root, and an app that
+    /// loads `.env` from its working directory — dotenv's default — finds
+    /// nothing when it runs in its own. A pair is here only when the root
+    /// file is gitignored and present, the app directory has no env file of
+    /// its own at all, and the destination is gitignored in the main
+    /// checkout. Defaulted so an older dump still deserialises.
+    #[serde(default)]
+    pub workspace_env_links: Vec<(String, String)>,
 }
 
 const WORKSPACE_MARKERS: [&str; 3] = ["pnpm-workspace.yaml", "turbo.json", "nx.json"];
@@ -90,7 +102,7 @@ pub(super) const COMPOSE_FILES: [&str; 4] = [
 /// Reads every tier 1 signal from the main checkout.
 pub fn signals(root: &Path) -> Signals {
     let manifest = std::fs::read_to_string(root.join("package.json")).unwrap_or_default();
-    Signals {
+    let mut signals = Signals {
         scripts: parse_scripts(&manifest),
         targets: parse_targets(root),
         lockfiles: present(root, &package_managers::lockfiles()),
@@ -102,7 +114,12 @@ pub fn signals(root: &Path) -> Signals {
         compose_files: present(root, &COMPOSE_FILES),
         ignored_present: ignored_present(root),
         provision_seeds: provision_seeds(root),
-    }
+        workspace_env_links: Vec::new(),
+    };
+    // Last, because which directories are apps is itself read from the
+    // signals above.
+    signals.workspace_env_links = super::workspaces::workspace_env_links(root, &signals);
+    signals
 }
 
 pub(super) fn present(root: &Path, names: &[&str]) -> Vec<String> {
