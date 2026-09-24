@@ -751,6 +751,10 @@ fn a_workspace_proposes_one_process_per_app() {
         web.env
     );
     assert_eq!(web.ready.clone().unwrap().role.as_deref(), Some("web"));
+    assert_eq!(
+        web.env["API_PORT"], "{port:api}",
+        "a port variable the env example declares for the api is how any app finds it"
+    );
 
     let api = &processes["api"];
     assert_eq!(api.cwd.as_deref(), Some("apps/api"));
@@ -763,6 +767,11 @@ fn a_workspace_proposes_one_process_per_app() {
         !api.env.contains_key("VITE_API_URL"),
         "the app a reference points at is the one that need not be told"
     );
+    assert_eq!(
+        api.env["WEB_PORT"], "{port:web}",
+        "and the other way round: the api is told where the web app is"
+    );
+    assert_eq!(api.env["API_PORT"], "{port:api}", "its own, unchanged");
     assert_eq!(api.ready.clone().unwrap().role.as_deref(), Some("api"));
 
     // The question shows each process with its directory and command.
@@ -987,7 +996,8 @@ fn the_processes_slot_writes_a_table_per_app() {
             ("ports", "[\"web\"]".to_string()),
             (
                 "env",
-                "{ VITE_API_URL = \"http://localhost:{port:api}\" }".to_string()
+                "{ API_PORT = \"{port:api}\", VITE_API_URL = \"http://localhost:{port:api}\" }"
+                    .to_string()
             ),
             ("ready", "{ role = \"web\" }".to_string()),
         ]

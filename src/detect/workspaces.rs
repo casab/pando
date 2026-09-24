@@ -335,6 +335,28 @@ fn cross_references(
     out
 }
 
+/// The bare-port twin of [`cross_references`]: an `<APP>_PORT` the env
+/// example declares for an app that owns a role, as `(app, variable)`.
+///
+/// A project that writes `API_PORT=4000` in its env example has said, once
+/// for every process, where the api listens. A gateway that proxies to the
+/// api reads that same variable — and told nothing, falls back to the
+/// default, which is the main checkout's api whenever one is running. So
+/// the variable goes to every process, carrying the owner's role, and the
+/// two halves of each worktree find each other rather than someone else's.
+fn sibling_port_vars(
+    signals: &Signals,
+    apps: &[WorkspaceApp],
+    owns_role: &[bool],
+) -> Vec<(String, String)> {
+    apps.iter()
+        .zip(owns_role)
+        .filter(|(_, owns)| **owns)
+        .map(|(app, _)| (app.name.clone(), app_port_var(&app.name)))
+        .filter(|(_, var)| signals.env_keys().any(|key| key == var))
+        .collect()
+}
+
 /// The port of a URL that points at this machine, if that is what this is.
 pub(super) fn localhost_url_port(value: &str) -> Option<u16> {
     let (_, after) = value.split_once("://")?;
@@ -376,6 +398,7 @@ pub(super) fn processes_proposal(root: &Path, signals: &Signals) -> Option<Propo
         .map(|(app, port_env)| app.port == PortMechanism::InCommand || !port_env.is_empty())
         .collect();
     let references = cross_references(signals, &apps, &owns_role);
+    let siblings = sibling_port_vars(signals, &apps, &owns_role);
     let mut processes: BTreeMap<String, ProcessConfig> = BTreeMap::new();
     for ((app, port_env), owns_role) in apps.iter().zip(&port_envs).zip(&owns_role) {
         let mut env: BTreeMap<String, String> = BTreeMap::new();
@@ -389,6 +412,15 @@ pub(super) fn processes_proposal(root: &Path, signals: &Signals) -> Option<Propo
                 continue;
             }
             env.insert(key.clone(), template.clone());
+        }
+        for (target, var) in &siblings {
+            if *target == app.name {
+                continue;
+            }
+            // Never over a variable the app already reads for itself: its
+            // own port wins over a sibling's of the same spelling.
+            env.entry(var.clone())
+                .or_insert_with(|| format!("{{port:{target}}}"));
         }
         let roles = if *owns_role {
             vec![app.name.clone()]

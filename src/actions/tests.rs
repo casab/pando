@@ -3731,11 +3731,20 @@ fn a_workspace_app_with_no_way_to_be_told_a_port_gets_neither_a_role_nor_readine
         "and there is nothing for readiness to wait for: {:?}",
         worker.ready
     );
+    // No port of its own. It is told where its siblings listen — a worker
+    // that calls the api reads `API_PORT` like anything else does — and
+    // every such variable carries another app's role, never one of its own.
     assert!(
-        !worker.env.keys().any(|key| key.ends_with("PORT")),
+        !worker.env.contains_key("PORT") && !worker.env.contains_key("WORKER_PORT"),
         "{:?}",
         worker.env
     );
+    for (key, value) in worker.env.iter().filter(|(key, _)| key.ends_with("PORT")) {
+        assert!(
+            value == "{port:api}" || value == "{port:web}",
+            "{key} = {value} is not a sibling's port"
+        );
+    }
     // The apps that *can* be told one still are.
     assert_eq!(config.processes["web"].roles(), vec!["web"]);
     assert_eq!(config.processes["api"].roles(), vec!["api"]);

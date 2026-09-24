@@ -266,12 +266,11 @@ impl Kind {
                             cwd: Some(format!("apps/{app}")),
                             // The env example's `<APP>_PORT` beside the
                             // Node convention: both carry the one port.
+                            // Every app is also told the other's variable.
                             env: BTreeMap::from([
                                 ("PORT".to_string(), format!("{{port:{app}}}")),
-                                (
-                                    format!("{}_PORT", app.to_uppercase()),
-                                    format!("{{port:{app}}}"),
-                                ),
+                                ("API_PORT".to_string(), "{port:api}".to_string()),
+                                ("WEB_PORT".to_string(), "{port:web}".to_string()),
                             ]),
                             ready: Some(ReadySpec {
                                 role: Some(app.to_string()),
@@ -423,10 +422,16 @@ impl Kind {
                         // The reason `{port:<role>}` exists: the web app
                         // has to be told the port the api was given in
                         // this worktree.
-                        env: std::collections::BTreeMap::from([(
-                            "VITE_API_URL".to_string(),
-                            "http://localhost:{port:api}".to_string(),
-                        )]),
+                        // And `API_PORT`, the api's own variable in the
+                        // env example: whatever reads it finds this
+                        // worktree's api, not the default port.
+                        env: std::collections::BTreeMap::from([
+                            (
+                                "VITE_API_URL".to_string(),
+                                "http://localhost:{port:api}".to_string(),
+                            ),
+                            ("API_PORT".to_string(), "{port:api}".to_string()),
+                        ]),
                         ready: Some(ReadySpec {
                             role: Some("web".to_string()),
                             timeout_s: None,
@@ -441,9 +446,12 @@ impl Kind {
                         ports: Some(PortsSpec::List(strings(&["api"]))),
                         // `API_PORT` from the env example, beside the
                         // Node convention the app itself reads.
+                        // `WEB_PORT` is the web app's, told to the api
+                        // the same way.
                         env: std::collections::BTreeMap::from([
                             ("PORT".to_string(), "{port:api}".to_string()),
                             ("API_PORT".to_string(), "{port:api}".to_string()),
+                            ("WEB_PORT".to_string(), "{port:web}".to_string()),
                         ]),
                         ready: Some(ReadySpec {
                             role: Some("api".to_string()),
