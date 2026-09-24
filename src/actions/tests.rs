@@ -5678,6 +5678,68 @@ fn the_root_env_given_to_a_workspace_app_is_linked_not_seeded() {
     assert!(status.trim().is_empty(), "{status}");
 }
 
+// `git worktree add` leaves every submodule empty, and a build that needs
+// one fails far from the cause. pando does not fill them — that clones
+// into `.git` — but it says which, and how.
+#[test]
+fn new_names_the_submodules_it_left_empty() {
+    let fx = fixture();
+    let library = tempdir().unwrap();
+    git(
+        library.path(),
+        &["init", "--quiet", "--initial-branch=main"],
+    );
+    std::fs::write(library.path().join("lib.txt"), "x\n").unwrap();
+    git(library.path(), &["add", "."]);
+    git(library.path(), &["commit", "--quiet", "-m", "lib"]);
+    git(
+        &fx.root,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "--quiet",
+            &library.path().display().to_string(),
+            "vendor/lib",
+        ],
+    );
+    git(&fx.root, &["commit", "--quiet", "-m", "a submodule"]);
+
+    let said = std::cell::RefCell::new(Vec::<String>::new());
+    let name = new(&fx.paths, &fx.config, "feat/sub", None, &|line: &str| {
+        said.borrow_mut().push(line.to_string())
+    })
+    .unwrap();
+    let said = said.borrow();
+    let line = said
+        .iter()
+        .find(|line| line.starts_with("submodules left empty"))
+        .unwrap_or_else(|| panic!("nothing said about the submodule: {said:?}"));
+    assert!(line.contains("vendor/lib"), "{line}");
+    assert!(line.contains("submodule update --init"), "{line}");
+    assert!(
+        !fx.worktrees_dir()
+            .join(&name)
+            .join("vendor/lib/lib.txt")
+            .exists(),
+        "and pando did not fill it"
+    );
+
+    // A project with no submodules hears nothing about them.
+    let plain = fixture();
+    let quiet = std::cell::RefCell::new(Vec::<String>::new());
+    new(
+        &plain.paths,
+        &plain.config,
+        "feat/plain",
+        None,
+        &|line: &str| quiet.borrow_mut().push(line.to_string()),
+    )
+    .unwrap();
+    assert!(!quiet.borrow().iter().any(|l| l.contains("submodule")));
+}
+
 #[test]
 fn a_missing_provision_source_is_skipped_rather_than_invented() {
     let mut fx = fixture();

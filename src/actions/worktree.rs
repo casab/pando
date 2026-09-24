@@ -162,6 +162,9 @@ pub fn new(
             .hooks
             .iter()
             .any(|hook| hook.after == config::HookPoint::Create);
+    for line in uninitialised_submodules(&target) {
+        progress(&line);
+    }
     if installs {
         progress("installing");
     }
@@ -178,6 +181,41 @@ pub fn new(
     run_hooks(paths, config, config::HookPoint::Create, &ctx, progress)
         .with_context(|| format!("{branch} was created, but its install step failed"))?;
     Ok(dir_name)
+}
+
+/// What `new` says about submodules it left empty, one line, or nothing.
+///
+/// `git worktree add` checks out the superproject only, so every submodule
+/// of a new worktree is an empty directory — and a build that needs one
+/// fails far from the cause. pando does not fill them: `submodule update`
+/// clones into `.git`, beyond what `worktree add` records, which Invariant
+/// 1 leaves to the developer. So it says which, and the command that does.
+pub(super) fn uninitialised_submodules(worktree: &Path) -> Vec<String> {
+    if !worktree.join(".gitmodules").is_file() {
+        return Vec::new();
+    }
+    let Ok(out) = crate::project::git(worktree, ["submodule", "status"]) else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    // `-<sha> <path>` is a submodule that was never initialised here.
+    let empty: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix('-'))
+        .filter_map(|rest| rest.split_whitespace().nth(1))
+        .map(str::to_string)
+        .collect();
+    if empty.is_empty() {
+        return Vec::new();
+    }
+    vec![format!(
+        "submodules left empty: {} — pando does not fill them; `git -C {} submodule update \
+         --init --recursive` does, if this worktree needs them",
+        empty.join(", "),
+        worktree.display()
+    )]
 }
 
 /// The first thing `git worktree remove` would refuse over, when there is
