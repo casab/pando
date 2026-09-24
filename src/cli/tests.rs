@@ -2568,6 +2568,11 @@ fn the_brief_teaches_the_things_only_it_teaches() {
             "the one answer the decisions log cannot hold",
         ),
         ("decisions.jsonl", "what pando records about the answerer"),
+        ("Prove it by running", "a setup is proved by starting it"),
+        (
+            "listening on … instead",
+            "the failure a config that reads right hides",
+        ),
         ("exit 3", "the code that means a question is open"),
         ("--json", "never parse human-readable output"),
     ] {

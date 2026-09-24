@@ -318,6 +318,44 @@ yours to fix:
 Do not claim a project starts unless you started it. If you did not run
 `pando start`, say that you did not.
 
+### Prove it by running, when the developer agrees
+
+Rules read files; only a start meets the project. A config every slot of
+which is `decided` can still describe an environment that does not run —
+an app that reads its port from a variable nobody set, a gateway pointed
+at a sibling's default port, a database with no schema. The only way to
+find those is to start it, so ask once whether you may, and then:
+
+```bash
+pando new pando-setup-check              # a scratch worktree, on its own branch
+pando start pando-setup-check --isolated --wait
+pando status pando-setup-check --json    # every process, its phase, its ports
+pando stop pando-setup-check
+```
+
+Read what came back, not what you expected:
+
+- **every process `running`, `observed_ports` equal to `ports`** — it
+  works. Say so, with the URL `status` gave.
+- **a `reason` that says `listening on … instead`** — the process runs,
+  but the port pando assigned never reached it. `observed_ports` shows the
+  port it chose. Which variable it reads is in the project's own code or
+  its env example; if that variable is one pando did not set, that is the
+  finding.
+- **`command not found`** — dependencies are not installed in the
+  worktree. With no install configured, that is the no-lockfile case in §2:
+  report it, and never loosen the install to make it pass.
+- **`connection refused`, or an app log about a missing database or
+  table** — a service is not running, or the schema step is missing.
+  That is the `services` and `schema_hook` questions, not a retry.
+
+A fix that is one of the nine answers goes through `init --answers`, and
+you start the scratch worktree again. A fix that is not — a variable one
+process needs, an app whose own config pins a port — is the developer's:
+name the process, what it did, and the line that would fix it, and write
+nothing. Stop the scratch worktree when you are done and tell the
+developer its name; removing it is theirs, as removing anything is.
+
 ## 7. What pando records about you
 
 Every answer you supply to a question the rules could not decide is
