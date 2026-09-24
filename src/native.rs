@@ -352,7 +352,29 @@ impl Native {
         port: u16,
         url: Option<&str>,
     ) -> Result<Native> {
+        Native::plan_with(paths, worktree, service, recipe, port, url, (None, None))
+    }
+
+    /// [`Native::plan`], with what the app's env says about the service in
+    /// keys of their own: `DATABASE_NAME` beside a bare `DATABASE_PORT`.
+    ///
+    /// Between the URL and the recipe's default in precedence: a URL that
+    /// names a database has said it in the one value the app connects
+    /// with, and a sibling key is still the app's word where the recipe's
+    /// default is only the engine's.
+    pub fn plan_with(
+        paths: &PandoPaths,
+        worktree: &str,
+        service: &str,
+        recipe: Recipe,
+        port: u16,
+        url: Option<&str>,
+        sibling: (Option<String>, Option<String>),
+    ) -> Result<Native> {
         let (url_user, url_db) = url.map(crate::services::url_identity).unwrap_or_default();
+        let (sibling_user, sibling_db) = sibling;
+        let url_user = url_user.or(sibling_user);
+        let url_db = url_db.or(sibling_db);
         let fallback = recipe
             .service()
             .map(|s| (s.db_user.clone(), s.db_name.clone()));
@@ -860,6 +882,70 @@ mod tests {
                 .nth(1),
             Some("c postgres postgres")
         );
+    }
+
+    // A database addressed in parts — a bare port beside a name — names
+    // its database in a key of its own. Without it the recipe had nothing
+    // to create, and the app met a server with no database in it.
+    #[test]
+    fn a_sibling_key_names_the_database_between_the_url_and_the_recipe() {
+        let fx = fixture();
+        let defaults = "kind = \"service\"\nname = \"r\"\n\n[service]\ncmd = \"x\"\n\
+                        db_user = \"root\"\ndb_name = \"mysql\"\n";
+        let sibling = (Some("app_user".to_string()), Some("app_db".to_string()));
+        let from_sibling = Native::plan_with(
+            &fx.paths,
+            "feat+one",
+            "db",
+            recipe(defaults),
+            17_400,
+            Some("17400"),
+            sibling.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            from_sibling
+                .shell_cmd("c {db_user} {db_name}")
+                .unwrap()
+                .lines()
+                .nth(1),
+            Some("c app_user app_db"),
+            "the app's own word beats the engine's default"
+        );
+        let from_url = Native::plan_with(
+            &fx.paths,
+            "feat+one",
+            "db",
+            recipe(defaults),
+            17_400,
+            Some("mysql://url_user@localhost:17400/url_db"),
+            sibling,
+        )
+        .unwrap();
+        assert_eq!(
+            from_url
+                .shell_cmd("c {db_user} {db_name}")
+                .unwrap()
+                .lines()
+                .nth(1),
+            Some("c url_user url_db"),
+            "and the URL the app connects with beats both"
+        );
+        // Spliced into SQL all the same, so held to the same rule.
+        let e = format!(
+            "{:#}",
+            Native::plan_with(
+                &fx.paths,
+                "feat+one",
+                "db",
+                recipe(defaults),
+                17_400,
+                None,
+                (None, Some("x';DROP".to_string())),
+            )
+            .unwrap_err()
+        );
+        assert!(e.contains("plain identifier"), "{e}");
     }
 
     #[test]

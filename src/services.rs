@@ -532,6 +532,52 @@ pub fn url_identity(value: &str) -> (Option<String>, Option<String>) {
     (user, database)
 }
 
+/// Who the app connects as, and to which database, from keys beside the
+/// one that addresses the service: `(user, database)`.
+///
+/// Many projects address a database as parts — `DB_HOST`, `DB_PORT`,
+/// `DB_NAME`, `DB_USER` — rather than as one URL, and only a URL carries a
+/// database name. So for each addressing key `<P>_PORT`, `<P>_HOST` or
+/// `<P>_URL`, the siblings `<P>_NAME`, `<P>_DATABASE` or `<P>_DB` and
+/// `<P>_USER` or `<P>_USERNAME` are read, first found wins. A database
+/// "name" that is all digits is a numbered database — redis's `REDIS_DB=2`
+/// — and not a name anything creates.
+pub fn sibling_identity<'a>(
+    worktree: &Path,
+    keys: impl IntoIterator<Item = &'a str>,
+) -> (Option<String>, Option<String>) {
+    let files = read_env_files(worktree);
+    let lookup = |key: &str| {
+        files
+            .iter()
+            .find_map(|(_, map)| map.get(key))
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let mut user = None;
+    let mut database = None;
+    for key in keys {
+        let Some(prefix) = ["_PORT", "_HOST", "_URL"]
+            .iter()
+            .find_map(|suffix| key.strip_suffix(suffix))
+        else {
+            continue;
+        };
+        if database.is_none() {
+            database = ["_NAME", "_DATABASE", "_DB"]
+                .iter()
+                .filter_map(|suffix| lookup(&format!("{prefix}{suffix}")))
+                .find(|value| !value.chars().all(|c| c.is_ascii_digit()));
+        }
+        if user.is_none() {
+            user = ["_USER", "_USERNAME"]
+                .iter()
+                .find_map(|suffix| lookup(&format!("{prefix}{suffix}")));
+        }
+    }
+    (user, database)
+}
+
 /// The port an env key names in this directory's env files: the port of a
 /// URL, or a bare number.
 ///
@@ -727,6 +773,33 @@ mod tests {
         std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
         let paths = PandoPaths::new(home, ProjectRef::from_root(&root).unwrap());
         (dir, paths)
+    }
+
+    #[test]
+    fn a_service_addressed_in_parts_names_its_database_and_user_in_siblings() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(".env.example"),
+            "DB_HOST=localhost\nDB_PORT=3306\nDB_NAME=shop\nDB_USERNAME=shop_user\n\
+             REDIS_PORT=6379\nREDIS_DB=2\n",
+        )
+        .unwrap();
+        assert_eq!(
+            sibling_identity(dir.path(), ["DB_PORT"]),
+            (Some("shop_user".to_string()), Some("shop".to_string()))
+        );
+        assert_eq!(
+            sibling_identity(dir.path(), ["REDIS_PORT"]),
+            (None, None),
+            "a numbered database is not a name anything creates"
+        );
+        assert_eq!(sibling_identity(dir.path(), ["PORT"]), (None, None));
+        // `.env` is read before the example, as everywhere else.
+        std::fs::write(dir.path().join(".env"), "DB_NAME=shop_local\n").unwrap();
+        assert_eq!(
+            sibling_identity(dir.path(), ["DB_PORT"]).1.as_deref(),
+            Some("shop_local")
+        );
     }
 
     #[test]

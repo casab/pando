@@ -324,6 +324,31 @@ fn native_urls(
     out
 }
 
+/// Each native service's identity as the app's env spells it in keys of
+/// their own, for a service addressed by a bare port or host — see
+/// [`services::sibling_identity`].
+fn native_sibling_identities(
+    paths: &PandoPaths,
+    config: &Config,
+    worktree: &Path,
+) -> BTreeMap<String, (Option<String>, Option<String>)> {
+    let recipes = crate::recipes::Recipes::load(&paths.recipes_dir());
+    let mut out = BTreeMap::new();
+    for entry in native::Entry::all(config) {
+        let recipe = native::resolve(&recipes, &entry).ok().map(|r| r.recipe);
+        let (mapping, _) = entry.env_map(recipe.as_ref());
+        let keys = mapping
+            .iter()
+            .filter(|(_, service)| *service == entry.name)
+            .map(|(key, _)| key.as_str());
+        out.insert(
+            entry.name.to_string(),
+            services::sibling_identity(worktree, keys),
+        );
+    }
+    out
+}
+
 /// Which of several values an app reads for one service says who it
 /// connects as and to which database.
 ///
@@ -595,19 +620,21 @@ fn plan_native(
     }
     let recipes = crate::recipes::Recipes::load(&paths.recipes_dir());
     let urls = native_urls(paths, config, worktree, ports);
+    let siblings = native_sibling_identities(paths, config, worktree);
     let mut planned: Vec<native::Native> = Vec::new();
     for entry in &entries {
         let resolved = native::resolve(&recipes, entry)?;
         let port = *ports
             .get(entry.name)
             .with_context(|| format!("no port was allocated for the service {:?}", entry.name))?;
-        let service = native::Native::plan(
+        let service = native::Native::plan_with(
             paths,
             name,
             entry.name,
             resolved.recipe,
             port,
             urls.get(entry.name).map(String::as_str),
+            siblings.get(entry.name).cloned().unwrap_or_default(),
         )?;
         let missing = service.missing_binaries();
         if !missing.is_empty() {
