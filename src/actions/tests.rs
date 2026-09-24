@@ -1934,6 +1934,65 @@ fn fake_record(pgid: i32) -> ProcessRecord {
     }
 }
 
+// A readiness timeout over a process that is serving — on a port it
+// chose itself — is not a crash, and "nothing bound port N" alone sends
+// the developer looking for one.
+#[test]
+fn a_timeout_names_the_ports_the_process_opened_instead() {
+    let mut store = state::State::new();
+    let mut record = WorktreeRecord::new("/trees/feat+one", true);
+    record.ports.insert("web".to_string(), 17_000);
+    record.ports.insert("api".to_string(), 17_001);
+    let mut web = fake_record(999_901);
+    web.phase = Phase::Failed {
+        at: Utc::now(),
+        reason: "timeout: nothing bound port 17000 in 30s".to_string(),
+    };
+    let mut api = fake_record(999_902);
+    api.phase = Phase::Failed {
+        at: Utc::now(),
+        reason: "timeout: nothing bound port 17001 in 30s".to_string(),
+    };
+    record.processes.insert("web".to_string(), web);
+    record.processes.insert("api".to_string(), api);
+    store.worktrees.insert("feat+one".to_string(), record);
+
+    let scans = BTreeMap::from([
+        (999_901, Some(vec![3000, 3000])),
+        // Listening only on a port the worktree assigned to a role — its
+        // own second role, say — is not listening elsewhere.
+        (999_902, Some(vec![17_000])),
+    ]);
+    assert!(explain_new_failures(&mut store, &[], &scans));
+    let record = &store.worktrees["feat+one"];
+    let Phase::Failed { reason, .. } = &record.processes["web"].phase else {
+        panic!("still failed");
+    };
+    assert!(
+        reason.starts_with("timeout: nothing bound port 17000"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("listening on 3000 instead"),
+        "the port it did open is the diagnosis: {reason}"
+    );
+    let Phase::Failed { reason, .. } = &record.processes["api"].phase else {
+        panic!("still failed");
+    };
+    assert!(!reason.contains("instead"), "{reason}");
+}
+
+#[test]
+fn only_a_timeout_is_explained_by_where_the_process_listens() {
+    assert_eq!(listening_elsewhere(state::EXITED, &[3000], &[17_000]), None);
+    assert_eq!(listening_elsewhere("timeout: x", &[], &[17_000]), None);
+    let note = listening_elsewhere("timeout: x", &[5180, 3001, 17_000], &[17_000]).unwrap();
+    assert!(
+        note.starts_with("it is listening on 3001, 5180 instead"),
+        "{note}"
+    );
+}
+
 // Phase 2b review, finding 4. One flat list per worktree cannot say
 // which group opened which socket, and the URL rule needs exactly that.
 #[test]

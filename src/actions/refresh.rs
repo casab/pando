@@ -154,7 +154,7 @@ fn advance_with(store: &mut state::State, scans: &BTreeMap<i32, Option<Vec<u16>>
         state::advance_phases(store, proc::is_alive, proc::group_alive, |pgid, port| {
             port_is_bound(scans, pgid, port)
         });
-    changed |= explain_new_failures(store, &failed_before);
+    changed |= explain_new_failures(store, &failed_before, scans);
     changed
 }
 
@@ -298,9 +298,14 @@ pub(super) fn capture_observed_ports(
 /// pando is not the process's parent by the time it dies, so there is no
 /// exit status to read. The last lines of its log are the only evidence, and
 /// four patterns cover most of what actually goes wrong.
-fn explain_new_failures(store: &mut state::State, failed_before: &[(String, String)]) -> bool {
+pub(super) fn explain_new_failures(
+    store: &mut state::State,
+    failed_before: &[(String, String)],
+    scans: &BTreeMap<i32, Option<Vec<u16>>>,
+) -> bool {
     let mut changed = false;
     for (name, record) in store.worktrees.iter_mut() {
+        let assigned: Vec<u16> = record.ports.values().copied().collect();
         for (process, p) in record.processes.iter_mut() {
             let Phase::Failed { at, reason } = &p.phase else {
                 continue;
@@ -311,7 +316,12 @@ fn explain_new_failures(store: &mut state::State, failed_before: &[(String, Stri
             {
                 continue;
             }
-            let explained = explain_failure(reason, &p.log_path, proc::group_alive(p.pgid));
+            let mut explained = explain_failure(reason, &p.log_path, proc::group_alive(p.pgid));
+            if let Some(Some(listening)) = scans.get(&p.pgid)
+                && let Some(note) = listening_elsewhere(reason, listening, &assigned)
+            {
+                explained = format!("{explained} — {note}");
+            }
             if &explained == reason {
                 continue;
             }
@@ -345,6 +355,46 @@ fn explain_new_failures(store: &mut state::State, failed_before: &[(String, Stri
 /// looks identical from the leader's exit status, and is not the wrong
 /// command. Read after the phases are advanced, so the leader has already
 /// been reaped and a zombie cannot hold its own group open.
+/// What a readiness timeout leaves out when the process is up and serving,
+/// just not where pando waited: the ports it did open.
+///
+/// "Nothing bound port 17002" over a server listening on 3000 sends a
+/// developer looking for a crash that did not happen. The real failure is
+/// that the port pando assigned never reached the process — its own env
+/// file, its config, or a variable pando did not set chose another one —
+/// and those ports are the whole of the evidence for that. A port another
+/// role of the same worktree owns is not "elsewhere": a process that
+/// serves two roles has opened one of its own.
+pub(super) fn listening_elsewhere(
+    reason: &str,
+    listening: &[u16],
+    assigned: &[u16],
+) -> Option<String> {
+    if !reason.starts_with("timeout") {
+        return None;
+    }
+    let mut elsewhere: Vec<u16> = listening
+        .iter()
+        .copied()
+        .filter(|port| !assigned.contains(port))
+        .collect();
+    elsewhere.sort_unstable();
+    elsewhere.dedup();
+    if elsewhere.is_empty() {
+        return None;
+    }
+    let ports = elsewhere
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "it is listening on {ports} instead: the port pando assigned never reached it — \
+         check which variable or flag it reads its port from, and whether a value in its own \
+         env file or config wins over the one pando passed"
+    ))
+}
+
 /// How many lines of a failed process's log a front end shows under its
 /// reason: enough for a stack trace's closing frames, not a screenful.
 pub const FAILURE_SHOWN_LINES: usize = 10;
