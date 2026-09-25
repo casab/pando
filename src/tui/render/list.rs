@@ -13,9 +13,9 @@
 //!    ✗ fix/crash       │             │        │          │     │ failed
 //! ```
 //!
-//! Faint lines divide the columns and rule the rows apart, while every
-//! row fits with a rule under it; a list longer than that closes up, and
-//! keeps its column lines.
+//! Faint lines divide the columns and rule every row from the next; a
+//! list longer than the pane scrolls under the cursor. Only a pane too
+//! short for three ruled rows closes them up.
 //!
 //! A column is only there when some row has something in it, and its
 //! title goes with it.
@@ -456,12 +456,12 @@ pub(super) fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
         }
     }
     let room = height.saturating_sub(lines.len());
-    // A rule between rows while every row fits with one; past that the
-    // rows close up, because a list of thirty that scrolls to show half of
-    // them is worse than one without the lines.
-    let ruled = rows.len() * 2 - 1 <= room;
-    let per_row = if ruled { 2 } else { 1 };
-    let visible = if ruled { rows.len() } else { room.max(1) };
+    // A rule between every two rows: a list longer than the pane scrolls
+    // under the cursor rather than losing its lines. Only a pane too short
+    // for three ruled rows — a small tmux split — closes them up, where a
+    // rule would cost a whole row.
+    let ruled = room >= 5 || rows.len() * 2 - 1 <= room;
+    let visible = if ruled { room.div_ceil(2) } else { room }.max(1);
     let selected = app.list_state.selected();
     let mut offset = app.list_state.offset();
     if let Some(sel) = selected {
@@ -484,7 +484,11 @@ pub(super) fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
         if lines.len() + 1 > height {
             break;
         }
-        if i > offset && per_row == 2 {
+        if i > offset && ruled {
+            // A rule with no row under it is a line spent on nothing.
+            if lines.len() + 2 > height {
+                break;
+            }
             lines.push(rule());
         }
         let is_selected = selected == Some(i);

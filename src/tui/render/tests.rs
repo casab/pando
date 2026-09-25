@@ -719,7 +719,7 @@ fn long_labels_keep_the_part_that_tells_them_apart() {
     for wt in &mut app.worktrees {
         wt.branch = Some(wt.name.replace('+', "/"));
     }
-    let rendered = text_of(&draw(&mut app, 80, 20));
+    let rendered = text_of(&draw(&mut app, 80, 30));
     for n in [1, 7, 12] {
         assert!(
             rendered.contains(&format!("number-{n}-")),
@@ -2922,21 +2922,22 @@ fn rows_are_ruled_apart_and_columns_divided_when_they_fit() {
     );
 }
 
-// Thirty rows with a rule under each is a list that shows fifteen.
+// However long the list, every row is ruled from the next; the rest is
+// reached by scrolling.
 #[test]
-fn rows_close_up_when_the_rules_would_hide_some() {
+fn a_long_list_keeps_its_rules_and_scrolls() {
     let names: Vec<String> = (0..12).map(|i| format!("feat+n{i:02}")).collect();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     let mut app = test_app(&refs);
     let rendered = text_of(&draw(&mut app, 140, 16));
-    let rules = rendered
-        .lines()
-        .filter(|line| line.starts_with("│─") && line.contains('┼'))
-        .count();
-    assert!(rules <= 1, "only the header's, if any:\n{rendered}");
+    let lines: Vec<&str> = rendered.lines().collect();
+    let first = lines.iter().position(|l| l.contains("○ feat/n00")).unwrap();
+    let second = lines.iter().position(|l| l.contains("○ feat/n01")).unwrap();
+    assert_eq!(second, first + 2, "a rule between them:\n{rendered}");
+    assert!(lines[first + 1].contains('┼'), "{rendered}");
     assert!(
-        rendered.contains("feat/n00") && rendered.contains("feat/n05"),
-        "{rendered}"
+        !rendered.contains("feat/n11"),
+        "the rest is below:\n{rendered}"
     );
 }
 
