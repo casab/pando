@@ -294,7 +294,7 @@ fn git_row(app: &App, wt: &crate::worktree::Worktree, width: usize) -> Line<'sta
     let mut parts: Vec<(String, Style)> = Vec::new();
     match wt.dirty {
         Some(true) => parts.push((
-            "edited · uncommitted changes".to_string(),
+            "uncommitted changes".to_string(),
             Style::new().fg(yellow()).add_modifier(Modifier::BOLD),
         )),
         Some(false) => parts.push(("clean".to_string(), Style::new().fg(text_dim()))),

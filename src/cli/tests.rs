@@ -2161,7 +2161,7 @@ fn the_listing_shows_mode_and_public_only_when_some_worktree_has_them() {
 }
 
 #[test]
-fn ls_text_marks_adopted_dirty_and_gone_worktrees() {
+fn ls_text_marks_adopted_uncommitted_and_prunable_worktrees() {
     let fx = fixture();
     let adopted = fx.root.parent().unwrap().join("adopted");
     git(
@@ -2185,7 +2185,7 @@ fn ls_text_marks_adopted_dirty_and_gone_worktrees() {
     std::fs::remove_dir_all(fx.paths.worktrees_dir().join(&gone)).unwrap();
 
     let text = capture(|b| ls_text_at(&fx.paths, b, usize::MAX));
-    for word in ["adopted", "dirty", "gone"] {
+    for word in ["adopted", "uncommitted", "prunable"] {
         assert!(text.contains(word), "missing {word:?} in:\n{text}");
     }
 }

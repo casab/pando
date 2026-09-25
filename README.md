@@ -146,7 +146,7 @@ sharing it, and removing it ask in a dialog instead. On a stopped
 worktree nothing asks.
 
 The list is a table with a header row: `branch`, then `changes`
-(`edited` when there are uncommitted changes), `port`, `public` (`◈`
+(`uncommitted` when there are uncommitted changes), `port`, `public` (`◈`
 while it is shared), `mode` (`isolated` when it runs private copies of
 the services), `git` (commits ahead of and behind the base branch), `PR`
 and `status` (`failed`, or what is being done to it). A column shows

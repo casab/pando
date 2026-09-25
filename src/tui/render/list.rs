@@ -6,10 +6,10 @@
 //! column, so a cell never has to be decoded from help:
 //!
 //! ```text
-//!      branch          changes  port    other ports  public  mode      git      PR   status
-//!  ▸ ● feat/checkout   edited   :17342  api:17343    ◈       isolated  ↑2       ◍42
+//!      branch         changes      port    other ports  public  mode      git  PR   status
+//!  ▸ ● feat/checkout  uncommitted  :17342  api:17343    ◈       isolated  ↑2   ◍42
 //!    ○ fix/typo
-//!    ✗ fix/crash                                                                     failed
+//!    ✗ fix/crash                                                                    failed
 //! ```
 //!
 //! A column is only there when some row has something in it, and its
@@ -23,7 +23,7 @@
 //! about what a key does — the detail pane and the remove dialog say it
 //! where it matters.
 //!
-//! `edited`, for uncommitted changes, sits right after the label and is
+//! `uncommitted` sits right after the label and is
 //! never shed: it is what stops a removal, and what somebody switching
 //! branches most needs to see.
 
@@ -64,7 +64,7 @@ const ROW_NAME_MIN: usize = 12;
 /// label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Col {
-    /// `edited` for uncommitted changes. Never shed.
+    /// `uncommitted` for uncommitted changes. Never shed.
     Dirty,
     /// The directory name, when it is not just the branch with its
     /// slashes encoded — an adopted worktree somebody named themselves.
@@ -79,7 +79,7 @@ pub enum Col {
     Share,
     /// `isolated` for a worktree with private copies of the services.
     Mode,
-    /// Ahead and behind, or gone or locked.
+    /// Ahead and behind, or prunable or locked.
     Signals,
     Pr,
     /// `failed`, or what is being done to it: `starting`, `stopping`…
@@ -252,7 +252,11 @@ fn row_cells(app: &App, wt: &Worktree) -> RowCells {
         ));
     }
     if wt.dirty == Some(true) && !wt.prunable && !wt.locked {
-        cells.push((Col::Dirty, "edited".to_string(), Style::new().fg(yellow())));
+        cells.push((
+            Col::Dirty,
+            "uncommitted".to_string(),
+            Style::new().fg(yellow()),
+        ));
     }
     let drift = drift_text(wt);
     if !drift.is_empty() {
@@ -503,7 +507,7 @@ pub(super) fn drift_text(wt: &Worktree) -> String {
 /// how far the branch has drifted.
 pub(super) fn signal_text(wt: &Worktree) -> String {
     if wt.prunable {
-        return "gone".to_string();
+        return "prunable".to_string();
     }
     if wt.locked {
         return "locked".to_string();

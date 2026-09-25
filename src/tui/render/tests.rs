@@ -664,7 +664,7 @@ fn a_header_row_names_each_column_over_its_cells() {
     let row = list_row(&rendered, "feat/one");
     for (title, cell) in [
         ("branch", "feat/one"),
-        ("changes", "edited"),
+        ("changes", "uncommitted"),
         ("port", ":17342"),
         ("mode", "isolated"),
         ("git", "↑1"),
@@ -816,7 +816,7 @@ fn the_detail_pane_shows_the_public_url_under_the_local_one() {
 fn signals_report_gone_locked_dirty_and_drift() {
     let mut gone = wt("g");
     gone.prunable = true;
-    assert_eq!(signal_text(&gone), "gone");
+    assert_eq!(signal_text(&gone), "prunable");
 
     let mut locked = wt("l");
     locked.locked = true;
@@ -2200,7 +2200,7 @@ fn removing_a_running_worktree_warns_that_it_stops_it() {
 
 // ---- git state on screen ---------------------------------------------
 
-// A worktree with uncommitted changes says `edited` right after its
+// A worktree with uncommitted changes says `uncommitted` right after its
 // label, even on a pane too narrow for the drift column.
 #[test]
 fn a_dirty_worktree_is_marked_in_the_list_at_any_width() {
@@ -2209,9 +2209,9 @@ fn a_dirty_worktree_is_marked_in_the_list_at_any_width() {
     for width in [60, 100, 200] {
         let rendered = text_of(&draw(&mut app, width, 12));
         let row = list_row(&rendered, "feat/tui");
-        assert!(row.contains("edited"), "at {width}:\n{rendered}");
+        assert!(row.contains("uncommitted"), "at {width}:\n{rendered}");
         assert!(
-            !list_row(&rendered, "feat/clean").contains("edited"),
+            !list_row(&rendered, "feat/clean").contains("uncommitted"),
             "at {width}:\n{rendered}"
         );
     }
@@ -2227,7 +2227,7 @@ fn the_detail_pane_has_a_git_row() {
         .lines()
         .find(|line| line.contains("│ git "))
         .unwrap_or_default();
-    assert!(row.contains("edited · uncommitted changes"), "{rendered}");
+    assert!(row.contains("uncommitted changes"), "{rendered}");
     assert!(row.contains("↑2 ahead, ↓1 behind of main"), "{rendered}");
 
     app.worktrees[0].dirty = Some(false);

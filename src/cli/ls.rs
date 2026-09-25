@@ -470,18 +470,18 @@ fn mode_cell(record: Option<&WorktreeRecord>) -> Cell {
     }
 }
 
-/// What git has to say, ordered by how much it should stop you — a gone or
-/// locked entry, then dirty — then how far it is ahead of and behind the
+/// What git has to say, in git's own words, ordered by how much it should
+/// stop you — a prunable or locked entry, then uncommitted changes — then how far it is ahead of and behind the
 /// base branch, and
 /// whether pando made it: `rm` asks before removing one it did not.
 fn git_cell(w: &Worktree, created_by_pando: bool) -> Cell {
     let (word, paint) = if w.prunable {
-        ("gone", Paint::Bad)
+        ("prunable", Paint::Bad)
     } else if w.locked {
         ("locked", Paint::Bad)
     } else {
         match w.dirty {
-            Some(true) => ("dirty", Paint::Warn),
+            Some(true) => ("uncommitted", Paint::Warn),
             Some(false) => ("clean", Paint::Faint),
             None => ("?", Paint::Faint),
         }

@@ -133,8 +133,12 @@ pub const LIST_LEGEND: &[(&str, &str)] = &[
     ("✗", "failed — ⏎ shows the log that says why"),
     ("○", "stopped — s starts it"),
     (
-        "edited",
-        "changes: uncommitted — the detail pane's git row says more",
+        "uncommitted",
+        "changes: uncommitted changes — the detail pane's git row says more",
+    ),
+    (
+        "prunable",
+        "git: its directory is missing — git worktree prune removes the entry",
     ),
     (":17342", "port: where it serves — c copies the URL"),
     (
