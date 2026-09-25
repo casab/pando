@@ -585,10 +585,14 @@ pub fn sibling_identity<'a>(
 /// already runs, on the ports the project's own files say, so pando reads
 /// rather than assigns.
 pub fn port_in_env(dir: &Path, key: &str) -> Option<u16> {
-    let value = read_env_files(dir)
+    port_of_value(&value_in_env(dir, key)?)
+}
+
+/// The value an env key has in this directory's env files, in lookup order.
+pub fn value_in_env(dir: &Path, key: &str) -> Option<String> {
+    read_env_files(dir)
         .iter()
-        .find_map(|(_, map)| map.get(key).cloned())?;
-    port_of_value(&value)
+        .find_map(|(_, map)| map.get(key).cloned())
 }
 
 fn port_of_value(value: &str) -> Option<u16> {

@@ -21,8 +21,8 @@ use super::runtime::with_prelude;
 use super::services::{
     Fresh, bring_up_services, clear_native_sockets, compose_projects, forget_hooks_after_services,
     forget_unstarted_services, has_live_services, planned_services, preflight_isolation,
-    resolve_service_env, service_roles, stop_containers, stop_service_pumps, undo_failed_isolation,
-    worktree_url,
+    resolve_service_env, service_roles, shared_service_env, stop_containers, stop_service_pumps,
+    undo_failed_isolation, worktree_url,
 };
 use super::share::{sweep_dead_shares_with, take_share_down};
 // Only for the intra-doc link above `sweep_orphaned_groups`.
@@ -516,7 +516,7 @@ fn start_checked(
     let service_env = if isolate {
         resolve_service_env(paths, config, &canonical, &assignment.ports).map_err(undo)?
     } else {
-        BTreeMap::new()
+        shared_service_env(paths, config)
     };
 
     // The lifecycle in order: create (which is where the install step

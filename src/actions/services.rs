@@ -1302,6 +1302,38 @@ pub fn recorded_service_statuses(record: &WorktreeRecord) -> Vec<ServiceStatus> 
 /// through the key the `[[services]]` entry maps to that service. That is
 /// the number the developer's own `docker compose up` published, which is
 /// exactly what the header chip is claiming to know about.
+/// What a shared start tells its processes about the services: each service
+/// key — `DATABASE_PORT`, `REDIS_URL` — with the value the main checkout's
+/// own env files give it.
+///
+/// Shared means the main checkout's services, and the worktree's own env
+/// file is not always the main checkout's: one another tool made for an
+/// isolated run carries that tool's private port, and the app went looking
+/// for a database nobody was running. The environment wins over a dotenv
+/// file that does not override, which is how these are read; a process's
+/// own `env` in `pando.toml` still wins over this.
+pub fn shared_service_env(paths: &PandoPaths, config: &Config) -> BTreeMap<String, String> {
+    let mut keys: Vec<String> = Vec::new();
+    for entry in compose_entries(config) {
+        keys.extend(entry.env.keys().map(|key| key.to_string()));
+    }
+    let native = native::Entry::all(config);
+    if !native.is_empty() {
+        let recipes = crate::recipes::Recipes::load(&paths.recipes_dir());
+        for entry in &native {
+            let recipe = native::resolve(&recipes, entry).ok().map(|r| r.recipe);
+            let (mapping, _) = entry.env_map(recipe.as_ref());
+            keys.extend(mapping.keys().map(|key| key.to_string()));
+        }
+    }
+    keys.into_iter()
+        .filter_map(|key| {
+            let value = services::value_in_env(paths.root(), &key)?;
+            Some((key, value))
+        })
+        .collect()
+}
+
 pub fn shared_service_statuses(paths: &PandoPaths, config: &Config) -> Vec<ServiceStatus> {
     let mut out: Vec<ServiceStatus> = Vec::new();
     let mut add = |key: &str, service: &str| {

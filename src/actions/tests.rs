@@ -537,6 +537,49 @@ fn a_process_that_backgrounds_its_server_is_not_called_dead() {
 /// Through `refresh`, so the liveness check and the port scan are the
 /// real ones rather than closures saying what this test would like to
 /// hear.
+// A worktree whose own `.env` another tool wrote for an isolated run
+// points at a database nobody runs. Started shared, the app is told the
+// main checkout's port in its environment, which a dotenv file that does
+// not override leaves alone.
+#[test]
+fn a_shared_start_tells_the_app_the_main_checkouts_service_ports() {
+    let mut fx = fixture();
+    std::fs::write(fx.root.join(".env"), "DATABASE_PORT=3306\n").unwrap();
+    let services: Config = toml::from_str(
+        "[[services]]\nkind = \"native\"\nname = \"mariadb\"\nenv = { DATABASE_PORT = \"mariadb\" }\n",
+    )
+    .unwrap();
+    fx.config.services = services.services;
+    let seen = fx.root.parent().unwrap().join("seen-env");
+    with_dev(
+        &mut fx,
+        ProcessConfig {
+            cmd: format!("env > {}; sleep 30", seen.display()),
+            ports: Some(crate::config::PortsSpec::List(Vec::new())),
+            ..Default::default()
+        },
+    );
+    let name = worktree_named(&fx, "feat/one");
+    std::fs::write(
+        fx.worktrees_dir().join(&name).join(".env"),
+        "DATABASE_PORT=52434\n",
+    )
+    .unwrap();
+
+    let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+    let _guard = guard(&outcome);
+    assert!(
+        wait_until(Duration::from_secs(5), || std::fs::read_to_string(&seen)
+            .is_ok_and(|env| env.contains("DATABASE_PORT="))),
+        "the process never wrote its environment"
+    );
+    let env = std::fs::read_to_string(&seen).unwrap();
+    assert!(
+        env.lines().any(|line| line == "DATABASE_PORT=3306"),
+        "{env}"
+    );
+}
+
 #[test]
 fn a_process_that_owns_no_ports_starts_and_reaches_running() {
     let mut fx = fixture();
