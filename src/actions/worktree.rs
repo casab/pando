@@ -601,12 +601,29 @@ pub fn new_for_pr(
     progress: &dyn Fn(&str),
 ) -> Result<String> {
     let branch = pr.local_branch();
-    if !pr.cross_repository {
-        return new(paths, config, &branch, None, progress);
-    }
     let root = paths.root().to_path_buf();
     validate_branch_name(&root, &branch)?;
     if ref_exists(&root, &format!("refs/heads/{branch}")) {
+        return new(paths, config, &branch, None, progress);
+    }
+    if !pr.cross_repository {
+        // `new` of a name it cannot find forks a new branch of that name,
+        // which here would be an empty worktree that looks like the pull
+        // request. `gh` may be answering for a remote other than `origin`
+        // — `upstream`, with `origin` somebody's fork — so it is looked
+        // for first, and its absence said.
+        let tracking = format!("refs/remotes/origin/{branch}");
+        if has_origin(&root) && !ref_exists(&root, &tracking) {
+            progress(&format!("looking for origin/{branch}"));
+            fetch_branch(&root, &branch, crate::project::GIT_TIMEOUT)?;
+        }
+        if !ref_exists(&root, &tracking) {
+            bail!(
+                "#{}'s branch {branch} is not on origin — gh may list pull requests from \
+                 another remote; fetch the branch, then try again",
+                pr.number
+            );
+        }
         return new(paths, config, &branch, None, progress);
     }
     if !has_origin(&root) {

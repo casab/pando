@@ -761,16 +761,26 @@ impl PrInfo {
 /// Pull requests via the `gh` CLI, which resolves the repository from the
 /// checkout's origin remote. Errors carry enough context to explain a
 /// missing or unauthenticated `gh`; callers treat that as "no chips".
+///
+/// Every open one, and the most recent of the rest: one list of every
+/// state would cut off an open pull request older than the newest few
+/// hundred merged ones, and the picker lists only the open.
 pub fn list_prs(root: &Path) -> Result<Vec<PrInfo>> {
+    let open = gh_pr_list(root, "open", "1000")?;
+    let recent = gh_pr_list(root, "all", "300")?;
+    Ok(merge_pr_lists(open, recent))
+}
+
+fn gh_pr_list(root: &Path, state: &str, limit: &str) -> Result<Vec<PrInfo>> {
     let out = Command::new("gh")
         .current_dir(root)
         .args([
             "pr",
             "list",
             "--state",
-            "all",
+            state,
             "--limit",
-            "300",
+            limit,
             "--json",
             "number,title,headRefName,author,isDraft,state,url,isCrossRepository",
         ])
@@ -783,6 +793,35 @@ pub fn list_prs(root: &Path) -> Result<Vec<PrInfo>> {
         );
     }
     parse_pr_list(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Both lists as one, each pull request once, newest first — the order
+/// `gh` gives each of them.
+fn merge_pr_lists(open: Vec<PrInfo>, recent: Vec<PrInfo>) -> Vec<PrInfo> {
+    let mut merged = open;
+    for pr in recent {
+        if !merged.iter().any(|p| p.number == pr.number) {
+            merged.push(pr);
+        }
+    }
+    merged.sort_by(|a, b| b.number.cmp(&a.number));
+    merged
+}
+
+/// Pull requests by the local branch a worktree for each checks out, so
+/// a fork's `main` is not the main checkout's. Where two share a branch
+/// — one merged, a later one opened from the same name — the newest wins.
+pub fn prs_by_branch(prs: &[PrInfo]) -> std::collections::BTreeMap<String, PrInfo> {
+    let mut by_branch = std::collections::BTreeMap::new();
+    for pr in prs {
+        let newer = by_branch
+            .get(&pr.local_branch())
+            .is_none_or(|kept: &PrInfo| kept.number < pr.number);
+        if newer {
+            by_branch.insert(pr.local_branch(), pr.clone());
+        }
+    }
+    by_branch
 }
 
 /// Which GitHub account `gh` acts as for a checkout.
@@ -1377,6 +1416,54 @@ bare
         assert_eq!(prs[2].state, PrState::Closed);
         assert!(!prs[0].cross_repository);
         assert!(prs[2].cross_repository);
+    }
+
+    fn pr(number: u32, branch: &str, state: PrState, fork: bool) -> PrInfo {
+        PrInfo {
+            number,
+            title: String::new(),
+            branch: branch.into(),
+            author: String::new(),
+            draft: false,
+            state,
+            url: String::new(),
+            cross_repository: fork,
+        }
+    }
+
+    // An open pull request older than the newest few hundred is in the
+    // open list only; one in both is kept once.
+    #[test]
+    fn the_open_list_and_the_recent_one_merge_newest_first() {
+        let open = vec![
+            pr(40, "a", PrState::Open, false),
+            pr(3, "old", PrState::Open, false),
+        ];
+        let recent = vec![
+            pr(41, "b", PrState::Merged, false),
+            pr(40, "a", PrState::Open, false),
+        ];
+        let numbers: Vec<u32> = merge_pr_lists(open, recent)
+            .iter()
+            .map(|p| p.number)
+            .collect();
+        assert_eq!(numbers, vec![41, 40, 3]);
+    }
+
+    #[test]
+    fn prs_by_branch_keeps_the_newest_and_keys_a_fork_by_its_own_branch() {
+        let prs = [
+            pr(20, "feat/x", PrState::Open, false),
+            pr(15, "main", PrState::Open, true),
+            pr(9, "feat/x", PrState::Merged, false),
+        ];
+        let by_branch = prs_by_branch(&prs);
+        assert_eq!(
+            by_branch["feat/x"].number, 20,
+            "not the merged one before it"
+        );
+        assert!(!by_branch.contains_key("main"), "a fork's main is not ours");
+        assert_eq!(by_branch["pr-15/main"].number, 15);
     }
 
     #[test]

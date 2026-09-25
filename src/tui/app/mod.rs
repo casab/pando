@@ -419,7 +419,7 @@ impl App {
             AppEvent::PrsReady(Ok(prs)) => {
                 self.pr_fetching = false;
                 self.pr_error = None;
-                self.prs = prs.iter().map(|p| (p.branch.clone(), p.clone())).collect();
+                self.prs = worktree::prs_by_branch(&prs).into_iter().collect();
                 self.pr_list = prs;
                 self.save_pr_cache();
                 true

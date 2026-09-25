@@ -194,6 +194,9 @@ impl App {
         mut selected: usize,
     ) {
         let count = pr_rows(&self.pr_list, &input).len();
+        // The list can shrink under the cursor when a fetch lands; the
+        // paint clamps it, and enter must take the row the paint showed.
+        selected = selected.min(count.saturating_sub(1));
         match key.code {
             KeyCode::Esc => return,
             KeyCode::Down => selected = (selected + 1).min(count.saturating_sub(1)),

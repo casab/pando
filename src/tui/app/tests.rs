@@ -543,6 +543,35 @@ fn enter_on_a_pull_request_with_a_worktree_selects_it() {
     );
 }
 
+// A fetch that lands while the picker is open can shorten the list; enter
+// takes the row the paint showed selected, not nothing.
+#[test]
+fn enter_after_the_list_shrank_takes_the_last_row() {
+    let mut app = app_with_prs(&["feat+two"]);
+    press(&mut app, KeyCode::Char('p'));
+    press(&mut app, KeyCode::Down);
+    app.handle_event(AppEvent::PrsReady(Ok(vec![a_pr(
+        12,
+        "feat/new",
+        crate::worktree::PrState::Open,
+    )])));
+    press(&mut app, KeyCode::Enter);
+    let pending = app.pending.as_ref().expect("a worker started");
+    assert_eq!(pending.label, "#12 feat/new");
+}
+
+#[test]
+fn a_forks_pull_request_is_not_the_chip_of_the_main_branch() {
+    let mut app = test_app(&["feat+one"]);
+    let fork = crate::worktree::PrInfo {
+        cross_repository: true,
+        ..a_pr(5, "main", crate::worktree::PrState::Open)
+    };
+    app.handle_event(AppEvent::PrsReady(Ok(vec![fork])));
+    assert!(!app.prs.contains_key("main"));
+    assert_eq!(app.prs["pr-5/main"].number, 5);
+}
+
 #[test]
 fn the_picker_says_why_it_has_no_pull_requests() {
     let mut app = test_app(&["feat+one"]);

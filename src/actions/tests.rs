@@ -5513,6 +5513,23 @@ fn a_pull_request_from_a_fork_is_fetched_into_a_branch_of_its_own() {
     assert_eq!(fx.names(), vec!["pr-7+main"]);
 }
 
+// Not an empty branch of the same name, which `new` would fork: a
+// worktree that looks like the pull request and holds none of it.
+#[test]
+fn a_pull_request_whose_branch_is_not_on_origin_is_refused() {
+    let fx = fixture_with_origin(&[]);
+    let err = new_for_pr(
+        &fx.paths,
+        &fx.config,
+        &open_pr(4, "feat/elsewhere", false),
+        &noop,
+    )
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("is not on origin"), "{err:#}");
+    assert!(!ref_exists(&fx.root, "refs/heads/feat/elsewhere"));
+    assert!(fx.names().is_empty());
+}
+
 #[test]
 fn a_fork_pull_request_origin_does_not_have_leaves_no_branch_behind() {
     let fx = fixture_with_origin(&[]);
