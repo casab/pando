@@ -3128,3 +3128,120 @@ fn the_slot_question_at_exit_3_says_how_it_is_answered_and_offers_no_flag() {
     assert_eq!(answer.unwrap(), actions::Answer::None);
     assert!(printed.contains("free nothing"), "{printed}");
 }
+
+// ---- namespaces in status ---------------------------------------------------------
+
+fn with_namespaces(fx: &Fx, name: &str, mode: crate::state::ServiceMode) {
+    let mut store = crate::state::load(&fx.paths.state_file()).unwrap();
+    let record = store.worktrees.get_mut(name).unwrap();
+    record.mode = Some(mode);
+    for (service, kind, ns, host, port) in [
+        (
+            "mariadb",
+            crate::state::NamespaceKind::Database,
+            "shop__feat_one",
+            "localhost",
+            3306,
+        ),
+        (
+            "redis",
+            crate::state::NamespaceKind::Slot,
+            "3",
+            "127.0.0.1",
+            6379,
+        ),
+    ] {
+        record.namespaces.push(crate::state::NamespaceRecord {
+            service: service.into(),
+            recipe: service.into(),
+            kind,
+            host: host.into(),
+            port,
+            name: ns.into(),
+            main: "shop".into(),
+            keys: Vec::new(),
+            used_at: Utc::now(),
+        });
+    }
+    crate::state::save(&fx.paths.state_file(), &store).unwrap();
+}
+
+// Each namespace a worktree holds is in `status --json`, database by name
+// and slot by number, on the server it was made on — and whether the
+// worktree runs on it now or keeps it for the way back.
+#[test]
+fn status_json_lists_the_namespaces_a_worktree_holds() {
+    use crate::state::ServiceMode;
+    let fx = fixture();
+    let name = actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
+    with_namespaces(&fx, &name, ServiceMode::Namespaced);
+    let text = capture(|b| status_json(&fx.paths, None, b));
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let namespaces = &v["worktrees"][0]["namespaces"];
+    assert_eq!(namespaces[0]["service"], "mariadb");
+    assert_eq!(namespaces[0]["database"], "shop__feat_one");
+    assert!(namespaces[0].get("slot").is_none());
+    assert_eq!(namespaces[0]["host"], "localhost");
+    assert_eq!(namespaces[0]["port"], 3306);
+    assert_eq!(namespaces[0]["in_use"], true);
+    assert_eq!(namespaces[1]["slot"], 3);
+    assert!(namespaces[1].get("database").is_none());
+
+    let mut store = crate::state::load(&fx.paths.state_file()).unwrap();
+    store.worktrees.get_mut(&name).unwrap().mode = Some(ServiceMode::Shared);
+    crate::state::save(&fx.paths.state_file(), &store).unwrap();
+    let text = capture(|b| status_json(&fx.paths, None, b));
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["worktrees"][0]["namespaces"][0]["in_use"], false);
+
+    // Every field is in the contract, and the contract says them.
+    let doc = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("agent/json.md"),
+    )
+    .unwrap();
+    for field in ["\"namespaces\"", "\"database\"", "\"slot\"", "\"in_use\""] {
+        assert!(doc.contains(field), "agent/json.md never mentions {field}");
+    }
+}
+
+// `status` says per service what the worktree holds: its own database and
+// slot while it runs namespaced, and the same, kept until `rm`, once it
+// runs in another mode.
+#[test]
+fn status_text_says_what_a_worktree_holds_in_each_service() {
+    use crate::state::ServiceMode;
+    let fx = fixture();
+    let name = actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
+    with_namespaces(&fx, &name, ServiceMode::Namespaced);
+    let text = capture(|b| status_text_at(&fx.paths, None, b, usize::MAX));
+    assert!(
+        text.lines().any(|l| l.contains("mariadb")
+            && l.contains("own")
+            && l.contains("database shop__feat_one on localhost:3306")),
+        "{text}"
+    );
+    assert!(
+        text.lines()
+            .any(|l| l.contains("redis") && l.contains("slot 3 on 127.0.0.1:6379")),
+        "{text}"
+    );
+
+    let mut store = crate::state::load(&fx.paths.state_file()).unwrap();
+    store.worktrees.get_mut(&name).unwrap().mode = Some(ServiceMode::Shared);
+    crate::state::save(&fx.paths.state_file(), &store).unwrap();
+    let text = capture(|b| status_text_at(&fx.paths, None, b, usize::MAX));
+    assert!(
+        text.lines()
+            .any(|l| l.contains("kept") && l.contains("shop__feat_one") && l.contains("until rm")),
+        "{text}"
+    );
+}
+
+#[test]
+fn three_flags_mean_three_modes_and_none_is_the_remembered_one() {
+    use actions::Mode;
+    assert_eq!(Mode::of(false, false, false), Mode::Remembered);
+    assert_eq!(Mode::of(true, false, false), Mode::Isolated);
+    assert_eq!(Mode::of(false, true, false), Mode::Namespaced);
+    assert_eq!(Mode::of(false, false, true), Mode::Shared);
+}

@@ -92,7 +92,28 @@ struct StatusWorktreeOut {
     share: Option<ShareOut>,
     processes: BTreeMap<String, ProcessOut>,
     services: BTreeMap<String, ServiceOut>,
+    /// What it holds in the main checkout's own servers: a database or a
+    /// slot of its own, one per service.
+    namespaces: Vec<NamespaceOut>,
     hooks: BTreeMap<String, HookOut>,
+}
+
+/// One namespace a worktree holds. Never its login: that is not in state,
+/// and this shape is printed, logged and piped into things.
+#[derive(Serialize)]
+struct NamespaceOut {
+    service: String,
+    /// The database's name, for a database.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    database: Option<String>,
+    /// The slot's number, for a slot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slot: Option<u32>,
+    host: String,
+    port: u16,
+    /// Whether the worktree runs on it now. `false` for one kept through a
+    /// switch to another mode, which `rm` still drops.
+    in_use: bool,
 }
 
 #[derive(Serialize)]
@@ -192,6 +213,22 @@ pub fn status_json<W: Write>(paths: &PandoPaths, only: Option<&str>, out: &mut W
                             )
                         })
                         .collect(),
+                    namespaces: record
+                        .namespaces
+                        .iter()
+                        .map(|ns| NamespaceOut {
+                            service: ns.service.clone(),
+                            database: (ns.kind == crate::state::NamespaceKind::Database)
+                                .then(|| ns.name.clone()),
+                            slot: match ns.kind {
+                                crate::state::NamespaceKind::Slot => ns.name.parse().ok(),
+                                crate::state::NamespaceKind::Database => None,
+                            },
+                            host: ns.host.clone(),
+                            port: ns.port,
+                            in_use: record.mode() == crate::state::ServiceMode::Namespaced,
+                        })
+                        .collect(),
                     hooks: record
                         .hooks
                         .iter()
@@ -282,6 +319,9 @@ fn status_lines<W: Write>(
 ) -> Result<()> {
     let refreshed = actions::refresh(paths);
     report_refresh(&refreshed);
+    // For the services a namespaced worktree leaves shared, and why; a
+    // config that does not load only costs those lines.
+    let config = crate::config::load(paths).ok().map(|loaded| loaded.config);
     // Only the worktrees that will be shown are enriched: a `git status`
     // apiece, and `status <name>` shows one.
     let mut worktrees = crate::worktree::discover(&paths.project)?;
@@ -346,9 +386,15 @@ fn status_lines<W: Write>(
         // And one per private service, so a worktree whose database is
         // down says which one rather than only that its app failed.
         let services = actions::service_statuses(record);
+        let namespaces = actions::namespace_lines(paths, config.as_ref(), record);
         let service_width = services
             .iter()
             .map(|s| s.name.chars().count())
+            .chain(
+                namespaces
+                    .iter()
+                    .map(|(service, _, _)| service.chars().count()),
+            )
             .max()
             .unwrap_or(0)
             .max(process_width);
@@ -371,6 +417,13 @@ fn status_lines<W: Write>(
                 service.name,
                 if service.up { "up" } else { "down" },
             );
+            writeln!(out, "{}", ellipsize(&row, width))?;
+        }
+        // And what it holds in the main checkout's own servers: its own
+        // database and slot, ones kept for the way back from another mode,
+        // and the services a namespaced worktree leaves on main's data.
+        for (service, word, what) in &namespaces {
+            let row = format!("  {service:<service_width$}  {word:<PHASE_CELL$}  {what}");
             writeln!(out, "{}", ellipsize(&row, width))?;
         }
         // And the public URL, last, because it is the line somebody is

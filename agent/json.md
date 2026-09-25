@@ -325,6 +325,12 @@ rather than re-deriving.
         "postgres": { "kind": "compose|native", "port": 17010, "up": true,
                       "logging": true, "project": "pando-…" }
       },
+      "namespaces": [                  // its own, in the main checkout's servers
+        { "service": "mariadb", "database": "shop__feat_one",
+          "host": "localhost", "port": 3306, "in_use": true },
+        { "service": "redis", "slot": 3,
+          "host": "127.0.0.1", "port": 6379, "in_use": true }
+      ],
       "hooks": { "install": { "fingerprint": "md5:…", "ran_at": "…" } }
     }
   ]
@@ -338,6 +344,13 @@ slot of the worktree's own in them, and `isolated` servers of its own. A
 worktree never started reads `shared`. `isolated` came first and stays,
 true exactly when `mode` is `isolated`, so a program written against it
 keeps working.
+
+`namespaces` lists what a worktree holds in the main checkout's own
+servers: a `database` of its own, or a `slot` of its own, each on the
+`host` and `port` it was made on. `in_use` is true while the worktree runs
+namespaced, and false for one kept through a switch to another mode —
+kept until `rm`, which drops it. The list is empty for a worktree that
+never started namespaced. No login is ever in this shape.
 
 `phase` is per process; a worktree is only as up as its worst one.
 `reason` is non-null exactly when `phase` is `failed`, and it is the

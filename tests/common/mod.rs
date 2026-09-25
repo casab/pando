@@ -1230,3 +1230,42 @@ pub fn wait_until(timeout: std::time::Duration, ready: impl Fn() -> bool) -> boo
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
 }
+
+/// A fake `mariadb` in a pando home's `bin`, which every namespace command
+/// finds first on PATH: its databases are files under `dbs/` of the
+/// directory returned, and `created` and `dropped` record what it did.
+/// Enough of the client for a namespaced start and an `rm`, and no server
+/// anywhere.
+pub fn fake_mariadb(home: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let state = home.join("fake-mariadb");
+    std::fs::create_dir_all(state.join("dbs")).unwrap();
+    let bin = home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let script = format!(
+        r#"#!/bin/sh
+state='{state}'
+printf '%s\n' "$*" >> "$state/argv"
+case "$*" in
+  *"SELECT 1"*) echo 1 ;;
+  *"CURRENT_USER()"*) echo "app@localhost" ;;
+  *"CREATE DATABASE"*)
+    db=$(printf '%s' "$*" | sed -n 's/.*CREATE DATABASE `\([^`]*\)`.*/\1/p')
+    if [ -f "$state/dbs/$db" ]; then echo "ERROR 1007 (HY000): database exists" >&2; exit 1; fi
+    touch "$state/dbs/$db"; echo "$db" >> "$state/created" ;;
+  *"LIKE"*) ;;
+  *"SCHEMATA"*)
+    db=$(printf '%s' "$*" | sed -n "s/.*SCHEMA_NAME = '\([^']*\)'.*/\1/p")
+    if [ -f "$state/dbs/$db" ]; then echo "$db"; fi ;;
+  *"DROP DATABASE"*)
+    db=$(printf '%s' "$*" | sed -n 's/.*DROP DATABASE IF EXISTS `\([^`]*\)`.*/\1/p')
+    rm -f "$state/dbs/$db"; echo "$db" >> "$state/dropped" ;;
+  *) echo "unexpected: $*" >&2; exit 9 ;;
+esac
+"#,
+        state = state.display()
+    );
+    std::fs::write(bin.join("mariadb"), script).unwrap();
+    std::fs::set_permissions(bin.join("mariadb"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    state
+}

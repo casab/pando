@@ -162,6 +162,7 @@ Examples:
   pando start feat/login --no-wait     return as soon as everything is spawned
   pando start feat/login --wait        wait, even from a script
   pando start feat/login --isolated    with private copies of the services
+  pando start feat/login --namespaced  experimental: a database of its own in your own server
   pando start --only api               one process of the worktree you are in")]
     #[command(display_order = 2)]
     Start {
@@ -186,11 +187,20 @@ Examples:
         /// them.
         #[arg(long)]
         isolated: bool,
+        /// Experimental: a namespace of its own in each of the project's
+        /// own servers.
+        ///
+        /// The main checkout's MariaDB and Redis, with a database and a slot
+        /// of this worktree's own in them, built by its own schema step: no
+        /// server to start, and main's data untouched. Remembered like
+        /// `--isolated`; `rm` drops what it made.
+        #[arg(long, conflicts_with = "isolated")]
+        namespaced: bool,
         /// Stop this worktree's private services and use the shared ones.
         ///
-        /// The way back from `--isolated`. Its processes restart, so they
-        /// see them.
-        #[arg(long, conflicts_with = "isolated")]
+        /// The way back from `--isolated` and `--namespaced`. Its processes
+        /// restart, so they see them. A namespace is kept until `rm`.
+        #[arg(long, conflicts_with_all = ["isolated", "namespaced"])]
         shared: bool,
         /// Wait until every process is ready; exit 1 if one fails.
         ///
@@ -311,6 +321,12 @@ Examples:
         /// Run private copies of the project's services for this worktree.
         #[arg(long)]
         isolated: bool,
+        /// Experimental: a namespace of its own in each of the project's
+        /// own servers.
+        ///
+        /// As `start --namespaced`.
+        #[arg(long, conflicts_with = "isolated")]
+        namespaced: bool,
         /// Wait until every process is ready again; exit 1 if one fails.
         ///
         /// The default when stderr is a terminal. Readiness is judged as
@@ -521,6 +537,7 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             yes,
             only,
             isolated,
+            namespaced,
             shared,
             wait,
             no_wait,
@@ -530,7 +547,7 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             let typed = name;
             let name = names::target(paths, typed.as_deref(), "start")?;
             let named = names::Named::of(paths, typed.as_deref(), &name);
-            let mode = actions::Mode::of(isolated, shared);
+            let mode = actions::Mode::of(isolated, namespaced, shared);
             let config = &actions::resolve_for_start(
                 paths,
                 config,
@@ -660,6 +677,7 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             yes,
             only,
             isolated,
+            namespaced,
             wait,
             no_wait,
         } => {
@@ -672,7 +690,7 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             // `--shared` is `start`'s: a restart into shared mode is what
             // `start --shared` already is, since changing the mode
             // restarts the processes anyway.
-            let mode = actions::Mode::of(isolated, false);
+            let mode = actions::Mode::of(isolated, namespaced, false);
             let config = &actions::resolve_for_start(
                 paths,
                 config,

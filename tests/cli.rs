@@ -3489,3 +3489,91 @@ fn doctor_json_says_the_same_thing_the_text_does() {
     );
     assert_eq!(problems[0]["fix"], serde_json::json!("use `npm ci`"));
 }
+
+// The whole of namespaced mode through the binary: `start --namespaced`
+// makes the worktree's own database, `status` says so, `restart` keeps
+// the mode, the flags refuse each other, and `rm` drops it — with the
+// password in no line of any of it.
+#[test]
+fn a_namespaced_worktree_through_the_cli_from_start_to_rm() {
+    let e = env();
+    let fake = common::fake_mariadb(&e.home);
+    std::fs::write(
+        e.root.join(".env"),
+        "DATABASE_HOST=localhost\nDATABASE_PORT=3306\nDATABASE_NAME=shop\n\
+         DATABASE_USER=app\nDATABASE_PASSWORD=cli-secret-pw\n",
+    )
+    .unwrap();
+    e.write_config(&format!(
+        "[dev]\ncmd = '''{}'''\nports = {{ PORT = \"web\" }}\n\n\
+         [[services]]\nkind = \"native\"\nname = \"mariadb\"\n\
+         env = {{ DATABASE_PORT = \"mariadb\" }}\n",
+        common::listener_on_port_env()
+    ));
+    let mut printed = String::new();
+    let mut run = |args: &[&str], expect: i32| {
+        let out = e.pando(args);
+        printed.push_str(&stdout(&out));
+        printed.push_str(&stderr(&out));
+        assert_eq!(code(&out), expect, "{args:?}: {}", stderr(&out));
+        out
+    };
+    run(&["new", "feat/one"], 0);
+    let out = run(&["start", "feat/one", "--namespaced", "--no-wait"], 0);
+    assert!(
+        stderr(&out).contains("mariadb: own database shop__feat_one, made just now"),
+        "{}",
+        stderr(&out)
+    );
+    let status =
+        |out: &Output| -> serde_json::Value { serde_json::from_str(&stdout(out)).unwrap() };
+    let v = status(&run(&["status", "--json"], 0));
+    assert_eq!(v["worktrees"][0]["mode"], "namespaced");
+    assert_eq!(
+        v["worktrees"][0]["namespaces"][0]["database"],
+        "shop__feat_one"
+    );
+    let text = stdout(&run(&["status", "feat/one"], 0));
+    assert!(
+        text.contains("database shop__feat_one on localhost:3306"),
+        "{text}"
+    );
+
+    run(&["restart", "feat/one", "--no-wait"], 0);
+    let v = status(&run(&["status", "--json"], 0));
+    assert_eq!(
+        v["worktrees"][0]["mode"], "namespaced",
+        "restart keeps the mode"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fake.join("created")).unwrap(),
+        "shop__feat_one\n",
+        "and its database"
+    );
+
+    run(&["start", "feat/one", "--namespaced", "--isolated"], 2);
+    run(&["start", "feat/one", "--namespaced", "--shared"], 2);
+
+    let out = run(&["rm", "feat/one"], 0);
+    assert!(
+        stderr(&out).contains("mariadb: dropped database shop__feat_one"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(
+        std::fs::read_to_string(fake.join("dropped")).unwrap(),
+        "shop__feat_one\n"
+    );
+    assert!(!printed.contains("cli-secret-pw"), "{printed}");
+}
+
+// Decision 7: visible from the start, and labelled experimental in help.
+#[test]
+fn namespaced_is_in_start_help_and_says_it_is_experimental() {
+    let e = env();
+    for command in ["start", "restart"] {
+        let help = stdout(&e.pando(&[command, "--help"]));
+        assert!(help.contains("--namespaced"), "{command}: {help}");
+        assert!(help.contains("Experimental"), "{command}: {help}");
+    }
+}

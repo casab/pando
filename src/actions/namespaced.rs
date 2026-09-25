@@ -143,10 +143,21 @@ pub(super) enum Tell {
 pub(super) struct Plan {
     /// The ones that get a namespace.
     pub targets: Vec<Target>,
-    /// A line for each one that stays on the main checkout's own data, and
-    /// why — said at every namespaced start, because an app half on its
-    /// own data and half on main's is only safe when somebody knows.
-    pub shared: Vec<String>,
+    /// Each one that stays on the main checkout's own data, and why —
+    /// said at every namespaced start, because an app half on its own data
+    /// and half on main's is only safe when somebody knows.
+    pub shared: Vec<(String, String)>,
+}
+
+impl Plan {
+    /// `redis: shared — the app reads no slot setting`, one a service
+    /// that stays on main's data.
+    pub fn shared_lines(&self) -> Vec<String> {
+        self.shared
+            .iter()
+            .map(|(service, why)| format!("{service}: shared — {why}"))
+            .collect()
+    }
 }
 
 /// Which of the project's services a namespaced start gives the worktree a
@@ -163,7 +174,7 @@ pub(super) fn plan(paths: &PandoPaths, config: &Config) -> Plan {
     for (service, recipe, keys) in services_with_recipes(paths, config, &recipes) {
         match target(paths.root(), &service, recipe.as_ref(), keys) {
             Ok(target) => out.targets.push(target),
-            Err(why) => out.shared.push(format!("{service}: shared — {why}")),
+            Err(why) => out.shared.push((service, why)),
         }
     }
     out
@@ -406,8 +417,8 @@ pub(super) fn prepare(
         ));
         namespaces.push(namespace);
     }
-    for line in &plan.shared {
-        progress(line);
+    for line in plan.shared_lines() {
+        progress(&line);
     }
     Ok(Ready {
         plan,
@@ -1127,6 +1138,47 @@ pub fn namespace_leftovers(
                 by_hand: server.by_hand(&name),
                 name,
             });
+        }
+    }
+    out
+}
+
+/// What a worktree holds in each service, as `status` says it: the
+/// service, a word, and the rest of the line.
+///
+/// `own` for a namespace it runs on; `kept` for one it holds while running
+/// in another mode, which waits for the way back until `rm`; and, for a
+/// namespaced worktree, `shared` for a service that stays on the main
+/// checkout's data, with why. `config` is `None` when it does not load,
+/// and then the shared ones go unsaid.
+pub fn namespace_lines(
+    paths: &PandoPaths,
+    config: Option<&Config>,
+    record: &crate::state::WorktreeRecord,
+) -> Vec<(String, &'static str, String)> {
+    let running_on_them = record.mode() == crate::state::ServiceMode::Namespaced;
+    let mut out: Vec<(String, &'static str, String)> = record
+        .namespaces
+        .iter()
+        .map(|ns| {
+            let what = match ns.kind {
+                NamespaceKind::Database => format!("database {}", ns.name),
+                NamespaceKind::Slot => format!("slot {}", ns.name),
+            };
+            let (word, until) = match running_on_them {
+                true => ("own", ""),
+                false => ("kept", ", until rm"),
+            };
+            (
+                ns.service.clone(),
+                word,
+                format!("{what} on {}:{}{until}", ns.host, ns.port),
+            )
+        })
+        .collect();
+    if running_on_them && let Some(config) = config {
+        for (service, why) in plan(paths, config).shared {
+            out.push((service, "shared", why));
         }
     }
     out

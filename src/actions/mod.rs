@@ -30,7 +30,8 @@ pub use lifecycle::{
     stop_all_with,
 };
 pub use namespaced::{
-    Leftover, login_question, namespace_leftovers, namespace_login, namespaces_rm_drops,
+    Leftover, login_question, namespace_leftovers, namespace_lines, namespace_login,
+    namespaces_rm_drops,
 };
 pub use questions::{
     Answer, Answering, Ask, NEW_SLOTS, NeedsAnswer, Question, RefusedAnswer, START_SLOTS,

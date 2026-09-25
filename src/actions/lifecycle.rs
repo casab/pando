@@ -71,12 +71,13 @@ impl From<ServiceMode> for Mode {
 }
 
 impl Mode {
-    /// The mode two flags mean. `start` and `restart` refuse the pair
-    /// before this is ever called.
-    pub fn of(isolated: bool, shared: bool) -> Mode {
-        match (isolated, shared) {
-            (true, _) => Mode::Isolated,
-            (_, true) => Mode::Shared,
+    /// The mode three flags mean. `start` and `restart` refuse any two of
+    /// them together before this is ever called.
+    pub fn of(isolated: bool, namespaced: bool, shared: bool) -> Mode {
+        match (isolated, namespaced, shared) {
+            (true, _, _) => Mode::Isolated,
+            (_, true, _) => Mode::Namespaced,
+            (_, _, true) => Mode::Shared,
             _ => Mode::Remembered,
         }
     }
@@ -233,7 +234,7 @@ fn start_checked(
     let namespaceable = can_namespace(paths, config, name, mode);
     if mode == Mode::Namespaced && !namespaceable {
         progress("no service here can have a namespace of its own — starting in shared mode");
-        for line in namespaced::plan(paths, config).shared {
+        for line in namespaced::plan(paths, config).shared_lines() {
             progress(&line);
         }
     }
