@@ -69,11 +69,14 @@ not link to them from files that are committed, such as `README.md`.
 
 ## The origin project is frozen
 
-`dwt` is a separate, private project and stays untouched while pando is built.
-Its local path is in `CLAUDE.local.md`, which is not committed. Never edit,
-commit to, build, or run anything in that directory from a pando session.
-Reading it to port a module is fine; `docs/07-architecture.md` lists which
-modules carry over.
+`dwt` and the project it was built for are separate, private projects, and
+both stay unchanged while pando is built. Their local paths are in
+`CLAUDE.local.md`, which is not committed. A pando session may **read**
+either one — dwt to port a module (`docs/07-architecture.md` lists which
+carry over), the origin project to see why pando does not yet run it —
+and never edits, commits to, builds, or runs anything in them. Decided by
+the maintainer on 2026-09-25; before that, the origin project was not to
+be read at all.
 
 ## Public-repo hygiene
 
@@ -91,8 +94,12 @@ database, a prod schema dump, and cookie auth."
 - Real repositories on this machine may be used only with read-only commands:
   `ls`, `doctor`, `signals`, `status`, `path`. Never `new` or `start` on them
   during development.
-- dwt's origin project is never used, not even read-only. Its path is in
-  `CLAUDE.local.md` only so it can be recognised and avoided.
+- dwt's origin project is read-only in the same way, and more strictly:
+  reading its files and those read-only commands, run with `PANDO_HOME`
+  pointed at a temporary directory so the maintainer's own `~/.pando` is
+  not written either. To see what a start would do there, clone it into a
+  temporary directory and run pando against the clone. Nothing learnt from
+  it goes into a committed file except in generic terms.
 - Nothing under test reaches GitHub. The TUI's `gh` workers
   (`spawn_pr_fetch`, `spawn_gh_account_check`) return early under
   `cfg!(test)`; tests set `pr_list` by hand, and `gh` parsing is tested
@@ -102,9 +109,9 @@ database, a prod schema dump, and cookie auth."
   (`plans/open-follow-ups.md`); under a parallel build they fail for
   reasons that have nothing to do with the change. Rerun a readiness or
   timeout failure alone before concluding anything.
-- The maintainer's own repositories are off limits to pando sessions, which
-  has a consequence worth stating plainly: **the fixture corpus is the only
-  validation pando gets.** A corpus of tidy shapes therefore proves very
+- Beyond those read-only uses, the maintainer's own repositories are off
+  limits to pando sessions, which has a consequence worth stating plainly:
+  **the fixture corpus is the main validation pando gets.** A corpus of tidy shapes therefore proves very
   little — `plans/fixture-hard-shapes.md` exists because of this, and the
   first real project pando met broke it in three ways no fixture had.
 
