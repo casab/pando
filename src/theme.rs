@@ -2,6 +2,28 @@
 //! call site follows the appearance detected once at startup — log lines are
 //! colorized at ingest and cached, so a mid-session appearance change only
 //! takes effect on the next launch.
+//!
+//! Each colour means one thing, everywhere, so a colour learnt in one place
+//! reads the same in the next. A new use picks the row it belongs to:
+//!
+//! | colour       | means                                              |
+//! |--------------|----------------------------------------------------|
+//! | `green`      | up, working, done: running, a success, a public    |
+//! |              | URL, an open pull request                          |
+//! | `yellow`     | in flight, or needs a look: starting, uncommitted  |
+//! | `red`        | failed, down, destructive                          |
+//! | `cyan`       | an address: a URL, a port                          |
+//! | `magenta`    | isolated: private copies of the services; a merged |
+//! |              | pull request, as GitHub colours it                 |
+//! | `blue`       | where you are: the cursor, the checked-out branch  |
+//! | `orange`     | a key to press                                     |
+//! | `text`       | what the row is about: a branch, a title           |
+//! | `text_dim`   | a value that is there but not news                 |
+//! | `text_muted` | labels, titles, hints: read once, then skipped     |
+//! | `border`     | lines: borders and the grid                        |
+//!
+//! Colour never carries a meaning alone: a glyph or a word says it too,
+//! for whoever cannot tell two of them apart.
 
 use ratatui::style::Color;
 use std::sync::OnceLock;

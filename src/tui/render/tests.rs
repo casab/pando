@@ -2,7 +2,8 @@ use super::*;
 use super::{chrome::*, detail::*, list::*, log_viewer::*};
 use crate::log_tail::{LogLevel, ParsedLine};
 use crate::theme::{
-    cyan, green, highlight_bg, red, search_cursor_bg, search_match_bg, text_dim, text_muted, yellow,
+    blue, cyan, green, highlight_bg, red, search_cursor_bg, search_match_bg, text_dim, text_muted,
+    yellow,
 };
 use crate::tui::app::App;
 use crate::tui::app::tests::{
@@ -721,8 +722,10 @@ fn long_labels_keep_the_part_that_tells_them_apart() {
     }
     let rendered = text_of(&draw(&mut app, 80, 30));
     for n in [1, 7, 12] {
+        // The number whole, whether the dash after it fits or not.
         assert!(
-            rendered.contains(&format!("number-{n}-")),
+            rendered.contains(&format!("number-{n}-"))
+                || rendered.contains(&format!("number-{n}…")),
             "row {n} is told apart:\n{rendered}"
         );
     }
@@ -2901,7 +2904,7 @@ fn the_header_names_the_gh_account_of_this_project() {
 // ---- the list's grid -------------------------------------------------
 
 #[test]
-fn rows_are_ruled_apart_and_columns_divided_when_they_fit() {
+fn columns_are_divided_and_only_the_header_is_ruled_off() {
     let mut app = test_app(&["feat+one", "feat+two"]);
     with_process(&mut app, "feat+one", running_phase());
     let rendered = text_of(&draw(&mut app, 140, 20));
@@ -2916,29 +2919,53 @@ fn rows_are_ruled_apart_and_columns_divided_when_they_fit() {
         .lines()
         .filter(|line| line.starts_with("│─") && line.contains('┼'))
         .count();
-    assert_eq!(
-        rules, 2,
-        "under the header, and between the rows:\n{rendered}"
+    assert_eq!(rules, 1, "under the header, and nowhere else:\n{rendered}");
+    let lines: Vec<&str> = rendered.lines().collect();
+    let first = lines
+        .iter()
+        .position(|l| l.contains("▸ ● feat/one"))
+        .unwrap();
+    assert!(
+        lines[first + 1].contains("○ feat/two"),
+        "rows sit together:\n{rendered}"
     );
 }
 
-// However long the list, every row is ruled from the next; the rest is
-// reached by scrolling.
+// The cursor gets the accent colour as well as the band, so it is not
+// lost on a screen where the band barely shows.
 #[test]
-fn a_long_list_keeps_its_rules_and_scrolls() {
-    let names: Vec<String> = (0..12).map(|i| format!("feat+n{i:02}")).collect();
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let mut app = test_app(&refs);
-    let rendered = text_of(&draw(&mut app, 140, 16));
-    let lines: Vec<&str> = rendered.lines().collect();
-    let first = lines.iter().position(|l| l.contains("○ feat/n00")).unwrap();
-    let second = lines.iter().position(|l| l.contains("○ feat/n01")).unwrap();
-    assert_eq!(second, first + 2, "a rule between them:\n{rendered}");
-    assert!(lines[first + 1].contains('┼'), "{rendered}");
-    assert!(
-        !rendered.contains("feat/n11"),
-        "the rest is below:\n{rendered}"
+fn the_cursor_marker_is_in_the_accent_colour() {
+    let mut app = test_app(&["feat+one", "feat+two"]);
+    let buf = draw(&mut app, 140, 20);
+    assert_eq!(style_at(&buf, "feat/one", "▸").fg, Some(blue()));
+}
+
+#[test]
+fn the_detail_title_leads_with_the_rows_glyph() {
+    let mut app = test_app(&["feat+one"]);
+    with_process(&mut app, "feat+one", running_phase());
+    let buf = draw(&mut app, 140, 20);
+    let rendered = text_of(&buf);
+    assert!(rendered.contains("╭ ● feat/one"), "{rendered}");
+    assert_eq!(style_at(&buf, "╭ ● feat/one", "●").fg, Some(green()));
+}
+
+#[test]
+fn the_header_counts_with_the_lists_glyphs() {
+    let mut app = test_app(&["up", "broken"]);
+    with_process(&mut app, "up", running_phase());
+    with_process(
+        &mut app,
+        "broken",
+        crate::state::Phase::Failed {
+            at: chrono::Utc::now(),
+            reason: "process exited".into(),
+        },
     );
+    let rendered = text_of(&draw(&mut app, 140, 20));
+    let header = rendered.lines().next().unwrap();
+    assert!(header.contains("● 1 running"), "{header}");
+    assert!(header.contains("✗ 1 failed"), "{header}");
 }
 
 #[test]
@@ -2957,9 +2984,9 @@ fn the_selected_row_stays_on_screen_as_the_cursor_moves_past_the_bottom() {
     );
 }
 
-// The highlight is the row's; the rule under it stays a rule.
+// The highlight is the row's own, and stops at the row under it.
 #[test]
-fn the_highlight_covers_the_row_and_not_the_rule_under_it() {
+fn the_highlight_covers_the_row_and_not_the_one_under_it() {
     let mut app = test_app(&["feat+one", "feat+two"]);
     let buf = draw(&mut app, 140, 20);
     let text = text_of(&buf);

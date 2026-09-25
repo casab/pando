@@ -9,13 +9,11 @@
 //!      branch          │ changes     │ port   │ mode     │ git │ status
 //! ─────────────────────┼─────────────┼────────┼──────────┼─────┼───────
 //!  ▸ ● feat/checkout   │ uncommitted │ :17342 │ isolated │ ↑2  │
-//! ─────────────────────┼─────────────┼────────┼──────────┼─────┼───────
 //!    ✗ fix/crash       │             │        │          │     │ failed
 //! ```
 //!
-//! Faint lines divide the columns and rule every row from the next; a
-//! list longer than the pane scrolls under the cursor. Only a pane too
-//! short for three ruled rows closes them up.
+//! Faint lines divide the columns and rule the header off; the rows sit
+//! one under the other, and the highlight is what marks the cursor's.
 //!
 //! A column is only there when some row has something in it, and its
 //! title goes with it.
@@ -41,8 +39,8 @@ use ratatui::widgets::{Block, BorderType, Paragraph};
 use crate::actions;
 use crate::state::Aggregate;
 use crate::theme::{
-    border, cyan, green, highlight_bg, magenta, orange, red, surface, text, text_dim, text_muted,
-    yellow,
+    blue, border, cyan, green, highlight_bg, magenta, orange, red, surface, text, text_dim,
+    text_muted, yellow,
 };
 use crate::tui::app::{App, Mode};
 use crate::worktree::{PrInfo, PrState, Worktree};
@@ -380,7 +378,10 @@ pub(super) fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
             (col, widest)
         })
         .collect();
-    let width = list_area.width as usize;
+    // Text stops one cell short of the border, so the last column never
+    // runs into it; rules and highlight bands still reach it.
+    let full = list_area.width as usize;
+    let width = full.saturating_sub(1);
     let mut shown = list_columns(width, &widths);
     // The label is as wide as the widest one, and no wider: on a wide
     // screen the room left over goes after the columns, not into a gap
@@ -417,8 +418,8 @@ pub(super) fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
             out.push('┼');
             out.push_str(&"─".repeat(col_width(col) + 2));
         }
-        let out = truncate(&out, width).trim_end_matches('…').to_string();
-        let fill = width.saturating_sub(text_width(&out));
+        let out = truncate(&out, full).trim_end_matches('…').to_string();
+        let fill = full.saturating_sub(text_width(&out));
         Line::styled(format!("{out}{}", "─".repeat(fill)), grid)
     };
     // Spaces to the pane's edge, so a highlight or a header band is one
@@ -427,7 +428,7 @@ pub(super) fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
         let line = truncate_line(Line::from(std::mem::take(&mut spans)), width);
         let used: usize = line.spans.iter().map(|s| text_width(&s.content)).sum();
         let mut spans = line.spans;
-        spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
+        spans.push(Span::raw(" ".repeat(full.saturating_sub(used))));
         Line::from(spans)
     };
 
@@ -455,13 +456,7 @@ pub(super) fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
             lines.push(rule());
         }
     }
-    let room = height.saturating_sub(lines.len());
-    // A rule between every two rows: a list longer than the pane scrolls
-    // under the cursor rather than losing its lines. Only a pane too short
-    // for three ruled rows — a small tmux split — closes them up, where a
-    // rule would cost a whole row.
-    let ruled = room >= 5 || rows.len() * 2 - 1 <= room;
-    let visible = if ruled { room.div_ceil(2) } else { room }.max(1);
+    let visible = height.saturating_sub(lines.len()).max(1);
     let selected = app.list_state.selected();
     let mut offset = app.list_state.offset();
     if let Some(sel) = selected {
@@ -484,17 +479,15 @@ pub(super) fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
         if lines.len() + 1 > height {
             break;
         }
-        if i > offset && ruled {
-            // A rule with no row under it is a line spent on nothing.
-            if lines.len() + 2 > height {
-                break;
-            }
-            lines.push(rule());
-        }
         let is_selected = selected == Some(i);
         let (glyph, color) = row.glyph;
         let mut spans = vec![
-            Span::raw(if is_selected { " ▸ " } else { "   " }),
+            // The cursor in the accent, not only the band behind it: a
+            // highlight alone is easy to lose on a low-contrast screen.
+            Span::styled(
+                if is_selected { " ▸ " } else { "   " },
+                Style::new().fg(blue()),
+            ),
             Span::styled(glyph, Style::new().fg(color)),
             Span::styled(
                 pad(
@@ -604,11 +597,13 @@ fn pr_chip(pr: &PrInfo) -> String {
     format!("{mark}{}", pr.number)
 }
 
+/// GitHub's own colours for a pull request's state, so the chip reads the
+/// way the pull request page does.
 pub(super) fn pr_color(pr: &PrInfo) -> Color {
     match pr.state {
         PrState::Open if pr.draft => text_muted(),
-        PrState::Open => cyan(),
-        PrState::Merged => green(),
+        PrState::Open => green(),
+        PrState::Merged => magenta(),
         PrState::Closed => red(),
     }
 }

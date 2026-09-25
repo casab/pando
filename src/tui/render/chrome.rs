@@ -129,7 +129,7 @@ pub(super) fn render_header(f: &mut Frame, area: Rect, app: &App) {
     let mut spans = vec![
         Span::styled(
             " pando ",
-            Style::new().fg(green()).add_modifier(Modifier::BOLD),
+            Style::new().fg(blue()).add_modifier(Modifier::BOLD),
         ),
         Span::styled(project.clone(), Style::new().fg(text())),
         Span::styled(" · ", Style::new().fg(text_muted())),
@@ -145,16 +145,19 @@ pub(super) fn render_header(f: &mut Frame, area: Rect, app: &App) {
             Style::new().fg(text_dim()),
         ),
     ]);
+    // The list's own glyphs, so the header and the rows speak one
+    // language: the glyph for the colour, the word for whoever cannot tell
+    // the colours apart.
     if running > 0 {
         spans.push(Span::styled(
-            format!(", {running} running"),
+            format!("  ● {running} running"),
             Style::new().fg(green()),
         ));
     }
     if failed > 0 {
         spans.push(Span::styled(
-            format!(", {failed} failed"),
-            Style::new().fg(red()),
+            format!("  ✗ {failed} failed"),
+            Style::new().fg(red()).add_modifier(Modifier::BOLD),
         ));
     }
     // One chip per shared service, so a dev server that will not connect

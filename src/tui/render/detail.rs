@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, BorderType, Paragraph};
 use crate::log_tail::LogLevel;
 use crate::state::{Aggregate, Phase, ProcessRecord};
 use crate::theme::{
-    border, cyan, green, highlight_bg, magenta, orange, red, text, text_dim, text_muted, yellow,
+    border, cyan, green, highlight_bg, magenta, red, text, text_dim, text_muted, yellow,
 };
 use crate::tui::app::{App, compact_age};
 
@@ -39,6 +39,10 @@ pub(super) const KEEP_PR: u8 = 3;
 const KEEP_MODE: u8 = 3;
 
 pub(super) const KEEP_HEAD: u8 = 4;
+
+/// The blank line between what runs and what git says: the first thing a
+/// short pane gives up, after the path.
+const KEEP_SPACER: u8 = 5;
 
 pub(super) const KEEP_PATH: u8 = 6;
 
@@ -102,18 +106,30 @@ fn wrapped_rows<'a>(label: &str, value: &str, style: Style, width: usize) -> Vec
 
 pub(super) fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
     let selected = app.selected_worktree().map(|w| w.name.clone());
+    // The title leads with the row's own glyph, in its colour, so the pane
+    // says which state it describes before a word of it is read.
+    let (glyph, glyph_color) = match &selected {
+        Some(name) => run_marker(app.phase_of(name).as_ref()),
+        None => ("", text_muted()),
+    };
     let title = match &selected {
-        Some(name) => format!(" {} ", app.label_of(name)),
+        Some(name) => format!("{} ", app.label_of(name)),
         None => " detail ".to_string(),
     };
-    let block = Block::bordered()
-        .title(Span::styled(
-            truncate_middle(&title, area.width.saturating_sub(2) as usize),
+    let title_room = (area.width.saturating_sub(4) as usize).saturating_sub(text_width(glyph));
+    let title = Line::from(vec![
+        Span::raw(if glyph.is_empty() { "" } else { " " }),
+        Span::styled(glyph, Style::new().fg(glyph_color)),
+        Span::styled(
+            truncate_middle(&title, title_room),
             Style::new().fg(text()).add_modifier(Modifier::BOLD),
-        ))
+        ),
+    ]);
+    let block = Block::bordered()
+        .title(title)
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(if app.tail_scroll > 0 {
-            orange()
+            yellow()
         } else {
             border()
         }));
@@ -191,6 +207,8 @@ pub(super) fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
     if let Some(mode) = mode_row(app, &name, width) {
         rows.push((KEEP_MODE, mode));
     }
+    // Two groups: what runs, above, and what git says, below.
+    rows.push((KEEP_SPACER, Line::raw("")));
     rows.push((KEEP_GIT, git_row(app, &wt, width)));
     for line in branch_rows(&wt, width) {
         rows.push((KEEP_HEAD, line));
