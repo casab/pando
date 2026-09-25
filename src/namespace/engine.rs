@@ -180,6 +180,49 @@ impl Server<'_> {
         )
     }
 
+    /// Every database on the server named for a worktree of `main` —
+    /// `<main>__…` — as far as this login can see. Empty when the recipe
+    /// has no way to ask.
+    pub fn list(&self, main: &str) -> Result<Vec<String>> {
+        let Some(command) = self.recipe.list.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let vars = Vars {
+            prefix_like: Some(prefix_like(main)),
+            ..self.vars(None)
+        };
+        let script = self.with_path(&template::render_with(command, &vars)?);
+        let env = self.login.env(self.recipe.password_env.as_deref());
+        let out = proc::run_captured(&script, &std::env::temp_dir(), &env, TIMEOUT)?;
+        if !out.success() {
+            bail!(
+                "could not list {main}{MARKER}… on {}: {}",
+                self.address(),
+                out.last_stderr_line().unwrap_or("no output")
+            );
+        }
+        Ok(out
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// The command that drops `name` — the recipe's own, as pando would
+    /// run it — for a person to run when pando could not: printed, never
+    /// run, and never with the password in it.
+    pub fn by_hand(&self, name: &str) -> Option<String> {
+        let rendered = template::render_with(&self.recipe.drop, &self.vars(Some(name))).ok()?;
+        Some(match &self.recipe.password_env {
+            Some(var) if self.login.has_password() => {
+                format!("{rendered}   (with the password in {var})")
+            }
+            _ => rendered,
+        })
+    }
+
     /// How many keys a slot holds.
     pub fn size(&self, slot: u32) -> Result<u64> {
         let command = self.command(self.recipe.size.as_deref(), "size")?;

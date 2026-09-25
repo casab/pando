@@ -167,6 +167,7 @@ fn database(name: &str, main: &str) -> NamespaceRecord {
         port: 3306,
         name: name.into(),
         main: main.into(),
+        keys: Vec::new(),
         used_at: Utc::now(),
     }
 }
@@ -180,6 +181,7 @@ fn slot(n: &str, main: &str) -> NamespaceRecord {
         port: 6379,
         name: n.into(),
         main: main.into(),
+        keys: Vec::new(),
         used_at: Utc::now(),
     }
 }

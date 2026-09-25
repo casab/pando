@@ -22,8 +22,9 @@
 //! (`Finding`, `Section`, `Severity`, and one `*Report` per section) and
 //! `render` turns them into text. Each section is built in its own file:
 //! `config` (the project and every config layer), `runtime`, `tools`,
-//! `worktrees`, `services`, `hooks`, and `adopt` (project folders left
-//! behind by a moved repository, and `--adopt` itself). `stale` compares
+//! `worktrees`, `services`, `namespaces` (databases a namespaced worktree
+//! left behind), `hooks`, and `adopt` (project folders left behind by a
+//! moved repository, and `--adopt` itself). `stale` compares
 //! detected values with what detection would write now, and `validate`
 //! checks the merged config. This file only gathers them: [`run`] and
 //! [`run_on`].
@@ -35,6 +36,7 @@ use crate::paths::PandoPaths;
 mod adopt;
 mod config;
 mod hooks;
+mod namespaces;
 mod render;
 mod report;
 mod runtime;
@@ -109,6 +111,7 @@ pub fn run_on(paths: &PandoPaths, machine: &Machine<'_>) -> Report {
     let view = actions::inspect(paths);
     let worktrees = worktrees_report(paths, &config, &view, &mut findings);
     let services = services_report(paths, &config, machine, &mut findings);
+    namespaces::leftover_findings(paths, &config, &mut findings);
     let hooks = hooks_report(paths, &config, &view, &worktrees, &mut findings);
     let adoption = adoption_report(paths, &mut findings);
     // Lines composed below doctor name the machine-wide config by its

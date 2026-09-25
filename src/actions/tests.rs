@@ -7867,11 +7867,20 @@ case "$*" in
       echo "ERROR 1007 (HY000) at line 1: Can't create database '$db'; database exists" >&2; exit 1
     fi
     touch "$state/dbs/$db"; echo "$db" >> "$state/created" ;;
+  *"LIKE"*)
+    prefix=$(printf '%s' "$*" | sed -n "s/.*LIKE '\([^']*\)'.*/\1/p" | tr -d '\\' | sed 's/%$//')
+    for f in "$state"/dbs/*; do
+      n=$(basename "$f")
+      case "$n" in "$prefix"*) echo "$n" ;; esac
+    done ;;
   *"SCHEMATA"*)
     db=$(printf '%s' "$*" | sed -n "s/.*SCHEMA_NAME = '\([^']*\)'.*/\1/p")
     if [ -f "$state/dbs/$db" ]; then echo "$db"; fi ;;
   *"DROP DATABASE"*)
     db=$(printf '%s' "$*" | sed -n 's/.*DROP DATABASE IF EXISTS `\([^`]*\)`.*/\1/p')
+    if [ -f "$state/deny-drop" ]; then
+      echo "ERROR 1044 (42000) at line 1: Access denied for user 'app'@'localhost' to database '$db'" >&2; exit 1
+    fi
     rm -f "$state/dbs/$db"; echo "$db" >> "$state/dropped" ;;
   *) echo "unexpected: $*" >&2; exit 9 ;;
 esac
@@ -8378,6 +8387,7 @@ fn slot_holder(n: u32, running: bool, hours: i64) -> WorktreeRecord {
         port: 6379,
         name: n.to_string(),
         main: "0".into(),
+        keys: Vec::new(),
         used_at: Utc::now() - chrono::Duration::hours(hours),
     });
     if running {
@@ -8657,4 +8667,173 @@ fn freeing_a_slot_goes_through_the_guard() {
         1,
         "still recorded"
     );
+}
+
+// ---- rm and doctor, for namespaces --------------------------------------------
+
+/// A namespaced worktree with a database and a slot, started and stopped.
+fn stopped_namespaced() -> (Namespaced, PathBuf) {
+    let (ns, redis) = slots_fixture(MAIN_ENV_WITH_REDIS);
+    let (report, _) = ns.start(Mode::Namespaced).unwrap();
+    drop(guard(&report));
+    stop(&ns.fx.paths, &ns.name, None).unwrap();
+    (ns, redis)
+}
+
+// `rm` takes the worktree's own database and slot with it — through the
+// guard, on the server they were made on — and nothing else.
+#[test]
+fn rm_drops_the_worktrees_database_and_empties_its_slot_and_nothing_else() {
+    let (ns, redis) = stopped_namespaced();
+    std::fs::write(ns.fake.join("dbs/shop"), "").unwrap();
+    std::fs::write(ns.fake.join("dbs/shop__feat_two"), "").unwrap();
+    let (said, progress) = collecting();
+    super::rm(&ns.fx.paths, &ns.name, false, false, &progress).unwrap();
+    let said = said.borrow().clone();
+    assert!(
+        said.iter()
+            .any(|l| l == "mariadb: dropped database shop__feat_one"),
+        "{said:?}"
+    );
+    assert!(
+        said.iter().any(|l| l == "redis: emptied slot 1"),
+        "{said:?}"
+    );
+    assert_eq!(ns.fake("dropped"), "shop__feat_one\n");
+    assert_eq!(
+        std::fs::read_to_string(redis.join("flushed")).unwrap(),
+        "1\n"
+    );
+    assert!(ns.fake.join("dbs/shop").exists(), "main's is where it was");
+    assert!(
+        ns.fake.join("dbs/shop__feat_two").exists(),
+        "and so is another worktree's"
+    );
+    assert!(!ns.fx.state().worktrees.contains_key(&ns.name));
+}
+
+// Whatever the record says, the guard stands between it and the server: a
+// record naming the main database is never dropped, and `rm` says so.
+#[test]
+fn rm_leaves_what_the_guard_refuses_and_says_why() {
+    let (ns, redis) = stopped_namespaced();
+    let mut store = ns.fx.state();
+    let record = store.worktrees.get_mut(&ns.name).unwrap();
+    for namespace in record.namespaces.iter_mut() {
+        namespace.name = namespace.main.clone();
+    }
+    state::save(&ns.fx.paths.state_file(), &store).unwrap();
+    let (said, progress) = collecting();
+    super::rm(&ns.fx.paths, &ns.name, false, false, &progress).unwrap();
+    let said = said.borrow().clone();
+    assert!(
+        said.iter()
+            .any(|l| l.contains("database shop is left as it is")
+                && l.contains("main checkout's own database")),
+        "{said:?}"
+    );
+    assert!(said.iter().any(|l| l.contains("slot 0")), "{said:?}");
+    assert_eq!(ns.fake("dropped"), "", "nothing was dropped");
+    assert!(!redis.join("flushed").exists(), "nothing was emptied");
+}
+
+// A database the server will not let the login drop is said, with the
+// command that drops it by hand — and never with the password in it.
+#[test]
+fn a_namespace_rm_cannot_drop_is_said_with_the_command_that_drops_it() {
+    let (ns, _redis) = stopped_namespaced();
+    std::fs::write(ns.fake.join("deny-drop"), "").unwrap();
+    let (said, progress) = collecting();
+    super::rm(&ns.fx.paths, &ns.name, false, false, &progress).unwrap();
+    let said = said.borrow().clone();
+    let line = said
+        .iter()
+        .find(|l| l.contains("could not be dropped"))
+        .unwrap_or_else(|| panic!("{said:?}"));
+    assert!(
+        line.contains("DROP DATABASE IF EXISTS `shop__feat_one`")
+            && line.contains("with the password in MYSQL_PWD"),
+        "{line}"
+    );
+    assert!(said.iter().all(|l| !l.contains("s3cret-pw")), "{said:?}");
+    assert!(ns.fake.join("dbs/shop__feat_one").exists());
+}
+
+// A removal git refuses has cost nothing: the worktree is there, and so is
+// its database.
+#[test]
+fn a_refused_removal_keeps_the_worktrees_namespaces() {
+    let (ns, redis) = stopped_namespaced();
+    let wt = ns.fx.worktrees_dir().join(&ns.name);
+    std::fs::write(wt.join("scratch.txt"), "work in progress\n").unwrap();
+    assert!(super::rm(&ns.fx.paths, &ns.name, false, false, &noop).is_err());
+    assert_eq!(ns.fake("dropped"), "");
+    assert!(!redis.join("flushed").exists());
+    assert_eq!(ns.fx.state().worktrees[&ns.name].namespaces.len(), 2);
+}
+
+// doctor lists a database named for a worktree of this project that no
+// record holds, with the command that drops it — and never drops it.
+#[test]
+fn doctor_lists_a_leftover_database_with_the_command_that_drops_it() {
+    let (ns, _redis) = stopped_namespaced();
+    std::fs::write(ns.fake.join("dbs/shop__feat_gone"), "").unwrap();
+    std::fs::write(ns.fake.join("dbs/shop"), "").unwrap();
+    let leftovers = namespace_leftovers(&ns.fx.paths, &ns.fx.config, &ns.fx.state());
+    assert_eq!(
+        leftovers
+            .iter()
+            .map(|l| l.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["shop__feat_gone"],
+        "the worktree's own is held, and main's is not a namespace"
+    );
+    assert!(
+        leftovers[0]
+            .by_hand
+            .as_deref()
+            .is_some_and(|c| c.contains("DROP DATABASE IF EXISTS `shop__feat_gone`")),
+        "{leftovers:?}"
+    );
+    assert_eq!(ns.fake("dropped"), "", "listed, never dropped");
+
+    // And a project that runs no namespaced worktree is never looked at.
+    let plain = namespaced_fixture(MAIN_ENV);
+    std::fs::write(plain.fake.join("dbs/shop__feat_gone"), "").unwrap();
+    assert!(namespace_leftovers(&plain.fx.paths, &plain.fx.config, &plain.fx.state()).is_empty());
+    assert_eq!(plain.fake("argv"), "", "no server was asked anything");
+}
+
+#[test]
+fn doctor_reports_a_leftover_database_as_a_note_with_its_fix() {
+    let (ns, _redis) = stopped_namespaced();
+    // doctor reads config from disk, as it always does.
+    std::fs::write(
+        ns.fx.paths.config_file(),
+        "[dev]\ncmd = \"sleep 30\"\nports = []\n\n\
+         [[services]]\nkind = \"native\"\nname = \"mariadb\"\nenv = { DATABASE_PORT = \"mariadb\" }\n",
+    )
+    .unwrap();
+    std::fs::write(ns.fake.join("dbs/shop__feat_gone"), "").unwrap();
+    let report = crate::doctor::run(&ns.fx.paths);
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.message.contains("shop__feat_gone"))
+        .unwrap_or_else(|| panic!("{:?}", report.findings));
+    assert_eq!(finding.severity, crate::doctor::Severity::Note);
+    assert!(
+        finding.message.contains("no worktree's record holds it"),
+        "{}",
+        finding.message
+    );
+    assert!(
+        finding
+            .fix
+            .as_deref()
+            .is_some_and(|fix| fix.contains("DROP DATABASE") && fix.contains("never drops")),
+        "{:?}",
+        finding.fix
+    );
+    assert_eq!(ns.fake("dropped"), "");
 }

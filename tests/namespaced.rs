@@ -104,13 +104,20 @@ fn wait_for(what: &str, ready: impl Fn() -> bool) {
 /// main checkout's database `shop` and an app login that may use it and
 /// nothing else, as a developer's own server would.
 fn mariadb() -> Throwaway {
+    // One at a time: two bootstraps at once trip over each other's
+    // temporary tables ("Unknown table 'mysql.tmp_user_sys'").
+    static INSTALL: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let dir = TempDir::new().unwrap();
     let data = dir.path().join("data");
+    let installing = INSTALL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let init = Command::new("mariadb-install-db")
         .arg(format!("--datadir={}", data.display()))
         .arg("--auth-root-authentication-method=normal")
         .output()
         .unwrap();
+    drop(installing);
     assert!(
         init.status.success(),
         "{}",
@@ -469,6 +476,38 @@ fn a_real_namespaced_start_gives_each_worktree_a_redis_slot_of_its_own() {
     assert_eq!(
         redis_cli(&cache, &["-n", "0", "GET", "seeded"]).unwrap(),
         ""
+    );
+    assert_eq!(
+        redis_cli(&cache, &["-n", "0", "GET", "main-key"]).unwrap(),
+        "main"
+    );
+
+    // `rm` takes one worktree's database and slot with it, on the real
+    // servers, and leaves the other worktree's and main's as they were.
+    let said = std::cell::RefCell::new(Vec::<String>::new());
+    pando::actions::rm(&paths, "feat+one", false, false, &|line: &str| {
+        said.borrow_mut().push(line.to_string())
+    })
+    .unwrap();
+    let said = said.into_inner();
+    assert!(
+        said.iter()
+            .any(|l| l == "mariadb: dropped database shop__feat_one"),
+        "{said:?}"
+    );
+    assert!(
+        said.iter().any(|l| l == "redis: emptied slot 1"),
+        "{said:?}"
+    );
+    let databases = root_sql(&db, "SHOW DATABASES LIKE 'shop%'").unwrap();
+    assert_eq!(
+        databases.lines().collect::<Vec<_>>(),
+        vec!["shop", "shop__feat_two"]
+    );
+    assert_eq!(redis_cli(&cache, &["-n", "1", "DBSIZE"]).unwrap(), "0");
+    assert_eq!(
+        redis_cli(&cache, &["-n", "2", "GET", "seeded"]).unwrap(),
+        "feat+two"
     );
     assert_eq!(
         redis_cli(&cache, &["-n", "0", "GET", "main-key"]).unwrap(),

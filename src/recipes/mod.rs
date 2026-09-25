@@ -117,6 +117,11 @@ pub struct NamespaceRecipe {
     /// when it does not, and fails when it cannot be asked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exists: Option<String>,
+    /// A `database`'s: prints the name of every database on the server
+    /// whose name matches `{prefix_like}`, one a line — what `doctor`
+    /// reads to find a worktree's database no record holds any more.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list: Option<String>,
     /// A `database`'s: makes it, and **fails when it is there already**,
     /// so one pando did not make is never taken for one it did.
     #[serde(default, skip_serializing_if = "Option::is_none")]

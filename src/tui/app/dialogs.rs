@@ -95,6 +95,10 @@ pub enum RemoveBlocker {
     /// Something runs in it, which the removal stops first.
     Running,
     NotOurs,
+    /// The namespaces it holds in the project's own servers, which go with
+    /// it: `drops database northwind_traders__feat_x`, `empties redis slot
+    /// 3`.
+    Drops(Vec<String>),
 }
 
 impl RemoveBlocker {
@@ -118,6 +122,7 @@ impl RemoveBlocker {
             RemoveBlocker::NotOurs => {
                 "pando did not create this worktree — confirming removes it anyway".to_string()
             }
+            RemoveBlocker::Drops(what) => format!("{} with it", what.join(", ")),
         }
     }
 
@@ -460,6 +465,13 @@ impl App {
         }
         if !self.created_by_pando.get(name).copied().unwrap_or(false) {
             out.push(RemoveBlocker::NotOurs);
+        }
+        let drops = self
+            .record_for(name)
+            .map(actions::namespaces_rm_drops)
+            .unwrap_or_default();
+        if !drops.is_empty() {
+            out.push(RemoveBlocker::Drops(drops));
         }
         out
     }

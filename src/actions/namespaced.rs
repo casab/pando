@@ -519,6 +519,7 @@ fn ensure_database(
         port: target.port,
         name: candidate.to_string(),
         main: target.main.clone(),
+        keys: target.keys.clone(),
         used_at: chrono::Utc::now(),
     };
     let store = crate::state::load(&paths.state_file())?;
@@ -602,6 +603,7 @@ fn ensure_slot(
         port: target.port,
         name: n.to_string(),
         main: target.main.clone(),
+        keys: target.keys.clone(),
         used_at: chrono::Utc::now(),
     };
     let store = crate::state::load(&paths.state_file())?;
@@ -958,4 +960,174 @@ pub(super) fn namespaced_env(
         }
     }
     Ok(env)
+}
+
+/// What goes with a worktree when it is removed, one phrase a namespace:
+/// `drops database northwind_traders__feat_x`, `empties redis slot 3`.
+/// What the remove dialog says before anything happens.
+pub fn namespaces_rm_drops(record: &crate::state::WorktreeRecord) -> Vec<String> {
+    record
+        .namespaces
+        .iter()
+        .map(|ns| match ns.kind {
+            NamespaceKind::Database => format!("drops database {}", ns.name),
+            NamespaceKind::Slot => format!("empties {} slot {}", ns.service, ns.name),
+        })
+        .collect()
+}
+
+/// Drops every namespace a removed worktree held — each database dropped,
+/// each slot emptied — through [`namespace::may_drop`], on the server it
+/// was made on.
+///
+/// Called by `rm` once the worktree itself is gone, so a removal git
+/// refused never costs a worktree its data. One pando may not or cannot
+/// drop is said, with the command that drops it by hand; its record goes
+/// with the worktree's, and `doctor` lists it after that.
+pub(super) fn drop_namespaces(
+    paths: &PandoPaths,
+    store: &crate::state::State,
+    name: &str,
+    progress: &dyn Fn(&str),
+) {
+    let Some(record) = store.worktrees.get(name) else {
+        return;
+    };
+    if record.namespaces.is_empty() {
+        return;
+    }
+    // `rm` works with a config that does not load; the logins it might
+    // hold are only a fallback to the main checkout's own.
+    let config = config::load(paths)
+        .map(|loaded| loaded.config)
+        .unwrap_or_else(|_| config::load_without_home(paths).config);
+    let recipes = crate::recipes::Recipes::load(&paths.recipes_dir());
+    let targets = plan(paths, &config).targets;
+    for ns in &record.namespaces {
+        let target = targets
+            .iter()
+            .find(|t| t.service == ns.service && t.port == ns.port && t.namespace.kind == ns.kind);
+        // The name the main checkout's env files give its own today,
+        // refused whatever the record says.
+        let main_now = target.map(|t| t.main.as_str());
+        let what = namespace::describe(ns);
+        if let Err(e) = namespace::may_drop(store, name, ns, main_now) {
+            progress(&format!("{}: {what} is left as it is — {e:#}", ns.service));
+            continue;
+        }
+        let Some(recipe) = recipes
+            .get(&ns.recipe)
+            .ok()
+            .and_then(|loaded| loaded.recipe.namespace.clone())
+        else {
+            progress(&format!(
+                "{}: {what} is left as it is — the recipe {:?} no longer says how to drop it",
+                ns.service, ns.recipe
+            ));
+            continue;
+        };
+        let keys = match (&ns.keys[..], target) {
+            ([], Some(target)) => target.keys.clone(),
+            (keys, _) => keys.to_vec(),
+        };
+        let login = namespace::find_login(
+            paths.root(),
+            &config,
+            &ns.service,
+            &keys,
+            recipe.user,
+            &paths.config_file(),
+        )
+        .unwrap_or_else(Login::none);
+        let server = namespace::Server {
+            service: &ns.service,
+            recipe: &recipe,
+            host: ns.host.clone(),
+            port: ns.port,
+            login,
+            bin_dir: paths.home.join("bin"),
+        };
+        match server.drop(&ns.name, &ns.main) {
+            Ok(()) => progress(&format!(
+                "{}: {}",
+                ns.service,
+                match ns.kind {
+                    NamespaceKind::Database => format!("dropped database {}", ns.name),
+                    NamespaceKind::Slot => format!("emptied slot {}", ns.name),
+                }
+            )),
+            Err(e) => progress(&format!(
+                "{}: {what} could not be dropped — {e:#}{}",
+                ns.service,
+                server
+                    .by_hand(&ns.name)
+                    .map(|command| format!(" — `{command}` drops it by hand"))
+                    .unwrap_or_default()
+            )),
+        }
+    }
+}
+
+/// A database named for a worktree of this project that no worktree's
+/// record holds: one `rm` could not drop, or one whose record was lost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Leftover {
+    pub service: String,
+    /// `host:port`.
+    pub address: String,
+    pub name: String,
+    /// The command that drops it, for a person: pando never drops what it
+    /// has no record of.
+    pub by_hand: Option<String>,
+}
+
+/// Every leftover database of this project on the servers it namespaces
+/// in, as far as each server says — asked only of a project that runs
+/// namespaced worktrees, because asking is a login to a server.
+///
+/// Read-only: a listing, never a drop. A server that does not answer, or
+/// a login nothing gives, is skipped rather than reported: this is a look
+/// for leftovers, and not being able to look is not one.
+pub fn namespace_leftovers(
+    paths: &PandoPaths,
+    config: &Config,
+    store: &crate::state::State,
+) -> Vec<Leftover> {
+    let namespaced = store.worktrees.values().any(|record| {
+        !record.namespaces.is_empty() || record.mode == Some(crate::state::ServiceMode::Namespaced)
+    });
+    if !namespaced {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for target in plan(paths, config).targets {
+        if target.namespace.kind != NamespaceKind::Database || target.namespace.list.is_none() {
+            continue;
+        }
+        let Ok(server) = server_for(paths, config, &target) else {
+            continue;
+        };
+        let Ok(names) = server.list(&target.main) else {
+            continue;
+        };
+        for name in names {
+            let held = store.worktrees.values().any(|record| {
+                record.namespaces.iter().any(|ns| {
+                    ns.kind == NamespaceKind::Database
+                        && ns.port == target.port
+                        && ns.name.eq_ignore_ascii_case(&name)
+                })
+            });
+            if held {
+                continue;
+            }
+            out.push(Leftover {
+                service: target.service.clone(),
+                address: server.address(),
+                by_hand: server.by_hand(&name),
+                name,
+            });
+        }
+    }
+    out
 }

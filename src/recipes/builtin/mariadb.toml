@@ -59,6 +59,7 @@ user = true
 password_env = "MYSQL_PWD"
 ping = "mariadb --protocol=tcp -h {host} -P {port} -u {user} -N -B -e 'SELECT 1'"
 exists = "mariadb --protocol=tcp -h {host} -P {port} -u {user} -N -B -e \"SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = '{namespace}'\""
+list = "mariadb --protocol=tcp -h {host} -P {port} -u {user} -N -B -e \"SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME LIKE '{prefix_like}'\""
 create = "mariadb --protocol=tcp -h {host} -P {port} -u {user} -e 'CREATE DATABASE `{namespace}`'"
 drop = "mariadb --protocol=tcp -h {host} -P {port} -u {user} -e 'DROP DATABASE IF EXISTS `{namespace}`'"
 denied = ["ERROR 1044"]

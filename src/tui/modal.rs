@@ -957,6 +957,8 @@ fn render_remove(f: &mut Frame, area: Rect, label: &str, blockers: &[RemoveBlock
             RemoveBlocker::DirtyUnknown => ("?", text_muted()),
             RemoveBlocker::Running => ("●", yellow()),
             RemoveBlocker::NotOurs => ("⚠", yellow()),
+            // Data that goes for good: the destructive colour.
+            RemoveBlocker::Drops(_) => ("✕", red()),
         };
         for (i, row) in wrap_text(&blocker.line(), cap.saturating_sub(2))
             .into_iter()

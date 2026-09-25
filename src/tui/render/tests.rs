@@ -3045,3 +3045,44 @@ fn a_login_typed_into_the_question_shows_its_password_as_dots() {
     assert!(rendered.contains("root:•••••••"), "{rendered}");
     assert!(rendered.contains("mariadb"), "{rendered}");
 }
+
+// The remove dialog says what goes with the worktree before anything
+// does: its own database and its slot, in the destructive colour's words.
+#[test]
+fn the_remove_dialog_says_which_database_and_slot_go_with_the_worktree() {
+    let mut app = test_app(&["feat+one"]);
+    let record = app
+        .state
+        .worktrees
+        .entry("feat+one".into())
+        .or_insert_with(|| crate::state::WorktreeRecord::new("/abs/feat+one", true));
+    for (service, kind, name) in [
+        (
+            "mariadb",
+            crate::state::NamespaceKind::Database,
+            "shop__feat_one",
+        ),
+        ("redis", crate::state::NamespaceKind::Slot, "3"),
+    ] {
+        record.namespaces.push(crate::state::NamespaceRecord {
+            service: service.into(),
+            recipe: service.into(),
+            kind,
+            host: "localhost".into(),
+            port: 1,
+            name: name.into(),
+            main: "0".into(),
+            keys: Vec::new(),
+            used_at: chrono::Utc::now(),
+        });
+    }
+    app.modal = Some(Modal::Remove {
+        name: "feat+one".into(),
+        created_by_pando: true,
+    });
+    let rendered = text_of(&draw(&mut app, 140, 30));
+    assert!(
+        rendered.contains("drops database shop__feat_one, empties redis slot 3 with it"),
+        "{rendered}"
+    );
+}

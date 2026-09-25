@@ -29,7 +29,9 @@ pub use lifecycle::{
     Mode, StartReport, StartedProcess, StopOutcome, process_names, restart, start, stop, stop_all,
     stop_all_with,
 };
-pub use namespaced::{login_question, namespace_login};
+pub use namespaced::{
+    Leftover, login_question, namespace_leftovers, namespace_login, namespaces_rm_drops,
+};
 pub use questions::{
     Answer, Answering, Ask, NEW_SLOTS, NeedsAnswer, Question, RefusedAnswer, START_SLOTS,
     Volunteered, already_answered, question_for, recommended, resolve, resolve_for_new,

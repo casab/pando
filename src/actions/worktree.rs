@@ -14,6 +14,7 @@ use crate::worktree::{self, PrInfo, Worktree};
 
 use super::hooks::{HookContext, run_hooks};
 use super::lifecycle::{MissingOnly, StopOutcome, stop_recorded, sweep_orphaned_groups};
+use super::namespaced::drop_namespaces;
 use super::refresh::refresh;
 use super::services::{clear_native_sockets, compose_projects, docker_down_for, remove_containers};
 use crate::remedy;
@@ -478,6 +479,11 @@ pub fn rm(
     // And the compose override, which is regenerated on every isolated
     // start and would otherwise outlive every worktree that ever had one.
     let _ = std::fs::remove_file(paths.compose_override_file(name));
+    // Its namespaces last, once the worktree is gone for certain: a
+    // removal git refused must not have cost the worktree its database.
+    // Each goes through the guard, on the server it was made on; one pando
+    // cannot drop is said, with the command that does.
+    drop_namespaces(paths, &store, name, progress);
     store.worktrees.remove(name);
     state::save(&paths.state_file(), &store)?;
     Ok(())

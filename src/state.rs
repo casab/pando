@@ -322,6 +322,11 @@ pub struct NamespaceRecord {
     /// The main checkout's own database, or slot, on that server: what the
     /// name was derived from, and what it must never be.
     pub main: String,
+    /// The env keys the app found the service by when this was made,
+    /// which is where its login is read from: `rm` reads it there to drop
+    /// this without loading config.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<String>,
     /// When a start of this worktree last used it.
     pub used_at: DateTime<Utc>,
 }
@@ -1226,6 +1231,7 @@ mod tests {
             port: 3306,
             name: "shop__feat_x".into(),
             main: "shop".into(),
+            keys: vec!["DATABASE_PORT".into()],
             used_at: at(10),
         }];
         let mut state = State::new();
