@@ -195,6 +195,80 @@ fn a_services_question() -> actions::Question {
     }
 }
 
+/// A single-choice question, the dev command's, with a first choice or
+/// without one.
+fn a_dev_question(preselect: Option<usize>) -> actions::Question {
+    actions::Question {
+        slot: crate::detect::Slot::DevCmd,
+        prompt: "Which command starts the local development server?".to_string(),
+        options: vec![
+            (
+                "npm run dev".to_string(),
+                "package.json scripts.dev".to_string(),
+            ),
+            (
+                "npm run start".to_string(),
+                "package.json scripts.start".to_string(),
+            ),
+        ],
+        preselect,
+        allow_custom: true,
+        allow_none: false,
+        multi: false,
+        checked: Vec::new(),
+        details: Vec::new(),
+        answer_file: Some(PathBuf::from("/home/.pando/projects/p/pando.toml")),
+        snippet: String::new(),
+    }
+}
+
+// A first `start` runs rather than interviews: a question the rules have a
+// first choice for takes it, and says so where `m` keeps it.
+#[test]
+fn the_tui_takes_the_rules_first_choice_instead_of_asking() {
+    let (tx, rx) = mpsc::channel();
+    let answer = super::background::ask_through_ui(&tx, &a_dev_question(Some(0))).unwrap();
+    assert_eq!(answer, actions::Answer::Choice(0));
+    match rx.try_recv() {
+        Ok(AppEvent::Notice(line)) => {
+            assert!(
+                line.contains("\"npm run dev\" (package.json scripts.dev), pando's first choice"),
+                "{line}"
+            );
+            assert!(line.contains("over 1 other option"), "{line}");
+            assert!(
+                line.contains("/home/.pando/projects/p/pando.toml"),
+                "{line}"
+            );
+        }
+        _ => panic!("no notice was sent"),
+    }
+}
+
+// With nothing to take, and for a set of services, the question is put.
+#[test]
+fn a_question_with_no_options_or_a_set_is_still_asked() {
+    let mut empty = a_dev_question(None);
+    empty.options.clear();
+    assert!(actions::recommended(&empty).is_none());
+    assert!(actions::recommended(&a_services_question()).is_none());
+}
+
+// A local file seeded from the project's example is one `--yes` may not
+// take; somebody at the TUI is told which file it came from instead.
+#[test]
+fn an_option_only_a_person_may_take_is_taken_when_a_person_is_there() {
+    let mut seeded = a_dev_question(None);
+    seeded.slot = crate::detect::Slot::Provision;
+    seeded.options = vec![(
+        ".env".to_string(),
+        ".env copied from .env.example — this clone has none of its own".to_string(),
+    )];
+    let (answer, line) = actions::recommended(&seeded).unwrap();
+    assert_eq!(answer, actions::Answer::Choice(0));
+    assert!(line.contains(".env copied from .env.example"), "{line}");
+}
+
 // ---- the multi-select modal ------------------------------------------
 
 #[test]

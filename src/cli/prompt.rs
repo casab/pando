@@ -50,6 +50,26 @@ pub(super) fn asker(yes: bool) -> impl Fn(&actions::Question) -> Result<actions:
     }
 }
 
+/// The asker of an everyday command — `new`, `start`, `restart`. On a
+/// terminal, a question pando's rules have a first choice for is not put:
+/// the choice is taken and said, with the file to change it in. `init`
+/// keeps [`asker`], because asking is what it is for; a script without
+/// `--yes` still gets exit 3, which is what it is written against.
+pub(super) fn everyday_asker(yes: bool) -> impl Fn(&actions::Question) -> Result<actions::Answer> {
+    let ask = asker(yes);
+    move |question: &actions::Question| {
+        use std::io::IsTerminal;
+        if !yes
+            && std::io::stdin().is_terminal()
+            && let Some((answer, line)) = actions::recommended(question)
+        {
+            notice(&line);
+            return Ok(answer);
+        }
+        ask(question)
+    }
+}
+
 fn needs_answer(question: &actions::Question) -> anyhow::Error {
     anyhow::Error::new(actions::NeedsAnswer {
         question: question.clone(),

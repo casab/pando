@@ -97,6 +97,53 @@ pub enum Answer {
     Program(Box<Answer>),
 }
 
+/// What an everyday command takes instead of asking — `new`, `start` and
+/// `restart` on a terminal, and the TUI: the option pando's rules put
+/// first, with the line that says so and where to change it.
+///
+/// A developer's first `start` should run, not interview them; the file
+/// the answer lands in is theirs to edit, and `pando init` is where
+/// somebody who wants every choice put to them goes. Taken as a
+/// [`Answer::Choice`], because that is what it is — one of pando's own
+/// options, written down with the evidence that found it.
+///
+/// Somebody is there to read the line, so the first option is taken even
+/// where `--yes` may not take it — a local file seeded from the project's
+/// example — and the line carries the option's own reason, which names the
+/// file it copies from.
+///
+/// `None` for a question with no options, which is still asked, and for a
+/// set question — which of the services to run private copies of — whose
+/// answer is not one option but a selection.
+pub fn recommended(question: &Question) -> Option<(Answer, String)> {
+    if question.multi || question.options.is_empty() {
+        return None;
+    }
+    let index = question.preselect.unwrap_or(0);
+    let (value, why) = question.options.get(index)?;
+    let why = match why.is_empty() {
+        true => String::new(),
+        false => format!(" ({why})"),
+    };
+    let alternatives = match question.options.len() - 1 {
+        0 => String::new(),
+        1 => ", over 1 other option".to_string(),
+        others => format!(", over {others} other options"),
+    };
+    let change = question
+        .answer_file
+        .as_ref()
+        .map(|file| format!(" — change it in {}", file.display()))
+        .unwrap_or_default();
+    Some((
+        Answer::Choice(index),
+        format!(
+            "{}: using {value:?}{why}, pando's first choice{alternatives}{change}",
+            slot_label(question.slot)
+        ),
+    ))
+}
+
 /// How a front end asks. The CLI prompts on a terminal and refuses
 /// elsewhere; the TUI opens a modal; a test hands back a scripted answer.
 pub type Ask<'a> = &'a dyn Fn(&Question) -> Result<Answer>;

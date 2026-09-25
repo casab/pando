@@ -26,7 +26,7 @@ use self::answers::read_answers;
 use self::answers::render_init;
 use self::answers::report_unused;
 use self::answers::volunteered_from;
-use self::prompt::asker;
+use self::prompt::everyday_asker;
 pub use answers::{Answers, UsageError, render_needs_answer, slot_name};
 pub use doctor::{adopt_project, doctor};
 pub use logs::logs;
@@ -482,7 +482,7 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
     let mut out = std::io::stdout();
     match command {
         Command::New { branch, base, yes } => {
-            let config = &actions::resolve_for_new(paths, config, &asker(yes), &notice)?;
+            let config = &actions::resolve_for_new(paths, config, &everyday_asker(yes), &notice)?;
             let name = actions::new(paths, config, &branch, base.as_deref(), &notice)
                 .map_err(|e| with_a_way_past(paths, e))?;
             // The canonical path, the one the state record and `pando path`
@@ -531,8 +531,14 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             let name = names::target(paths, typed.as_deref(), "start")?;
             let named = names::Named::of(paths, typed.as_deref(), &name);
             let mode = actions::Mode::of(isolated, shared);
-            let config =
-                &actions::resolve_for_start(paths, config, &name, mode, &asker(yes), &notice)?;
+            let config = &actions::resolve_for_start(
+                paths,
+                config,
+                &name,
+                mode,
+                &everyday_asker(yes),
+                &notice,
+            )?;
             let report = actions::start(paths, config, &name, only.as_deref(), mode, &notice)
                 .map_err(|e| with_a_way_past(paths, named.reword(e)))?;
             if report.reassigned {
@@ -667,8 +673,14 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             // `start --shared` already is, since changing the mode
             // restarts the processes anyway.
             let mode = actions::Mode::of(isolated, false);
-            let config =
-                &actions::resolve_for_start(paths, config, &name, mode, &asker(yes), &notice)?;
+            let config = &actions::resolve_for_start(
+                paths,
+                config,
+                &name,
+                mode,
+                &everyday_asker(yes),
+                &notice,
+            )?;
             let report = actions::restart(paths, config, &name, only.as_deref(), mode, &notice)
                 .map_err(|e| with_a_way_past(paths, named.reword(e)))?;
             if waits(wait, no_wait) {

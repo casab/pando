@@ -46,6 +46,9 @@ pub enum AppEvent {
     ConfigResolved(Box<Config>),
     /// A shell or editor handed to tmux or the desktop did not start.
     LaunchFailed(String),
+    /// Something a worker decided without asking, worth a line in the
+    /// header and in `m`: the first choice it took for a question.
+    Notice(String),
 }
 
 /// One consistent read of the repository, taken off the UI thread.
@@ -75,6 +78,12 @@ pub(super) fn ask_through_ui(
     tx: &Sender<AppEvent>,
     question: &actions::Question,
 ) -> Result<actions::Answer> {
+    // The rules' first choice is taken, not asked about — see
+    // `actions::recommended` — and said where `m` keeps it.
+    if let Some((answer, line)) = actions::recommended(question) {
+        let _ = tx.send(AppEvent::Notice(line));
+        return Ok(answer);
+    }
     let (reply_tx, reply_rx) = mpsc::channel();
     tx.send(AppEvent::AskQuestion(Box::new((
         question.clone(),

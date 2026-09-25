@@ -455,6 +455,10 @@ impl App {
                 self.set_error(message);
                 true
             }
+            AppEvent::Notice(message) => {
+                self.set_status(message);
+                true
+            }
             AppEvent::ConfigResolved(config) => {
                 // The one place the session's config changes while it runs.
                 // Without it the modal reopens on the next `s`, with the
