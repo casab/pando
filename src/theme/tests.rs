@@ -224,3 +224,120 @@ fn contrast_is_wcags_ratio() {
     assert!((black.contrast(white) - 21.0).abs() < 0.01);
     assert!((white.contrast(white) - 1.0).abs() < 0.001);
 }
+
+fn channels(color: Color) -> Rgb {
+    match color {
+        Color::Rgb(r, g, b) => Rgb(r, g, b),
+        other => panic!("a theme colour is always RGB: {other:?}"),
+    }
+}
+
+fn distance(a: Color, b: Color) -> f32 {
+    let (a, b) = (channels(a), channels(b));
+    let d = |x: u8, y: u8| (x as f32 - y as f32).powi(2);
+    (d(a.0, b.0) + d(a.1, b.1) + d(a.2, b.2)).sqrt()
+}
+
+// Decision 11: every theme has a namespaced colour of its own — readable
+// on its background as text is, and never mistaken for another meaning:
+// not isolated's magenta, not the cursor's blue, not any other accent, and
+// not the text itself, which a theme whose text is blue would otherwise
+// hand it.
+#[test]
+fn every_built_in_theme_has_a_readable_namespaced_colour_of_its_own() {
+    let (all, _) = themes(None);
+    for theme in &all {
+        for appearance in [Appearance::Dark, Appearance::Light] {
+            let p = theme.palette(appearance);
+            let background = match theme.source {
+                Source::BuiltIn => {
+                    let text = BUILT_IN.iter().find(|(n, _)| *n == theme.name).unwrap().1;
+                    let file: toml::Value = toml::from_str(text).unwrap();
+                    let half = match appearance {
+                        Appearance::Dark => "dark",
+                        Appearance::Light => "light",
+                    };
+                    Rgb::parse(file[half]["background"].as_str().unwrap()).unwrap()
+                }
+                Source::File(_) => unreachable!("built-ins only"),
+            };
+            let contrast = channels(p.namespaced).contrast(background);
+            assert!(
+                contrast >= 4.5,
+                "{} {appearance:?}: namespaced reads at {contrast:.2} on its background",
+                theme.name
+            );
+            for (meaning, other) in [
+                ("magenta", p.magenta),
+                ("blue", p.blue),
+                ("red", p.red),
+                ("green", p.green),
+                ("yellow", p.yellow),
+                ("cyan", p.cyan),
+                ("orange", p.orange),
+                ("text", p.text),
+            ] {
+                let apart = distance(p.namespaced, other);
+                assert!(
+                    apart >= 18.0,
+                    "{} {appearance:?}: namespaced is {apart:.0} from {meaning}",
+                    theme.name
+                );
+            }
+        }
+    }
+}
+
+// A theme may name it, as the eighth accent, and then it is exactly that;
+// two themes that do not name it get two colours, from their own accents.
+#[test]
+fn a_theme_that_names_namespaced_gets_it_and_one_that_does_not_gets_its_own() {
+    let text = |namespaced: &str| {
+        format!(
+            r##"
+            description = "test"
+            [dark]
+            background = "#000000"
+            foreground = "#ffffff"
+            red = "#ff0000"
+            green = "#00ff00"
+            yellow = "#ffff00"
+            blue = "#0000ff"
+            magenta = "#ff00ff"
+            cyan = "#00ffff"
+            orange = "#ff8800"
+            {namespaced}
+            [light]
+            background = "#ffffff"
+            foreground = "#000000"
+            red = "#ff0000"
+            green = "#00ff00"
+            yellow = "#ffff00"
+            blue = "#0000ff"
+            magenta = "#ff00ff"
+            cyan = "#00ffff"
+            orange = "#ff8800"
+            "##
+        )
+    };
+    let named = Theme::parse("named", &text("namespaced = \"#123456\""), Source::BuiltIn).unwrap();
+    assert_eq!(
+        named.palette(Appearance::Dark).namespaced,
+        Color::Rgb(0x12, 0x34, 0x56)
+    );
+    let mixed = Theme::parse("mixed", &text(""), Source::BuiltIn).unwrap();
+    assert_ne!(
+        mixed.palette(Appearance::Dark).namespaced,
+        Color::Rgb(0x12, 0x34, 0x56)
+    );
+    let (all, _) = themes(None);
+    let pando = find(&all, "pando")
+        .unwrap()
+        .palette(Appearance::Dark)
+        .namespaced;
+    let gruvbox = find(&all, "gruvbox")
+        .unwrap()
+        .palette(Appearance::Dark)
+        .namespaced;
+    assert_ne!(pando, gruvbox, "each theme mixes its own");
+}

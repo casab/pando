@@ -55,6 +55,15 @@ pub enum Modal {
         /// The mode it is switching to.
         to: crate::state::ServiceMode,
     },
+    /// ⏎: which services it runs on — shared, namespaced (experimental),
+    /// isolated. On a stopped worktree the mode it last ran in is under
+    /// the cursor; on a running one the mode it runs in, and choosing
+    /// another switches it, with no second dialog: this was the asking.
+    Mode {
+        name: String,
+        /// The row under the cursor, in [`crate::state::ServiceMode::ALL`].
+        selected: usize,
+    },
     /// `X`: every worktree with anything up, stopped at once, as
     /// `pando stop --all` does. Lists what goes down before it does.
     StopAll {
@@ -569,7 +578,9 @@ impl App {
                     selected = (selected + 1).min(question.options.len().saturating_sub(1));
                 }
                 KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
-                KeyCode::Char('c') => custom = Some(String::new()),
+                // Only where a typed answer is one: a slot to free is
+                // chosen from the list, never typed.
+                KeyCode::Char('c') if question.allow_custom => custom = Some(String::new()),
                 // The CLI prompt's `n`: a slot that may have no answer —
                 // no schema hook, no port variable — records that, the
                 // same `Answer::None` the prompt sends.

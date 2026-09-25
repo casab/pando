@@ -125,8 +125,10 @@ From a script they return once everything is spawned; `--wait` and
 ### In the TUI
 
 ```
-⏎        open the logs when it runs, start it when it is stopped
+⏎        pick its mode — shared, namespaced (experimental), isolated —
+         and start it, or switch it when it runs
 s i S    start it: as last time, isolated, or on the shared services
+l        open the log viewer
 x X      stop it, or stop everything
 r P      restart it, or only the selected process
 o O      open its URL, or the public one
@@ -138,17 +140,25 @@ p        open pull requests: ⏎ makes a worktree for one
 m ?      what pando said in full, and every key
 ```
 
+Enter opens the mode chooser on every worktree. On a stopped one the
+mode it last ran in is under the cursor and marked `last used`, so
+enter, enter is still one quick start; one never started has shared
+there. On a running one the mode it runs in is marked `running`, and
+choosing another switches it — every process restarts on the other
+services, and the chooser was the asking. The logs are `l`.
+
 A key that would interrupt a running worktree asks for a second press:
 `r r` restarts it, `x x` stops it, `P P` restarts one process, and `i`
 or `S` twice restarts it in the mode it already runs in. Esc takes the
-first press back. Moving a running worktree between isolated and shared,
-sharing it, and removing it ask in a dialog instead. On a stopped
+first press back. Moving a running worktree between modes with `i` or
+`S`, sharing it, and removing it ask in a dialog instead. On a stopped
 worktree nothing asks.
 
 The list is a table with a header row: `branch`, then `changes`
 (`uncommitted` when there are uncommitted changes), `port`, `public` (`◈`
 while it is shared), `mode` (`isolated` when it runs private copies of
-the services), `git` (commits ahead of and behind the base branch), `PR`
+the services, `namespaced` when it runs on a database and a slot of its
+own in the main checkout's servers, each in its own colour), `git` (commits ahead of and behind the base branch), `PR`
 and `status` (`failed`, or what is being done to it). A column shows
 only when some row has something in it. The glyph before the branch
 says whether it runs: `●` running, `◌` starting, `✗` failed, `○`

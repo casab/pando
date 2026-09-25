@@ -47,7 +47,8 @@ pub const LIST_KEYS: &[KeyHelp] = &[
     key(
         "⏎",
         &[KeyCode::Enter],
-        "open the logs when it runs, start it when stopped",
+        "choose its mode — shared, namespaced (experimental), isolated — and start it, or \
+         switch it when it runs",
     ),
     key(
         "s",
@@ -57,12 +58,12 @@ pub const LIST_KEYS: &[KeyHelp] = &[
     key(
         "i",
         &[KeyCode::Char('i')],
-        "start it isolated: private copies of the services (asks when it runs shared)",
+        "start it isolated: private copies of the services (asks when it runs otherwise)",
     ),
     key(
         "S",
         &[KeyCode::Char('S')],
-        "start it shared: the project's own services (asks when it runs isolated)",
+        "start it shared: the project's own services (asks when it runs otherwise)",
     ),
     key("x", &[KeyCode::Char('x')], "stop it (x twice when it runs)"),
     key(
@@ -131,7 +132,7 @@ pub const LIST_KEYS: &[KeyHelp] = &[
 pub const LIST_LEGEND: &[(&str, &str)] = &[
     ("●", "running: the dev server is up"),
     ("◌", "starting, or something is being done to it"),
-    ("✗", "failed — ⏎ shows the log that says why"),
+    ("✗", "failed — l shows the log that says why"),
     ("○", "stopped — s starts it"),
     (
         "uncommitted",
@@ -147,6 +148,10 @@ pub const LIST_LEGEND: &[(&str, &str)] = &[
         "public: shared on the internet — O opens, C copies the URL",
     ),
     ("isolated", "mode: runs private copies of the services"),
+    (
+        "namespaced",
+        "mode: a database and a slot of its own in the project's own servers (experimental)",
+    ),
     ("↑n ↓n", "git: commits ahead of / behind the base branch"),
     ("◍n", "its pull request: ◌ draft, ✓ merged, ✗ closed"),
     (

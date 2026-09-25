@@ -87,6 +87,14 @@ const BORDER: f32 = 0.22;
 /// A search match is the theme's blue, washed into the background far
 /// enough that the text on it stays readable.
 const SEARCH_MATCH: f32 = 0.35;
+/// Namespaced, when a theme does not name it: this share of the way from
+/// its magenta to its blue. Nearer magenta, so it reads as isolated's
+/// sibling — both are data of the worktree's own — and never as the
+/// cursor's blue.
+const NAMESPACED: f32 = 0.4;
+/// And it is text, a word in a column, so it is held to the floor the
+/// dimmer text is.
+const NAMESPACED_CONTRAST: f32 = TEXT_DIM_CONTRAST;
 
 /// One appearance of a theme, as its file writes it: the base colours every
 /// theme has, and any role it would rather set than have derived.
@@ -102,6 +110,10 @@ pub struct Variant {
     pub magenta: Rgb,
     pub cyan: Rgb,
     pub orange: Rgb,
+    /// The eighth accent, which a theme may leave to be mixed from two of
+    /// the others.
+    #[serde(default)]
+    pub namespaced: Option<Rgb>,
     #[serde(default)]
     pub text_dim: Option<Rgb>,
     #[serde(default)]
@@ -129,6 +141,7 @@ pub struct Palette {
     pub magenta: Color,
     pub cyan: Color,
     pub orange: Color,
+    pub namespaced: Color,
     pub text: Color,
     pub text_dim: Color,
     pub text_muted: Color,
@@ -158,6 +171,22 @@ impl Variant {
             })
             .color()
         };
+        // Between magenta and blue, then lighter on a dark background, or
+        // darker on a light one, until it reads — the way a grey is held to
+        // its floor, but towards white or black rather than the text, so
+        // the hue survives a theme whose text is itself a colour.
+        let namespaced = self.namespaced.unwrap_or_else(|| {
+            let hue = self.magenta.mix(self.blue, NAMESPACED);
+            let away = match bg.luminance() < 0.5 {
+                true => Rgb(255, 255, 255),
+                false => Rgb(0, 0, 0),
+            };
+            let mut t = 0.0;
+            while t < 1.0 && hue.mix(away, t).contrast(bg) < NAMESPACED_CONTRAST {
+                t += 0.02;
+            }
+            hue.mix(away, t)
+        });
         Palette {
             red: self.red.color(),
             green: self.green.color(),
@@ -166,6 +195,7 @@ impl Variant {
             magenta: self.magenta.color(),
             cyan: self.cyan.color(),
             orange: self.orange.color(),
+            namespaced: namespaced.color(),
             text: fg.color(),
             text_dim: readable(self.text_dim, TEXT_DIM, bg, TEXT_DIM_CONTRAST),
             text_muted: readable(self.text_muted, TEXT_MUTED, surface, TEXT_MUTED_CONTRAST),

@@ -19,8 +19,8 @@ use super::app::{
 use super::render::{centered_box, chunk_cells, text_width, truncate, truncate_middle, wrap_text};
 use crate::state::ServiceMode;
 use crate::theme::{
-    blue, border, cyan, green, highlight_bg, magenta, orange, red, surface, text, text_dim,
-    text_muted, yellow,
+    blue, border, cyan, green, highlight_bg, magenta, namespaced, orange, red, surface, text,
+    text_dim, text_muted, yellow,
 };
 use crate::worktree::{BranchSource, PrState};
 
@@ -65,6 +65,7 @@ pub fn render_modal(f: &mut Frame, area: Rect, modal: &Modal, app: &App) -> Opti
         Modal::Share { name } => {
             render_share(f, area, &app.label_of(name), app.url_of(name).as_deref())
         }
+        Modal::Mode { name, selected } => render_mode_chooser(f, area, app, name, *selected),
         Modal::SwitchMode { name, to } => {
             let processes: Vec<String> =
                 app.processes_of(name).into_iter().map(|(p, _)| p).collect();
@@ -207,8 +208,17 @@ fn render_question(
     // "type the variable names" for ports, "a shell line" for the prelude:
     // what a typed answer is, as the CLI's prompt says it.
     let type_it = format!("type the {}", question.slot.custom_noun());
+    // A question only a person may answer is one whose answer destroys
+    // data: the slot to free. Its action says so, in the destructive
+    // colour, and there is nothing to type in place of a choice.
+    let destroys = question.slot.takes_a_person();
     let footer: Vec<(&str, &str)> = match custom {
         Some(_) => vec![("⏎", "accept"), ("esc", "back")],
+        None if destroys => vec![
+            ("⏎", "empty its slot and free it"),
+            ("n", "free none"),
+            ("esc", "cancel"),
+        ],
         None if question.multi => vec![
             ("space", "toggle"),
             ("⏎", "accept"),
@@ -229,11 +239,11 @@ fn render_question(
             .enumerate()
             .flat_map(|(i, (key, label))| {
                 let gap = if i == 0 { "" } else { "   " };
-                [
-                    hint_span(gap),
-                    key_span(key),
-                    hint_span(&format!(" {label}")),
-                ]
+                let label = match destroys && i == 0 && custom.is_none() {
+                    true => Span::styled(format!(" {label}"), Style::new().fg(red())),
+                    false => hint_span(&format!(" {label}")),
+                };
+                [hint_span(gap), key_span(key), label]
             })
             .collect::<Vec<_>>(),
     );
@@ -345,7 +355,11 @@ fn render_question(
 
     // The body scrolls; the key line under it does not.
     let height = body.len() + 2;
-    let Some(inner) = popup(f, area, "pando needs an answer", None, width, height) else {
+    let title = match destroys {
+        true => "free a slot",
+        false => "pando needs an answer",
+    };
+    let Some(inner) = popup(f, area, title, None, width, height) else {
         return;
     };
     let [body_area, footer_area] =
@@ -790,6 +804,97 @@ fn render_switch_mode(
     let width = widest(&lines).min(cap);
     let title = format!("restart {how}");
     let Some(inner) = popup(f, area, &title, None, width, lines.len()) else {
+        return;
+    };
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// ⏎: shared, namespaced, isolated — one row each, in the colour each
+/// mode is painted in wherever it is shown, with what it means and, beside
+/// the mode it runs in or last ran in, `running` or `last used`.
+fn render_mode_chooser(f: &mut Frame, area: Rect, app: &App, name: &str, selected: usize) {
+    let cap = max_content_width(area);
+    let record = app.record_for(name);
+    let running = app.is_up(name);
+    let current = record.and_then(|r| r.mode);
+    let rows: Vec<(ServiceMode, &str, &str)> = ServiceMode::ALL
+        .iter()
+        .map(|mode| match mode {
+            ServiceMode::Shared => (*mode, "shared", "the main checkout's servers and its data"),
+            ServiceMode::Namespaced => (
+                *mode,
+                "namespaced (experimental)",
+                "its own database and slot in the main checkout's servers",
+            ),
+            ServiceMode::Isolated => (*mode, "isolated", "servers of its own, on ports of its own"),
+        })
+        .collect();
+    let word_width = rows
+        .iter()
+        .map(|(_, word, _)| text_width(word))
+        .max()
+        .unwrap_or(0);
+    let mut lines: Vec<Line> = vec![
+        Line::styled(
+            truncate_middle(
+                &format!(
+                    "{} {} on which services?",
+                    if running { "run" } else { "start" },
+                    app.label_of(name)
+                ),
+                cap,
+            ),
+            Style::new().fg(text()).add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+    ];
+    for (i, (mode, word, what)) in rows.iter().enumerate() {
+        let here = i == selected;
+        let color = match mode {
+            ServiceMode::Shared => text(),
+            ServiceMode::Namespaced => namespaced(),
+            ServiceMode::Isolated => magenta(),
+        };
+        let mut word_style = Style::new().fg(color);
+        if here {
+            word_style = word_style.add_modifier(Modifier::BOLD);
+        }
+        let (label, label_color) = match (current == Some(*mode), running) {
+            (true, true) => ("  running", green()),
+            (true, false) => ("  last used", text_dim()),
+            (false, _) => ("", text_dim()),
+        };
+        let mut spans = vec![
+            Span::styled(if here { "▸ " } else { "  " }, Style::new().fg(blue())),
+            Span::styled(format!("{word:<word_width$}"), word_style),
+            Span::styled(label, Style::new().fg(label_color)),
+        ];
+        let used: usize = spans.iter().map(|s| text_width(&s.content)).sum();
+        spans.push(Span::styled(
+            format!("  {}", truncate(what, cap.saturating_sub(used + 2))),
+            Style::new().fg(text_muted()),
+        ));
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::raw(""));
+    // On a running worktree the one it runs in changes nothing, and every
+    // other one restarts every process: said on the key line, before it.
+    let chosen = ServiceMode::ALL.get(selected).copied();
+    let action = match (running, chosen == current) {
+        (true, true) => " keeps it as it is   ",
+        (true, false) => " switches it — every process restarts   ",
+        (false, _) => " starts it   ",
+    };
+    lines.push(Line::from(vec![
+        key_span("↑↓"),
+        hint_span(" choose   "),
+        key_span("⏎"),
+        hint_span(action),
+        key_span("esc"),
+        hint_span(" cancel"),
+    ]));
+    let width = widest(&lines).min(cap);
+    let Some(inner) = popup(f, area, "mode", None, width, lines.len()) else {
         return;
     };
     f.render_widget(Paragraph::new(lines), inner);

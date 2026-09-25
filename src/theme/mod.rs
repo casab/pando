@@ -5,7 +5,8 @@
 //! own under `<pando home>/themes/`, which replaces a built-in of the same
 //! name. It gives a background, a foreground and seven accents for each
 //! appearance, and every other colour is mixed from those
-//! ([`palette`](self::palette)), so a new theme is nine lines a side.
+//! ([`palette`](self::palette)) — an eighth accent, `namespaced`, included
+//! — so a new theme is nine lines a side.
 //!
 //! Which one applies: `PANDO_THEME`, then the file `[ui] theme_from`
 //! names (a terminal theme switcher's state file, followed while pando
@@ -24,6 +25,9 @@
 //! | `cyan`       | an address: a URL, a port                          |
 //! | `magenta`    | isolated: private copies of the services; a merged |
 //! |              | pull request, as GitHub colours it                 |
+//! | `namespaced` | namespaced: a namespace of the worktree's own in   |
+//! |              | the project's servers. Mixed from magenta and blue |
+//! |              | when a theme does not name it                      |
 //! | `blue`       | where you are: the cursor, the checked-out branch  |
 //! | `orange`     | a key to press                                     |
 //! | `text`       | what the row is about: a branch, a title           |
@@ -149,6 +153,10 @@ pub fn orange() -> Color {
 
 pub fn magenta() -> Color {
     palette().magenta
+}
+
+pub fn namespaced() -> Color {
+    palette().namespaced
 }
 
 pub fn green() -> Color {

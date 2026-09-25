@@ -39,8 +39,8 @@ use ratatui::widgets::{Block, BorderType, Paragraph};
 use crate::actions;
 use crate::state::{Aggregate, ServiceMode};
 use crate::theme::{
-    blue, border, cyan, green, highlight_bg, magenta, orange, red, surface, text, text_dim,
-    text_muted, yellow,
+    blue, border, cyan, green, highlight_bg, magenta, namespaced, orange, red, surface, text,
+    text_dim, text_muted, yellow,
 };
 use crate::tui::app::{App, Mode};
 use crate::worktree::{PrInfo, PrState, Worktree};
@@ -257,7 +257,7 @@ fn row_cells(app: &App, wt: &Worktree) -> RowCells {
         Some(ServiceMode::Namespaced) => cells.push((
             Col::Mode,
             ServiceMode::Namespaced.word().to_string(),
-            Style::new().fg(text()),
+            Style::new().fg(namespaced()),
         )),
         Some(ServiceMode::Shared) | None => {}
     }

@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, BorderType, Paragraph};
 use crate::log_tail::LogLevel;
 use crate::state::{Aggregate, Phase, ProcessRecord, ServiceMode};
 use crate::theme::{
-    border, cyan, green, highlight_bg, magenta, red, text, text_dim, text_muted, yellow,
+    border, cyan, green, highlight_bg, magenta, namespaced, red, text, text_dim, text_muted, yellow,
 };
 use crate::tui::app::{App, compact_age};
 
@@ -176,6 +176,11 @@ pub(super) fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
     for line in service_rows(app, &name, width) {
         rows.push((KEEP_PROCESSES, line));
     }
+    // And what it holds in the main checkout's own servers, as private
+    // services are: what is its own there, and what stays shared.
+    for line in namespace_rows(app, &name, width) {
+        rows.push((KEEP_PROCESSES, line));
+    }
     // Never truncated, either of them: the URL is the thing that gets
     // copied, and one missing its end is worse than none.
     if let Some(phase) = app.phase_of(&name)
@@ -287,8 +292,8 @@ fn mode_row<'a>(app: &App, name: &str, width: usize) -> Option<Line<'a>> {
     let (color, what) = match mode {
         ServiceMode::Isolated => (magenta(), "  private services · S shares"),
         ServiceMode::Namespaced => (
-            text(),
-            "  its own namespaces in the project's services · S shares",
+            namespaced(),
+            "  its own database and slot in the project's servers · S shares",
         ),
         ServiceMode::Shared => (text_dim(), "  the project's services · i isolates"),
     };
@@ -433,7 +438,7 @@ fn status_row<'a>(app: &App, name: &str, width: usize) -> Line<'a> {
         let hint = if app.nothing_to_run {
             ""
         } else {
-            "  ⏎ starts it · i isolated"
+            "  ⏎ picks a mode to start"
         };
         return detail_row(
             "status",
@@ -489,7 +494,7 @@ fn status_row<'a>(app: &App, name: &str, width: usize) -> Line<'a> {
                     Style::new().fg(red()).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    truncate("  ⏎ shows the log", width.saturating_sub(LABEL_WIDTH + 8)),
+                    truncate("  l shows the log", width.saturating_sub(LABEL_WIDTH + 8)),
                     Style::new().fg(text_muted()),
                 ),
             ],
@@ -631,6 +636,69 @@ fn service_rows<'a>(app: &App, name: &str, width: usize) -> Vec<Line<'a>> {
                 Span::styled(glyph, Style::new().fg(color)),
                 Span::styled(
                     format!(" {:<label_width$}  ", service.name),
+                    Style::new().fg(text_dim()),
+                ),
+                Span::styled(
+                    truncate(&detail, width.saturating_sub(label_width + 7)),
+                    Style::new().fg(text_muted()),
+                ),
+            ])
+        })
+        .collect()
+}
+
+/// One row per namespace the worktree holds in the main checkout's own
+/// servers — `own database northwind_traders__feat_x`, `slot 3`, or `kept`
+/// for one waiting through another mode until `rm` — and, while it runs
+/// namespaced, one per service that stays on main's data, with why.
+fn namespace_rows<'a>(app: &App, name: &str, width: usize) -> Vec<Line<'a>> {
+    let Some(record) = app.record_for(name) else {
+        return Vec::new();
+    };
+    let namespaced_now = record.mode() == ServiceMode::Namespaced;
+    let mut rows: Vec<(String, &str, String)> = record
+        .namespaces
+        .iter()
+        .map(|ns| {
+            let what = match ns.kind {
+                crate::state::NamespaceKind::Database => format!("database {}", ns.name),
+                crate::state::NamespaceKind::Slot => format!("slot {}", ns.name),
+            };
+            match namespaced_now {
+                true => (ns.service.clone(), "own", what),
+                false => (ns.service.clone(), "kept", format!("{what} until rm")),
+            }
+        })
+        .collect();
+    if namespaced_now {
+        let shared = app.namespace_shared.get_or_init(|| {
+            crate::actions::namespace_lines(&app.paths, Some(&app.config), record)
+                .into_iter()
+                .filter(|(_, word, _)| *word == "shared")
+                .map(|(service, _, why)| (service, why))
+                .collect()
+        });
+        for (service, why) in shared {
+            rows.push((service.clone(), "shared", why.clone()));
+        }
+    }
+    let label_width = rows
+        .iter()
+        .map(|(service, _, _)| text_width(service))
+        .max()
+        .unwrap_or(0);
+    rows.into_iter()
+        .map(|(service, word, what)| {
+            let color = match word {
+                "shared" => text_dim(),
+                _ => namespaced(),
+            };
+            let detail = format!("{word:<6}  {what}");
+            Line::from(vec![
+                Span::styled("   ", Style::new().fg(text_muted())),
+                Span::styled("◆", Style::new().fg(color)),
+                Span::styled(
+                    format!(" {service:<label_width$}  "),
                     Style::new().fg(text_dim()),
                 ),
                 Span::styled(

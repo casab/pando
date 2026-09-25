@@ -266,6 +266,16 @@ fn renders_every_modal_at_any_terminal_size() {
             name: "feat+one".into(),
             to: crate::state::ServiceMode::Isolated,
         },
+        Modal::Mode {
+            name: "feat+one".into(),
+            selected: 1,
+        },
+        Modal::Question {
+            question: free_slot_question(&["feat+two", "feat+three"]),
+            selected: 1,
+            custom: None,
+            reply: reply.clone(),
+        },
         Modal::Question {
             question: crate::actions::Question {
                 slot: crate::detect::Slot::DevCmd,
@@ -969,7 +979,7 @@ fn a_stopped_worktree_is_told_how_to_start() {
     let mut app = test_app(&["feat+one"]);
     let rendered = text_of(&draw(&mut app, 120, 20));
     assert!(rendered.contains("○ stopped"), "{rendered}");
-    assert!(rendered.contains("⏎ starts it"), "{rendered}");
+    assert!(rendered.contains("⏎ picks a mode to start"), "{rendered}");
 }
 
 #[test]
@@ -1156,7 +1166,7 @@ fn the_footer_offers_the_keys_the_selected_row_needs() {
 
     with_process(&mut app, "feat+one", running_phase());
     let running = text_of(&draw(&mut app, 120, 20));
-    assert!(running.contains("⏎ logs"), "{running}");
+    assert!(running.contains("l logs"), "{running}");
     assert!(running.contains("x stop"), "{running}");
     assert!(running.contains("r restart"), "{running}");
 }
@@ -1182,7 +1192,7 @@ fn the_share_keys_go_before_anything_essential_when_the_footer_will_not_fit() {
     let mut app = test_app(&["feat+one"]);
     with_process(&mut app, "feat+one", running_phase());
     let rendered = text_of(&draw(&mut app, 60, 20));
-    for essential in ["j/k move", "⏎ logs", "x stop", "? help", "q quit"] {
+    for essential in ["j/k move", "l logs", "x stop", "? help", "q quit"] {
         assert!(rendered.contains(essential), "{essential}: {rendered}");
     }
     for line in rendered.lines() {
@@ -2319,7 +2329,7 @@ fn a_project_with_nothing_to_run_says_so_in_the_pane_and_the_footer() {
     let mut app = test_app(&["main-lib"]);
     app.nothing_to_run = true;
     let rendered = text_of(&draw(&mut app, 200, 30));
-    assert!(!rendered.contains("⏎ starts it"), "{rendered}");
+    assert!(!rendered.contains("⏎ picks a mode"), "{rendered}");
     assert!(
         rendered.contains("nothing to run: add a [dev] command in"),
         "{rendered}"
@@ -2839,6 +2849,16 @@ fn wide_names_paint_at_any_terminal_size() {
         Some(Modal::StopAll {
             names: names.iter().map(|n| n.to_string()).collect(),
         }),
+        Some(Modal::Mode {
+            name: names[0].into(),
+            selected: 2,
+        }),
+        Some(Modal::Question {
+            question: free_slot_question(&names),
+            selected: 0,
+            custom: None,
+            reply: reply.clone(),
+        }),
         Some(Modal::Question {
             question: crate::actions::Question {
                 slot: crate::detect::Slot::DevCmd,
@@ -3083,6 +3103,225 @@ fn the_remove_dialog_says_which_database_and_slot_go_with_the_worktree() {
     let rendered = text_of(&draw(&mut app, 140, 30));
     assert!(
         rendered.contains("drops database shop__feat_one, empties redis slot 3 with it"),
+        "{rendered}"
+    );
+}
+
+// ---- namespaced in the TUI ------------------------------------------------------
+
+/// The question a namespaced start asks when every slot is held.
+fn free_slot_question(holders: &[&str]) -> crate::actions::Question {
+    crate::actions::Question {
+        slot: crate::detect::Slot::FreeSlot,
+        prompt:
+            "Every slot of redis on 127.0.0.1:6379 is held. Which stopped worktree gives up its \
+                 slot?"
+                .into(),
+        options: holders
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                (
+                    name.to_string(),
+                    format!("slot {}, last ran {} h ago", i + 1, i + 2),
+                )
+            })
+            .collect(),
+        preselect: None,
+        allow_custom: false,
+        allow_none: true,
+        multi: false,
+        checked: Vec::new(),
+        details: vec!["the one chosen has its slot emptied".into()],
+        answer_file: None,
+        snippet: String::new(),
+    }
+}
+
+/// The foreground of the first cell where `needle` starts, on the first
+/// row that has it. For ASCII needles, where a character is a cell.
+fn fg_of(buf: &Buffer, needle: &str) -> Option<ratatui::style::Color> {
+    let area = buf.area;
+    for y in area.top()..area.bottom() {
+        let row: String = (area.left()..area.right())
+            .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        if let Some(at) = row.find(needle) {
+            let x = area.left() + row[..at].chars().count() as u16;
+            return Some(buf[(x, y)].fg);
+        }
+    }
+    None
+}
+
+fn with_mode(app: &mut App, name: &str, mode: crate::state::ServiceMode) {
+    app.state
+        .worktrees
+        .entry(name.into())
+        .or_insert_with(|| crate::state::WorktreeRecord::new(format!("/abs/{name}"), true))
+        .mode = Some(mode);
+}
+
+// Decision 6: the chooser offers all three, says which one is
+// experimental, and marks the one a stopped worktree last used — or the
+// one a running worktree runs in, with what choosing another costs.
+#[test]
+fn the_mode_chooser_marks_what_it_last_ran_in_or_runs_in() {
+    use crate::state::ServiceMode;
+    let mut app = test_app(&["feat+one"]);
+    with_mode(&mut app, "feat+one", ServiceMode::Namespaced);
+    app.modal = Some(Modal::Mode {
+        name: "feat+one".into(),
+        selected: 1,
+    });
+    let rendered = text_of(&draw(&mut app, 140, 30));
+    for wanted in [
+        "shared",
+        "namespaced (experimental)",
+        "isolated",
+        "starts it",
+    ] {
+        assert!(rendered.contains(wanted), "{wanted}: {rendered}");
+    }
+    let row = rendered
+        .lines()
+        .find(|l| l.contains("namespaced (experimental)"))
+        .unwrap();
+    assert!(row.contains("last used"), "{row}");
+    assert!(!row.contains("running"), "{row}");
+
+    with_process(&mut app, "feat+one", running_phase());
+    with_mode(&mut app, "feat+one", ServiceMode::Namespaced);
+    app.modal = Some(Modal::Mode {
+        name: "feat+one".into(),
+        selected: 2,
+    });
+    let rendered = text_of(&draw(&mut app, 140, 30));
+    let row = rendered
+        .lines()
+        .find(|l| l.contains("namespaced (experimental)"))
+        .unwrap();
+    assert!(row.contains("running"), "{row}");
+    assert!(rendered.contains("every process restarts"), "{rendered}");
+
+    // Never started: nothing is labelled, and shared is under the cursor.
+    let mut fresh = test_app(&["feat+one"]);
+    fresh.modal = Some(Modal::Mode {
+        name: "feat+one".into(),
+        selected: 0,
+    });
+    let rendered = text_of(&draw(&mut fresh, 140, 30));
+    let rows: Vec<&str> = rendered
+        .lines()
+        .filter(|l| {
+            l.contains("its data") || l.contains("(experimental)") || l.contains("of its own, on")
+        })
+        .collect();
+    assert_eq!(rows.len(), 3, "{rendered}");
+    assert!(
+        rows.iter()
+            .all(|r| !r.contains("last used") && !r.contains("running")),
+        "{rows:?}"
+    );
+}
+
+// Decision 11: namespaced has a colour of its own, wherever the word is.
+#[test]
+fn namespaced_is_painted_in_its_own_colour_in_the_list_and_the_chooser() {
+    use crate::state::ServiceMode;
+    let mut app = test_app(&["feat+one"]);
+    with_process(&mut app, "feat+one", running_phase());
+    with_mode(&mut app, "feat+one", ServiceMode::Namespaced);
+    let buf = draw(&mut app, 180, 20);
+    assert_eq!(fg_of(&buf, "namespaced"), Some(crate::theme::namespaced()));
+    assert_ne!(crate::theme::namespaced(), crate::theme::magenta());
+    app.modal = Some(Modal::Mode {
+        name: "feat+one".into(),
+        selected: 0,
+    });
+    let buf = draw(&mut app, 180, 20);
+    assert_eq!(
+        fg_of(&buf, "namespaced (ex"),
+        Some(crate::theme::namespaced())
+    );
+}
+
+// Decision 9: choosing whose slot to empty is the same list, with its
+// action in the destructive colour and nothing to type instead.
+#[test]
+fn the_free_slot_chooser_names_its_action_in_the_destructive_colour() {
+    let (reply, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app(&["feat+one"]);
+    app.modal = Some(Modal::Question {
+        question: free_slot_question(&["feat+old", "feat+older"]),
+        selected: 0,
+        custom: None,
+        reply,
+    });
+    let buf = draw(&mut app, 140, 30);
+    let rendered = text_of(&buf);
+    for wanted in [
+        "free a slot",
+        "feat+old",
+        "slot 1, last ran 2 h ago",
+        "free none",
+    ] {
+        assert!(rendered.contains(wanted), "{wanted}: {rendered}");
+    }
+    assert!(!rendered.contains("type the"), "{rendered}");
+    assert_eq!(fg_of(&buf, "empty its slot"), Some(crate::theme::red()));
+}
+
+// The detail pane says per service what a namespaced worktree got: its own
+// database and slot — and, once it runs in another mode, that they are
+// kept until rm.
+#[test]
+fn the_detail_pane_says_what_each_service_holds_for_the_worktree() {
+    use crate::state::ServiceMode;
+    let mut app = test_app(&["feat+one"]);
+    with_process(&mut app, "feat+one", running_phase());
+    with_mode(&mut app, "feat+one", ServiceMode::Namespaced);
+    let record = app.state.worktrees.get_mut("feat+one").unwrap();
+    for (service, kind, name) in [
+        (
+            "mariadb",
+            crate::state::NamespaceKind::Database,
+            "shop__feat_one",
+        ),
+        ("redis", crate::state::NamespaceKind::Slot, "3"),
+    ] {
+        record.namespaces.push(crate::state::NamespaceRecord {
+            service: service.into(),
+            recipe: service.into(),
+            kind,
+            host: "localhost".into(),
+            port: 1,
+            name: name.into(),
+            main: "0".into(),
+            keys: Vec::new(),
+            used_at: chrono::Utc::now(),
+        });
+    }
+    let rendered = text_of(&draw(&mut app, 200, 40));
+    assert!(
+        rendered.lines().any(|l| l.contains("mariadb")
+            && l.contains("own")
+            && l.contains("database shop__feat_one")),
+        "{rendered}"
+    );
+    assert!(
+        rendered
+            .lines()
+            .any(|l| l.contains("redis") && l.contains("slot 3")),
+        "{rendered}"
+    );
+
+    with_mode(&mut app, "feat+one", ServiceMode::Shared);
+    let rendered = text_of(&draw(&mut app, 200, 40));
+    assert!(
+        rendered
+            .lines()
+            .any(|l| l.contains("kept") && l.contains("shop__feat_one until rm")),
         "{rendered}"
     );
 }

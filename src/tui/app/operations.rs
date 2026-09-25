@@ -7,6 +7,7 @@ use std::thread;
 
 use crate::actions;
 use crate::state::ServiceMode;
+use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
 use super::background::{AppEvent, ask_through_ui};
 use super::dialogs::Modal;
@@ -186,14 +187,54 @@ impl App {
 
     /// Enter: the log of a worktree that runs, or has failed — the log is
     /// what says why — and a start for one that is stopped.
+    /// ⏎ on any worktree: the mode chooser (decision 6). What it would
+    /// keep is under the cursor — the mode it runs in, or last ran in, or
+    /// shared for one never started — so ⏎ ⏎ is still one quick start.
+    /// The logs are `l`'s.
     pub(super) fn enter_selected(&mut self) {
         let Some(name) = self.selected_name() else {
             return;
         };
-        if self.phase_of(&name).is_some() {
-            self.open_log_viewer();
-        } else {
-            self.start_selected();
+        if self.refuses_nothing_to_run() {
+            return;
+        }
+        let current = self
+            .record_for(&name)
+            .and_then(|record| record.mode)
+            .unwrap_or_default();
+        let selected = ServiceMode::ALL
+            .iter()
+            .position(|mode| *mode == current)
+            .unwrap_or(0);
+        self.modal = Some(Modal::Mode { name, selected });
+    }
+
+    /// A key in the mode chooser: move, choose, or leave it.
+    pub(super) fn handle_mode_key(&mut self, key: KeyEvent, name: String, selected: usize) {
+        let last = ServiceMode::ALL.len() - 1;
+        let selected = match key.code {
+            KeyCode::Down | KeyCode::Char('j') => (selected + 1).min(last),
+            KeyCode::Up | KeyCode::Char('k') => selected.saturating_sub(1),
+            KeyCode::Enter => return self.choose_mode(&name, ServiceMode::ALL[selected]),
+            KeyCode::Esc | KeyCode::Char('q') => return,
+            _ => selected,
+        };
+        self.modal = Some(Modal::Mode { name, selected });
+    }
+
+    /// The chooser's answer. A stopped worktree starts in it; a running one
+    /// switches to it — every process restarts on the other services — or,
+    /// in the mode it already runs in, stays exactly as it is.
+    fn choose_mode(&mut self, name: &str, chosen: ServiceMode) {
+        let label = self.label_of(name);
+        let runs = self.record_for(name).map(|r| r.mode()).unwrap_or_default();
+        match self.is_up(name) {
+            true if runs == chosen => self.set_status(format!(
+                "{label} already runs {} — r restarts it",
+                chosen.word()
+            )),
+            true => self.restart_selected_with(actions::Mode::from(chosen)),
+            false => self.start_selected_with(actions::Mode::from(chosen)),
         }
     }
 
@@ -209,6 +250,7 @@ impl App {
             && !loaded.config.processes.is_empty()
         {
             self.config = loaded.config;
+            self.namespace_shared = std::cell::OnceCell::new();
             self.nothing_to_run = false;
             return false;
         }

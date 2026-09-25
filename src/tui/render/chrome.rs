@@ -220,10 +220,11 @@ pub(super) fn gh_account_spans(account: Option<&GhAccount>) -> Vec<Span<'static>
 
 /// Key hints for a selected worktree that runs, most valuable first. The
 /// essential ones are never dropped.
-pub(super) const RUNNING_HINTS: [(&str, &str, bool); 14] = [
+pub(super) const RUNNING_HINTS: [(&str, &str, bool); 15] = [
     ("j/k", "move", true),
-    ("⏎", "logs", true),
+    ("l", "logs", true),
     ("x", "stop", true),
+    ("⏎", "mode", false),
     ("r", "restart", false),
     ("o", "open", false),
     ("c", "copy url", false),

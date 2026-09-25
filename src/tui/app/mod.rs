@@ -174,6 +174,10 @@ impl Status {
 pub struct App {
     pub paths: PandoPaths,
     pub config: Config,
+    /// The services a namespaced start leaves on the main checkout's data,
+    /// and why: read from the env files once per config, not on every
+    /// paint. Emptied wherever `config` is replaced.
+    pub namespace_shared: std::cell::OnceCell<Vec<(String, String)>>,
     pub main: Option<Worktree>,
     pub default_base: Option<String>,
     pub worktrees: Vec<Worktree>,
@@ -298,6 +302,7 @@ impl App {
         let mut app = Self {
             paths,
             config,
+            namespace_shared: std::cell::OnceCell::new(),
             main: None,
             default_base: None,
             worktrees: Vec::new(),
@@ -498,6 +503,7 @@ impl App {
                 // rule's first candidate preselected rather than the answer
                 // just given.
                 self.config = *config;
+                self.namespace_shared = std::cell::OnceCell::new();
                 // Only ever cleared here, never concluded: a config file
                 // with no process in it is what `new` writes, and a start
                 // is what asks for the command. `nothing_to_run` is set by
@@ -670,6 +676,10 @@ impl App {
                 self.handle_theme_key(key, selected, before);
                 return;
             }
+            Some(Modal::Mode { name, selected }) => {
+                self.handle_mode_key(key, name, selected);
+                return;
+            }
             Some(Modal::SwitchMode { name, to }) => {
                 match key.code {
                     KeyCode::Char('y') | KeyCode::Enter => {
@@ -734,8 +744,8 @@ impl App {
             KeyCode::Char('c') => self.copy_selected_url(),
             KeyCode::Char('C') => self.copy_selected_public_url(),
             KeyCode::Char('s') => self.start_selected(),
-            // The key pressed on a row without thinking: the log of what
-            // is running (or failed), a start for what is not.
+            // The key pressed on a row without thinking: which services
+            // it runs on, with what it already does under the cursor.
             KeyCode::Enter => self.enter_selected(),
             // The isolated start. Its own key rather than a mode, because
             // isolation is remembered on the worktree: pressing it once is
@@ -1234,7 +1244,7 @@ impl App {
                     return;
                 }
                 let label = self.label_of(&name);
-                self.set_error_about(&name, format!("{label} failed — ⏎ shows the log"));
+                self.set_error_about(&name, format!("{label} failed — l shows the log"));
             }
             None => self.awaiting_ready = None,
         }
@@ -1256,6 +1266,7 @@ impl App {
         let mut app = Self {
             paths,
             config,
+            namespace_shared: std::cell::OnceCell::new(),
             main: None,
             default_base: Some("main".into()),
             worktrees,

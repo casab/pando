@@ -299,7 +299,8 @@ impl App {
                     (pending.kind, pending.label.clone(), pending.name.clone());
                 self.pending = None;
                 // The one start failure that is not about this worktree but
-                // about the project: from now on `⏎` says so up front.
+                // about the project: from now on `⏎` and `s` say so up
+                // front.
                 if matches!(kind, PendingKind::Start | PendingKind::Restart)
                     && e.contains(NO_PROCESSES)
                 {

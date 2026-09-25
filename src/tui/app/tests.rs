@@ -1229,8 +1229,9 @@ fn what_a_start_resolves_is_applied_to_this_session_in_memory() {
 }
 
 #[test]
-fn enter_starts_the_selected_worktree() {
+fn enter_twice_starts_the_selected_worktree() {
     let mut app = test_app(&["feat+one"]);
+    press(&mut app, KeyCode::Enter);
     press(&mut app, KeyCode::Enter);
     assert_eq!(
         app.pending.as_ref().map(|p| p.kind),
@@ -3238,21 +3239,90 @@ fn help_lists_exactly_the_keys_the_viewer_answers() {
 
 // ---- enter, and the modes -------------------------------------------
 
+/// The row the mode chooser has under its cursor, when it is open.
+fn chooser(app: &App) -> Option<ServiceMode> {
+    match &app.modal {
+        Some(Modal::Mode { selected, .. }) => ServiceMode::ALL.get(*selected).copied(),
+        _ => None,
+    }
+}
+
+// Decision 6: ⏎ is the mode chooser on every worktree. A stopped one has
+// the mode it last ran in under the cursor — shared for one never
+// started — so ⏎ ⏎ is still one quick start in it.
 #[test]
-fn enter_opens_the_logs_of_a_running_worktree_and_starts_a_stopped_one() {
+fn enter_opens_the_mode_chooser_on_what_a_stopped_worktree_last_ran_in() {
     let mut app = test_app(&["feat+one"]);
     press(&mut app, KeyCode::Enter);
     assert_eq!(
+        chooser(&app),
+        Some(ServiceMode::Shared),
+        "never started: shared"
+    );
+    assert!(app.pending.is_none(), "nothing starts on the first ⏎");
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(
         app.pending.as_ref().map(|p| p.kind),
-        Some(PendingKind::Start),
-        "stopped: enter starts it"
+        Some(PendingKind::Start)
+    );
+
+    for last in ServiceMode::ALL {
+        let mut app = test_app(&["feat+one"]);
+        app.state
+            .worktrees
+            .entry("feat+one".into())
+            .or_insert_with(|| crate::state::WorktreeRecord::new("/abs/feat+one", true))
+            .mode = Some(last);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(chooser(&app), Some(last), "last used: {last:?}");
+    }
+
+    // Moved and left: nothing happens.
+    let mut app = test_app(&["feat+one"]);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char('j'));
+    assert_eq!(chooser(&app), Some(ServiceMode::Namespaced));
+    press(&mut app, KeyCode::Esc);
+    assert!(app.modal.is_none() && app.pending.is_none());
+}
+
+// On a running worktree the chooser is the asking: another mode restarts
+// it there with no second dialog, and the mode it runs in changes nothing
+// and says so. ⏎ never opens the logs; `l` does.
+#[test]
+fn enter_on_a_running_worktree_switches_it_or_says_it_already_runs_so() {
+    let mut app = test_app(&["feat+one"]);
+    with_process(&mut app, "feat+one", running_phase());
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(chooser(&app), Some(ServiceMode::Shared));
+    assert!(app.log_view().is_none(), "the logs are l's");
+    press(&mut app, KeyCode::Enter);
+    assert!(app.pending.is_none() && app.modal.is_none());
+    let said = app.status.as_ref().map(|s| s.message.clone());
+    assert!(
+        said.as_deref()
+            .is_some_and(|s| s.contains("already runs shared") && s.contains("r restarts")),
+        "{said:?}"
+    );
+
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char('j'));
+    press(&mut app, KeyCode::Char('j'));
+    assert_eq!(chooser(&app), Some(ServiceMode::Isolated));
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        !matches!(app.modal, Some(Modal::SwitchMode { .. })),
+        "the chooser was the asking"
+    );
+    assert_eq!(
+        app.pending.as_ref().map(|p| p.kind),
+        Some(PendingKind::Restart)
     );
 
     let mut app = test_app(&["feat+one"]);
     with_process(&mut app, "feat+one", running_phase());
-    press(&mut app, KeyCode::Enter);
-    assert!(app.pending.is_none(), "running: nothing is started");
-    assert!(app.log_view().is_some(), "the log viewer opens instead");
+    press(&mut app, KeyCode::Char('l'));
+    assert!(app.log_view().is_some(), "l opens the logs");
 }
 
 // The TUI's way back from `i`, as `start --shared` is the CLI's.
@@ -4624,6 +4694,7 @@ fn a_config_file_with_no_process_still_lets_enter_start() {
     app.handle_event(AppEvent::ConfigResolved(Box::default()));
     assert!(!app.nothing_to_run, "a file alone concludes nothing");
     press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Enter);
     assert_eq!(
         app.pending.as_ref().map(|p| p.kind),
         Some(PendingKind::Start),
@@ -5127,4 +5198,41 @@ fn a_theme_is_saved_to_the_ui_section_and_nothing_else_moves() {
     assert!(text.contains("[ui]\ntheme = \"gruvbox\""), "{text}");
     super::themes::set_theme(&mut doc, "github");
     assert_eq!(doc.to_string().matches("theme =").count(), 1);
+}
+
+// A slot to free is chosen from the list: `c` types nothing, enter sends
+// the choice, and `n` frees none.
+#[test]
+fn the_free_slot_question_takes_a_choice_and_nothing_typed() {
+    let (reply, answers) = std::sync::mpsc::channel();
+    let mut app = test_app(&["feat+one"]);
+    app.modal = Some(Modal::Question {
+        question: actions::Question {
+            slot: crate::detect::Slot::FreeSlot,
+            prompt: "Which stopped worktree gives up its slot?".into(),
+            options: vec![
+                ("feat+old".into(), "slot 1".into()),
+                ("feat+older".into(), "slot 2".into()),
+            ],
+            preselect: None,
+            allow_custom: false,
+            allow_none: true,
+            multi: false,
+            checked: Vec::new(),
+            details: Vec::new(),
+            answer_file: None,
+            snippet: String::new(),
+        },
+        selected: 0,
+        custom: None,
+        reply,
+    });
+    press(&mut app, KeyCode::Char('c'));
+    assert!(
+        matches!(&app.modal, Some(Modal::Question { custom: None, .. })),
+        "nothing to type"
+    );
+    press(&mut app, KeyCode::Char('j'));
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(answers.try_recv().unwrap(), Ok(actions::Answer::Choice(1)));
 }
