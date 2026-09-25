@@ -219,6 +219,7 @@ pub fn resolve(recipes: &crate::recipes::Recipes, entry: &Entry<'_>) -> Result<R
                 version_flag: None,
                 install: None,
                 notes: None,
+                namespace: None,
                 untested: false,
                 body: crate::recipes::Body::Service(crate::recipes::ServiceRecipe::default()),
             },

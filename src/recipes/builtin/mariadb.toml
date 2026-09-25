@@ -41,3 +41,26 @@ cmd = "exec mariadbd --datadir={datadir} --port={port} --bind-address=127.0.0.1 
 ready = "mariadb --protocol=tcp -h 127.0.0.1 -P {port} -u root -e 'SELECT 1'"
 
 create = "mariadb --protocol=tcp -h 127.0.0.1 -P {port} -u root -e 'CREATE DATABASE IF NOT EXISTS `{db_name}`'"
+
+# Namespaced starts: a database of the worktree's own inside the main
+# checkout's MariaDB — the developer's server, never one pando started.
+#
+# - **The password never reaches a command line.** The client reads it
+#   from MYSQL_PWD, and `{user}` and `{host}` arrive shell-quoted.
+# - **`create` has no `IF NOT EXISTS`.** A database already there is not
+#   one pando made, and a start moves to another name rather than adopt
+#   it; `rm` only ever drops what `create` made.
+# - **A refused `create` is ERROR 1044**, and turns into the grant below:
+#   the login may then make and drop `<main>__…` and nothing else.
+[namespace]
+kind = "database"
+binaries = ["mariadb"]
+user = true
+password_env = "MYSQL_PWD"
+ping = "mariadb --protocol=tcp -h {host} -P {port} -u {user} -N -B -e 'SELECT 1'"
+exists = "mariadb --protocol=tcp -h {host} -P {port} -u {user} -N -B -e \"SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = '{namespace}'\""
+create = "mariadb --protocol=tcp -h {host} -P {port} -u {user} -e 'CREATE DATABASE `{namespace}`'"
+drop = "mariadb --protocol=tcp -h {host} -P {port} -u {user} -e 'DROP DATABASE IF EXISTS `{namespace}`'"
+denied = ["ERROR 1044"]
+account = "mariadb --protocol=tcp -h {host} -P {port} -u {user} -N -B -e 'SELECT CURRENT_USER()'"
+grant = '''GRANT ALL ON `{prefix_like}`.* TO '{account_user}'@'{account_host}';'''

@@ -557,3 +557,248 @@ fn a_password_is_never_in_what_a_login_or_its_config_prints() {
     assert_eq!(login.env(None), Vec::new());
     assert_eq!(Login::none().env(Some("MYSQL_PWD")), Vec::new());
 }
+
+// ---- the engine, against a fake client -------------------------------------------
+
+/// A pando `bin` with a fake client in it that records what it was run
+/// with — its arguments and the password variable — and behaves as the
+/// files in its directory say.
+struct FakeClient {
+    dir: tempfile::TempDir,
+}
+
+impl FakeClient {
+    fn new(name: &str, password_env: &str, body: &str) -> FakeClient {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().display().to_string();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let script = format!(
+            "#!/bin/sh\nstate='{state}'\nprintf '%s\\n' \"$*\" >> \"$state/argv\"\n\
+             printf '%s\\n' \"${{{password_env}-unset}}\" >> \"$state/env\"\n\
+             for last; do :; done\n{body}"
+        );
+        std::fs::write(bin.join(name), script).unwrap();
+        std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755)).unwrap();
+        FakeClient { dir }
+    }
+
+    fn bin(&self) -> std::path::PathBuf {
+        self.dir.path().join("bin")
+    }
+
+    fn touch(&self, file: &str) {
+        std::fs::write(self.dir.path().join(file), "").unwrap();
+    }
+
+    fn write(&self, file: &str, text: &str) {
+        std::fs::write(self.dir.path().join(file), text).unwrap();
+    }
+
+    fn read(&self, file: &str) -> String {
+        std::fs::read_to_string(self.dir.path().join(file)).unwrap_or_default()
+    }
+}
+
+const FAKE_MARIADB: &str = r#"case "$*" in
+  *"SELECT 1"*) echo 1 ;;
+  *"CURRENT_USER()"*) echo "app@localhost" ;;
+  *"CREATE DATABASE"*)
+    if [ -f "$state/deny" ]; then
+      echo "ERROR 1044 (42000) at line 1: Access denied for user 'app'@'localhost' to database 'shop__feat_x'" >&2; exit 1
+    fi
+    if [ -f "$state/exists" ]; then
+      echo "ERROR 1007 (HY000) at line 1: Can't create database 'shop__feat_x'; database exists" >&2; exit 1
+    fi
+    touch "$state/exists" ;;
+  *"SCHEMATA"*) if [ -f "$state/exists" ]; then echo "SHOP__FEAT_X"; fi ;;
+  *"DROP DATABASE"*) rm -f "$state/exists" ;;
+  *) echo "unexpected: $*" >&2; exit 9 ;;
+esac
+"#;
+
+const PASSWORD: &str = "hunter2 'quoted' $HOME";
+
+fn recipe_namespace(name: &str) -> crate::recipes::NamespaceRecipe {
+    crate::recipes::Recipes::built_in()
+        .get(name)
+        .unwrap()
+        .recipe
+        .namespace
+        .clone()
+        .unwrap()
+}
+
+fn server<'a>(
+    recipe: &'a crate::recipes::NamespaceRecipe,
+    fake: &FakeClient,
+    service: &'a str,
+) -> Server<'a> {
+    Server {
+        service,
+        recipe,
+        host: "localhost".into(),
+        port: 3306,
+        login: Login::new(Some("app".into()), Some(PASSWORD.into()), "the test's env"),
+        bin_dir: fake.bin(),
+    }
+}
+
+// The whole round, and the password in exactly one place: the variable the
+// client reads. Not an argument of the client, and not in the script pando
+// hands `bash -lc`, which anyone on the machine can read in `ps`.
+#[test]
+fn a_database_is_made_found_and_dropped_with_the_password_in_the_environment_alone() {
+    let fake = FakeClient::new("mariadb", "MYSQL_PWD", FAKE_MARIADB);
+    let recipe = recipe_namespace("mariadb");
+    let db = server(&recipe, &fake, "mariadb");
+    db.ping().unwrap();
+    assert!(!db.exists("shop__feat_x").unwrap());
+    assert_eq!(db.create("shop__feat_x", "shop").unwrap(), Created::Made);
+    assert!(
+        db.exists("shop__feat_x").unwrap(),
+        "found without case, as MariaDB compares"
+    );
+    assert_eq!(
+        db.create("shop__feat_x", "shop").unwrap(),
+        Created::AlreadyThere,
+        "one already there is not one pando made"
+    );
+    db.drop("shop__feat_x", "shop").unwrap();
+    assert!(!db.exists("shop__feat_x").unwrap());
+
+    let argv = fake.read("argv");
+    assert!(argv.contains("-h localhost -P 3306 -u app"), "{argv}");
+    assert!(argv.contains("CREATE DATABASE `shop__feat_x`"), "{argv}");
+    assert!(
+        !argv.contains("hunter2"),
+        "the password reached the client's arguments: {argv}"
+    );
+    // Nor the script `bash -lc` runs, which is the other command line `ps`
+    // shows while it runs — for every command the recipe has.
+    for command in [
+        Some(recipe.ping.as_str()),
+        recipe.exists.as_deref(),
+        recipe.create.as_deref(),
+        Some(recipe.drop.as_str()),
+        recipe.account.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let script = db.script(command, Some("shop__feat_x")).unwrap();
+        assert!(script.contains("mariadb"), "{script}");
+        assert!(!script.contains("hunter2"), "{script}");
+    }
+    let env = fake.read("env");
+    assert!(env.lines().all(|line| line == PASSWORD), "{env}");
+}
+
+// Decision 4: a login that may not make the namespace stops the start with
+// nothing made, and the refusal is the one statement that fixes it —
+// scoped to the main database's prefix, for the account the server sees.
+#[test]
+fn a_login_that_may_not_make_a_database_is_refused_with_the_grant_that_lets_it() {
+    let fake = FakeClient::new("mariadb", "MYSQL_PWD", FAKE_MARIADB);
+    fake.touch("deny");
+    let recipe = recipe_namespace("mariadb");
+    let db = server(&recipe, &fake, "mariadb");
+    let e = format!("{:#}", db.create("shop__feat_x", "shop").unwrap_err());
+    assert!(
+        e.contains("GRANT ALL ON `shop\\_\\_%`.* TO 'app'@'localhost';"),
+        "{e}"
+    );
+    assert!(e.contains("Nothing was made"), "{e}");
+    assert!(e.contains("the test's env"), "it says whose login: {e}");
+    assert!(!e.contains("hunter2"), "{e}");
+    assert!(!fake.dir.path().join("exists").exists());
+}
+
+// The last line before the statement runs holds its own: a name that is
+// not a worktree's is refused before anything is asked of the server.
+#[test]
+fn the_engine_refuses_to_drop_anything_that_is_not_a_namespace() {
+    let fake = FakeClient::new("mariadb", "MYSQL_PWD", FAKE_MARIADB);
+    let recipe = recipe_namespace("mariadb");
+    let db = server(&recipe, &fake, "mariadb");
+    for name in ["shop", "shop`; DROP DATABASE shop; --", "", "a b__c"] {
+        assert!(db.drop(name, "shop").is_err(), "{name:?}");
+        assert!(db.exists(name).is_err() || name == "shop", "{name:?}");
+    }
+    assert!(
+        !fake.read("argv").contains("DROP"),
+        "a drop reached the server: {}",
+        fake.read("argv")
+    );
+}
+
+const FAKE_REDIS: &str = r#"case "$*" in
+  *" ping") echo PONG ;;
+  *DBSIZE*)
+    if [ "$last" -gt 15 ]; then echo "ERR DB index is out of range" >&2; exit 1; fi
+    cat "$state/size-$last" 2>/dev/null || echo 0 ;;
+  *FLUSHDB*) echo "$last" >> "$state/flushed"; echo OK ;;
+  *) echo "unexpected: $*" >&2; exit 9 ;;
+esac
+"#;
+
+#[test]
+fn a_slot_is_sized_and_emptied_by_its_own_number_and_never_by_a_fallback() {
+    let fake = FakeClient::new("redis-cli", "REDISCLI_AUTH", FAKE_REDIS);
+    let recipe = recipe_namespace("redis");
+    let mut cache = server(&recipe, &fake, "redis");
+    cache.port = 6379;
+    cache.login = Login::new(None, Some(PASSWORD.into()), "the test's env");
+    cache.ping().unwrap();
+    fake.write("size-3", "2\n");
+    fake.write("size-4", "(integer) 7\n");
+    assert_eq!(cache.size(3).unwrap(), 2);
+    assert_eq!(cache.size(4).unwrap(), 7);
+    assert_eq!(cache.size(5).unwrap(), 0);
+    let e = format!("{:#}", cache.size(16).unwrap_err());
+    assert!(e.contains("out of range"), "{e}");
+
+    cache.drop("3", "0").unwrap();
+    for name in ["0", "x", "-1", "3 4", ""] {
+        assert!(cache.drop(name, "0").is_err(), "{name:?}");
+    }
+    assert_eq!(fake.read("flushed"), "3\n", "only slot 3 was ever emptied");
+    let argv = fake.read("argv");
+    assert!(argv.contains("-e -h localhost -p 6379 EVAL"), "{argv}");
+    assert!(!argv.contains(" -n "), "{argv}");
+    assert!(!argv.contains("hunter2"), "{argv}");
+    for command in [
+        recipe.ping.as_str(),
+        &recipe.drop,
+        recipe.size.as_deref().unwrap(),
+    ] {
+        assert!(
+            !cache
+                .script(command, Some("3"))
+                .unwrap()
+                .contains("hunter2")
+        );
+    }
+}
+
+#[test]
+fn a_missing_client_is_named_before_anything_is_asked() {
+    let fake = FakeClient::new("not-mariadb", "MYSQL_PWD", "exit 0\n");
+    let mut recipe = recipe_namespace("mariadb");
+    recipe.binaries = vec!["pando-test-no-such-client".into()];
+    let db = server(&recipe, &fake, "mariadb");
+    let e = format!("{:#}", db.ping().unwrap_err());
+    assert!(e.contains("pando-test-no-such-client"), "{e}");
+    assert!(e.contains("not on PATH"), "{e}");
+}
+
+#[test]
+fn a_prefix_is_an_sql_pattern_matching_only_itself_and_what_follows() {
+    assert_eq!(
+        prefix_like("northwind_traders"),
+        "northwind\\_traders\\_\\_%"
+    );
+    assert_eq!(prefix_like("a%b"), "a\\%b\\_\\_%");
+    assert_eq!(prefix_like("shop"), "shop\\_\\_%");
+}

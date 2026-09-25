@@ -24,3 +24,22 @@ ready_timeout_s = 30
 
 cmd = "exec redis-server --port {port} --bind 127.0.0.1 --dir {datadir} --daemonize no"
 ready = "redis-cli -h 127.0.0.1 -p {port} ping"
+
+# Namespaced starts: a numbered slot of the worktree's own inside the main
+# checkout's Redis.
+#
+# Every command that names a slot goes through EVAL, because `redis-cli
+# -n 16 FLUSHDB` on a server with 16 slots says "SELECT 16 failed" and
+# then empties slot 0 — the main checkout's — exiting 0. Inside a script
+# a SELECT that fails is an error and nothing after it runs, and `-e`
+# makes that error an exit status. The password is read from
+# REDISCLI_AUTH, never passed as `-a`.
+[namespace]
+kind = "slot"
+binaries = ["redis-cli"]
+password_env = "REDISCLI_AUTH"
+slots = 16
+ping = "redis-cli -e -h {host} -p {port} ping"
+size = "redis-cli -e -h {host} -p {port} EVAL \"redis.call('SELECT', ARGV[1]); return redis.call('DBSIZE')\" 0 {namespace}"
+drop = "redis-cli -e -h {host} -p {port} EVAL \"redis.call('SELECT', ARGV[1]); return redis.call('FLUSHDB')\" 0 {namespace}"
+denied = ["NOPERM"]

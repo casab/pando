@@ -20,11 +20,16 @@
 //! - **A password is never printed.** A [`Login`] keeps it private and
 //!   hands it to the engine's client in its environment, never on a
 //!   command line.
+//! - **No engine name in code.** What a namespace is on a server and the
+//!   commands that make, find and drop one are a recipe's `[namespace]`;
+//!   [`Server`] only runs them.
 
+mod engine;
 mod guard;
 mod login;
 mod name;
 
+pub use engine::{Created, Server, prefix_like};
 pub use guard::{describe, may_drop, same_namespace};
 pub use login::{
     Login, find as find_login, from_config as login_from_config,

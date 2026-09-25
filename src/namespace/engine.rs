@@ -1,0 +1,377 @@
+//! Making, finding and dropping a namespace on a server, through the
+//! commands its recipe gives — the one place pando talks to a developer's
+//! own database server.
+
+use anyhow::{Result, bail};
+use std::path::PathBuf;
+use std::time::Duration;
+
+use crate::process::{self as proc, shell_quote};
+use crate::recipes::NamespaceRecipe;
+use crate::state::NamespaceKind;
+use crate::template;
+
+use super::login::Login;
+use super::name::{MARKER, is_plain};
+
+/// How long one command gets. Each is one statement against a server that
+/// is already up, so a slow answer is a server that is not answering.
+const TIMEOUT: Duration = Duration::from_secs(30);
+
+/// One server the main checkout runs, as a namespaced start reaches it:
+/// where it is, who to log in as, and the recipe's commands for it.
+pub struct Server<'a> {
+    pub service: &'a str,
+    pub recipe: &'a NamespaceRecipe,
+    pub host: String,
+    pub port: u16,
+    pub login: Login,
+    /// pando's own `bin`, ahead of everything on PATH for every command,
+    /// as for a service recipe: where a developer puts a client the login
+    /// shell does not find, and where a test puts a fake one.
+    pub bin_dir: PathBuf,
+}
+
+/// What [`Server::create`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Created {
+    /// The server made it for pando just now.
+    Made,
+    /// It was there already, so pando did not make it.
+    AlreadyThere,
+}
+
+impl Server<'_> {
+    /// `host:port`, for a sentence.
+    pub fn address(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+
+    /// The clients the recipe needs that this machine does not have.
+    pub fn missing_binaries(&self) -> Vec<String> {
+        if self.recipe.binaries.is_empty() {
+            return Vec::new();
+        }
+        let checks: Vec<String> = self
+            .recipe
+            .binaries
+            .iter()
+            .map(|binary| {
+                let quoted = shell_quote(binary);
+                format!("command -v {quoted} >/dev/null 2>&1 || echo {quoted}")
+            })
+            .collect();
+        let Ok(out) = proc::run_captured(
+            &self.with_path(&checks.join("\n")),
+            &std::env::temp_dir(),
+            &[],
+            TIMEOUT,
+        ) else {
+            return Vec::new();
+        };
+        out.stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Whether the server answers and takes the login. The first thing a
+    /// namespaced start asks, before anything is made or stopped.
+    pub fn ping(&self) -> Result<()> {
+        let missing = self.missing_binaries();
+        if !missing.is_empty() {
+            bail!(
+                "namespaced mode reaches {} through {}, and {} not on PATH — install it, or put \
+                 it in {}",
+                self.service,
+                missing.join(", "),
+                if missing.len() == 1 {
+                    "it is"
+                } else {
+                    "they are"
+                },
+                self.bin_dir.display()
+            );
+        }
+        let out = self.run(&self.recipe.ping, None)?;
+        if out.success() {
+            return Ok(());
+        }
+        bail!(
+            "{} on {} did not take the login from {}: {}",
+            self.service,
+            self.address(),
+            self.login.from,
+            out.last_stderr_line().unwrap_or("no output")
+        )
+    }
+
+    /// Whether the server has a database of this name.
+    pub fn exists(&self, name: &str) -> Result<bool> {
+        let command = self.command(self.recipe.exists.as_deref(), "exists")?;
+        let out = self.run(command, Some(name))?;
+        if !out.success() {
+            bail!(
+                "could not ask {} on {} whether {name} exists: {}",
+                self.service,
+                self.address(),
+                out.last_stderr_line().unwrap_or("no output")
+            );
+        }
+        // Without case: MariaDB on macOS compares names that way, and says
+        // a name back the way it was first written.
+        Ok(out
+            .stdout
+            .lines()
+            .any(|line| line.trim().eq_ignore_ascii_case(name)))
+    }
+
+    /// Makes a database for a worktree whose main one is `main`.
+    ///
+    /// A server that already has it did not make it for pando, which is
+    /// [`Created::AlreadyThere`] and not an error. A login that may not is
+    /// an error carrying the grant that lets it — and nothing was made.
+    pub fn create(&self, name: &str, main: &str) -> Result<Created> {
+        let command = self.command(self.recipe.create.as_deref(), "create")?;
+        let out = self.run(command, Some(name))?;
+        if out.success() {
+            return Ok(Created::Made);
+        }
+        if self.is_denied(&out) {
+            bail!("{} Nothing was made.", self.denied(name, main));
+        }
+        if self.exists(name)? {
+            return Ok(Created::AlreadyThere);
+        }
+        bail!(
+            "{} on {} could not make {name}: {}",
+            self.service,
+            self.address(),
+            out.last_stderr_line().unwrap_or("no output")
+        )
+    }
+
+    /// Drops a database, or empties a slot.
+    ///
+    /// Only ever called past [`super::may_drop`]; the name is checked again
+    /// here anyway, because this is the line that runs the statement.
+    pub fn drop(&self, name: &str, main: &str) -> Result<()> {
+        let fits = match self.recipe.kind {
+            NamespaceKind::Database => is_plain(name) && name.contains(MARKER),
+            NamespaceKind::Slot => name.parse::<u32>().is_ok_and(|slot| slot > 0),
+        };
+        if !fits {
+            bail!("pando will not drop {name:?}: it is not a namespace it could have made");
+        }
+        let out = self.run(&self.recipe.drop, Some(name))?;
+        if out.success() {
+            return Ok(());
+        }
+        if self.is_denied(&out) {
+            bail!("{} Nothing was dropped.", self.denied(name, main));
+        }
+        bail!(
+            "{} on {} could not drop {name}: {}",
+            self.service,
+            self.address(),
+            out.last_stderr_line().unwrap_or("no output")
+        )
+    }
+
+    /// How many keys a slot holds.
+    pub fn size(&self, slot: u32) -> Result<u64> {
+        let command = self.command(self.recipe.size.as_deref(), "size")?;
+        let out = self.run(command, Some(&slot.to_string()))?;
+        let count = out
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .next_back()
+            .and_then(|line| line.trim_start_matches("(integer)").trim().parse().ok());
+        match (out.success(), count) {
+            (true, Some(count)) => Ok(count),
+            _ => bail!(
+                "could not ask {} on {} how full slot {slot} is: {}",
+                self.service,
+                self.address(),
+                out.last_stderr_line()
+                    .or_else(|| out.stdout.lines().last())
+                    .unwrap_or("no output")
+            ),
+        }
+    }
+
+    /// What an administrator runs, once, so this login may make and drop
+    /// `<main>__…` on this server and nothing else — when the recipe
+    /// knows how to say it.
+    pub fn grant(&self, main: &str) -> Option<String> {
+        let grant = self.recipe.grant.as_deref()?;
+        let account = self
+            .recipe
+            .account
+            .as_deref()
+            .and_then(|command| self.run(command, None).ok())
+            .filter(proc::Captured::success)
+            .and_then(|out| {
+                let line = out.stdout.lines().map(str::trim).find(|l| !l.is_empty())?;
+                let (user, host) = line.rsplit_once('@')?;
+                Some((user.to_string(), host.to_string()))
+            });
+        let (user, host) = account.unwrap_or_else(|| {
+            (
+                self.login.user.clone().unwrap_or_default(),
+                "localhost".to_string(),
+            )
+        });
+        let vars = Vars {
+            prefix_like: Some(prefix_like(main)),
+            account_user: Some(user),
+            account_host: Some(host),
+            ..self.vars(None)
+        };
+        template::render_with(grant, &vars).ok()
+    }
+
+    /// The refusal a login that may not make or drop namespaces earns: who
+    /// it is, and the one statement that fixes it.
+    fn denied(&self, name: &str, main: &str) -> String {
+        let fix = match self.grant(main) {
+            Some(grant) => {
+                format!(" — run this once as an administrator of that server:\n\n    {grant}\n\n")
+            }
+            None => " — give it the right to, on that server".to_string(),
+        };
+        format!(
+            "{} on {} does not let the login from {} make or drop {name}{fix}It lets that login \
+             make and drop databases named {main}{MARKER}… and nothing else.",
+            self.service,
+            self.address(),
+            self.login.from,
+        )
+    }
+
+    fn is_denied(&self, out: &proc::Captured) -> bool {
+        self.recipe.denied.iter().any(|needle| {
+            out.stderr.contains(needle.as_str()) || out.stdout.contains(needle.as_str())
+        })
+    }
+
+    fn command<'r>(&self, command: Option<&'r str>, what: &str) -> Result<&'r str> {
+        match command {
+            Some(command) => Ok(command),
+            None => bail!(
+                "the recipe for {} has no `{what}` in its [namespace], which a {} needs",
+                self.service,
+                match self.recipe.kind {
+                    NamespaceKind::Database => "database",
+                    NamespaceKind::Slot => "slot",
+                }
+            ),
+        }
+    }
+
+    fn vars(&self, namespace: Option<&str>) -> Vars {
+        Vars {
+            host: Some(shell_quote(&self.host)),
+            port: Some(self.port.to_string()),
+            user: self.login.user.as_deref().map(shell_quote),
+            namespace: namespace.map(str::to_string),
+            prefix_like: None,
+            account_user: None,
+            account_host: None,
+        }
+    }
+
+    fn with_path(&self, script: &str) -> String {
+        format!(
+            "export PATH={}:\"$PATH\"\n{script}",
+            shell_quote(&self.bin_dir.display().to_string())
+        )
+    }
+
+    /// The script `bash -lc` is handed for one recipe command: what
+    /// anyone on the machine can read in `ps` while it runs, so it carries
+    /// everything but the password.
+    pub fn script(&self, command: &str, namespace: Option<&str>) -> Result<String> {
+        if let Some(name) = namespace
+            && !is_plain(name)
+        {
+            bail!("{name:?} is not a plain name, so pando will not put it in a command");
+        }
+        let rendered = template::render_with(command, &self.vars(namespace))?;
+        Ok(self.with_path(&rendered))
+    }
+
+    /// One recipe command, run with the password in the environment the
+    /// client reads it from, and nowhere else.
+    fn run(&self, command: &str, namespace: Option<&str>) -> Result<proc::Captured> {
+        let script = self.script(command, namespace)?;
+        let env = self.login.env(self.recipe.password_env.as_deref());
+        proc::run_captured(&script, &std::env::temp_dir(), &env, TIMEOUT)
+    }
+}
+
+/// The prefix every namespace of `main` starts with, as an SQL `LIKE`
+/// pattern: `_` and `%` match anything there, so they are escaped.
+pub fn prefix_like(main: &str) -> String {
+    let mut out = String::new();
+    for c in format!("{main}{MARKER}").chars() {
+        if matches!(c, '_' | '%' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('%');
+    out
+}
+
+/// The placeholders a namespace command may use.
+struct Vars {
+    host: Option<String>,
+    port: Option<String>,
+    user: Option<String>,
+    namespace: Option<String>,
+    prefix_like: Option<String>,
+    account_user: Option<String>,
+    account_host: Option<String>,
+}
+
+const KNOWN: [&str; 7] = [
+    "host",
+    "port",
+    "user",
+    "namespace",
+    "prefix_like",
+    "account_user",
+    "account_host",
+];
+
+impl template::Resolver for Vars {
+    fn resolve(&self, key: &str, arg: Option<&str>) -> Result<String> {
+        if let Some(arg) = arg {
+            bail!("{{{key}:{arg}}} — {key} takes no argument in a [namespace] command");
+        }
+        let value = match key {
+            "host" => &self.host,
+            "port" => &self.port,
+            "user" => &self.user,
+            "namespace" => &self.namespace,
+            "prefix_like" => &self.prefix_like,
+            "account_user" => &self.account_user,
+            "account_host" => &self.account_host,
+            _ => bail!(
+                "unknown placeholder {{{key}}} in a [namespace] command — it understands {}",
+                KNOWN.join(", ")
+            ),
+        };
+        match value {
+            Some(value) => Ok(value.clone()),
+            None => bail!(
+                "{{{key}}} has no value here — a [namespace] command used it where it means nothing"
+            ),
+        }
+    }
+}

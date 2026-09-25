@@ -83,6 +83,101 @@ pub struct ServiceRecipe {
     pub db_name: Option<String>,
 }
 
+/// How a worktree gets a namespace of its own inside a server the main
+/// checkout already runs: `start --namespaced`.
+///
+/// Every command runs through `bash -lc` with pando's own `bin` ahead on
+/// PATH, as a service recipe's do, and sees `{host}`, `{port}` and
+/// `{user}` — the main checkout's server and login, shell-quoted — and
+/// `{namespace}`, the database's name or the slot's number, which pando
+/// has already held to a plain identifier. The password is never a
+/// placeholder: it reaches the client in the variable `password_env`
+/// names, and nowhere else.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamespaceRecipe {
+    /// A `database` is made and dropped by name; a `slot` is a number the
+    /// server always has, taken only while empty and emptied to free it.
+    pub kind: crate::state::NamespaceKind,
+    /// What has to be on PATH for any of this: the engine's client, not
+    /// its server.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub binaries: Vec<String>,
+    /// Whether the engine logs in as somebody. MariaDB does; a
+    /// development Redis asks for a password, if that.
+    #[serde(default)]
+    pub user: bool,
+    /// The variable the client reads a password from: `MYSQL_PWD`,
+    /// `REDISCLI_AUTH`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_env: Option<String>,
+    /// Answers "does the server take this login?" with its exit status.
+    pub ping: String,
+    /// A `database`'s: prints its name when the server has it, nothing
+    /// when it does not, and fails when it cannot be asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exists: Option<String>,
+    /// A `database`'s: makes it, and **fails when it is there already**,
+    /// so one pando did not make is never taken for one it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create: Option<String>,
+    /// Drops a database, or empties a slot. A slot's must fail rather than
+    /// fall back to another slot when this one cannot be selected —
+    /// `redis-cli -n` does fall back, onto slot 0.
+    pub drop: String,
+    /// A `slot`'s: prints how many keys it holds, failing the same way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    /// A `slot`'s: how many the server has. 0 is the main checkout's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slots: Option<u32>,
+    /// A line of stderr that means the login may not make or drop this
+    /// namespace — what turns a failure into the grant below.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denied: Vec<String>,
+    /// Prints the account the server knows the login as, `user@host`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// What an administrator runs, once, so the login may make and drop
+    /// namespaces under this worktree's prefix and nothing else. Printed,
+    /// never run. Sees `{prefix_like}` — the prefix as an SQL `LIKE`
+    /// pattern — and `{account_user}`, `{account_host}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant: Option<String>,
+}
+
+impl NamespaceRecipe {
+    /// The shape a kind needs, or what is missing from it.
+    fn check(&self) -> Result<()> {
+        use crate::state::NamespaceKind;
+        let (needs, kind): (&[(&str, bool)], &str) = match self.kind {
+            NamespaceKind::Database => (
+                &[
+                    ("exists", self.exists.is_some()),
+                    ("create", self.create.is_some()),
+                ],
+                "database",
+            ),
+            NamespaceKind::Slot => (
+                &[
+                    ("size", self.size.is_some()),
+                    ("slots", self.slots.is_some_and(|n| n > 1)),
+                ],
+                "slot",
+            ),
+        };
+        for (key, present) in needs {
+            if !present {
+                bail!("a `kind = \"{kind}\"` [namespace] needs `{key}`");
+            }
+        }
+        if self.ping.trim().is_empty() || self.drop.trim().is_empty() {
+            bail!("a [namespace] needs `ping` and `drop`");
+        }
+        Ok(())
+    }
+}
+
 /// One file that pins a language, in the shape [`crate::runtime::Source`]
 /// already has.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,6 +233,9 @@ pub struct Recipe {
     /// Something true about this recipe that a developer should know
     /// without reading it: Postgres's trust authentication, for one.
     pub notes: Option<String>,
+    /// How a worktree gets a namespace of its own in the main checkout's
+    /// server of this kind, when it can. A service recipe's only.
+    pub namespace: Option<NamespaceRecipe>,
     /// Whether this recipe has ever been run against a real server.
     ///
     /// pando ships recipes for engines nobody on the project had
@@ -422,6 +520,12 @@ pub fn parse(text: &str) -> Result<Recipe> {
             raw.name
         );
     }
+    if let Some(namespace) = &raw.namespace {
+        if raw.kind != Kind::Service {
+            bail!("a [namespace] belongs to a `kind = \"service\"` recipe");
+        }
+        namespace.check()?;
+    }
     let body = match raw.kind {
         Kind::Service => {
             if raw.language.is_some() {
@@ -454,6 +558,7 @@ pub fn parse(text: &str) -> Result<Recipe> {
         version_flag: raw.version_flag,
         install: raw.install,
         notes: raw.notes,
+        namespace: raw.namespace,
         untested: raw.untested,
         body,
     })
@@ -482,6 +587,8 @@ struct RawRecipe {
     service: Option<ServiceRecipe>,
     #[serde(default)]
     language: Option<LanguageRecipe>,
+    #[serde(default)]
+    namespace: Option<NamespaceRecipe>,
 }
 
 /// The recipes this build ships, as `(file name, TOML text)`.
@@ -571,6 +678,103 @@ mod tests {
             assert!(recipe.notes.is_some(), "{name} says nothing about its auth");
             assert!(recipe.version_cmd().is_some(), "{name} cannot be versioned");
         }
+    }
+
+    /// Rules every shipped `[namespace]` is held to, whichever engine it is
+    /// for: these commands run against a developer's own server.
+    #[test]
+    fn every_built_in_namespace_keeps_its_password_off_the_command_line_and_its_slot_exact() {
+        use crate::state::NamespaceKind;
+        let mut namespaced: Vec<&str> = Vec::new();
+        for (name, text) in BUILT_IN {
+            let recipe = parse(text).unwrap();
+            let Some(ns) = &recipe.namespace else {
+                continue;
+            };
+            namespaced.push(name);
+            let commands: Vec<&str> = [
+                Some(ns.ping.as_str()),
+                ns.exists.as_deref(),
+                ns.create.as_deref(),
+                Some(ns.drop.as_str()),
+                ns.size.as_deref(),
+                ns.account.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            for command in &commands {
+                // The client reads it from the environment or not at all.
+                assert!(!command.contains("{password}"), "{name}: {command}");
+                assert!(!command.contains(" -a "), "{name}: {command}");
+                assert!(!command.contains(" -p{"), "{name}: {command}");
+            }
+            assert!(
+                ns.password_env.is_some(),
+                "{name} names no password variable"
+            );
+            assert!(!ns.binaries.is_empty(), "{name} names no client");
+            match ns.kind {
+                // A database already there is not one pando made.
+                NamespaceKind::Database => {
+                    let create = ns.create.as_deref().unwrap();
+                    assert!(
+                        !create.to_uppercase().contains("IF NOT EXISTS"),
+                        "{name}: {create}"
+                    );
+                    assert!(ns.grant.is_some() && !ns.denied.is_empty(), "{name}");
+                }
+                // `-n` falls back to slot 0 when the slot cannot be
+                // selected; every command naming a slot must fail instead.
+                NamespaceKind::Slot => {
+                    for command in [ns.drop.as_str(), ns.size.as_deref().unwrap()] {
+                        assert!(!command.contains(" -n "), "{name}: {command}");
+                        assert!(command.contains("{namespace}"), "{name}: {command}");
+                    }
+                    assert!(ns.slots.is_some_and(|n| n > 1), "{name}");
+                }
+            }
+        }
+        assert_eq!(
+            namespaced,
+            vec!["mariadb", "redis"],
+            "which engines can namespace changed"
+        );
+    }
+
+    #[test]
+    fn a_namespace_table_is_held_to_what_its_kind_needs() {
+        let service = "kind = \"service\"\nname = \"x\"\n\n[service]\ncmd = \"c\"\n\n";
+        for (table, says) in [
+            (
+                "[namespace]\nkind = \"database\"\nping = \"p\"\ndrop = \"d\"\ncreate = \"c\"\n",
+                "needs `exists`",
+            ),
+            (
+                "[namespace]\nkind = \"slot\"\nping = \"p\"\ndrop = \"d\"\nslots = 16\n",
+                "needs `size`",
+            ),
+            (
+                "[namespace]\nkind = \"slot\"\nping = \"p\"\ndrop = \"d\"\nsize = \"s\"\nslots = 1\n",
+                "needs `slots`",
+            ),
+            (
+                "[namespace]\nkind = \"slot\"\nping = \"\"\ndrop = \"d\"\nsize = \"s\"\nslots = 4\n",
+                "needs `ping` and `drop`",
+            ),
+        ] {
+            let e = format!("{:#}", parse(&format!("{service}{table}")).unwrap_err());
+            assert!(e.contains(says), "{says}: {e}");
+        }
+        let e = format!(
+            "{:#}",
+            parse(
+                "kind = \"language\"\nname = \"x\"\n\n[language]\nmanagers = [\"mise\"]\n\n\
+                 [namespace]\nkind = \"slot\"\nping = \"p\"\ndrop = \"d\"\nsize = \"s\"\nslots = 4\n"
+            )
+            .unwrap_err()
+        );
+        assert!(e.contains("belongs to a `kind = \"service\"`"), "{e}");
     }
 
     /// An engine nobody here could run says so in the one place that is
@@ -821,6 +1025,7 @@ files = [{ file = "rust-toolchain.toml", toml_key = ["toolchain", "channel"] }]
             version_flag: Some(entry.version_flag.to_string()),
             install: None,
             notes: None,
+            namespace: None,
             untested: false,
             body: Body::Language(LanguageRecipe {
                 files: entry
