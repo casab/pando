@@ -6,11 +6,16 @@
 //! column, so a cell never has to be decoded from help:
 //!
 //! ```text
-//!      branch         changes      port    other ports  public  mode      git  PR   status
-//!  ▸ ● feat/checkout  uncommitted  :17342  api:17343    ◈       isolated  ↑2   ◍42
-//!    ○ fix/typo
-//!    ✗ fix/crash                                                                    failed
+//!      branch          │ changes     │ port   │ mode     │ git │ status
+//! ─────────────────────┼─────────────┼────────┼──────────┼─────┼───────
+//!  ▸ ● feat/checkout   │ uncommitted │ :17342 │ isolated │ ↑2  │
+//! ─────────────────────┼─────────────┼────────┼──────────┼─────┼───────
+//!    ✗ fix/crash       │             │        │          │     │ failed
 //! ```
+//!
+//! Faint lines divide the columns and rule the rows apart, while every
+//! row fits with a rule under it; a list longer than that closes up, and
+//! keeps its column lines.
 //!
 //! A column is only there when some row has something in it, and its
 //! title goes with it.
@@ -31,7 +36,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, BorderType, Paragraph};
 
 use crate::actions;
 use crate::state::Aggregate;
@@ -52,9 +57,10 @@ const ROW_RUN_WIDTH: usize = 2;
 /// `" ▸ "` — the list's own highlight column.
 const ROW_CHROME_WIDTH: usize = 3;
 
-/// Blank cells between two columns: one reads as a single run of text
-/// once a header sits over it.
-const COL_GAP: usize = 2;
+/// Between two columns: a faint rule with a space either side, so each
+/// value reads as under its title.
+const COL_GAP: usize = 3;
+const COL_RULE: &str = " │ ";
 
 /// Below this a label stops being an identifier, so a column is dropped to
 /// buy it back.
@@ -299,15 +305,6 @@ pub(super) fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         (None, inner)
     };
-    // The header row, when there are rows for it to name and room for a
-    // row under it.
-    let (header_area, list_area) = if !app.filtered_indices.is_empty() && list_area.height > 1 {
-        let [ha, la] =
-            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(list_area);
-        (Some(ha), la)
-    } else {
-        (None, list_area)
-    };
     app.list_area = Some(list_area);
 
     if let Some(fa) = filter_area {
@@ -410,69 +407,115 @@ pub(super) fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
         shown.retain(|&c| c != col);
     }
     let label_width = label_room(&shown).min(widest_label.max(ROW_NAME_MIN));
-    let gap = " ".repeat(COL_GAP);
     let col_width = |col: &Col| widths.iter().find(|(c, _)| c == col).map_or(0, |(_, w)| *w);
-    if let Some(ha) = header_area {
+    let grid = Style::new().fg(border());
+    let lead = ROW_CHROME_WIDTH + ROW_RUN_WIDTH;
+    // A rule across the whole pane, crossing each column line with `┼`.
+    let rule = || {
+        let mut out = "─".repeat(lead + label_width + 1);
+        for col in &shown {
+            out.push('┼');
+            out.push_str(&"─".repeat(col_width(col) + 2));
+        }
+        let out = truncate(&out, width).trim_end_matches('…').to_string();
+        let fill = width.saturating_sub(text_width(&out));
+        Line::styled(format!("{out}{}", "─".repeat(fill)), grid)
+    };
+    // Spaces to the pane's edge, so a highlight or a header band is one
+    // unbroken bar.
+    let fill_to = |mut spans: Vec<Span<'static>>| {
+        let line = truncate_line(Line::from(std::mem::take(&mut spans)), width);
+        let used: usize = line.spans.iter().map(|s| text_width(&s.content)).sum();
+        let mut spans = line.spans;
+        spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
+        Line::from(spans)
+    };
+
+    let height = list_area.height as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    // The header when there is room for rows under it; the rule under
+    // the header only when it would not push a row off a short pane.
+    if height >= 3 {
         let title_style = Style::new().fg(text_muted()).add_modifier(Modifier::BOLD);
         let mut spans = vec![Span::styled(
             format!(
                 "{}{}",
-                " ".repeat(ROW_CHROME_WIDTH + ROW_RUN_WIDTH),
+                " ".repeat(lead),
                 pad(&truncate(LABEL_TITLE, label_width), label_width)
             ),
             title_style,
         )];
         for col in &shown {
             let w = col_width(col);
-            spans.push(Span::styled(
-                format!("{gap}{}", pad(&truncate(col.title(), w), w)),
-                title_style,
-            ));
+            spans.push(Span::styled(COL_RULE, grid));
+            spans.push(Span::styled(pad(&truncate(col.title(), w), w), title_style));
         }
-        f.render_widget(
-            Paragraph::new(truncate_line(Line::from(spans), width))
-                .style(Style::new().bg(surface())),
-            ha,
-        );
+        lines.push(fill_to(spans).style(Style::new().bg(surface())));
+        if height >= 3 + rows.len().min(3) {
+            lines.push(rule());
+        }
     }
+    let room = height.saturating_sub(lines.len());
+    // A rule between rows while every row fits with one; past that the
+    // rows close up, because a list of thirty that scrolls to show half of
+    // them is worse than one without the lines.
+    let ruled = rows.len() * 2 - 1 <= room;
+    let per_row = if ruled { 2 } else { 1 };
+    let visible = if ruled { rows.len() } else { room.max(1) };
+    let selected = app.list_state.selected();
+    let mut offset = app.list_state.offset();
+    if let Some(sel) = selected {
+        if sel < offset {
+            offset = sel;
+        } else if sel >= offset + visible {
+            offset = sel + 1 - visible;
+        }
+    }
+    offset = offset.min(rows.len().saturating_sub(visible));
+    *app.list_state.offset_mut() = offset;
+
     // Where each label differs from its nearest neighbour, so thirty
     // branches that share a long prefix keep the part that tells them
     // apart.
     let labels: Vec<String> = rows.iter().map(|row| row.label.clone()).collect();
     let distinct = distinct_offsets(&labels);
 
-    let items: Vec<ListItem> = rows
-        .iter()
-        .zip(&distinct)
-        .map(|(row, &differs_at)| {
-            let (glyph, color) = row.glyph;
-            let mut spans = vec![
-                Span::styled(glyph, Style::new().fg(color)),
-                Span::styled(
-                    pad(
-                        &truncate_distinct(&row.label, label_width, differs_at),
-                        label_width,
-                    ),
-                    Style::new().fg(if row.live { text() } else { text_dim() }),
+    for (i, (row, &differs_at)) in rows.iter().zip(&distinct).enumerate().skip(offset) {
+        if lines.len() + 1 > height {
+            break;
+        }
+        if i > offset && per_row == 2 {
+            lines.push(rule());
+        }
+        let is_selected = selected == Some(i);
+        let (glyph, color) = row.glyph;
+        let mut spans = vec![
+            Span::raw(if is_selected { " ▸ " } else { "   " }),
+            Span::styled(glyph, Style::new().fg(color)),
+            Span::styled(
+                pad(
+                    &truncate_distinct(&row.label, label_width, differs_at),
+                    label_width,
                 ),
-            ];
-            for col in &shown {
-                let w = col_width(col);
-                let (text, style) = row
-                    .cell(*col)
-                    .map(|(_, text, style)| (text.as_str(), *style))
-                    .unwrap_or(("", Style::new()));
-                spans.push(Span::raw(gap.clone()));
-                spans.push(Span::styled(pad(&truncate(text, w), w), style));
-            }
-            ListItem::new(truncate_line(Line::from(spans), width))
-        })
-        .collect();
-
-    let list = List::new(items)
-        .highlight_symbol(" ▸ ")
-        .highlight_style(Style::new().bg(highlight_bg()).add_modifier(Modifier::BOLD));
-    f.render_stateful_widget(list, list_area, &mut app.list_state);
+                Style::new().fg(if row.live { text() } else { text_dim() }),
+            ),
+        ];
+        for col in &shown {
+            let w = col_width(col);
+            let (text, style) = row
+                .cell(*col)
+                .map(|(_, text, style)| (text.as_str(), *style))
+                .unwrap_or(("", Style::new()));
+            spans.push(Span::styled(COL_RULE, grid));
+            spans.push(Span::styled(pad(&truncate(text, w), w), style));
+        }
+        let mut line = fill_to(spans);
+        if is_selected {
+            line = line.style(Style::new().bg(highlight_bg()).add_modifier(Modifier::BOLD));
+        }
+        lines.push(line);
+    }
+    f.render_widget(Paragraph::new(lines), list_area);
 }
 
 /// The port of a URL, `17342` of `http://localhost:17342/app`, when it

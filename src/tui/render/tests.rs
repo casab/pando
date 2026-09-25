@@ -547,7 +547,7 @@ fn list_columns_shed_the_least_useful_first_and_the_status_last() {
         ],
         "wide enough for everything, the status word last"
     );
-    let medium = list_columns(70, &all);
+    let medium = list_columns(80, &all);
     assert!(!medium.contains(&Col::Ports), "{medium:?}");
     assert!(
         medium.contains(&Col::Aside) && medium.contains(&Col::Port),
@@ -2225,7 +2225,7 @@ fn the_detail_pane_has_a_git_row() {
     let rendered = text_of(&draw(&mut app, 200, 30));
     let row = rendered
         .lines()
-        .find(|line| line.contains("│ git "))
+        .find(|line| line.contains("││ git "))
         .unwrap_or_default();
     assert!(row.contains("uncommitted changes"), "{rendered}");
     assert!(row.contains("↑2 ahead, ↓1 behind of main"), "{rendered}");
@@ -2235,7 +2235,7 @@ fn the_detail_pane_has_a_git_row() {
     let rendered = text_of(&draw(&mut app, 140, 30));
     let row = rendered
         .lines()
-        .find(|line| line.contains("│ git "))
+        .find(|line| line.contains("││ git "))
         .unwrap_or_default();
     assert!(row.contains("clean · even with main"), "{rendered}");
 }
@@ -2382,7 +2382,7 @@ fn a_wide_list_shows_every_port_and_a_narrow_one_sheds_them_first() {
     with_second_process(&mut app, "feat+one", "api", running_phase());
     let wide = text_of(&draw(&mut app, 220, 10));
     let row = list_row(&wide, "feat/one");
-    assert!(row.contains(":17342  api:17344"), "{wide}");
+    assert!(row.contains(":17342 │ api:17344"), "{wide}");
     assert!(
         !row.contains("web:17342"),
         "the URL's port is not said twice: {row}"
@@ -2767,9 +2767,9 @@ fn a_wide_branch_name_keeps_the_list_columns_straight() {
     for width in [60u16, 100] {
         let buf = draw(&mut app, width, 14);
         // The list's two rows, under the header and the border.
-        // The list's two rows, under the header row.
-        let columns: Vec<u16> = (3..5)
-            .filter_map(|y| column_of(&buf, y, ":17342"))
+        // The list's two rows, wherever the header and the rules put them.
+        let columns: Vec<u16> = (2..buf.area().height)
+            .filter_map(|y| column_of(&buf, y, "│ :17342"))
             .collect();
         assert_eq!(columns.len(), 2, "{}", text_of(&buf));
         assert_eq!(columns[0], columns[1], "{}", text_of(&buf));
@@ -2896,4 +2896,78 @@ fn the_header_names_the_gh_account_of_this_project() {
     // A narrow header drops the counts before the account.
     let narrow = header(Some(GhAccount::Login("octocat".into())), 50);
     assert!(narrow.contains("@octocat"), "{narrow}");
+}
+
+// ---- the list's grid -------------------------------------------------
+
+#[test]
+fn rows_are_ruled_apart_and_columns_divided_when_they_fit() {
+    let mut app = test_app(&["feat+one", "feat+two"]);
+    with_process(&mut app, "feat+one", running_phase());
+    let rendered = text_of(&draw(&mut app, 140, 20));
+    let header = list_row(&rendered, "branch");
+    assert!(
+        header.contains(" │ port"),
+        "a line before each title: {header}"
+    );
+    let one = list_row(&rendered, "feat/one");
+    assert!(one.contains(" │ :17342"), "{one}");
+    let rules = rendered
+        .lines()
+        .filter(|line| line.starts_with("│─") && line.contains('┼'))
+        .count();
+    assert_eq!(
+        rules, 2,
+        "under the header, and between the rows:\n{rendered}"
+    );
+}
+
+// Thirty rows with a rule under each is a list that shows fifteen.
+#[test]
+fn rows_close_up_when_the_rules_would_hide_some() {
+    let names: Vec<String> = (0..12).map(|i| format!("feat+n{i:02}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let mut app = test_app(&refs);
+    let rendered = text_of(&draw(&mut app, 140, 16));
+    let rules = rendered
+        .lines()
+        .filter(|line| line.starts_with("│─") && line.contains('┼'))
+        .count();
+    assert!(rules <= 1, "only the header's, if any:\n{rendered}");
+    assert!(
+        rendered.contains("feat/n00") && rendered.contains("feat/n05"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn the_selected_row_stays_on_screen_as_the_cursor_moves_past_the_bottom() {
+    let names: Vec<String> = (0..12).map(|i| format!("feat+n{i:02}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let mut app = test_app(&refs);
+    for _ in 0..11 {
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    }
+    let rendered = text_of(&draw(&mut app, 140, 12));
+    assert!(list_row(&rendered, "feat/n11").contains("▸"), "{rendered}");
+    assert!(
+        !rendered.contains("feat/n00"),
+        "scrolled past the top:\n{rendered}"
+    );
+}
+
+// The highlight is the row's; the rule under it stays a rule.
+#[test]
+fn the_highlight_covers_the_row_and_not_the_rule_under_it() {
+    let mut app = test_app(&["feat+one", "feat+two"]);
+    let buf = draw(&mut app, 140, 20);
+    let text = text_of(&buf);
+    let y = text
+        .lines()
+        .position(|line| line.contains("▸ ○ feat/one"))
+        .unwrap() as u16;
+    let bar = buf.cell((6, y)).unwrap().style().bg;
+    let under = buf.cell((6, y + 1)).unwrap().style().bg;
+    assert_eq!(bar, Some(highlight_bg()), "{text}");
+    assert_ne!(under, Some(highlight_bg()), "{text}");
 }
