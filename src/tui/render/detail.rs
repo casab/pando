@@ -294,7 +294,7 @@ fn git_row(app: &App, wt: &crate::worktree::Worktree, width: usize) -> Line<'sta
     let mut parts: Vec<(String, Style)> = Vec::new();
     match wt.dirty {
         Some(true) => parts.push((
-            "* uncommitted changes".to_string(),
+            "edited · uncommitted changes".to_string(),
             Style::new().fg(yellow()).add_modifier(Modifier::BOLD),
         )),
         Some(false) => parts.push(("clean".to_string(), Style::new().fg(text_dim()))),
@@ -709,7 +709,7 @@ fn tail_header<'a>(app: &App, name: &str, width: usize) -> Line<'a> {
     let hint = if app.tail_scroll > 0 {
         format!(" · scrolled back {} · PgDn newer", app.tail_scroll)
     } else if processes.len() > 1 {
-        " · tab switches · P restarts it · l opens".to_string()
+        " · tab next · P restarts it".to_string()
     } else {
         " · l opens".to_string()
     };

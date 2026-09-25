@@ -44,8 +44,10 @@ const STACK_MIN_DETAIL_HEIGHT: u16 = 6;
 pub fn body_layout(body: Rect) -> [Rect; 2] {
     let stack = body.width < SIDE_BY_SIDE_MIN_WIDTH
         && body.height >= STACK_MIN_LIST_HEIGHT + STACK_MIN_DETAIL_HEIGHT;
+    // The list is a table and the thing the screen is for; the detail
+    // pane is read a row at a time, and the full log has its own screen.
     if !stack {
-        return Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)])
+        return Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
             .areas(body);
     }
     let list_height = (body.height * 2 / 5)

@@ -132,14 +132,17 @@ pub const LIST_LEGEND: &[(&str, &str)] = &[
     ("◌", "starting, or something is being done to it"),
     ("✗", "failed — ⏎ shows the log that says why"),
     ("○", "stopped — s starts it"),
-    (":17342", "the port it serves on — c copies the URL"),
-    ("◈", "shared publicly — O opens, C copies the URL"),
-    ("▣", "isolated: runs private copies of the services"),
     (
-        "*",
-        "uncommitted changes — the detail pane's git row says more",
+        "edited",
+        "changes: uncommitted — the detail pane's git row says more",
     ),
-    ("↑n ↓n", "commits ahead of / behind the base branch"),
+    (":17342", "port: where it serves — c copies the URL"),
+    (
+        "◈",
+        "public: shared on the internet — O opens, C copies the URL",
+    ),
+    ("isolated", "mode: runs private copies of the services"),
+    ("↑n ↓n", "git: commits ahead of / behind the base branch"),
     ("◍n", "its pull request: ◌ draft, ✓ merged, ✗ closed"),
     (
         "gh @login",

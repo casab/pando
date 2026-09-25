@@ -547,7 +547,7 @@ fn list_columns_shed_the_least_useful_first_and_the_status_last() {
         ],
         "wide enough for everything, the status word last"
     );
-    let medium = list_columns(60, &all);
+    let medium = list_columns(70, &all);
     assert!(!medium.contains(&Col::Ports), "{medium:?}");
     assert!(
         medium.contains(&Col::Aside) && medium.contains(&Col::Port),
@@ -654,14 +654,46 @@ fn the_row_leaves_adoption_to_the_detail_pane() {
 }
 
 #[test]
-fn an_isolated_worktree_is_marked_with_a_glyph() {
-    let mut app = test_app(&["feat+one"]);
+fn a_header_row_names_each_column_over_its_cells() {
+    let mut app = test_app(&["feat+one", "feat+two"]);
     with_process(&mut app, "feat+one", running_phase());
     app.state.worktrees.get_mut("feat+one").unwrap().isolated = true;
-    let rendered = text_of(&draw(&mut app, 140, 10));
+    app.worktrees[0].dirty = Some(true);
+    let rendered = text_of(&draw(&mut app, 180, 10));
+    let header = list_row(&rendered, "branch");
     let row = list_row(&rendered, "feat/one");
-    assert!(row.contains('▣'), "{row}");
-    assert!(!row.contains("isolated"), "{row}");
+    for (title, cell) in [
+        ("branch", "feat/one"),
+        ("changes", "edited"),
+        ("port", ":17342"),
+        ("mode", "isolated"),
+        ("git", "↑1"),
+    ] {
+        let at = |line: &str, needle: &str| {
+            line.find(needle)
+                .map(|i| line[..i].chars().count())
+                .unwrap_or_else(|| panic!("no {needle}:\n{rendered}"))
+        };
+        assert_eq!(
+            at(&header, title),
+            at(&row, cell),
+            "{title} is not over {cell}:\n{rendered}"
+        );
+    }
+    // Nobody has a public URL or a pull request: no column, no title.
+    assert!(
+        !header.contains("public") && !header.contains("PR"),
+        "{header}"
+    );
+}
+
+#[test]
+fn no_header_row_when_the_list_is_empty() {
+    let mut app = test_app(&["feat+one"]);
+    app.filter = "nothing matches this".into();
+    app.filtered_indices.clear();
+    let rendered = text_of(&draw(&mut app, 140, 10));
+    assert!(!rendered.contains("branch"), "{rendered}");
 }
 
 #[test]
@@ -947,7 +979,7 @@ fn a_failure_shows_its_reason_in_the_detail_pane() {
             reason: "process exited; dependencies are missing".into(),
         },
     );
-    let rendered = text_of(&draw(&mut app, 120, 20));
+    let rendered = text_of(&draw(&mut app, 180, 20));
     assert!(rendered.contains("failed"), "{rendered}");
     assert!(rendered.contains("dependencies are missing"), "{rendered}");
 }
@@ -1062,10 +1094,10 @@ fn the_tail_header_names_every_process_and_marks_the_one_it_shows() {
     let mut app = test_app(&["feat+one"]);
     with_process(&mut app, "feat+one", running_phase());
     with_second_process(&mut app, "feat+one", "api", running_phase());
-    let rendered = text_of(&draw(&mut app, 120, 24));
+    let rendered = text_of(&draw(&mut app, 140, 24));
     assert!(rendered.contains("▸api │ dev"), "{rendered}");
     assert!(
-        rendered.contains("tab switches"),
+        rendered.contains("tab next"),
         "and says how to see the other one: {rendered}"
     );
     assert!(
@@ -1073,7 +1105,7 @@ fn the_tail_header_names_every_process_and_marks_the_one_it_shows() {
         "and how to restart just this one: {rendered}"
     );
     app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-    let rendered = text_of(&draw(&mut app, 120, 24));
+    let rendered = text_of(&draw(&mut app, 140, 24));
     assert!(
         rendered.contains("api │ ▸dev"),
         "tab moves the mark: {rendered}"
@@ -2168,8 +2200,8 @@ fn removing_a_running_worktree_warns_that_it_stops_it() {
 
 // ---- git state on screen ---------------------------------------------
 
-// A worktree with uncommitted changes carries a `*` against its label,
-// even on a pane too narrow for the drift column.
+// A worktree with uncommitted changes says `edited` right after its
+// label, even on a pane too narrow for the drift column.
 #[test]
 fn a_dirty_worktree_is_marked_in_the_list_at_any_width() {
     let mut app = test_app(&["feat+tui", "feat+clean"]);
@@ -2177,9 +2209,9 @@ fn a_dirty_worktree_is_marked_in_the_list_at_any_width() {
     for width in [60, 100, 200] {
         let rendered = text_of(&draw(&mut app, width, 12));
         let row = list_row(&rendered, "feat/tui");
-        assert!(row.contains('*'), "at {width}:\n{rendered}");
+        assert!(row.contains("edited"), "at {width}:\n{rendered}");
         assert!(
-            !list_row(&rendered, "feat/clean").contains('*'),
+            !list_row(&rendered, "feat/clean").contains("edited"),
             "at {width}:\n{rendered}"
         );
     }
@@ -2190,12 +2222,12 @@ fn the_detail_pane_has_a_git_row() {
     let mut app = test_app(&["feat+tui"]);
     app.worktrees[0].dirty = Some(true);
     app.worktrees[0].ahead_behind = Some((2, 1));
-    let rendered = text_of(&draw(&mut app, 140, 30));
+    let rendered = text_of(&draw(&mut app, 200, 30));
     let row = rendered
         .lines()
-        .find(|line| line.contains(" git "))
+        .find(|line| line.contains("│ git "))
         .unwrap_or_default();
-    assert!(row.contains("* uncommitted changes"), "{rendered}");
+    assert!(row.contains("edited · uncommitted changes"), "{rendered}");
     assert!(row.contains("↑2 ahead, ↓1 behind of main"), "{rendered}");
 
     app.worktrees[0].dirty = Some(false);
@@ -2203,7 +2235,7 @@ fn the_detail_pane_has_a_git_row() {
     let rendered = text_of(&draw(&mut app, 140, 30));
     let row = rendered
         .lines()
-        .find(|line| line.contains(" git "))
+        .find(|line| line.contains("│ git "))
         .unwrap_or_default();
     assert!(row.contains("clean · even with main"), "{rendered}");
 }
@@ -2350,12 +2382,12 @@ fn a_wide_list_shows_every_port_and_a_narrow_one_sheds_them_first() {
     with_second_process(&mut app, "feat+one", "api", running_phase());
     let wide = text_of(&draw(&mut app, 220, 10));
     let row = list_row(&wide, "feat/one");
-    assert!(row.contains(":17342 api:17344"), "{wide}");
+    assert!(row.contains(":17342  api:17344"), "{wide}");
     assert!(
         !row.contains("web:17342"),
         "the URL's port is not said twice: {row}"
     );
-    let narrow = text_of(&draw(&mut app, 60, 10));
+    let narrow = text_of(&draw(&mut app, 72, 10));
     let row = list_row(&narrow, "feat/one");
     assert!(!row.contains("api:17344"), "{narrow}");
     assert!(row.contains(":17342"), "{narrow}");
@@ -2369,7 +2401,7 @@ fn the_ports_give_way_before_a_long_branch_is_cut() {
     let mut app = test_app(&["feat+one", long]);
     with_process(&mut app, "feat+one", running_phase());
     with_second_process(&mut app, "feat+one", "api", running_phase());
-    let rendered = text_of(&draw(&mut app, 110, 10));
+    let rendered = text_of(&draw(&mut app, 95, 10));
     assert!(
         rendered.contains("feature/checkout-flow-for-guests"),
         "{rendered}"
@@ -2735,7 +2767,8 @@ fn a_wide_branch_name_keeps_the_list_columns_straight() {
     for width in [60u16, 100] {
         let buf = draw(&mut app, width, 14);
         // The list's two rows, under the header and the border.
-        let columns: Vec<u16> = (2..4)
+        // The list's two rows, under the header row.
+        let columns: Vec<u16> = (3..5)
             .filter_map(|y| column_of(&buf, y, ":17342"))
             .collect();
         assert_eq!(columns.len(), 2, "{}", text_of(&buf));

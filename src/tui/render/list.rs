@@ -1,26 +1,31 @@
-//! The worktree list: which columns survive the width, and each row.
+//! The worktree list: a table, which columns survive the width, and each
+//! row.
 //!
 //! A row reads left to right as the question it answers: is it up, which
-//! branch, where, and anything unusual about it.
+//! branch, where, and anything unusual about it. A header row names every
+//! column, so a cell never has to be decoded from help:
 //!
 //! ```text
-//!  ▸ ● feat/checkout *  :17342 api:17343 ◈ ▣ ↑2 ◍42
+//!      branch          changes  port    other ports  public  mode      git      PR   status
+//!  ▸ ● feat/checkout   edited   :17342  api:17343    ◈       isolated  ↑2       ◍42
 //!    ○ fix/typo
-//!    ✗ fix/crash                                 failed
-//!    ◌ feat/search    :17344                     starting
+//!    ✗ fix/crash                                                                     failed
 //! ```
+//!
+//! A column is only there when some row has something in it, and its
+//! title goes with it.
 //!
 //! The glyph says whether it runs, so the steady states have no word: a
 //! word is kept for what needs reading — a failure, or an action in
 //! flight — and goes at the end, where it moves nothing as it comes and
 //! goes. The full URL is the detail pane's; the row has its port. Being
-//! adopted is not on the row either: most worktrees are, and it changes
-//! nothing about what a key does — the detail pane and the remove dialog
-//! say it where it matters.
+//! adopted is not on the row: most worktrees are, and it changes nothing
+//! about what a key does — the detail pane and the remove dialog say it
+//! where it matters.
 //!
-//! The `*` of a worktree with uncommitted changes sits against the label
-//! and is never shed: it is what stops a removal, and what somebody
-//! switching branches most needs to see.
+//! `edited`, for uncommitted changes, sits right after the label and is
+//! never shed: it is what stops a removal, and what somebody switching
+//! branches most needs to see.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -31,7 +36,8 @@ use ratatui::widgets::{Block, BorderType, List, ListItem, Paragraph};
 use crate::actions;
 use crate::state::Aggregate;
 use crate::theme::{
-    border, cyan, green, highlight_bg, magenta, orange, red, text, text_dim, text_muted, yellow,
+    border, cyan, green, highlight_bg, magenta, orange, red, surface, text, text_dim, text_muted,
+    yellow,
 };
 use crate::tui::app::{App, Mode};
 use crate::worktree::{PrInfo, PrState, Worktree};
@@ -46,6 +52,10 @@ const ROW_RUN_WIDTH: usize = 2;
 /// `" ▸ "` — the list's own highlight column.
 const ROW_CHROME_WIDTH: usize = 3;
 
+/// Blank cells between two columns: one reads as a single run of text
+/// once a header sits over it.
+const COL_GAP: usize = 2;
+
 /// Below this a label stops being an identifier, so a column is dropped to
 /// buy it back.
 const ROW_NAME_MIN: usize = 12;
@@ -54,7 +64,7 @@ const ROW_NAME_MIN: usize = 12;
 /// label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Col {
-    /// `*` for uncommitted changes. Never shed.
+    /// `edited` for uncommitted changes. Never shed.
     Dirty,
     /// The directory name, when it is not just the branch with its
     /// slashes encoded — an adopted worktree somebody named themselves.
@@ -67,7 +77,7 @@ pub enum Col {
     Ports,
     /// `◈` for a worktree with a public URL.
     Share,
-    /// `▣` for a worktree with private copies of the services.
+    /// `isolated` for a worktree with private copies of the services.
     Mode,
     /// Ahead and behind, or gone or locked.
     Signals,
@@ -76,6 +86,26 @@ pub enum Col {
     /// Empty for a worktree that simply runs or is stopped.
     Status,
 }
+
+impl Col {
+    /// What the header row calls it.
+    pub fn title(self) -> &'static str {
+        match self {
+            Col::Dirty => "changes",
+            Col::Aside => "dir",
+            Col::Port => "port",
+            Col::Ports => "other ports",
+            Col::Share => "public",
+            Col::Mode => "mode",
+            Col::Signals => "git",
+            Col::Pr => "PR",
+            Col::Status => "status",
+        }
+    }
+}
+
+/// The title over the glyph and the label.
+const LABEL_TITLE: &str = "branch";
 
 /// Left to right.
 const LAYOUT: [Col; 9] = [
@@ -116,7 +146,9 @@ pub fn list_columns(list_width: usize, widths: &[(Col, usize)]) -> Vec<Col> {
             .unwrap_or(0)
     };
     let used = |shown: &[Col]| {
-        ROW_CHROME_WIDTH + ROW_RUN_WIDTH + shown.iter().map(|&c| width_of(c) + 1).sum::<usize>()
+        ROW_CHROME_WIDTH
+            + ROW_RUN_WIDTH
+            + shown.iter().map(|&c| width_of(c) + COL_GAP).sum::<usize>()
     };
     let mut shown: Vec<Col> = LAYOUT.into_iter().filter(|&c| width_of(c) > 0).collect();
     for col in SHED {
@@ -213,10 +245,14 @@ fn row_cells(app: &App, wt: &Worktree) -> RowCells {
         cells.push((Col::Share, "◈".to_string(), Style::new().fg(green())));
     }
     if app.record_for(&wt.name).is_some_and(|r| r.isolated) {
-        cells.push((Col::Mode, "▣".to_string(), Style::new().fg(magenta())));
+        cells.push((
+            Col::Mode,
+            "isolated".to_string(),
+            Style::new().fg(magenta()),
+        ));
     }
     if wt.dirty == Some(true) && !wt.prunable && !wt.locked {
-        cells.push((Col::Dirty, "*".to_string(), Style::new().fg(yellow())));
+        cells.push((Col::Dirty, "edited".to_string(), Style::new().fg(yellow())));
     }
     let drift = drift_text(wt);
     if !drift.is_empty() {
@@ -258,6 +294,15 @@ pub(super) fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
         (Some(fa), la)
     } else {
         (None, inner)
+    };
+    // The header row, when there are rows for it to name and room for a
+    // row under it.
+    let (header_area, list_area) = if !app.filtered_indices.is_empty() && list_area.height > 1 {
+        let [ha, la] =
+            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(list_area);
+        (Some(ha), la)
+    } else {
+        (None, list_area)
     };
     app.list_area = Some(list_area);
 
@@ -324,6 +369,13 @@ pub(super) fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
                 .map(|(_, text, _)| text_width(text))
                 .max()
                 .unwrap_or(0);
+            // A column with something in it is at least as wide as its
+            // title; one with nothing is not there, title and all.
+            let widest = if widest > 0 {
+                widest.max(text_width(col.title()))
+            } else {
+                0
+            };
             (col, widest)
         })
         .collect();
@@ -340,17 +392,45 @@ pub(super) fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
     let label_room = |shown: &[Col]| {
         let columns_width: usize = shown
             .iter()
-            .map(|col| widths.iter().find(|(c, _)| c == col).map_or(0, |(_, w)| *w) + 1)
+            .map(|col| widths.iter().find(|(c, _)| c == col).map_or(0, |(_, w)| *w) + COL_GAP)
             .sum();
         width.saturating_sub(ROW_CHROME_WIDTH + ROW_RUN_WIDTH + columns_width)
     };
-    // Every port is a nicety one running row brings to all thirty; a
-    // branch cut short is the thing the list exists to show. The ports
-    // give way before any label is cut.
-    if label_room(&shown) < widest_label {
-        shown.retain(|&col| col != Col::Ports);
+    // A branch cut short is the one thing the list exists to show. The
+    // columns the detail pane repeats in full give way, least useful
+    // first, before any label is cut.
+    for col in [Col::Ports, Col::Aside, Col::Pr, Col::Signals] {
+        if label_room(&shown) >= widest_label {
+            break;
+        }
+        shown.retain(|&c| c != col);
     }
     let label_width = label_room(&shown).min(widest_label.max(ROW_NAME_MIN));
+    let gap = " ".repeat(COL_GAP);
+    let col_width = |col: &Col| widths.iter().find(|(c, _)| c == col).map_or(0, |(_, w)| *w);
+    if let Some(ha) = header_area {
+        let title_style = Style::new().fg(text_muted()).add_modifier(Modifier::BOLD);
+        let mut spans = vec![Span::styled(
+            format!(
+                "{}{}",
+                " ".repeat(ROW_CHROME_WIDTH + ROW_RUN_WIDTH),
+                pad(&truncate(LABEL_TITLE, label_width), label_width)
+            ),
+            title_style,
+        )];
+        for col in &shown {
+            let w = col_width(col);
+            spans.push(Span::styled(
+                format!("{gap}{}", pad(&truncate(col.title(), w), w)),
+                title_style,
+            ));
+        }
+        f.render_widget(
+            Paragraph::new(truncate_line(Line::from(spans), width))
+                .style(Style::new().bg(surface())),
+            ha,
+        );
+    }
     // Where each label differs from its nearest neighbour, so thirty
     // branches that share a long prefix keep the part that tells them
     // apart.
@@ -373,15 +453,13 @@ pub(super) fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
                 ),
             ];
             for col in &shown {
-                let col_width = widths.iter().find(|(c, _)| c == col).map_or(0, |(_, w)| *w);
+                let w = col_width(col);
                 let (text, style) = row
                     .cell(*col)
                     .map(|(_, text, style)| (text.as_str(), *style))
                     .unwrap_or(("", Style::new()));
-                spans.push(Span::styled(
-                    format!(" {}", pad(&truncate(text, col_width), col_width)),
-                    style,
-                ));
+                spans.push(Span::raw(gap.clone()));
+                spans.push(Span::styled(pad(&truncate(text, w), w), style));
             }
             ListItem::new(truncate_line(Line::from(spans), width))
         })

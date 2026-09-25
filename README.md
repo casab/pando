@@ -145,13 +145,14 @@ first press back. Moving a running worktree between isolated and shared,
 sharing it, and removing it ask in a dialog instead. On a stopped
 worktree nothing asks.
 
-A row in the list reads `● feat/login * :17342 ◈ ▣ ↑2 ◍42`. The glyph
-says whether it runs (`●` running, `◌` starting, `✗` failed, `○`
-stopped), `*` marks uncommitted changes, `:17342` is the port it serves
-on, `◈` means it is shared publicly and `▣` that it runs isolated, then
-how far it has drifted from the base branch and its pull request. The
-full URL, the mode and the rest are in the detail pane beside it; `?`
-lists every mark.
+The list is a table with a header row: `branch`, then `changes`
+(`edited` when there are uncommitted changes), `port`, `public` (`◈`
+while it is shared), `mode` (`isolated` when it runs private copies of
+the services), `git` (commits ahead of and behind the base branch), `PR`
+and `status` (`failed`, or what is being done to it). A column shows
+only when some row has something in it. The glyph before the branch
+says whether it runs: `●` running, `◌` starting, `✗` failed, `○`
+stopped. The full URL and the rest are in the detail pane beside it.
 
 `p` lists the repository's open pull requests through the GitHub CLI
 (`gh`, signed in); typing narrows them by number, title, branch or
