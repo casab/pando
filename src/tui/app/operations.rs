@@ -7,10 +7,10 @@ use std::thread;
 
 use crate::actions;
 
-use super::App;
 use super::background::{AppEvent, ask_through_ui};
 use super::dialogs::Modal;
 use super::pending::{PendingKind, PendingOutcome};
+use super::{ARM_TTL, App, Armed};
 
 /// Standard base64, for the OSC 52 payload. A dependency would be a lot of
 /// machinery for one escape sequence.
@@ -122,15 +122,70 @@ impl App {
     /// A mode key on a worktree that is already up is a restart in that
     /// mode: a start would find its processes running and leave them on
     /// the services they were started against.
+    ///
+    /// Pressed on one that runs in the other mode, it asks in a dialog,
+    /// because that restart swaps the services under every process. In
+    /// the mode it already runs in it is a plain restart, and asks for the
+    /// key twice like `r` does.
     fn start_selected_in(&mut self, mode: actions::Mode) {
-        let running = self
-            .selected_worktree()
-            .is_some_and(|wt| self.phase_of(&wt.name).is_some());
-        if running {
-            self.restart_selected_with(mode)
-        } else {
-            self.start_selected_with(mode)
+        let Some(name) = self.selected_worktree().map(|wt| wt.name.clone()) else {
+            return self.start_selected_with(mode);
+        };
+        if self.phase_of(&name).is_none() {
+            return self.start_selected_with(mode);
         }
+        let isolated = mode == actions::Mode::Isolated;
+        let runs_isolated = self.record_for(&name).is_some_and(|r| r.isolated);
+        if self.is_up(&name) && isolated != runs_isolated {
+            self.modal = Some(Modal::SwitchMode { name, isolated });
+            return;
+        }
+        let (key, how) = if isolated {
+            ('i', "isolated")
+        } else {
+            ('S', "shared")
+        };
+        let label = self.label_of(&name);
+        if self.pressed_twice(key, &name, &format!("restart {label} {how}")) {
+            self.restart_selected_with(mode)
+        }
+    }
+
+    /// Whether anything of a worktree is up — starting or running, not
+    /// only failed. Only then is there something a key would interrupt.
+    pub fn is_up(&self, name: &str) -> bool {
+        self.record_for(name).is_some_and(|record| {
+            record
+                .processes
+                .values()
+                .any(|p| !matches!(p.phase, crate::state::Phase::Failed { .. }))
+        })
+    }
+
+    /// Whether a key that interrupts a worktree goes ahead now. On one with
+    /// nothing up it always does. On one that runs, the first press only
+    /// says what the second would do, and the second — the same key, the
+    /// same worktree, within `ARM_TTL` — does it. A dialog for these
+    /// would be read once and then answered without reading; a second
+    /// press is cheap on purpose and still catches a stray one.
+    pub(super) fn pressed_twice(&mut self, key: char, name: &str, what: &str) -> bool {
+        if !self.is_up(name) {
+            return true;
+        }
+        if let Some(armed) = self.armed.take()
+            && armed.key == key
+            && armed.name == name
+            && armed.at.elapsed() < ARM_TTL
+        {
+            return true;
+        }
+        self.armed = Some(Armed {
+            key,
+            name: name.to_string(),
+            at: std::time::Instant::now(),
+        });
+        self.set_prompt(format!("{what}? {key} again to confirm · esc cancels"));
+        false
     }
 
     /// Enter: the log of a worktree that runs, or has failed — the log is
@@ -204,6 +259,10 @@ impl App {
         let Some(name) = self.selected_name() else {
             return;
         };
+        let label = self.label_of(&name);
+        if !self.pressed_twice('x', &name, &format!("stop {label}")) {
+            return;
+        }
         let paths = self.paths.clone();
         let worker_name = name.clone();
         // A stop reaches the sweep that closes a *sibling's* half-dead
@@ -240,19 +299,20 @@ impl App {
         self.set_success(format!("opened {url}"));
     }
 
-    /// One key for both directions. Sharing is a plain action; unsharing
-    /// asks first, because somebody may be looking at that URL right now.
+    /// One key for both directions, and both ask first: sharing puts the
+    /// dev server on the internet, and unsharing takes a URL away from
+    /// somebody who may be looking at it right now.
     pub(super) fn toggle_share(&mut self) {
         let Some(name) = self.selected_name() else {
             return;
         };
-        match self.public_url_of(&name) {
-            Some(url) => self.modal = Some(Modal::Unshare { name, url }),
-            None => self.share_selected(name),
-        }
+        self.modal = Some(match self.public_url_of(&name) {
+            Some(url) => Modal::Unshare { name, url },
+            None => Modal::Share { name },
+        });
     }
 
-    fn share_selected(&mut self, name: String) {
+    pub(super) fn share_selected(&mut self, name: String) {
         let paths = self.paths.clone();
         let config = self.config.clone();
         let worker_name = name.clone();
@@ -292,13 +352,18 @@ impl App {
             .selected_worktree()
             .is_some_and(|wt| self.phase_of(&wt.name).is_none());
         if stopped {
-            self.start_selected()
-        } else {
+            return self.start_selected();
+        }
+        let Some(name) = self.selected_name() else {
+            return;
+        };
+        let label = self.label_of(&name);
+        if self.pressed_twice('r', &name, &format!("restart {label}")) {
             self.restart_selected_with(actions::Mode::Remembered)
         }
     }
 
-    fn restart_selected_with(&mut self, mode: actions::Mode) {
+    pub(super) fn restart_selected_with(&mut self, mode: actions::Mode) {
         self.restart_selected_only(mode, None);
     }
 
@@ -309,15 +374,21 @@ impl App {
             return;
         };
         let processes = self.processes_of(&name);
+        let label = self.label_of(&name);
         match processes.len() {
             0 => {
-                let label = self.label_of(&name);
                 self.set_error(format!("{label} is running nothing — s starts it"));
             }
-            1 => self.restart_selected_with(actions::Mode::Remembered),
+            1 => {
+                if self.pressed_twice('P', &name, &format!("restart {label}")) {
+                    self.restart_selected_with(actions::Mode::Remembered)
+                }
+            }
             n => {
                 let process = processes[self.tail_index.min(n - 1)].0.clone();
-                self.restart_selected_only(actions::Mode::Remembered, Some(process));
+                if self.pressed_twice('P', &name, &format!("restart {process} of {label}")) {
+                    self.restart_selected_only(actions::Mode::Remembered, Some(process));
+                }
             }
         }
     }
@@ -480,14 +551,30 @@ impl App {
         self.set_success(format!("copied {path}"));
     }
 
-    /// The URL a worktree is reached at, for pasting: the public one when
-    /// it is shared, because that is the one being handed to somebody.
+    /// `c`: the local URL, shared or not. One key that copied the public
+    /// URL whenever there was one pasted a tunnel address where a
+    /// localhost one was wanted; each URL has its own key instead.
     pub(super) fn copy_selected_url(&mut self) {
         let Some(name) = self.selected_name() else {
             return;
         };
-        let Some(url) = self.public_url_of(&name).or_else(|| self.url_of(&name)) else {
-            self.set_error(format!("{name} has no URL yet — start it first"));
+        let Some(url) = self.url_of(&name) else {
+            let label = self.label_of(&name);
+            self.set_error(format!("{label} has no URL yet — start it first"));
+            return;
+        };
+        self.copy_to_clipboard(&url);
+        self.set_success(format!("copied {url}"));
+    }
+
+    /// `C`: the public URL, the one handed to somebody else.
+    pub(super) fn copy_selected_public_url(&mut self) {
+        let Some(name) = self.selected_name() else {
+            return;
+        };
+        let Some(url) = self.public_url_of(&name) else {
+            let label = self.label_of(&name);
+            self.set_error(format!("{label} is not shared — t shares it"));
             return;
         };
         self.copy_to_clipboard(&url);

@@ -9,11 +9,13 @@ use ratatui::widgets::{Block, BorderType, Paragraph};
 
 use crate::log_tail::LogLevel;
 use crate::state::{Aggregate, Phase, ProcessRecord};
-use crate::theme::{border, cyan, green, magenta, orange, red, text, text_dim, text_muted, yellow};
+use crate::theme::{
+    border, cyan, green, highlight_bg, magenta, orange, red, text, text_dim, text_muted, yellow,
+};
 use crate::tui::app::{App, compact_age};
 
 use super::list::{pr_color, run_marker, signal_color, signal_text};
-use super::{chunk_cells, home_relative, text_width, truncate, truncate_middle};
+use super::{chunk_cells, home_relative, text_width, truncate, truncate_line, truncate_middle};
 
 // Detail rows, by how much they are worth keeping when the pane is short.
 // `KEEP_ALWAYS` rows are the pane's reason to exist and are never shed.
@@ -703,32 +705,46 @@ fn tail_header<'a>(app: &App, name: &str, width: usize) -> Line<'a> {
         .and_then(|(key, _, _)| app.log_tails.get(key))
         .map(|t| t.lines().len())
         .unwrap_or(0);
-    let processes = app.processes_of(name).len();
-    let label = match &target {
-        Some((_, process, _)) if processes > 1 => format!(" log · {process}"),
-        _ => " log".to_string(),
-    };
+    let processes = app.processes_of(name);
     let hint = if app.tail_scroll > 0 {
         format!(" · scrolled back {} · PgDn newer", app.tail_scroll)
-    } else if processes > 1 {
-        " · l opens · tab switches · P restarts it".to_string()
+    } else if processes.len() > 1 {
+        " · tab switches · P restarts it · l opens".to_string()
     } else {
         " · l opens".to_string()
     };
     let unit = if count == 1 { "line" } else { "lines" };
-    Line::from(vec![
-        Span::styled(
-            label.clone(),
-            Style::new().fg(text_dim()).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            truncate(
-                &format!("  {count} {unit}{hint}"),
-                width.saturating_sub(text_width(&label)),
-            ),
-            Style::new().fg(text_muted()),
-        ),
-    ])
+    let mut spans = vec![Span::styled(
+        " log",
+        Style::new().fg(text_dim()).add_modifier(Modifier::BOLD),
+    )];
+    // Every process by name, the one on screen marked, so what `tab`
+    // moves and what `P` would restart can be seen rather than guessed.
+    if processes.len() > 1 {
+        let shown = target.as_ref().map(|(_, process, _)| process.as_str());
+        spans.push(Span::raw("  "));
+        for (i, (process, _)) in processes.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(" │ ", Style::new().fg(text_muted())));
+            }
+            spans.push(if Some(process.as_str()) == shown {
+                Span::styled(
+                    format!("▸{process}"),
+                    Style::new()
+                        .fg(text())
+                        .bg(highlight_bg())
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled(process.clone(), Style::new().fg(text_muted()))
+            });
+        }
+    }
+    spans.push(Span::styled(
+        format!("  {count} {unit}{hint}"),
+        Style::new().fg(text_muted()),
+    ));
+    truncate_line(Line::from(spans), width)
 }
 
 /// The last lines of the dev log, coloured by level.

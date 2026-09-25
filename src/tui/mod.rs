@@ -75,7 +75,7 @@ fn main_loop(
                 Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
             }
         }
-        // A shell or editor `c` or `e` asked for. Run here because this is
+        // A shell or editor `!` or `e` asked for. Run here because this is
         // where the terminal is.
         if let Some(request) = app.launch.take() {
             match handoff::carry_out(request, terminal, &gate, &app.event_tx) {

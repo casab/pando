@@ -1,5 +1,5 @@
-//! The modals: create, pull requests, remove, and the question a worker
-//! asks.
+//! The modals: create, pull requests, remove, the confirmations, and the
+//! question a worker asks.
 
 use anyhow::Result;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
@@ -40,6 +40,19 @@ pub enum Modal {
     Unshare {
         name: String,
         url: String,
+    },
+    /// `t` on a worktree that is not shared: its dev server goes on the
+    /// internet, which is the one step here that cannot be taken back —
+    /// a link, once given out, has been given out.
+    Share {
+        name: String,
+    },
+    /// `i` on a worktree running shared, `S` on one running isolated:
+    /// every process restarts, on services it was not using a moment ago.
+    SwitchMode {
+        name: String,
+        /// The mode it is switching to.
+        isolated: bool,
     },
     /// `X`: every worktree with anything up, stopped at once, as
     /// `pando stop --all` does. Lists what goes down before it does.

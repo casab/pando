@@ -1,5 +1,5 @@
-//! Overlays: create, pull requests, remove, unshare, questions, help,
-//! messages. Pure
+//! Overlays: create, pull requests, remove, share, unshare, switching
+//! mode, questions, help, messages. Pure
 //! painting, like `render`.
 //!
 //! Every popup is sized to what it holds, with a margin inside its border,
@@ -61,6 +61,14 @@ pub fn render_modal(f: &mut Frame, area: Rect, modal: &Modal, app: &App) -> Opti
         }
         Modal::Unshare { name, url } => render_unshare(f, area, &app.label_of(name), url),
         Modal::StopAll { names } => render_stop_all(f, area, names, app),
+        Modal::Share { name } => {
+            render_share(f, area, &app.label_of(name), app.url_of(name).as_deref())
+        }
+        Modal::SwitchMode { name, isolated } => {
+            let processes: Vec<String> =
+                app.processes_of(name).into_iter().map(|(p, _)| p).collect();
+            render_switch_mode(f, area, &app.label_of(name), &processes, *isolated)
+        }
         Modal::Question {
             question,
             selected,
@@ -675,6 +683,89 @@ fn render_unshare(f: &mut Frame, area: Rect, label: &str, url: &str) {
     ]));
     let width = widest(&lines).min(width);
     let Some(inner) = popup(f, area, "stop sharing", None, width, lines.len()) else {
+        return;
+    };
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Confirming `t`: the local address that is about to be reachable from
+/// anywhere, before it is.
+fn render_share(f: &mut Frame, area: Rect, label: &str, url: Option<&str>) {
+    let width = (url.map(text_width).unwrap_or(0).max(40)).min(max_content_width(area));
+    let mut lines = vec![Line::styled(
+        truncate(&format!("share {label} publicly?"), width),
+        Style::new().fg(text()).add_modifier(Modifier::BOLD),
+    )];
+    if let Some(url) = url {
+        for chunk in chunk_cells(url, width) {
+            lines.push(Line::styled(chunk, Style::new().fg(cyan())));
+        }
+    }
+    lines.push(Line::styled(
+        truncate("anyone with the public link reaches it — t stops it", width),
+        Style::new().fg(yellow()),
+    ));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        key_span("y"),
+        hint_span(" share   "),
+        key_span("esc"),
+        hint_span(" cancel"),
+    ]));
+    let width = widest(&lines).min(width);
+    let Some(inner) = popup(f, area, "share", None, width, lines.len()) else {
+        return;
+    };
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Confirming `i` on a worktree running shared, or `S` on one running
+/// isolated: which services it leaves, and what restarts onto the others.
+fn render_switch_mode(
+    f: &mut Frame,
+    area: Rect,
+    label: &str,
+    processes: &[String],
+    isolated: bool,
+) {
+    let cap = max_content_width(area);
+    let (how, now, then) = if isolated {
+        (
+            "isolated",
+            "it runs on the project's shared services now",
+            "private copies of the services start for it",
+        )
+    } else {
+        (
+            "shared",
+            "it runs private copies of the services now",
+            "they stop, and it moves to the project's own",
+        )
+    };
+    let restarts = match processes.len() {
+        0 => "its processes restart".to_string(),
+        1 => format!("{} restarts", processes[0]),
+        _ => format!("{} restart", processes.join(", ")),
+    };
+    let lines = vec![
+        Line::styled(
+            truncate(&format!("restart {label} {how}?"), cap),
+            Style::new().fg(text()).add_modifier(Modifier::BOLD),
+        ),
+        Line::styled(truncate(now, cap), Style::new().fg(text_dim())),
+        Line::styled(truncate(then, cap), Style::new().fg(text_dim())),
+        Line::styled(truncate(&restarts, cap), Style::new().fg(yellow())),
+        Line::raw(""),
+        Line::from(vec![
+            key_span("y"),
+            hint_span(&format!(" restart {how}   ")),
+            key_span("esc"),
+            hint_span(" keep it as it is"),
+        ]),
+    ];
+    let width = widest(&lines).min(cap);
+    let title = format!("restart {how}");
+    let Some(inner) = popup(f, area, &title, None, width, lines.len()) else {
         return;
     };
     f.render_widget(Paragraph::new(lines), inner);

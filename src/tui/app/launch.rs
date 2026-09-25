@@ -226,7 +226,7 @@ impl App {
         Some((path, self.label_of(&name)))
     }
 
-    /// `c`: a shell in the selected worktree.
+    /// `!`: a shell in the selected worktree.
     pub(super) fn open_shell(&mut self) {
         let Some((path, label)) = self.selected_path_and_label() else {
             return;

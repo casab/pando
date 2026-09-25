@@ -1160,6 +1160,12 @@ fn the_process_keys_each_start_their_own_work() {
         let mut app = test_app(&["feat+one"]);
         with_process(&mut app, "feat+one", running_phase());
         press(&mut app, key);
+        // Stop and restart interrupt something that runs, so they are
+        // pressed twice; start on a running worktree interrupts nothing.
+        if kind != PendingKind::Start {
+            assert!(app.pending.is_none(), "{key:?}: the first press only asks");
+            press(&mut app, key);
+        }
         let pending = app.pending.as_ref().expect("the key started something");
         assert_eq!(pending.kind, kind, "{key:?}");
         assert_eq!(pending.name, "feat+one");
@@ -1259,17 +1265,33 @@ fn open_needs_a_port_before_it_has_a_url() {
 
 // ---- share -----------------------------------------------------------
 
+// Sharing puts the dev server on the internet, and a link once given
+// out cannot be taken back, so it asks as unsharing does.
 #[test]
-fn t_on_a_worktree_that_is_not_shared_starts_a_share() {
+fn t_on_a_worktree_that_is_not_shared_asks_and_then_shares() {
     let mut app = test_app(&["feat+one"]);
     with_process(&mut app, "feat+one", running_phase());
 
     press(&mut app, KeyCode::Char('t'));
+    assert!(
+        matches!(&app.modal, Some(Modal::Share { name }) if name == "feat+one"),
+        "{:?}",
+        app.modal
+    );
+    assert!(
+        app.pending.is_none(),
+        "nothing is published until confirmed"
+    );
+    press(&mut app, KeyCode::Esc);
+    assert!(app.modal.is_none());
+    assert!(app.pending.is_none(), "escape shares nothing");
 
+    press(&mut app, KeyCode::Char('t'));
+    press(&mut app, KeyCode::Enter);
     let pending = app.pending.as_ref().expect("a share is in flight");
     assert_eq!(pending.kind, PendingKind::Share);
     assert_eq!(pending.name, "feat+one");
-    assert!(app.modal.is_none(), "sharing asks nothing");
+    assert!(app.modal.is_none());
 }
 
 #[test]
@@ -3243,12 +3265,17 @@ fn capital_s_starts_the_selected_worktree_shared() {
 }
 
 // A start of a worktree that is already up leaves its processes on the
-// services they were started against, so a mode key restarts instead.
+// services they were started against, so a mode key restarts instead —
+// on the second press, when it is the mode it already runs in.
 #[test]
 fn a_mode_key_on_a_running_worktree_restarts_it_in_that_mode() {
-    for key in ['i', 'S'] {
+    for (key, isolated) in [('i', true), ('S', false)] {
         let mut app = test_app(&["feat+one"]);
         with_process(&mut app, "feat+one", running_phase());
+        app.state.worktrees.get_mut("feat+one").unwrap().isolated = isolated;
+        press(&mut app, KeyCode::Char(key));
+        assert!(app.pending.is_none(), "{key}: the first press only asks");
+        assert!(app.modal.is_none(), "{key}: no dialog for the same mode");
         press(&mut app, KeyCode::Char(key));
         assert_eq!(
             app.pending.as_ref().map(|p| p.kind),
@@ -3258,22 +3285,157 @@ fn a_mode_key_on_a_running_worktree_restarts_it_in_that_mode() {
     }
 }
 
+// The accident this exists for: `i` on a worktree running shared swapped
+// every service under it on one keystroke.
 #[test]
-fn capital_y_copies_the_public_url_when_there_is_one_and_the_local_one_otherwise() {
+fn a_mode_key_that_switches_a_running_worktree_asks_in_a_dialog() {
+    for (key, isolated) in [('i', true), ('S', false)] {
+        let mut app = test_app(&["feat+one"]);
+        with_process(&mut app, "feat+one", running_phase());
+        app.state.worktrees.get_mut("feat+one").unwrap().isolated = !isolated;
+        press(&mut app, KeyCode::Char(key));
+        assert!(
+            matches!(
+                &app.modal,
+                Some(Modal::SwitchMode { name, isolated: to })
+                    if name == "feat+one" && *to == isolated
+            ),
+            "{key}: {:?}",
+            app.modal
+        );
+        assert!(app.pending.is_none(), "{key}: nothing restarts yet");
+        press(&mut app, KeyCode::Char(key));
+        assert!(app.pending.is_none(), "{key}: only y or enter confirms");
+        assert!(app.modal.is_some(), "{key}: and the dialog stays");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.modal.is_none() && app.pending.is_none(), "{key}");
+
+        press(&mut app, KeyCode::Char(key));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(
+            app.pending.as_ref().map(|p| p.kind),
+            Some(PendingKind::Restart),
+            "{key}"
+        );
+    }
+}
+
+#[test]
+fn c_copies_the_local_url_even_when_shared_and_capital_c_the_public_one() {
     let mut app = test_app(&["feat+one"]);
-    press(&mut app, KeyCode::Char('Y'));
+    press(&mut app, KeyCode::Char('c'));
     assert_eq!(app.clipboard, None, "nothing runs, so there is no URL");
     assert!(app.active_status().unwrap().1, "and it says so as an error");
 
     with_process(&mut app, "feat+one", running_phase());
-    press(&mut app, KeyCode::Char('Y'));
+    press(&mut app, KeyCode::Char('C'));
+    assert_eq!(app.clipboard, None, "not shared, so no public URL");
+    let (message, error) = app.active_status().unwrap();
+    assert!(error && message.contains("t shares it"), "{message}");
+
+    press(&mut app, KeyCode::Char('c'));
     assert_eq!(app.clipboard.as_deref(), Some("http://localhost:17342"));
 
     with_share(&mut app, "feat+one", None);
-    press(&mut app, KeyCode::Char('Y'));
+    press(&mut app, KeyCode::Char('c'));
+    assert_eq!(
+        app.clipboard.as_deref(),
+        Some("http://localhost:17342"),
+        "c never stands in for the public one"
+    );
+    press(&mut app, KeyCode::Char('C'));
     assert_eq!(
         app.clipboard.as_deref(),
         Some("https://fake-host.trycloudflare.com")
+    );
+}
+
+// ---- keys pressed twice ----------------------------------------------
+
+#[test]
+fn a_first_press_says_what_the_second_would_do() {
+    let mut app = test_app(&["feat+one"]);
+    with_process(&mut app, "feat+one", running_phase());
+    press(&mut app, KeyCode::Char('r'));
+    let (message, error) = app.active_status().expect("a prompt");
+    assert!(!error);
+    assert_eq!(
+        message,
+        "restart feat/one? r again to confirm · esc cancels"
+    );
+    assert!(
+        app.messages.iter().all(|m| !m.message.contains("again")),
+        "a prompt is not kept in the history"
+    );
+}
+
+#[test]
+fn esc_takes_a_first_press_back_without_quitting() {
+    let mut app = test_app(&["feat+one"]);
+    with_process(&mut app, "feat+one", running_phase());
+    press(&mut app, KeyCode::Char('x'));
+    press(&mut app, KeyCode::Esc);
+    assert!(!app.should_quit, "esc cancels rather than quits");
+    assert_eq!(app.active_status(), Some(("cancelled", false)));
+    press(&mut app, KeyCode::Char('x'));
+    assert!(app.pending.is_none(), "after esc, x is a first press again");
+    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Esc);
+    assert!(app.should_quit, "with nothing armed esc quits as before");
+}
+
+#[test]
+fn any_other_key_between_the_presses_disarms() {
+    let mut app = test_app(&["feat+one", "feat+two"]);
+    for name in ["feat+one", "feat+two"] {
+        with_process(&mut app, name, running_phase());
+    }
+    // Another key between them.
+    press(&mut app, KeyCode::Char('r'));
+    press(&mut app, KeyCode::Char('y'));
+    press(&mut app, KeyCode::Char('r'));
+    assert!(app.pending.is_none(), "r y r is a first press again");
+    // A different interrupting key is its own first press.
+    press(&mut app, KeyCode::Char('x'));
+    assert!(app.pending.is_none(), "r x does not stop it");
+    // Moving to another worktree: the second press is not on the same one.
+    press(&mut app, KeyCode::Char('j'));
+    press(&mut app, KeyCode::Char('x'));
+    assert!(app.pending.is_none(), "x j x stops neither");
+}
+
+#[test]
+fn a_first_press_that_has_waited_too_long_is_a_first_press_again() {
+    let mut app = test_app(&["feat+one"]);
+    with_process(&mut app, "feat+one", running_phase());
+    press(&mut app, KeyCode::Char('r'));
+    app.armed.as_mut().unwrap().at -= super::ARM_TTL;
+    press(&mut app, KeyCode::Char('r'));
+    assert!(app.pending.is_none(), "too late to be the second press");
+    press(&mut app, KeyCode::Char('r'));
+    assert_eq!(
+        app.pending.as_ref().map(|p| p.kind),
+        Some(PendingKind::Restart)
+    );
+}
+
+// Only something up can be interrupted: a worktree whose every process
+// has died stops and restarts on one press.
+#[test]
+fn a_worktree_with_nothing_up_is_stopped_on_one_press() {
+    let mut app = test_app(&["feat+one"]);
+    with_process(
+        &mut app,
+        "feat+one",
+        crate::state::Phase::Failed {
+            at: chrono::Utc::now(),
+            reason: "process exited".into(),
+        },
+    );
+    press(&mut app, KeyCode::Char('x'));
+    assert_eq!(
+        app.pending.as_ref().map(|p| p.kind),
+        Some(PendingKind::Stop)
     );
 }
 
@@ -3438,11 +3600,11 @@ fn env(tmux: bool, shell: Option<&str>, visual: Option<&str>, editor: Option<&st
 }
 
 #[test]
-fn c_outside_tmux_suspends_for_a_shell_in_the_worktree() {
+fn bang_outside_tmux_suspends_for_a_shell_in_the_worktree() {
     let mut app = test_app(&["feat+one"]);
     app.launch_env = env(false, Some("/bin/zsh"), None, None);
-    press(&mut app, KeyCode::Char('c'));
-    let request = app.launch.clone().expect("c asks for a shell");
+    press(&mut app, KeyCode::Char('!'));
+    let request = app.launch.clone().expect("! asks for a shell");
     assert_eq!(
         request.launch,
         Launch::Suspend {
@@ -3458,10 +3620,10 @@ fn c_outside_tmux_suspends_for_a_shell_in_the_worktree() {
 }
 
 #[test]
-fn c_without_a_shell_falls_back_to_sh() {
+fn bang_without_a_shell_falls_back_to_sh() {
     let mut app = test_app(&["feat+one"]);
     app.launch_env = env(false, None, None, None);
-    press(&mut app, KeyCode::Char('c'));
+    press(&mut app, KeyCode::Char('!'));
     assert!(matches!(
         app.launch.map(|r| r.launch),
         Some(Launch::Suspend { program, .. }) if program == "/bin/sh"
@@ -3469,10 +3631,10 @@ fn c_without_a_shell_falls_back_to_sh() {
 }
 
 #[test]
-fn c_inside_tmux_opens_a_window_named_for_the_branch() {
+fn bang_inside_tmux_opens_a_window_named_for_the_branch() {
     let mut app = test_app(&["feat+one"]);
     app.launch_env = env(true, Some("/bin/zsh"), None, None);
-    press(&mut app, KeyCode::Char('c'));
+    press(&mut app, KeyCode::Char('!'));
     assert_eq!(
         app.launch.clone().map(|r| r.launch),
         Some(Launch::Tmux {
@@ -3507,7 +3669,7 @@ fn c_inside_tmux_opens_a_window_named_for_the_branch() {
 fn a_suspended_shell_says_so_only_on_the_way_back() {
     let mut app = test_app(&["feat+one"]);
     app.launch_env = env(false, Some("/bin/zsh"), None, None);
-    press(&mut app, KeyCode::Char('c'));
+    press(&mut app, KeyCode::Char('!'));
     assert!(
         app.messages.is_empty(),
         "nothing yet: the shell has not run"
@@ -3645,6 +3807,12 @@ fn shift_p_restarts_only_the_process_the_detail_pane_marks() {
     press(&mut app, KeyCode::Tab);
     let (_, marked, _) = app.tail_target().expect("a process is marked");
     press(&mut app, KeyCode::Char('P'));
+    let (message, _) = app.active_status().expect("a prompt");
+    assert!(
+        message.starts_with(&format!("restart {marked} of feat/one?")),
+        "{message}"
+    );
+    press(&mut app, KeyCode::Char('P'));
     let pending = app.pending.as_ref().expect("P started something");
     assert_eq!(pending.kind, PendingKind::Restart);
     assert_eq!(pending.name, "feat+one");
@@ -3655,6 +3823,7 @@ fn shift_p_restarts_only_the_process_the_detail_pane_marks() {
 fn shift_p_on_one_process_restarts_the_worktree_and_on_none_says_so() {
     let mut app = test_app(&["feat+one"]);
     with_process(&mut app, "feat+one", running_phase());
+    press(&mut app, KeyCode::Char('P'));
     press(&mut app, KeyCode::Char('P'));
     let pending = app.pending.as_ref().expect("P started something");
     assert_eq!(pending.kind, PendingKind::Restart);

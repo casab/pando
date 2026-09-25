@@ -258,6 +258,13 @@ fn renders_every_modal_at_any_terminal_size() {
         Modal::StopAll {
             names: (0..20).map(|i| format!("feat+number-{i}")).collect(),
         },
+        Modal::Share {
+            name: "feat+one".into(),
+        },
+        Modal::SwitchMode {
+            name: "feat+one".into(),
+            isolated: true,
+        },
         Modal::Question {
             question: crate::actions::Question {
                 slot: crate::detect::Slot::DevCmd,
@@ -1032,12 +1039,12 @@ fn the_list_row_shows_the_aggregate_not_the_first_process() {
 }
 
 #[test]
-fn the_tail_header_names_the_process_it_is_showing() {
+fn the_tail_header_names_every_process_and_marks_the_one_it_shows() {
     let mut app = test_app(&["feat+one"]);
     with_process(&mut app, "feat+one", running_phase());
     with_second_process(&mut app, "feat+one", "api", running_phase());
     let rendered = text_of(&draw(&mut app, 120, 24));
-    assert!(rendered.contains("log · api"), "{rendered}");
+    assert!(rendered.contains("▸api │ dev"), "{rendered}");
     assert!(
         rendered.contains("tab switches"),
         "and says how to see the other one: {rendered}"
@@ -1048,7 +1055,10 @@ fn the_tail_header_names_the_process_it_is_showing() {
     );
     app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
     let rendered = text_of(&draw(&mut app, 120, 24));
-    assert!(rendered.contains("log · dev"), "{rendered}");
+    assert!(
+        rendered.contains("api │ ▸dev"),
+        "tab moves the mark: {rendered}"
+    );
 }
 
 // Level colours are what make an error findable in a wall of output.
@@ -1107,7 +1117,7 @@ fn the_footer_offers_the_share_keys_on_a_wide_terminal() {
     crate::tui::app::tests::with_share(&mut app, "feat+one", None);
     let shared = text_of(&draw(&mut app, 160, 20));
     assert!(shared.contains("O public"), "{shared}");
-    assert!(shared.contains("Y copy URL"), "{shared}");
+    assert!(shared.contains("C copy public"), "{shared}");
 }
 
 // …and they are optional, so a narrow terminal sheds them rather than
@@ -2009,7 +2019,7 @@ fn every_footer_hint_is_a_key_help_documents() {
             .collect()
     };
     let list = tokens(LIST_KEYS);
-    let shared = [("O", "public", false), ("Y", "copy URL", false)];
+    let shared = [("O", "public", false), ("C", "copy public", false)];
     for (key, _, _) in RUNNING_HINTS
         .iter()
         .chain(&STOPPED_HINTS)
@@ -2067,6 +2077,39 @@ fn the_welcome_names_the_real_pando_home() {
         "{rendered}"
     );
     assert!(!rendered.contains("~/.pando"), "{rendered}");
+}
+
+#[test]
+fn the_share_confirmation_names_the_address_that_goes_public() {
+    let mut app = test_app(&["feat+one"]);
+    with_process(&mut app, "feat+one", running_phase());
+    app.modal = Some(Modal::Share {
+        name: "feat+one".into(),
+    });
+    let rendered = text_of(&draw(&mut app, 120, 30));
+    assert!(rendered.contains("share feat/one publicly?"), "{rendered}");
+    assert!(rendered.contains("http://localhost:17342"), "{rendered}");
+    assert!(rendered.contains("y share"), "{rendered}");
+}
+
+#[test]
+fn the_switch_confirmation_says_what_restarts_on_which_services() {
+    let mut app = test_app(&["feat+one"]);
+    with_process(&mut app, "feat+one", running_phase());
+    with_second_process(&mut app, "feat+one", "api", running_phase());
+    for (isolated, title, now) in [
+        (true, "restart feat/one isolated?", "shared services now"),
+        (false, "restart feat/one shared?", "private copies"),
+    ] {
+        app.modal = Some(Modal::SwitchMode {
+            name: "feat+one".into(),
+            isolated,
+        });
+        let rendered = text_of(&draw(&mut app, 120, 30));
+        assert!(rendered.contains(title), "{rendered}");
+        assert!(rendered.contains(now), "{rendered}");
+        assert!(rendered.contains("api, dev restart"), "{rendered}");
+    }
 }
 
 #[test]

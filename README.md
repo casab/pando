@@ -129,13 +129,21 @@ From a script they return once everything is spawned; `--wait` and
 s i S    start it: as last time, isolated, or on the shared services
 x X      stop it, or stop everything
 r P      restart it, or only the selected process
-o O Y    open its URL, open the public one, copy the URL
+o O      open its URL, or the public one
+c C y    copy its local URL, its public URL, its path
 t        share it publicly, or stop sharing
-c e      a shell in it, or open it in your editor
+! e      a shell in it, or open it in your editor
 n d      new worktree, remove one
 p        open pull requests: ⏎ makes a worktree for one
 m ?      what pando said in full, and every key
 ```
+
+A key that would interrupt a running worktree asks for a second press:
+`r r` restarts it, `x x` stops it, `P P` restarts one process, and `i`
+or `S` twice restarts it in the mode it already runs in. Esc takes the
+first press back. Moving a running worktree between isolated and shared,
+sharing it, and removing it ask in a dialog instead. On a stopped
+worktree nothing asks.
 
 `p` lists the repository's open pull requests through the GitHub CLI
 (`gh`, signed in); typing narrows them by number, title, branch or

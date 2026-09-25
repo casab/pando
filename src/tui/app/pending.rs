@@ -276,7 +276,7 @@ impl App {
                         let how = if pre_authed { " (pre-authed)" } else { "" };
                         // Long enough to read out; `m` keeps it after that.
                         self.set_lasting(format!(
-                            "{label} is public at {url}{how} — O opens it, Y copies it"
+                            "{label} is public at {url}{how} — O opens it, C copies it"
                         ));
                         self.spawn_refresh();
                     }

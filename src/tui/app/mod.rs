@@ -68,6 +68,11 @@ const LASTING_TTL: Duration = Duration::from_secs(30);
 /// Messages `m` keeps, newest last.
 const MESSAGE_HISTORY: usize = 50;
 
+/// How long a first press of a key that interrupts a running worktree
+/// waits for the second one. Long enough to read the prompt, short enough
+/// that a stray press later does not find it still waiting.
+pub const ARM_TTL: Duration = Duration::from_secs(3);
+
 /// Ticks between repaints that nothing asked for, so the uptimes on screen
 /// keep counting. A paint is a millisecond or two; a clock that says
 /// `up 16s` for a minute is a bug report.
@@ -117,6 +122,16 @@ pub enum View {
 pub struct ServiceHealth {
     pub shared: Vec<actions::ServiceStatus>,
     pub worktrees: BTreeMap<String, Vec<actions::ServiceStatus>>,
+}
+
+/// A key pressed once on a worktree that runs, waiting to be pressed again
+/// on the same worktree: `r` `x` `P`, and `i` `S` in the mode it already
+/// runs in. Any other key disarms it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Armed {
+    pub key: char,
+    pub name: String,
+    pub at: Instant,
 }
 
 /// What a status message is, which decides its mark, its colour and how
@@ -211,6 +226,8 @@ pub struct App {
     pub filtered_indices: Vec<usize>,
     pub mode: Mode,
     pub modal: Option<Modal>,
+    /// The first press of a key that asks for a second.
+    pub armed: Option<Armed>,
     pub help_scroll: usize,
     /// The furthest help or messages can scroll on the screen it was last
     /// painted on. Written by the paint, read by the scroll keys.
@@ -255,10 +272,10 @@ pub struct App {
     pub list_area: Option<Rect>,
     pub event_tx: Sender<AppEvent>,
     pub event_rx: Option<Receiver<AppEvent>>,
-    /// How `c` and `e` leave pando: inside tmux or not, which shell, which
+    /// How `!` and `e` leave pando: inside tmux or not, which shell, which
     /// editor. Read once at startup.
     pub launch_env: LaunchEnv,
-    /// A shell or editor `c` or `e` asked for, waiting for the event loop,
+    /// A shell or editor `!` or `e` asked for, waiting for the event loop,
     /// which owns the terminal, to run it.
     pub launch: Option<LaunchRequest>,
     /// Set instead of touching the terminal when tests drive the app.
@@ -301,6 +318,7 @@ impl App {
             filtered_indices: Vec::new(),
             mode: Mode::Normal,
             modal: None,
+            armed: None,
             help_scroll: 0,
             help_scroll_max: usize::MAX,
             status: None,
@@ -505,6 +523,8 @@ impl App {
                     | Modal::Remove { .. }
                     | Modal::Unshare { .. }
                     | Modal::StopAll { .. }
+                    | Modal::Share { .. }
+                    | Modal::SwitchMode { .. }
                     | Modal::Question { .. }
             )
         );
@@ -626,6 +646,29 @@ impl App {
                 }
                 return;
             }
+            Some(Modal::Share { name }) => {
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Enter => self.share_selected(name),
+                    KeyCode::Esc | KeyCode::Char('n') => {}
+                    _ => self.modal = Some(Modal::Share { name }),
+                }
+                return;
+            }
+            Some(Modal::SwitchMode { name, isolated }) => {
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Enter => {
+                        let mode = if isolated {
+                            actions::Mode::Isolated
+                        } else {
+                            actions::Mode::Shared
+                        };
+                        self.restart_selected_with(mode);
+                    }
+                    KeyCode::Esc | KeyCode::Char('n') => {}
+                    _ => self.modal = Some(Modal::SwitchMode { name, isolated }),
+                }
+                return;
+            }
             Some(Modal::Question {
                 question,
                 selected,
@@ -646,6 +689,12 @@ impl App {
         }
         if self.mode == Mode::Filter {
             self.handle_filter_key(key);
+            return;
+        }
+        // A key waiting for its second press: esc takes it back and does
+        // nothing else, where it would otherwise clear a filter or quit.
+        if key.code == KeyCode::Esc && self.armed.take().is_some() {
+            self.set_status("cancelled");
             return;
         }
         // Every key below is a row of `keymap::LIST_KEYS`, which help
@@ -669,7 +718,10 @@ impl App {
             KeyCode::Char('p') => self.open_pull_requests(),
             KeyCode::Char('d') => self.open_remove(),
             KeyCode::Char('y') => self.copy_selected_path(),
-            KeyCode::Char('Y') => self.copy_selected_url(),
+            // The local URL, always: what gets pasted into a browser tab,
+            // a curl, a chat. `C` is the public one, and never stands in.
+            KeyCode::Char('c') => self.copy_selected_url(),
+            KeyCode::Char('C') => self.copy_selected_public_url(),
             KeyCode::Char('s') => self.start_selected(),
             // The key pressed on a row without thinking: the log of what
             // is running (or failed), a start for what is not.
@@ -685,7 +737,7 @@ impl App {
             // The one process the detail pane's `▸` marks, which tab moves.
             KeyCode::Char('P') => self.restart_selected_process(),
             KeyCode::Char('X') => self.confirm_stop_all(),
-            KeyCode::Char('c') => self.open_shell(),
+            KeyCode::Char('!') => self.open_shell(),
             KeyCode::Char('e') => self.open_editor(),
             KeyCode::Char('o') => self.open_selected_url(),
             // Shift-O, because the public one is the URL you give away and
@@ -712,6 +764,15 @@ impl App {
                 self.modal = Some(Modal::Messages);
             }
             _ => {}
+        }
+        // Any key but the one that armed it takes the arming back, so a
+        // second `r` after a `j` is a first press again.
+        if self
+            .armed
+            .as_ref()
+            .is_some_and(|armed| key.code != KeyCode::Char(armed.key))
+        {
+            self.armed = None;
         }
     }
 
@@ -941,6 +1002,18 @@ impl App {
             kind: StatusKind::Progress,
             at: Instant::now(),
             ttl: STATUS_TTL,
+            about: None,
+        });
+    }
+
+    /// What a second press would do, for as long as it would. Not kept
+    /// in the history: once it has expired it is no longer true.
+    pub fn set_prompt(&mut self, message: impl Into<String>) {
+        self.status = Some(Status {
+            message: message.into(),
+            kind: StatusKind::Info,
+            at: Instant::now(),
+            ttl: ARM_TTL,
             about: None,
         });
     }
@@ -1195,6 +1268,7 @@ impl App {
             filtered_indices: Vec::new(),
             mode: Mode::Normal,
             modal: None,
+            armed: None,
             help_scroll: 0,
             help_scroll_max: usize::MAX,
             status: None,

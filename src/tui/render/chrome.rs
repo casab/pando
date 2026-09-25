@@ -217,15 +217,16 @@ pub(super) fn gh_account_spans(account: Option<&GhAccount>) -> Vec<Span<'static>
 
 /// Key hints for a selected worktree that runs, most valuable first. The
 /// essential ones are never dropped.
-pub(super) const RUNNING_HINTS: [(&str, &str, bool); 13] = [
+pub(super) const RUNNING_HINTS: [(&str, &str, bool); 14] = [
     ("j/k", "move", true),
     ("⏎", "logs", true),
     ("x", "stop", true),
     ("r", "restart", false),
     ("o", "open", false),
+    ("c", "copy url", false),
     ("t", "share", false),
-    ("tab", "log", false),
-    ("c", "shell", false),
+    ("tab", "process", false),
+    ("!", "shell", false),
     ("e", "edit", false),
     ("n", "new", false),
     ("/", "filter", false),
@@ -239,7 +240,7 @@ pub(super) const STOPPED_HINTS: [(&str, &str, bool); 11] = [
     ("⏎", "start", true),
     ("i", "isolated", false),
     ("l", "logs", false),
-    ("c", "shell", false),
+    ("!", "shell", false),
     ("e", "edit", false),
     ("n", "new", false),
     ("d", "remove", false),
@@ -253,7 +254,7 @@ pub(super) const STOPPED_HINTS: [(&str, &str, bool); 11] = [
 pub(super) const NOTHING_TO_RUN_HINTS: [(&str, &str, bool); 9] = [
     ("j/k", "move", true),
     ("l", "logs", false),
-    ("c", "shell", false),
+    ("!", "shell", false),
     ("e", "edit", false),
     ("n", "new", false),
     ("d", "remove", false),
@@ -313,7 +314,10 @@ pub(super) fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                     .iter()
                     .position(|(key, ..)| *key == "t")
                     .map_or(0, |i| i + 1);
-                hints.splice(at..at, [("O", "public", false), ("Y", "copy URL", false)]);
+                hints.splice(
+                    at..at,
+                    [("O", "public", false), ("C", "copy public", false)],
+                );
                 hint_line(&hints, width)
             }
             Some(name) if app.phase_of(&name).is_some() => hint_line(&RUNNING_HINTS, width),

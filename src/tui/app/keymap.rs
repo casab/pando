@@ -57,14 +57,14 @@ pub const LIST_KEYS: &[KeyHelp] = &[
     key(
         "i",
         &[KeyCode::Char('i')],
-        "start it isolated: private copies of the services",
+        "start it isolated: private copies of the services (asks when it runs shared)",
     ),
     key(
         "S",
         &[KeyCode::Char('S')],
-        "start it shared: the project's own services",
+        "start it shared: the project's own services (asks when it runs isolated)",
     ),
-    key("x", &[KeyCode::Char('x')], "stop it"),
+    key("x", &[KeyCode::Char('x')], "stop it (x twice when it runs)"),
     key(
         "X",
         &[KeyCode::Char('X')],
@@ -73,29 +73,26 @@ pub const LIST_KEYS: &[KeyHelp] = &[
     key(
         "r",
         &[KeyCode::Char('r')],
-        "restart it (start it when stopped)",
+        "restart it: r twice when it runs, once when stopped starts it",
     ),
     key(
         "P",
         &[KeyCode::Char('P')],
-        "restart only the ▸ process (tab picks it)",
+        "restart only the ▸ process (tab picks it; P twice)",
     ),
     key("o", &[KeyCode::Char('o')], "open its URL in the browser"),
     key(
         "t",
         &[KeyCode::Char('t')],
-        "share it publicly, or stop sharing",
+        "share it publicly, or stop sharing (asks first)",
     ),
     key("O", &[KeyCode::Char('O')], "open its public URL"),
-    key(
-        "Y",
-        &[KeyCode::Char('Y')],
-        "copy its URL (the public one when shared)",
-    ),
+    key("c", &[KeyCode::Char('c')], "copy its local URL"),
+    key("C", &[KeyCode::Char('C')], "copy its public URL"),
     key("y", &[KeyCode::Char('y')], "copy its path"),
     key(
-        "c",
-        &[KeyCode::Char('c')],
+        "!",
+        &[KeyCode::Char('!')],
         "a shell in it (a tmux window inside tmux)",
     ),
     key("e", &[KeyCode::Char('e')], "open it in $VISUAL / $EDITOR"),
@@ -135,7 +132,7 @@ pub const LIST_LEGEND: &[(&str, &str)] = &[
     ("◌ starting", "waiting for its port"),
     ("✗ failed", "⏎ shows the log that says why"),
     ("○ stopped", "s starts it"),
-    ("◈", "shared publicly — O opens, Y copies the URL"),
+    ("◈", "shared publicly — O opens, C copies the URL"),
     ("isolated", "runs private copies of the services"),
     (
         "*",
