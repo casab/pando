@@ -3363,6 +3363,23 @@ fn the_install_hook_runs_after_new_and_records_its_fingerprint() {
     assert!(recorded.starts_with("md5:"), "{recorded}");
 }
 
+// A plain install writes the gitignored lockfile itself, so the lockfile
+// says nothing about whether the dependencies changed: the manifests do.
+#[test]
+fn a_plain_install_is_keyed_on_the_manifests_and_a_frozen_one_on_the_lockfiles() {
+    let mut config = Config::default();
+    config.project.install = Some("npm install".to_string());
+    let plain = install_hook(&config).unwrap();
+    assert_eq!(plain.fingerprint, vec!["**/package.json".to_string()]);
+    config.project.install = Some("npm ci".to_string());
+    let frozen = install_hook(&config).unwrap();
+    assert!(
+        frozen
+            .fingerprint
+            .contains(&"package-lock.json".to_string())
+    );
+}
+
 #[test]
 fn the_install_hook_is_skipped_while_the_lockfile_is_unchanged() {
     let mut fx = installable_fixture("echo run");

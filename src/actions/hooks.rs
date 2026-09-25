@@ -21,24 +21,38 @@ use super::services::service_roles;
 /// name would have its log truncated on every start.
 pub const INSTALL_HOOK: &str = "install";
 
+/// What a plain install is keyed on: every `package.json` in the worktree,
+/// the root's and each workspace app's. `node_modules` is never walked.
+const UNLOCKED_INSTALL_KEY: &str = "**/package.json";
+
 /// `[project].install` expressed as the `[[hooks]]` entry it is: a
 /// create-point hook keyed on the lockfiles, because a lockfile changing
 /// is what "the dependencies changed" means.
 ///
 /// One mechanism rather than two. The only thing still special about it is
 /// the warning below when a "frozen" install rewrites a lockfile.
-fn install_hook(config: &Config) -> Option<config::HookConfig> {
+///
+/// A plain install — the one a project that gitignores its lockfile gets —
+/// is keyed on the manifests instead: the lockfile is one it writes itself,
+/// so it says nothing about whether the dependencies changed, and keying on
+/// it would call every first install a lockfile rewrite.
+pub(super) fn install_hook(config: &Config) -> Option<config::HookConfig> {
     let install = config.project.install.as_deref()?.trim();
     if install.is_empty() {
         return None;
     }
-    Some(config::HookConfig {
-        name: INSTALL_HOOK.to_string(),
-        after: config::HookPoint::Create,
-        fingerprint: crate::catalog::package_managers::lockfiles()
+    let managers = &crate::catalog::package_managers::PACKAGE_MANAGERS;
+    let fingerprint = match managers.iter().any(|m| m.unlocked_install == Some(install)) {
+        true => vec![UNLOCKED_INSTALL_KEY.to_string()],
+        false => crate::catalog::package_managers::lockfiles()
             .iter()
             .map(|l| l.to_string())
             .collect(),
+    };
+    Some(config::HookConfig {
+        name: INSTALL_HOOK.to_string(),
+        after: config::HookPoint::Create,
+        fingerprint,
         cmd: install.to_string(),
         cwd: None,
         fallback: None,
