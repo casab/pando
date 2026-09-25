@@ -128,18 +128,19 @@ pub const LIST_KEYS: &[KeyHelp] = &[
 
 /// What the marks in a list row mean, shown under the keys.
 pub const LIST_LEGEND: &[(&str, &str)] = &[
-    ("● running", "the dev server is up"),
-    ("◌ starting", "waiting for its port"),
-    ("✗ failed", "⏎ shows the log that says why"),
-    ("○ stopped", "s starts it"),
+    ("●", "running: the dev server is up"),
+    ("◌", "starting, or something is being done to it"),
+    ("✗", "failed — ⏎ shows the log that says why"),
+    ("○", "stopped — s starts it"),
+    (":17342", "the port it serves on — c copies the URL"),
     ("◈", "shared publicly — O opens, C copies the URL"),
-    ("isolated", "runs private copies of the services"),
+    ("▣", "isolated: runs private copies of the services"),
     (
         "*",
         "uncommitted changes — the detail pane's git row says more",
     ),
     ("↑n ↓n", "commits ahead of / behind the base branch"),
-    ("adopted", "a worktree pando did not create"),
+    ("◍n", "its pull request: ◌ draft, ✓ merged, ✗ closed"),
     (
         "gh @login",
         "the GitHub account gh uses in this project's directory; R asks again",

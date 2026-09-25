@@ -1,12 +1,22 @@
 //! The worktree list: which columns survive the width, and each row.
 //!
-//! A row reads left to right as the question it answers: which branch, is
-//! it up, where, and anything unusual about it.
+//! A row reads left to right as the question it answers: is it up, which
+//! branch, where, and anything unusual about it.
 //!
 //! ```text
-//!  ▸ ● feat/checkout * running  http://localhost:17342  ◈ isolated  ↑2  ◍42
-//!    ○ fix/typo        stopped
+//!  ▸ ● feat/checkout *  :17342 api:17343 ◈ ▣ ↑2 ◍42
+//!    ○ fix/typo
+//!    ✗ fix/crash                                 failed
+//!    ◌ feat/search    :17344                     starting
 //! ```
+//!
+//! The glyph says whether it runs, so the steady states have no word: a
+//! word is kept for what needs reading — a failure, or an action in
+//! flight — and goes at the end, where it moves nothing as it comes and
+//! goes. The full URL is the detail pane's; the row has its port. Being
+//! adopted is not on the row either: most worktrees are, and it changes
+//! nothing about what a key does — the detail pane and the remove dialog
+//! say it where it matters.
 //!
 //! The `*` of a worktree with uncommitted changes sits against the label
 //! and is never shed: it is what stops a removal, and what somebody
@@ -40,11 +50,6 @@ const ROW_CHROME_WIDTH: usize = 3;
 /// buy it back.
 const ROW_NAME_MIN: usize = 12;
 
-/// The status column is never narrower than its commonest words
-/// (`starting`, `stopping`, `stopped`), so a row going from `starting` to
-/// `running` does not shift every column after it by one.
-const STATUS_MIN_WIDTH: usize = 8;
-
 /// The optional columns of a row, in the order they are painted after the
 /// label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,53 +59,45 @@ pub enum Col {
     /// The directory name, when it is not just the branch with its
     /// slashes encoded — an adopted worktree somebody named themselves.
     Aside,
-    /// `running`, `stopped`, `stopping`…
-    Status,
-    /// The whole local URL.
-    Url,
-    /// Only its port, `:17342`: what the URL shrinks to first.
+    /// The port of its URL, `:17342`, while something runs.
     Port,
-    /// Every port it was given, `web 17342 api 17343`, for a worktree that
+    /// The other ports it was given, `api:17343`, for a worktree that
     /// runs more than one process. What a wide screen has room for, and
     /// the first thing a narrow one gives up.
     Ports,
     /// `◈` for a worktree with a public URL.
     Share,
-    /// `isolated` for a worktree with private copies of the services.
+    /// `▣` for a worktree with private copies of the services.
     Mode,
     /// Ahead and behind, or gone or locked.
     Signals,
     Pr,
-    /// A worktree pando did not create.
-    Adopted,
+    /// `failed`, or what is being done to it: `starting`, `stopping`…
+    /// Empty for a worktree that simply runs or is stopped.
+    Status,
 }
 
 /// Left to right.
-const LAYOUT: [Col; 11] = [
+const LAYOUT: [Col; 9] = [
     Col::Dirty,
     Col::Aside,
-    Col::Status,
-    Col::Url,
     Col::Port,
     Col::Ports,
     Col::Share,
     Col::Mode,
     Col::Signals,
     Col::Pr,
-    Col::Adopted,
+    Col::Status,
 ];
 
 /// The order columns give way in when the label is too narrow to read:
-/// the least useful first, the status word last. The URL gives way to its
-/// port before either goes.
-const SHED: [Col; 10] = [
+/// the least useful first, the status word last.
+const SHED: [Col; 8] = [
     Col::Ports,
     Col::Aside,
-    Col::Adopted,
     Col::Signals,
     Col::Pr,
     Col::Mode,
-    Col::Url,
     Col::Port,
     Col::Share,
     Col::Status,
@@ -121,21 +118,12 @@ pub fn list_columns(list_width: usize, widths: &[(Col, usize)]) -> Vec<Col> {
     let used = |shown: &[Col]| {
         ROW_CHROME_WIDTH + ROW_RUN_WIDTH + shown.iter().map(|&c| width_of(c) + 1).sum::<usize>()
     };
-    // The port stands in for the URL only once the URL has gone.
-    let mut shown: Vec<Col> = LAYOUT
-        .into_iter()
-        .filter(|&c| c != Col::Port && width_of(c) > 0)
-        .collect();
+    let mut shown: Vec<Col> = LAYOUT.into_iter().filter(|&c| width_of(c) > 0).collect();
     for col in SHED {
         if list_width.saturating_sub(used(&shown)) >= ROW_NAME_MIN {
             break;
         }
-        if let Some(at) = shown.iter().position(|&c| c == col) {
-            shown.remove(at);
-            if col == Col::Url && width_of(Col::Port) > 0 {
-                shown.insert(at, Col::Port);
-            }
-        }
+        shown.retain(|&c| c != col);
     }
     shown
 }
@@ -144,6 +132,10 @@ pub fn list_columns(list_width: usize, widths: &[(Col, usize)]) -> Vec<Col> {
 struct RowCells {
     glyph: (&'static str, Color),
     label: String,
+    /// Whether anything of it is up, or being done to it: its label is
+    /// full brightness, and a stopped one's recedes, so the eye goes to
+    /// the few rows that run in a list of thirty.
+    live: bool,
     cells: Vec<(Col, String, Style)>,
 }
 
@@ -166,70 +158,62 @@ fn row_cells(app: &App, wt: &Worktree) -> RowCells {
     }
 
     let phase = app.phase_of(&wt.name);
-    let (glyph, word, color) = match app.pending_on(&wt.name) {
+    let pending = app.pending_on(&wt.name);
+    let (glyph, word, color) = match pending {
         // What is being done to it outranks what it was doing: a stop in
         // flight is not `running`.
-        Some(_) if app.awaiting_answer() => ("? ", "waiting", orange()),
-        Some(pending) => ("◌ ", pending.kind.verb(), yellow()),
+        Some(_) if app.awaiting_answer() => ("? ", Some("waiting"), orange()),
+        Some(pending) => ("◌ ", Some(pending.kind.verb()), yellow()),
         None => {
             let (glyph, color) = run_marker(phase.as_ref());
-            (glyph, phase.as_ref().map_or("stopped", |p| p.word()), color)
+            // Running and stopped are the glyph's to say; the rest have
+            // something worth reading.
+            let word = match &phase {
+                Some(Aggregate::Starting { .. }) => Some("starting"),
+                Some(Aggregate::Failed { .. }) => Some("failed"),
+                _ => None,
+            };
+            (glyph, word, color)
         }
     };
-    let mut status_style = Style::new().fg(color);
-    if matches!(
-        phase,
-        Some(Aggregate::Failed { .. }) | Some(Aggregate::Running { .. })
-    ) {
-        status_style = status_style.add_modifier(Modifier::BOLD);
+    if let Some(word) = word {
+        let mut style = Style::new().fg(color);
+        if matches!(phase, Some(Aggregate::Failed { .. })) && pending.is_none() {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        cells.push((Col::Status, word.to_string(), style));
     }
-    // Thirty `stopped` down one column drown out the two rows that are
-    // up. Faint, so the word is there for whoever looks for it and the
-    // eye goes to the ones that run, start or failed.
-    if phase.is_none() && app.pending_on(&wt.name).is_none() {
-        status_style = status_style.add_modifier(Modifier::DIM);
-    }
-    cells.push((Col::Status, word.to_string(), status_style));
 
     // Only while something runs: a stopped or failed worktree keeps its
-    // ports, but a URL on its row would promise a page that is not there.
-    if matches!(
+    // ports, but one on its row would promise a page that is not there.
+    let up = matches!(
         phase,
         Some(Aggregate::Running { .. } | Aggregate::Starting { .. })
-    ) && let Some(url) = app.url_of(&wt.name)
-    {
-        let port = url
-            .rsplit_once(':')
-            .map(|(_, port)| format!(":{}", port.trim_end_matches('/')))
-            .unwrap_or_default();
-        cells.push((Col::Url, url, Style::new().fg(cyan())));
-        if !port.is_empty() {
-            cells.push((Col::Port, port, Style::new().fg(cyan())));
-        }
+    );
+    let url_port = app.url_of(&wt.name).as_deref().and_then(port_of);
+    if up && let Some(port) = &url_port {
+        cells.push((Col::Port, format!(":{port}"), Style::new().fg(cyan())));
     }
-    if matches!(
-        phase,
-        Some(Aggregate::Running { .. } | Aggregate::Starting { .. })
-    ) && let Some(record) = app.record_for(&wt.name)
+    if up
+        && let Some(record) = app.record_for(&wt.name)
         && record.ports.len() > 1
     {
-        let ports = record
+        let others = record
             .ports
             .iter()
-            .map(|(role, port)| format!("{role} {port}"))
+            .filter(|(_, port)| url_port.as_deref() != Some(port.to_string().as_str()))
+            .map(|(role, port)| format!("{role}:{port}"))
             .collect::<Vec<_>>()
             .join(" ");
-        cells.push((Col::Ports, ports, Style::new().fg(text_dim())));
+        if !others.is_empty() {
+            cells.push((Col::Ports, others, Style::new().fg(text_dim())));
+        }
     }
     if app.public_url_of(&wt.name).is_some() {
         cells.push((Col::Share, "◈".to_string(), Style::new().fg(green())));
     }
     if app.record_for(&wt.name).is_some_and(|r| r.isolated) {
-        cells.push((
-            Col::Mode,
-            "isolated".to_string(),
-            Style::new().fg(magenta()),
-        ));
+        cells.push((Col::Mode, "▣".to_string(), Style::new().fg(magenta())));
     }
     if wt.dirty == Some(true) && !wt.prunable && !wt.locked {
         cells.push((Col::Dirty, "*".to_string(), Style::new().fg(yellow())));
@@ -241,16 +225,10 @@ fn row_cells(app: &App, wt: &Worktree) -> RowCells {
     if let Some(pr) = app.pr_for(wt) {
         cells.push((Col::Pr, pr_chip(pr), Style::new().fg(pr_color(pr))));
     }
-    if !app.created_by_pando.get(&wt.name).copied().unwrap_or(false) {
-        cells.push((
-            Col::Adopted,
-            "adopted".to_string(),
-            Style::new().fg(text_muted()),
-        ));
-    }
     RowCells {
         glyph: (glyph, color),
         label,
+        live: phase.is_some() || pending.is_some(),
         cells,
     }
 }
@@ -346,12 +324,6 @@ pub(super) fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
                 .map(|(_, text, _)| text_width(text))
                 .max()
                 .unwrap_or(0);
-            // Every row has a status, so the floor only ever widens it.
-            let widest = if col == Col::Status {
-                widest.max(STATUS_MIN_WIDTH)
-            } else {
-                widest
-            };
             (col, widest)
         })
         .collect();
@@ -359,7 +331,7 @@ pub(super) fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
     let mut shown = list_columns(width, &widths);
     // The label is as wide as the widest one, and no wider: on a wide
     // screen the room left over goes after the columns, not into a gap
-    // between the branch and whether it runs.
+    // between the branch and where it runs.
     let widest_label = rows
         .iter()
         .map(|row| text_width(&row.label))
@@ -397,7 +369,7 @@ pub(super) fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
                         &truncate_distinct(&row.label, label_width, differs_at),
                         label_width,
                     ),
-                    Style::new().fg(text()),
+                    Style::new().fg(if row.live { text() } else { text_dim() }),
                 ),
             ];
             for col in &shown {
@@ -419,6 +391,15 @@ pub(super) fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
         .highlight_symbol(" ▸ ")
         .highlight_style(Style::new().bg(highlight_bg()).add_modifier(Modifier::BOLD));
     f.render_stateful_widget(list, list_area, &mut app.list_state);
+}
+
+/// The port of a URL, `17342` of `http://localhost:17342/app`, when it
+/// names one.
+pub(super) fn port_of(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let (_, port) = host.rsplit_once(':')?;
+    (!port.is_empty() && port.chars().all(|c| c.is_ascii_digit())).then(|| port.to_string())
 }
 
 /// What a worktree is doing, in one cell.

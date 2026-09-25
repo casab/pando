@@ -520,14 +520,13 @@ fn the_header_gives_the_whole_bar_to_a_status_message() {
 fn every_column(width: usize) -> Vec<(Col, usize)> {
     vec![
         (Col::Aside, 10),
-        (Col::Status, 7),
-        (Col::Url, 22),
         (Col::Port, 6),
+        (Col::Ports, 9),
         (Col::Share, 1),
-        (Col::Mode, 8),
+        (Col::Mode, 1),
         (Col::Signals, width),
         (Col::Pr, 4),
-        (Col::Adopted, 7),
+        (Col::Status, 8),
     ]
 }
 
@@ -538,29 +537,25 @@ fn list_columns_shed_the_least_useful_first_and_the_status_last() {
         list_columns(200, &all),
         vec![
             Col::Aside,
-            Col::Status,
-            Col::Url,
+            Col::Port,
+            Col::Ports,
             Col::Share,
             Col::Mode,
             Col::Signals,
             Col::Pr,
-            Col::Adopted
+            Col::Status,
         ],
-        "wide enough for everything, and the port is not shown beside its URL"
+        "wide enough for everything, the status word last"
     );
-    let medium = list_columns(70, &all);
-    assert!(!medium.contains(&Col::Aside), "{medium:?}");
-    assert!(!medium.contains(&Col::Adopted), "{medium:?}");
+    let medium = list_columns(60, &all);
+    assert!(!medium.contains(&Col::Ports), "{medium:?}");
     assert!(
-        medium.contains(&Col::Status) && medium.contains(&Col::Url),
+        medium.contains(&Col::Aside) && medium.contains(&Col::Port),
         "{medium:?}"
     );
 
-    let narrow = list_columns(40, &all);
-    assert!(
-        narrow.contains(&Col::Port) && !narrow.contains(&Col::Url),
-        "the URL shrinks to its port before it goes: {narrow:?}"
-    );
+    let narrow = list_columns(30, &all);
+    assert!(!narrow.contains(&Col::Port), "{narrow:?}");
     assert!(narrow.contains(&Col::Status), "{narrow:?}");
 
     assert_eq!(
@@ -627,33 +622,57 @@ fn a_row_says_what_it_is_doing_and_where() {
     );
     let rendered = text_of(&draw(&mut app, 140, 10));
     let row = |name: &str| list_row(&rendered, name);
-    assert!(row("feat/one").contains("running"), "{rendered}");
+    let one = row("feat/one");
+    assert!(one.contains("● feat/one"), "{rendered}");
+    assert!(one.contains(":17342"), "the port, not the whole URL: {one}");
+    assert!(!one.contains("http"), "{one}");
+    assert!(!one.contains("running"), "the glyph says it: {one}");
+    let two = row("feat/two");
+    assert!(two.contains("○ feat/two"), "{rendered}");
+    assert!(!two.contains("stopped"), "the glyph says it: {two}");
     assert!(
-        row("feat/one").contains("http://localhost:17342"),
-        "{rendered}"
-    );
-    assert!(row("feat/two").contains("stopped"), "{rendered}");
-    assert!(
-        !row("feat/two").contains("localhost"),
+        !two.contains(":17342"),
         "a stopped row promises no page:\n{rendered}"
     );
 }
 
 #[test]
-fn the_row_marks_adopted_worktrees_in_words() {
+fn the_row_leaves_adoption_to_the_detail_pane() {
     let mut app = test_app(&["mine", "theirs"]);
     app.created_by_pando.insert("mine".into(), true);
     app.created_by_pando.insert("theirs".into(), false);
-    let rendered = text_of(&draw(&mut app, 100, 10));
-    let row = |name: &str| {
-        rendered
-            .lines()
-            .find(|line| line.contains(name))
-            .unwrap_or_default()
-            .to_string()
-    };
-    assert!(row("theirs").contains("adopted"), "{rendered}");
-    assert!(!row("mine").contains("adopted"), "{rendered}");
+    app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    let rendered = text_of(&draw(&mut app, 120, 20));
+    assert!(
+        !list_row(&rendered, "theirs").contains("adopted"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("adopted"),
+        "the detail pane says it: {rendered}"
+    );
+}
+
+#[test]
+fn an_isolated_worktree_is_marked_with_a_glyph() {
+    let mut app = test_app(&["feat+one"]);
+    with_process(&mut app, "feat+one", running_phase());
+    app.state.worktrees.get_mut("feat+one").unwrap().isolated = true;
+    let rendered = text_of(&draw(&mut app, 140, 10));
+    let row = list_row(&rendered, "feat/one");
+    assert!(row.contains('▣'), "{row}");
+    assert!(!row.contains("isolated"), "{row}");
+}
+
+#[test]
+fn the_port_is_read_from_the_host_whatever_follows_it() {
+    assert_eq!(port_of("http://localhost:17342").as_deref(), Some("17342"));
+    assert_eq!(port_of("http://localhost:17342/").as_deref(), Some("17342"));
+    assert_eq!(
+        port_of("http://127.0.0.1:3000/app?x=1:2").as_deref(),
+        Some("3000")
+    );
+    assert_eq!(port_of("https://example.com/a:b"), None);
 }
 
 // Thirty branches that share a long prefix must still read as thirty
@@ -947,7 +966,7 @@ fn the_list_marks_what_each_worktree_is_doing() {
     );
     let rendered = text_of(&draw(&mut app, 120, 20));
     let up = list_row(&rendered, "up ");
-    assert!(up.contains("● up") && up.contains("running"), "{rendered}");
+    assert!(up.contains("● up") && !up.contains("running"), "{rendered}");
     let broken = list_row(&rendered, "broken");
     assert!(
         broken.contains("✗ broken") && broken.contains("failed"),
@@ -2052,19 +2071,19 @@ fn style_at(buf: &Buffer, row: &str, needle: &str) -> ratatui::style::Style {
     buf.cell((x as u16, y as u16)).unwrap().style()
 }
 
-// Thirty `stopped` down a column drown out the two rows that matter: the
-// word is faint, and what runs or failed is not.
+// Thirty stopped rows drown out the two that matter: a stopped branch
+// recedes, and one that runs does not.
 #[test]
-fn stopped_is_faint_and_running_is_not() {
+fn a_stopped_branch_recedes_and_a_running_one_does_not() {
     let mut app = test_app(&["feat+up", "feat+down"]);
     with_process(&mut app, "feat+up", running_phase());
+    // The cursor's highlight restyles its row; put it on neither.
+    app.list_state.select(None);
     let buf = draw(&mut app, 120, 12);
-    let stopped = style_at(&buf, "feat/down", "stopped");
-    let running = style_at(&buf, "feat/up", "running");
-    use ratatui::style::Modifier;
-    assert!(stopped.add_modifier.contains(Modifier::DIM), "{stopped:?}");
-    assert!(!running.add_modifier.contains(Modifier::DIM), "{running:?}");
-    assert!(running.add_modifier.contains(Modifier::BOLD), "{running:?}");
+    let stopped = style_at(&buf, "feat/down", "feat/down");
+    let running = style_at(&buf, "feat/up", "feat/up");
+    assert_eq!(stopped.fg, Some(text_dim()), "{stopped:?}");
+    assert_eq!(running.fg, Some(crate::theme::text()), "{running:?}");
 }
 
 // PANDO_HOME moves the home; the welcome names the one in use.
@@ -2288,15 +2307,15 @@ fn a_long_error_on_a_short_screen_takes_two_rows_at_most() {
 
 // ---- the list's columns ----------------------------------------------
 
-// The status column does not change width when a row goes from starting
-// to running, so nothing after it moves.
+// The status word is at the end of the row, so a row going from
+// starting to running moves nothing before it.
 #[test]
-fn the_status_column_keeps_its_width_between_starting_and_running() {
+fn the_port_stays_put_between_starting_and_running() {
     let url_column = |phase: crate::state::Phase| {
         let mut app = test_app(&["feat+one"]);
         with_process(&mut app, "feat+one", phase);
         let rendered = text_of(&draw(&mut app, 140, 10));
-        list_row(&rendered, "feat/one").find("http").unwrap()
+        list_row(&rendered, "feat/one").find(":17342").unwrap()
     };
     assert_eq!(
         url_column(crate::state::Phase::Starting {
@@ -2307,14 +2326,15 @@ fn the_status_column_keeps_its_width_between_starting_and_running() {
 }
 
 // On a wide screen the room goes after the columns, not into a gap
-// between the branch and whether it runs.
+// between the branch and where it runs.
 #[test]
-fn a_wide_list_puts_the_status_right_after_the_branch() {
+fn a_wide_list_puts_the_port_right_after_the_branch() {
     let mut app = test_app(&["feat+one"]);
+    with_process(&mut app, "feat+one", running_phase());
     let rendered = text_of(&draw(&mut app, 200, 10));
     let row = list_row(&rendered, "feat/one");
     let branch_end = row.find("feat/one").unwrap() + "feat/one".len();
-    let status = row.find("stopped").unwrap();
+    let status = row.find(":17342").unwrap();
     assert!(
         status - branch_end <= 12,
         "{} columns between them:\n{row}",
@@ -2329,11 +2349,16 @@ fn a_wide_list_shows_every_port_and_a_narrow_one_sheds_them_first() {
     with_process(&mut app, "feat+one", running_phase());
     with_second_process(&mut app, "feat+one", "api", running_phase());
     let wide = text_of(&draw(&mut app, 220, 10));
-    assert!(list_row(&wide, "feat/one").contains("api 17344"), "{wide}");
-    let narrow = text_of(&draw(&mut app, 90, 10));
+    let row = list_row(&wide, "feat/one");
+    assert!(row.contains(":17342 api:17344"), "{wide}");
+    assert!(
+        !row.contains("web:17342"),
+        "the URL's port is not said twice: {row}"
+    );
+    let narrow = text_of(&draw(&mut app, 60, 10));
     let row = list_row(&narrow, "feat/one");
-    assert!(!row.contains("api 17344"), "{narrow}");
-    assert!(row.contains("running"), "{narrow}");
+    assert!(!row.contains("api:17344"), "{narrow}");
+    assert!(row.contains(":17342"), "{narrow}");
 }
 
 // Every port is a nicety; a branch cut short is what the list exists to
@@ -2344,13 +2369,13 @@ fn the_ports_give_way_before_a_long_branch_is_cut() {
     let mut app = test_app(&["feat+one", long]);
     with_process(&mut app, "feat+one", running_phase());
     with_second_process(&mut app, "feat+one", "api", running_phase());
-    let rendered = text_of(&draw(&mut app, 170, 10));
+    let rendered = text_of(&draw(&mut app, 110, 10));
     assert!(
         rendered.contains("feature/checkout-flow-for-guests"),
         "{rendered}"
     );
     assert!(
-        !list_row(&rendered, "feat/one").contains("api 17344"),
+        !list_row(&rendered, "feat/one").contains("api:17344"),
         "{rendered}"
     );
 }
@@ -2711,7 +2736,7 @@ fn a_wide_branch_name_keeps_the_list_columns_straight() {
         let buf = draw(&mut app, width, 14);
         // The list's two rows, under the header and the border.
         let columns: Vec<u16> = (2..4)
-            .filter_map(|y| column_of(&buf, y, "running"))
+            .filter_map(|y| column_of(&buf, y, ":17342"))
             .collect();
         assert_eq!(columns.len(), 2, "{}", text_of(&buf));
         assert_eq!(columns[0], columns[1], "{}", text_of(&buf));
