@@ -396,3 +396,82 @@ fn a_real_namespaced_start_builds_the_worktrees_own_database_and_leaves_main_alo
         "the main checkout's database never saw a branch's schema step"
     );
 }
+
+// The same, with a Redis beside it: each worktree gets a slot of its own,
+// its schema step writes there, and slot 0 — the main checkout's — keeps
+// only what the main checkout put in it.
+#[test]
+fn a_real_namespaced_start_gives_each_worktree_a_redis_slot_of_its_own() {
+    if skip(&[
+        "mariadb-install-db",
+        "mariadbd",
+        "mariadb",
+        "redis-server",
+        "redis-cli",
+        "python3",
+    ]) {
+        return;
+    }
+    let db = mariadb();
+    root_sql(&db, "GRANT ALL ON `shop\\_\\_%`.* TO 'app'@'localhost'").unwrap();
+    let cache = redis();
+    redis_cli(&cache, &["-n", "0", "SET", "main-key", "main"]).unwrap();
+
+    let dir = TempDir::new().unwrap();
+    let root = common::fixture_repo(dir.path());
+    std::fs::write(
+        root.join(".env"),
+        format!(
+            "DATABASE_HOST=127.0.0.1\nDATABASE_PORT={}\nDATABASE_NAME=shop\n\
+             DATABASE_USER=app\nDATABASE_PASSWORD={APP_PASSWORD}\n\
+             REDIS_HOST=127.0.0.1\nREDIS_PORT={}\nREDIS_PASSWORD={REDIS_PASSWORD}\nREDIS_DB=0\n",
+            db.port, cache.port
+        ),
+    )
+    .unwrap();
+    let paths = common::paths_for(&dir.path().join("pando-home"), &root);
+    std::fs::create_dir_all(paths.project_dir()).unwrap();
+    std::fs::write(
+        paths.config_file(),
+        format!(
+            "[dev]\ncmd = '''{}'''\nports = {{ PORT = \"web\" }}\n\n\
+             [[services]]\nkind = \"native\"\nname = \"mariadb\"\n\
+             env = {{ DATABASE_PORT = \"mariadb\" }}\n\n\
+             [[services]]\nkind = \"native\"\nname = \"redis\"\n\
+             env = {{ REDIS_PORT = \"redis\" }}\n\n\
+             [[hooks]]\nname = \"seed\"\nafter = \"services\"\n\
+             cmd = '''export REDISCLI_AUTH=\"$(sed -n 's/^REDIS_PASSWORD=//p' \"$PANDO_ROOT/.env\")\"; \
+             redis-cli -e -h 127.0.0.1 -p \"$REDIS_PORT\" -n \"$REDIS_DB\" SET seeded \"$PANDO_NAME\" '''\n",
+            common::listener_on_port_env()
+        ),
+    )
+    .unwrap();
+    let config = pando::config::load(&paths).unwrap().config;
+    let _started = Started(paths.clone());
+
+    for (branch, slot) in [("feat/one", "1"), ("feat/two", "2")] {
+        let name = pando::actions::new(&paths, &config, branch, None, &|_| {}).unwrap();
+        pando::actions::start(
+            &paths,
+            &config,
+            &name,
+            None,
+            pando::actions::Mode::Namespaced,
+            &|_| {},
+        )
+        .unwrap_or_else(|e| panic!("start {branch} namespaced: {e:#}"));
+        assert_eq!(
+            redis_cli(&cache, &["-n", slot, "GET", "seeded"]).unwrap(),
+            name,
+            "{branch}'s own slot"
+        );
+    }
+    assert_eq!(
+        redis_cli(&cache, &["-n", "0", "GET", "seeded"]).unwrap(),
+        ""
+    );
+    assert_eq!(
+        redis_cli(&cache, &["-n", "0", "GET", "main-key"]).unwrap(),
+        "main"
+    );
+}

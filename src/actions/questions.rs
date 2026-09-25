@@ -12,7 +12,7 @@ use crate::services;
 
 use super::init::{machine_evidence, slot_value};
 use super::lifecycle::{Mode, target_of, worktree_roles};
-use super::namespaced::ask_for_logins;
+use super::namespaced::{ask_for_logins, free_slots_if_full};
 use super::runtime::{
     Machine, RuntimeOutcome, answer_prelude, resolve_runtime, runtime_shell, user_home,
 };
@@ -114,11 +114,12 @@ pub enum Answer {
 /// example — and the line carries the option's own reason, which names the
 /// file it copies from.
 ///
-/// `None` for a question with no options, which is still asked, and for a
+/// `None` for a question with no options, which is still asked, for a
 /// set question — which of the services to run private copies of — whose
-/// answer is not one option but a selection.
+/// answer is not one option but a selection, and for one only a person
+/// may answer, because its answer empties somebody's data.
 pub fn recommended(question: &Question) -> Option<(Answer, String)> {
-    if question.multi || question.options.is_empty() {
+    if question.multi || question.options.is_empty() || question.slot.takes_a_person() {
         return None;
     }
     let index = question.preselect.unwrap_or(0);
@@ -459,6 +460,7 @@ pub fn resolve_for_start(
     // above may just have given its services.
     if namespacing {
         ask_for_logins(paths, &mut config, ask, progress)?;
+        free_slots_if_full(paths, &config, name, ask, progress)?;
     }
     Ok(config)
 }
@@ -1338,6 +1340,7 @@ pub(super) fn slot_label(slot: Slot) -> &'static str {
         Slot::SchemaHook => "schema command",
         Slot::Provision => "provision list",
         Slot::Login => "namespace login",
+        Slot::FreeSlot => "slot to free",
     }
 }
 
@@ -1367,5 +1370,7 @@ pub fn already_answered(slot: Slot, config: &Config) -> bool {
         // Per service, so "any" is the most this can say; the question
         // itself asks about one service and checks that one.
         Slot::Login => !config.namespaced.is_empty(),
+        // Asked of a server, never of config.
+        Slot::FreeSlot => false,
     }
 }

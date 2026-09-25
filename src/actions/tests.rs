@@ -8310,3 +8310,351 @@ fn only_one_process_cannot_be_moved_onto_namespaces() {
     assert!(e.contains("--only dev"), "{e}");
     assert_eq!(ns.fake("created"), "", "refused before anything was made");
 }
+
+// ---- redis slots -----------------------------------------------------------------
+
+/// A fake `redis-cli` beside the fake `mariadb`: slot `n` holds as many
+/// keys as `slot-<n>` says, a slot past 15 is out of range, and `flushed`
+/// records every slot emptied.
+fn fake_redis(paths: &PandoPaths) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let state = paths.home.join("fake-redis");
+    std::fs::create_dir_all(&state).unwrap();
+    let bin = paths.home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let script = format!(
+        r#"#!/bin/sh
+state='{state}'
+printf '%s\n' "$*" >> "$state/argv"
+for last; do :; done
+case "$*" in
+  *" ping") echo PONG ;;
+  *DBSIZE*)
+    if [ "$last" -gt 15 ]; then echo "ERR DB index is out of range" >&2; exit 1; fi
+    cat "$state/slot-$last" 2>/dev/null || echo 0 ;;
+  *FLUSHDB*) echo 0 > "$state/slot-$last"; echo "$last" >> "$state/flushed"; echo OK ;;
+  *) echo "unexpected: $*" >&2; exit 9 ;;
+esac
+"#,
+        state = state.display()
+    );
+    std::fs::write(bin.join("redis-cli"), script).unwrap();
+    std::fs::set_permissions(
+        bin.join("redis-cli"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    state
+}
+
+const MAIN_ENV_WITH_REDIS: &str = "DATABASE_HOST=localhost\nDATABASE_PORT=3306\n\
+                                   DATABASE_NAME=shop\nDATABASE_USER=app\n\
+                                   DATABASE_PASSWORD=s3cret-pw\nREDIS_HOST=\nREDIS_PORT=6379\n\
+                                   REDIS_DB=0\n";
+
+/// The namespaced fixture with a Redis beside the MariaDB, addressed by
+/// `REDIS_PORT` with its slot in `REDIS_DB`, as the origin project does.
+fn slots_fixture(env: &str) -> (Namespaced, PathBuf) {
+    let mut ns = namespaced_fixture(env);
+    let redis: Config = toml::from_str(
+        "[[services]]\nkind = \"native\"\nname = \"redis\"\nenv = { REDIS_PORT = \"redis\" }\n",
+    )
+    .unwrap();
+    ns.fx.config.services.extend(redis.services);
+    let fake = fake_redis(&ns.fx.paths);
+    (ns, fake)
+}
+
+/// A worktree record holding slot `n` of the fixture's Redis, stopped
+/// unless `running`, last used `hours` ago.
+fn slot_holder(n: u32, running: bool, hours: i64) -> WorktreeRecord {
+    let mut record = WorktreeRecord::new(format!("/abs/w{n}"), true);
+    record.mode = Some(crate::state::ServiceMode::Namespaced);
+    record.namespaces.push(crate::state::NamespaceRecord {
+        service: "redis".into(),
+        recipe: "redis".into(),
+        kind: crate::state::NamespaceKind::Slot,
+        host: "127.0.0.1".into(),
+        port: 6379,
+        name: n.to_string(),
+        main: "0".into(),
+        used_at: Utc::now() - chrono::Duration::hours(hours),
+    });
+    if running {
+        record.processes.insert(
+            "dev".into(),
+            ProcessRecord {
+                pid: std::process::id(),
+                pgid: 999_997,
+                started_at: Utc::now(),
+                log_path: PathBuf::from("/nowhere"),
+                ready_port: None,
+                ready_timeout_s: None,
+                observed_ports: Vec::new(),
+                swept: false,
+                phase: Phase::Running { since: Utc::now() },
+            },
+        );
+    }
+    record
+}
+
+/// Writes holders for `slots` into the fixture's state.
+fn hold(ns: &Namespaced, slots: impl IntoIterator<Item = (u32, bool)>) {
+    let mut store = ns.fx.state();
+    for (n, running) in slots {
+        store
+            .worktrees
+            .insert(format!("w{n}"), slot_holder(n, running, i64::from(n)));
+    }
+    state::save(&ns.fx.paths.state_file(), &store).unwrap();
+}
+
+// A slot is given out only when no worktree holds it and the server says
+// it is empty: keys nobody here put there are somebody else's.
+#[test]
+fn a_namespaced_start_takes_the_first_empty_slot_nobody_holds_and_tells_the_app() {
+    let (ns, redis) = slots_fixture(MAIN_ENV_WITH_REDIS);
+    std::fs::write(redis.join("slot-1"), "5\n").unwrap();
+    hold(&ns, [(2, false)]);
+    let (report, said) = ns.start(Mode::Namespaced).unwrap();
+    let _guard = guard(&report);
+    assert_eq!(ns.env_line("REDIS_DB").as_deref(), Some("3"));
+    assert_eq!(ns.env_line("REDIS_PORT").as_deref(), Some("6379"));
+    assert_eq!(
+        ns.env_line("DATABASE_NAME").as_deref(),
+        Some("shop__feat_one")
+    );
+    assert!(
+        said.iter().any(|l| l == "redis: slot 3, made just now"),
+        "{said:?}"
+    );
+    let slot = ns
+        .record()
+        .namespaces
+        .into_iter()
+        .find(|n| n.service == "redis")
+        .unwrap();
+    assert_eq!((slot.name.as_str(), slot.main.as_str()), ("3", "0"));
+    assert_eq!(slot.host, "127.0.0.1", "an empty REDIS_HOST is loopback");
+    let argv = std::fs::read_to_string(redis.join("argv")).unwrap();
+    assert!(
+        !argv.contains(" 0\n") && !argv.contains("FLUSHDB"),
+        "{argv}"
+    );
+
+    // And a restart keeps it, asking the server nothing about other slots.
+    stop(&ns.fx.paths, &ns.name, None).unwrap();
+    std::fs::remove_file(redis.join("argv")).unwrap();
+    let (report, said) = ns.start(Mode::Remembered).unwrap();
+    let _guard = guard(&report);
+    assert!(said.iter().any(|l| l == "redis: slot 3"), "{said:?}");
+    let argv = std::fs::read_to_string(redis.join("argv")).unwrap();
+    assert!(!argv.contains("DBSIZE"), "{argv}");
+}
+
+// Decision 3: an app that reads no slot setting has nowhere to be told
+// another slot, so its Redis stays shared — said in one line — and the
+// database is still its own.
+#[test]
+fn a_redis_the_app_reads_no_slot_setting_for_stays_shared_and_says_so() {
+    let (ns, redis) = slots_fixture(
+        "DATABASE_PORT=3306\nDATABASE_NAME=shop\nDATABASE_USER=app\nREDIS_PORT=6379\n",
+    );
+    let (report, said) = ns.start(Mode::Namespaced).unwrap();
+    let _guard = guard(&report);
+    assert!(
+        said.iter()
+            .any(|l| l == "redis: shared — the app reads no slot setting"),
+        "{said:?}"
+    );
+    assert_eq!(ns.record().namespaces.len(), 1);
+    assert!(
+        !redis.join("argv").exists(),
+        "Redis was never asked anything"
+    );
+}
+
+// Decision 9: every slot held, so a start that can ask asks which stopped
+// worktree gives its slot up — never a running one, never on anyone's
+// behalf — and the one chosen is emptied, freed, and taken.
+#[test]
+fn every_slot_held_asks_which_stopped_worktree_gives_up_its_slot() {
+    let (ns, redis) = slots_fixture(MAIN_ENV_WITH_REDIS);
+    hold(&ns, (1..=15).map(|n| (n, n == 7)));
+    std::fs::write(redis.join("slot-4"), "12\n").unwrap();
+
+    // A start that cannot ask says who holds them.
+    let e = format!("{:#}", ns.start(Mode::Namespaced).unwrap_err());
+    assert!(
+        e.contains("every slot of redis") && e.contains("w7 (slot 7, running)"),
+        "{e}"
+    );
+    assert!(e.contains("asks which stopped one to free"), "{e}");
+
+    let asked = std::cell::RefCell::new(None::<Question>);
+    let ask = |q: &Question| -> Result<Answer> {
+        if q.slot == crate::detect::Slot::Login {
+            panic!("the env files have the login");
+        }
+        asked.replace(Some(q.clone()));
+        let index = q
+            .options
+            .iter()
+            .position(|(value, _)| value == "w4")
+            .unwrap();
+        Ok(Answer::Choice(index))
+    };
+    let (said, progress) = collecting();
+    let config = resolve_for_start(
+        &ns.fx.paths,
+        &ns.fx.config,
+        &ns.name,
+        Mode::Namespaced,
+        &ask,
+        &progress,
+    )
+    .unwrap();
+    let question = asked.into_inner().expect("asked");
+    assert_eq!(question.slot, crate::detect::Slot::FreeSlot);
+    assert_eq!(question.options.len(), 14, "the running one is not offered");
+    assert!(question.options.iter().all(|(value, _)| value != "w7"));
+    assert!(
+        question
+            .options
+            .iter()
+            .any(|(value, why)| value == "w4" && why.starts_with("slot 4, last ran 4 h ago")),
+        "{:?}",
+        question.options
+    );
+    assert!(
+        question.details.iter().any(|d| d.contains("w7")),
+        "{:?}",
+        question.details
+    );
+    assert_eq!(
+        question.preselect, None,
+        "nothing is taken on anyone's behalf"
+    );
+    assert!(recommended(&question).is_none());
+    assert_eq!(
+        std::fs::read_to_string(redis.join("flushed")).unwrap(),
+        "4\n"
+    );
+    assert!(
+        ns.fx.state().worktrees["w4"].namespaces.is_empty(),
+        "released"
+    );
+    assert!(
+        said.borrow()
+            .iter()
+            .any(|l| l.contains("slot 4 emptied and freed")),
+        "{:?}",
+        said.borrow()
+    );
+
+    let report = super::start(
+        &ns.fx.paths,
+        &config,
+        &ns.name,
+        None,
+        Mode::Namespaced,
+        &noop,
+    )
+    .unwrap();
+    let _guard = guard(&report);
+    assert_eq!(ns.env_line("REDIS_DB").as_deref(), Some("4"));
+}
+
+#[test]
+fn every_slot_held_by_a_running_worktree_stops_the_start_naming_them() {
+    let (ns, redis) = slots_fixture(MAIN_ENV_WITH_REDIS);
+    hold(&ns, (1..=15).map(|n| (n, true)));
+    let ask = |q: &Question| -> Result<Answer> { panic!("asked {:?}", q.slot) };
+    let e = format!(
+        "{:#}",
+        resolve_for_start(
+            &ns.fx.paths,
+            &ns.fx.config,
+            &ns.name,
+            Mode::Namespaced,
+            &ask,
+            &noop
+        )
+        .unwrap_err()
+    );
+    assert!(e.contains("held by a running worktree"), "{e}");
+    assert!(e.contains("w15 (slot 15, running)"), "{e}");
+    assert!(!redis.join("flushed").exists());
+}
+
+#[test]
+fn freeing_no_slot_starts_nothing_and_empties_nothing() {
+    let (ns, redis) = slots_fixture(MAIN_ENV_WITH_REDIS);
+    hold(&ns, (1..=15).map(|n| (n, false)));
+    let ask = |q: &Question| -> Result<Answer> {
+        assert_eq!(q.slot, crate::detect::Slot::FreeSlot);
+        assert!(q.allow_none && !q.allow_custom);
+        Ok(Answer::None)
+    };
+    let e = format!(
+        "{:#}",
+        resolve_for_start(
+            &ns.fx.paths,
+            &ns.fx.config,
+            &ns.name,
+            Mode::Namespaced,
+            &ask,
+            &noop
+        )
+        .unwrap_err()
+    );
+    assert!(e.contains("no slot was freed"), "{e}");
+    assert!(!redis.join("flushed").exists());
+    assert_eq!(ns.fake("created"), "", "nothing was made either");
+}
+
+// The guard stands behind the question: a holder whose record claims the
+// main checkout's own slot is never emptied, whatever was answered.
+#[test]
+fn freeing_a_slot_goes_through_the_guard() {
+    let (ns, redis) = slots_fixture(
+        "DATABASE_PORT=3306\nDATABASE_NAME=shop\nDATABASE_USER=app\nREDIS_PORT=6379\nREDIS_DB=5\n",
+    );
+    let mut store = ns.fx.state();
+    for n in (1..=15).filter(|n| *n != 5) {
+        store
+            .worktrees
+            .insert(format!("w{n}"), slot_holder(n, false, 1));
+    }
+    // w1's record claims slot 1 but names 1 as main: the guard refuses it.
+    store.worktrees.get_mut("w1").unwrap().namespaces[0].main = "1".into();
+    state::save(&ns.fx.paths.state_file(), &store).unwrap();
+    let ask = |q: &Question| -> Result<Answer> {
+        let index = q
+            .options
+            .iter()
+            .position(|(value, _)| value == "w1")
+            .unwrap();
+        Ok(Answer::Choice(index))
+    };
+    let e = format!(
+        "{:#}",
+        resolve_for_start(
+            &ns.fx.paths,
+            &ns.fx.config,
+            &ns.name,
+            Mode::Namespaced,
+            &ask,
+            &noop
+        )
+        .unwrap_err()
+    );
+    assert!(e.contains("main checkout's own slot"), "{e}");
+    assert!(!redis.join("flushed").exists());
+    assert_eq!(
+        ns.fx.state().worktrees["w1"].namespaces.len(),
+        1,
+        "still recorded"
+    );
+}

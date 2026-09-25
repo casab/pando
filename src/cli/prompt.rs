@@ -156,6 +156,7 @@ fn none_label(slot: crate::detect::Slot) -> &'static str {
         crate::detect::Slot::SchemaHook => {
             "no — do not run a schema step (written as on = \"never\")"
         }
+        crate::detect::Slot::FreeSlot => "none — free nothing, and start nothing",
         _ => "none — this process has no port",
     }
 }

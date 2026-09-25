@@ -463,6 +463,15 @@ fn render_question(needs: &actions::NeedsAnswer) -> String {
             i + 1
         ));
     }
+    // Nothing to write down: the answer empties a slot, and only a person
+    // may choose whose.
+    if needs.question.slot == crate::detect::Slot::FreeSlot {
+        out.push_str(
+            "pando: on a terminal pando asks which one to free; from a script, `pando rm` of a \
+             worktree you no longer need frees its slot with it\n",
+        );
+        return out;
+    }
     let file = answer_file(&needs.question);
     if needs.question.multi {
         out.push_str(&format!(

@@ -364,6 +364,8 @@ pub(super) fn slot_value(config: &Config, slot: Slot) -> Option<String> {
                 true => "none".to_string(),
                 false => paths.join(", "),
             }),
+        // Nothing config holds.
+        Slot::FreeSlot => None,
         // Which services have one, and never what it is.
         Slot::Login => (!config.namespaced.is_empty()).then(|| {
             let services: Vec<&str> = config.namespaced.keys().map(String::as_str).collect();

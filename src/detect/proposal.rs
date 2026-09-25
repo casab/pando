@@ -15,8 +15,9 @@ use super::services::{MachineEvidence, ServiceSource, schema_hook_proposal, serv
 use super::signals::Signals;
 use super::workspaces::processes_proposal;
 
-/// A config slot detection has something to say about — or, for
-/// [`Slot::Login`], one a namespaced start asks about on its own.
+/// A config slot detection has something to say about — or one of the two
+/// questions a namespaced start asks on its own, [`Slot::Login`] and
+/// [`Slot::FreeSlot`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Slot {
@@ -47,6 +48,10 @@ pub enum Slot {
     /// first time it needs one, and a project that never starts namespaced
     /// is never asked for a password.
     Login,
+    /// Which stopped worktree gives up its numbered slot, when every slot
+    /// a server has is held. Its answer empties that slot rather than
+    /// writing config, so it is never taken on anyone's behalf.
+    FreeSlot,
 }
 
 impl Slot {
@@ -80,6 +85,12 @@ impl Slot {
     /// terminal, shown as dots in the TUI, and never printed back.
     pub fn is_secret(self) -> bool {
         self == Slot::Login
+    }
+
+    /// Whether only a person may answer: an answer that destroys data is
+    /// never pando's first choice taken for somebody, nor `--yes`'s.
+    pub fn takes_a_person(self) -> bool {
+        self == Slot::FreeSlot
     }
 
     /// Whether this slot's single answer is a *list* written as one
@@ -129,8 +140,11 @@ impl Slot {
             Slot::DevCmd => (&["dev"], "cmd"),
             Slot::PortEnv => (&["dev"], "ports"),
             Slot::Provision => (&["project"], "provision"),
-            // One table per service, which only the question knows.
-            Slot::Processes | Slot::Services | Slot::SchemaHook | Slot::Login => return None,
+            // One table per service, which only the question knows — or,
+            // for a slot to free, nothing written at all.
+            Slot::Processes | Slot::Services | Slot::SchemaHook | Slot::Login | Slot::FreeSlot => {
+                return None;
+            }
         })
     }
 
@@ -164,6 +178,7 @@ impl Slot {
             Slot::SchemaHook => "Which command brings a fresh database up to the schema?",
             Slot::Provision => "Which local files should each worktree get a copy of?",
             Slot::Login => "Which login may create and drop this worktree's own databases?",
+            Slot::FreeSlot => "Which stopped worktree gives up its slot?",
         }
     }
 }

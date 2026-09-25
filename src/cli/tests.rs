@@ -3094,3 +3094,37 @@ fn an_answers_file_cannot_answer_the_login_a_namespaced_start_asks_for() {
     assert!(e.contains("not a question pando asks"), "{e}");
     assert!(!e.contains("hunter2"), "{e}");
 }
+
+// A slot to free has nothing to write down and nothing `--yes` may take:
+// a script is told how a person answers it, and what it can do instead.
+#[test]
+fn the_slot_question_at_exit_3_says_how_it_is_answered_and_offers_no_flag() {
+    let question = actions::Question {
+        slot: crate::detect::Slot::FreeSlot,
+        prompt: "Every slot of redis on 127.0.0.1:6379 is held. Which stopped worktree gives up \
+                 its slot?"
+            .into(),
+        options: vec![("feat+old".into(), "slot 3, last ran 4 days ago".into())],
+        preselect: None,
+        allow_custom: false,
+        allow_none: true,
+        multi: false,
+        checked: Vec::new(),
+        details: vec!["the one chosen has its slot emptied".into()],
+        answer_file: None,
+        snippet: String::new(),
+    };
+    assert!(actions::recommended(&question).is_none());
+    let text = render_needs_answer(&actions::NeedsAnswer {
+        question: question.clone(),
+    });
+    for wanted in ["feat+old", "slot 3, last ran 4 days ago", "pando rm"] {
+        assert!(text.contains(wanted), "{wanted}: {text}");
+    }
+    for unwanted in ["--yes", "init --answers", "pando.toml"] {
+        assert!(!text.contains(unwanted), "{unwanted}: {text}");
+    }
+    let (answer, printed) = answer_with(&question, &["n"]);
+    assert_eq!(answer.unwrap(), actions::Answer::None);
+    assert!(printed.contains("free nothing"), "{printed}");
+}

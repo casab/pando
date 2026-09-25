@@ -265,7 +265,7 @@ fn target(
         NamespaceKind::Database => database_main(root, &keys, &urls)
             .ok_or("nothing in the main checkout's env files names its database")?,
         NamespaceKind::Slot => {
-            return Err("pando does not give a worktree a slot of its own in it yet".to_string());
+            slot_main(root, &keys, &urls).ok_or("the app reads no slot setting")?
         }
     };
     Ok(Target {
@@ -278,6 +278,35 @@ fn target(
         main,
         tells,
     })
+}
+
+/// The main checkout's own slot, and every key that says which one the app
+/// uses: the path of each URL — none is slot 0 — and a key of its own
+/// beside the address, `REDIS_DB` next to `REDIS_PORT`. An app that reads
+/// neither has nowhere to be told another slot, and stays shared.
+fn slot_main(
+    root: &std::path::Path,
+    keys: &[String],
+    urls: &[&(String, String)],
+) -> Option<(String, Vec<Tell>)> {
+    let mut main: Option<String> = None;
+    let mut tells: Vec<Tell> = Vec::new();
+    for (key, url) in urls {
+        let (_, path) = crate::services::url_identity(url);
+        let slot = path.unwrap_or_else(|| "0".to_string());
+        if slot.chars().all(|c| c.is_ascii_digit()) {
+            main.get_or_insert(slot);
+            tells.push(Tell::UrlPath(key.clone()));
+        }
+    }
+    if let Some((key, value)) =
+        crate::services::sibling_value(root, keys.iter().map(String::as_str), &["_DB"])
+        && value.chars().all(|c| c.is_ascii_digit())
+    {
+        main.get_or_insert(value);
+        tells.push(Tell::Key(key));
+    }
+    Some((main?, tells))
 }
 
 /// The main checkout's own database, and every key that says which one
@@ -364,12 +393,11 @@ pub(super) fn prepare(
     for (target, server) in &servers {
         let (namespace, made) = match target.namespace.kind {
             NamespaceKind::Database => ensure_database(paths, name, target, server, progress)?,
-            NamespaceKind::Slot => bail!(
-                "pando does not give a worktree a slot of its own in {} yet",
-                target.service
-            ),
+            NamespaceKind::Slot => ensure_slot(paths, name, target, server)?,
         };
-        fresh |= made;
+        // A slot given out is empty and needs no schema; only a database
+        // made just now does.
+        fresh |= made && namespace.kind == NamespaceKind::Database;
         progress(&format!(
             "{}: {}{}",
             target.service,
@@ -550,6 +578,292 @@ fn ensure_database(
         server.address(),
         names.join(" and ")
     )
+}
+
+/// This worktree's slot on one server: the one state records, else the
+/// first one no worktree holds and the server says is empty.
+///
+/// Empty, not merely unrecorded: a slot with keys in it that no worktree
+/// of this project holds is somebody else's — another project's, or the
+/// developer's own — and emptying it later would destroy their data. When
+/// every slot is held the start stops and says by whom; a start that can
+/// ask has already been asked which one to free.
+fn ensure_slot(
+    paths: &PandoPaths,
+    name: &str,
+    target: &Target,
+    server: &namespace::Server<'_>,
+) -> Result<(crate::state::NamespaceRecord, bool)> {
+    let slot = |n: &str| crate::state::NamespaceRecord {
+        service: target.service.clone(),
+        recipe: target.recipe.clone(),
+        kind: NamespaceKind::Slot,
+        host: target.host.clone(),
+        port: target.port,
+        name: n.to_string(),
+        main: target.main.clone(),
+        used_at: chrono::Utc::now(),
+    };
+    let store = crate::state::load(&paths.state_file())?;
+    if let Some(recorded) = store.worktrees.get(name).and_then(|record| {
+        record.namespaces.iter().find(|ns| {
+            ns.service == target.service && namespace::same_namespace(ns, &slot(&ns.name))
+        })
+    }) {
+        return Ok((record(paths, name, slot(&recorded.name))?, false));
+    }
+    let holders = slot_holders(&store, target);
+    let mut full: Vec<u32> = Vec::new();
+    for n in allocatable(target) {
+        if holders.iter().any(|holder| holder.slot == n) {
+            continue;
+        }
+        if server.size(n)? > 0 {
+            full.push(n);
+            continue;
+        }
+        return Ok((record(paths, name, slot(&n.to_string()))?, true));
+    }
+    if full.is_empty() {
+        bail!(
+            "every slot of {} on {} that pando gives out is held — {}. `pando start` on a \
+             terminal asks which stopped one to free; `pando rm` of one you no longer need frees \
+             its slot with it",
+            target.service,
+            server.address(),
+            holders
+                .iter()
+                .map(Holder::describe)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    bail!(
+        "no slot of {} on {} is free: {} hold keys no worktree of this project put there, and \
+         pando never takes a slot somebody else is using",
+        target.service,
+        server.address(),
+        full.iter()
+            .map(|n| format!("slot {n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// The slots pando may give a worktree on a target's server: every one it
+/// has but 0 — where an app that names no slot keeps its keys — and the
+/// main checkout's own.
+fn allocatable(target: &Target) -> Vec<u32> {
+    let slots = target.namespace.slots.unwrap_or(0);
+    let main = target.main.parse::<u32>().ok();
+    (1..slots).filter(|n| Some(*n) != main).collect()
+}
+
+/// A worktree holding a slot on a target's server.
+#[derive(Debug, Clone)]
+struct Holder {
+    worktree: String,
+    slot: u32,
+    namespace: crate::state::NamespaceRecord,
+    running: bool,
+}
+
+impl Holder {
+    /// `feat+x (slot 3, running)`.
+    fn describe(&self) -> String {
+        format!(
+            "{} (slot {}, {})",
+            self.worktree,
+            self.slot,
+            match self.running {
+                true => "running".to_string(),
+                false => format!("last ran {}", since(self.namespace.used_at)),
+            }
+        )
+    }
+}
+
+/// Every worktree holding a slot on this target's server, as state says.
+fn slot_holders(store: &crate::state::State, target: &Target) -> Vec<Holder> {
+    let mut out = Vec::new();
+    for (worktree, record) in &store.worktrees {
+        let running = record.processes.values().any(|p| {
+            !matches!(p.phase, crate::state::Phase::Failed { .. })
+                && crate::process::is_alive(p.pid)
+        });
+        for ns in &record.namespaces {
+            let here = crate::state::NamespaceRecord {
+                host: target.host.clone(),
+                port: target.port,
+                kind: NamespaceKind::Slot,
+                ..ns.clone()
+            };
+            if !namespace::same_namespace(ns, &here) {
+                continue;
+            }
+            if let Ok(slot) = ns.name.parse::<u32>() {
+                out.push(Holder {
+                    worktree: worktree.clone(),
+                    slot,
+                    namespace: ns.clone(),
+                    running,
+                });
+            }
+        }
+    }
+    out.sort_by_key(|holder| holder.slot);
+    out
+}
+
+/// `3 days ago`, `just now` — when a stopped worktree last ran, for a
+/// choice about whose data to empty.
+fn since(at: chrono::DateTime<chrono::Utc>) -> String {
+    let ago = chrono::Utc::now() - at;
+    match ago.num_minutes() {
+        m if m < 1 => "just now".to_string(),
+        m if m < 60 => format!("{m} min ago"),
+        m if m < 60 * 24 => format!("{} h ago", m / 60),
+        m => format!("{} days ago", m / (60 * 24)),
+    }
+}
+
+/// Decision 9: when every slot a target's server has is held and this
+/// worktree has none, asks which stopped worktree gives its slot up — and
+/// empties and frees the one chosen, through the guard, before anything
+/// else of this start happens.
+///
+/// A running worktree is never offered: its app is using the slot. When
+/// every holder is running, the start stops naming them. A script gets
+/// exit 3 with the list, as for any question.
+pub(super) fn free_slots_if_full(
+    paths: &PandoPaths,
+    config: &Config,
+    name: &str,
+    ask: Ask<'_>,
+    progress: &dyn Fn(&str),
+) -> Result<()> {
+    for target in plan(paths, config).targets {
+        if target.namespace.kind != NamespaceKind::Slot {
+            continue;
+        }
+        let store = crate::state::load(&paths.state_file())?;
+        let holders = slot_holders(&store, &target);
+        if holders.iter().any(|holder| holder.worktree == name) {
+            continue;
+        }
+        let taken = allocatable(&target)
+            .iter()
+            .all(|n| holders.iter().any(|holder| holder.slot == *n));
+        if !taken {
+            continue;
+        }
+        let stopped: Vec<&Holder> = holders.iter().filter(|holder| !holder.running).collect();
+        let running: Vec<String> = holders
+            .iter()
+            .filter(|holder| holder.running)
+            .map(Holder::describe)
+            .collect();
+        if stopped.is_empty() {
+            bail!(
+                "every slot of {} on {}:{} is held by a running worktree — {}. Stop one, and its \
+                 slot can be freed",
+                target.service,
+                target.host,
+                target.port,
+                running.join(", ")
+            );
+        }
+        let question = Question {
+            slot: Slot::FreeSlot,
+            prompt: format!(
+                "Every slot of {} on {}:{} is held. Which stopped worktree gives up its slot?",
+                target.service, target.host, target.port
+            ),
+            options: stopped
+                .iter()
+                .map(|holder| {
+                    (
+                        holder.worktree.clone(),
+                        format!(
+                            "slot {}, last ran {}",
+                            holder.slot,
+                            since(holder.namespace.used_at)
+                        ),
+                    )
+                })
+                .collect(),
+            preselect: None,
+            allow_custom: false,
+            allow_none: true,
+            multi: false,
+            checked: Vec::new(),
+            details: std::iter::once(
+                "the one chosen has its slot emptied — every key in it deleted — and gets a new, \
+                 empty one the next time it starts"
+                    .to_string(),
+            )
+            .chain(
+                (!running.is_empty())
+                    .then(|| format!("running, so not offered: {}", running.join(", "))),
+            )
+            .collect(),
+            answer_file: None,
+            snippet: String::new(),
+        };
+        let (answer, _) = answered_by(ask(&question)?);
+        let chosen = match answer {
+            Answer::Choice(index) => stopped
+                .get(index)
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("option {index} is not on offer"))?,
+            Answer::None => bail!("no slot was freed, so nothing was started"),
+            _ => bail!("the slot to free is chosen from the list, not typed"),
+        };
+        free_slot(paths, config, &target, chosen, progress)?;
+    }
+    Ok(())
+}
+
+/// Empties and releases one worktree's slot: checked against state again
+/// under the lock — still recorded, still stopped — then through
+/// [`namespace::may_drop`], then emptied, then forgotten.
+fn free_slot(
+    paths: &PandoPaths,
+    config: &Config,
+    target: &Target,
+    holder: &Holder,
+    progress: &dyn Fn(&str),
+) -> Result<()> {
+    let server = server_for(paths, config, target)?;
+    let _lock = crate::state::lock(&paths.lock_file())?;
+    let mut store = crate::state::load(&paths.state_file())?;
+    let still = slot_holders(&store, target)
+        .into_iter()
+        .find(|h| h.worktree == holder.worktree && h.slot == holder.slot);
+    match still {
+        Some(h) if !h.running => {}
+        Some(_) => bail!(
+            "{} started again while this start was asking, so its slot was not freed",
+            holder.worktree
+        ),
+        None => bail!("{} no longer holds slot {}", holder.worktree, holder.slot),
+    }
+    namespace::may_drop(
+        &store,
+        &holder.worktree,
+        &holder.namespace,
+        Some(&target.main),
+    )?;
+    server.drop(&holder.namespace.name, &target.main)?;
+    if let Some(record) = store.worktrees.get_mut(&holder.worktree) {
+        record.namespaces.retain(|ns| ns != &holder.namespace);
+    }
+    crate::state::save(&paths.state_file(), &store)?;
+    progress(&format!(
+        "{}: slot {} emptied and freed — {} gets a new, empty one when it next starts",
+        target.service, holder.slot, holder.worktree
+    ));
+    Ok(())
 }
 
 /// Writes a namespace into this worktree's record — the moment after the
