@@ -12,7 +12,7 @@ use super::report::{Finding, Section};
 
 pub(super) fn validate_config(paths: &PandoPaths, config: &Config, findings: &mut Vec<Finding>) {
     check_provision(paths, config, findings);
-    check_install(config, findings);
+    check_install(paths.root(), config, findings);
     check_templates(config, findings);
     check_something_to_run(paths, config, findings);
 }
@@ -95,7 +95,7 @@ fn check_provision(paths: &PandoPaths, config: &Config, findings: &mut Vec<Findi
     }
 }
 
-fn check_install(config: &Config, findings: &mut Vec<Finding>) {
+fn check_install(root: &Path, config: &Config, findings: &mut Vec<Finding>) {
     let Some(install) = config.project.install.as_deref() else {
         return;
     };
@@ -109,12 +109,26 @@ fn check_install(config: &Config, findings: &mut Vec<Finding>) {
         let Some(program) = program else { continue };
         let index = words.iter().position(|w| w == program).unwrap_or(0);
         let sub = words.get(index + 1).copied().unwrap_or("");
-        let Some(shape) = package_managers::for_program(program)
-            .and_then(|manager| manager.install_shape)
+        let Some(manager) = package_managers::for_program(program) else {
+            continue;
+        };
+        let Some(shape) = manager
+            .install_shape
             .filter(|shape| shape.verbs.contains(&sub))
         else {
             continue;
         };
+        // The plain install pando proposes itself where the lockfile is
+        // gitignored: the file it rewrites is one git ignores, so it
+        // cannot change the repository.
+        if manager.unlocked_install == Some(step.trim())
+            && manager
+                .lockfiles
+                .first()
+                .is_some_and(|lockfile| crate::detect::is_gitignored(root, lockfile))
+        {
+            continue;
+        }
         let frozen = shape.suggest;
         if shape
             .frozen_markers

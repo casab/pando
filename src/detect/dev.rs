@@ -2,6 +2,7 @@
 //! command, make targets, ports, and the files each worktree needs.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use crate::catalog::frameworks::{FrameworkRule, PortMechanism};
 use crate::catalog::package_managers::{self, Ecosystem};
@@ -13,22 +14,58 @@ use super::signals::Signals;
 
 /// Lockfile to frozen install command.
 ///
-pub(super) fn install_proposal(signals: &Signals) -> Option<Proposal> {
-    let candidates: Vec<Candidate> = signals
-        .lockfiles
-        .iter()
-        .filter_map(|lock| package_managers::install_for(lock))
-        .map(|(cmd, why)| Candidate {
-            value: cmd.to_string(),
-            why: why.to_string(),
-            ..Candidate::default()
-        })
-        .collect();
+/// A lockfile the project gitignores is not frozen against anything: a new
+/// worktree is checked out without it, so the frozen install fails there.
+/// Such a project, and a JavaScript one with no lockfile whose lockfile
+/// name is gitignored, gets its manager's plain install instead — the file
+/// it writes is one git ignores, so it cannot change the repository.
+pub(super) fn install_proposal(root: &Path, signals: &Signals) -> Option<Proposal> {
+    let mut candidates: Vec<Candidate> = Vec::new();
+    for lock in &signals.lockfiles {
+        let Some((cmd, why)) = package_managers::install_for(lock) else {
+            continue;
+        };
+        let candidate = match unlocked_install(root, package_managers::for_lockfile(lock)) {
+            Some(unlocked) => unlocked,
+            None => Candidate {
+                value: cmd.to_string(),
+                why: why.to_string(),
+                ..Candidate::default()
+            },
+        };
+        candidates.push(candidate);
+    }
+    if signals.lockfiles.is_empty() && root.join("package.json").is_file() {
+        let manifest = std::fs::read_to_string(root.join("package.json")).unwrap_or_default();
+        candidates.extend(unlocked_install(
+            root,
+            Some(package_managers::declared_javascript(&manifest)),
+        ));
+    }
+    dedup_by_value(&mut candidates);
     if candidates.is_empty() {
         return None;
     }
     let decided = candidates.len() == 1;
     Some(Proposal::of(Slot::Install, candidates, decided))
+}
+
+/// The plain install of `manager`, when its lockfile is gitignored.
+fn unlocked_install(
+    root: &Path,
+    manager: Option<&'static package_managers::PackageManager>,
+) -> Option<Candidate> {
+    let manager = manager?;
+    let cmd = manager.unlocked_install?;
+    let lockfile = manager.lockfiles.first()?;
+    if !super::signals::is_gitignored(root, lockfile) {
+        return None;
+    }
+    Some(Candidate {
+        value: cmd.to_string(),
+        why: format!("{lockfile} is gitignored, so {cmd} cannot change the repository"),
+        ..Candidate::default()
+    })
 }
 
 pub(super) fn version_files_proposal(signals: &Signals) -> Option<Proposal> {

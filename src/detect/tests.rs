@@ -656,7 +656,7 @@ fn a_build_that_resolves_its_own_modules_gets_no_install_step() {
         lockfiles: vec!["go.sum".to_string()],
         ..Default::default()
     };
-    assert!(install_proposal(&signals).is_none());
+    assert!(install_proposal(tempdir().unwrap().path(), &signals).is_none());
 }
 
 #[test]
@@ -668,12 +668,54 @@ fn two_lockfiles_are_a_question() {
         ],
         ..Default::default()
     };
-    let proposal = install_proposal(&signals).unwrap();
+    let proposal = install_proposal(tempdir().unwrap().path(), &signals).unwrap();
     assert_eq!(
         values(&proposal),
         vec!["pnpm install --frozen-lockfile", "npm ci"]
     );
     assert!(!proposal.decided, "pando does not guess which one is live");
+}
+
+// A project that gitignores its lockfile: `npm ci` has nothing to be
+// frozen against in a new worktree, and the lockfile `npm install` writes
+// is one git ignores.
+#[test]
+fn a_gitignored_lockfile_gets_the_plain_install() {
+    let dir = seed_fixture(&[
+        ("package.json", r#"{ "scripts": { "dev": "vite" } }"#),
+        (".gitignore", "package-lock.json\n"),
+    ]);
+    let proposal = install_proposal(dir.path(), &signals(dir.path())).unwrap();
+    assert_eq!(values(&proposal), vec!["npm install"]);
+    assert!(proposal.decided);
+    assert!(
+        proposal.candidates[0]
+            .why
+            .contains("package-lock.json is gitignored")
+    );
+
+    // Present and ignored is the same: a worktree is checked out without it.
+    std::fs::write(dir.path().join("package-lock.json"), "{}").unwrap();
+    let proposal = install_proposal(dir.path(), &signals(dir.path())).unwrap();
+    assert_eq!(values(&proposal), vec!["npm install"]);
+}
+
+#[test]
+fn the_declared_package_manager_installs_a_project_with_no_lockfile() {
+    let dir = seed_fixture(&[
+        ("package.json", r#"{ "packageManager": "pnpm@9.1.0" }"#),
+        (".gitignore", "pnpm-lock.yaml\n"),
+    ]);
+    let proposal = install_proposal(dir.path(), &signals(dir.path())).unwrap();
+    assert_eq!(values(&proposal), vec!["pnpm install"]);
+}
+
+// Not ignored, the plain install would leave a lockfile in `git status`:
+// still nothing is proposed.
+#[test]
+fn no_lockfile_and_none_ignored_is_still_no_install() {
+    let dir = seed_fixture(&[("package.json", r#"{ "scripts": { "dev": "vite" } }"#)]);
+    assert!(install_proposal(dir.path(), &signals(dir.path())).is_none());
 }
 
 // ---- workspaces ------------------------------------------------------

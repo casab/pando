@@ -88,7 +88,10 @@ the slot is closed.
 `null` is not "this slot is closed". It is "the rules found nothing", and a
 project with no lockfile is the plain case: `"install": {"proposal": null}`,
 because pando will not propose an install that can rewrite a lockfile and
-there is no frozen one to propose. Whether anything should go there is then
+there is no frozen one to propose. (One exception is pando's, not yours:
+when the project *gitignores* its lockfile, pando proposes the plain
+install itself — `npm install` — because the file it writes is one git
+ignores, and says so in the `why`.) Whether anything should go there is then
 a question about the project that only its developer — or a program reading
 their README — can answer. `{"install": "make deps"}` is a legitimate
 answer. `{"install": "npm install"}` is not, and no absence of a rule makes
@@ -134,7 +137,7 @@ Four more facts that are not visible in the shape:
 
 | Question | Who | Notes |
 |---|---|---|
-| `install` | rules, then you | a frozen install, or silence where no lockfile exists — and silence is a slot you may fill from what the project's own docs say. Never a non-frozen one |
+| `install` | rules, then you | a frozen install; the plain one where the project gitignores its lockfile; or silence — and silence is a slot you may fill from what the project's own docs say. Never a non-frozen one of your own |
 | `version_files` | rules | which file pins the runtime |
 | `prelude` | machine → human | only when the machine does not resolve the pin. `doctor` gives the exact line; the human decides whether to run it |
 | `processes` | **human** | one process, or one per app of a workspace |
@@ -397,7 +400,8 @@ Absolute. None of these has an exception worth taking.
   This one is a rule about *you*, not a promise about pando: pando will
   honour a line a developer wrote there, and it should — but a line you
   wrote has no developer behind it. No lockfile means no *frozen* install
-  exists, so pando proposes none; if the project installs by a step of its
+  exists, so pando proposes none — unless the lockfile is gitignored, where
+  pando proposes the plain install itself and you take its proposal; if the project installs by a step of its
   own that you have actually read, naming that step is an answer. Guessing
   one, or reaching for the non-frozen form because the slot looked empty,
   is not.
@@ -449,7 +453,7 @@ something the rules did. Do not.
 ## B. A workspace monorepo with several apps
 
 Several apps under `apps/`, workspaces declared in `package.json`, and —
-in this shape — no lockfile at all:
+in this shape — no lockfile at all, and no lockfile name in `.gitignore`:
 
 ```
 install     proposal null                        ← no lockfile, so no frozen install exists

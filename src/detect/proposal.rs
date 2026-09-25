@@ -325,7 +325,7 @@ pub fn propose_with(
 ) -> Vec<Proposal> {
     let rule = framework(root, signals);
     [
-        install_proposal(signals),
+        install_proposal(root, signals),
         version_files_proposal(signals),
         // Before the single-process slots: it decides whether there is one
         // process or several, and the slots below only fill a single one.

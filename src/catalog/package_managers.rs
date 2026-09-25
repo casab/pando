@@ -64,6 +64,13 @@ pub struct PackageManager {
     /// forbids.
     pub install: Option<FrozenInstall>,
     pub install_shape: Option<InstallShape>,
+    /// The install for a project that keeps no lockfile in git: proposed
+    /// only when this manager's lockfile is gitignored, because then the
+    /// lockfile it writes cannot change the repository, and a frozen
+    /// install has nothing in a new worktree to be frozen against.
+    /// `None` where no such form is proposed: outside JavaScript, a
+    /// project without a lockfile configures its own install.
+    pub unlocked_install: Option<&'static str>,
 }
 
 /// Every manager pando knows, in detection order. Order is a contract: it
@@ -86,6 +93,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
             frozen_markers: &["--frozen-lockfile"],
             suggest: "pnpm install --frozen-lockfile",
         }),
+        unlocked_install: Some("pnpm install"),
     },
     PackageManager {
         program: "npm",
@@ -102,6 +110,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
             frozen_markers: &[],
             suggest: "npm ci",
         }),
+        unlocked_install: Some("npm install"),
     },
     PackageManager {
         program: "yarn",
@@ -122,6 +131,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
             frozen_markers: &["--immutable", "--frozen-lockfile"],
             suggest: "yarn install --frozen-lockfile",
         }),
+        unlocked_install: Some("yarn install"),
     },
     PackageManager {
         program: "bun",
@@ -138,6 +148,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
             frozen_markers: &["--frozen-lockfile"],
             suggest: "bun install --frozen-lockfile",
         }),
+        unlocked_install: Some("bun install"),
     },
     PackageManager {
         program: "uv",
@@ -154,6 +165,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
             frozen_markers: &["--frozen", "--locked"],
             suggest: "uv sync --frozen",
         }),
+        unlocked_install: None,
     },
     PackageManager {
         program: "poetry",
@@ -169,6 +181,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
             why: None,
         }),
         install_shape: None,
+        unlocked_install: None,
     },
     PackageManager {
         program: "pipenv",
@@ -187,6 +200,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
             frozen_markers: &["--deploy", "--ignore-pipfile"],
             suggest: "pipenv sync",
         }),
+        unlocked_install: None,
     },
     PackageManager {
         program: "bundle",
@@ -205,6 +219,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
             frozen_markers: &["BUNDLE_FROZEN", "--deployment", "--frozen"],
             suggest: "BUNDLE_FROZEN=true bundle install",
         }),
+        unlocked_install: None,
     },
     PackageManager {
         program: "composer",
@@ -223,6 +238,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
             frozen_markers: &[],
             suggest: "composer install",
         }),
+        unlocked_install: None,
     },
     PackageManager {
         program: "mix",
@@ -236,6 +252,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         // its own install command.
         install: None,
         install_shape: None,
+        unlocked_install: None,
     },
     PackageManager {
         program: "go",
@@ -247,6 +264,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         // for it is noise.
         install: None,
         install_shape: None,
+        unlocked_install: None,
     },
     PackageManager {
         program: "cargo",
@@ -262,6 +280,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
             frozen_markers: &["--locked"],
             suggest: "cargo fetch --locked",
         }),
+        unlocked_install: None,
     },
 ];
 
@@ -296,6 +315,20 @@ pub fn install_for(lockfile: &str) -> Option<(&'static str, &'static str)> {
     // spelling of it rather than the caller's.
     let own = manager.lockfiles.iter().find(|l| **l == lockfile)?;
     Some((install.cmd, install.why.unwrap_or(own)))
+}
+
+/// The manager a JavaScript project names in `package.json`'s
+/// `packageManager` field (`"pnpm@9.1.0"`), else npm's, which is what
+/// runs a `package.json` that names none.
+pub fn declared_javascript(manifest: &str) -> &'static PackageManager {
+    let declared = serde_json::from_str::<serde_json::Value>(manifest)
+        .ok()
+        .and_then(|json| json.get("packageManager")?.as_str().map(str::to_string))
+        .and_then(|spec| {
+            let program = spec.split('@').next()?.trim().to_string();
+            for_program(&program).filter(|m| m.ecosystem == Ecosystem::JavaScript)
+        });
+    declared.unwrap_or_else(|| for_program("npm").expect("npm is a row"))
 }
 
 /// The run prefix of the first present lockfile whose manager belongs to

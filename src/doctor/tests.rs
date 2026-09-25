@@ -561,6 +561,24 @@ fn an_install_command_that_can_rewrite_a_lockfile_is_a_problem() {
     }
 }
 
+// The install pando proposes for a project that gitignores its lockfile
+// is not a problem there — and still is where the lockfile is tracked.
+#[test]
+fn the_plain_install_is_fine_where_the_lockfile_is_gitignored() {
+    let fx = fixture();
+    std::fs::write(fx.root.join(".gitignore"), "package-lock.json\n").unwrap();
+    write_project_config(&fx, "[project]\ninstall = \"npm install\"\n");
+    let report = report(&fx);
+    assert!(
+        !report
+            .findings
+            .iter()
+            .any(|f| f.message.contains("non-frozen")),
+        "{:?}",
+        report.findings
+    );
+}
+
 #[test]
 fn a_frozen_install_and_a_command_pando_has_no_opinion_about_are_both_fine() {
     for install in [
