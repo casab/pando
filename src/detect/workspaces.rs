@@ -401,12 +401,32 @@ pub(super) fn localhost_url_port(value: &str) -> Option<u16> {
     port.parse().ok()
 }
 
+/// Whether the root `dev` script is the project's own orchestration of its
+/// apps rather than a generic fan-out over them: it has a `predev` step,
+/// which running each app's own script would skip, or it runs a script
+/// file of the project's (`node scripts/dev.mjs`), which is where a
+/// project that wrote one says how its apps are started and told about
+/// each other.
+pub(super) fn root_orchestrates(signals: &Signals) -> bool {
+    let Some(dev) = signals.scripts.get("dev") else {
+        return false;
+    };
+    const SCRIPT_FILES: [&str; 6] = [".js", ".mjs", ".cjs", ".ts", ".mts", ".cts"];
+    let runs_a_file = dev
+        .split(|c: char| c.is_whitespace() || matches!(c, '&' | ';' | '|'))
+        .any(|word| SCRIPT_FILES.iter().any(|ext| word.ends_with(ext)));
+    signals.scripts.contains_key("predev") || runs_a_file
+}
+
 /// The multi-process form, for a workspace whose apps each have a dev
-/// script — and the root script as the one-process fallback beside it.
+/// script — and the root script as the one-process form beside it.
 ///
 /// Always a question: running two servers instead of one changes what
 /// `start`, `stop` and the log tabs do, and that is the developer's call.
-/// `--yes` takes the first option, which is the per-app form.
+/// The first option is what is taken without asking: the per-app form,
+/// unless the root script is the project's own orchestration of its apps
+/// (see [`root_orchestrates`]), which then leads — with the ports the
+/// project's apps read from the env example, so it needs nothing else.
 pub(super) fn processes_proposal(root: &Path, signals: &Signals) -> Option<Proposal> {
     let apps = workspace_apps(root, signals);
     if apps.len() < MIN_WORKSPACE_APPS {
@@ -494,23 +514,54 @@ pub(super) fn processes_proposal(root: &Path, signals: &Signals) -> Option<Propo
         processes: Some(processes),
         ..Candidate::default()
     }];
-    // The fallback: whatever the root script is, as it was before. Written
-    // as `[dev]`, because one process is what that shorthand is for.
-    if let Some(script) = signals.scripts.get("dev") {
-        let _ = script;
+    // The root script, as one process. Written as `[dev]`, because one
+    // process is what that shorthand is for.
+    if signals.scripts.contains_key("dev") {
         let value = format!("{}dev", script_runner(signals));
-        candidates.push(Candidate {
+        let orchestrates = root_orchestrates(signals);
+        // The ports the project's own apps read, `<APP>_PORT` in the env
+        // example, each under its app's role: what the root script's own
+        // orchestration hands on to them.
+        let ports: BTreeMap<String, String> = if orchestrates {
+            apps.iter()
+                .map(|app| (app_port_var(&app.name), app.name.clone()))
+                .filter(|(key, _)| signals.env_keys().any(|k| k == key))
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
+        let mut why = "package.json scripts.dev".to_string();
+        if orchestrates {
+            why.push_str(", which starts the workspace's apps itself");
+        }
+        if !ports.is_empty() {
+            let keys: Vec<&str> = ports.keys().map(String::as_str).collect();
+            why.push_str(&format!("; {} in the env example", keys.join(" and ")));
+        }
+        let root = Candidate {
             value: value.clone(),
-            why: "package.json scripts.dev".to_string(),
+            why,
             processes: Some(BTreeMap::from([(
                 DEV.to_string(),
                 ProcessConfig {
                     cmd: value,
+                    ports: match ports.is_empty() {
+                        true => None,
+                        false => Some(PortsSpec::Map(ports)),
+                    },
                     ..Default::default()
                 },
             )])),
             ..Candidate::default()
-        });
+        };
+        // The project's own way of starting itself leads: what its
+        // `predev` builds and what its script hands each app are what a
+        // per-app split would leave out.
+        if orchestrates {
+            candidates.insert(0, root);
+        } else {
+            candidates.push(root);
+        }
     }
     // Never decided: two processes instead of one is a change of shape,
     // and "ask just in time, once" is exactly what this is for.

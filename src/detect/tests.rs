@@ -676,6 +676,77 @@ fn two_lockfiles_are_a_question() {
     assert!(!proposal.decided, "pando does not guess which one is live");
 }
 
+/// A workspace that starts its own apps: a `predev` step and a script of
+/// its own that hands each app its port, beside a library whose `dev` is
+/// not a server — the shape a hand-grown monorepo has.
+fn orchestrated_workspace(dir: &Path) {
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{ "workspaces": ["apps/api", "apps/web", "packages/sdk"],
+             "scripts": { "predev": "node scripts/vendor.mjs",
+                          "dev": "node scripts/dev.mjs & npm -w apps/web run dev" } }"#,
+    )
+    .unwrap();
+    for (dir_name, dev) in [
+        ("apps/api", "tsx watch src/server.ts"),
+        ("apps/web", "node --watch src/server.js"),
+        ("packages/sdk", "tsx src/cli-dev.ts"),
+    ] {
+        std::fs::create_dir_all(dir.join(dir_name)).unwrap();
+        std::fs::write(
+            dir.join(dir_name).join("package.json"),
+            format!(r#"{{ "scripts": {{ "dev": "{dev}" }} }}"#),
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        dir.join(".env.example"),
+        "PORT=3000\nWEB_PORT=3000\nAPI_PORT=3001\nDATABASE_PORT=3306\n",
+    )
+    .unwrap();
+}
+
+// The project's own `npm run dev` is what runs it: its `predev` builds
+// what the apps serve, and its script is what tells each app the other's
+// port. It leads, carrying the ports its apps read, so taking it settles
+// the port question too — and the library is never started as a server.
+#[test]
+fn a_workspace_that_starts_its_own_apps_is_run_by_its_own_script() {
+    let dir = tempdir().unwrap();
+    orchestrated_workspace(dir.path());
+    let signals = signals(dir.path());
+    assert!(root_orchestrates(&signals));
+    let proposal = processes_proposal(dir.path(), &signals).unwrap();
+    let first = &proposal.candidates[0];
+    assert_eq!(first.value, "npm run dev");
+    assert!(
+        first.why.contains("starts the workspace's apps itself"),
+        "{}",
+        first.why
+    );
+    let dev = &first.processes.as_ref().unwrap()["dev"];
+    assert_eq!(
+        dev.ports,
+        Some(PortsSpec::Map(BTreeMap::from([
+            ("API_PORT".to_string(), "api".to_string()),
+            ("WEB_PORT".to_string(), "web".to_string()),
+        ])))
+    );
+}
+
+// A root script that only fans out over the apps says nothing the apps'
+// own scripts do not: the per-app form still leads.
+#[test]
+fn a_workspace_that_only_fans_out_still_runs_each_app() {
+    let dir = tempdir().unwrap();
+    workspace(dir.path());
+    let signals = signals(dir.path());
+    assert!(!root_orchestrates(&signals));
+    let proposal = processes_proposal(dir.path(), &signals).unwrap();
+    assert_ne!(proposal.candidates[0].value, "pnpm dev");
+    assert_eq!(proposal.candidates.last().unwrap().value, "pnpm dev");
+}
+
 // A project that gitignores its lockfile: `npm ci` has nothing to be
 // frozen against in a new worktree, and the lockfile `npm install` writes
 // is one git ignores.
