@@ -6,7 +6,7 @@
 //! catalog · paths · term · remedy · theme → compose → project · config · ports · process · runtime · state
 //!       · template · recipes
 //!       → detect · hooks · worktree · cache · log_tail · observe · services
-//!         · native · decisions
+//!         · native · namespace · decisions
 //!       → tunnel · share_proxy
 //!       → actions
 //!       → doctor
@@ -50,6 +50,7 @@ pub mod detect;
 pub mod doctor;
 pub mod hooks;
 pub mod log_tail;
+pub mod namespace;
 pub mod native;
 pub mod observe;
 pub mod paths;

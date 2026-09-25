@@ -124,6 +124,13 @@ pub struct WorktreeRecord {
         skip_serializing_if = "Option::is_none"
     )]
     pub mode: Option<ServiceMode>,
+    /// The namespaces pando made for this worktree in the project's own
+    /// servers: a database, a numbered slot. Recorded the moment a server
+    /// made one, and kept through a switch to another mode, so switching
+    /// back finds its data; only `rm` drops them, through
+    /// `namespace::may_drop`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub namespaces: Vec<NamespaceRecord>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub hooks: BTreeMap<String, HookRecord>,
     /// The port this worktree's share proxy listens on, once it has needed
@@ -154,6 +161,7 @@ impl WorktreeRecord {
             observed_ports: Vec::new(),
             services: Vec::new(),
             mode: None,
+            namespaces: Vec::new(),
             hooks: BTreeMap::new(),
             share_port: None,
             share: None,
@@ -289,6 +297,44 @@ pub struct ServiceRecord {
     /// Compose services are addressed by their compose project name instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compose_project: Option<String>,
+}
+
+/// A namespace pando made for one worktree inside a server the main
+/// checkout runs: a database of its own, or a numbered slot of its own.
+///
+/// A record here is pando's word that pando made it. It is written only
+/// once the server has made it for pando — a database that was already
+/// there is never recorded — and it is the only thing `rm` will ever drop.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct NamespaceRecord {
+    /// The `[[services]]` entry it belongs to: `mariadb`, `redis`.
+    pub service: String,
+    /// The recipe that knows how to make and drop it. `rm` never loads
+    /// config, so it finds the commands by this name.
+    pub recipe: String,
+    pub kind: NamespaceKind,
+    /// The server, as the main checkout's env files named it when this was
+    /// made. What `rm` drops it on, even if those files have moved on.
+    pub host: String,
+    pub port: u16,
+    /// The database, or the slot's number, as the server names it.
+    pub name: String,
+    /// The main checkout's own database, or slot, on that server: what the
+    /// name was derived from, and what it must never be.
+    pub main: String,
+    /// When a start of this worktree last used it.
+    pub used_at: DateTime<Utc>,
+}
+
+/// What a namespace is on its server.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum NamespaceKind {
+    /// A database of its own name: `CREATE DATABASE`, `DROP DATABASE`.
+    Database,
+    /// A numbered slot the server always has: allocated, emptied, never
+    /// created. Redis's `SELECT n`.
+    Slot,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -1172,6 +1218,16 @@ mod tests {
             },
         );
         rec.share = Some(share(7000));
+        rec.namespaces = vec![NamespaceRecord {
+            service: "mariadb".into(),
+            recipe: "mariadb".into(),
+            kind: NamespaceKind::Database,
+            host: "localhost".into(),
+            port: 3306,
+            name: "shop__feat_x".into(),
+            main: "shop".into(),
+            used_at: at(10),
+        }];
         let mut state = State::new();
         state.worktrees.insert("feat+x".into(), rec);
         state
@@ -1353,6 +1409,10 @@ mod tests {
         let before = &state.worktrees["feat+x"];
         assert_eq!(rec.ports, before.ports);
         assert_eq!(rec.hooks, before.hooks);
+        assert_eq!(
+            rec.namespaces, before.namespaces,
+            "a database on the developer's server outlives a restart of this one"
+        );
         assert_eq!(rec.services.len(), before.services.len());
         assert_eq!(
             rec.services[0].compose_project, before.services[0].compose_project,
