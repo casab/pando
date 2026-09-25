@@ -381,3 +381,179 @@ fn every_name_pando_gives_passes_the_guard_and_the_main_database_never_does() {
         }
     }
 }
+
+// ---- the login ----------------------------------------------------------------
+
+fn main_checkout(env: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".env"), env).unwrap();
+    dir
+}
+
+fn keys(keys: &[&str]) -> Vec<String> {
+    keys.iter().map(|k| k.to_string()).collect()
+}
+
+#[test]
+fn a_login_is_read_from_the_keys_beside_the_services_address() {
+    let root = main_checkout(
+        "DATABASE_HOST=localhost\nDATABASE_PORT=3306\nDATABASE_NAME=shop\n\
+         DATABASE_USER=shop_user\nDATABASE_PASSWORD=s3cr3t:w0rd\n",
+    );
+    let login = login_from_env_files(root.path(), &keys(&["DATABASE_PORT"])).unwrap();
+    assert_eq!(login.user.as_deref(), Some("shop_user"));
+    assert_eq!(
+        login.env(Some("MYSQL_PWD")),
+        vec![("MYSQL_PWD".to_string(), "s3cr3t:w0rd".to_string())]
+    );
+    assert!(
+        login.from.contains("DATABASE_USER and DATABASE_PASSWORD"),
+        "{}",
+        login.from
+    );
+    // The other spellings an app uses.
+    let root = main_checkout("DB_PORT=3306\nDB_USERNAME=u\nDB_PASS=p\n");
+    let login = login_from_env_files(root.path(), &keys(&["DB_PORT"])).unwrap();
+    assert_eq!(login.user.as_deref(), Some("u"));
+    assert_eq!(
+        login.env(Some("X")),
+        vec![("X".to_string(), "p".to_string())]
+    );
+}
+
+#[test]
+fn a_login_in_a_url_is_read_with_its_escapes_undone() {
+    let root =
+        main_checkout("DATABASE_URL=mysql://shop%40corp:p%40ss%3Aw0rd@localhost:3306/shop\n");
+    let login = login_from_env_files(root.path(), &keys(&["DATABASE_URL"])).unwrap();
+    assert_eq!(login.user.as_deref(), Some("shop@corp"));
+    assert_eq!(
+        login.env(Some("MYSQL_PWD")),
+        vec![("MYSQL_PWD".to_string(), "p@ss:w0rd".to_string())]
+    );
+    assert!(login.from.contains("DATABASE_URL"), "{}", login.from);
+    // A password alone, the way a development Redis is protected.
+    let root = main_checkout("REDIS_URL=redis://:only-a-password@localhost:6379/0\n");
+    let login = login_from_env_files(root.path(), &keys(&["REDIS_URL"])).unwrap();
+    assert_eq!(login.user, None);
+    assert!(login.has_password());
+}
+
+#[test]
+fn a_url_with_no_login_in_it_and_no_keys_beside_it_is_no_login() {
+    let root = main_checkout("DATABASE_URL=mysql://localhost:3306/shop\nREDIS_PORT=6379\n");
+    assert_eq!(
+        login_from_env_files(root.path(), &keys(&["DATABASE_URL"])),
+        None
+    );
+    assert_eq!(
+        login_from_env_files(root.path(), &keys(&["REDIS_PORT"])),
+        None
+    );
+    assert_eq!(login_from_env_files(root.path(), &keys(&[])), None);
+    // Empty values say nothing either.
+    let root = main_checkout("DATABASE_PORT=3306\nDATABASE_USER=\nDATABASE_PASSWORD=\n");
+    assert_eq!(
+        login_from_env_files(root.path(), &keys(&["DATABASE_PORT"])),
+        None
+    );
+}
+
+#[test]
+fn the_login_written_for_pando_is_used_when_the_env_files_have_none_that_will_do() {
+    let file = std::path::Path::new("/home/.pando/projects/p/pando.toml");
+    let mut config = crate::config::Config::default();
+    config.namespaced.insert(
+        "mariadb".into(),
+        crate::config::LoginConfig {
+            user: Some("root".into()),
+            password: Some("hunter2".into()),
+        },
+    );
+    // Nothing in the env files: the one written down.
+    let root = main_checkout("DATABASE_PORT=3306\n");
+    let login = find_login(
+        root.path(),
+        &config,
+        "mariadb",
+        &keys(&["DATABASE_PORT"]),
+        true,
+        file,
+    )
+    .unwrap();
+    assert_eq!(login.user.as_deref(), Some("root"));
+    assert!(
+        login.from.contains("[namespaced.mariadb]"),
+        "{}",
+        login.from
+    );
+    // A password with no user will not do for an engine that logs in as
+    // somebody, so the one written down wins over it…
+    let root = main_checkout("DATABASE_PORT=3306\nDATABASE_PASSWORD=x\n");
+    let login = find_login(
+        root.path(),
+        &config,
+        "mariadb",
+        &keys(&["DATABASE_PORT"]),
+        true,
+        file,
+    )
+    .unwrap();
+    assert_eq!(login.user.as_deref(), Some("root"));
+    // …and does for one that does not.
+    let login = find_login(
+        root.path(),
+        &config,
+        "redis",
+        &keys(&["DATABASE_PORT"]),
+        false,
+        file,
+    )
+    .unwrap();
+    assert_eq!(login.user, None);
+    // The main checkout's own login, when it has one, beats pando's.
+    let root = main_checkout("DATABASE_PORT=3306\nDATABASE_USER=app\n");
+    let login = find_login(
+        root.path(),
+        &config,
+        "mariadb",
+        &keys(&["DATABASE_PORT"]),
+        true,
+        file,
+    )
+    .unwrap();
+    assert_eq!(login.user.as_deref(), Some("app"));
+    // Nothing anywhere is nothing.
+    let root = main_checkout("DATABASE_PORT=3306\n");
+    let none = crate::config::Config::default();
+    assert!(
+        find_login(
+            root.path(),
+            &none,
+            "mariadb",
+            &keys(&["DATABASE_PORT"]),
+            true,
+            file
+        )
+        .is_none()
+    );
+}
+
+// A config and a login both end up in error messages and `{:?}`s; neither
+// may carry the password there.
+#[test]
+fn a_password_is_never_in_what_a_login_or_its_config_prints() {
+    let login = Login::new(Some("app".into()), Some("hunter2".into()), "somewhere");
+    let shown = format!("{login:?}");
+    assert!(!shown.contains("hunter2"), "{shown}");
+    assert!(shown.contains("hidden") && shown.contains("app"), "{shown}");
+    let config = crate::config::LoginConfig {
+        user: Some("app".into()),
+        password: Some("hunter2".into()),
+    };
+    let shown = format!("{config:?}");
+    assert!(!shown.contains("hunter2"), "{shown}");
+    // And the only way out is the environment of the command it is for.
+    assert_eq!(login.env(None), Vec::new());
+    assert_eq!(Login::none().env(Some("MYSQL_PWD")), Vec::new());
+}

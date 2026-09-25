@@ -178,6 +178,16 @@ fn hint_span(label: &str) -> Span<'static> {
     Span::styled(label.to_string(), Style::new().fg(text_muted()))
 }
 
+/// A login as it is typed, with the password after its first `:` as dots:
+/// the user is worth seeing, the password is nobody's to read off a
+/// screen.
+fn masked(typed: &str) -> String {
+    match typed.split_once(':') {
+        Some((user, password)) => format!("{user}:{}", "•".repeat(password.chars().count())),
+        None => typed.to_string(),
+    }
+}
+
 /// A question, its options with the signal that found each one, and a line
 /// for a command typed by hand. Every slot accepts one, so there is never a
 /// dead end.
@@ -315,7 +325,11 @@ fn render_question(
     }
     if let Some(typed) = custom {
         body.push(Line::raw(""));
-        for (row_at, row) in wrap_text(&format!("{typed}▏"), width.saturating_sub(2))
+        let shown = match question.slot.is_secret() {
+            true => masked(typed),
+            false => typed.to_string(),
+        };
+        for (row_at, row) in wrap_text(&format!("{shown}▏"), width.saturating_sub(2))
             .into_iter()
             .enumerate()
         {

@@ -1601,3 +1601,42 @@ fn an_appearance_pando_does_not_know_drops_the_layer_with_the_spellings() {
         loaded.warnings
     );
 }
+
+// A login is a password. A file the team shares must not carry one, and a
+// machine-wide one is not where a project's login belongs; pando's own
+// file for the project is.
+#[test]
+fn a_namespace_login_is_read_from_pandos_own_file_and_nowhere_else() {
+    let f = fixture();
+    let login = "[namespaced.mariadb]\nuser = \"root\"\npassword = \"hunter2\"\n";
+    write_committed(&f, login);
+    write_user(&f, login);
+    let loaded = load(&f.paths).unwrap();
+    assert!(
+        loaded.config.namespaced.is_empty(),
+        "{:?}",
+        loaded.config.namespaced
+    );
+    for why in ["a file the team shares", "pando's own file"] {
+        assert!(
+            loaded
+                .warnings
+                .iter()
+                .any(|w| w.contains("ignoring [namespaced]") && w.contains(why)),
+            "{:?}",
+            loaded.warnings
+        );
+    }
+    assert!(
+        loaded.warnings.iter().all(|w| !w.contains("hunter2")),
+        "{:?}",
+        loaded.warnings
+    );
+
+    write_home(&f, login);
+    let loaded = load(&f.paths).unwrap();
+    let mariadb = &loaded.config.namespaced["mariadb"];
+    assert_eq!(mariadb.user.as_deref(), Some("root"));
+    assert_eq!(mariadb.password.as_deref(), Some("hunter2"));
+    assert!(!format!("{:?}", loaded.config).contains("hunter2"));
+}

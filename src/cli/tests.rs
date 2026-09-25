@@ -3018,3 +3018,79 @@ fn a_wide_branch_name_keeps_the_ls_columns_straight() {
         "{text}"
     );
 }
+
+// ---- the namespace login question -----------------------------------------------
+
+fn login_question_for_tests() -> actions::Question {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    crate::testutil::init_repo(&root);
+    let paths = PandoPaths::new(
+        dir.path().join("pando-home"),
+        ProjectRef::from_root(&root).unwrap(),
+    );
+    actions::login_question(&paths, "mariadb", &["DATABASE_PORT".to_string()])
+}
+
+// Nothing to choose: the prompt asks for the login outright, says it is
+// not shown, and takes the whole line — colons and all — as the answer.
+#[test]
+fn the_login_question_asks_for_a_login_that_is_not_shown_as_it_is_typed() {
+    let question = login_question_for_tests();
+    let (answer, printed) = answer_with(&question, &["root:p@ss:word"]);
+    assert_eq!(
+        answer.unwrap(),
+        actions::Answer::Custom("root:p@ss:word".to_string())
+    );
+    assert!(printed.contains("not shown as you type"), "{printed}");
+    assert!(printed.contains("user:password"), "{printed}");
+    assert!(!printed.contains("c) something else"), "{printed}");
+    assert!(
+        !printed.contains("p@ss"),
+        "the prompt never prints it back: {printed}"
+    );
+}
+
+// A script gets exit 3 with the table to write and the file to write it
+// in — and no answers-file line, because `init` never asks this one.
+#[test]
+fn the_login_question_at_exit_3_names_the_table_to_write_and_not_an_answers_file() {
+    let question = login_question_for_tests();
+    let file = question.answer_file.clone().unwrap();
+    let text = render_needs_answer(&actions::NeedsAnswer { question });
+    for wanted in [
+        "[namespaced.mariadb]",
+        "user = \"<user>\"",
+        "password = \"<password>\"",
+        file.to_str().unwrap(),
+    ] {
+        assert!(text.contains(wanted), "{wanted}: {text}");
+    }
+    assert!(!text.contains("init --answers"), "{text}");
+}
+
+// A namespace login lives in pando's own config; nothing `status` prints
+// reads it, and nothing it prints may carry it.
+#[test]
+fn status_never_prints_a_namespace_login() {
+    let fx = fixture();
+    actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
+    std::fs::write(
+        fx.paths.config_file(),
+        "[namespaced.mariadb]\nuser = \"root\"\npassword = \"hunter2\"\n",
+    )
+    .unwrap();
+    let json = capture(|b| status_json(&fx.paths, None, b));
+    let text = capture(|b| status_text(&fx.paths, None, b));
+    for shown in [&json, &text] {
+        assert!(!shown.contains("hunter2"), "{shown}");
+    }
+}
+
+#[test]
+fn an_answers_file_cannot_answer_the_login_a_namespaced_start_asks_for() {
+    let e = crate::cli::answers::Answers::parse(r#"{"login": "root:hunter2"}"#).unwrap_err();
+    let e = format!("{e:#}");
+    assert!(e.contains("not a question pando asks"), "{e}");
+    assert!(!e.contains("hunter2"), "{e}");
+}

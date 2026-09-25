@@ -1323,6 +1323,7 @@ pub(super) fn slot_label(slot: Slot) -> &'static str {
         Slot::Services => "service list",
         Slot::SchemaHook => "schema command",
         Slot::Provision => "provision list",
+        Slot::Login => "namespace login",
     }
 }
 
@@ -1349,5 +1350,8 @@ pub fn already_answered(slot: Slot, config: &Config) -> bool {
         // question asked twice: has anything already said what this
         // project's processes are?
         Slot::Processes | Slot::DevCmd | Slot::PortEnv => !detect::still_needed(slot, config),
+        // Per service, so "any" is the most this can say; the question
+        // itself asks about one service and checks that one.
+        Slot::Login => !config.namespaced.is_empty(),
     }
 }

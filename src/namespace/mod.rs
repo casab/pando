@@ -17,11 +17,19 @@
 //!   developer grants the app's login.
 //! - **Only what pando made is ever dropped.** [`may_drop`] is the one
 //!   gate every drop and every flush goes through.
+//! - **A password is never printed.** A [`Login`] keeps it private and
+//!   hands it to the engine's client in its environment, never on a
+//!   command line.
 
 mod guard;
+mod login;
 mod name;
 
 pub use guard::{describe, may_drop, same_namespace};
+pub use login::{
+    Login, find as find_login, from_config as login_from_config,
+    from_env_files as login_from_env_files,
+};
 pub use name::{MARKER, MAX_NAME, database_names, is_plain};
 
 #[cfg(test)]

@@ -15,6 +15,10 @@ use toml::{Table, Value};
 /// pando writes for one project on one machine.
 const PROJECT_LAYER_ONLY: [&str; 2] = ["root", "worktrees_dir"];
 
+/// The table of logins for namespaced starts, which only pando's own
+/// project layer may hold.
+pub(super) const NAMESPACED: &str = "namespaced";
+
 /// Why a layer beneath the project one may not decide where pando writes.
 /// Each layer says it in its own terms, because the two reasons differ: one
 /// file is inside the repository, the other is shared by every project.
@@ -221,12 +225,13 @@ fn read_table(path: &Path, warnings: &mut Vec<String>) -> Option<Table> {
 /// Removes the keys this layer may not set, warning by name for each
 /// one, with the reason it may not.
 ///
-/// Three kinds of key, and the reason differs for each. `project.root`
+/// Four kinds of key, and the reason differs for each. `project.root`
 /// and `project.worktrees_dir` decide where pando writes, which only
 /// pando's own file may say. `[isolation] none` is a fact about one
 /// repository, so a machine-wide file may not answer it for every
 /// project at once. `[isolation] prefer` is a fact about one laptop, so
-/// a file the team shares may not answer it for everyone's.
+/// a file the team shares may not answer it for everyone's. And
+/// `[namespaced]` holds passwords, which belong in pando's own file.
 fn strip_keys_only_pando_may_set(
     table: &mut Table,
     path: &Path,
@@ -264,6 +269,18 @@ fn strip_keys_only_pando_may_set(
         warnings.push(format!(
             "ignoring isolation.{key} in {}: {why}",
             path.display()
+        ));
+    }
+    // A login is a password: kept in pando's own file for the project,
+    // which is 0600 and never committed, and nowhere else.
+    if table.remove(NAMESPACED).is_some() {
+        warnings.push(format!(
+            "ignoring [{NAMESPACED}] in {}: {}",
+            path.display(),
+            match layer {
+                LowerLayer::Committed => "a login may not live in a file the team shares",
+                LowerLayer::User => "a login belongs to one project, in pando's own file for it",
+            }
         ));
     }
 }

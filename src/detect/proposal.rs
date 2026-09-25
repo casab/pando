@@ -15,7 +15,8 @@ use super::services::{MachineEvidence, ServiceSource, schema_hook_proposal, serv
 use super::signals::Signals;
 use super::workspaces::processes_proposal;
 
-/// A config slot detection has something to say about.
+/// A config slot detection has something to say about — or, for
+/// [`Slot::Login`], one a namespaced start asks about on its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Slot {
@@ -40,6 +41,12 @@ pub enum Slot {
     /// and the files whose change means it has to run again.
     SchemaHook,
     Provision,
+    /// The login that may create and drop a worktree's namespaces in one
+    /// service, when the main checkout's env files carry none. No rule
+    /// proposes it and `init` never asks it: a namespaced start does, the
+    /// first time it needs one, and a project that never starts namespaced
+    /// is never asked for a password.
+    Login,
 }
 
 impl Slot {
@@ -67,6 +74,12 @@ impl Slot {
     /// is no command to type in place of "which of these containers".
     pub fn allows_custom(self) -> bool {
         !self.is_multi()
+    }
+
+    /// Whether what is typed here is a secret: read without echo on a
+    /// terminal, shown as dots in the TUI, and never printed back.
+    pub fn is_secret(self) -> bool {
+        self == Slot::Login
     }
 
     /// Whether this slot's single answer is a *list* written as one
@@ -116,7 +129,8 @@ impl Slot {
             Slot::DevCmd => (&["dev"], "cmd"),
             Slot::PortEnv => (&["dev"], "ports"),
             Slot::Provision => (&["project"], "provision"),
-            Slot::Processes | Slot::Services | Slot::SchemaHook => return None,
+            // One table per service, which only the question knows.
+            Slot::Processes | Slot::Services | Slot::SchemaHook | Slot::Login => return None,
         })
     }
 
@@ -127,6 +141,7 @@ impl Slot {
             Slot::PortEnv => "variable names",
             Slot::VersionFiles | Slot::Provision => "file names",
             Slot::Prelude => "shell line",
+            Slot::Login => "login, as user:password",
             _ => "command",
         }
     }
@@ -148,6 +163,7 @@ impl Slot {
             Slot::Services => "Run private copies of these services for each worktree?",
             Slot::SchemaHook => "Which command brings a fresh database up to the schema?",
             Slot::Provision => "Which local files should each worktree get a copy of?",
+            Slot::Login => "Which login may create and drop this worktree's own databases?",
         }
     }
 }

@@ -41,8 +41,13 @@ pub fn slot_name(slot: crate::detect::Slot) -> String {
         .expect("every slot serialises to its name")
 }
 
+/// The question an answers file names, among the ones `init` asks. A
+/// login is asked by a namespaced start alone, so a file naming it would
+/// be a program believing it had answered something nothing reads.
 pub(super) fn slot_named(name: &str) -> Option<crate::detect::Slot> {
-    serde_json::from_value(serde_json::Value::String(name.to_string())).ok()
+    serde_json::from_value(serde_json::Value::String(name.to_string()))
+        .ok()
+        .filter(|slot| actions::ALL_SLOTS.contains(slot))
 }
 
 /// Every name an answers file may use, in the order the questions come.
@@ -423,10 +428,15 @@ fn how_to_answer(question: &actions::Question) -> String {
         (false, Some((value, _))) => serde_json::Value::String(value.clone()).to_string(),
         (false, None) => "\"<your own>\"".to_string(),
     };
-    out.push_str(&format!(
-        "  or from a program: `pando init --answers <file.json>` with {{\"{}\": {value}}}\n",
-        slot_name(question.slot)
-    ));
+    // Only for a question `init` asks. The login is asked by a namespaced
+    // start alone, so an answers file has nowhere to put it; the table
+    // above is the way in.
+    if actions::ALL_SLOTS.contains(&question.slot) {
+        out.push_str(&format!(
+            "  or from a program: `pando init --answers <file.json>` with {{\"{}\": {value}}}\n",
+            slot_name(question.slot)
+        ));
+    }
     out
 }
 

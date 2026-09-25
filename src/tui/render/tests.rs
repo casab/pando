@@ -3024,3 +3024,24 @@ fn the_highlight_covers_the_row_and_not_the_one_under_it() {
     assert_eq!(bar, Some(highlight_bg()), "{text}");
     assert_ne!(under, Some(highlight_bg()), "{text}");
 }
+
+// A login typed into the question: the user is shown, the password after
+// its first colon is dots, and the screen never carries it.
+#[test]
+fn a_login_typed_into_the_question_shows_its_password_as_dots() {
+    let (reply, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app(&["feat+one"]);
+    let paths = app.paths.clone();
+    let question =
+        crate::actions::login_question(&paths, "mariadb", &["DATABASE_PORT".to_string()]);
+    app.modal = Some(Modal::Question {
+        question,
+        selected: 0,
+        custom: Some("root:hunter2".into()),
+        reply,
+    });
+    let rendered = text_of(&draw(&mut app, 120, 30));
+    assert!(!rendered.contains("hunter2"), "{rendered}");
+    assert!(rendered.contains("root:•••••••"), "{rendered}");
+    assert!(rendered.contains("mariadb"), "{rendered}");
+}

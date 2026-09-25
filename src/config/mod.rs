@@ -33,8 +33,8 @@ pub use edit::{
 pub use layers::{Loaded, load, load_without_home};
 pub use schema::{
     BranchRule, BranchesSection, Config, HookConfig, HookPoint, HookScope, ISOLATION_KINDS,
-    IsolationSection, PortsSpec, ProbeConfig, ProcessConfig, ProjectSection, ProvisionMode,
-    ReadySpec, RuntimeSection, ServiceConfig, ShareSection, UiSection,
+    IsolationSection, LoginConfig, PortsSpec, ProbeConfig, ProcessConfig, ProjectSection,
+    ProvisionMode, ReadySpec, RuntimeSection, ServiceConfig, ShareSection, UiSection,
 };
 pub use suggest::{KeyError, closest, edit_distance};
 pub use validate::validate;

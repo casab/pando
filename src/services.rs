@@ -578,6 +578,80 @@ pub fn sibling_identity<'a>(
     (user, database)
 }
 
+/// Something an app keeps beside a service's address, by the same rule
+/// [`sibling_identity`] reads a database's name by: for each addressing
+/// key `<P>_PORT`, `<P>_HOST` or `<P>_URL` among `keys`, the first of
+/// `<P><suffix>` this directory's env files set to anything — as the key
+/// it was found under, and its value.
+///
+/// `DATABASE_PASSWORD` beside `DATABASE_PORT`, `REDIS_DB` beside
+/// `REDIS_PORT`.
+pub fn sibling_value<'a>(
+    dir: &Path,
+    keys: impl IntoIterator<Item = &'a str>,
+    suffixes: &[&str],
+) -> Option<(String, String)> {
+    let files = read_env_files(dir);
+    keys.into_iter().find_map(|key| {
+        let prefix = ["_PORT", "_HOST", "_URL"]
+            .iter()
+            .find_map(|suffix| key.strip_suffix(suffix))?;
+        suffixes.iter().find_map(|suffix| {
+            let sibling = format!("{prefix}{suffix}");
+            let value = files.iter().find_map(|(_, map)| map.get(&sibling))?;
+            let value = value.trim();
+            (!value.is_empty()).then(|| (sibling, value.to_string()))
+        })
+    })
+}
+
+/// The user and the password a connection URL carries before its `@`,
+/// percent-escapes decoded: a password with an `@` or a `:` in it can only
+/// be written in a URL escaped, and the client that is handed it wants
+/// the characters, not the escapes.
+pub fn url_userinfo(value: &str) -> (Option<String>, Option<String>) {
+    let Some(after_scheme) = value.find("://").map(|at| at + 3) else {
+        return (None, None);
+    };
+    let rest = &value[after_scheme..];
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    let Some(at) = authority.rfind('@') else {
+        return (None, None);
+    };
+    let userinfo = &authority[..at];
+    let (user, password) = match userinfo.split_once(':') {
+        Some((user, password)) => (user, Some(password)),
+        None => (userinfo, None),
+    };
+    let decoded = |text: &str| Some(percent_decoded(text)).filter(|t| !t.is_empty());
+    (decoded(user), password.and_then(decoded))
+}
+
+/// `%40` as `@`; anything that is not a valid escape stays as written.
+fn percent_decoded(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = bytes
+            .get(i + 1..i + 3)
+            .filter(|pair| pair.iter().all(u8::is_ascii_hexdigit))
+            .and_then(|pair| std::str::from_utf8(pair).ok())
+            .and_then(|pair| u8::from_str_radix(pair, 16).ok());
+        match (bytes[i], hex) {
+            (b'%', Some(byte)) => {
+                out.push(byte);
+                i += 3;
+            }
+            (byte, _) => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// The port an env key names in this directory's env files: the port of a
 /// URL, or a bare number.
 ///
@@ -804,6 +878,48 @@ mod tests {
             sibling_identity(dir.path(), ["DB_PORT"]).1.as_deref(),
             Some("shop_local")
         );
+    }
+
+    #[test]
+    fn a_urls_login_is_read_with_only_real_escapes_undone() {
+        assert_eq!(
+            url_userinfo("mysql://a%40b:c%3Ad@h:1/x"),
+            (Some("a@b".to_string()), Some("c:d".to_string()))
+        );
+        // Not escapes: left exactly as written.
+        assert_eq!(
+            url_userinfo("mysql://u:%zz%+1%@h/x").1.as_deref(),
+            Some("%zz%+1%")
+        );
+        assert_eq!(url_userinfo("mysql://h:1/x"), (None, None));
+        assert_eq!(url_userinfo("mysql://:@h:1/x"), (None, None));
+        assert_eq!(url_userinfo("not a url"), (None, None));
+        // The `@` that ends the login is the last one before the host.
+        assert_eq!(
+            url_userinfo("redis://:p@ss@h:6379/0").1.as_deref(),
+            Some("p@ss")
+        );
+    }
+
+    #[test]
+    fn a_value_beside_an_address_is_found_by_its_prefix() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(".env.example"),
+            "DB_PORT=1\nDB_PASS=example\nREDIS_URL=redis://h\nREDIS_DB=2\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(".env"), "DB_PASSWORD=\nDB_PWD=real\n").unwrap();
+        // An empty `.env` value is nothing, and the next spelling is read.
+        assert_eq!(
+            sibling_value(dir.path(), ["DB_PORT"], &["_PASSWORD", "_PWD", "_PASS"]),
+            Some(("DB_PWD".to_string(), "real".to_string()))
+        );
+        assert_eq!(
+            sibling_value(dir.path(), ["REDIS_URL"], &["_DB"]),
+            Some(("REDIS_DB".to_string(), "2".to_string()))
+        );
+        assert_eq!(sibling_value(dir.path(), ["PORT"], &["_DB"]), None);
     }
 
     #[test]

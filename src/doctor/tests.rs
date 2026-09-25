@@ -2273,3 +2273,42 @@ fn a_project_with_nothing_to_run_gets_a_note_with_the_file_and_the_lines() {
     write_project_config(&fx, "[dev]\ncmd = \"true\"\n");
     assert!(!mentions(&report_of(&fx, &every_tool), "nothing to run"));
 }
+
+// doctor prints every key of every layer, and `--json` is piped into
+// things: a login's password is named there and never shown.
+#[test]
+fn a_namespace_login_is_reported_without_its_password() {
+    let fx = fixture();
+    write_project_config(
+        &fx,
+        "[namespaced.mariadb]  # answered: 2026-09-26\nuser = \"root\"\npassword = \"hunter2\"\n",
+    );
+    std::fs::write(
+        fx.root.join("pando.toml"),
+        "[namespaced.redis]\npassword = \"committed-secret\"\n",
+    )
+    .unwrap();
+    let report = report(&fx);
+    let project = &report.config.layers[2];
+    let password = project
+        .keys
+        .iter()
+        .find(|k| k.key == "namespaced.mariadb.password")
+        .expect("the key is named");
+    assert_eq!(password.value.as_deref(), Some("(hidden)"));
+    assert!(password.raw.is_none());
+    let committed = &report.config.layers[0];
+    let leaked = committed
+        .keys
+        .iter()
+        .find(|k| k.key == "namespaced.redis.password")
+        .expect("named in the committed layer too");
+    assert!(leaked.ignored, "and ignored there");
+    let json = serde_json::to_string(&report).unwrap();
+    let text = report.render();
+    for shown in [&json, &text] {
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(!shown.contains("committed-secret"), "{shown}");
+    }
+    assert!(text.contains("namespaced.mariadb.password"), "{text}");
+}

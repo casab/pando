@@ -159,7 +159,8 @@ fn layer_report(layer: &'static str, path: &Path, strips: bool) -> LayerReport {
     walk_table(doc.as_table(), "", &mut keys);
     if strips {
         for key in &mut keys {
-            key.ignored = STRIPPED_BELOW_PROJECT.contains(&key.key.as_str());
+            key.ignored = STRIPPED_BELOW_PROJECT.contains(&key.key.as_str())
+                || key.key.starts_with("namespaced.");
         }
     }
     LayerReport {
@@ -186,6 +187,15 @@ fn walk_table(table: &toml_edit::Table, prefix: &str, out: &mut Vec<KeyReport>) 
             false => format!("{prefix}.{key}"),
         };
         match item {
+            // A login's password is named and never shown: this report is
+            // printed, and printed JSON is logged and piped into things.
+            toml_edit::Item::Value(value) if is_password(&path) => out.push(KeyReport {
+                key: path,
+                value: Some(HIDDEN.to_string()),
+                raw: None,
+                note: comment(value.decor().suffix().and_then(|s| s.as_str())),
+                ignored: false,
+            }),
             toml_edit::Item::Value(value) => out.push(KeyReport {
                 key: path,
                 value: Some(value_repr(value)),
@@ -221,6 +231,15 @@ fn walk_table(table: &toml_edit::Table, prefix: &str, out: &mut Vec<KeyReport>) 
             toml_edit::Item::None => {}
         }
     }
+}
+
+/// What a password's value reads as in the report.
+pub(super) const HIDDEN: &str = "(hidden)";
+
+/// `namespaced.<service>.password`: a login pando keeps for namespaced
+/// starts.
+fn is_password(key: &str) -> bool {
+    key.starts_with("namespaced.") && key.ends_with(".password")
 }
 
 /// A value without the whitespace and comments around it: the report lines

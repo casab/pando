@@ -6,11 +6,13 @@
 //! with `git check-ignore` before anything is created.
 //!
 //! One file per concern: worktrees, hooks, questions, `init`, the runtime
-//! check, start/stop/restart, private services, share, and reading state.
+//! check, start/stop/restart, private services, namespaced starts, share,
+//! and reading state.
 
 mod hooks;
 mod init;
 mod lifecycle;
+mod namespaced;
 mod questions;
 mod refresh;
 mod runtime;
@@ -27,6 +29,7 @@ pub use lifecycle::{
     Mode, StartReport, StartedProcess, StopOutcome, process_names, restart, start, stop, stop_all,
     stop_all_with,
 };
+pub use namespaced::{login_question, namespace_login};
 pub use questions::{
     Answer, Answering, Ask, NEW_SLOTS, NeedsAnswer, Question, RefusedAnswer, START_SLOTS,
     Volunteered, already_answered, question_for, recommended, resolve, resolve_for_new,

@@ -7711,3 +7711,128 @@ fn a_fetch_from_an_origin_that_never_answers_is_bounded_and_says_so() {
     assert!(err.contains("did not answer"), "{err}");
     drop(silent);
 }
+
+// ---- the namespace login ------------------------------------------------------
+
+/// Every line a call printed, for asserting what it did and did not say.
+fn collecting() -> (std::rc::Rc<std::cell::RefCell<Vec<String>>>, impl Fn(&str)) {
+    let lines = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let sink = lines.clone();
+    (lines, move |line: &str| {
+        sink.borrow_mut().push(line.to_string())
+    })
+}
+
+// The main checkout's own login is the one a namespaced start uses, and
+// nobody is asked anything for it.
+#[test]
+fn a_namespace_login_the_main_checkout_has_is_used_without_asking() {
+    let fx = fixture();
+    std::fs::write(
+        fx.root.join(".env"),
+        "DATABASE_PORT=3306\nDATABASE_USER=app\nDATABASE_PASSWORD=hunter2\n",
+    )
+    .unwrap();
+    let ask = |_: &Question| -> Result<Answer> { panic!("asked for a login the env files have") };
+    let login = namespace_login(
+        &fx.paths,
+        &fx.config,
+        "mariadb",
+        &["DATABASE_PORT".to_string()],
+        true,
+        &ask,
+        &noop,
+    )
+    .unwrap();
+    assert_eq!(login.user.as_deref(), Some("app"));
+    assert!(!fx.paths.config_file().exists(), "nothing was written");
+}
+
+// Decision 8: nothing says, so it asks — the same question every front
+// end puts — and keeps the answer in pando's own file, 0600, where the
+// next start finds it without asking again.
+#[test]
+fn a_namespace_login_nothing_says_is_asked_once_and_kept_where_only_pando_reads_it() {
+    let fx = fixture();
+    std::fs::write(fx.root.join(".env"), "DATABASE_PORT=3306\n").unwrap();
+    let asked = std::cell::RefCell::new(Vec::<Question>::new());
+    let ask = |q: &Question| -> Result<Answer> {
+        asked.borrow_mut().push(q.clone());
+        Ok(Answer::Custom("root:pa:ss word".to_string()))
+    };
+    let (said, progress) = collecting();
+    let keys = ["DATABASE_PORT".to_string()];
+    let login = namespace_login(
+        &fx.paths, &fx.config, "mariadb", &keys, true, &ask, &progress,
+    )
+    .unwrap();
+    assert_eq!(login.user.as_deref(), Some("root"));
+    assert_eq!(
+        login.env(Some("MYSQL_PWD")),
+        vec![("MYSQL_PWD".to_string(), "pa:ss word".to_string())],
+        "everything after the first colon is the password"
+    );
+
+    let question = asked.borrow()[0].clone();
+    assert_eq!(question.slot, crate::detect::Slot::Login);
+    assert!(question.slot.is_secret());
+    assert!(question.options.is_empty() && question.allow_custom);
+    assert!(question.prompt.contains("mariadb"), "{}", question.prompt);
+    assert_eq!(question.answer_file.as_ref(), Some(&fx.paths.config_file()));
+    assert!(
+        question.snippet.contains("[namespaced.mariadb]"),
+        "{}",
+        question.snippet
+    );
+    assert!(
+        recommended(&question).is_none(),
+        "nothing to take on anyone's behalf"
+    );
+
+    let file = fx.paths.config_file();
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(text.contains("[namespaced.mariadb]"), "{text}");
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "the file holding a password is its owner's alone"
+    );
+    for line in said.borrow().iter() {
+        assert!(!line.contains("pa:ss word"), "printed the password: {line}");
+    }
+
+    // The next start reads it back and asks nothing.
+    let config = crate::config::load(&fx.paths).unwrap().config;
+    let never = |_: &Question| -> Result<Answer> { panic!("asked twice") };
+    let again = namespace_login(&fx.paths, &config, "mariadb", &keys, true, &never, &noop).unwrap();
+    assert_eq!(again.user.as_deref(), Some("root"));
+    assert_eq!(again.env(Some("P")), login.env(Some("P")));
+}
+
+#[test]
+fn a_namespace_login_with_no_user_is_refused_and_nothing_is_written() {
+    let fx = fixture();
+    let keys = ["DATABASE_PORT".to_string()];
+    for answer in [
+        Answer::Custom(":hunter2".to_string()),
+        Answer::Custom("  ".to_string()),
+        Answer::Choice(0),
+        Answer::None,
+    ] {
+        let reply = answer.clone();
+        let ask = move |_: &Question| -> Result<Answer> { Ok(reply.clone()) };
+        let e = namespace_login(&fx.paths, &fx.config, "mariadb", &keys, true, &ask, &noop)
+            .unwrap_err();
+        let e = format!("{e:#}");
+        assert!(e.contains("nothing was written"), "{answer:?}: {e}");
+        assert!(!e.contains("hunter2"), "{e}");
+        assert!(!fx.paths.config_file().exists(), "{answer:?}");
+    }
+    // A user with no password is a login too.
+    let ask = |_: &Question| -> Result<Answer> { Ok(Answer::Custom("root".to_string())) };
+    let login =
+        namespace_login(&fx.paths, &fx.config, "mariadb", &keys, true, &ask, &noop).unwrap();
+    assert_eq!(login.user.as_deref(), Some("root"));
+    assert!(!login.has_password());
+}

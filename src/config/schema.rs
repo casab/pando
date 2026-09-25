@@ -32,6 +32,35 @@ pub struct Config {
     pub share: ShareSection,
     #[serde(default, skip_serializing_if = "UiSection::is_empty")]
     pub ui: UiSection,
+    /// Who pando connects as to make and drop a worktree's namespaces, by
+    /// `[[services]]` name, for a service the main checkout's env files
+    /// give no login for. Written when a namespaced start asks, and read
+    /// from pando's own project layer only: it is a password.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub namespaced: BTreeMap<String, LoginConfig>,
+}
+
+/// One service's login for namespaced starts.
+///
+/// Its `Debug` never prints the password: a config is printed whole in
+/// more than one error path, and a password in a terminal's scrollback is
+/// a password somebody else can read.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoginConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
+impl std::fmt::Debug for LoginConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoginConfig")
+            .field("user", &self.user)
+            .field("password", &self.password.as_ref().map(|_| "(hidden)"))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
