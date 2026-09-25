@@ -104,16 +104,26 @@ pub struct WorktreeRecord {
     pub observed_ports: Vec<u16>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub services: Vec<ServiceRecord>,
-    /// Whether this worktree runs private copies of the project's
-    /// services.
+    /// Which services this worktree's processes talk to: the mode it runs
+    /// in, or last ran in once stopped. `None` for a worktree never
+    /// started — and for one 0.3.0 started shared, which it did not write
+    /// down. [`WorktreeRecord::mode`] reads it with that default.
     ///
     /// Per start and remembered per worktree: `start --isolated` sets it,
     /// a later plain `start` keeps the services already up, and only `rm`
     /// forgets it. Without the memory, restarting an isolated worktree
     /// would hand its processes the *shared* database's address while its
     /// own database was still running beside it.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub isolated: bool,
+    ///
+    /// Read from `isolated` too, which is what every 0.3.0 state file
+    /// says instead: `true` is isolated, and `false` is nothing written.
+    #[serde(
+        default,
+        alias = "isolated",
+        deserialize_with = "mode_or_isolated",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub mode: Option<ServiceMode>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub hooks: BTreeMap<String, HookRecord>,
     /// The port this worktree's share proxy listens on, once it has needed
@@ -143,12 +153,76 @@ impl WorktreeRecord {
             roles: BTreeMap::new(),
             observed_ports: Vec::new(),
             services: Vec::new(),
-            isolated: false,
+            mode: None,
             hooks: BTreeMap::new(),
             share_port: None,
             share: None,
         }
     }
+
+    /// The mode this worktree runs in, or last ran in: shared when nothing
+    /// says otherwise, because that is where a plain start puts it.
+    pub fn mode(&self) -> ServiceMode {
+        self.mode.unwrap_or_default()
+    }
+}
+
+/// How a worktree's processes reach the project's stateful services.
+///
+/// Code, processes, dependencies, ports and logs are the worktree's own in
+/// every mode; a mode only decides how the databases and caches are
+/// separated.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceMode {
+    /// The main checkout's servers and the main checkout's data.
+    #[default]
+    Shared,
+    /// The main checkout's servers, and a namespace of its own in each: a
+    /// database, a numbered slot.
+    Namespaced,
+    /// Servers of its own, on ports of its own.
+    Isolated,
+}
+
+impl ServiceMode {
+    /// Every mode, in the order a chooser offers them.
+    pub const ALL: [ServiceMode; 3] = [
+        ServiceMode::Shared,
+        ServiceMode::Namespaced,
+        ServiceMode::Isolated,
+    ];
+
+    /// The word for it everywhere pando prints one: `status`, `ls`, the
+    /// TUI, and `--json`.
+    pub fn word(self) -> &'static str {
+        match self {
+            ServiceMode::Shared => "shared",
+            ServiceMode::Namespaced => "namespaced",
+            ServiceMode::Isolated => "isolated",
+        }
+    }
+}
+
+/// `mode` as this version writes it, or `isolated` as 0.3.0 wrote it.
+///
+/// One field under two names rather than two fields, so nothing past the
+/// parser ever has to reconcile them.
+fn mode_or_isolated<'de, D>(deserializer: D) -> Result<Option<ServiceMode>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Written {
+        Mode(ServiceMode),
+        Isolated(bool),
+    }
+    Ok(match Written::deserialize(deserializer)? {
+        Written::Mode(mode) => Some(mode),
+        Written::Isolated(true) => Some(ServiceMode::Isolated),
+        Written::Isolated(false) => None,
+    })
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -377,7 +451,7 @@ fn read_boot_id() -> Option<String> {
 /// of a stranger (a terminal's shell leads a group of its own). So a file
 /// written during another boot keeps what outlives a restart — ports,
 /// roles, hooks, the compose projects that name containers and volumes,
-/// the isolation mode — and loses every pid.
+/// the mode — and loses every pid.
 ///
 /// A file with no boot recorded, or a system that cannot say, keeps them:
 /// not knowing is not evidence of a restart.
@@ -1116,6 +1190,43 @@ mod tests {
         assert!(json.contains("\"version\":2"));
         let back: State = serde_json::from_str(&json).unwrap();
         assert_eq!(state, back);
+    }
+
+    // Every 0.3.0 state file says `isolated` and never `mode`. Read wrong,
+    // an isolated worktree's next plain start would hand its processes the
+    // shared database while its own was still running beside it.
+    #[test]
+    fn a_state_file_from_before_modes_reads_its_isolated_flag() {
+        let with = |field: &str| -> WorktreeRecord {
+            serde_json::from_str(&format!(r#"{{"path":"/abs/w"{field}}}"#)).unwrap()
+        };
+        assert_eq!(
+            with(r#","isolated":true"#).mode,
+            Some(ServiceMode::Isolated)
+        );
+        assert_eq!(with(r#","isolated":false"#).mode, None);
+        assert_eq!(with("").mode, None);
+        assert_eq!(with("").mode(), ServiceMode::Shared, "unsaid is shared");
+        for mode in ServiceMode::ALL {
+            let rec = with(&format!(r#","mode":"{}""#, mode.word()));
+            assert_eq!(rec.mode, Some(mode));
+        }
+    }
+
+    #[test]
+    fn a_mode_is_written_as_its_word_and_never_as_the_old_flag() {
+        let mut rec = WorktreeRecord::new("/abs/w", true);
+        let json = serde_json::to_value(&rec).unwrap();
+        assert!(json.get("mode").is_none(), "never started says nothing");
+        rec.mode = Some(ServiceMode::Namespaced);
+        let json = serde_json::to_value(&rec).unwrap();
+        assert_eq!(json["mode"], "namespaced");
+        assert!(json.get("isolated").is_none(), "{json}");
+        let back: WorktreeRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(back, rec);
+        for mode in ServiceMode::ALL {
+            assert_eq!(serde_json::to_value(mode).unwrap(), mode.word());
+        }
     }
 
     #[test]

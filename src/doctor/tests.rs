@@ -1787,7 +1787,7 @@ fn a_service_record_the_config_no_longer_includes_is_reported_with_its_volume() 
     write_compose(&fx, "services:\n  postgres:\n    image: postgres:16\n");
     write_project_config(&fx, &services_config("\"postgres\""));
     let mut record = state::WorktreeRecord::new(&fx.root, true);
-    record.isolated = true;
+    record.mode = Some(crate::state::ServiceMode::Isolated);
     for (name, port) in [("postgres", 17_001u16), ("mailpit", 17_002)] {
         record.services.push(state::ServiceRecord {
             name: name.to_string(),
@@ -1800,6 +1800,8 @@ fn a_service_record_the_config_no_longer_includes_is_reported_with_its_volume() 
     }
     write_state(&fx, &one_worktree("feat+one", record));
     let report = report(&fx);
+    assert_eq!(report.worktrees[0].mode, state::ServiceMode::Isolated);
+    assert!(report.worktrees[0].isolated, "the old flag says so too");
     let mailpit = report.worktrees[0]
         .services
         .iter()

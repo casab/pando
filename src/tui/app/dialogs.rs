@@ -47,12 +47,13 @@ pub enum Modal {
     Share {
         name: String,
     },
-    /// `i` on a worktree running shared, `S` on one running isolated:
-    /// every process restarts, on services it was not using a moment ago.
+    /// A mode key on a worktree running in another mode — `i` on one
+    /// running shared, `S` on one running isolated: every process
+    /// restarts, on services it was not using a moment ago.
     SwitchMode {
         name: String,
         /// The mode it is switching to.
-        isolated: bool,
+        to: crate::state::ServiceMode,
     },
     /// `X`: every worktree with anything up, stopped at once, as
     /// `pando stop --all` does. Lists what goes down before it does.

@@ -138,7 +138,7 @@ fn an_isolated_start_gives_a_native_service_a_port_a_database_and_a_log() {
     // A role and a port like any other service, and the worktree
     // remembers it is isolated.
     let record = f.record(&name);
-    assert!(record.isolated);
+    assert!(record.mode() == pando::state::ServiceMode::Isolated);
     let service = f.service(&name, "postgres");
     assert_eq!(service.kind, ServiceKind::Native);
     assert_eq!(
@@ -338,7 +338,10 @@ fn a_database_that_dies_is_forgotten_by_the_next_read() {
         f.record(&name).services.is_empty(),
         "and the forgetting is saved"
     );
-    assert!(record.isolated, "the worktree is still an isolated one");
+    assert!(
+        record.mode() == pando::state::ServiceMode::Isolated,
+        "the worktree is still an isolated one"
+    );
     assert!(
         actions::refresh(&f.paths).notices.is_empty(),
         "said once, not on every tick"
@@ -459,7 +462,7 @@ fn a_server_that_never_becomes_ready_fails_the_start_and_leaves_nothing_running(
         record.services
     );
     assert!(!record.ports.contains_key("db"), "{:?}", record.ports);
-    assert!(!record.isolated);
+    assert!(record.mode() != pando::state::ServiceMode::Isolated);
     assert!(f.datadir(&name, "db").exists());
     assert!(
         f.record(&name).processes.is_empty(),
@@ -851,7 +854,7 @@ fn a_switch_whose_services_another_start_took_down_starts_nothing() {
     );
     let record = f.record(&name);
     assert!(
-        !record.isolated,
+        record.mode() != pando::state::ServiceMode::Isolated,
         "a worktree with no services is not isolated"
     );
     let dev = &record.processes["dev"];

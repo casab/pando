@@ -5,8 +5,8 @@ use crate::config::Config;
 use crate::log_tail::{LogLevel, LogTail};
 use crate::paths::PandoPaths;
 use crate::project::ProjectRef;
-use crate::state::Phase;
 use crate::state::State;
+use crate::state::{Phase, ServiceMode};
 use crate::worktree::BranchSource;
 use crate::worktree::{BranchEntry, Worktree};
 use anyhow::Result;
@@ -3269,10 +3269,10 @@ fn capital_s_starts_the_selected_worktree_shared() {
 // on the second press, when it is the mode it already runs in.
 #[test]
 fn a_mode_key_on_a_running_worktree_restarts_it_in_that_mode() {
-    for (key, isolated) in [('i', true), ('S', false)] {
+    for (key, mode) in [('i', ServiceMode::Isolated), ('S', ServiceMode::Shared)] {
         let mut app = test_app(&["feat+one"]);
         with_process(&mut app, "feat+one", running_phase());
-        app.state.worktrees.get_mut("feat+one").unwrap().isolated = isolated;
+        app.state.worktrees.get_mut("feat+one").unwrap().mode = Some(mode);
         press(&mut app, KeyCode::Char(key));
         assert!(app.pending.is_none(), "{key}: the first press only asks");
         assert!(app.modal.is_none(), "{key}: no dialog for the same mode");
@@ -3289,16 +3289,21 @@ fn a_mode_key_on_a_running_worktree_restarts_it_in_that_mode() {
 // every service under it on one keystroke.
 #[test]
 fn a_mode_key_that_switches_a_running_worktree_asks_in_a_dialog() {
-    for (key, isolated) in [('i', true), ('S', false)] {
+    for (key, from, target) in [
+        ('i', ServiceMode::Shared, ServiceMode::Isolated),
+        ('i', ServiceMode::Namespaced, ServiceMode::Isolated),
+        ('S', ServiceMode::Isolated, ServiceMode::Shared),
+        ('S', ServiceMode::Namespaced, ServiceMode::Shared),
+    ] {
         let mut app = test_app(&["feat+one"]);
         with_process(&mut app, "feat+one", running_phase());
-        app.state.worktrees.get_mut("feat+one").unwrap().isolated = !isolated;
+        app.state.worktrees.get_mut("feat+one").unwrap().mode = Some(from);
         press(&mut app, KeyCode::Char(key));
         assert!(
             matches!(
                 &app.modal,
-                Some(Modal::SwitchMode { name, isolated: to })
-                    if name == "feat+one" && *to == isolated
+                Some(Modal::SwitchMode { name, to })
+                    if name == "feat+one" && *to == target
             ),
             "{key}: {:?}",
             app.modal

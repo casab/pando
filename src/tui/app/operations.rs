@@ -6,6 +6,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use crate::actions;
+use crate::state::ServiceMode;
 
 use super::background::{AppEvent, ask_through_ui};
 use super::dialogs::Modal;
@@ -110,43 +111,38 @@ impl App {
     /// as `start_selected`; the flag reaches detection too, because the
     /// services question is only worth asking when it is being answered.
     pub(super) fn start_selected_isolated(&mut self) {
-        self.start_selected_in(actions::Mode::Isolated)
+        self.start_selected_in(ServiceMode::Isolated, 'i')
     }
 
     /// Back to the project's own services, the private copies stopped:
     /// `start --shared`.
     pub(super) fn start_selected_shared(&mut self) {
-        self.start_selected_in(actions::Mode::Shared)
+        self.start_selected_in(ServiceMode::Shared, 'S')
     }
 
     /// A mode key on a worktree that is already up is a restart in that
     /// mode: a start would find its processes running and leave them on
     /// the services they were started against.
     ///
-    /// Pressed on one that runs in the other mode, it asks in a dialog,
+    /// Pressed on one that runs in another mode, it asks in a dialog,
     /// because that restart swaps the services under every process. In
     /// the mode it already runs in it is a plain restart, and asks for the
     /// key twice like `r` does.
-    fn start_selected_in(&mut self, mode: actions::Mode) {
+    fn start_selected_in(&mut self, to: ServiceMode, key: char) {
+        let mode = actions::Mode::from(to);
         let Some(name) = self.selected_worktree().map(|wt| wt.name.clone()) else {
             return self.start_selected_with(mode);
         };
         if self.phase_of(&name).is_none() {
             return self.start_selected_with(mode);
         }
-        let isolated = mode == actions::Mode::Isolated;
-        let runs_isolated = self.record_for(&name).is_some_and(|r| r.isolated);
-        if self.is_up(&name) && isolated != runs_isolated {
-            self.modal = Some(Modal::SwitchMode { name, isolated });
+        let runs = self.record_for(&name).map(|r| r.mode()).unwrap_or_default();
+        if self.is_up(&name) && to != runs {
+            self.modal = Some(Modal::SwitchMode { name, to });
             return;
         }
-        let (key, how) = if isolated {
-            ('i', "isolated")
-        } else {
-            ('S', "shared")
-        };
         let label = self.label_of(&name);
-        if self.pressed_twice(key, &name, &format!("restart {label} {how}")) {
+        if self.pressed_twice(key, &name, &format!("restart {label} {}", to.word())) {
             self.restart_selected_with(mode)
         }
     }

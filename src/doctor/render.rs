@@ -317,8 +317,8 @@ fn render_worktrees(out: &mut String, worktrees: &[WorktreeReport], style: &Styl
             true => "pando-created",
             false => "adopted",
         }];
-        if worktree.isolated {
-            flags.push("isolated");
+        if worktree.mode != crate::state::ServiceMode::Shared {
+            flags.push(worktree.mode.word());
         }
         if worktree.locked {
             flags.push("locked");

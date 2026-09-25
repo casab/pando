@@ -1505,6 +1505,32 @@ fn status_json_reports_a_worktree_that_was_never_started() {
     assert!(wt["processes"].as_object().unwrap().is_empty());
     assert_eq!(wt["url"], serde_json::Value::Null);
     assert!(wt["observed_ports"].as_array().unwrap().is_empty());
+    assert_eq!(wt["mode"], "shared", "never started is shared");
+    assert_eq!(wt["isolated"], false);
+}
+
+// `mode` came after `isolated`, which programs already read: the new
+// word is added beside it, and the old flag stays true for isolated alone.
+#[test]
+fn status_and_ls_json_publish_the_mode_beside_the_old_isolated_flag() {
+    use crate::state::ServiceMode;
+    let fx = fixture();
+    let name = actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
+    for mode in ServiceMode::ALL {
+        let mut store = crate::state::load(&fx.paths.state_file()).unwrap();
+        store.worktrees.get_mut(&name).unwrap().mode = Some(mode);
+        crate::state::save(&fx.paths.state_file(), &store).unwrap();
+
+        let text = capture(|b| status_json(&fx.paths, None, b));
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let wt = &v["worktrees"][0];
+        assert_eq!(wt["mode"], mode.word(), "{text}");
+        assert_eq!(wt["isolated"], mode == ServiceMode::Isolated, "{text}");
+
+        let text = capture(|b| ls_json(&fx.paths, b));
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["worktrees"][0]["mode"], mode.word(), "{text}");
+    }
 }
 
 #[test]
@@ -2140,10 +2166,18 @@ fn the_listing_shows_mode_and_public_only_when_some_worktree_has_them() {
 
     with_share(&fx, &one, None);
     let mut store = crate::state::load(&fx.paths.state_file()).unwrap();
-    store.worktrees.get_mut(&one).unwrap().isolated = true;
+    store.worktrees.get_mut(&one).unwrap().mode = Some(crate::state::ServiceMode::Isolated);
     crate::state::save(&fx.paths.state_file(), &store).unwrap();
     let text = capture(|b| ls_text_at(&fx.paths, b, usize::MAX));
     assert!(text.contains("MODE") && text.contains("isolated"), "{text}");
+    let mut store = crate::state::load(&fx.paths.state_file()).unwrap();
+    store.worktrees.get_mut(&one).unwrap().mode = Some(crate::state::ServiceMode::Namespaced);
+    crate::state::save(&fx.paths.state_file(), &store).unwrap();
+    let text = capture(|b| ls_text_at(&fx.paths, b, usize::MAX));
+    assert!(
+        text.contains("MODE") && text.contains("namespaced"),
+        "{text}"
+    );
     assert!(
         text.contains("https://fake-host.trycloudflare.com"),
         "{text}"
@@ -2212,6 +2246,7 @@ fn ls_json_emits_the_documented_shape() {
     assert_eq!(w["ahead"], 0);
     assert_eq!(w["behind"], 0);
     assert_eq!(w["created_by_pando"], true);
+    assert_eq!(w["mode"], "shared");
     assert_eq!(w["prunable"], false);
     assert_eq!(w["locked"], serde_json::Value::Null);
     assert_eq!(w["pr"], serde_json::Value::Null);
@@ -2842,6 +2877,21 @@ fn every_enum_value_agent_json_documents_is_one_the_binary_prints() {
         }
     }
     check("kind", kinds.map(serde_word).to_vec());
+
+    // Every mode, and the published words for them: `status --json`,
+    // `ls --json` and `doctor --json` print these, and a program reading
+    // them decides by them which services a worktree is on.
+    for m in crate::state::ServiceMode::ALL {
+        match m {
+            crate::state::ServiceMode::Shared
+            | crate::state::ServiceMode::Namespaced
+            | crate::state::ServiceMode::Isolated => {}
+        }
+    }
+    check(
+        "mode",
+        crate::state::ServiceMode::ALL.map(serde_word).to_vec(),
+    );
 
     let states = [PrState::Open, PrState::Merged, PrState::Closed];
     for s in states {

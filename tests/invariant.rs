@@ -1114,7 +1114,10 @@ fn an_isolated_lifecycle_never_writes_into_the_repository() {
         &|_| {},
     )
     .unwrap();
-    assert!(state::load(&h.paths.state_file()).unwrap().worktrees[&name].isolated);
+    assert!(
+        state::load(&h.paths.state_file()).unwrap().worktrees[&name].mode()
+            == pando::state::ServiceMode::Isolated
+    );
     h.assert_untouched("start", Some(&worktree));
 
     // And the way back, which stops containers and restarts processes:
@@ -1128,7 +1131,10 @@ fn an_isolated_lifecycle_never_writes_into_the_repository() {
         &|_| {},
     )
     .unwrap();
-    assert!(!state::load(&h.paths.state_file()).unwrap().worktrees[&name].isolated);
+    assert!(
+        state::load(&h.paths.state_file()).unwrap().worktrees[&name].mode()
+            != pando::state::ServiceMode::Isolated
+    );
     h.assert_untouched("start --shared", Some(&worktree));
 
     actions::rm(&h.paths, &name, false, false, &|_| {}).unwrap();
@@ -1249,7 +1255,10 @@ fn a_native_isolated_lifecycle_never_writes_into_the_repository() {
         &|_| {},
     )
     .unwrap();
-    assert!(state::load(&h.paths.state_file()).unwrap().worktrees[&name].isolated);
+    assert!(
+        state::load(&h.paths.state_file()).unwrap().worktrees[&name].mode()
+            == pando::state::ServiceMode::Isolated
+    );
     h.assert_untouched("start", Some(&worktree));
 
     actions::rm(&h.paths, &name, false, false, &|_| {}).unwrap();

@@ -37,7 +37,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
 
 use crate::actions;
-use crate::state::Aggregate;
+use crate::state::{Aggregate, ServiceMode};
 use crate::theme::{
     blue, border, cyan, green, highlight_bg, magenta, orange, red, surface, text, text_dim,
     text_muted, yellow,
@@ -248,12 +248,18 @@ fn row_cells(app: &App, wt: &Worktree) -> RowCells {
     if app.public_url_of(&wt.name).is_some() {
         cells.push((Col::Share, "◈".to_string(), Style::new().fg(green())));
     }
-    if app.record_for(&wt.name).is_some_and(|r| r.isolated) {
-        cells.push((
+    match app.record_for(&wt.name).map(|r| r.mode()) {
+        Some(ServiceMode::Isolated) => cells.push((
             Col::Mode,
-            "isolated".to_string(),
+            ServiceMode::Isolated.word().to_string(),
             Style::new().fg(magenta()),
-        ));
+        )),
+        Some(ServiceMode::Namespaced) => cells.push((
+            Col::Mode,
+            ServiceMode::Namespaced.word().to_string(),
+            Style::new().fg(text()),
+        )),
+        Some(ServiceMode::Shared) | None => {}
     }
     if wt.dirty == Some(true) && !wt.prunable && !wt.locked {
         cells.push((

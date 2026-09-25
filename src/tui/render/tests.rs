@@ -264,7 +264,7 @@ fn renders_every_modal_at_any_terminal_size() {
         },
         Modal::SwitchMode {
             name: "feat+one".into(),
-            isolated: true,
+            to: crate::state::ServiceMode::Isolated,
         },
         Modal::Question {
             question: crate::actions::Question {
@@ -658,7 +658,8 @@ fn the_row_leaves_adoption_to_the_detail_pane() {
 fn a_header_row_names_each_column_over_its_cells() {
     let mut app = test_app(&["feat+one", "feat+two"]);
     with_process(&mut app, "feat+one", running_phase());
-    app.state.worktrees.get_mut("feat+one").unwrap().isolated = true;
+    app.state.worktrees.get_mut("feat+one").unwrap().mode =
+        Some(crate::state::ServiceMode::Isolated);
     app.worktrees[0].dirty = Some(true);
     let rendered = text_of(&draw(&mut app, 180, 10));
     let header = list_row(&rendered, "branch");
@@ -2151,13 +2152,37 @@ fn the_switch_confirmation_says_what_restarts_on_which_services() {
     let mut app = test_app(&["feat+one"]);
     with_process(&mut app, "feat+one", running_phase());
     with_second_process(&mut app, "feat+one", "api", running_phase());
-    for (isolated, title, now) in [
-        (true, "restart feat/one isolated?", "shared services now"),
-        (false, "restart feat/one shared?", "private copies"),
+    use crate::state::ServiceMode;
+    for (from, to, title, now) in [
+        (
+            ServiceMode::Shared,
+            ServiceMode::Isolated,
+            "restart feat/one isolated?",
+            "shared services now",
+        ),
+        (
+            ServiceMode::Isolated,
+            ServiceMode::Shared,
+            "restart feat/one shared?",
+            "private copies",
+        ),
+        (
+            ServiceMode::Namespaced,
+            ServiceMode::Shared,
+            "restart feat/one shared?",
+            "namespaces are kept until rm",
+        ),
+        (
+            ServiceMode::Shared,
+            ServiceMode::Namespaced,
+            "restart feat/one namespaced?",
+            "namespaces of its own",
+        ),
     ] {
+        app.state.worktrees.get_mut("feat+one").unwrap().mode = Some(from);
         app.modal = Some(Modal::SwitchMode {
             name: "feat+one".into(),
-            isolated,
+            to,
         });
         let rendered = text_of(&draw(&mut app, 120, 30));
         assert!(rendered.contains(title), "{rendered}");

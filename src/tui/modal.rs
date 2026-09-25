@@ -17,6 +17,7 @@ use super::app::{
     Modal, RemoveBlocker, StatusKind, create_rows, pr_rows,
 };
 use super::render::{centered_box, chunk_cells, text_width, truncate, truncate_middle, wrap_text};
+use crate::state::ServiceMode;
 use crate::theme::{
     blue, border, cyan, green, highlight_bg, magenta, orange, red, surface, text, text_dim,
     text_muted, yellow,
@@ -64,10 +65,11 @@ pub fn render_modal(f: &mut Frame, area: Rect, modal: &Modal, app: &App) -> Opti
         Modal::Share { name } => {
             render_share(f, area, &app.label_of(name), app.url_of(name).as_deref())
         }
-        Modal::SwitchMode { name, isolated } => {
+        Modal::SwitchMode { name, to } => {
             let processes: Vec<String> =
                 app.processes_of(name).into_iter().map(|(p, _)| p).collect();
-            render_switch_mode(f, area, &app.label_of(name), &processes, *isolated)
+            let from = app.record_for(name).map(|r| r.mode()).unwrap_or_default();
+            render_switch_mode(f, area, &app.label_of(name), &processes, from, *to)
         }
         Modal::Question {
             question,
@@ -720,28 +722,35 @@ fn render_share(f: &mut Frame, area: Rect, label: &str, url: Option<&str>) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-/// Confirming `i` on a worktree running shared, or `S` on one running
-/// isolated: which services it leaves, and what restarts onto the others.
+/// Confirming a mode key on a worktree running in another mode: which
+/// services it leaves, and what restarts onto the others.
 fn render_switch_mode(
     f: &mut Frame,
     area: Rect,
     label: &str,
     processes: &[String],
-    isolated: bool,
+    from: ServiceMode,
+    to: ServiceMode,
 ) {
     let cap = max_content_width(area);
-    let (how, now, then) = if isolated {
-        (
-            "isolated",
-            "it runs on the project's shared services now",
-            "private copies of the services start for it",
-        )
-    } else {
-        (
-            "shared",
-            "it runs private copies of the services now",
-            "they stop, and it moves to the project's own",
-        )
+    let how = to.word();
+    let now = match from {
+        ServiceMode::Shared => "it runs on the project's shared services now",
+        ServiceMode::Namespaced => "it runs on namespaces of its own in the project's services now",
+        ServiceMode::Isolated => "it runs private copies of the services now",
+    };
+    let then = match (from, to) {
+        (ServiceMode::Isolated, ServiceMode::Shared) => {
+            "they stop, and it moves to the project's own"
+        }
+        (_, ServiceMode::Shared) => {
+            "it moves to the main checkout's data; its namespaces are kept until rm"
+        }
+        (ServiceMode::Isolated, ServiceMode::Namespaced) => {
+            "they stop, and it moves to its own namespaces in the project's services"
+        }
+        (_, ServiceMode::Namespaced) => "it moves to namespaces of its own, kept until rm",
+        (_, ServiceMode::Isolated) => "private copies of the services start for it",
     };
     let restarts = match processes.len() {
         0 => "its processes restart".to_string(),

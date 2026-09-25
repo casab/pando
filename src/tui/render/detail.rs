@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
 
 use crate::log_tail::LogLevel;
-use crate::state::{Aggregate, Phase, ProcessRecord};
+use crate::state::{Aggregate, Phase, ProcessRecord, ServiceMode};
 use crate::theme::{
     border, cyan, green, highlight_bg, magenta, red, text, text_dim, text_muted, yellow,
 };
@@ -277,22 +277,22 @@ pub(super) fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-/// Shared or isolated, and the key that switches — for a project that has
-/// services to be shared or isolated at all.
+/// Which services it talks to, and the key that switches — for a project
+/// that has services to separate at all.
 fn mode_row<'a>(app: &App, name: &str, width: usize) -> Option<Line<'a>> {
-    let isolated = app.record_for(name).is_some_and(|r| r.isolated);
-    if app.config.services.is_empty() && !isolated {
+    let mode = app.record_for(name).map(|r| r.mode()).unwrap_or_default();
+    if app.config.services.is_empty() && mode == ServiceMode::Shared {
         return None;
     }
-    let (word, color, what) = if isolated {
-        ("isolated", magenta(), "  private services · S shares")
-    } else {
-        (
-            "shared",
-            text_dim(),
-            "  the project's services · i isolates",
-        )
+    let (color, what) = match mode {
+        ServiceMode::Isolated => (magenta(), "  private services · S shares"),
+        ServiceMode::Namespaced => (
+            text(),
+            "  its own namespaces in the project's services · S shares",
+        ),
+        ServiceMode::Shared => (text_dim(), "  the project's services · i isolates"),
     };
+    let word = mode.word();
     Some(detail_row(
         "mode",
         vec![

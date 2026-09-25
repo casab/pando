@@ -670,18 +670,13 @@ impl App {
                 self.handle_theme_key(key, selected, before);
                 return;
             }
-            Some(Modal::SwitchMode { name, isolated }) => {
+            Some(Modal::SwitchMode { name, to }) => {
                 match key.code {
                     KeyCode::Char('y') | KeyCode::Enter => {
-                        let mode = if isolated {
-                            actions::Mode::Isolated
-                        } else {
-                            actions::Mode::Shared
-                        };
-                        self.restart_selected_with(mode);
+                        self.restart_selected_with(actions::Mode::from(to));
                     }
                     KeyCode::Esc | KeyCode::Char('n') => {}
-                    _ => self.modal = Some(Modal::SwitchMode { name, isolated }),
+                    _ => self.modal = Some(Modal::SwitchMode { name, to }),
                 }
                 return;
             }

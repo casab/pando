@@ -180,7 +180,8 @@ pub(super) fn worktrees_report(
                 .map(state::Aggregate::word)
                 .unwrap_or("stopped"),
             created_by_pando: record.created_by_pando,
-            isolated: record.isolated,
+            mode: record.mode(),
+            isolated: record.mode() == state::ServiceMode::Isolated,
             locked: git.is_some_and(|g| g.locked),
             prunable: git.is_some_and(|g| g.prunable),
             prunable_reason: git.and_then(|g| g.prunable_reason.clone()),

@@ -82,8 +82,11 @@ struct StatusWorktreeOut {
     observed_ports: Vec<u16>,
     /// The readiness role's URL, when this worktree has one.
     url: Option<String>,
+    /// Which services it talks to: `shared`, `namespaced` or `isolated`.
+    mode: crate::state::ServiceMode,
     /// Whether this worktree runs private copies of the project's
-    /// services.
+    /// services: `mode` is `isolated`. Published before `mode` was, and
+    /// kept for every program that reads it.
     isolated: bool,
     /// `null` when the worktree is not shared.
     share: Option<ShareOut>,
@@ -146,7 +149,8 @@ pub fn status_json<W: Write>(paths: &PandoPaths, only: Option<&str>, out: &mut W
                     ports: record.ports.clone(),
                     observed_ports: record.observed_ports.clone(),
                     url: worktree_url(record),
-                    isolated: record.isolated,
+                    mode: record.mode(),
+                    isolated: record.mode() == crate::state::ServiceMode::Isolated,
                     share: record.share.as_ref().map(|share| ShareOut {
                         url: share.public_url.clone(),
                         local_port: share.local_port,

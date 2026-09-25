@@ -150,7 +150,10 @@ fn services_get_roles_and_ports_beside_the_processes() {
     assert_eq!(report.ports["redis"], web + 2);
 
     let record = f.record(&name);
-    assert!(record.isolated, "the mode is remembered on the record");
+    assert!(
+        record.mode() == pando::state::ServiceMode::Isolated,
+        "the mode is remembered on the record"
+    );
     assert_eq!(
         record
             .services
@@ -235,7 +238,7 @@ fn a_later_plain_start_keeps_the_services_and_the_mode() {
     )
     .unwrap();
     assert_eq!(second.ports, first.ports, "the ports do not move");
-    assert!(f.record(&name).isolated);
+    assert!(f.record(&name).mode() == pando::state::ServiceMode::Isolated);
     assert_eq!(
         docker::services_up(&f.home, &f.project(&name)),
         up,
@@ -320,7 +323,10 @@ fn stop_takes_the_processes_and_the_services_down_together() {
         "the records survive: only they know which compose project to take down"
     );
     assert!(record.services.iter().all(|s| s.pid.is_none()));
-    assert!(record.isolated, "and the worktree is still an isolated one");
+    assert!(
+        record.mode() == pando::state::ServiceMode::Isolated,
+        "and the worktree is still an isolated one"
+    );
 }
 
 // `--only dev` and then `--only dev` again — keep the database, restart
@@ -600,7 +606,7 @@ fn a_start_that_fails_before_any_container_leaves_the_worktree_startable() {
     );
     assert!(err.contains("DB_HOST"), "{err}");
     assert!(
-        !f.record(&name).isolated,
+        f.record(&name).mode() != pando::state::ServiceMode::Isolated,
         "nothing was brought up, so nothing is remembered"
     );
     assert!(
@@ -620,7 +626,7 @@ fn a_start_that_fails_before_any_container_leaves_the_worktree_startable() {
     )
     .unwrap();
     assert!(report.ports.contains_key("web"));
-    assert!(!f.record(&name).isolated);
+    assert!(f.record(&name).mode() != pando::state::ServiceMode::Isolated);
     actions::stop(&f.paths, &name, None, &|_| {}).unwrap();
 }
 
@@ -842,7 +848,10 @@ fn a_project_with_no_services_runs_shared_and_says_so() {
         vec!["web"],
         "and nothing extra is reserved"
     );
-    assert!(!state::load(&paths.state_file()).unwrap().worktrees[&name].isolated);
+    assert!(
+        state::load(&paths.state_file()).unwrap().worktrees[&name].mode()
+            != pando::state::ServiceMode::Isolated
+    );
     assert!(
         docker::invocations(&home).is_empty(),
         "docker is never even asked"
@@ -952,7 +961,7 @@ fn start_shared_stops_the_private_services_and_clears_the_mode() {
     let f = iso();
     let name = new_worktree(&f, "feat/one");
     let isolated = start_isolated(&f, &name);
-    assert!(f.record(&name).isolated);
+    assert!(f.record(&name).mode() == pando::state::ServiceMode::Isolated);
     assert!(!docker::services_up(&f.home, &f.project(&name)).is_empty());
     let pump = f.service(&name, "postgres");
     let pump_pid = pump.pid.expect("a log pump");
@@ -968,7 +977,10 @@ fn start_shared_stops_the_private_services_and_clears_the_mode() {
     .unwrap();
 
     let record = f.record(&name);
-    assert!(!record.isolated, "the mode is cleared");
+    assert!(
+        record.mode() != pando::state::ServiceMode::Isolated,
+        "the mode is cleared"
+    );
     assert!(
         docker::services_up(&f.home, &f.project(&name)).is_empty(),
         "the private services are stopped"
@@ -1048,7 +1060,10 @@ fn a_plain_start_after_shared_stays_shared() {
         &|_| {},
     )
     .unwrap();
-    assert!(!f.record(&name).isolated, "a plain start does not undo it");
+    assert!(
+        f.record(&name).mode() != pando::state::ServiceMode::Isolated,
+        "a plain start does not undo it"
+    );
     assert!(
         docker::services_up(&f.home, &f.project(&name)).is_empty(),
         "and nothing brought the private services back up"
@@ -1214,7 +1229,10 @@ fn only_is_refused_when_the_start_would_change_which_services_are_used() {
     // Refused, so nothing moved: both processes are the ones that were
     // running, and the worktree is still isolated.
     let after = f.record(&name);
-    assert!(after.isolated, "the mode changed under a refusal");
+    assert!(
+        after.mode() == pando::state::ServiceMode::Isolated,
+        "the mode changed under a refusal"
+    );
     assert_eq!(
         after.processes.keys().cloned().collect::<Vec<_>>(),
         before,
@@ -1246,7 +1264,10 @@ fn only_is_refused_when_the_start_would_change_which_services_are_used() {
         .unwrap_err()
     );
     assert!(e.contains("its own"), "{e}");
-    assert!(!f.record(&two).isolated, "the mode changed under a refusal");
+    assert!(
+        f.record(&two).mode() != pando::state::ServiceMode::Isolated,
+        "the mode changed under a refusal"
+    );
 
     // And asking for the mode a worktree is already in is no change at
     // all, so `--only` is fine: the refusal is about the switch, not
@@ -1289,7 +1310,7 @@ fn restart_only_across_a_mode_change_refuses_before_it_stops_anything() {
         process::is_alive(web),
         "the process was stopped by a command that then refused"
     );
-    assert!(f.record(&name).isolated);
+    assert!(f.record(&name).mode() == pando::state::ServiceMode::Isolated);
 }
 
 // `--only` is fine when the mode is not changing, which is the whole
@@ -1313,7 +1334,7 @@ fn only_still_works_when_the_mode_stays_as_it_is() {
     .expect("a restart that changes no mode");
     let after = f.record(&name);
     assert_eq!(after.processes["api"].pid, api, "the sibling was replaced");
-    assert!(after.isolated);
+    assert!(after.mode() == pando::state::ServiceMode::Isolated);
 }
 
 // ---- a request that can never succeed must not cost what is running --------
@@ -1350,7 +1371,7 @@ fn an_isolated_start_with_docker_down_stops_nothing_and_leaves_nothing_behind() 
     assert_eq!(after.processes, before.processes, "not one record touched");
     assert!(after.services.is_empty(), "{:?}", after.services);
     assert_eq!(after.ports, before.ports, "no service port reserved");
-    assert!(!after.isolated);
+    assert!(after.mode() != pando::state::ServiceMode::Isolated);
     assert!(
         docker::invocations(&f.home)
             .iter()
@@ -1415,7 +1436,7 @@ fn docker_down_with_every_engine_installed_offers_the_native_recipes() {
     assert!(!err.contains("--"), "the TUI shows this verbatim: {err}");
     // Nothing was decided for the developer.
     assert!(!f.paths.user_config_file().exists());
-    assert!(!f.record(&name).isolated);
+    assert!(f.record(&name).mode() != pando::state::ServiceMode::Isolated);
 }
 
 // With Docker down an isolated start cannot happen, so it asks nothing:
@@ -1490,7 +1511,7 @@ fn a_switch_to_isolated_that_fails_late_is_undone() {
 
     start_mode(&f, &name, actions::Mode::Isolated).unwrap_err();
     let after = f.record(&name);
-    assert!(!after.isolated);
+    assert!(after.mode() != pando::state::ServiceMode::Isolated);
     // The dev server the developer had is the one they still have: it was
     // only ever going to be replaced once the services were ready.
     assert!(
@@ -1583,7 +1604,7 @@ fn a_switch_to_isolated_whose_migration_fails_keeps_the_dev_server_and_stops_the
     assert!(process::is_alive(dev), "the dev server was lost");
     let after = f.record(&name);
     assert_eq!(after.processes["dev"].pid, before.processes["dev"].pid);
-    assert!(!after.isolated);
+    assert!(after.mode() != pando::state::ServiceMode::Isolated);
     assert_eq!(after.ports, before.ports, "the service roles are released");
     assert!(
         docker::services_up(&f.home, &f.project(&name)).is_empty(),
@@ -1621,7 +1642,7 @@ fn a_restart_into_isolated_that_fails_late_keeps_the_dev_server() {
     )
     .unwrap_err();
     assert!(process::is_alive(dev), "restart stopped it and then failed");
-    assert!(!f.record(&name).isolated);
+    assert!(f.record(&name).mode() != pando::state::ServiceMode::Isolated);
 }
 
 // And when the switch works, every process is replaced — the old one is
@@ -1655,7 +1676,7 @@ fn a_switch_to_isolated_replaces_the_running_processes_once_the_services_are_rea
     }
     assert!(!process::is_alive(old), "the shared-mode process survived");
     assert!(process::is_alive(new));
-    assert!(f.record(&name).isolated);
+    assert!(f.record(&name).mode() == pando::state::ServiceMode::Isolated);
     // In that order: the services first, the processes after them.
     let services_at = said
         .iter()
@@ -1813,7 +1834,7 @@ fn stop_shared_and_rm_all_work_with_docker_down() {
         &note,
     )
     .unwrap();
-    assert!(!f.record(&name).isolated);
+    assert!(f.record(&name).mode() != pando::state::ServiceMode::Isolated);
     assert!(
         said.lock()
             .unwrap()
@@ -1899,6 +1920,6 @@ fn a_failed_switch_keeps_the_recorded_ports_equal_to_the_live_ones() {
     start_mode(&f, &name, actions::Mode::Isolated).unwrap_err();
     assert!(process::is_alive(dev));
     let after = f.record(&name);
-    assert!(!after.isolated);
+    assert!(after.mode() != pando::state::ServiceMode::Isolated);
     assert_eq!(after.ports.get("web"), Some(&web), "{:?}", after.ports);
 }

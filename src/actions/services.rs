@@ -882,7 +882,9 @@ fn forget_failed_isolation(
             record.ports.insert(role.clone(), *port);
         }
     }
-    record.isolated = false;
+    if record.mode == Some(state::ServiceMode::Isolated) {
+        record.mode = Some(state::ServiceMode::Shared);
+    }
     let _ = state::save(&paths.state_file(), &store);
     projects
 }
@@ -890,7 +892,7 @@ fn forget_failed_isolation(
 /// Whether a record is isolated with a live process running against its
 /// services — a switch some other start completed.
 fn switched_by_another_start(record: &WorktreeRecord) -> bool {
-    record.isolated
+    record.mode() == state::ServiceMode::Isolated
         && record.processes.values().any(|p| {
             matches!(
                 p.phase,
@@ -1274,7 +1276,7 @@ pub struct ServiceStatus {
 pub fn service_statuses(record: &WorktreeRecord) -> Vec<ServiceStatus> {
     recorded_service_statuses(record)
         .into_iter()
-        .filter(|status| record.isolated || status.port.is_some())
+        .filter(|status| record.mode() == state::ServiceMode::Isolated || status.port.is_some())
         .collect()
 }
 
@@ -1401,7 +1403,7 @@ pub fn resolved_env(
         );
     }
     let mut out: BTreeMap<String, String> = BTreeMap::new();
-    if record.isolated {
+    if record.mode() == state::ServiceMode::Isolated {
         out.extend(resolve_service_env(
             paths,
             config,

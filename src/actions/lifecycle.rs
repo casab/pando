@@ -11,7 +11,7 @@ use crate::detect;
 use crate::paths::PandoPaths;
 use crate::ports;
 use crate::process::{self as proc, SpawnOptions};
-use crate::state::{self, Phase, ProcessRecord, WorktreeRecord};
+use crate::state::{self, Phase, ProcessRecord, ServiceMode, WorktreeRecord};
 use crate::template;
 use crate::worktree::Worktree;
 
@@ -53,6 +53,20 @@ pub enum Mode {
     /// The project's shared services, and the private copies stopped. The
     /// way back.
     Shared,
+    /// The project's own servers, with a namespace of this worktree's own
+    /// in each. Not something a start can do yet.
+    Namespaced,
+}
+
+impl From<ServiceMode> for Mode {
+    /// The start that puts a worktree in this mode.
+    fn from(mode: ServiceMode) -> Mode {
+        match mode {
+            ServiceMode::Shared => Mode::Shared,
+            ServiceMode::Namespaced => Mode::Namespaced,
+            ServiceMode::Isolated => Mode::Isolated,
+        }
+    }
 }
 
 impl Mode {
@@ -179,6 +193,9 @@ fn start_checked(
     mut preflighted: bool,
     progress: &dyn Fn(&str),
 ) -> Result<StartReport> {
+    if mode == Mode::Namespaced {
+        bail!("pando cannot start a worktree namespaced yet — start it shared or isolated");
+    }
     let worktree = find_worktree(paths, name)?;
     // Before anything is installed, signalled or spawned: a `--only` naming
     // a process that does not exist must have no side effects at all.
@@ -255,10 +272,13 @@ fn start_checked(
     // start that changes the answer is a start that has to replace the
     // processes: an application still pointed at a database that is going
     // away is not running in the mode it was asked for.
-    let was_isolated = store.worktrees.get(name).is_some_and(|r| r.isolated);
+    let was_isolated = store
+        .worktrees
+        .get(name)
+        .is_some_and(|r| r.mode() == ServiceMode::Isolated);
     let isolate = isolatable
         && match mode {
-            Mode::Shared => false,
+            Mode::Shared | Mode::Namespaced => false,
             Mode::Isolated => true,
             Mode::Remembered => was_isolated,
         };
@@ -388,7 +408,9 @@ fn start_checked(
     // worktree pando can no longer isolate is one whose next start is a
     // shared one, and there is no container to contradict that.
     if !isolate {
-        record.isolated = false;
+        if record.mode == Some(ServiceMode::Isolated) {
+            record.mode = Some(ServiceMode::Shared);
+        }
         // A worktree on the shared services owns no service ports: the
         // window this start re-derives has no room for them. And a record
         // whose service was never brought up — what a failed isolated
@@ -661,7 +683,7 @@ fn start_checked(
             ));
         }
     }
-    let running_isolated = record.isolated;
+    let running_isolated = record.mode() == ServiceMode::Isolated;
     let mut replace: Vec<(String, i32)> = Vec::new();
     for (process_name, _) in &selection {
         if already.contains(process_name) {
@@ -724,7 +746,10 @@ fn start_checked(
     // run in the mode this flag says — see above — and until this point
     // they were the shared ones.
     if let Some(record) = store.worktrees.get_mut(name) {
-        record.isolated = isolate;
+        record.mode = Some(match isolate {
+            true => ServiceMode::Isolated,
+            false => ServiceMode::Shared,
+        });
     }
 
     let mut started: Vec<StartedProcess> = Vec::new();
@@ -1356,7 +1381,12 @@ fn mode_would_change(paths: &PandoPaths, config: &Config, name: &str, mode: Mode
     }
     let was_isolated = state::load(&paths.state_file())
         .ok()
-        .and_then(|store| store.worktrees.get(name).map(|r| r.isolated))
+        .and_then(|store| {
+            store
+                .worktrees
+                .get(name)
+                .map(|r| r.mode() == ServiceMode::Isolated)
+        })
         .unwrap_or(false);
     let isolate = !service_roles(config).is_empty() && mode == Mode::Isolated;
     was_isolated != isolate
@@ -1370,10 +1400,15 @@ pub(super) fn would_isolate(paths: &PandoPaths, config: &Config, name: &str, mod
     }
     match mode {
         Mode::Isolated => true,
-        Mode::Shared => false,
+        Mode::Shared | Mode::Namespaced => false,
         Mode::Remembered => state::load(&paths.state_file())
             .ok()
-            .and_then(|store| store.worktrees.get(name).map(|r| r.isolated))
+            .and_then(|store| {
+                store
+                    .worktrees
+                    .get(name)
+                    .map(|r| r.mode() == ServiceMode::Isolated)
+            })
             .unwrap_or(false),
     }
 }
@@ -1386,7 +1421,12 @@ fn would_switch_to_isolated(paths: &PandoPaths, config: &Config, name: &str, mod
         && would_isolate(paths, config, name, mode)
         && !state::load(&paths.state_file())
             .ok()
-            .and_then(|store| store.worktrees.get(name).map(|r| r.isolated))
+            .and_then(|store| {
+                store
+                    .worktrees
+                    .get(name)
+                    .map(|r| r.mode() == ServiceMode::Isolated)
+            })
             .unwrap_or(false)
 }
 

@@ -8,7 +8,7 @@ use crate::actions;
 use crate::actions::worktree_url;
 use crate::cache;
 use crate::paths::PandoPaths;
-use crate::state::{Aggregate, WorktreeRecord};
+use crate::state::{Aggregate, ServiceMode, WorktreeRecord};
 use crate::term::{Paint, Style, ellipsize_distinct};
 use crate::worktree::{PrState, Worktree};
 use anyhow::Result;
@@ -280,10 +280,13 @@ pub fn ls_text_with<W: Write>(paths: &PandoPaths, out: &mut W, view: &LsView) ->
         .map(|w| refreshed.state.worktrees.get(&w.name))
         .collect();
     // A column earns its place when some row has something to say in it:
-    // a project that never isolates has no MODE, one with nothing shared
-    // has no PUBLIC, and one whose every worktree is named for its branch
-    // has no BRANCH — the name already said it.
-    let any_isolated = records.iter().flatten().any(|r| r.isolated);
+    // a project that never leaves the shared services has no MODE, one
+    // with nothing shared has no PUBLIC, and one whose every worktree is
+    // named for its branch has no BRANCH — the name already said it.
+    let any_own_data = records
+        .iter()
+        .flatten()
+        .any(|r| r.mode() != ServiceMode::Shared);
     let any_shared = records.iter().flatten().any(|r| r.share.is_some());
     let any_renamed = worktrees.iter().any(|w| !named_for_branch(w));
 
@@ -299,7 +302,7 @@ pub fn ls_text_with<W: Write>(paths: &PandoPaths, out: &mut W, view: &LsView) ->
             (Col::Ports, ports_cell(record, aggregate.as_ref())),
             (Col::Git, git_cell(w, created)),
         ]);
-        if any_isolated {
+        if any_own_data {
             row.insert(Col::Mode, mode_cell(record));
         }
         let mut compact = BTreeMap::new();
@@ -460,12 +463,12 @@ fn ports_cell(record: Option<&WorktreeRecord>, aggregate: Option<&Aggregate>) ->
     Cell::new(text, aggregate.is_none().then_some(Paint::Faint))
 }
 
-/// Whether the worktree runs private copies of the project's services, in
-/// the words `start --isolated` and `start --shared` use.
+/// Which services the worktree talks to, in the words `start --isolated`,
+/// `start --namespaced` and `start --shared` use.
 fn mode_cell(record: Option<&WorktreeRecord>) -> Cell {
-    match record {
-        Some(r) if r.isolated => Cell::new("isolated", None),
-        Some(_) => Cell::new("shared", Some(Paint::Faint)),
+    match record.map(WorktreeRecord::mode) {
+        Some(ServiceMode::Shared) => Cell::new("shared", Some(Paint::Faint)),
+        Some(mode) => Cell::new(mode.word(), None),
         None => Cell::dash(),
     }
 }
@@ -527,6 +530,8 @@ struct WorktreeOut {
     ahead: Option<u32>,
     behind: Option<u32>,
     created_by_pando: bool,
+    /// Which services it talks to: `shared`, `namespaced` or `isolated`.
+    mode: ServiceMode,
     prunable: bool,
     /// `null` when unlocked; the lock reason, possibly empty, when locked.
     locked: Option<String>,
@@ -542,7 +547,11 @@ struct PrOut {
 
 pub fn ls_json<W: Write>(paths: &PandoPaths, out: &mut W) -> Result<()> {
     let worktrees = actions::ls(paths)?;
-    let owned = actions::created_by_pando(paths, &worktrees);
+    let refreshed = actions::refresh(paths);
+    let owned = actions::Ownership {
+        by_name: actions::ownership(&refreshed.state, &worktrees),
+        warning: refreshed.warning.clone(),
+    };
     warn_about(&owned);
     // Cache only: the CLI never spawns `gh`, so `ls --json` stays fast and
     // works offline. The TUI is what refreshes this.
@@ -568,8 +577,15 @@ pub fn ls_json<W: Write>(paths: &PandoPaths, out: &mut W) -> Result<()> {
                         state: p.state,
                         url: p.url.clone(),
                     });
+                let mode = refreshed
+                    .state
+                    .worktrees
+                    .get(&w.name)
+                    .map(WorktreeRecord::mode)
+                    .unwrap_or_default();
                 WorktreeOut {
                     created_by_pando: owned.by_name.get(&w.name).copied().unwrap_or(false),
+                    mode,
                     name: w.name,
                     path: w.path.display().to_string(),
                     branch: w.branch,

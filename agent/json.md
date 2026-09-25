@@ -258,7 +258,8 @@ half `signals` deliberately leaves out. It writes nothing anywhere.
   "tools":    [ { "name": "git", "path": "/usr/bin/git", "version": "...",
                   "detail": null, "needed_for": "...", "found": true } ],
   "worktrees":[ { "name": "...", "path": "...", "phase": "...", "created_by_pando": true,
-                  "isolated": false, "locked": false, "prunable": false,
+                  "mode": "shared|namespaced|isolated", "isolated": false,
+                  "locked": false, "prunable": false,
                   "prunable_reason": null, "known_to_git": true,
                   "processes": [...], "services": [...] } ],
   "services": { "compose": [...], "native": [...], "isolation": { ... } },
@@ -312,7 +313,8 @@ rather than re-deriving.
       "ports": { "web": 17008 },       // the roles this worktree holds
       "observed_ports": [17008],       // what is actually listening
       "url": "http://localhost:17008", // the readiness role's URL, or null
-      "isolated": false,               // runs private copies of the services
+      "mode": "shared|namespaced|isolated", // which services it talks to
+      "isolated": false,               // true exactly when mode is "isolated"
       "share": null,                   // or { url, local_port, proxy_port, since }
       "processes": {
         "dev": { "pid": 1234, "phase": "starting|running|failed",
@@ -328,6 +330,14 @@ rather than re-deriving.
   ]
 }
 ```
+
+`mode` says which services a worktree's processes talk to, or last
+talked to once it is stopped: `shared` is the main checkout's servers and
+its data, `namespaced` the main checkout's servers with a database and a
+slot of the worktree's own in them, and `isolated` servers of its own. A
+worktree never started reads `shared`. `isolated` came first and stays,
+true exactly when `mode` is `isolated`, so a program written against it
+keeps working.
 
 `phase` is per process; a worktree is only as up as its worst one.
 `reason` is non-null exactly when `phase` is `failed`, and it is the
@@ -347,7 +357,8 @@ when the share is behind an auth command.
   "worktrees": [
     { "name": "feat+one", "path": "...", "branch": "feat/one", "head": "abc1234",
       "detached": false, "dirty": false, "ahead": 0, "behind": 0,
-      "created_by_pando": true, "prunable": false, "locked": null,
+      "created_by_pando": true, "mode": "shared|namespaced|isolated",
+      "prunable": false, "locked": null,
       "pr": { "number": 12, "state": "open|merged|closed", "url": "..." } }
   ]
 }

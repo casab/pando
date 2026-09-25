@@ -7097,12 +7097,12 @@ fn a_shared_worktrees_leftover_compose_record_is_kept_but_not_shown() {
     );
 
     // An isolated worktree's stopped service is a real row.
-    record.isolated = true;
+    record.mode = Some(crate::state::ServiceMode::Isolated);
     assert_eq!(service_statuses(&record).len(), 1);
 
     // And so is a service a switch to isolated is bringing up: it has its
     // port before the worktree is flagged.
-    record.isolated = false;
+    record.mode = Some(crate::state::ServiceMode::Shared);
     record.services[0].port = Some(17_010);
     assert_eq!(service_statuses(&record).len(), 1);
 }
@@ -7276,7 +7276,7 @@ fn a_plain_start_of_an_isolated_worktree_asks_the_schema_question() {
     super::resolve_for_start(&fx.paths, &loaded, &name, Mode::Remembered, &refuse, &noop).unwrap();
 
     let mut store = fx.state();
-    store.worktrees.get_mut(&name).unwrap().isolated = true;
+    store.worktrees.get_mut(&name).unwrap().mode = Some(crate::state::ServiceMode::Isolated);
     state::save(&fx.paths.state_file(), &store).unwrap();
     let (ask, asked) = scripted(vec![Answer::None]);
     super::resolve_for_start(&fx.paths, &loaded, &name, Mode::Remembered, &ask, &noop).unwrap();
@@ -7612,7 +7612,7 @@ fn a_failed_switchs_undo_leaves_a_switch_another_start_completed() {
     );
     let mut store = state::State::new();
     let mut record = WorktreeRecord::new(fx.root.clone(), false);
-    record.isolated = true;
+    record.mode = Some(crate::state::ServiceMode::Isolated);
     record.processes.insert(
         "dev".to_string(),
         ProcessRecord {
@@ -7636,7 +7636,10 @@ fn a_failed_switchs_undo_leaves_a_switch_another_start_completed() {
     super::services::undo_failed_isolation(&fx.paths, &fx.config, "feat+one", &BTreeMap::new());
 
     let after = &fx.state().worktrees["feat+one"];
-    assert!(after.isolated, "the other start's switch was undone");
+    assert!(
+        after.mode() == crate::state::ServiceMode::Isolated,
+        "the other start's switch was undone"
+    );
     assert_eq!(after.services, record.services);
 }
 
@@ -7657,7 +7660,7 @@ fn a_plain_start_takes_down_the_services_an_interrupted_switch_left_running() {
     );
     let mut store = fx.state();
     let record = store.worktrees.get_mut(&name).expect("new wrote a record");
-    assert!(!record.isolated);
+    assert!(record.mode() != crate::state::ServiceMode::Isolated);
     record.services.push(state::ServiceRecord {
         name: "postgres".to_string(),
         kind: state::ServiceKind::Native,
