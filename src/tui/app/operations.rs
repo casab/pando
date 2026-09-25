@@ -302,7 +302,7 @@ impl App {
         self.restart_selected_only(mode, None);
     }
 
-    /// `p`: only the process the detail pane's `▸` marks — `restart
+    /// `P`: only the process the detail pane's `▸` marks — `restart
     /// --only`. The others keep running, and so do their logs.
     pub(super) fn restart_selected_process(&mut self) {
         let Some(name) = self.selected_name() else {

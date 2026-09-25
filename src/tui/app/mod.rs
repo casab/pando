@@ -27,7 +27,9 @@ mod tails;
 
 pub use ages::{compact_age, parse_git_relative};
 pub use background::{AppEvent, Snapshot, snapshot};
-pub use dialogs::{BranchLoadState, CreateRow, Modal, RemoveBlocker, base_choices, create_rows};
+pub use dialogs::{
+    BranchLoadState, CreateRow, Modal, RemoveBlocker, base_choices, create_rows, pr_rows,
+};
 pub use keymap::{INSPECT_LEGEND, KeyHelp, LIST_KEYS, LIST_LEGEND, LOG_KEYS, OVERLAY_KEYS};
 pub use launch::{
     Launch, LaunchEnv, LaunchRequest, is_terminal_editor, plan_editor, plan_shell, said_after,
@@ -194,6 +196,13 @@ pub struct App {
     /// it appears or changes rather than on every refresh.
     pub state_warning: Option<String>,
     pub prs: HashMap<String, PrInfo>,
+    /// Every pull request the last fetch listed, in `gh`'s order: `prs`
+    /// is keyed by branch, and two forks' `main` are one key.
+    pub pr_list: Vec<PrInfo>,
+    /// A fetch is on its way; the picker says so rather than "none".
+    pub pr_fetching: bool,
+    /// Why the last fetch failed, for the picker to say.
+    pub pr_error: Option<String>,
     /// Which GitHub account `gh` acts as for this project; `None` while
     /// the first answer is on its way.
     pub gh_account: Option<GhAccount>,
@@ -280,6 +289,9 @@ impl App {
             viewer_height: 0,
             state_warning: None,
             prs: HashMap::new(),
+            pr_list: Vec::new(),
+            pr_fetching: false,
+            pr_error: None,
             gh_account: None,
             list_state: ListState::default(),
             filter: String::new(),
@@ -405,12 +417,20 @@ impl App {
                 false
             }
             AppEvent::PrsReady(Ok(prs)) => {
-                self.prs = prs.into_iter().map(|p| (p.branch.clone(), p)).collect();
+                self.pr_fetching = false;
+                self.pr_error = None;
+                self.prs = prs.iter().map(|p| (p.branch.clone(), p.clone())).collect();
+                self.pr_list = prs;
                 self.save_pr_cache();
                 true
             }
-            // A missing or unauthenticated `gh` just means no chips.
-            AppEvent::PrsReady(Err(_)) => false,
+            // A missing or unauthenticated `gh` just means no chips — and,
+            // in the picker, the reason there is no list.
+            AppEvent::PrsReady(Err(e)) => {
+                self.pr_fetching = false;
+                self.pr_error = Some(e);
+                matches!(self.modal, Some(Modal::PullRequests { .. }))
+            }
             AppEvent::GhAccountReady(account) => {
                 let changed = self.gh_account.as_ref() != Some(&account);
                 self.gh_account = Some(account);
@@ -473,6 +493,7 @@ impl App {
             self.modal,
             Some(
                 Modal::Create { .. }
+                    | Modal::PullRequests { .. }
                     | Modal::Remove { .. }
                     | Modal::Unshare { .. }
                     | Modal::StopAll { .. }
@@ -575,6 +596,10 @@ impl App {
                 self.handle_create_key(key, input, branches, selected, base);
                 return;
             }
+            Some(Modal::PullRequests { input, selected }) => {
+                self.handle_pull_request_key(key, input, selected);
+                return;
+            }
             Some(Modal::StopAll { names }) => {
                 match key.code {
                     KeyCode::Char('y') | KeyCode::Enter => self.stop_everything(),
@@ -633,6 +658,7 @@ impl App {
             }
             KeyCode::Char('/') => self.mode = Mode::Filter,
             KeyCode::Char('n') => self.open_create(),
+            KeyCode::Char('p') => self.open_pull_requests(),
             KeyCode::Char('d') => self.open_remove(),
             KeyCode::Char('y') => self.copy_selected_path(),
             KeyCode::Char('Y') => self.copy_selected_url(),
@@ -649,7 +675,7 @@ impl App {
             KeyCode::Char('x') => self.stop_selected(),
             KeyCode::Char('r') => self.restart_selected(),
             // The one process the detail pane's `▸` marks, which tab moves.
-            KeyCode::Char('p') => self.restart_selected_process(),
+            KeyCode::Char('P') => self.restart_selected_process(),
             KeyCode::Char('X') => self.confirm_stop_all(),
             KeyCode::Char('c') => self.open_shell(),
             KeyCode::Char('e') => self.open_editor(),
@@ -1046,7 +1072,7 @@ impl App {
         died
     }
 
-    /// Says so for each process that died, whenever it did: after a `p`, or
+    /// Says so for each process that died, whenever it did: after a `P`, or
     /// an hour into a run. Otherwise the last word on screen is the
     /// `ready` that preceded it.
     fn announce_deaths(&mut self, died: Vec<Death>) {
@@ -1123,6 +1149,9 @@ impl App {
             viewer_height: 0,
             state_warning: None,
             prs: HashMap::new(),
+            pr_list: Vec::new(),
+            pr_fetching: false,
+            pr_error: None,
             gh_account: None,
             list_state: ListState::default(),
             filter: String::new(),

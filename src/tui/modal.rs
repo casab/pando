@@ -1,4 +1,5 @@
-//! Overlays: create, remove, unshare, questions, help, messages. Pure
+//! Overlays: create, pull requests, remove, unshare, questions, help,
+//! messages. Pure
 //! painting, like `render`.
 //!
 //! Every popup is sized to what it holds, with a margin inside its border,
@@ -13,14 +14,14 @@ use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph};
 
 use super::app::{
     App, BranchLoadState, CreateRow, INSPECT_LEGEND, KeyHelp, LIST_KEYS, LIST_LEGEND, LOG_KEYS,
-    Modal, RemoveBlocker, StatusKind, create_rows,
+    Modal, RemoveBlocker, StatusKind, create_rows, pr_rows,
 };
 use super::render::{centered_box, chunk_cells, text_width, truncate, truncate_middle, wrap_text};
 use crate::theme::{
     blue, border, cyan, green, highlight_bg, magenta, orange, red, surface, text, text_dim,
     text_muted, yellow,
 };
-use crate::worktree::BranchSource;
+use crate::worktree::{BranchSource, PrState};
 
 /// Popups never shrink below this; a narrow tmux split gets a readable box
 /// rather than a sliver.
@@ -52,6 +53,9 @@ pub fn render_modal(f: &mut Frame, area: Rect, modal: &Modal, app: &App) -> Opti
             selected,
             base,
         } => render_create(f, area, input, branches, *selected, base.as_deref(), app),
+        Modal::PullRequests { input, selected } => {
+            render_pull_requests(f, area, input, *selected, app)
+        }
         Modal::Remove { name, .. } => {
             render_remove(f, area, &app.label_of(name), &app.remove_blockers(name))
         }
@@ -499,6 +503,149 @@ fn render_create(
         })
         .collect();
     f.render_widget(Paragraph::new(lines), list_area);
+}
+
+/// The open pull requests, one a row: number, title, and what enter does
+/// with it. The selected one's branch sits under the list, since that is
+/// what the worktree will check out.
+fn render_pull_requests(f: &mut Frame, area: Rect, input: &str, selected: usize, app: &App) {
+    let width = 76.min(max_content_width(area));
+    // The filter, a gap, the list, a gap, the branch, the keys.
+    let height = 2 + CREATE_LIST_ROWS + 3;
+    let Some(inner) = popup(f, area, "open pull requests", None, width, height) else {
+        return;
+    };
+    let [prompt, _, list_area, _, branch_row, keys] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    let width = inner.width as usize;
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("filter ", Style::new().fg(text_muted())),
+            Span::styled(
+                truncate_middle(input, width.saturating_sub(8)),
+                Style::new().fg(text()).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("▏", Style::new().fg(orange())),
+        ])),
+        prompt,
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            key_span("⏎"),
+            hint_span(" worktree   "),
+            key_span("↑↓"),
+            hint_span(" choose   "),
+            key_span("esc"),
+            hint_span(" cancel"),
+        ])),
+        keys,
+    );
+
+    let rows = pr_rows(&app.pr_list, input);
+    if rows.is_empty() {
+        let (message, color) = if app.pr_fetching {
+            ("asking GitHub…".to_string(), text_muted())
+        } else if let Some(error) = app.pr_error.as_deref() {
+            (error.to_string(), red())
+        } else if app.pr_list.iter().any(|pr| pr.state == PrState::Open) {
+            ("no open pull request matches".to_string(), text_muted())
+        } else {
+            ("no open pull requests".to_string(), text_muted())
+        };
+        let lines: Vec<Line> = wrap_text(&message, width)
+            .into_iter()
+            .take(list_area.height as usize)
+            .map(|line| Line::styled(line, Style::new().fg(color)))
+            .collect();
+        f.render_widget(Paragraph::new(lines), list_area);
+        return;
+    }
+
+    let selected = selected.min(rows.len() - 1);
+    let visible = list_area.height as usize;
+    let start = selected.saturating_sub(visible.saturating_sub(1));
+    let number_width = rows
+        .iter()
+        .map(|pr| text_width(&format!("#{}", pr.number)))
+        .max()
+        .unwrap_or(0);
+    let lines: Vec<Line> = rows
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+        .map(|(i, pr)| {
+            let marker = if i == selected { "▸ " } else { "  " };
+            let number = format!("{:<number_width$} ", format!("#{}", pr.number));
+            let branch = pr.local_branch();
+            let (tag, color) = if app.is_main_branch(&branch) {
+                ("main checkout".to_string(), text_muted())
+            } else if app.worktree_for_branch(&branch).is_some() {
+                ("has a worktree".to_string(), orange())
+            } else if pr.draft {
+                (format!("draft · @{}", pr.author), text_dim())
+            } else {
+                (format!("@{}", pr.author), text_dim())
+            };
+            let fixed = text_width(marker) + text_width(&number) + text_width(&tag) + 2;
+            let title = truncate(&pr.title, width.saturating_sub(fixed));
+            let gap = width
+                .saturating_sub(
+                    text_width(marker)
+                        + text_width(&number)
+                        + text_width(&title)
+                        + text_width(&tag),
+                )
+                .max(1);
+            let mut line = vec![
+                Span::styled(marker, Style::new().fg(orange())),
+                Span::styled(number, Style::new().fg(green())),
+                Span::styled(title, Style::new().fg(text())),
+                Span::raw(" ".repeat(gap)),
+                Span::styled(tag, Style::new().fg(color)),
+            ];
+            if i == selected {
+                line = line
+                    .into_iter()
+                    .map(|s| Span::styled(s.content, s.style.bg(highlight_bg())))
+                    .collect();
+            }
+            super::render::truncate_line(Line::from(line), width)
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), list_area);
+
+    // What enter will do with the selected one, said before it is pressed.
+    let pr = rows[selected];
+    let branch = pr.local_branch();
+    let what = if app.is_main_branch(&branch) {
+        "checked out in the main checkout"
+    } else if app.worktree_for_branch(&branch).is_some() {
+        "⏎ selects its worktree"
+    } else if pr.cross_repository {
+        "from a fork · ⏎ fetches it into a worktree"
+    } else {
+        "⏎ makes a worktree for it"
+    };
+    let branch_line = Line::from(vec![
+        Span::styled(
+            truncate_middle(&branch, width / 2),
+            Style::new().fg(cyan()).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("  {what}"), Style::new().fg(text_muted())),
+    ]);
+    f.render_widget(
+        Paragraph::new(super::render::truncate_line(branch_line, width)),
+        branch_row,
+    );
 }
 
 /// Confirming that a public URL goes away.

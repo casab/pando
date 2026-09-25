@@ -5457,6 +5457,71 @@ fn new_fetches_a_remote_branch_that_has_not_been_fetched_yet() {
     );
 }
 
+fn open_pr(number: u32, branch: &str, cross_repository: bool) -> worktree::PrInfo {
+    worktree::PrInfo {
+        number,
+        title: format!("PR {number}"),
+        branch: branch.into(),
+        author: "someone".into(),
+        draft: false,
+        state: worktree::PrState::Open,
+        url: String::new(),
+        cross_repository,
+    }
+}
+
+fn head_of(dir: &Path, rev: &str) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", rev])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn a_pull_request_from_origin_checks_out_its_own_branch() {
+    let fx = fixture_with_origin(&["feat/pr"]);
+    let name = new_for_pr(&fx.paths, &fx.config, &open_pr(3, "feat/pr", false), &noop).unwrap();
+    assert_eq!(name, "feat+pr");
+    assert_eq!(
+        upstream_of(&fx.root, "feat/pr").as_deref(),
+        Some("origin/feat/pr")
+    );
+}
+
+// A fork's branch is on origin only as `refs/pull/<n>/head`, and its name —
+// here `main` — is one the main checkout already has.
+#[test]
+fn a_pull_request_from_a_fork_is_fetched_into_a_branch_of_its_own() {
+    let fx = fixture_with_origin(&[]);
+    let seed = fx.root.parent().unwrap().join("seed");
+    git(
+        &seed,
+        &["commit", "--quiet", "--allow-empty", "-m", "fork work"],
+    );
+    git(
+        &seed,
+        &["push", "--quiet", "origin", "HEAD:refs/pull/7/head"],
+    );
+    let fork_head = head_of(&seed, "HEAD");
+
+    let name = new_for_pr(&fx.paths, &fx.config, &open_pr(7, "main", true), &noop).unwrap();
+    assert_eq!(name, "pr-7+main");
+    assert_eq!(head_of(&fx.worktrees_dir().join(&name), "HEAD"), fork_head);
+    assert_eq!(fx.names(), vec!["pr-7+main"]);
+}
+
+#[test]
+fn a_fork_pull_request_origin_does_not_have_leaves_no_branch_behind() {
+    let fx = fixture_with_origin(&[]);
+    let err = new_for_pr(&fx.paths, &fx.config, &open_pr(9, "main", true), &noop).unwrap_err();
+    assert!(format!("{err:#}").contains("could not fetch #9"), "{err:#}");
+    assert!(!ref_exists(&fx.root, "refs/heads/pr-9/main"));
+    assert!(fx.names().is_empty());
+}
+
 #[test]
 fn new_forks_from_the_requested_base() {
     let fx = fixture();

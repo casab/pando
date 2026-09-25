@@ -76,8 +76,8 @@ pub const LIST_KEYS: &[KeyHelp] = &[
         "restart it (start it when stopped)",
     ),
     key(
-        "p",
-        &[KeyCode::Char('p')],
+        "P",
+        &[KeyCode::Char('P')],
         "restart only the ▸ process (tab picks it)",
     ),
     key("o", &[KeyCode::Char('o')], "open its URL in the browser"),
@@ -111,6 +111,11 @@ pub const LIST_KEYS: &[KeyHelp] = &[
     ),
     key("tab", &[KeyCode::Tab], "preview the next process's log"),
     key("n", &[KeyCode::Char('n')], "new worktree"),
+    key(
+        "p",
+        &[KeyCode::Char('p')],
+        "open pull requests: ⏎ makes a worktree for one",
+    ),
     key("d", &[KeyCode::Char('d')], "remove it"),
     key("/", &[KeyCode::Char('/')], "filter by branch or name"),
     key(

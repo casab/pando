@@ -194,6 +194,43 @@ fn renders_at_any_terminal_size_without_panicking() {
     }
 }
 
+fn a_pr(number: u32, branch: &str, draft: bool, fork: bool) -> crate::worktree::PrInfo {
+    crate::worktree::PrInfo {
+        number,
+        title: format!("a pull request with a title long enough to be cut {number}"),
+        branch: branch.into(),
+        author: "someone".into(),
+        draft,
+        state: crate::worktree::PrState::Open,
+        url: String::new(),
+        cross_repository: fork,
+    }
+}
+
+// Open pull requests with a title each, the one that already has a
+// worktree marked, and merged ones left out.
+#[test]
+fn the_pull_request_picker_lists_the_open_ones() {
+    let mut app = test_app(&["feat+one"]);
+    app.pr_list = vec![
+        a_pr(12, "feat/new", true, false),
+        a_pr(11, "feat/one", false, false),
+        crate::worktree::PrInfo {
+            state: crate::worktree::PrState::Merged,
+            title: "long gone".into(),
+            ..a_pr(10, "feat/old", false, false)
+        },
+    ];
+    app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+    let rendered = text_of(&draw(&mut app, 120, 30));
+    assert!(rendered.contains("open pull requests"), "{rendered}");
+    assert!(rendered.contains("#12"), "{rendered}");
+    assert!(rendered.contains("draft · @someone"), "{rendered}");
+    assert!(rendered.contains("has a worktree"), "{rendered}");
+    assert!(!rendered.contains("long gone"), "{rendered}");
+    assert!(rendered.contains("⏎ makes a worktree for it"), "{rendered}");
+}
+
 #[test]
 fn renders_every_modal_at_any_terminal_size() {
     let (reply, _rx) = std::sync::mpsc::channel();
@@ -205,6 +242,10 @@ fn renders_every_modal_at_any_terminal_size() {
             branches: BranchLoadState::Loading,
             selected: 0,
             base: Some("origin/some-rather-long-release-branch".into()),
+        },
+        Modal::PullRequests {
+            input: "a filter that is rather long for the box it is typed in".into(),
+            selected: 3,
         },
         Modal::Remove {
             name: "feat+one".into(),
@@ -245,6 +286,10 @@ fn renders_every_modal_at_any_terminal_size() {
     ];
     for modal in modals {
         let mut app = test_app(&["feat+one"]);
+        app.pr_list = (0..12)
+            .map(|i| a_pr(900 + i, &format!("feat/{i}"), i % 3 == 0, i % 4 == 0))
+            .chain([a_pr(7, "feat/one", false, false)])
+            .collect();
         app.modal = Some(modal);
         for width in [1u16, 4, 20, 41, 80, 200, 1092, 1093, 1500, 2000, 3000] {
             for height in [1u16, 3, 8, 24] {
@@ -998,7 +1043,7 @@ fn the_tail_header_names_the_process_it_is_showing() {
         "and says how to see the other one: {rendered}"
     );
     assert!(
-        rendered.contains("p restarts it"),
+        rendered.contains("P restarts it"),
         "and how to restart just this one: {rendered}"
     );
     app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
@@ -2654,6 +2699,10 @@ fn wide_names_paint_at_any_terminal_size() {
             selected: 1,
             base: Some("起動".into()),
         }),
+        Some(Modal::PullRequests {
+            input: String::new(),
+            selected: 0,
+        }),
         Some(Modal::Remove {
             name: names[0].into(),
             created_by_pando: false,
@@ -2683,6 +2732,10 @@ fn wide_names_paint_at_any_terminal_size() {
     for modal in modals {
         let mut app = test_app(&names);
         app.main = Some(wt("日本語"));
+        app.pr_list = vec![crate::worktree::PrInfo {
+            title: "日本語のプルリクエストの題名がとても長い🎉".repeat(3),
+            ..a_pr(1, "ブランチ", true, true)
+        }];
         with_process(&mut app, names[0], running_phase());
         with_second_process(&mut app, names[0], "起動", running_phase());
         app.set_error(format!("{} 失敗しました", names[0]).repeat(4));

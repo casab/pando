@@ -737,6 +737,25 @@ pub struct PrInfo {
     pub draft: bool,
     pub state: PrState,
     pub url: String,
+    /// Opened from a fork: its branch lives in another repository, so
+    /// `origin` has it only as `refs/pull/<number>/head`. Absent from a
+    /// cache written before pando asked, which reads as not a fork.
+    #[serde(default)]
+    pub cross_repository: bool,
+}
+
+impl PrInfo {
+    /// The local branch a worktree for this pull request checks out: its
+    /// own branch when that lives on `origin`, and `pr-<number>/<branch>`
+    /// for a fork's, whose name — often `main` or `patch-1` — says nothing
+    /// and may already be taken here.
+    pub fn local_branch(&self) -> String {
+        if self.cross_repository {
+            format!("pr-{}/{}", self.number, self.branch)
+        } else {
+            self.branch.clone()
+        }
+    }
 }
 
 /// Pull requests via the `gh` CLI, which resolves the repository from the
@@ -753,7 +772,7 @@ pub fn list_prs(root: &Path) -> Result<Vec<PrInfo>> {
             "--limit",
             "300",
             "--json",
-            "number,title,headRefName,author,isDraft,state,url",
+            "number,title,headRefName,author,isDraft,state,url,isCrossRepository",
         ])
         .output()
         .context("spawn gh — is the GitHub CLI installed?")?;
@@ -851,6 +870,8 @@ fn parse_pr_list(json: &str) -> Result<Vec<PrInfo>> {
         is_draft: bool,
         state: String,
         url: String,
+        #[serde(rename = "isCrossRepository", default)]
+        is_cross_repository: bool,
     }
     let raw: Vec<RawPr> = serde_json::from_str(json).context("parse gh pr list JSON")?;
     Ok(raw
@@ -867,6 +888,7 @@ fn parse_pr_list(json: &str) -> Result<Vec<PrInfo>> {
                 _ => PrState::Closed,
             },
             url: p.url,
+            cross_repository: p.is_cross_repository,
         })
         .collect())
 }
@@ -1342,7 +1364,8 @@ bare
             {"author":{"login":"dev"},"headRefName":"docs/two","isDraft":false,"number":427,
              "title":"docs: two","state":"MERGED","url":"https://github.com/org/repo/pull/427"},
             {"author":{"login":"dev"},"headRefName":"feat/three","isDraft":false,"number":400,
-             "title":"abandoned","state":"CLOSED","url":"https://github.com/org/repo/pull/400"}
+             "title":"abandoned","state":"CLOSED","url":"https://github.com/org/repo/pull/400",
+             "isCrossRepository":true}
         ]"#;
         let prs = parse_pr_list(json).unwrap();
         assert_eq!(prs.len(), 3);
@@ -1352,6 +1375,25 @@ bare
         assert_eq!(prs[0].state, PrState::Open);
         assert_eq!(prs[1].state, PrState::Merged);
         assert_eq!(prs[2].state, PrState::Closed);
+        assert!(!prs[0].cross_repository);
+        assert!(prs[2].cross_repository);
+    }
+
+    #[test]
+    fn a_forks_pull_request_gets_a_local_branch_of_its_own() {
+        let mut pr = PrInfo {
+            number: 12,
+            title: "fix".into(),
+            branch: "main".into(),
+            author: "someone".into(),
+            draft: false,
+            state: PrState::Open,
+            url: String::new(),
+            cross_repository: false,
+        };
+        assert_eq!(pr.local_branch(), "main");
+        pr.cross_repository = true;
+        assert_eq!(pr.local_branch(), "pr-12/main");
     }
 
     /// A stand-in `gh` that prints `stdout` and `stderr` and exits `code`,

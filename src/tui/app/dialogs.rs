@@ -1,11 +1,12 @@
-//! The modals: create, remove, and the question a worker asks.
+//! The modals: create, pull requests, remove, and the question a worker
+//! asks.
 
 use anyhow::Result;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use std::sync::mpsc::Sender;
 
 use crate::actions;
-use crate::worktree::BranchEntry;
+use crate::worktree::{BranchEntry, PrInfo, PrState};
 
 use super::App;
 
@@ -18,6 +19,13 @@ pub enum Modal {
         /// What a new branch forks from, when it is not the default base.
         /// Tab walks the choices.
         base: Option<String>,
+    },
+    /// `p`: the project's open pull requests, narrowed by what is typed.
+    /// The list itself is the app's, read at every paint, so the answer to
+    /// the fetch opening this started lands in it while it is open.
+    PullRequests {
+        input: String,
+        selected: usize,
     },
     /// What would stop the removal, or what it would take with it, is not
     /// kept here: it is read off the app at every paint and every key, so
@@ -161,7 +169,93 @@ pub fn create_rows(input: &str, branches: &[BranchEntry]) -> Vec<CreateRow> {
     rows
 }
 
+/// Rows of the pull request picker: every open one, newest first as `gh`
+/// lists them, that the typed text finds in its number, title, branch or
+/// author.
+pub fn pr_rows<'a>(prs: &'a [PrInfo], input: &str) -> Vec<&'a PrInfo> {
+    let needle = input.trim().trim_start_matches('#').to_lowercase();
+    prs.iter()
+        .filter(|pr| pr.state == PrState::Open)
+        .filter(|pr| {
+            needle.is_empty()
+                || pr.number.to_string().starts_with(&needle)
+                || pr.title.to_lowercase().contains(&needle)
+                || pr.branch.to_lowercase().contains(&needle)
+                || pr.author.to_lowercase().contains(&needle)
+        })
+        .collect()
+}
+
 impl App {
+    pub(super) fn handle_pull_request_key(
+        &mut self,
+        key: KeyEvent,
+        mut input: String,
+        mut selected: usize,
+    ) {
+        let count = pr_rows(&self.pr_list, &input).len();
+        match key.code {
+            KeyCode::Esc => return,
+            KeyCode::Down => selected = (selected + 1).min(count.saturating_sub(1)),
+            KeyCode::Up => selected = selected.saturating_sub(1),
+            KeyCode::Backspace => {
+                input.pop();
+                selected = 0;
+            }
+            KeyCode::Char(c) => {
+                input.push(c);
+                selected = 0;
+            }
+            KeyCode::Enter => {
+                let chosen = pr_rows(&self.pr_list, &input)
+                    .get(selected)
+                    .map(|pr| (*pr).clone());
+                let Some(pr) = chosen else {
+                    if self.pr_fetching {
+                        self.set_status("still asking GitHub…");
+                    } else {
+                        self.set_error("no open pull request to make a worktree for");
+                    }
+                    self.modal = Some(Modal::PullRequests { input, selected });
+                    return;
+                };
+                let branch = pr.local_branch();
+                if self.is_main_branch(&branch) {
+                    self.set_error(format!(
+                        "#{}'s branch {branch} is checked out in the main checkout",
+                        pr.number
+                    ));
+                } else if let Some(existing) = self.worktree_for_branch(&branch) {
+                    // The same as `n` on a branch that has one: enter goes
+                    // to it.
+                    self.filter.clear();
+                    self.mode = super::Mode::Normal;
+                    self.refilter_keeping(Some(existing), 0);
+                    self.tail_index = 0;
+                    self.tail_scroll = 0;
+                    self.set_status(format!(
+                        "#{} already has a worktree — selected it",
+                        pr.number
+                    ));
+                    return;
+                } else if self.spawn_create_pr(pr) {
+                    return; // closes only once the work is under way
+                }
+            }
+            _ => {}
+        }
+        self.modal = Some(Modal::PullRequests { input, selected });
+    }
+
+    pub(super) fn open_pull_requests(&mut self) {
+        self.modal = Some(Modal::PullRequests {
+            input: String::new(),
+            selected: 0,
+        });
+        // What the last fetch said shows at once; this brings it up to date.
+        self.spawn_pr_fetch();
+    }
+
     pub(super) fn handle_create_key(
         &mut self,
         key: KeyEvent,

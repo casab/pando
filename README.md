@@ -97,11 +97,12 @@ From a script they return once everything is spawned; `--wait` and
 ⏎        open the logs when it runs, start it when it is stopped
 s i S    start it: as last time, isolated, or on the shared services
 x X      stop it, or stop everything
-r p      restart it, or only the selected process
+r P      restart it, or only the selected process
 o O Y    open its URL, open the public one, copy the URL
 t        share it publicly, or stop sharing
 c e      a shell in it, or open it in your editor
 n d      new worktree, remove one
+p        open pull requests: ⏎ makes a worktree for one
 m ?      what pando said in full, and every key
 ```
 

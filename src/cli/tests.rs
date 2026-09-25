@@ -2262,6 +2262,7 @@ fn ls_json_fills_the_pr_field_from_the_cache() {
             draft: false,
             state: PrState::Open,
             url: "https://example.test/pull/42".into(),
+            cross_repository: false,
         },
     );
     cache::save_prs(&fx.paths.pr_cache_file(), &prs).unwrap();

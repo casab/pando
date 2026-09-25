@@ -386,7 +386,13 @@ impl App {
         });
     }
 
-    pub fn spawn_pr_fetch(&self) {
+    /// One at a time: `p` pressed twice does not ask GitHub twice.
+    pub fn spawn_pr_fetch(&mut self) {
+        // Tests press `p` like any other key; they must not reach GitHub.
+        if cfg!(test) || self.pr_fetching {
+            return;
+        }
+        self.pr_fetching = true;
         let root = self.paths.root().to_path_buf();
         let tx = self.event_tx.clone();
         thread::spawn(move || {

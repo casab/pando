@@ -174,6 +174,7 @@ mod tests {
             draft: false,
             state: crate::worktree::PrState::Merged,
             url: format!("https://github.com/org/repo/pull/{number}"),
+            cross_repository: false,
         }
     }
 

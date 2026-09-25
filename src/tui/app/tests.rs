@@ -462,6 +462,101 @@ fn the_create_modal_goes_to_a_worktree_that_already_exists() {
     assert!(message.contains("already has a worktree"), "{message}");
 }
 
+fn a_pr(number: u32, branch: &str, state: crate::worktree::PrState) -> crate::worktree::PrInfo {
+    crate::worktree::PrInfo {
+        number,
+        title: format!("title of {number}"),
+        branch: branch.into(),
+        author: "someone".into(),
+        draft: false,
+        state,
+        url: format!("https://example.test/pull/{number}"),
+        cross_repository: false,
+    }
+}
+
+fn app_with_prs(names: &[&str]) -> App {
+    use crate::worktree::PrState::{Merged, Open};
+    let mut app = test_app(names);
+    app.pr_list = vec![
+        a_pr(12, "feat/new", Open),
+        a_pr(11, "feat/one", Open),
+        a_pr(10, "feat/old", Merged),
+    ];
+    app
+}
+
+fn picker_rows(app: &App) -> Vec<u32> {
+    match &app.modal {
+        Some(Modal::PullRequests { input, .. }) => pr_rows(&app.pr_list, input)
+            .iter()
+            .map(|pr| pr.number)
+            .collect(),
+        _ => panic!("the pull request picker is not open"),
+    }
+}
+
+#[test]
+fn p_lists_the_open_pull_requests_and_typing_narrows_them() {
+    let mut app = app_with_prs(&["feat+one"]);
+    press(&mut app, KeyCode::Char('p'));
+    assert_eq!(
+        picker_rows(&app),
+        vec![12, 11],
+        "merged ones are not listed"
+    );
+    type_str(&mut app, "#11");
+    assert_eq!(picker_rows(&app), vec![11]);
+    press(&mut app, KeyCode::Esc);
+    assert!(app.modal.is_none());
+}
+
+#[test]
+fn enter_on_a_pull_request_makes_a_worktree_for_it() {
+    let mut app = app_with_prs(&["feat+one"]);
+    press(&mut app, KeyCode::Char('p'));
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        app.modal.is_none(),
+        "the picker closes once the work starts"
+    );
+    let pending = app.pending.as_ref().expect("a worker started");
+    assert_eq!(pending.kind, PendingKind::Create);
+    assert_eq!(pending.name, "feat+new");
+    assert_eq!(pending.label, "#12 feat/new");
+}
+
+#[test]
+fn enter_on_a_pull_request_with_a_worktree_selects_it() {
+    let mut app = app_with_prs(&["feat+two", "feat+one"]);
+    assert_eq!(app.selected_worktree().unwrap().name, "feat+two");
+    press(&mut app, KeyCode::Char('p'));
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    assert!(app.modal.is_none());
+    assert!(app.pending.is_none(), "no worker should have started");
+    assert_eq!(app.selected_worktree().unwrap().name, "feat+one");
+    let (message, is_error) = app.active_status().unwrap();
+    assert!(
+        !is_error && message.contains("#11 already has a worktree"),
+        "{message}"
+    );
+}
+
+#[test]
+fn the_picker_says_why_it_has_no_pull_requests() {
+    let mut app = test_app(&["feat+one"]);
+    press(&mut app, KeyCode::Char('p'));
+    app.handle_event(AppEvent::PrsReady(Err("gh pr list failed: no auth".into())));
+    assert_eq!(app.pr_error.as_deref(), Some("gh pr list failed: no auth"));
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        matches!(app.modal, Some(Modal::PullRequests { .. })),
+        "enter on nothing keeps the picker open"
+    );
+    assert!(app.pending.is_none());
+}
+
 // And one `n` did create takes the cursor as soon as it is listed.
 #[test]
 fn a_created_worktree_is_selected_when_it_arrives() {
@@ -3439,31 +3534,31 @@ fn r_on_a_stopped_worktree_starts_it() {
 }
 
 #[test]
-fn p_restarts_only_the_process_the_detail_pane_marks() {
+fn shift_p_restarts_only_the_process_the_detail_pane_marks() {
     let mut app = test_app(&["feat+one"]);
     with_process(&mut app, "feat+one", running_phase());
     with_second_process(&mut app, "feat+one", "api", running_phase());
-    // Tab moves the `▸`; `p` follows it.
+    // Tab moves the `▸`; `P` follows it.
     press(&mut app, KeyCode::Tab);
     let (_, marked, _) = app.tail_target().expect("a process is marked");
-    press(&mut app, KeyCode::Char('p'));
-    let pending = app.pending.as_ref().expect("p started something");
+    press(&mut app, KeyCode::Char('P'));
+    let pending = app.pending.as_ref().expect("P started something");
     assert_eq!(pending.kind, PendingKind::Restart);
     assert_eq!(pending.name, "feat+one");
     assert_eq!(pending.label, format!("{marked} of feat/one"));
 }
 
 #[test]
-fn p_on_one_process_restarts_the_worktree_and_on_none_says_so() {
+fn shift_p_on_one_process_restarts_the_worktree_and_on_none_says_so() {
     let mut app = test_app(&["feat+one"]);
     with_process(&mut app, "feat+one", running_phase());
-    press(&mut app, KeyCode::Char('p'));
-    let pending = app.pending.as_ref().expect("p started something");
+    press(&mut app, KeyCode::Char('P'));
+    let pending = app.pending.as_ref().expect("P started something");
     assert_eq!(pending.kind, PendingKind::Restart);
     assert_eq!(pending.label, "feat/one");
 
     let mut app = test_app(&["feat+one"]);
-    press(&mut app, KeyCode::Char('p'));
+    press(&mut app, KeyCode::Char('P'));
     assert!(app.pending.is_none());
     let (message, error) = app.active_status().expect("an error");
     assert!(error && message.contains("running nothing"), "{message}");
@@ -4528,7 +4623,7 @@ fn a_worktree_is_up_since_its_oldest_running_process() {
             since: two_minutes_ago,
         },
     );
-    // `p` just restarted the other one.
+    // `P` just restarted the other one.
     with_second_process(&mut app, "feat+m", "worker", running_phase());
     assert_eq!(app.up_since("feat+m"), Some(two_minutes_ago));
 }

@@ -10,7 +10,7 @@ use std::process::Command;
 use crate::config::{self, Config, ProvisionMode};
 use crate::paths::PandoPaths;
 use crate::state::{self, WorktreeRecord};
-use crate::worktree::{self, Worktree};
+use crate::worktree::{self, PrInfo, Worktree};
 
 use super::hooks::{HookContext, run_hooks};
 use super::lifecycle::{MissingOnly, StopOutcome, stop_recorded, sweep_orphaned_groups};
@@ -584,6 +584,74 @@ pub fn created_by_pando(paths: &PandoPaths, worktrees: &[Worktree]) -> Ownership
     Ownership {
         by_name: ownership(&refreshed.state, worktrees),
         warning: refreshed.warning,
+    }
+}
+
+/// Creates a worktree for a pull request, returning its directory name.
+///
+/// One opened from a branch on `origin` is `new` of that branch, which
+/// fetches it when it has not been yet. One from a fork has no branch on
+/// `origin`, only `refs/pull/<number>/head`, so that is fetched into
+/// [`PrInfo::local_branch`] first — once: a local branch of that name
+/// already is somebody's work on it, and is checked out as it stands.
+pub fn new_for_pr(
+    paths: &PandoPaths,
+    config: &Config,
+    pr: &PrInfo,
+    progress: &dyn Fn(&str),
+) -> Result<String> {
+    let branch = pr.local_branch();
+    if !pr.cross_repository {
+        return new(paths, config, &branch, None, progress);
+    }
+    let root = paths.root().to_path_buf();
+    validate_branch_name(&root, &branch)?;
+    if ref_exists(&root, &format!("refs/heads/{branch}")) {
+        return new(paths, config, &branch, None, progress);
+    }
+    if !has_origin(&root) {
+        bail!(
+            "#{} is from a fork, and pando fetches it from a remote named origin, which this \
+             repository does not have",
+            pr.number
+        );
+    }
+    progress(&format!("fetching #{}", pr.number));
+    fetch_pr_head(&root, pr.number, &branch, crate::project::GIT_TIMEOUT)?;
+    // A rejected `new` leaves no branch behind, and the one fetched here
+    // is part of what it made.
+    new(paths, config, &branch, None, progress).inspect_err(|_| {
+        let _ = crate::project::git(&root, ["branch", "-D", branch.as_str()]);
+    })
+}
+
+/// `git fetch origin refs/pull/<number>/head` into a new local branch.
+/// Bounded and never prompting, as [`fetch_branch`] is; unlike it, a
+/// failure is an error, because there is no other place the branch could be.
+fn fetch_pr_head(
+    root: &Path,
+    number: u32,
+    branch: &str,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    let refspec = format!("refs/pull/{number}/head:refs/heads/{branch}");
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(root)
+        .args(["fetch", "--quiet", "origin", &refspec])
+        .env("GIT_TERMINAL_PROMPT", "0");
+    match crate::project::output_within(command, timeout) {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => bail!(
+            "could not fetch #{number} from origin: {}",
+            git_failure_reason(&out)
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => bail!(
+            "`git fetch origin {refspec}` did not answer in {}s",
+            timeout.as_secs()
+        ),
+        Err(e) => Err(e).context("spawn git fetch"),
     }
 }
 

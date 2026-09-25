@@ -6,6 +6,9 @@ use std::thread;
 use std::time::Instant;
 
 use crate::actions;
+use crate::config::Config;
+use crate::paths::PandoPaths;
+use crate::worktree::PrInfo;
 
 use super::App;
 use super::background::{AppEvent, ask_through_ui};
@@ -90,8 +93,29 @@ impl App {
     /// Returns whether the action started; the create modal only closes (and
     /// throws away what was typed) once it did.
     pub(super) fn spawn_create(&mut self, branch: String, base: Option<String>) -> bool {
+        let (label, dir_name) = (branch.clone(), actions::sanitize_branch_to_dir(&branch));
+        self.spawn_create_with(label, dir_name, move |paths, config, progress| {
+            actions::new(paths, config, &branch, base.as_deref(), progress)
+        })
+    }
+
+    /// A worktree for a pull request, `p` then ⏎: its branch, or for a
+    /// fork's, one fetched from `origin`'s copy of its head.
+    pub(super) fn spawn_create_pr(&mut self, pr: PrInfo) -> bool {
+        let branch = pr.local_branch();
+        let label = format!("#{} {branch}", pr.number);
         let dir_name = actions::sanitize_branch_to_dir(&branch);
-        let label = branch.clone();
+        self.spawn_create_with(label, dir_name, move |paths, config, progress| {
+            actions::new_for_pr(paths, config, &pr, progress)
+        })
+    }
+
+    /// Settles what `new` needs to know, asking through the modal, then
+    /// runs `create` with the config that settled.
+    fn spawn_create_with<F>(&mut self, label: String, dir_name: String, create: F) -> bool
+    where
+        F: FnOnce(&PandoPaths, &Config, &dyn Fn(&str)) -> Result<String> + Send + 'static,
+    {
         let paths = self.paths.clone();
         let config = self.config.clone();
         let tx = self.event_tx.clone();
@@ -109,7 +133,7 @@ impl App {
             let config = actions::resolve_for_new(&paths, &config, &ask, &progress)
                 .map_err(|e| format!("{e:#}"))?;
             let _ = tx.send(AppEvent::ConfigResolved(Box::new(config.clone())));
-            actions::new(&paths, &config, &branch, base.as_deref(), &progress)
+            create(&paths, &config, &progress)
                 .map(PendingOutcome::Created)
                 .map_err(|e| format!("{e:#}"))
         });

@@ -426,7 +426,7 @@ fn status_row<'a>(app: &App, name: &str, width: usize) -> Line<'a> {
             ],
         );
     };
-    // Up since the oldest process that runs: `p` restarting one of three
+    // Up since the oldest process that runs: `P` restarting one of three
     // does not make the worktree two seconds old.
     let since = match phase {
         Aggregate::Running { .. } => app.up_since(name).unwrap_or(phase.since()),
@@ -699,7 +699,7 @@ fn tail_header<'a>(app: &App, name: &str, width: usize) -> Line<'a> {
     let hint = if app.tail_scroll > 0 {
         format!(" · scrolled back {} · PgDn newer", app.tail_scroll)
     } else if processes > 1 {
-        " · l opens · tab switches · p restarts it".to_string()
+        " · l opens · tab switches · P restarts it".to_string()
     } else {
         " · l opens".to_string()
     };
