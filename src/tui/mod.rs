@@ -22,6 +22,12 @@ use app::AppEvent;
 use handoff::InputGate;
 
 const TICK_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How often the theme watcher looks again at the file `[ui] theme_from`
+/// names and at whether the system is dark or light. Each look runs one
+/// small program, so not every tick; often enough that a terminal switched
+/// to another theme takes pando with it before anyone waits for it.
+const THEME_POLL: Duration = Duration::from_secs(2);
 const FS_DEBOUNCE: Duration = Duration::from_millis(500);
 
 /// How long the input thread waits for a key before it checks whether a
@@ -35,7 +41,18 @@ pub fn run(paths: PandoPaths, config: Config) -> Result<()> {
     // by one of those would carry the umask instead of 0700.
     paths.ensure_home()?;
     let worktrees_dir = config.worktrees_dir(&paths);
+    // Before the first frame, so the screen never flashes another theme.
+    let themes_dir = paths.themes_dir();
+    let resolved = crate::theme::resolve(&config.ui.theme_settings(), Some(&themes_dir));
     let mut app = app::App::new(paths, config)?;
+    let watched = (resolved.name.clone(), resolved.appearance);
+    app.adopt_theme(resolved);
+    spawn_theme_watcher(
+        app.event_tx.clone(),
+        Arc::clone(&app.theme.settings),
+        themes_dir,
+        watched,
+    );
     let mut terminal = ratatui::init();
     let result = main_loop(&mut terminal, &mut app, &worktrees_dir);
     ratatui::restore();
@@ -97,6 +114,35 @@ fn main_loop(
             return Ok(());
         }
     }
+}
+
+/// Follows the theme while pando runs: a theme switcher writing a new
+/// name to the file `[ui] theme_from` names, a choice saved from the
+/// picker, the system going dark or light. Only a change is sent.
+fn spawn_theme_watcher(
+    tx: Sender<AppEvent>,
+    settings: Arc<std::sync::Mutex<crate::theme::Settings>>,
+    themes_dir: std::path::PathBuf,
+    mut last: (String, crate::theme::Appearance),
+) {
+    thread::spawn(move || {
+        loop {
+            thread::sleep(THEME_POLL);
+            let current = match settings.lock() {
+                Ok(settings) => settings.clone(),
+                Err(_) => return,
+            };
+            let resolved = crate::theme::resolve(&current, Some(&themes_dir));
+            let now = (resolved.name.clone(), resolved.appearance);
+            if now == last {
+                continue;
+            }
+            last = now;
+            if tx.send(AppEvent::Theme(Box::new(resolved))).is_err() {
+                return;
+            }
+        }
+    });
 }
 
 fn spawn_input_thread(tx: Sender<AppEvent>, gate: Arc<InputGate>) {

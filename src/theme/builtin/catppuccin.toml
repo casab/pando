@@ -1,0 +1,27 @@
+# Catppuccin: Mocha when dark, Latte when light.
+# From Ghostty's "Catppuccin Mocha" and "Catppuccin Latte" themes; every other colour
+# pando uses is derived from these (see theme/palette.rs).
+
+description = "Catppuccin: Mocha when dark, Latte when light"
+
+[dark]
+background = "#1e1e2e"
+foreground = "#cdd6f4"
+red        = "#f38ba8"
+green      = "#a6e3a1"
+yellow     = "#f9e2af"
+blue       = "#89b4fa"
+magenta    = "#cba6f7"
+cyan       = "#94e2d5"
+orange     = "#fab387"
+
+[light]
+background = "#eff1f5"
+foreground = "#4c4f69"
+red        = "#d20f39"
+green      = "#40a02b"
+yellow     = "#df8e1d"
+blue       = "#1e66f5"
+magenta    = "#8839ef"
+cyan       = "#179299"
+orange     = "#fe640b"

@@ -1,0 +1,40 @@
+# pando's own palette, and the default. Every role is spelled out rather
+# than derived, because pando paints on the terminal's background, whatever
+# that is, rather than on one of its own.
+
+description = "pando's own: quiet greys, one colour per meaning"
+
+[dark]
+background = "#16181f"
+foreground = "#d2d7e1"
+red        = "#eb5a5a"
+green      = "#50c878"
+yellow     = "#ebc34b"
+blue       = "#6e9beb"
+magenta    = "#b482e6"
+cyan       = "#5fd2d2"
+orange     = "#e6963c"
+text_dim     = "#6e7387"
+text_muted   = "#5c6174"
+surface      = "#1e212d"
+highlight    = "#2d3246"
+border       = "#373c50"
+search_match = "#505082"
+
+[light]
+background = "#ffffff"
+foreground = "#232837"
+red        = "#c82d2d"
+green      = "#198746"
+yellow     = "#a07300"
+blue       = "#325fcd"
+magenta    = "#8c3cc8"
+cyan       = "#0a7d8c"
+orange     = "#b95f0a"
+text_dim     = "#696e82"
+text_muted   = "#82879b"
+surface      = "#e8eaf2"
+highlight    = "#d5dcf0"
+border       = "#c4c9d8"
+search_match = "#cdd0f5"
+search_cursor = "#f5be6e"

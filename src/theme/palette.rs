@@ -1,0 +1,182 @@
+//! A palette: the colour of every role, derived from a theme's few base
+//! colours unless the theme names the role itself.
+
+use ratatui::style::Color;
+use serde::Deserialize;
+
+/// A 24-bit colour, as a theme file writes it: `"#89b4fa"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rgb(pub u8, pub u8, pub u8);
+
+impl Rgb {
+    pub fn parse(text: &str) -> Option<Rgb> {
+        let hex = text.strip_prefix('#')?;
+        if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+        Some(Rgb(byte(0)?, byte(2)?, byte(4)?))
+    }
+
+    /// `self` moved `amount` of the way towards `other`: `0.0` is `self`,
+    /// `1.0` is `other`.
+    pub fn mix(self, other: Rgb, amount: f32) -> Rgb {
+        let channel = |a: u8, b: u8| {
+            let t = amount.clamp(0.0, 1.0);
+            (a as f32 + (b as f32 - a as f32) * t).round() as u8
+        };
+        Rgb(
+            channel(self.0, other.0),
+            channel(self.1, other.1),
+            channel(self.2, other.2),
+        )
+    }
+
+    pub fn color(self) -> Color {
+        Color::Rgb(self.0, self.1, self.2)
+    }
+
+    /// Relative luminance, as WCAG defines it: `0.0` is black, `1.0` white.
+    fn luminance(self) -> f32 {
+        let linear = |c: u8| {
+            let v = c as f32 / 255.0;
+            if v <= 0.039_28 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(self.0) + 0.7152 * linear(self.1) + 0.0722 * linear(self.2)
+    }
+
+    /// The WCAG contrast ratio between two colours, from `1.0` (the same)
+    /// to `21.0` (black on white).
+    pub fn contrast(self, other: Rgb) -> f32 {
+        let (a, b) = (self.luminance(), other.luminance());
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+}
+
+impl<'de> Deserialize<'de> for Rgb {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(de)?;
+        Rgb::parse(&text).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "`{text}` is not a colour — write it as \"#rrggbb\""
+            ))
+        })
+    }
+}
+
+/// How far each derived role sits between the background (`0.0`) and the
+/// foreground (`1.0`). One table, so every theme's greys stand in the same
+/// relation to its own background and text.
+const TEXT_DIM: f32 = 0.55;
+const TEXT_MUTED: f32 = 0.42;
+
+/// The least contrast a derived text colour is allowed, whatever the
+/// theme: a theme whose own text is soft would otherwise hand its softness
+/// on to every grey mixed from it. `TEXT_DIM` against the background is
+/// WCAG's floor for text; `TEXT_MUTED` against the surface is its floor
+/// for large or incidental text, which labels and hints are.
+const TEXT_DIM_CONTRAST: f32 = 4.5;
+const TEXT_MUTED_CONTRAST: f32 = 3.0;
+const SURFACE: f32 = 0.06;
+const HIGHLIGHT: f32 = 0.13;
+const BORDER: f32 = 0.22;
+/// A search match is the theme's blue, washed into the background far
+/// enough that the text on it stays readable.
+const SEARCH_MATCH: f32 = 0.35;
+
+/// One appearance of a theme, as its file writes it: the base colours every
+/// theme has, and any role it would rather set than have derived.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Variant {
+    pub background: Rgb,
+    pub foreground: Rgb,
+    pub red: Rgb,
+    pub green: Rgb,
+    pub yellow: Rgb,
+    pub blue: Rgb,
+    pub magenta: Rgb,
+    pub cyan: Rgb,
+    pub orange: Rgb,
+    #[serde(default)]
+    pub text_dim: Option<Rgb>,
+    #[serde(default)]
+    pub text_muted: Option<Rgb>,
+    #[serde(default)]
+    pub surface: Option<Rgb>,
+    #[serde(default)]
+    pub highlight: Option<Rgb>,
+    #[serde(default)]
+    pub border: Option<Rgb>,
+    #[serde(default)]
+    pub search_match: Option<Rgb>,
+    #[serde(default)]
+    pub search_cursor: Option<Rgb>,
+}
+
+/// Every colour the interface paints with, by what it means. What each
+/// role is for is the table in the module doc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Palette {
+    pub red: Color,
+    pub green: Color,
+    pub yellow: Color,
+    pub blue: Color,
+    pub magenta: Color,
+    pub cyan: Color,
+    pub orange: Color,
+    pub text: Color,
+    pub text_dim: Color,
+    pub text_muted: Color,
+    pub surface: Color,
+    pub highlight_bg: Color,
+    pub border: Color,
+    pub search_cursor_bg: Color,
+    pub search_match_bg: Color,
+}
+
+impl Variant {
+    /// The palette this variant paints: its own colours where it gives
+    /// them, and the rest mixed from its background and foreground.
+    pub fn palette(&self) -> Palette {
+        let (bg, fg) = (self.background, self.foreground);
+        let between = |set: Option<Rgb>, amount: f32| set.unwrap_or(bg.mix(fg, amount)).color();
+        let surface = self.surface.unwrap_or(bg.mix(fg, SURFACE));
+        // A text grey starts at its share of the way to the foreground and
+        // moves on towards it until it reads against what it sits on.
+        let readable = |set: Option<Rgb>, amount: f32, on: Rgb, floor: f32| {
+            set.unwrap_or_else(|| {
+                let mut t = amount;
+                while t < 1.0 && bg.mix(fg, t).contrast(on) < floor {
+                    t += 0.02;
+                }
+                bg.mix(fg, t)
+            })
+            .color()
+        };
+        Palette {
+            red: self.red.color(),
+            green: self.green.color(),
+            yellow: self.yellow.color(),
+            blue: self.blue.color(),
+            magenta: self.magenta.color(),
+            cyan: self.cyan.color(),
+            orange: self.orange.color(),
+            text: fg.color(),
+            text_dim: readable(self.text_dim, TEXT_DIM, bg, TEXT_DIM_CONTRAST),
+            text_muted: readable(self.text_muted, TEXT_MUTED, surface, TEXT_MUTED_CONTRAST),
+            surface: surface.color(),
+            highlight_bg: between(self.highlight, HIGHLIGHT),
+            border: between(self.border, BORDER),
+            search_cursor_bg: self.search_cursor.unwrap_or(self.orange).color(),
+            search_match_bg: self
+                .search_match
+                .unwrap_or(bg.mix(self.blue, SEARCH_MATCH))
+                .color(),
+        }
+    }
+}

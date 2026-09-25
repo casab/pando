@@ -45,6 +45,14 @@ pub fn validate(config: &Config, project: &ProjectRef) -> Result<()> {
             ISOLATION_KINDS.join(" or ")
         );
     }
+    if let Some(appearance) = &config.ui.appearance
+        && !super::schema::APPEARANCES.contains(&appearance.as_str())
+    {
+        bail!(
+            "[ui] appearance = {appearance:?} is not one pando knows — it is {}",
+            super::schema::APPEARANCES.join(", ")
+        );
+    }
     if config.isolation.none && !config.services.is_empty() {
         bail!(
             "[isolation] none = true says this project runs no private services, and \

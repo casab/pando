@@ -1,0 +1,27 @@
+# GitHub: Dark Dimmed, with Light Default.
+# From Ghostty's "GitHub Dark Dimmed" and "GitHub Light Default" themes; every other colour
+# pando uses is derived from these (see theme/palette.rs).
+
+description = "GitHub: Dark Dimmed, with Light Default"
+
+[dark]
+background = "#22272e"
+foreground = "#adbac7"
+red        = "#f47067"
+green      = "#57ab5a"
+yellow     = "#c69026"
+blue       = "#539bf5"
+magenta    = "#b083f0"
+cyan       = "#39c5cf"
+orange     = "#dc6d1a"
+
+[light]
+background = "#ffffff"
+foreground = "#1f2328"
+red        = "#cf222e"
+green      = "#116329"
+yellow     = "#9a6700"
+blue       = "#0969da"
+magenta    = "#8250df"
+cyan       = "#1b7c83"
+orange     = "#bc4c00"

@@ -1,0 +1,27 @@
+# GitHub: Dark and Light High Contrast.
+# From Ghostty's "GitHub Dark High Contrast" and "GitHub Light High Contrast" themes; every other colour
+# pando uses is derived from these (see theme/palette.rs).
+
+description = "GitHub: Dark and Light High Contrast"
+
+[dark]
+background = "#0a0c10"
+foreground = "#f0f3f6"
+red        = "#ff9492"
+green      = "#26cd4d"
+yellow     = "#f0b72f"
+blue       = "#71b7ff"
+magenta    = "#cb9eff"
+cyan       = "#39c5cf"
+orange     = "#ffb757"
+
+[light]
+background = "#ffffff"
+foreground = "#0e1116"
+red        = "#a0111f"
+green      = "#024c1a"
+yellow     = "#3f2200"
+blue       = "#0349b4"
+magenta    = "#622cbc"
+cyan       = "#1b7c83"
+orange     = "#873800"

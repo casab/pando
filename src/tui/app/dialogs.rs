@@ -69,6 +69,12 @@ pub enum Modal {
         custom: Option<String>,
         reply: Sender<Result<actions::Answer, String>>,
     },
+    /// `T`: every colour theme. The one under the cursor paints the
+    /// screen while it is there; `before` is what esc puts back.
+    Theme {
+        selected: usize,
+        before: crate::theme::Palette,
+    },
     Help,
     /// What pando has said this session, in full and newest first: the
     /// header has one row, and a long error does not fit in it.

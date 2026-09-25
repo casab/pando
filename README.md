@@ -167,6 +167,34 @@ The log viewer has a tab per log, led by an `all` tab that merges every
 process's when there are several. `1`–`9` switch tabs, `/` searches, `f`
 filters by level, and `e`/`E` jump between errors.
 
+### Themes
+
+`T` in the TUI lists the colour themes, each with a swatch of its
+colours; moving through them repaints the screen, enter keeps one and
+esc puts the old one back. The built-ins are pando's own, Catppuccin,
+Flexoki, GitHub (default, dimmed, high contrast, colorblind), Gruvbox,
+Kanagawa, Monokai Pro, One Dark, Rosé Pine, Tokyo Night, VS Code and
+Zenwritten, each with a dark and a light half that follows the system.
+
+A choice is saved in `~/.pando/config.toml`:
+
+```toml
+[ui]
+theme = "catppuccin"
+# appearance = "dark"            # or "light"; "auto" follows the system
+# theme_from = "~/.config/theme-switcher/current"
+```
+
+`theme_from` names a file whose first line is a theme's name, such as
+the state file a terminal theme switcher keeps. pando follows it while
+it runs, so switching the terminal's theme switches pando's with it.
+`PANDO_THEME` and `PANDO_APPEARANCE` override both for one run.
+
+A theme is a small TOML file: a background, a foreground and seven
+accents for each half, and every other colour is derived from them. One
+in `~/.pando/themes/<name>.toml` is listed beside the built-ins, and
+replaces the built-in of the same name.
+
 ## Install
 
 There is no published binary yet. Build it from source with a Rust

@@ -1,0 +1,27 @@
+# Kanagawa: Wave when dark, Lotus when light.
+# From Ghostty's "Kanagawa Wave" and "Kanagawa Lotus" themes; every other colour
+# pando uses is derived from these (see theme/palette.rs).
+
+description = "Kanagawa: Wave when dark, Lotus when light"
+
+[dark]
+background = "#1f1f28"
+foreground = "#dcd7ba"
+red        = "#c34043"
+green      = "#76946a"
+yellow     = "#c0a36e"
+blue       = "#7e9cd8"
+magenta    = "#957fb8"
+cyan       = "#6a9589"
+orange     = "#ffa066"
+
+[light]
+background = "#f2ecbc"
+foreground = "#545464"
+red        = "#c84053"
+green      = "#6f894e"
+yellow     = "#77713f"
+blue       = "#4d699b"
+magenta    = "#b35b79"
+cyan       = "#597b75"
+orange     = "#cc6d00"

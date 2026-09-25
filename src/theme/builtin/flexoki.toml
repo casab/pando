@@ -1,0 +1,27 @@
+# Flexoki: Dark and Light.
+# From Ghostty's "Flexoki Dark" and "Flexoki Light" themes; every other colour
+# pando uses is derived from these (see theme/palette.rs).
+
+description = "Flexoki: Dark and Light"
+
+[dark]
+background = "#100f0f"
+foreground = "#cecdc3"
+red        = "#d14d41"
+green      = "#879a39"
+yellow     = "#d0a215"
+blue       = "#4385be"
+magenta    = "#ce5d97"
+cyan       = "#3aa99f"
+orange     = "#da702c"
+
+[light]
+background = "#fffcf0"
+foreground = "#100f0f"
+red        = "#af3029"
+green      = "#66800b"
+yellow     = "#ad8301"
+blue       = "#205ea6"
+magenta    = "#a02f6f"
+cyan       = "#24837b"
+orange     = "#bc5215"

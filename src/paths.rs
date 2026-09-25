@@ -183,6 +183,12 @@ impl PandoPaths {
         self.home.join("recipes")
     }
 
+    /// The developer's own colour themes, one TOML file each, listed after
+    /// the built-ins; a file here replaces the built-in whose name it shares.
+    pub fn themes_dir(&self) -> PathBuf {
+        self.home.join("themes")
+    }
+
     /// Creates the home directory 0700 and the project directory under it.
     /// Idempotent; called before the first write of any run.
     pub fn ensure_home(&self) -> Result<()> {

@@ -1,0 +1,27 @@
+# Visual Studio Code: Dark+ and Light+.
+# From Ghostty's "Dark+" and "Light+" themes; every other colour
+# pando uses is derived from these (see theme/palette.rs).
+
+description = "Visual Studio Code: Dark+ and Light+"
+
+[dark]
+background = "#1e1e1e"
+foreground = "#cccccc"
+red        = "#cd3131"
+green      = "#0dbc79"
+yellow     = "#dcdcaa"
+blue       = "#2472c8"
+magenta    = "#bc3fbc"
+cyan       = "#11a8cd"
+orange     = "#ce9178"
+
+[light]
+background = "#ffffff"
+foreground = "#333333"
+red        = "#cd3131"
+green      = "#107c10"
+yellow     = "#795e26"
+blue       = "#0451a5"
+magenta    = "#bc05bc"
+cyan       = "#0598bc"
+orange     = "#b35900"

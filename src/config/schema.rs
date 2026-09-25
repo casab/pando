@@ -30,6 +30,8 @@ pub struct Config {
     pub branches: BranchesSection,
     #[serde(default, skip_serializing_if = "ShareSection::is_empty")]
     pub share: ShareSection,
+    #[serde(default, skip_serializing_if = "UiSection::is_empty")]
+    pub ui: UiSection,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -426,6 +428,42 @@ pub struct ShareSection {
 impl ShareSection {
     fn is_empty(&self) -> bool {
         *self == Self::default()
+    }
+}
+
+/// How the TUI looks. A property of the person rather than the project, so
+/// it belongs in the user layer, which is where the theme picker writes it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiSection {
+    /// A theme by name: a built-in, or a file in `<pando home>/themes/`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
+    /// A file whose first line names the theme, followed while the TUI
+    /// runs: the state file of a terminal theme switcher, so pando changes
+    /// with the terminal. Over `theme` while it names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme_from: Option<PathBuf>,
+    /// `auto` (the default: the system's), `dark` or `light`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub appearance: Option<String>,
+}
+
+/// The spellings `[ui] appearance` takes.
+pub const APPEARANCES: [&str; 3] = ["auto", "dark", "light"];
+
+impl UiSection {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// What the theme module needs from it, with `~` expanded.
+    pub fn theme_settings(&self) -> crate::theme::Settings {
+        crate::theme::Settings {
+            theme: self.theme.clone(),
+            theme_from: self.theme_from.as_deref().map(expand_tilde),
+            appearance: self.appearance.clone(),
+        }
     }
 }
 

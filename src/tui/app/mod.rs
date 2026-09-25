@@ -24,6 +24,7 @@ mod operations;
 mod pending;
 mod remedies;
 mod tails;
+mod themes;
 
 pub use ages::{compact_age, parse_git_relative};
 pub use background::{AppEvent, Snapshot, snapshot};
@@ -39,6 +40,7 @@ pub use merged::{ALL_SOURCE, MergedTail, SOURCE_SEPARATOR, ViewTail, strip_sourc
 pub use pending::{PendingAction, PendingKind, PendingOutcome};
 pub use remedies::as_tui_remedy;
 pub use tails::LogTails;
+pub use themes::ThemeState;
 
 use anyhow::Result;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -278,6 +280,8 @@ pub struct App {
     /// A shell or editor `!` or `e` asked for, waiting for the event loop,
     /// which owns the terminal, to run it.
     pub launch: Option<LaunchRequest>,
+    /// The colour theme in force, every theme there is, and what chose it.
+    pub theme: ThemeState,
     /// Set instead of touching the terminal when tests drive the app.
     #[cfg(test)]
     pub clipboard: Option<String>,
@@ -289,6 +293,8 @@ pub struct App {
 impl App {
     pub fn new(paths: PandoPaths, config: Config) -> Result<Self> {
         let (event_tx, event_rx) = mpsc::channel();
+        let theme_settings = config.ui.theme_settings();
+        let themes_dir = paths.themes_dir();
         let mut app = Self {
             paths,
             config,
@@ -340,6 +346,7 @@ impl App {
             event_rx: Some(event_rx),
             launch_env: LaunchEnv::from_env(),
             launch: None,
+            theme: ThemeState::new(theme_settings, &themes_dir),
             #[cfg(test)]
             clipboard: None,
             #[cfg(test)]
@@ -481,6 +488,10 @@ impl App {
                 self.set_status(message);
                 true
             }
+            AppEvent::Theme(resolved) => {
+                self.adopt_theme(*resolved);
+                true
+            }
             AppEvent::ConfigResolved(config) => {
                 // The one place the session's config changes while it runs.
                 // Without it the modal reopens on the next `s`, with the
@@ -525,6 +536,7 @@ impl App {
                     | Modal::StopAll { .. }
                     | Modal::Share { .. }
                     | Modal::SwitchMode { .. }
+                    | Modal::Theme { .. }
                     | Modal::Question { .. }
             )
         );
@@ -654,6 +666,10 @@ impl App {
                 }
                 return;
             }
+            Some(Modal::Theme { selected, before }) => {
+                self.handle_theme_key(key, selected, before);
+                return;
+            }
             Some(Modal::SwitchMode { name, isolated }) => {
                 match key.code {
                     KeyCode::Char('y') | KeyCode::Enter => {
@@ -749,6 +765,7 @@ impl App {
             KeyCode::PageUp => self.scroll_tail(-(self.tail_rows.max(1) as isize)),
             KeyCode::PageDown => self.scroll_tail(self.tail_rows.max(1) as isize),
             KeyCode::Tab => self.cycle_tail(),
+            KeyCode::Char('T') => self.open_theme_picker(),
             KeyCode::Char('R') => {
                 self.spawn_discovery();
                 // An account switched in another terminal shows here too.
@@ -1239,6 +1256,8 @@ impl App {
     #[cfg(test)]
     pub fn new_for_test(paths: PandoPaths, config: Config, worktrees: Vec<Worktree>) -> Self {
         let (event_tx, event_rx) = mpsc::channel();
+        let theme_settings = config.ui.theme_settings();
+        let themes_dir = paths.themes_dir();
         let mut app = Self {
             paths,
             config,
@@ -1290,6 +1309,7 @@ impl App {
             event_rx: Some(event_rx),
             launch_env: LaunchEnv::default(),
             launch: None,
+            theme: ThemeState::new(theme_settings, &themes_dir),
             clipboard: None,
             opened: None,
         };

@@ -120,6 +120,7 @@ pub const LIST_KEYS: &[KeyHelp] = &[
         &[KeyCode::Char('m')],
         "messages: what pando said, in full",
     ),
+    key("T", &[KeyCode::Char('T')], "pick a colour theme"),
     key("R", &[KeyCode::Char('R')], "refresh now"),
     key("?", &[KeyCode::Char('?')], "this help"),
     key("q esc", &[KeyCode::Char('q'), KeyCode::Esc], "quit"),

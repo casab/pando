@@ -5049,3 +5049,77 @@ fn the_gh_account_answer_is_kept_and_repaints_only_on_a_change() {
     assert!(!app.handle_event(AppEvent::GhAccountReady(login)));
     assert!(app.handle_event(AppEvent::GhAccountReady(GhAccount::SignedOut)));
 }
+
+// ---- the theme picker --------------------------------------------------
+
+#[test]
+fn capital_t_opens_the_theme_picker_on_the_theme_in_use() {
+    let mut app = test_app(&["feat+one"]);
+    press(&mut app, KeyCode::Char('T'));
+    match app.modal {
+        Some(Modal::Theme { selected, .. }) => {
+            assert_eq!(app.theme.themes[selected].name, app.theme.name);
+        }
+        ref other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn moving_in_the_picker_repaints_with_that_theme_and_esc_puts_it_back() {
+    let mut app = test_app(&["feat+one"]);
+    let before = crate::theme::palette();
+    press(&mut app, KeyCode::Char('T'));
+    press(&mut app, KeyCode::Char('j'));
+    let Some(Modal::Theme { selected, .. }) = app.modal else {
+        panic!("still open");
+    };
+    let previewed = app.theme.themes[selected].palette(app.theme.appearance);
+    assert_eq!(crate::theme::palette(), previewed, "the screen shows it");
+    assert_ne!(previewed, before);
+    press(&mut app, KeyCode::Esc);
+    assert!(app.modal.is_none());
+    assert_eq!(
+        crate::theme::palette(),
+        before,
+        "and esc puts back what was"
+    );
+    assert_eq!(
+        app.theme.name,
+        crate::theme::DEFAULT_THEME,
+        "nothing chosen"
+    );
+}
+
+#[test]
+fn enter_in_the_picker_keeps_the_theme_and_hands_it_to_the_watcher() {
+    let mut app = test_app(&["feat+one"]);
+    press(&mut app, KeyCode::Char('T'));
+    press(&mut app, KeyCode::Char('G'));
+    press(&mut app, KeyCode::Enter);
+    let last = app.theme.themes.last().unwrap().clone();
+    assert!(app.modal.is_none());
+    assert_eq!(app.theme.name, last.name);
+    assert_eq!(crate::theme::palette(), last.palette(app.theme.appearance));
+    assert_eq!(
+        app.theme.settings.lock().unwrap().theme.as_deref(),
+        Some(last.name.as_str()),
+        "the watcher compares against the choice, not the old config"
+    );
+    assert!(app.active_status().unwrap().0.contains(&last.name));
+}
+
+#[test]
+fn a_theme_is_saved_to_the_ui_section_and_nothing_else_moves() {
+    let mut doc: toml_edit::DocumentMut = "# mine\n[runtime]\nversion_manager = \"mise\"\n"
+        .parse()
+        .unwrap();
+    super::themes::set_theme(&mut doc, "gruvbox");
+    let text = doc.to_string();
+    assert!(
+        text.starts_with("# mine\n[runtime]\nversion_manager = \"mise\"\n"),
+        "{text}"
+    );
+    assert!(text.contains("[ui]\ntheme = \"gruvbox\""), "{text}");
+    super::themes::set_theme(&mut doc, "github");
+    assert_eq!(doc.to_string().matches("theme =").count(), 1);
+}

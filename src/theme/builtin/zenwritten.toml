@@ -1,0 +1,27 @@
+# Zenwritten: Dark and Light, from zenbones.
+# From Ghostty's "Zenwritten Dark" and "Zenwritten Light" themes; every other colour
+# pando uses is derived from these (see theme/palette.rs).
+
+description = "Zenwritten: Dark and Light, from zenbones"
+
+[dark]
+background = "#191919"
+foreground = "#bbbbbb"
+red        = "#de6e7c"
+green      = "#819b69"
+yellow     = "#b77e64"
+blue       = "#6099c0"
+magenta    = "#b279a7"
+cyan       = "#66a5ad"
+orange     = "#d68c67"
+
+[light]
+background = "#eeeeee"
+foreground = "#353535"
+red        = "#a8334c"
+green      = "#4f6c31"
+yellow     = "#944927"
+blue       = "#286486"
+magenta    = "#88507d"
+cyan       = "#3b8992"
+orange     = "#803d1c"

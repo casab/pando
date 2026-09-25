@@ -49,6 +49,9 @@ pub enum AppEvent {
     /// Something a worker decided without asking, worth a line in the
     /// header and in `m`: the first choice it took for a question.
     Notice(String),
+    /// The theme to paint with changed: the terminal's theme switcher
+    /// wrote a new name, or the system went dark or light.
+    Theme(Box<crate::theme::Resolved>),
 }
 
 /// One consistent read of the repository, taken off the UI thread.

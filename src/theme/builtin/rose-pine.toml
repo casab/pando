@@ -1,0 +1,27 @@
+# Rosé Pine: Main when dark, Dawn when light.
+# From Ghostty's "Rose Pine" and "Rose Pine Dawn" themes; every other colour
+# pando uses is derived from these (see theme/palette.rs).
+
+description = "Rosé Pine: Main when dark, Dawn when light"
+
+[dark]
+background = "#191724"
+foreground = "#e0def4"
+red        = "#eb6f92"
+green      = "#31748f"
+yellow     = "#f6c177"
+blue       = "#9ccfd8"
+magenta    = "#c4a7e7"
+cyan       = "#ebbcba"
+orange     = "#ebbcba"
+
+[light]
+background = "#faf4ed"
+foreground = "#575279"
+red        = "#b4637a"
+green      = "#286983"
+yellow     = "#ea9d34"
+blue       = "#56949f"
+magenta    = "#907aa9"
+cyan       = "#d7827e"
+orange     = "#d7827e"

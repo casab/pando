@@ -1562,3 +1562,42 @@ fn a_role_the_placeholder_cannot_spell_is_refused() {
     assert!(msg.contains("cannot"), "{msg}");
     assert!(msg.contains("\"my web\""), "{msg}");
 }
+
+// ---- [ui] ---------------------------------------------------------------
+
+#[test]
+fn the_user_layer_carries_the_theme_and_expands_its_file() {
+    let f = fixture();
+    write_user(
+        &f,
+        "[ui]\ntheme = \"gruvbox\"\ntheme_from = \"~/.config/switcher/current\"\nappearance = \"dark\"\n",
+    );
+    let loaded = load(&f.paths).unwrap();
+    assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+    let settings = loaded.config.ui.theme_settings();
+    assert_eq!(settings.theme.as_deref(), Some("gruvbox"));
+    assert_eq!(settings.appearance.as_deref(), Some("dark"));
+    let from = settings.theme_from.unwrap();
+    assert!(!from.starts_with("~"), "{}", from.display());
+    assert!(
+        from.ends_with(".config/switcher/current"),
+        "{}",
+        from.display()
+    );
+}
+
+#[test]
+fn an_appearance_pando_does_not_know_drops_the_layer_with_the_spellings() {
+    let f = fixture();
+    write_user(&f, "[ui]\nappearance = \"dusk\"\n");
+    let loaded = load(&f.paths).unwrap();
+    assert_eq!(loaded.config.ui.appearance, None);
+    assert!(
+        loaded
+            .warnings
+            .iter()
+            .any(|w| w.contains("auto, dark, light")),
+        "{:?}",
+        loaded.warnings
+    );
+}

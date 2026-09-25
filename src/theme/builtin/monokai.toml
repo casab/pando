@@ -1,0 +1,27 @@
+# Monokai Pro, and Monokai Pro Light.
+# From Ghostty's "Monokai Pro" and "Monokai Pro Light" themes; every other colour
+# pando uses is derived from these (see theme/palette.rs).
+
+description = "Monokai Pro, and Monokai Pro Light"
+
+[dark]
+background = "#2d2a2e"
+foreground = "#fcfcfa"
+red        = "#ff6188"
+green      = "#a9dc76"
+yellow     = "#ffd866"
+blue       = "#78dce8"
+magenta    = "#ab9df2"
+cyan       = "#78dce8"
+orange     = "#fc9867"
+
+[light]
+background = "#faf4f2"
+foreground = "#29242a"
+red        = "#e14775"
+green      = "#269d69"
+yellow     = "#cc7a0a"
+blue       = "#1c8ca8"
+magenta    = "#7058be"
+cyan       = "#1c8ca8"
+orange     = "#e16032"

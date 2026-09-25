@@ -99,6 +99,7 @@ pub fn render_modal(f: &mut Frame, area: Rect, modal: &Modal, app: &App) -> Opti
             ));
         }
         Modal::Messages => return Some(render_messages(f, area, app)),
+        Modal::Theme { selected, .. } => render_theme_picker(f, area, app, *selected),
     }
     None
 }
@@ -766,6 +767,99 @@ fn render_switch_mode(
     let width = widest(&lines).min(cap);
     let title = format!("restart {how}");
     let Some(inner) = popup(f, area, &title, None, width, lines.len()) else {
+        return;
+    };
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// `T`: every theme with a swatch of its accents in their own colours,
+/// so they can be compared without trying each, and the screen behind in
+/// the one under the cursor.
+fn render_theme_picker(f: &mut Frame, area: Rect, app: &App, selected: usize) {
+    let themes = &app.theme.themes;
+    let appearance = app.theme.appearance;
+    let cap = max_content_width(area);
+    let name_width = themes
+        .iter()
+        .map(|t| text_width(&t.name))
+        .max()
+        .unwrap_or(0);
+    // The popup keeps the rest of the screen in view: that is where the
+    // preview is.
+    let rows = themes
+        .len()
+        .min((area.height as usize).saturating_sub(8).max(3));
+    let first = selected.saturating_sub(rows.saturating_sub(1));
+    let mut lines: Vec<Line> = themes
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(rows)
+        .map(|(i, theme)| {
+            let here = i == selected;
+            let palette = theme.palette(appearance);
+            let mut spans = vec![
+                Span::styled(if here { "▸ " } else { "  " }, Style::new().fg(blue())),
+                Span::styled(
+                    format!("{:<name_width$}  ", theme.name),
+                    if here {
+                        Style::new().fg(text()).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::new().fg(text_dim())
+                    },
+                ),
+            ];
+            for color in [
+                palette.red,
+                palette.orange,
+                palette.yellow,
+                palette.green,
+                palette.cyan,
+                palette.blue,
+                palette.magenta,
+            ] {
+                spans.push(Span::styled("●", Style::new().fg(color)));
+            }
+            let mut note = String::new();
+            if theme.name == app.theme.name {
+                note.push_str("  in use");
+            }
+            if matches!(theme.source, crate::theme::Source::File(_)) {
+                note.push_str("  yours");
+            }
+            spans.push(Span::styled(note, Style::new().fg(green())));
+            let used: usize = spans.iter().map(|s| text_width(&s.content)).sum();
+            spans.push(Span::styled(
+                format!(
+                    "  {}",
+                    truncate(&theme.description, cap.saturating_sub(used + 2))
+                ),
+                Style::new().fg(text_muted()),
+            ));
+            Line::from(spans)
+        })
+        .collect();
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        truncate(
+            &format!(
+                "{} half, as the system is — [ui] appearance pins one",
+                appearance.word()
+            ),
+            cap,
+        ),
+        Style::new().fg(text_muted()),
+    ));
+    lines.push(Line::from(vec![
+        key_span("↑↓"),
+        hint_span(" try it   "),
+        key_span("⏎"),
+        hint_span(" keep it   "),
+        key_span("esc"),
+        hint_span(" put back"),
+    ]));
+    let width = widest(&lines).min(cap);
+    let Some(inner) = popup(f, area, "theme", None, width, lines.len()) else {
         return;
     };
     f.render_widget(Paragraph::new(lines), inner);

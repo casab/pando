@@ -1,0 +1,226 @@
+use super::*;
+
+#[test]
+fn every_built_in_theme_parses_in_both_appearances() {
+    for (name, text) in BUILT_IN {
+        let theme =
+            Theme::parse(name, text, Source::BuiltIn).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(!theme.description.is_empty(), "{name} says what it is");
+        assert_ne!(theme.dark, theme.light, "{name} has two different halves");
+    }
+}
+
+#[test]
+fn the_default_theme_is_built_in_and_listed_first() {
+    assert_eq!(BUILT_IN[0].0, DEFAULT_THEME);
+    let mut names: Vec<&str> = BUILT_IN.iter().map(|(n, _)| *n).collect();
+    let rest = names.split_off(1);
+    let mut sorted = rest.clone();
+    sorted.sort();
+    assert_eq!(
+        rest, sorted,
+        "the rest by name, so the picker reads as a list"
+    );
+}
+
+// The default palette is pando's own, exactly as it was before themes were
+// data: nobody who never picks a theme sees a colour change.
+#[test]
+fn the_default_theme_keeps_pandos_own_colours() {
+    let (all, _) = themes(None);
+    let pando = find(&all, DEFAULT_THEME).unwrap();
+    let dark = pando.palette(Appearance::Dark);
+    assert_eq!(dark.text, Color::Rgb(210, 215, 225));
+    assert_eq!(dark.text_muted, Color::Rgb(92, 97, 116));
+    assert_eq!(dark.surface, Color::Rgb(30, 33, 45));
+    assert_eq!(dark.search_cursor_bg, Color::Rgb(230, 150, 60));
+    let light = pando.palette(Appearance::Light);
+    assert_eq!(light.blue, Color::Rgb(50, 95, 205));
+    assert_eq!(light.search_cursor_bg, Color::Rgb(245, 190, 110));
+}
+
+#[test]
+fn a_role_a_theme_leaves_out_is_mixed_from_its_background_and_text() {
+    let text = r##"
+        description = "test"
+        [dark]
+        background = "#000000"
+        foreground = "#ffffff"
+        red = "#ff0000"
+        green = "#00ff00"
+        yellow = "#ffff00"
+        blue = "#0000ff"
+        magenta = "#ff00ff"
+        cyan = "#00ffff"
+        orange = "#ff8800"
+        [light]
+        background = "#ffffff"
+        foreground = "#000000"
+        red = "#ff0000"
+        green = "#00ff00"
+        yellow = "#ffff00"
+        blue = "#0000ff"
+        magenta = "#ff00ff"
+        cyan = "#00ffff"
+        orange = "#ff8800"
+        border = "#123456"
+    "##;
+    let theme = Theme::parse("t", text, Source::BuiltIn).unwrap();
+    let dark = theme.palette(Appearance::Dark);
+    // Between black and white, nearer black for a surface than for text.
+    let grey = |c: Color| match c {
+        Color::Rgb(r, g, b) => {
+            assert!(r == g && g == b, "{c:?} is a grey");
+            r
+        }
+        other => panic!("{other:?}"),
+    };
+    assert!(grey(dark.surface) < grey(dark.highlight_bg));
+    assert!(grey(dark.highlight_bg) < grey(dark.border));
+    assert!(grey(dark.border) < grey(dark.text_muted));
+    assert!(grey(dark.text_muted) < grey(dark.text_dim));
+    assert_eq!(dark.search_cursor_bg, Color::Rgb(255, 136, 0), "the orange");
+    // A role the file sets is taken as it is.
+    assert_eq!(
+        theme.palette(Appearance::Light).border,
+        Color::Rgb(0x12, 0x34, 0x56)
+    );
+}
+
+#[test]
+fn a_colour_that_is_not_hex_says_how_to_write_it() {
+    let bad = BUILT_IN[1].1.replacen("\"#", "\"", 1);
+    let error = Theme::parse("bad", &bad, Source::BuiltIn).unwrap_err();
+    assert!(error.contains("#rrggbb"), "{error}");
+}
+
+#[test]
+fn a_file_of_ones_own_replaces_the_built_in_it_is_named_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let mine = BUILT_IN[1]
+        .1
+        .replace("description = \"", "description = \"mine: ");
+    std::fs::write(dir.path().join("catppuccin.toml"), &mine).unwrap();
+    std::fs::write(dir.path().join("zz-new.toml"), &mine).unwrap();
+    std::fs::write(dir.path().join("broken.toml"), "not = [toml").unwrap();
+    let (all, warnings) = themes(Some(dir.path()));
+    let catppuccin = find(&all, "catppuccin").unwrap();
+    assert!(catppuccin.description.starts_with("mine: "));
+    assert!(matches!(catppuccin.source, Source::File(_)));
+    assert_eq!(all.len(), BUILT_IN.len() + 1, "one new, one replaced");
+    assert_eq!(all.last().unwrap().name, "zz-new");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("broken.toml"), "{warnings:?}");
+}
+
+#[test]
+fn a_theme_is_chosen_from_the_file_then_the_config_then_the_default() {
+    // The environment is left alone: other tests run beside this one.
+    if std::env::var(THEME_ENV).is_ok() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("current");
+    std::fs::write(&state, "gruvbox\n").unwrap();
+    let settings = Settings {
+        theme: Some("github".into()),
+        theme_from: Some(state.clone()),
+        appearance: Some("light".into()),
+    };
+    assert_eq!(
+        choose(&settings),
+        ("gruvbox".into(), Origin::File(state.clone()))
+    );
+    std::fs::write(&state, "").unwrap();
+    assert_eq!(
+        choose(&settings),
+        ("github".into(), Origin::Config),
+        "an empty file says nothing"
+    );
+    let none = Settings::default();
+    assert_eq!(choose(&none), (DEFAULT_THEME.into(), Origin::Default));
+}
+
+#[test]
+fn an_unknown_theme_falls_back_to_the_default_and_says_so() {
+    if std::env::var(THEME_ENV).is_ok() {
+        return;
+    }
+    let settings = Settings {
+        theme: Some("no-such-theme".into()),
+        theme_from: None,
+        appearance: Some("dark".into()),
+    };
+    let resolved = resolve(&settings, None);
+    assert_eq!(resolved.name, DEFAULT_THEME);
+    assert!(
+        resolved.warnings[0].contains("no-such-theme"),
+        "{:?}",
+        resolved.warnings
+    );
+}
+
+#[test]
+fn setting_a_palette_changes_what_every_role_returns() {
+    let (all, _) = themes(None);
+    let gruvbox = find(&all, "gruvbox").unwrap().palette(Appearance::Dark);
+    set_palette(gruvbox);
+    assert_eq!(green(), gruvbox.green);
+    assert_eq!(border(), gruvbox.border);
+}
+
+#[test]
+fn hex_colours_parse_and_mix() {
+    assert_eq!(Rgb::parse("#89b4fa"), Some(Rgb(0x89, 0xb4, 0xfa)));
+    assert_eq!(Rgb::parse("89b4fa"), None);
+    assert_eq!(Rgb::parse("#89b4f"), None);
+    assert_eq!(Rgb::parse("#89b4fg"), None);
+    assert_eq!(Rgb(0, 0, 0).mix(Rgb(200, 100, 50), 0.5), Rgb(100, 50, 25));
+}
+
+// One fact, one row: the files and the list that compiles them in are
+// held to one set.
+#[test]
+fn every_file_in_builtin_has_a_row_and_every_row_a_file() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/theme/builtin");
+    let mut files: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            e.path()
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+        })
+        .collect();
+    files.sort();
+    let mut rows: Vec<String> = BUILT_IN.iter().map(|(n, _)| n.to_string()).collect();
+    rows.sort();
+    assert_eq!(files, rows);
+}
+
+// A theme whose own text is soft must not make pando's labels unreadable:
+// the derived greys are pushed until they reach a floor.
+#[test]
+fn derived_text_reads_against_what_it_sits_on_in_every_built_in() {
+    let rgb = |c: Color| match c {
+        Color::Rgb(r, g, b) => Rgb(r, g, b),
+        other => panic!("{other:?}"),
+    };
+    for (name, text) in BUILT_IN.iter().filter(|(n, _)| *n != DEFAULT_THEME) {
+        let theme = Theme::parse(name, text, Source::BuiltIn).unwrap();
+        for appearance in [Appearance::Dark, Appearance::Light] {
+            let p = theme.palette(appearance);
+            let muted = rgb(p.text_muted).contrast(rgb(p.surface));
+            assert!(muted >= 2.95, "{name} {appearance:?}: muted {muted:.2}");
+        }
+    }
+}
+
+#[test]
+fn contrast_is_wcags_ratio() {
+    let black = Rgb(0, 0, 0);
+    let white = Rgb(255, 255, 255);
+    assert!((black.contrast(white) - 21.0).abs() < 0.01);
+    assert!((white.contrast(white) - 1.0).abs() < 0.001);
+}
