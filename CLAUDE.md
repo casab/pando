@@ -15,8 +15,8 @@ the log viewer, compose isolation, share, `init`/`doctor`/`signals`, native
 service recipes, and the agent layer. On 2026-09-23 the code was
 restructured for maintainability with no behaviour change
 (`plans/refactor-maintainability.md`), and 0.2.0 was built and tagged.
-On 2026-09-25, after 0.2.0 and unreleased, the TUI gained a pull request
-picker: `p` lists the open ones, enter makes a worktree for one
+On 2026-09-25 the TUI gained a pull request picker, and 0.3.0 was built
+and tagged with it: `p` lists the open ones, enter makes a worktree for one
 (`actions::new_for_pr`; a fork's is fetched from `pull/<n>/head` into
 `pr-<n>/<branch>`). Restarting only the selected process moved from `p`
 to `P`. There is no CLI flag for it yet.

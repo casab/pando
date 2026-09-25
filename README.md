@@ -152,14 +152,14 @@ warnings`, and `cargo fmt --check`.
 
 ## Status
 
-Version 0.2.0, built and not published. Every command above is
+Version 0.3.0, built and not published. Every command above is
 implemented and covered by tests, in this order: worktrees and their
 lifecycle; detached dev servers with their own ports, logs and readiness;
 several processes per worktree; the log viewer; private per-worktree
 services from the project's own compose file; public tunnel URLs; `init`,
 `doctor` and `signals`; native service recipes for machines without
-Docker; the JSON contract an agent reads; and, after 0.2.0 and not yet in a
-release, a worktree from any open pull request in the TUI.
+Docker; the JSON contract an agent reads; and a worktree from any open
+pull request in the TUI.
 
 macOS is what it is developed and tested on. The Unix-only parts have
 Linux branches written and no CI, so Linux is intended rather than
