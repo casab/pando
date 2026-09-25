@@ -15,6 +15,11 @@ the log viewer, compose isolation, share, `init`/`doctor`/`signals`, native
 service recipes, and the agent layer. On 2026-09-23 the code was
 restructured for maintainability with no behaviour change
 (`plans/refactor-maintainability.md`), and 0.2.0 was built and tagged.
+On 2026-09-25, after 0.2.0 and unreleased, the TUI gained a pull request
+picker: `p` lists the open ones, enter makes a worktree for one
+(`actions::new_for_pr`; a fork's is fetched from `pull/<n>/head` into
+`pr-<n>/<branch>`). Restarting only the selected process moved from `p`
+to `P`. There is no CLI flag for it yet.
 
 What is left is not a phase. `plans/open-follow-ups.md` carries the known
 edges, each with who found it and where it belongs, and the release
@@ -88,6 +93,11 @@ database, a prod schema dump, and cookie auth."
   during development.
 - dwt's origin project is never used, not even read-only. Its path is in
   `CLAUDE.local.md` only so it can be recognised and avoided.
+- Nothing under test reaches GitHub. The TUI's `gh` workers
+  (`spawn_pr_fetch`, `spawn_gh_account_check`) return early under
+  `cfg!(test)`; tests set `pr_list` by hand, and `gh` parsing is tested
+  on fixed JSON or a stand-in `gh` script. A fork's pull request is
+  tested by pushing to `refs/pull/<n>/head` on a bare fixture origin.
 - Never run two `cargo test`s at once. Two tests are load-sensitive
   (`plans/open-follow-ups.md`); under a parallel build they fail for
   reasons that have nothing to do with the change. Rerun a readiness or

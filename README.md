@@ -36,6 +36,8 @@ Your repository works the same way.
   that would rather not run Docker, the same databases natively from a
   recipe you can override
 - Shares any running worktree through a public tunnel URL
+- Turns an open pull request into a running worktree: pick it from the
+  list, press enter — a fork's too
 - Shows all of it on one terminal screen, with a real log viewer
 
 Built for people, and for agents, who work on several branches at once.
@@ -106,6 +108,15 @@ p        open pull requests: ⏎ makes a worktree for one
 m ?      what pando said in full, and every key
 ```
 
+`p` lists the repository's open pull requests through the GitHub CLI
+(`gh`, signed in); typing narrows them by number, title, branch or
+author. Enter checks out the pull request's branch in a new worktree, or
+goes to the worktree it already has. A pull request from a fork has no
+branch on `origin`, so pando fetches it from `pull/<number>/head` into a
+branch of its own, `pr-<number>/<branch>`. One whose branch cannot be
+found on `origin` is refused rather than started as an empty branch of
+the same name.
+
 The log viewer has a tab per log, led by an `all` tab that merges every
 process's when there are several. `1`–`9` switch tabs, `/` searches, `f`
 filters by level, and `e`/`E` jump between errors.
@@ -147,7 +158,8 @@ lifecycle; detached dev servers with their own ports, logs and readiness;
 several processes per worktree; the log viewer; private per-worktree
 services from the project's own compose file; public tunnel URLs; `init`,
 `doctor` and `signals`; native service recipes for machines without
-Docker; and the JSON contract an agent reads.
+Docker; the JSON contract an agent reads; and, after 0.2.0 and not yet in a
+release, a worktree from any open pull request in the TUI.
 
 macOS is what it is developed and tested on. The Unix-only parts have
 Linux branches written and no CI, so Linux is intended rather than
