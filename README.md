@@ -48,6 +48,35 @@ pando never writes into your repository. Not a config file, not a gitignore
 line, not a lockfile change. Everything it learns and everything it runs lives
 under `~/.pando`.
 
+## First run
+
+```bash
+cd your-project
+pando            # the TUI: n makes a worktree, s starts it
+```
+
+Nothing is asked where pando can tell. It reads the repository — the
+lockfile, the dev script, the env example, the version file — and takes
+its own first choice for anything it has one for, printing each as it goes
+with the file it wrote it to:
+
+```
+pando: process list: using "npm run dev" (package.json scripts.dev, which starts the
+       workspace's apps itself; API_PORT and WEB_PORT in the env example), pando's first
+       choice, over 1 other option — change it in ~/.pando/projects/<id>/pando.toml
+```
+
+That file is the whole configuration; edit any line, or delete one and
+run `pando init`, which puts every open question to you instead of taking
+a default. `pando doctor` says what was detected and from where. A
+question pando has no option for at all is still asked, and so is the one
+real choice isolation brings — which services to run private copies of.
+
+A project pando cannot read on its own — a dev server started some way no
+rule knows — is what the agent plugin below is for: `/pando:pando-setup`
+in Claude Code reads the project, writes the answers through
+`pando init --answers`, and proves them by starting a scratch worktree.
+
 ## For agents
 
 pando publishes what it knows as JSON so a program can read it instead of

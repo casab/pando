@@ -21,6 +21,14 @@ and tagged with it: `p` lists the open ones, enter makes a worktree for one
 `pr-<n>/<branch>`). Restarting only the selected process moved from `p`
 to `P`. There is no CLI flag for it yet.
 
+The same day, after the maintainer's first real run on the origin project
+failed, the first run was made to work without questions: `new`, `start`
+and the TUI take the rules' first choice and print it (`actions::
+recommended`), `init` still asks; a workspace whose root dev script is
+its own orchestration runs as that one script with its apps' ports; and a
+project that gitignores its lockfile gets the plain install. Proved on a
+temporary clone of the origin project: zero questions, web and api up.
+
 What is left is not a phase. `plans/open-follow-ups.md` carries the known
 edges, each with who found it and where it belongs, and the release
 checklist in `docs/08-roadmap.md` is untouched: no licence, no CI, no
