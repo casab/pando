@@ -16,6 +16,7 @@ use crate::template;
 use crate::worktree::Worktree;
 
 use super::hooks::{HookContext, run_hooks, run_probes};
+use super::namespaced::{self, Ready};
 use super::refresh::advance_before_reconcile;
 use super::runtime::with_prelude;
 use super::services::{
@@ -53,8 +54,8 @@ pub enum Mode {
     /// The project's shared services, and the private copies stopped. The
     /// way back.
     Shared,
-    /// The project's own servers, with a namespace of this worktree's own
-    /// in each. Not something a start can do yet.
+    /// The main checkout's own servers, with a namespace of this
+    /// worktree's own in each: a database, a numbered slot.
     Namespaced,
 }
 
@@ -178,24 +179,41 @@ pub fn start(
     mode: Mode,
     progress: &dyn Fn(&str),
 ) -> Result<StartReport> {
-    start_checked(paths, config, name, only, mode, false, progress)
+    start_checked(
+        paths,
+        config,
+        name,
+        only,
+        mode,
+        Preflight::default(),
+        progress,
+    )
 }
 
-/// [`start`], told whether its caller has already run
-/// [`preflight_isolation`] — `restart` has to, before its stop, and asking
-/// Docker twice in one command buys nothing.
+/// What a caller has already checked or made ready before [`start`] —
+/// `restart` has to, before its stop, and doing either twice in one
+/// command buys nothing.
+#[derive(Default)]
+struct Preflight {
+    /// [`preflight_isolation`] has run.
+    isolation: bool,
+    /// The namespaces a namespaced start needs are made and recorded.
+    namespaces: Option<Ready>,
+}
+
 fn start_checked(
     paths: &PandoPaths,
     config: &Config,
     name: &str,
     only: Option<&str>,
     mode: Mode,
-    mut preflighted: bool,
+    preflight: Preflight,
     progress: &dyn Fn(&str),
 ) -> Result<StartReport> {
-    if mode == Mode::Namespaced {
-        bail!("pando cannot start a worktree namespaced yet — start it shared or isolated");
-    }
+    let Preflight {
+        isolation: mut preflighted,
+        namespaces: mut ready,
+    } = preflight;
     let worktree = find_worktree(paths, name)?;
     // Before anything is installed, signalled or spawned: a `--only` naming
     // a process that does not exist must have no side effects at all.
@@ -208,6 +226,16 @@ fn start_checked(
     let isolatable = !service_roles(config).is_empty();
     if mode == Mode::Isolated && !isolatable {
         progress("no services are configured for this project — starting in shared mode");
+    }
+    // The same for namespaces: a project none of whose services pando can
+    // give a worktree a namespace in starts on the main checkout's data,
+    // and says why for each of them.
+    let namespaceable = can_namespace(paths, config, name, mode);
+    if mode == Mode::Namespaced && !namespaceable {
+        progress("no service here can have a namespace of its own — starting in shared mode");
+        for line in namespaced::plan(paths, config).shared {
+            progress(&line);
+        }
     }
     // A start that will only report what is already up must not install
     // first: `npm ci` inside a worktree whose dev server is live is a
@@ -234,6 +262,13 @@ fn start_checked(
             &worktree_roles(config, true),
         )?;
         preflighted = true;
+    }
+    // A namespaced start makes its namespaces now, before anything is
+    // stopped: a server that does not answer, or a login it will not let
+    // make a database, costs nothing here — the processes stay as they
+    // were, and nothing was made.
+    if ready.is_none() && target_of(paths, config, name, mode) == ServiceMode::Namespaced {
+        ready = Some(namespaced::prepare(paths, config, name, progress)?);
     }
 
     paths.ensure_home()?;
@@ -272,20 +307,28 @@ fn start_checked(
     // start that changes the answer is a start that has to replace the
     // processes: an application still pointed at a database that is going
     // away is not running in the mode it was asked for.
-    let was_isolated = store
+    let was = store
         .worktrees
         .get(name)
-        .is_some_and(|r| r.mode() == ServiceMode::Isolated);
-    let isolate = isolatable
-        && match mode {
-            Mode::Shared | Mode::Namespaced => false,
-            Mode::Isolated => true,
-            Mode::Remembered => was_isolated,
-        };
-    let mode_changed = was_isolated != isolate;
+        .map(WorktreeRecord::mode)
+        .unwrap_or_default();
+    let was_isolated = was == ServiceMode::Isolated;
+    let target = decide(mode, was, isolatable, namespaceable);
+    let isolate = target == ServiceMode::Isolated;
+    let mode_changed = was != target;
     if mode_changed {
-        refuse_only_across_a_mode_change(only, isolate)?;
+        refuse_only_across_a_mode_change(only, target)?;
     }
+    // The mode flipped to namespaced under a concurrent command between
+    // the read above and this one, and nothing was made for it.
+    let ready: Option<Ready> = match (target, ready.take()) {
+        (ServiceMode::Namespaced, None) => bail!(
+            "another start changed this worktree's mode while this one was starting, so nothing \
+             was started here — start it again with the mode you want"
+        ),
+        (ServiceMode::Namespaced, made) => made,
+        _ => None,
+    };
     // The mode flipped under a concurrent command between the lock-free
     // read above and this one. Rare, so checked here, under the lock,
     // rather than not at all.
@@ -307,21 +350,28 @@ fn start_checked(
     // for that before the services are really up is undone if the start
     // fails first — see `undo_failed_isolation`.
     let becoming_isolated = isolate && !was_isolated;
+    // A worktree moving onto data of its own — its own servers, or its own
+    // namespaces — from services that stay up whatever happens: the main
+    // checkout's, or namespaces that are kept until `rm`. Its processes can
+    // go on serving until the new data is ready; leaving isolated they
+    // cannot, because their servers are about to stop.
+    let keeps_serving = mode_changed && target != ServiceMode::Shared && !was_isolated;
 
     // Decided before anything is touched. A process that is alive is
     // reported and left exactly as it is; one whose leader is gone is
     // signalled before its record goes, because a dead leader is not a dead
     // process group and its child may still hold the port.
     //
-    // A live process of a worktree becoming isolated is the exception to
-    // both. It has to be replaced, since it talks to the shared services,
-    // but not yet: it keeps serving while the private services come up and
-    // the hooks run against them, and is replaced only once all of that
-    // has worked. A start that fails there — a container that never gets
-    // ready, a migration that fails — then costs nothing: the dev server
-    // the developer had is still the one they have. Nothing fights over a
-    // port meanwhile, because the services get roles of their own after
-    // the processes' and the processes keep the ports they hold.
+    // A live process of a worktree moving onto data of its own is the
+    // exception to both. It has to be replaced, since it talks to the
+    // services it is leaving, but not yet: it keeps serving while the
+    // private services or the namespaces come up and the hooks run against
+    // them, and is replaced only once all of that has worked. A start that
+    // fails there — a container that never gets ready, a migration that
+    // fails — then costs nothing: the dev server the developer had is
+    // still the one they have. Nothing fights over a port meanwhile,
+    // because the services get roles of their own after the processes'
+    // and the processes keep the ports they hold.
     let mut already: Vec<String> = Vec::new();
     let mut clear: Vec<(String, i32)> = Vec::new();
     let mut kept_serving: Vec<String> = Vec::new();
@@ -334,7 +384,7 @@ fn start_checked(
             ) && proc::is_alive(existing.pid);
             if selected && live && !mode_changed {
                 already.push(process.clone());
-            } else if selected && live && becoming_isolated {
+            } else if selected && live && keeps_serving {
                 kept_serving.push(process.clone());
             } else if selected || only.is_none() {
                 // Selected and not live: this start replaces it. Not
@@ -359,8 +409,12 @@ fn start_checked(
     }
     if !kept_serving.is_empty() {
         progress(&format!(
-            "{} keeps running on the shared services until this worktree's own are ready",
-            kept_serving.join(", ")
+            "{} keeps running on the {} until this worktree's own are ready",
+            kept_serving.join(", "),
+            match was {
+                ServiceMode::Namespaced => "namespaces it has",
+                _ => "shared services",
+            }
         ));
     }
     if !clear.is_empty() {
@@ -493,6 +547,13 @@ fn start_checked(
         if isolate {
             record.services = planned_services(config, &assignment.ports, record);
         }
+        // Written into the record this start saves and spawns from, not
+        // left to what `prepare` wrote: a stale record replaced above took
+        // those with it, and a namespace nothing records is one `rm` can
+        // never drop.
+        for namespace in ready.iter().flat_map(|ready| &ready.namespaces) {
+            namespaced::keep(record, namespace);
+        }
     }
     // Written down before anything is brought up: a start that fails
     // halfway must still leave `rm` able to name the compose project and
@@ -509,6 +570,11 @@ fn start_checked(
     // freeze `pando ls` and the TUI's tick.
     if !going_shared.is_empty() {
         progress(&match was_isolated {
+            true if target == ServiceMode::Namespaced => format!(
+                "{} moves to namespaces of its own in the project's services — stopping its \
+                 private ones",
+                worktree.display_name()
+            ),
             true => format!(
                 "{} is going back to the project's shared services — stopping its own",
                 worktree.display_name()
@@ -535,10 +601,14 @@ fn start_checked(
     // Everything the app is told about where its services are. Computed
     // from the allocated ports alone, so a hook that runs before the
     // containers exist sees exactly what the processes will.
-    let service_env = if isolate {
-        resolve_service_env(paths, config, &canonical, &assignment.ports).map_err(undo)?
-    } else {
-        shared_service_env(paths, config)
+    let service_env = match (&ready, isolate) {
+        (_, true) => {
+            resolve_service_env(paths, config, &canonical, &assignment.ports).map_err(undo)?
+        }
+        (Some(ready), false) => {
+            namespaced::namespaced_env(paths, config, &ready.plan, &ready.namespaces)?
+        }
+        (None, false) => shared_service_env(paths, config),
     };
 
     // The lifecycle in order: create (which is where the install step
@@ -555,7 +625,7 @@ fn start_checked(
         worktree: &canonical,
         ports: &assignment.ports,
         service_env: &service_env,
-        isolated: isolate,
+        own_data: target != ServiceMode::Shared,
     };
     if !everything_up {
         run_hooks(
@@ -590,10 +660,15 @@ fn start_checked(
     // inputs changed" is wrong, so it is discarded rather than trusted —
     // and the hooks are let through even on a worktree that was otherwise
     // fully up, because an empty schema is not "nothing to do".
-    let why = match (mode_changed, fresh.0) {
-        (true, _) if isolate => Some("this worktree now runs its own services"),
-        (true, _) => Some("this worktree is back on the project's shared services"),
-        (_, true) => Some("a service here was given a new, empty data directory"),
+    let made_now = ready.as_ref().is_some_and(|ready| ready.fresh);
+    let why = match (mode_changed, fresh.0, made_now) {
+        (true, _, _) if isolate => Some("this worktree now runs its own services"),
+        (true, _, _) if target == ServiceMode::Namespaced => {
+            Some("this worktree now runs on namespaces of its own")
+        }
+        (true, _, _) => Some("this worktree is back on the project's shared services"),
+        (_, true, _) => Some("a service here was given a new, empty data directory"),
+        (_, _, true) => Some("a database of this worktree's own was made just now"),
         _ => None,
     };
     if let Some(why) = why {
@@ -683,7 +758,7 @@ fn start_checked(
             ));
         }
     }
-    let running_isolated = record.mode() == ServiceMode::Isolated;
+    let running = record.mode();
     let mut replace: Vec<(String, i32)> = Vec::new();
     for (process_name, _) in &selection {
         if already.contains(process_name) {
@@ -697,7 +772,7 @@ fn start_checked(
         if !live {
             continue;
         }
-        if running_isolated == isolate {
+        if running == target {
             progress(&format!("{process_name} is already running"));
             already.push(process_name.clone());
         } else {
@@ -726,9 +801,16 @@ fn start_checked(
     };
 
     if !replace.is_empty() {
-        progress(match isolate {
-            true => "its own services are ready, so its processes restart against them",
-            false => "the services this worktree talks to changed, so its processes restart",
+        progress(match target {
+            ServiceMode::Isolated => {
+                "its own services are ready, so its processes restart against them"
+            }
+            ServiceMode::Namespaced => {
+                "its own namespaces are ready, so its processes restart against them"
+            }
+            ServiceMode::Shared => {
+                "the services this worktree talks to changed, so its processes restart"
+            }
         });
     }
     for (process_name, pgid) in &replace {
@@ -746,10 +828,7 @@ fn start_checked(
     // run in the mode this flag says — see above — and until this point
     // they were the shared ones.
     if let Some(record) = store.worktrees.get_mut(name) {
-        record.mode = Some(match isolate {
-            true => ServiceMode::Isolated,
-            false => ServiceMode::Shared,
-        });
+        record.mode = Some(target);
     }
 
     let mut started: Vec<StartedProcess> = Vec::new();
@@ -1301,16 +1380,18 @@ pub fn restart(
     // unrelated state, and never the one that lists the names config
     // declares.
     selected_processes(config, only)?;
+    let was = recorded_mode(paths, name);
+    let target = target_of(paths, config, name, mode);
     // Before the stop below, not after it: a refusal that has already
     // taken the process down is not a refusal.
     if mode_would_change(paths, config, name, mode) {
-        refuse_only_across_a_mode_change(only, mode == Mode::Isolated)?;
+        refuse_only_across_a_mode_change(only, target)?;
     }
     // And every precondition of the isolated start that follows, for the
     // same reason: a restart whose start half cannot succeed must not get
     // to run its stop half. Asked of every isolated restart, not only a
     // mode change, because the stop takes the containers down too.
-    let preflighted = would_isolate(paths, config, name, mode);
+    let preflighted = target == ServiceMode::Isolated;
     if preflighted {
         let worktree = find_worktree(paths, name)?;
         let canonical =
@@ -1329,15 +1410,33 @@ pub fn restart(
     // one thing it could not do — but only while a sibling was still
     // running, which made the failure look random.
     //
-    // Except on the way to isolated: that start replaces every process
-    // anyway, and only once the worktree's own services are ready. A stop
-    // first would throw that away — a restart whose services then failed
-    // to come up would have cost the developer the dev server it could not
-    // replace.
-    if !would_switch_to_isolated(paths, config, name, mode) {
+    // Except on the way onto data of its own: that start replaces every
+    // process anyway, and only once the worktree's own services or
+    // namespaces are ready. A stop first would throw that away — a restart
+    // whose services then failed to come up would have cost the developer
+    // the dev server it could not replace.
+    //
+    // A namespaced restart's namespaces are made before the stop, for the
+    // same reason the isolated preflight runs before it.
+    let namespaces = match target {
+        ServiceMode::Namespaced => Some(namespaced::prepare(paths, config, name, progress)?),
+        _ => None,
+    };
+    if !(target != was && target != ServiceMode::Shared && was != ServiceMode::Isolated) {
         stop_missing(paths, name, only, MissingOnly::IsNothingToDo, progress)?;
     }
-    start_checked(paths, config, name, only, mode, preflighted, progress)
+    start_checked(
+        paths,
+        config,
+        name,
+        only,
+        mode,
+        Preflight {
+            isolation: preflighted,
+            namespaces,
+        },
+        progress,
+    )
 }
 
 /// Refuses `--only` on a start that would change which services the
@@ -1354,15 +1453,16 @@ pub fn restart(
 ///
 /// Checked before anything is stopped or spawned, and again under the
 /// lock where the decision is actually made.
-fn refuse_only_across_a_mode_change(only: Option<&str>, going_isolated: bool) -> Result<()> {
+fn refuse_only_across_a_mode_change(only: Option<&str>, going: ServiceMode) -> Result<()> {
     let Some(only) = only else { return Ok(()) };
     bail!(
         "this worktree is switching to {} services, and `--only {only}` cannot do that for one \
          process: the others would keep talking to the services that are going away. Run it \
          without `--only`, or leave the mode as it is",
-        match going_isolated {
-            true => "its own",
-            false => "the project's shared",
+        match going {
+            ServiceMode::Isolated => "its own",
+            ServiceMode::Namespaced => "namespaces of its own in the project's",
+            ServiceMode::Shared => "the project's shared",
         }
     )
 }
@@ -1376,58 +1476,77 @@ fn refuse_only_across_a_mode_change(only: Option<&str>, going_isolated: bool) ->
 /// before a side effect, and a mode that is flipping under a concurrent
 /// command is caught there.
 fn mode_would_change(paths: &PandoPaths, config: &Config, name: &str, mode: Mode) -> bool {
-    if !matches!(mode, Mode::Isolated | Mode::Shared) {
-        return false;
-    }
-    let was_isolated = state::load(&paths.state_file())
+    mode != Mode::Remembered && target_of(paths, config, name, mode) != recorded_mode(paths, name)
+}
+
+/// The mode this worktree runs in, or last ran in, read without the lock:
+/// shared when nothing says.
+pub(super) fn recorded_mode(paths: &PandoPaths, name: &str) -> ServiceMode {
+    state::load(&paths.state_file())
         .ok()
-        .and_then(|store| {
-            store
-                .worktrees
-                .get(name)
-                .map(|r| r.mode() == ServiceMode::Isolated)
-        })
-        .unwrap_or(false);
-    let isolate = !service_roles(config).is_empty() && mode == Mode::Isolated;
-    was_isolated != isolate
+        .and_then(|store| store.worktrees.get(name).map(WorktreeRecord::mode))
+        .unwrap_or_default()
+}
+
+/// The mode a start asked for `mode` puts a worktree in that was in
+/// `was`. A wish the project cannot grant — isolated with no services,
+/// namespaced with none pando can give a namespace in — is a shared start.
+fn decide(mode: Mode, was: ServiceMode, isolatable: bool, namespaceable: bool) -> ServiceMode {
+    match mode {
+        Mode::Shared => ServiceMode::Shared,
+        Mode::Isolated if isolatable => ServiceMode::Isolated,
+        Mode::Namespaced if namespaceable => ServiceMode::Namespaced,
+        Mode::Isolated | Mode::Namespaced => ServiceMode::Shared,
+        Mode::Remembered => match was {
+            ServiceMode::Isolated if isolatable => ServiceMode::Isolated,
+            ServiceMode::Namespaced if namespaceable => ServiceMode::Namespaced,
+            _ => ServiceMode::Shared,
+        },
+    }
+}
+
+/// Whether a start in `mode` could give this worktree namespaces. Asked
+/// only of a start that wants them, because answering reads the recipes
+/// and the main checkout's env files.
+fn can_namespace(paths: &PandoPaths, config: &Config, name: &str, mode: Mode) -> bool {
+    let wants = match mode {
+        Mode::Namespaced => true,
+        Mode::Remembered => recorded_mode(paths, name) == ServiceMode::Namespaced,
+        Mode::Shared | Mode::Isolated => false,
+    };
+    wants && !namespaced::plan(paths, config).targets.is_empty()
+}
+
+/// The mode a start in `mode` would leave this worktree in, read without
+/// the lock. `start` decides again under it, where it is authoritative.
+pub(super) fn target_of(
+    paths: &PandoPaths,
+    config: &Config,
+    name: &str,
+    mode: Mode,
+) -> ServiceMode {
+    decide(
+        mode,
+        recorded_mode(paths, name),
+        !service_roles(config).is_empty(),
+        can_namespace(paths, config, name, mode),
+    )
 }
 
 /// Whether a start in this mode would run this worktree on its own
 /// services, read without the lock.
 pub(super) fn would_isolate(paths: &PandoPaths, config: &Config, name: &str, mode: Mode) -> bool {
-    if service_roles(config).is_empty() {
-        return false;
-    }
-    match mode {
-        Mode::Isolated => true,
-        Mode::Shared | Mode::Namespaced => false,
-        Mode::Remembered => state::load(&paths.state_file())
-            .ok()
-            .and_then(|store| {
-                store
-                    .worktrees
-                    .get(name)
-                    .map(|r| r.mode() == ServiceMode::Isolated)
-            })
-            .unwrap_or(false),
-    }
+    target_of(paths, config, name, mode) == ServiceMode::Isolated
 }
 
-/// Whether a start in this mode would move a shared worktree onto its own
-/// services — the one start that replaces every running process for the
-/// sake of services that do not exist yet. Read without the lock.
+/// Whether a start in this mode would move a worktree onto private
+/// services it does not have yet — the one start that replaces every
+/// running process for the sake of services that do not exist yet. Read
+/// without the lock.
 fn would_switch_to_isolated(paths: &PandoPaths, config: &Config, name: &str, mode: Mode) -> bool {
     mode == Mode::Isolated
         && would_isolate(paths, config, name, mode)
-        && !state::load(&paths.state_file())
-            .ok()
-            .and_then(|store| {
-                store
-                    .worktrees
-                    .get(name)
-                    .map(|r| r.mode() == ServiceMode::Isolated)
-            })
-            .unwrap_or(false)
+        && recorded_mode(paths, name) != ServiceMode::Isolated
 }
 
 /// The processes a start, stop or restart acts on: every one config

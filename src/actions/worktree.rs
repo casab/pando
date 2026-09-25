@@ -176,7 +176,7 @@ pub fn new(
         worktree: &target,
         ports: &no_ports,
         service_env: &no_services,
-        isolated: false,
+        own_data: false,
     };
     run_hooks(paths, config, config::HookPoint::Create, &ctx, progress)
         .with_context(|| format!("{branch} was created, but its install step failed"))?;

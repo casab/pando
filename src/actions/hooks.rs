@@ -84,11 +84,12 @@ pub struct HookContext<'a> {
     /// Service addresses, so a migration talks to this worktree's own
     /// database rather than the shared one.
     pub service_env: &'a BTreeMap<String, String>,
-    /// Whether this start runs private services. A hook scoped to
-    /// isolated starts — every hook after `services`, unless its entry
-    /// says otherwise — is skipped when it is not, because the services
-    /// it would run against are the developer's shared ones.
-    pub isolated: bool,
+    /// Whether this start runs on data of the worktree's own: private
+    /// services, or namespaces of its own. A hook scoped to isolated
+    /// starts — every hook after `services`, unless its entry says
+    /// otherwise — runs on both and is skipped otherwise, because the data
+    /// it would run against is the main checkout's.
+    pub own_data: bool,
 }
 
 /// Runs every hook at one lifecycle point whose fingerprint has changed.
@@ -106,7 +107,7 @@ pub fn run_hooks(
 ) -> Result<()> {
     let has_services = !service_roles(config).is_empty();
     for hook in hooks_at(config, point) {
-        if !hook.runs_on(ctx.isolated, has_services) {
+        if !hook.runs_on(ctx.own_data, has_services) {
             if let Some(note) = skipped(&hook, has_services) {
                 progress(&note);
             }
@@ -118,8 +119,8 @@ pub fn run_hooks(
 }
 
 /// Why a hook did not run, when that is worth a line: one that only runs
-/// on isolated starts, on a start that is not. `never` is the developer's
-/// own answer and says nothing.
+/// where the worktree has data of its own, on a start that has none.
+/// `never` is the developer's own answer and says nothing.
 pub(super) fn skipped(hook: &config::HookConfig, has_services: bool) -> Option<String> {
     // Only an explicit `on = "isolated"` reaches here in a project with
     // no services, and there is no "shared services" to speak of: nothing
@@ -130,8 +131,8 @@ pub(super) fn skipped(hook: &config::HookConfig, has_services: bool) -> Option<S
     };
     (hook.scope(has_services) == config::HookScope::Isolated).then(|| {
         format!(
-            "{}: not run — it runs on isolated starts only, and {why} (set `on = \"always\"` \
-             in its [[hooks]] entry to run it here too)",
+            "{}: not run — it runs on isolated and namespaced starts only, and {why} (set \
+             `on = \"always\"` in its [[hooks]] entry to run it here too)",
             hook.name
         )
     })

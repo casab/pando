@@ -7836,3 +7836,477 @@ fn a_namespace_login_with_no_user_is_refused_and_nothing_is_written() {
     assert_eq!(login.user.as_deref(), Some("root"));
     assert!(!login.has_password());
 }
+
+// ---- namespaced starts ---------------------------------------------------------
+
+/// A fake `mariadb` in pando's own `bin`, which every namespace command
+/// finds first on PATH. Its databases are files under `dbs/`; `deny`
+/// refuses every CREATE the way a login without the grant is refused; and
+/// `argv` and `env` record what it was run with.
+fn fake_mariadb(paths: &PandoPaths) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let state = paths.home.join("fake-mariadb");
+    std::fs::create_dir_all(state.join("dbs")).unwrap();
+    let bin = paths.home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let script = format!(
+        r#"#!/bin/sh
+state='{state}'
+printf '%s\n' "$*" >> "$state/argv"
+printf '%s\n' "${{MYSQL_PWD-unset}}" >> "$state/env"
+named() {{ printf '%s' "$*" | sed -n "s/.*$1[^a-zA-Z0-9_-]*\([a-zA-Z0-9_-]*\).*/\1/p"; }}
+case "$*" in
+  *"SELECT 1"*) echo 1 ;;
+  *"CURRENT_USER()"*) echo "app@localhost" ;;
+  *"CREATE DATABASE"*)
+    db=$(printf '%s' "$*" | sed -n 's/.*CREATE DATABASE `\([^`]*\)`.*/\1/p')
+    if [ -f "$state/deny" ]; then
+      echo "ERROR 1044 (42000) at line 1: Access denied for user 'app'@'localhost' to database '$db'" >&2; exit 1
+    fi
+    if [ -f "$state/dbs/$db" ]; then
+      echo "ERROR 1007 (HY000) at line 1: Can't create database '$db'; database exists" >&2; exit 1
+    fi
+    touch "$state/dbs/$db"; echo "$db" >> "$state/created" ;;
+  *"SCHEMATA"*)
+    db=$(printf '%s' "$*" | sed -n "s/.*SCHEMA_NAME = '\([^']*\)'.*/\1/p")
+    if [ -f "$state/dbs/$db" ]; then echo "$db"; fi ;;
+  *"DROP DATABASE"*)
+    db=$(printf '%s' "$*" | sed -n 's/.*DROP DATABASE IF EXISTS `\([^`]*\)`.*/\1/p')
+    rm -f "$state/dbs/$db"; echo "$db" >> "$state/dropped" ;;
+  *) echo "unexpected: $*" >&2; exit 9 ;;
+esac
+"#,
+        state = state.display()
+    );
+    std::fs::write(bin.join("mariadb"), script).unwrap();
+    std::fs::set_permissions(bin.join("mariadb"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    state
+}
+
+/// A project whose main checkout runs a MariaDB it addresses in parts, a
+/// dev process that writes down its environment, and a schema step after
+/// the services that writes down which database it was pointed at.
+struct Namespaced {
+    fx: Fx,
+    name: String,
+    fake: PathBuf,
+    seen: PathBuf,
+    schema: PathBuf,
+}
+
+fn namespaced_fixture(env: &str) -> Namespaced {
+    let mut fx = fixture();
+    std::fs::write(fx.root.join(".env"), env).unwrap();
+    let seen = fx.root.parent().unwrap().join("seen-env");
+    let schema = fx.root.parent().unwrap().join("schema-ran");
+    let config: Config = toml::from_str(&format!(
+        "[[services]]\nkind = \"native\"\nname = \"mariadb\"\nenv = {{ DATABASE_PORT = \"mariadb\" }}\n\n\
+         [[hooks]]\nname = \"schema\"\nafter = \"services\"\n\
+         cmd = \"echo \\\"$DATABASE_NAME\\\" >> '{}'\"\n",
+        schema.display()
+    ))
+    .unwrap();
+    fx.config.services = config.services;
+    fx.config.hooks = config.hooks;
+    with_dev(
+        &mut fx,
+        ProcessConfig {
+            cmd: format!("env > {}; sleep 30", seen.display()),
+            ports: Some(crate::config::PortsSpec::List(Vec::new())),
+            ..Default::default()
+        },
+    );
+    let name = worktree_named(&fx, "feat/one");
+    let fake = fake_mariadb(&fx.paths);
+    Namespaced {
+        fx,
+        name,
+        fake,
+        seen,
+        schema,
+    }
+}
+
+const MAIN_ENV: &str = "DATABASE_HOST=localhost\nDATABASE_PORT=3306\nDATABASE_NAME=shop\n\
+                        DATABASE_USER=app\nDATABASE_PASSWORD=s3cret-pw\n";
+
+impl Namespaced {
+    fn start(&self, mode: Mode) -> Result<(StartReport, Vec<String>)> {
+        let (said, progress) = collecting();
+        let report = super::start(
+            &self.fx.paths,
+            &self.fx.config,
+            &self.name,
+            None,
+            mode,
+            &progress,
+        )?;
+        let said = said.borrow().clone();
+        Ok((report, said))
+    }
+
+    fn env_line(&self, key: &str) -> Option<String> {
+        let prefix = format!("{key}=");
+        assert!(
+            wait_until(Duration::from_secs(5), || std::fs::read_to_string(
+                &self.seen
+            )
+            .is_ok_and(|env| env.contains("PANDO_NAME="))),
+            "the process never wrote its environment"
+        );
+        let env = std::fs::read_to_string(&self.seen).unwrap();
+        env.lines()
+            .find_map(|line| line.strip_prefix(&prefix).map(str::to_string))
+    }
+
+    fn fake(&self, file: &str) -> String {
+        std::fs::read_to_string(self.fake.join(file)).unwrap_or_default()
+    }
+
+    fn record(&self) -> WorktreeRecord {
+        self.fx.state().worktrees[&self.name].clone()
+    }
+}
+
+// The whole of a namespaced start: the worktree's own database made in the
+// main checkout's server, recorded as pando's, handed to the app and to the
+// schema step in place of main's — and the server's address left as it is.
+#[test]
+fn a_namespaced_start_makes_the_worktrees_own_database_and_points_the_app_at_it() {
+    let ns = namespaced_fixture(MAIN_ENV);
+    let (report, said) = ns.start(Mode::Namespaced).unwrap();
+    let _guard = guard(&report);
+
+    assert_eq!(ns.fake("created"), "shop__feat_one\n");
+    let record = ns.record();
+    assert_eq!(record.mode, Some(crate::state::ServiceMode::Namespaced));
+    assert_eq!(record.namespaces.len(), 1);
+    let namespace = &record.namespaces[0];
+    assert_eq!(namespace.name, "shop__feat_one");
+    assert_eq!(namespace.main, "shop");
+    assert_eq!(
+        (namespace.host.as_str(), namespace.port),
+        ("localhost", 3306)
+    );
+    assert_eq!(namespace.kind, crate::state::NamespaceKind::Database);
+
+    assert_eq!(
+        ns.env_line("DATABASE_NAME").as_deref(),
+        Some("shop__feat_one")
+    );
+    assert_eq!(ns.env_line("DATABASE_PORT").as_deref(), Some("3306"));
+    assert_eq!(
+        std::fs::read_to_string(&ns.schema).unwrap(),
+        "shop__feat_one\n",
+        "the schema step ran, against the worktree's own database"
+    );
+    assert!(
+        said.iter()
+            .any(|l| l == "mariadb: own database shop__feat_one, made just now"),
+        "{said:?}"
+    );
+    // The login went to the client in its environment, and nowhere a line
+    // of output could carry it.
+    assert!(ns.fake("env").lines().all(|l| l == "s3cret-pw"));
+    assert!(!ns.fake("argv").contains("s3cret-pw"));
+    assert!(said.iter().all(|l| !l.contains("s3cret-pw")), "{said:?}");
+}
+
+// A restart finds the database it made and makes nothing; one somebody
+// dropped by hand is made again, empty — and then the schema step runs
+// again whatever its fingerprint says, because an empty database is not
+// "nothing changed".
+#[test]
+fn a_namespace_is_found_again_and_one_dropped_by_hand_is_made_again_and_filled() {
+    let mut ns = namespaced_fixture(MAIN_ENV);
+    ns.fx.config.hooks[0].fingerprint = vec!["README.md".to_string()];
+    let (report, _) = ns.start(Mode::Namespaced).unwrap();
+    drop(guard(&report));
+    stop(&ns.fx.paths, &ns.name, None).unwrap();
+
+    let (report, said) = ns.start(Mode::Remembered).unwrap();
+    drop(guard(&report));
+    assert_eq!(
+        ns.fake("created"),
+        "shop__feat_one\n",
+        "nothing new was made"
+    );
+    assert!(
+        said.iter()
+            .any(|l| l == "mariadb: own database shop__feat_one"),
+        "{said:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&ns.schema).unwrap().lines().count(),
+        1,
+        "its fingerprint had not changed, and neither had its database"
+    );
+    stop(&ns.fx.paths, &ns.name, None).unwrap();
+
+    std::fs::remove_file(ns.fake.join("dbs/shop__feat_one")).unwrap();
+    let (report, said) = ns.start(Mode::Remembered).unwrap();
+    let _guard = guard(&report);
+    assert_eq!(ns.fake("created"), "shop__feat_one\nshop__feat_one\n");
+    assert!(
+        said.iter()
+            .any(|l| l.contains("is gone from localhost:3306")),
+        "{said:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&ns.schema).unwrap().lines().count(),
+        2,
+        "an empty database is filled again"
+    );
+}
+
+// Decision 4: the login may not make it, so the start stops with nothing
+// made, nothing recorded, nothing spawned, and the grant that fixes it.
+#[test]
+fn a_login_that_may_not_make_the_database_stops_the_start_with_the_grant() {
+    let ns = namespaced_fixture(MAIN_ENV);
+    std::fs::write(ns.fake.join("deny"), "").unwrap();
+    let e = format!("{:#}", ns.start(Mode::Namespaced).unwrap_err());
+    assert!(
+        e.contains("GRANT ALL ON `shop\\_\\_%`.* TO 'app'@'localhost';"),
+        "{e}"
+    );
+    assert!(e.contains("Nothing was made"), "{e}");
+    assert!(!e.contains("s3cret-pw"), "{e}");
+    let record = ns.fx.state().worktrees.get(&ns.name).cloned();
+    assert!(
+        record
+            .as_ref()
+            .is_none_or(|r| r.namespaces.is_empty() && r.processes.is_empty())
+    );
+    assert!(record.is_none_or(|r| r.mode != Some(crate::state::ServiceMode::Namespaced)));
+    assert!(!ns.schema.exists(), "no hook ran");
+}
+
+// A database of that name already on the server was not made by pando, so
+// it is left alone and the worktree gets its second name instead.
+#[test]
+fn a_database_already_there_is_left_alone_and_the_worktree_gets_its_other_name() {
+    let ns = namespaced_fixture(MAIN_ENV);
+    std::fs::write(ns.fake.join("dbs/shop__feat_one"), "").unwrap();
+    let (report, said) = ns.start(Mode::Namespaced).unwrap();
+    let _guard = guard(&report);
+    let made = ns.fake("created");
+    assert!(
+        made.starts_with("shop__feat_one_") && made.lines().count() == 1,
+        "{made}"
+    );
+    assert_eq!(ns.record().namespaces[0].name, made.trim());
+    assert_eq!(ns.env_line("DATABASE_NAME").as_deref(), Some(made.trim()));
+    assert!(
+        said.iter().any(|l| l.contains("pando did not make it")),
+        "{said:?}"
+    );
+}
+
+// Decision 10: switching back to shared keeps the namespace until `rm`,
+// and the app is back on the main checkout's own data — so switching to
+// namespaced again finds what it had.
+#[test]
+fn a_worktree_switched_back_to_shared_keeps_its_namespace_for_the_way_back() {
+    let ns = namespaced_fixture(MAIN_ENV);
+    let (report, _) = ns.start(Mode::Namespaced).unwrap();
+    let running = guard(&report);
+    assert_eq!(
+        ns.env_line("DATABASE_NAME").as_deref(),
+        Some("shop__feat_one")
+    );
+    drop(running);
+    std::fs::remove_file(&ns.seen).unwrap();
+
+    let (report, _) = ns.start(Mode::Shared).unwrap();
+    let running = guard(&report);
+    let record = ns.record();
+    assert_eq!(record.mode, Some(crate::state::ServiceMode::Shared));
+    assert_eq!(record.namespaces.len(), 1, "kept until rm");
+    assert_eq!(
+        ns.env_line("DATABASE_NAME"),
+        None,
+        "no longer the worktree's own"
+    );
+    assert_eq!(ns.fake("dropped"), "", "nothing was dropped");
+    drop(running);
+    std::fs::remove_file(&ns.seen).unwrap();
+
+    let (report, _) = ns.start(Mode::Namespaced).unwrap();
+    let _guard = guard(&report);
+    assert_eq!(
+        ns.fake("created"),
+        "shop__feat_one\n",
+        "found again, not made again"
+    );
+    assert_eq!(
+        ns.env_line("DATABASE_NAME").as_deref(),
+        Some("shop__feat_one")
+    );
+}
+
+// A start that asks — a terminal, the TUI — asks for the login nothing
+// gives, and a start that cannot ask says where to write one.
+#[test]
+fn a_namespaced_start_with_no_login_asks_for_one_or_says_where_it_goes() {
+    let ns = namespaced_fixture("DATABASE_PORT=3306\nDATABASE_NAME=shop\n");
+    let e = format!("{:#}", ns.start(Mode::Namespaced).unwrap_err());
+    assert!(e.contains("[namespaced.mariadb]"), "{e}");
+    assert!(
+        e.contains(&ns.fx.paths.config_file().display().to_string()),
+        "{e}"
+    );
+    assert_eq!(ns.fake("created"), "", "nothing was made");
+
+    let ask = |q: &Question| -> Result<Answer> {
+        assert_eq!(q.slot, crate::detect::Slot::Login);
+        Ok(Answer::Custom("root:typed-pw".to_string()))
+    };
+    let config = resolve_for_start(
+        &ns.fx.paths,
+        &ns.fx.config,
+        &ns.name,
+        Mode::Namespaced,
+        &ask,
+        &noop,
+    )
+    .unwrap();
+    let report = super::start(
+        &ns.fx.paths,
+        &config,
+        &ns.name,
+        None,
+        Mode::Namespaced,
+        &noop,
+    )
+    .unwrap();
+    let _guard = guard(&report);
+    assert_eq!(ns.fake("created"), "shop__feat_one\n");
+    assert!(ns.fake("env").lines().all(|l| l == "typed-pw"));
+}
+
+// A project none of whose services pando can give a namespace in starts
+// on the main checkout's data, and says so for each.
+#[test]
+fn a_project_with_nothing_to_namespace_starts_shared_and_says_why() {
+    let ns = namespaced_fixture("DATABASE_PORT=3306\n");
+    let (report, said) = ns.start(Mode::Namespaced).unwrap();
+    let _guard = guard(&report);
+    assert!(
+        said.iter()
+            .any(|l| l.contains("no service here can have a namespace of its own")),
+        "{said:?}"
+    );
+    assert!(
+        said.iter()
+            .any(|l| l.contains("mariadb: shared") && l.contains("names its database")),
+        "{said:?}"
+    );
+    assert_eq!(ns.record().mode, Some(crate::state::ServiceMode::Shared));
+    assert!(!ns.schema.exists(), "a shared start runs no schema step");
+}
+
+// The schema step is scoped to starts with data of their own: a namespaced
+// start runs it, and a shared one of the same worktree does not.
+#[test]
+fn the_schema_step_runs_on_a_namespaced_start_and_not_on_a_shared_one() {
+    let ns = namespaced_fixture(MAIN_ENV);
+    let (report, said) = ns.start(Mode::Shared).unwrap();
+    drop(guard(&report));
+    assert!(!ns.schema.exists());
+    assert!(
+        said.iter()
+            .any(|l| l.contains("schema: not run") && l.contains("namespaced")),
+        "{said:?}"
+    );
+    stop(&ns.fx.paths, &ns.name, None).unwrap();
+    let (report, _) = ns.start(Mode::Namespaced).unwrap();
+    let _guard = guard(&report);
+    assert!(ns.schema.exists());
+}
+
+// `status --env` is what a command run by hand needs, and for a
+// namespaced worktree that is its own database.
+#[test]
+fn the_env_a_namespaced_worktree_gives_a_command_run_by_hand_names_its_own_database() {
+    let mut ns = namespaced_fixture(MAIN_ENV);
+    ns.fx.config.processes.get_mut("dev").unwrap().ports =
+        Some(PortsSpec::Map(BTreeMap::from([(
+            "PORT".to_string(),
+            "web".to_string(),
+        )])));
+    let (report, _) = ns.start(Mode::Namespaced).unwrap();
+    let _guard = guard(&report);
+    let env = resolved_env(&ns.fx.paths, &ns.fx.config, &ns.name).unwrap();
+    assert_eq!(
+        env.get("DATABASE_NAME").map(String::as_str),
+        Some("shop__feat_one")
+    );
+    assert_eq!(env.get("DATABASE_PORT").map(String::as_str), Some("3306"));
+}
+
+// A running shared worktree switched to namespaced keeps serving on the
+// main checkout's data until its own is made and filled, and only then are
+// its processes replaced — a namespace that cannot be made costs nothing.
+#[test]
+fn a_running_worktree_switched_to_namespaced_keeps_serving_until_its_data_is_ready() {
+    let ns = namespaced_fixture(MAIN_ENV);
+    let (first, _) = ns.start(Mode::Shared).unwrap();
+    let _first = guard(&first);
+    let before = first.started[0].record.pid;
+
+    let (second, said) = ns.start(Mode::Namespaced).unwrap();
+    let _second = guard(&second);
+    assert!(
+        said.iter()
+            .any(|l| l.contains("dev keeps running on the shared services")),
+        "{said:?}"
+    );
+    assert!(
+        said.iter()
+            .any(|l| l.contains("its own namespaces are ready")),
+        "{said:?}"
+    );
+    let after = ns.record().processes["dev"].pid;
+    assert_ne!(before, after, "replaced, onto its own data");
+    assert_eq!(
+        ns.record().mode,
+        Some(crate::state::ServiceMode::Namespaced)
+    );
+
+    // And the other way, a namespace that cannot be made leaves the
+    // running process exactly where it was.
+    let other = namespaced_fixture(MAIN_ENV);
+    let (running, _) = other.start(Mode::Shared).unwrap();
+    let _running = guard(&running);
+    std::fs::write(other.fake.join("deny"), "").unwrap();
+    assert!(other.start(Mode::Namespaced).is_err());
+    let record = other.record();
+    assert_eq!(record.processes["dev"].pid, running.started[0].record.pid);
+    assert!(crate::process::is_alive(record.processes["dev"].pid));
+    assert_eq!(record.mode, Some(crate::state::ServiceMode::Shared));
+}
+
+// `--only` through a switch would leave the other processes on the data
+// the switch is leaving; it is refused in the words of where it goes.
+#[test]
+fn only_one_process_cannot_be_moved_onto_namespaces() {
+    let ns = namespaced_fixture(MAIN_ENV);
+    let (report, _) = ns.start(Mode::Shared).unwrap();
+    let _guard = guard(&report);
+    let e = format!(
+        "{:#}",
+        super::restart(
+            &ns.fx.paths,
+            &ns.fx.config,
+            &ns.name,
+            Some("dev"),
+            Mode::Namespaced,
+            &noop
+        )
+        .unwrap_err()
+    );
+    assert!(e.contains("namespaces of its own"), "{e}");
+    assert!(e.contains("--only dev"), "{e}");
+    assert_eq!(ns.fake("created"), "", "refused before anything was made");
+}

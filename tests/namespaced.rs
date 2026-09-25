@@ -313,3 +313,86 @@ fn a_real_redis_empties_one_slot_and_never_falls_back_to_slot_0() {
     let e = format!("{:#}", refused.ping().unwrap_err());
     assert!(e.contains("NOAUTH"), "{e}");
 }
+
+// ---- a whole namespaced start -----------------------------------------------------
+
+mod common;
+
+/// Stops whatever a test started through pando, even when it panics.
+struct Started(pando::paths::PandoPaths);
+
+impl Drop for Started {
+    fn drop(&mut self) {
+        let _ = pando::actions::stop_all(&self.0, &|_| {});
+    }
+}
+
+// The start path against a real server: the worktree's own database is
+// made under the grant, the schema step builds its table there and not in
+// main, and a second worktree gets a database of its own beside it.
+#[test]
+fn a_real_namespaced_start_builds_the_worktrees_own_database_and_leaves_main_alone() {
+    if skip(&["mariadb-install-db", "mariadbd", "mariadb", "python3"]) {
+        return;
+    }
+    let db = mariadb();
+    root_sql(&db, "GRANT ALL ON `shop\\_\\_%`.* TO 'app'@'localhost'").unwrap();
+    root_sql(&db, "CREATE TABLE shop.main_only (x int)").unwrap();
+
+    let dir = TempDir::new().unwrap();
+    let root = common::fixture_repo(dir.path());
+    std::fs::write(
+        root.join(".env"),
+        format!(
+            "DATABASE_HOST=127.0.0.1\nDATABASE_PORT={}\nDATABASE_NAME=shop\n\
+             DATABASE_USER=app\nDATABASE_PASSWORD={APP_PASSWORD}\n",
+            db.port
+        ),
+    )
+    .unwrap();
+    let paths = common::paths_for(&dir.path().join("pando-home"), &root);
+    std::fs::create_dir_all(paths.project_dir()).unwrap();
+    std::fs::write(
+        paths.config_file(),
+        format!(
+            "[dev]\ncmd = '''{}'''\nports = {{ PORT = \"web\" }}\n\n\
+             [[services]]\nkind = \"native\"\nname = \"mariadb\"\n\
+             env = {{ DATABASE_PORT = \"mariadb\" }}\n\n\
+             [[hooks]]\nname = \"schema\"\nafter = \"services\"\n\
+             cmd = '''export MYSQL_PWD=\"$(sed -n 's/^DATABASE_PASSWORD=//p' \"$PANDO_ROOT/.env\")\"; \
+             mariadb --protocol=tcp -h 127.0.0.1 -P \"$DATABASE_PORT\" -u app \"$DATABASE_NAME\" \
+             -e 'CREATE TABLE worktree_only (x int)' '''\n",
+            common::listener_on_port_env()
+        ),
+    )
+    .unwrap();
+    let config = pando::config::load(&paths).unwrap().config;
+    let _started = Started(paths.clone());
+
+    for (branch, database) in [
+        ("feat/one", "shop__feat_one"),
+        ("feat/two", "shop__feat_two"),
+    ] {
+        let name = pando::actions::new(&paths, &config, branch, None, &|_| {}).unwrap();
+        pando::actions::start(
+            &paths,
+            &config,
+            &name,
+            None,
+            pando::actions::Mode::Namespaced,
+            &|_| {},
+        )
+        .unwrap_or_else(|e| panic!("start {branch} namespaced: {e:#}"));
+        let tables = root_sql(&db, &format!("SHOW TABLES FROM {database}")).unwrap();
+        assert_eq!(tables, "worktree_only", "{database}");
+        let store = pando::state::load(&paths.state_file()).unwrap();
+        let record = &store.worktrees[&name];
+        assert_eq!(record.namespaces[0].name, database);
+        assert_eq!(record.mode, Some(pando::state::ServiceMode::Namespaced));
+    }
+    assert_eq!(
+        root_sql(&db, "SHOW TABLES FROM shop").unwrap(),
+        "main_only",
+        "the main checkout's database never saw a branch's schema step"
+    );
+}

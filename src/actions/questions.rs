@@ -11,12 +11,14 @@ use crate::paths::PandoPaths;
 use crate::services;
 
 use super::init::{machine_evidence, slot_value};
-use super::lifecycle::{Mode, worktree_roles, would_isolate};
+use super::lifecycle::{Mode, target_of, worktree_roles};
+use super::namespaced::ask_for_logins;
 use super::runtime::{
     Machine, RuntimeOutcome, answer_prelude, resolve_runtime, runtime_shell, user_home,
 };
 use super::services::{backends_reachable, placeholder_ports, service_roles};
 use super::worktree::find_worktree;
+use crate::state::ServiceMode;
 
 /// Something pando needs to know and cannot work out on its own.
 ///
@@ -412,20 +414,23 @@ pub fn resolve_process(
     ask: Ask<'_>,
     progress: &dyn Fn(&str),
 ) -> Result<Config> {
-    // Only a start that is isolating may *ask* which services to run
-    // private copies of. `--shared` is a start that is putting them away,
-    // which is no more a reason to ask than a plain one. With no worktree
-    // to read, the flag is all there is; [`resolve_for_start`] knows more.
-    resolve_starting(paths, config, mode == Mode::Isolated, ask, progress)
+    // Only a start onto data of its own may *ask* which services there are
+    // and what fills a fresh database. `--shared` is a start that is
+    // putting them away, which is no more a reason to ask than a plain
+    // one. With no worktree to read, the flag is all there is;
+    // [`resolve_for_start`] knows more.
+    let own_data = matches!(mode, Mode::Isolated | Mode::Namespaced);
+    resolve_starting(paths, config, own_data, ask, progress)
 }
 
 /// [`resolve_process`] for a start of one worktree: what `start` and
 /// `restart` call.
 ///
-/// Two things only the worktree can say. Whether this start isolates is
-/// not only the flag: a plain start of a worktree that is already
-/// isolated keeps its own services, so the schema and services questions
-/// are about the mode it is in. And a start that isolates with Docker not
+/// Two things only the worktree can say. Whether this start runs on data
+/// of its own is not only the flag: a plain start of a worktree that is
+/// already isolated or namespaced keeps its own, so the schema and
+/// services questions are about the mode it is in — and a namespaced one
+/// asks for the login its namespaces are made with, when nothing gives one. And a start that isolates with Docker not
 /// answering cannot happen at all, so that is found out before anything
 /// is asked — never after the developer has answered a question for it.
 pub fn resolve_for_start(
@@ -436,7 +441,8 @@ pub fn resolve_for_start(
     ask: Ask<'_>,
     progress: &dyn Fn(&str),
 ) -> Result<Config> {
-    let isolating = mode == Mode::Isolated || would_isolate(paths, config, name, mode);
+    let target = target_of(paths, config, name, mode);
+    let isolating = mode == Mode::Isolated || target == ServiceMode::Isolated;
     if isolating
         && !service_roles(config).is_empty()
         && let Ok(worktree) = find_worktree(paths, name)
@@ -446,10 +452,18 @@ pub fn resolve_for_start(
         let ports = placeholder_ports(&worktree_roles(config, true));
         backends_reachable(paths, config, name, &canonical, &ports)?;
     }
-    resolve_starting(paths, config, isolating, ask, progress)
+    let namespacing = mode == Mode::Namespaced || target == ServiceMode::Namespaced;
+    let mut config = resolve_starting(paths, config, isolating || namespacing, ask, progress)?;
+    // A namespaced start's login, when nothing gives one, is asked now
+    // with the rest — before anything runs, and of the config the answers
+    // above may just have given its services.
+    if namespacing {
+        ask_for_logins(paths, &mut config, ask, progress)?;
+    }
+    Ok(config)
 }
 
-/// The questions of a start that is, or is not, isolating.
+/// The questions of a start that is, or is not, onto data of its own.
 fn resolve_starting(
     paths: &PandoPaths,
     config: &Config,

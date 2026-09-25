@@ -351,11 +351,13 @@ pub struct HookConfig {
 /// Which starts a hook runs on.
 ///
 /// A hook after `services` is almost always a migration, and on a start
-/// that is not isolating the services it runs after are the developer's
+/// with no data of its own the services it runs after are the developer's
 /// shared ones: one branch's migrations applied to the database every
 /// other worktree uses. So such a hook runs on isolated starts only unless
-/// its entry says `on = "always"`. `never` is the recorded "no" to the
-/// schema question — the command pando found stays visible, switched off.
+/// its entry says `on = "always"` — and a namespaced start is one of
+/// those: its database is the worktree's own, in the shared server.
+/// `never` is the recorded "no" to the schema question — the command
+/// pando found stays visible, switched off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HookScope {
@@ -391,12 +393,13 @@ impl HookConfig {
         })
     }
 
-    /// Whether a start that is (or is not) isolating runs this hook, in a
-    /// project that has (or has no) services — see [`HookConfig::scope`].
-    pub fn runs_on(&self, isolated: bool, has_services: bool) -> bool {
+    /// Whether a start that has (or has no) data of its own — isolated or
+    /// namespaced — runs this hook, in a project that has (or has no)
+    /// services; see [`HookConfig::scope`].
+    pub fn runs_on(&self, own_data: bool, has_services: bool) -> bool {
         match self.scope(has_services) {
             HookScope::Always => true,
-            HookScope::Isolated => isolated,
+            HookScope::Isolated => own_data,
             HookScope::Never => false,
         }
     }

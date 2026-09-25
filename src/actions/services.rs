@@ -1403,13 +1403,22 @@ pub fn resolved_env(
         );
     }
     let mut out: BTreeMap<String, String> = BTreeMap::new();
-    if record.mode() == state::ServiceMode::Isolated {
-        out.extend(resolve_service_env(
+    match record.mode() {
+        state::ServiceMode::Isolated => out.extend(resolve_service_env(
             paths,
             config,
             &canonical,
             &record.ports,
-        )?);
+        )?),
+        // Its namespaces, as its processes are told them: the database and
+        // the slot that are the worktree's own.
+        state::ServiceMode::Namespaced => out.extend(super::namespaced::namespaced_env(
+            paths,
+            config,
+            &super::namespaced::plan(paths, config),
+            &record.namespaces,
+        )?),
+        state::ServiceMode::Shared => {}
     }
     for (process_name, process) in &config.processes {
         let log_file = paths.log_file(name, process_name);

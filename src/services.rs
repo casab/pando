@@ -627,6 +627,40 @@ pub fn url_userinfo(value: &str) -> (Option<String>, Option<String>) {
     (decoded(user), password.and_then(decoded))
 }
 
+/// The host of a URL, without its port, brackets and all for IPv6.
+pub fn url_host(value: &str) -> Option<String> {
+    let after_scheme = value.find("://")? + 3;
+    let rest = &value[after_scheme..];
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    let hostport = match authority.rfind('@') {
+        Some(at) => &authority[at + 1..],
+        None => authority,
+    };
+    let host = match hostport.starts_with('[') {
+        true => &hostport[..=hostport.find(']')?],
+        false => hostport.split(':').next().unwrap_or(hostport),
+    };
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+/// A URL with its path — the database a connection URL names, or the
+/// slot of a Redis URL — replaced, and everything else as it was: the
+/// login, the host, the port, and the query string.
+pub fn with_url_path(value: &str, path: &str) -> Option<String> {
+    let after_scheme = value.find("://")? + 3;
+    let rest = &value[after_scheme..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let query = match tail.starts_with('/') {
+        true => &tail[tail.find(['?', '#']).unwrap_or(tail.len())..],
+        false => tail,
+    };
+    Some(format!(
+        "{}{authority}/{path}{query}",
+        &value[..after_scheme]
+    ))
+}
+
 /// `%40` as `@`; anything that is not a valid escape stays as written.
 fn percent_decoded(text: &str) -> String {
     let bytes = text.as_bytes();
@@ -669,7 +703,8 @@ pub fn value_in_env(dir: &Path, key: &str) -> Option<String> {
         .find_map(|(_, map)| map.get(key).cloned())
 }
 
-fn port_of_value(value: &str) -> Option<u16> {
+/// The port a value names: the port of a URL, or a bare number.
+pub fn port_of_value(value: &str) -> Option<u16> {
     let value = value.trim();
     if let Ok(port) = value.parse::<u16>() {
         return Some(port);
