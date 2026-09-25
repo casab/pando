@@ -4715,6 +4715,47 @@ fn the_overlay_answers_exactly_the_scroll_keys_it_documents() {
 
 // ---- dogfood: uptime from the oldest process -------------------------
 
+// A web server up and the api beside it silent: said once in the header,
+// not on every refresh.
+#[test]
+fn a_silent_port_is_announced_once() {
+    let mut app = test_app(&["feat+one"]);
+    let mut state = State::new();
+    let mut record = crate::state::WorktreeRecord::new("/trees/feat+one", true);
+    let since = Utc::now() - chrono::Duration::minutes(1);
+    record.processes.insert(
+        "dev".to_string(),
+        ProcessRecord {
+            pid: 4242,
+            pgid: 4242,
+            started_at: since,
+            log_path: PathBuf::from("/does/not/exist/dev.log"),
+            ready_port: Some(17_342),
+            ready_timeout_s: None,
+            observed_ports: vec![17_342],
+            swept: false,
+            phase: Phase::Running { since },
+        },
+    );
+    record.ports.insert("web".to_string(), 17_342);
+    record.ports.insert("api".to_string(), 17_343);
+    record.roles.insert(
+        "dev".to_string(),
+        vec!["api".to_string(), "web".to_string()],
+    );
+    record.observed_ports = vec![17_342];
+    state.worktrees.insert("feat+one".to_string(), record);
+    app.adopt_state(state.clone());
+    let (message, is_error) = app.active_status().expect("announced");
+    assert!(
+        is_error && message.contains("nothing listens on api's port 17343"),
+        "{message}"
+    );
+    app.status = None;
+    app.adopt_state(state);
+    assert!(app.status.is_none(), "said once");
+}
+
 #[test]
 fn a_worktree_is_up_since_its_oldest_running_process() {
     let mut app = test_app(&["feat+m"]);

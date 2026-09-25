@@ -723,6 +723,40 @@ impl Aggregate {
 /// explains the worktree, and the classifier's hint for it is the one worth
 /// showing. Ties go to the first name in order, so the answer is stable
 /// across reads.
+/// How long a worktree has to have been up before a port of its processes
+/// that nothing listens on is worth saying: long enough for a second
+/// server the ready one started to bind.
+pub const SILENT_PORT_GRACE: chrono::Duration = chrono::Duration::seconds(15);
+
+/// The ports a running worktree's processes were given and nothing
+/// listens on, as `(role, port)`, once it has been up for
+/// [`SILENT_PORT_GRACE`].
+///
+/// Readiness waits for one role. A process that owns two — a root script
+/// that starts a web server and an api — reads as running when the web
+/// server binds, and the api can have died at startup behind it. Only
+/// process roles are looked at, since a service's port is its own
+/// process's; and nothing is said before the last scan saw anything at
+/// all, because an empty scan is not an answer.
+pub fn silent_ports(record: &WorktreeRecord, now: DateTime<Utc>) -> Vec<(String, u16)> {
+    let Some(Aggregate::Running { since }) = aggregate_phase(record) else {
+        return Vec::new();
+    };
+    if now - since < SILENT_PORT_GRACE || record.observed_ports.is_empty() {
+        return Vec::new();
+    }
+    let mut silent: Vec<(String, u16)> = record
+        .roles
+        .values()
+        .flatten()
+        .filter_map(|role| Some((role.clone(), *record.ports.get(role)?)))
+        .filter(|(_, port)| !record.observed_ports.contains(port))
+        .collect();
+    silent.sort();
+    silent.dedup();
+    silent
+}
+
 pub fn aggregate_phase(record: &WorktreeRecord) -> Option<Aggregate> {
     if record.processes.is_empty() {
         return None;
@@ -845,6 +879,38 @@ mod tests {
         rec.processes.insert("dev".into(), running(pid));
         rec.ports.insert("web".into(), 17_000);
         rec
+    }
+
+    // ---- silent ports ----------------------------------------------------
+
+    /// One process owning `web` and `api`, up since nine, with a private
+    /// database beside it; `observed` is what the last scan saw.
+    fn two_server_script(observed: &[u16]) -> WorktreeRecord {
+        let mut rec = record_with(1);
+        rec.ports.insert("api".into(), 17_001);
+        rec.ports.insert("db".into(), 17_002);
+        rec.roles
+            .insert("dev".into(), vec!["api".into(), "web".into()]);
+        rec.observed_ports = observed.to_vec();
+        rec
+    }
+
+    // The api died at startup behind a web server that is up: named, once
+    // the worktree has been up long enough for it to have bound. The
+    // database's port is its own process's, so it is never named.
+    #[test]
+    fn a_port_nothing_listens_on_is_named_after_the_grace() {
+        let rec = two_server_script(&[17_000]);
+        assert_eq!(
+            silent_ports(&rec, at(9) + SILENT_PORT_GRACE),
+            vec![("api".to_string(), 17_001)]
+        );
+        assert!(silent_ports(&rec, at(9)).is_empty(), "too early to say");
+        assert!(silent_ports(&two_server_script(&[17_000, 17_001]), at(10)).is_empty());
+        assert!(
+            silent_ports(&two_server_script(&[]), at(10)).is_empty(),
+            "an empty scan is not an answer"
+        );
     }
 
     // ---- the aggregate phase ---------------------------------------------

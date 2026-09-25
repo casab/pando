@@ -665,6 +665,18 @@ fn ports_row<'a>(app: &App, name: &str, width: usize) -> Option<Line<'a>> {
             Style::new().fg(text_muted()),
         ));
     }
+    // A port nothing listens on while the worktree reads as running: the
+    // half of a two-server script that died behind the half that is up.
+    let silent: Vec<String> = crate::state::silent_ports(record, chrono::Utc::now())
+        .into_iter()
+        .map(|(role, port)| format!("{role} {port}"))
+        .collect();
+    if !silent.is_empty() {
+        spans.push(Span::styled(
+            format!("  nothing on {} — l shows why", silent.join(", ")),
+            Style::new().fg(yellow()),
+        ));
+    }
     Some(detail_row("ports", spans))
 }
 

@@ -330,6 +330,15 @@ fn status_lines<W: Write>(
             );
             writeln!(out, "{}", ellipsize(&row, width))?;
         }
+        // A port the worktree's processes were given and nothing listens
+        // on: the api half of a root script whose web half is up.
+        for (role, port) in crate::state::silent_ports(record, Utc::now()) {
+            let row = format!(
+                "  {:<process_width$}  {:<PHASE_CELL$}  nothing listens on {port} — the log says why",
+                role, "silent",
+            );
+            writeln!(out, "{}", ellipsize(&row, width))?;
+        }
         // And one per private service, so a worktree whose database is
         // down says which one rather than only that its app failed.
         let services = actions::service_statuses(record);

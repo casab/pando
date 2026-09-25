@@ -247,6 +247,9 @@ pub struct App {
     /// The failure last announced for each worktree's process, by when it
     /// failed, so the same death is never announced twice.
     pub deaths_told: HashMap<(String, String), chrono::DateTime<chrono::Utc>>,
+    /// The silent ports already announced, per worktree and port, so a
+    /// dead half is said once and not on every refresh.
+    pub silence_told: std::collections::HashSet<(String, u16)>,
     pub should_quit: bool,
     pub tick: u32,
     pub list_area: Option<Rect>,
@@ -311,6 +314,7 @@ impl App {
             nothing_to_run: false,
             awaiting_ready: None,
             deaths_told: HashMap::new(),
+            silence_told: std::collections::HashSet::new(),
             should_quit: false,
             tick: 0,
             list_area: None,
@@ -1043,7 +1047,36 @@ impl App {
         let died = self.deaths_since(&before);
         self.announce_ready(&died);
         self.announce_deaths(died);
+        self.announce_silence();
         changed
+    }
+
+    /// Says once when a running worktree has a port nothing listens on —
+    /// see `state::silent_ports`. Forgotten when the port answers again or
+    /// the worktree stops, so a second death is said too.
+    fn announce_silence(&mut self) {
+        let now = chrono::Utc::now();
+        let silent: Vec<(String, String, u16)> = self
+            .state
+            .worktrees
+            .iter()
+            .flat_map(|(name, record)| {
+                state::silent_ports(record, now)
+                    .into_iter()
+                    .map(|(role, port)| (name.clone(), role, port))
+            })
+            .collect();
+        self.silence_told
+            .retain(|(name, port)| silent.iter().any(|(n, _, p)| n == name && p == port));
+        for (name, role, port) in silent {
+            if self.silence_told.insert((name.clone(), port)) {
+                let label = self.label_of(&name);
+                self.set_error_about(
+                    &name,
+                    format!("{label}: nothing listens on {role}'s port {port} — l shows the log"),
+                );
+            }
+        }
     }
 
     /// Every process that was starting or running before this refresh and
@@ -1175,6 +1208,7 @@ impl App {
             nothing_to_run: false,
             awaiting_ready: None,
             deaths_told: HashMap::new(),
+            silence_told: std::collections::HashSet::new(),
             should_quit: false,
             tick: 0,
             list_area: None,
