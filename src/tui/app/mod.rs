@@ -864,13 +864,12 @@ impl App {
             }
             KeyCode::Enter => {
                 // Enter settles on the row the filter found. A worktree
-                // `n` made that is listed by now does not take the cursor
+                // `n` made, listed yet or not, does not take the cursor
                 // from it, then or on a later discovery: `s` next started
                 // that one, not the row just picked. A filter that left
                 // no row to settle on still gives the cursor to it.
                 if self.selected_worktree().is_some() {
-                    self.select_on_arrival
-                        .take_if(|name| self.worktrees.iter().any(|w| w.name == *name));
+                    self.select_on_arrival = None;
                 }
                 self.end_filter();
             }

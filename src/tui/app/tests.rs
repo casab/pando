@@ -899,6 +899,32 @@ fn enter_on_a_filtered_row_keeps_it_over_a_created_worktree() {
     );
 }
 
+// Nor when the discovery that lists it comes back only after the enter:
+// the arrival outlived the choice, and that discovery cleared the filter
+// and took the cursor from the row just picked.
+#[test]
+fn enter_on_a_filtered_row_keeps_it_over_a_created_worktree_not_yet_listed() {
+    let mut app = test_app(&["feat+one", "fix+two"]);
+    app.select_on_arrival = Some("feat+new".to_string());
+    press(&mut app, KeyCode::Char('/'));
+    type_str(&mut app, "fix");
+    press(&mut app, KeyCode::Enter);
+    assert!(app.select_on_arrival.is_none(), "the arrival is done with");
+
+    app.apply_snapshot(listing(&app, &["feat+one", "fix+two", "feat+new"]));
+    assert_eq!(app.filter, "fix", "the filter is kept");
+    assert_eq!(
+        app.selected_worktree().map(|w| w.name.as_str()),
+        Some("fix+two")
+    );
+    press(&mut app, KeyCode::Char('s'));
+    let pending = app.pending.as_ref().expect("s started something");
+    assert_eq!(
+        (pending.name.as_str(), pending.kind),
+        ("fix+two", PendingKind::Start)
+    );
+}
+
 // A worktree removed while the cursor is on it — by `d`, or from the CLI —
 // leaves the cursor on its neighbour, not back at the top of a long list.
 #[test]
