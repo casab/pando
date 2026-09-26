@@ -1231,8 +1231,9 @@ fn a_workspace_apps_other_scripts_do_not_say_what_its_dev_script_runs() {
 // Handed `--port`, a library's `vite build --watch` exited on an option
 // Vite's build does not take, and without it the watcher would still
 // bind no port, so the readiness wait failed the whole worktree. The
-// `vite` of a config file's name, or of a cache the script clears, read
-// as Vite's server and brought the flag back.
+// `vite` of a config file's name, of a directory the build writes to, or
+// of a cache the script clears, read as Vite's server and brought the
+// flag back.
 #[test]
 fn a_package_whose_dev_script_only_builds_is_given_no_server_port() {
     let dir = tempdir().unwrap();
@@ -1250,6 +1251,11 @@ fn a_package_whose_dev_script_only_builds_is_given_no_server_port() {
             "vite.config.ts",
             "rm -rf node_modules/.vite && vite build --watch",
         ),
+        (
+            "assets",
+            "vite.config.ts",
+            "vite build --watch --outDir dist/vite",
+        ),
     ] {
         std::fs::create_dir_all(dir.path().join("apps").join(app)).unwrap();
         std::fs::write(dir.path().join("apps").join(app).join(marker), "{}\n").unwrap();
@@ -1263,7 +1269,7 @@ fn a_package_whose_dev_script_only_builds_is_given_no_server_port() {
         .processes
         .clone()
         .unwrap();
-    for app in ["ui", "widgets", "lib", "icons"] {
+    for app in ["ui", "widgets", "lib", "icons", "assets"] {
         let process = &processes[app];
         assert_eq!(process.cmd, "pnpm dev", "{app}");
         assert!(process.roles().is_empty(), "{app}: {:?}", process.ports);
@@ -1276,6 +1282,9 @@ fn a_package_whose_dev_script_only_builds_is_given_no_server_port() {
         "vite build --watch --config vite.lib.config.ts",
         "vite build --watch -c vite.config.lib.ts",
         "rm -rf node_modules/.vite && vite build --watch",
+        "vite build --watch --outDir dist/vite",
+        "vite build --watch --outDir ../api/public/vite",
+        "vite build --watch --outDir=dist/vite",
     ] {
         let manifest = format!(r#"{{ "scripts": {{ "dev": "{dev}" }} }}"#);
         let (dir, s) = marker_fixture(&[
@@ -1320,6 +1329,7 @@ fn a_package_whose_dev_script_builds_and_then_serves_is_given_its_port() {
     for dev in [
         "vite build && vite preview",
         "vite build -c vite.lib.config.ts && ./node_modules/.bin/vite preview",
+        "vite build --outDir dist/vite && vite preview --outDir dist/vite",
     ] {
         let manifest = format!(r#"{{ "scripts": {{ "dev": "{dev}" }} }}"#);
         let (dir, s) = marker_fixture(&[

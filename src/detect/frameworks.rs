@@ -42,27 +42,24 @@ pub(super) fn script_framework(
     (!only_builds(rule, dev)).then_some(rule)
 }
 
-/// Whether `body` runs one of the rule's build markers and, past them,
-/// nothing else of the rule's: the framework's build, which serves
+/// Whether `body` runs one of the rule's build markers and, besides them,
+/// no command of the rule's: the framework's build, which serves
 /// nothing. A build the server follows, `vite build && vite preview`, is
 /// that server's script, and the flag it is handed reaches the server. A
-/// file the build is handed, `--config vite.lib.config.ts`, or a path it
-/// clears first, `node_modules/.vite`, names the framework and runs none
-/// of it.
+/// file the build is handed, `--config vite.lib.config.ts`, a directory
+/// it writes to, `--outDir dist/vite`, or a path it clears first,
+/// `node_modules/.vite`, names the framework and runs none of it.
 pub(super) fn only_builds(rule: &FrameworkRule, body: &str) -> bool {
-    let builds = rule
+    let builds: Vec<usize> = rule
         .build_markers
         .iter()
-        .any(|needle| mentions(body, needle));
-    let rest = rule
-        .build_markers
-        .iter()
-        .fold(body.to_string(), |rest, needle| without(&rest, needle));
-    builds
+        .flat_map(|needle| mentioned_at(body, needle))
+        .collect();
+    !builds.is_empty()
         && !rule
             .script_markers
             .iter()
-            .any(|needle| invokes(&rest, needle))
+            .any(|needle| invoked_at(body, needle).any(|at| !builds.contains(&at)))
 }
 
 /// Whether one of the project's script bodies runs one of the rule's
@@ -114,29 +111,31 @@ fn mentioned_at<'a>(body: &'a str, needle: &'a str) -> impl Iterator<Item = usiz
     })
 }
 
-/// Whether `body` runs `needle` as [`mentions`] reads it, and not as part
-/// of a file's name or path: `vite.lib.config.ts` and `node_modules/.vite`
+/// Where `body` runs `needle` as [`mentions`] reads it and as a command:
+/// the first word of one, at the start of the body or after a `&`, `;`
+/// or `|`, bare or at the end of the path it is run by,
+/// `./node_modules/.bin/vite`. An option's value, `--outDir dist/vite`,
+/// a file's name, `vite.lib.config.ts`, and a path, `node_modules/.vite`,
 /// name Vite and run none of it.
-fn invokes(body: &str, needle: &str) -> bool {
-    mentioned_at(body, needle).any(|at| {
-        let before = body[..at].chars().next_back();
+fn invoked_at<'a>(body: &'a str, needle: &'a str) -> impl Iterator<Item = usize> + 'a {
+    let separator = |c: char| matches!(c, '&' | ';' | '|');
+    mentioned_at(body, needle).filter(move |&at| {
+        let word = body[..at]
+            .char_indices()
+            .rev()
+            .find(|&(_, c)| c.is_whitespace() || separator(c))
+            .map_or(0, |(i, c)| i + c.len_utf8());
+        let path = &body[word..at];
+        let first = body[..word]
+            .trim_end()
+            .chars()
+            .next_back()
+            .is_none_or(separator);
         let after = body[at + needle.len()..].chars().next();
-        before != Some('.') && (needle.ends_with(' ') || !matches!(after, Some('.' | '/')))
+        first
+            && (path.is_empty() || path.ends_with('/'))
+            && (needle.ends_with(' ') || !matches!(after, Some('.' | '/')))
     })
-}
-
-/// `body` with each place it runs `needle` cut out, a space left in its
-/// stead so the words either side stay apart.
-fn without(body: &str, needle: &str) -> String {
-    let mut out = String::with_capacity(body.len());
-    let mut from = 0;
-    for at in mentioned_at(body, needle) {
-        out.push_str(&body[from..at]);
-        out.push(' ');
-        from = at + needle.len();
-    }
-    out.push_str(&body[from..]);
-    out
 }
 
 /// Whether a Cargo project builds something runnable. A `[lib]`-only crate
