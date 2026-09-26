@@ -534,6 +534,55 @@ fn q_quits_and_ctrl_c_quits_from_anywhere() {
     assert!(app.should_quit, "ctrl-c quits even with a modal open");
 }
 
+// Quitting ends the worker wherever it is, and an esc meant to dismiss
+// something ended a start halfway through its switch.
+#[test]
+fn q_with_an_action_in_flight_asks_first_and_esc_does_not_quit() {
+    let mut app = test_app(&["feat+one"]);
+    let (_hold, held) = mpsc::channel::<()>();
+    app.spawn_pending("feat+one".into(), PendingKind::Start, move || {
+        let _ = held.recv();
+        Err("let go".to_string())
+    });
+
+    press(&mut app, KeyCode::Esc);
+    assert!(
+        !app.should_quit,
+        "esc cancels, and there is nothing to cancel"
+    );
+    let (message, _) = app.active_status().unwrap();
+    assert_eq!(
+        message,
+        "starting feat/one is in flight — q twice abandons it and quits"
+    );
+
+    press(&mut app, KeyCode::Char('q'));
+    assert!(!app.should_quit);
+    let (message, _) = app.active_status().unwrap();
+    assert_eq!(
+        message,
+        "abandon starting feat/one and quit? q again to confirm · esc cancels"
+    );
+    press(&mut app, KeyCode::Esc);
+    assert!(!app.should_quit);
+    assert_eq!(app.active_status(), Some(("cancelled", false)));
+
+    press(&mut app, KeyCode::Char('q'));
+    press(&mut app, KeyCode::Char('q'));
+    assert!(app.should_quit);
+
+    // ctrl-c is the hard way out: a worker that never returns must not
+    // trap anybody.
+    let mut app = test_app(&["feat+one"]);
+    let (_hold, held) = mpsc::channel::<()>();
+    app.spawn_pending("feat+one".into(), PendingKind::Start, move || {
+        let _ = held.recv();
+        Err("let go".to_string())
+    });
+    app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(app.should_quit);
+}
+
 #[test]
 fn the_help_modal_opens_scrolls_and_closes() {
     let mut app = test_app(&["a"]);

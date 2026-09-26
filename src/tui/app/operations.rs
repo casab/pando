@@ -124,9 +124,13 @@ impl App {
     /// would be read once and then answered without reading; a second
     /// press is cheap on purpose and still catches a stray one.
     pub(super) fn pressed_twice(&mut self, key: char, name: &str, what: &str) -> bool {
-        if !self.is_up(name) {
-            return true;
-        }
+        !self.is_up(name) || self.pressed_again(key, name, what)
+    }
+
+    /// The second press itself, whatever it is on: whether this is the
+    /// same key on the same `name` within `ARM_TTL`, and if not, the
+    /// prompt that arms it.
+    pub(super) fn pressed_again(&mut self, key: char, name: &str, what: &str) -> bool {
         if let Some(armed) = self.armed.take()
             && armed.key == key
             && armed.name == name

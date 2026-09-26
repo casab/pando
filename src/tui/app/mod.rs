@@ -734,7 +734,7 @@ impl App {
                 self.filter.clear();
                 self.refilter();
             }
-            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+            KeyCode::Char('q') | KeyCode::Esc => self.quit(key.code),
             KeyCode::Char('j') | KeyCode::Down => self.move_cursor(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1),
             KeyCode::Char('g') | KeyCode::Home => self.select_index(0),
@@ -802,6 +802,29 @@ impl App {
             .is_some_and(|armed| key.code != KeyCode::Char(armed.key))
         {
             self.armed = None;
+        }
+    }
+
+    /// `q` and esc on the list. Quitting ends an action in flight wherever
+    /// its worker is — halfway through an install, or through a switch
+    /// whose undo then never runs — so with one in flight `q` asks for a
+    /// second press, and esc, which cancels everywhere else, only says so.
+    /// ctrl-c still quits at once, whatever is in flight.
+    fn quit(&mut self, key: KeyCode) {
+        let Some(pending) = &self.pending else {
+            self.should_quit = true;
+            return;
+        };
+        let doing = format!("{} {}", pending.kind.verb(), pending.label);
+        let name = pending.name.clone();
+        if key == KeyCode::Esc {
+            self.set_prompt(format!(
+                "{doing} is in flight — q twice abandons it and quits"
+            ));
+            return;
+        }
+        if self.pressed_again('q', &name, &format!("abandon {doing} and quit")) {
+            self.should_quit = true;
         }
     }
 
