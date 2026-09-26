@@ -608,3 +608,29 @@ fn the_cache_round_trips_and_a_future_version_is_ignored() {
     assert!(!load_cache(&path).holds("md5:abc"));
     assert!(!load_cache(&dir.path().join("nothing.json")).holds("md5:abc"));
 }
+
+// Two starts that learn something at once both save. Neither may fail
+// on the other's temp file, and none is left behind.
+#[test]
+fn saves_at_the_same_moment_never_fail_each_other() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("cache").join("runtime.json");
+    std::thread::scope(|scope| {
+        for writer in 0..8 {
+            let path = &path;
+            scope.spawn(move || {
+                for round in 0..50 {
+                    let mut cache = ProbeCache::new();
+                    cache.remember(format!("md5:{writer}-{round}"), "22.11.0".into());
+                    save_cache(path, &cache).unwrap();
+                }
+            });
+        }
+    });
+    assert_eq!(load_cache(&path).satisfied.len(), 1, "the last save won");
+    let left: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(left, ["runtime.json"], "no temp file is left behind");
+}

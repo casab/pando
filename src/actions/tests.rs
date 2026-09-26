@@ -8519,6 +8519,36 @@ fn a_runtime_this_machine_meets_is_silent_and_probed_once() {
     );
 }
 
+// The cache only saves a probe. A start whose check passed goes on when
+// the pass cannot be written down, and probes again next time.
+#[test]
+fn a_pass_that_cannot_be_saved_does_not_stop_the_start() {
+    let fx = fixture_pinning(".nvmrc", "22");
+    let machine = FakeMachine::with_nvm();
+    let shell = machine.shell("22.11.0", "", "");
+    let cache_dir = fx
+        .paths
+        .runtime_cache_file()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    fx.paths.ensure_home().unwrap();
+    std::fs::create_dir_all(cache_dir.parent().unwrap()).unwrap();
+    // A file where the cache's directory would be, so no save can land.
+    std::fs::write(&cache_dir, "").unwrap();
+
+    for _ in 0..2 {
+        let config =
+            resolve_runtime_slot(&fx, &fx.config, &refuse, &shell, machine.home.path()).unwrap();
+        assert_eq!(config.runtime.prelude, None);
+    }
+    assert_eq!(
+        machine.probes(),
+        2,
+        "nothing was remembered, so it asks again"
+    );
+}
+
 // The case the whole work item exists for: the project pins one
 // version, the shell pando spawns in resolves another, and nothing is
 // started until that is settled.

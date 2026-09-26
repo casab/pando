@@ -159,7 +159,10 @@ fn first_mismatch(
         // and refuses it inside the repository, rather than by a cache
         // write that would know neither rule.
         paths.ensure_home()?;
-        crate::runtime::save_cache(&cache_file, &cache)?;
+        // Best effort. The cache only saves the next start a probe, and
+        // this start's check has already passed: a save that fails must
+        // not fail the start that learnt what it would have saved.
+        let _ = crate::runtime::save_cache(&cache_file, &cache);
     }
     Ok(mismatch)
 }
