@@ -20,10 +20,10 @@ use super::namespaced::{self, Ready};
 use super::refresh::advance_before_reconcile;
 use super::runtime::with_prelude;
 use super::services::{
-    Fresh, bring_up_services, clear_native_sockets, compose_projects, forget_hooks_after_services,
-    forget_unstarted_services, has_live_services, planned_services, preflight_isolation,
-    resolve_service_env, service_roles, shared_service_env, stop_containers, stop_service_pumps,
-    undo_failed_isolation, worktree_url,
+    FRESH_DATA_DIR, Fresh, bring_up_services, clear_native_sockets, compose_projects,
+    forget_hooks_after_services, forget_unstarted_services, has_live_services, planned_services,
+    preflight_isolation, resolve_service_env, service_roles, shared_service_env, stop_containers,
+    stop_service_pumps, undo_failed_isolation, worktree_url,
 };
 use super::share::{sweep_dead_shares_with, take_share_down};
 // Only for the intra-doc link above `sweep_orphaned_groups`.
@@ -735,7 +735,7 @@ fn start_checked(
             Some("this worktree now runs on namespaces of its own")
         }
         (true, _, _) => Some("this worktree is back on the project's shared services"),
-        (_, true, _) => Some("a service here was given a new, empty data directory"),
+        (_, true, _) => Some(FRESH_DATA_DIR),
         (_, _, true) => Some("a database of this worktree's own was made just now"),
         _ => None,
     };

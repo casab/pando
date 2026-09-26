@@ -949,7 +949,7 @@ fn bring_up_native_services(
         if live.contains(&service.service) {
             continue;
         }
-        match start_one_native(paths, name, &service, progress) {
+        match start_one_native(paths, config, name, &service, progress) {
             Ok(native::Init::Ran) => fresh = Fresh(true),
             Ok(_) => {}
             Err(e) => {
@@ -982,16 +982,31 @@ fn bring_up_native_services(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Fresh(pub(super) bool);
 
+/// Why the hooks after the services run again when a data directory was
+/// built from nothing: said once, whichever of the two places that forget
+/// them gets there first.
+pub(super) const FRESH_DATA_DIR: &str = "a service here was given a new, empty data directory";
+
 /// Initialises, spawns, and records one native service — recorded under
 /// the lock before anything waits on it, because a readiness failure has
 /// to leave a pgid the orphan sweep can find.
+///
+/// A data directory initialised here has its marker already, so the next
+/// start takes it for the old one. The hooks after the services are
+/// forgotten now, before anything that can fail: a start that dies waiting
+/// for the server would otherwise leave their fingerprints in place, and
+/// the retry would skip the migration against an empty database.
 fn start_one_native(
     paths: &PandoPaths,
+    config: &Config,
     name: &str,
     service: &native::Native,
     progress: &dyn Fn(&str),
 ) -> Result<native::Init> {
     let init = service.ensure_init(progress)?;
+    if matches!(init, native::Init::Ran) {
+        forget_hooks_after_services(paths, config, name, FRESH_DATA_DIR, progress)?;
+    }
     reset_log(&service.log_file)?;
     progress(&format!("starting services: {}", service.service));
     let spawned = service.spawn()?;
