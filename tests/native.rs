@@ -639,7 +639,7 @@ fn a_data_directory_built_by_a_start_that_failed_still_runs_the_migration_again(
     let f = nat_with(&format!(
         "[project]\ninstall = \"true\"\n\n\
          [dev]\ncmd = \"sleep 30\"\nports = []\n\n\
-         [[services]]\nkind = \"native\"\nname = \"postgres\"\nready_timeout_s = 1\n\
+         [[services]]\nkind = \"native\"\nname = \"postgres\"\n\
          env = {{ DATABASE_URL = \"postgres\" }}\n\n\
          [[hooks]]\nname = \"migrate\"\nafter = \"services\"\n\
          fingerprint = [\"package.json\"]\ncmd = \"echo migrated >> '{}'\"\n",
@@ -657,16 +657,27 @@ fn a_data_directory_built_by_a_start_that_failed_still_runs_the_migration_again(
     actions::stop(&f.paths, &name, None, &|_| {}).unwrap();
 
     // The data is cleared by hand, and the start that rebuilds it never
-    // hears the server say it is ready.
+    // hears the server say it is ready. Only this start waits a second:
+    // the ones that come up keep the default, which a loaded machine
+    // needs for a real server.
     std::fs::remove_dir_all(f.datadir(&name, "postgres")).unwrap();
     let probe = f.home.join("bin").join("pg_isready");
     std::fs::write(&probe, "#!/bin/sh\nexit 1\n").unwrap();
     std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut impatient = f.config.clone();
+    for service in &mut impatient.services {
+        if let config::ServiceConfig::Native {
+            ready_timeout_s, ..
+        } = service
+        {
+            *ready_timeout_s = Some(1);
+        }
+    }
     let e = format!(
         "{:#}",
         actions::start(
             &f.paths,
-            &f.config,
+            &impatient,
             &name,
             None,
             actions::Mode::Isolated,
