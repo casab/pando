@@ -55,12 +55,30 @@ pub enum HookOutcome {
 /// corrected in `pando.toml` never ran, since the migrations it watches
 /// had not changed.
 pub fn fingerprint(worktree: &Path, globs: &[String], cmd: &str) -> Option<String> {
-    let matched = matched(worktree, globs);
-    if matched.is_empty() {
+    fingerprint_with(worktree, globs, &[], cmd)
+}
+
+/// [`fingerprint`], with more files in the hash that cannot make one on
+/// their own: `None` still means the globs matched nothing, whatever
+/// `also` matches.
+///
+/// The install step's runtime pins are these. A changed `.nvmrc` is a
+/// reason to install again, but a project with no lockfile still has
+/// nothing that says its dependencies are unchanged, and an `.nvmrc`
+/// alone must not start saying so.
+pub fn fingerprint_with(
+    worktree: &Path,
+    globs: &[String],
+    also: &[String],
+    cmd: &str,
+) -> Option<String> {
+    let keyed = matched(worktree, globs);
+    if keyed.is_empty() {
         return None;
     }
+    let pinned = matched(worktree, also);
     let mut context = md5::Context::new();
-    for relative in &matched {
+    for relative in keyed.iter().chain(&pinned) {
         // The path is hashed too: a file renamed is a change, even when the
         // bytes are the same.
         context.consume(relative.to_string_lossy().as_bytes());

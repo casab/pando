@@ -179,7 +179,9 @@ fn run_hook(
     // The command is part of the fingerprint, not only the files: editing
     // what a hook runs is a reason to run it again, and keying on the
     // files alone meant a corrected migration command never ran.
-    let current = hooks::fingerprint(ctx.worktree, &hook.fingerprint, &cmd);
+    let (pins, keyed_cmd) = runtime_key(config, hook, &cmd);
+    let fingerprint = || hooks::fingerprint_with(ctx.worktree, &hook.fingerprint, pins, &keyed_cmd);
+    let current = fingerprint();
     let last_run = state::load(&paths.state_file()).ok().and_then(|store| {
         store
             .worktrees
@@ -239,7 +241,7 @@ fn run_hook(
     // tracked file changing under a worktree is what Invariant 1 exists to
     // prevent. And the fingerprint recorded is the one the hook *left
     // behind*, or it sees its own change and re-runs on every start.
-    let after = hooks::fingerprint(ctx.worktree, &hook.fingerprint, &cmd);
+    let after = fingerprint();
     if after != current {
         progress(&changed_its_inputs(&hook.name, &cmd));
     }
@@ -302,7 +304,8 @@ pub fn runs_again(
     let Ok(cmd) = template::render(&hook.cmd, &template_context(paths, ctx, &log_file)) else {
         return true;
     };
-    let current = hooks::fingerprint(ctx.worktree, &hook.fingerprint, &cmd);
+    let (pins, keyed_cmd) = runtime_key(config, hook, &cmd);
+    let current = hooks::fingerprint_with(ctx.worktree, &hook.fingerprint, pins, &keyed_cmd);
     !unchanged(current.as_deref(), recorded)
 }
 
@@ -328,6 +331,27 @@ fn template_context<'a>(
         ports: ctx.ports,
         default_role: None,
         log: Some(log_file),
+    }
+}
+
+/// What a hook's fingerprint covers besides its own globs, and the command
+/// it is keyed on.
+///
+/// The install step is keyed on the runtime it builds for as well: the
+/// files that pin the version, and the command with the prelude that picks
+/// it. A version manager reads the worktree's own `.nvmrc`, so a branch
+/// that moves it, or a corrected prelude, changes the runtime without
+/// touching a lockfile, and native modules built for the old one then
+/// fail to load. Every other hook is keyed on its globs and command alone:
+/// a migration run again because the runtime moved is run for nothing.
+fn runtime_key<'a>(
+    config: &'a Config,
+    hook: &config::HookConfig,
+    cmd: &str,
+) -> (&'a [String], String) {
+    match hook.name == INSTALL_HOOK {
+        true => (&config.runtime.version_files, with_prelude(config, cmd)),
+        false => (&[], cmd.to_string()),
     }
 }
 

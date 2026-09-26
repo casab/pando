@@ -4554,6 +4554,58 @@ fn an_install_with_nothing_to_fingerprint_runs_every_time() {
     assert_eq!(install_log(&fx, &name).matches("run").count(), 2);
 }
 
+// A version manager reads the worktree's own `.nvmrc`, so a branch that
+// moves it runs everything under another runtime with the lockfile
+// unchanged, and native modules built for the old one fail to load until
+// the install runs again. A corrected prelude does the same.
+#[test]
+fn the_install_hook_runs_again_when_the_runtime_it_builds_for_changes() {
+    let mut fx = installable_fixture("echo run");
+    std::fs::write(fx.root.join(".nvmrc"), "20\n").unwrap();
+    git(&fx.root, &["add", "."]);
+    git(&fx.root, &["commit", "--quiet", "-m", "pin"]);
+    fx.config.runtime.version_files = vec![".nvmrc".to_string()];
+    with_dev(&mut fx, dev("sleep 30"));
+    let name = worktree_named(&fx, "feat/one");
+    let runs = |fx: &Fx| install_log(fx, &name).matches("run").count();
+    let start_and_stop = |fx: &Fx| {
+        let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+        drop(guard(&outcome));
+        stop(&fx.paths, &name, None).unwrap();
+    };
+    assert_eq!(runs(&fx), 1);
+
+    start_and_stop(&fx);
+    assert_eq!(runs(&fx), 1, "an unchanged pin is no reason to install");
+
+    let worktree = fx.worktrees_dir().join(&name);
+    std::fs::write(worktree.join(".nvmrc"), "22\n").unwrap();
+    start_and_stop(&fx);
+    assert_eq!(runs(&fx), 2, "a moved pin is");
+
+    fx.config.runtime.prelude = Some("true".to_string());
+    start_and_stop(&fx);
+    assert_eq!(runs(&fx), 3, "and so is another prelude");
+}
+
+// The pins join a fingerprint and never make one: with no lockfile,
+// nothing says the dependencies are unchanged, `.nvmrc` or not.
+#[test]
+fn a_runtime_pin_alone_does_not_let_an_install_be_skipped() {
+    let mut fx = fixture();
+    std::fs::write(fx.root.join(".nvmrc"), "20\n").unwrap();
+    git(&fx.root, &["add", "."]);
+    git(&fx.root, &["commit", "--quiet", "-m", "pin"]);
+    fx.config.project.install = Some("echo run".to_string());
+    fx.config.runtime.version_files = vec![".nvmrc".to_string()];
+    with_dev(&mut fx, dev("sleep 30"));
+    let name = worktree_named(&fx, "feat/one");
+    assert!(install_fingerprint(&fx, &name).is_none());
+    let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+    let _guard = guard(&outcome);
+    assert_eq!(install_log(&fx, &name).matches("run").count(), 2);
+}
+
 // `dir/` names the directory as surely as `dir` does, and the advice for
 // it was `dir//**`: an empty segment matches no name, so following the
 // advice kept the warning it answered.
