@@ -147,6 +147,11 @@ pub(super) struct Plan {
     /// said at every namespaced start, because an app half on its own data
     /// and half on main's is only safe when somebody knows.
     pub shared: Vec<(String, String)>,
+    /// The shared ones a step after the services could reach the main
+    /// checkout's data through: every one but an engine whose namespace is
+    /// a slot — a Redis the app names no slot for, which decision 3 leaves
+    /// shared — and a helper the app keeps nothing in, like a mail catcher.
+    pub shared_data: Vec<String>,
 }
 
 impl Plan {
@@ -171,13 +176,41 @@ impl Plan {
 pub(super) fn plan(paths: &PandoPaths, config: &Config) -> Plan {
     let recipes = crate::recipes::Recipes::load(&paths.recipes_dir());
     let mut out = Plan::default();
-    for (service, recipe, keys) in services_with_recipes(paths, config, &recipes) {
-        match target(paths.root(), &service, recipe.as_ref(), keys) {
+    for declared in services_with_recipes(paths, config, &recipes) {
+        let data = !declared.helper
+            && !declared
+                .recipe
+                .as_ref()
+                .and_then(|recipe| recipe.namespace.as_ref())
+                .is_some_and(|namespace| namespace.kind == NamespaceKind::Slot);
+        match target(
+            paths.root(),
+            &declared.service,
+            declared.recipe.as_ref(),
+            declared.keys,
+        ) {
             Ok(target) => out.targets.push(target),
-            Err(why) => out.shared.push((service, why)),
+            Err(why) => {
+                if data {
+                    out.shared_data.push(declared.service.clone());
+                }
+                out.shared.push((declared.service, why));
+            }
         }
     }
     out
+}
+
+/// One service config declares, as a namespaced start first sees it.
+struct Declared {
+    service: String,
+    /// The recipe that knows its engine, when one does.
+    recipe: Option<crate::recipes::Recipe>,
+    /// The env keys the app finds it by.
+    keys: Vec<String>,
+    /// A compose image the catalog knows as a helper the app keeps no
+    /// data in: a mail catcher.
+    helper: bool,
 }
 
 /// Every service config declares, the recipe that knows its engine when
@@ -186,7 +219,7 @@ fn services_with_recipes(
     paths: &PandoPaths,
     config: &Config,
     recipes: &crate::recipes::Recipes,
-) -> Vec<(String, Option<crate::recipes::Recipe>, Vec<String>)> {
+) -> Vec<Declared> {
     let mut out = Vec::new();
     for service in &config.services {
         match service {
@@ -204,7 +237,12 @@ fn services_with_recipes(
                     .filter(|(_, name)| name == entry.name)
                     .map(|(key, _)| key)
                     .collect();
-                out.push((entry.name.to_string(), recipe, keys));
+                out.push(Declared {
+                    service: entry.name.to_string(),
+                    recipe,
+                    keys,
+                    helper: false,
+                });
             }
             config::ServiceConfig::Compose {
                 file, include, env, ..
@@ -216,11 +254,11 @@ fn services_with_recipes(
                     .and_then(|file| crate::compose::read(&file))
                     .ok();
                 for name in include {
-                    let image = parsed
+                    let reference = parsed
                         .as_ref()
                         .and_then(|p| p.services.get(name))
-                        .and_then(|s| s.image.as_deref())
-                        .map(crate::catalog::images::image_name);
+                        .and_then(|s| s.image.as_deref());
+                    let image = reference.map(crate::catalog::images::image_name);
                     let recipe = image
                         .into_iter()
                         .chain(std::iter::once(name.as_str()))
@@ -231,7 +269,15 @@ fn services_with_recipes(
                         .filter(|(_, service)| *service == name)
                         .map(|(key, _)| key.clone())
                         .collect();
-                    out.push((name.clone(), recipe, keys));
+                    let helper = reference
+                        .and_then(crate::catalog::images::known)
+                        .is_some_and(|known| known.role == crate::catalog::images::Role::Utility);
+                    out.push(Declared {
+                        service: name.clone(),
+                        recipe,
+                        keys,
+                        helper,
+                    });
                 }
             }
         }
@@ -375,6 +421,31 @@ pub(super) struct Ready {
     /// Whether a namespace was made just now: an empty database the
     /// schema step has to fill, whatever its fingerprint says.
     pub fresh: bool,
+}
+
+impl Ready {
+    /// Why the steps after the services — a schema, a migration, a seed —
+    /// would not run on data of the worktree's own, when they would not: a
+    /// service that stays on the main checkout's data they could reach, or
+    /// no database of the worktree's own at all, only a slot. `None` when
+    /// they run on the worktree's own, as on an isolated start.
+    pub fn not_own_data(&self) -> Option<String> {
+        if !self.plan.shared_data.is_empty() {
+            return Some(format!(
+                "{} {} on the main checkout's data",
+                self.plan.shared_data.join(", "),
+                match self.plan.shared_data.len() {
+                    1 => "stays",
+                    _ => "stay",
+                }
+            ));
+        }
+        (!self
+            .namespaces
+            .iter()
+            .any(|namespace| namespace.kind == NamespaceKind::Database))
+        .then(|| "no database here is this worktree's own, only a slot".to_string())
+    }
 }
 
 /// Everything a namespaced start does before any process is stopped or

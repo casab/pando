@@ -90,6 +90,10 @@ pub struct HookContext<'a> {
     /// otherwise — runs on both and is skipped otherwise, because the data
     /// it would run against is the main checkout's.
     pub own_data: bool,
+    /// Why a start that asked for data of its own has none such a hook
+    /// could run on — a namespaced one whose database stays the main
+    /// checkout's — for the line that says it was not run.
+    pub not_own: Option<&'a str>,
 }
 
 /// Runs every hook at one lifecycle point whose fingerprint has changed.
@@ -108,7 +112,7 @@ pub fn run_hooks(
     let has_services = !service_roles(config).is_empty();
     for hook in hooks_at(config, point) {
         if !hook.runs_on(ctx.own_data, has_services) {
-            if let Some(note) = skipped(&hook, has_services) {
+            if let Some(note) = skipped(&hook, has_services, ctx.not_own) {
                 progress(&note);
             }
             continue;
@@ -121,7 +125,24 @@ pub fn run_hooks(
 /// Why a hook did not run, when that is worth a line: one that only runs
 /// where the worktree has data of its own, on a start that has none.
 /// `never` is the developer's own answer and says nothing.
-pub(super) fn skipped(hook: &config::HookConfig, has_services: bool) -> Option<String> {
+///
+/// `not_own` is why a start that asked for data of its own has none: the
+/// line says that, and not a setting that would run the hook against the
+/// main checkout's data.
+pub(super) fn skipped(
+    hook: &config::HookConfig,
+    has_services: bool,
+    not_own: Option<&str>,
+) -> Option<String> {
+    if hook.scope(has_services) != config::HookScope::Isolated {
+        return None;
+    }
+    if let Some(not_own) = not_own {
+        return Some(format!(
+            "{}: not run — {not_own}, and it runs only where the data is the worktree's own",
+            hook.name
+        ));
+    }
     // Only an explicit `on = "isolated"` reaches here in a project with
     // no services, and there is no "shared services" to speak of: nothing
     // in the project can be isolated at all.
@@ -129,13 +150,11 @@ pub(super) fn skipped(hook: &config::HookConfig, has_services: bool) -> Option<S
         true => "this start uses the shared services",
         false => "this project has no services pando can isolate, so no start is isolated",
     };
-    (hook.scope(has_services) == config::HookScope::Isolated).then(|| {
-        format!(
-            "{}: not run — it runs on isolated and namespaced starts only, and {why} (set \
-             `on = \"always\"` in its [[hooks]] entry to run it here too)",
-            hook.name
-        )
-    })
+    Some(format!(
+        "{}: not run — it runs on isolated and namespaced starts only, and {why} (set \
+         `on = \"always\"` in its [[hooks]] entry to run it here too)",
+        hook.name
+    ))
 }
 
 fn run_hook(

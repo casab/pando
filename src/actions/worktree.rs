@@ -178,6 +178,7 @@ pub fn new(
         ports: &no_ports,
         service_env: &no_services,
         own_data: false,
+        not_own: None,
     };
     run_hooks(paths, config, config::HookPoint::Create, &ctx, progress)
         .with_context(|| format!("{branch} was created, but its install step failed"))?;

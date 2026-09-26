@@ -620,13 +620,19 @@ fn start_checked(
     // A worktree that is already running every process it was asked for
     // is not starting anything, so nothing is re-run for it either: `npm
     // ci` inside a live worktree is a surprise nobody asked for.
+    //
+    // A namespaced start is on data of its own only where its database is:
+    // one that got a Redis slot and left its database on the main
+    // checkout's would otherwise run the branch's migrations against main.
+    let not_own = ready.as_ref().and_then(Ready::not_own_data);
     let hook_ctx = HookContext {
         name,
         branch: worktree.branch.as_deref(),
         worktree: &canonical,
         ports: &assignment.ports,
         service_env: &service_env,
-        own_data: target != ServiceMode::Shared,
+        own_data: isolate || (ready.is_some() && not_own.is_none()),
+        not_own: not_own.as_deref(),
     };
     if !everything_up {
         run_hooks(

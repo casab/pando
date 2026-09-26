@@ -8483,6 +8483,106 @@ fn a_redis_the_app_reads_no_slot_setting_for_stays_shared_and_says_so() {
         !redis.join("argv").exists(),
         "Redis was never asked anything"
     );
+    assert_eq!(
+        std::fs::read_to_string(&ns.schema).unwrap(),
+        "shop__feat_one\n",
+        "a Redis left shared does not keep the schema step off the worktree's own database"
+    );
+}
+
+// A slot is not a database. A namespaced start that gave Redis a slot and
+// left the database on the main checkout's runs no schema step: its
+// migrations would run against main's database, which is what the step's
+// scope exists to prevent.
+#[test]
+fn a_namespaced_start_whose_database_stays_shared_runs_no_schema_step() {
+    let (ns, _redis) =
+        slots_fixture("DATABASE_PORT=3306\nDATABASE_USER=app\nREDIS_PORT=6379\nREDIS_DB=0\n");
+    let (report, said) = ns.start(Mode::Namespaced).unwrap();
+    let _guard = guard(&report);
+    assert_eq!(
+        ns.record().mode,
+        Some(crate::state::ServiceMode::Namespaced)
+    );
+    assert_eq!(ns.env_line("REDIS_DB").as_deref(), Some("1"));
+    assert!(
+        !ns.schema.exists(),
+        "the schema step ran against main's database"
+    );
+    assert!(
+        said.iter().any(|l| l.starts_with("schema: not run")
+            && l.contains("mariadb stays on the main checkout's data")),
+        "{said:?}"
+    );
+    assert!(
+        said.iter().all(|l| !l.contains("on = \"always\"")),
+        "a setting that would run it against main's is not offered: {said:?}"
+    );
+}
+
+// The same when the worktree has a database of its own and another one
+// stays shared: the step would reach that one.
+#[test]
+fn a_database_pando_knows_no_namespace_for_keeps_the_schema_step_from_running() {
+    let mut ns = namespaced_fixture(&format!("{MAIN_ENV}POSTGRES_PORT=5432\n"));
+    let postgres: Config = toml::from_str(
+        "[[services]]\nkind = \"native\"\nname = \"postgres\"\nenv = { POSTGRES_PORT = \"postgres\" }\n",
+    )
+    .unwrap();
+    ns.fx.config.services.extend(postgres.services);
+    let (report, said) = ns.start(Mode::Namespaced).unwrap();
+    let _guard = guard(&report);
+    assert_eq!(ns.fake("created"), "shop__feat_one\n");
+    assert!(
+        !ns.schema.exists(),
+        "the schema step ran beside a shared postgres"
+    );
+    assert!(
+        said.iter()
+            .any(|l| l.starts_with("schema: not run") && l.contains("postgres stays")),
+        "{said:?}"
+    );
+}
+
+// Which shared services a step could reach main's data through: a
+// database pando cannot give a namespace in is one, a mail catcher is not.
+#[test]
+fn a_mail_catcher_left_shared_is_no_data_a_step_could_reach() {
+    let mut fx = fixture();
+    std::fs::write(
+        fx.root.join("docker-compose.yml"),
+        "services:\n  db:\n    image: mariadb:11\n  mail:\n    image: axllent/mailpit:latest\n  \
+         pg:\n    image: postgres:16\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fx.root.join(".env"),
+        "DATABASE_PORT=3306\nDATABASE_NAME=shop\nSMTP_PORT=1025\nPG_PORT=5432\n",
+    )
+    .unwrap();
+    let config: Config = toml::from_str(
+        "[[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
+         include = [\"db\", \"mail\", \"pg\"]\n\
+         env = { DATABASE_PORT = \"db\", SMTP_PORT = \"mail\", PG_PORT = \"pg\" }\n",
+    )
+    .unwrap();
+    fx.config.services = config.services;
+    let plan = super::namespaced::plan(&fx.paths, &fx.config);
+    assert_eq!(
+        plan.targets
+            .iter()
+            .map(|t| t.service.as_str())
+            .collect::<Vec<_>>(),
+        vec!["db"]
+    );
+    assert_eq!(
+        plan.shared
+            .iter()
+            .map(|(s, _)| s.as_str())
+            .collect::<Vec<_>>(),
+        vec!["mail", "pg"]
+    );
+    assert_eq!(plan.shared_data, vec!["pg".to_string()]);
 }
 
 // Decision 9: every slot held, so a start that can ask asks which stopped
