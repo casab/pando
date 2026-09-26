@@ -2179,6 +2179,80 @@ fn a_hook_a_namespaced_start_skips_beside_a_shared_database_is_not_one_it_runs_a
     );
 }
 
+/// The JSON type a documented example gives `key`: the first character of
+/// the first value written after `"key": ` in it.
+fn documented_type(example: &str, key: &str) -> &'static str {
+    let needle = format!("\"{key}\": ");
+    let at = example
+        .find(&needle)
+        .unwrap_or_else(|| panic!("agent/json.md's hooks example has no `{key}`"));
+    match example[at + needle.len()..].chars().next() {
+        Some('[') => "array",
+        Some('{') => "object",
+        Some('"') => "string",
+        Some('t' | 'f') => "bool",
+        Some(c) if c.is_ascii_digit() => "number",
+        other => panic!("`{key}` is documented as {other:?}"),
+    }
+}
+
+fn printed_type(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::Null => "null",
+    }
+}
+
+// agent/json.md gave a hook's `matches` as a list and its `runs` as a
+// boolean, and doctor has always printed a count and a list of runs, each
+// with its own `will_run_again`. Every key doctor prints for a hook and for
+// a run of one is in the document's example, as a value of the same type.
+#[test]
+fn every_key_doctor_prints_for_a_hook_is_documented_with_its_type() {
+    let fx = fixture();
+    std::fs::create_dir_all(fx.root.join("prisma/migrations")).expect("migrations dir");
+    std::fs::write(fx.root.join("prisma/migrations/001.sql"), "select 1;\n").expect("sql");
+    write_project_config(
+        &fx,
+        "[[hooks]]\nname = \"migrate\"\nafter = \"services\"\n\
+             fingerprint = [\"prisma/migrations/**\"]\ncmd = \"true\"\n",
+    );
+    let mut record = state::WorktreeRecord::new(&fx.root, false);
+    record.hooks.insert(
+        "migrate".to_string(),
+        state::HookRecord {
+            fingerprint: Some("before this change".to_string()),
+            ran_at: chrono::Utc::now(),
+        },
+    );
+    write_state(&fx, &one_worktree("feat+one", record));
+    let hook = serde_json::to_value(&report(&fx).hooks[0]).expect("serialises");
+    let run = &hook["runs"][0];
+    assert!(run.is_object(), "a run is reported: {hook}");
+
+    let doc = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("agent/json.md"))
+        .expect("read agent/json.md");
+    let example = doc
+        .split("## `pando doctor --json`")
+        .nth(1)
+        .and_then(|section| section.split("\"hooks\":").nth(1))
+        .and_then(|rest| rest.split("\"adoption\":").next())
+        .expect("the doctor example's hooks");
+    for printed in [&hook, run] {
+        for (key, value) in printed.as_object().expect("an object") {
+            assert_eq!(
+                documented_type(example, key),
+                printed_type(value),
+                "agent/json.md documents hooks' `{key}` as another type than doctor prints"
+            );
+        }
+    }
+}
+
 // ---- worktrees --------------------------------------------------
 
 /// A state file, written through the real types: doctor reads state

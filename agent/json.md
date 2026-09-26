@@ -266,7 +266,10 @@ half `signals` deliberately leaves out. It writes nothing anywhere.
                   "processes": [...], "services": [...] } ],
   "services": { "compose": [...], "native": [...], "isolation": { ... } },
   "hooks":    [ { "name": "migrate", "after": "services", "cmd": "...",
-                  "fingerprint": [...], "matches": [...], "runs": true } ],
+                  "fingerprint": ["prisma/migrations/**"],
+                  "matches": 3,     // null when the hook is keyed on nothing
+                  "runs": [ { "worktree": "feat+one", "ran_at": "...",
+                              "will_run_again": false } ] } ],
   "adoption": [],           // project folders that look like this repo from before it moved
   "findings": [ { "section": "project|config|runtime|tools|worktrees|services|hooks|adoption",
                   "severity": "problem|note", "message": "...", "fix": "..." } ]
@@ -300,6 +303,13 @@ good.
 `services.isolation` carries the native-versus-container decision and the
 evidence behind it. It is the report a program should quote to a human
 rather than re-deriving.
+
+`hooks[].matches` is how many files the hook's `fingerprint` globs match
+in the main checkout — at `0` it runs on every start, and a `hooks`
+finding says so — and `null` for a hook keyed on nothing, which runs on
+every start by design. `hooks[].runs` has one entry per worktree the
+hook has run in: `ran_at`, and `will_run_again`, whether that worktree's
+next start runs it again. A worktree it has never run in has no entry.
 
 ## `pando status --json`
 
