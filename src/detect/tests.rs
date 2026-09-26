@@ -1018,23 +1018,36 @@ fn a_single_apps_script_is_given_the_port_flag_its_framework_takes() {
 // The flag is Vite's, and only Vite's own CLI is handed it: a custom
 // server would be given an option it never reads, a fan-out would hand
 // it to whichever process comes last, and a port the script names would
-// be said twice.
+// be said twice. In `vite & node api.js` the flag reached `node`, Vite
+// bound a port of its own, and the wait on the reserved one failed the
+// start.
 #[test]
 fn a_script_that_is_not_the_frameworks_own_server_is_not_given_its_flag() {
-    for body in [
-        "node server.js",
-        "vite --port 5173",
-        "concurrently \\\"vite\\\" \\\"tsc -w\\\"",
-    ] {
+    let first = |body: &str| {
         let manifest = format!(r#"{{ "scripts": {{ "dev": "{body}" }} }}"#);
         let (dir, s) = marker_fixture(&[
             ("vite.config.ts", "export default {}\n"),
             ("package.json", &manifest),
             ("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"),
         ]);
-        let proposal = dev_in(dir.path(), &s);
-        assert_eq!(proposal.candidates[0].value, "pnpm dev", "{body}");
-        assert_eq!(proposal.candidates[0].ports, None, "{body}");
+        dev_in(dir.path(), &s).candidates[0].clone()
+    };
+    for body in [
+        "node server.js",
+        "vite --port 5173",
+        "concurrently \\\"vite\\\" \\\"tsc -w\\\"",
+        "vite & node api.js",
+        "vite | tee dev.log",
+        "vite; vite build --watch",
+    ] {
+        let candidate = first(body);
+        assert_eq!(candidate.value, "pnpm dev", "{body}");
+        assert_eq!(candidate.ports, None, "{body}");
+    }
+    // The last command is Vite's: the flag reaches it.
+    for body in ["tsc -b && vite", "node gen.js & vite", "vite 2>&1"] {
+        let candidate = first(body);
+        assert_eq!(candidate.value, "pnpm dev --port {port:web}", "{body}");
     }
 }
 

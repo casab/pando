@@ -405,10 +405,11 @@ pub(super) fn dev_cmd_proposal(
 /// runs what the project already runs, on the port pando chose, and owns
 /// the web role. Told nothing, Vite moves itself to the next free port and
 /// pando holds no role for it, so the worktree has no URL to open or share.
-/// Only a script that runs the framework's own server, alone, on no port
-/// of its own: a custom server or a fan-out would hand the flag to
-/// something else, a build refuses it, and where the script names a port
-/// it would be said twice.
+/// Only a script whose last command, the one npm and pnpm hand the flag
+/// to, runs the framework's own server, alone, on no port of its own: a
+/// custom server or a fan-out would hand the flag to something else, a
+/// build refuses it, and where the script names a port it would be said
+/// twice.
 fn script_candidate(
     signals: &Signals,
     rule: Option<&'static FrameworkRule>,
@@ -417,11 +418,12 @@ fn script_candidate(
 ) -> Candidate {
     let value = format!("{}{name}", script_runner(signals));
     let why = format!("package.json scripts.{name}");
+    let last = last_command(body);
     let flagged = rule.filter(|rule| {
         rule.port == PortMechanism::InCommand
             && !rule.scripts_build_assets
-            && runs(rule, body)
-            && !only_builds(rule, body)
+            && runs(rule, last)
+            && !only_builds(rule, last)
             && !is_multiplexer(body)
             && fixed_port(body).is_none()
     });
@@ -443,6 +445,21 @@ fn script_candidate(
         ports: Some(PortsSpec::List(vec![role.to_string()])),
         ..Candidate::default()
     }
+}
+
+/// The last command of a script body, after its final `&`, `&&`, `;`, `|`
+/// or `||`: the one the arguments after a script's name are handed to, so
+/// `vite & node api.js --port 1234` tells `node` the port and not Vite.
+/// A redirect's `&`, `2>&1` or `&> log`, runs nothing and ends nothing.
+fn last_command(body: &str) -> &str {
+    let mut start = 0;
+    for (at, c) in body.char_indices() {
+        let redirect = c == '&' && (body[..at].ends_with('>') || body[at + 1..].starts_with('>'));
+        if matches!(c, '&' | ';' | '|') && !redirect {
+            start = at + 1;
+        }
+    }
+    &body[start..]
 }
 
 /// Makefile or justfile targets that look like they start something.
