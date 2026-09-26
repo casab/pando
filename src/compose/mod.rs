@@ -54,11 +54,11 @@ pub struct ComposeFile {
 /// `extends:` pulls a service's real definition out of another file, a
 /// top-level `include:` adds whole services this file never names, a
 /// YAML alias or merge key stands for text written somewhere else in the
-/// file, and a tag or a value spread over several lines is text this
-/// reader does not read at all. Any one of them means the ports and
-/// volumes pando is reading are not the ones compose would use — so every
-/// refusal has to say so rather than tell the developer to add a `ports:`
-/// entry their file already has.
+/// file, and a tag, a value spread over several lines or a second YAML
+/// document is text this reader does not read at all. Any one of them
+/// means the ports and volumes pando is reading are not the ones compose
+/// would use — so every refusal has to say so rather than tell the
+/// developer to add a `ports:` entry their file already has.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Unresolved {
     /// Services that carry an `extends:` key, in file order.
@@ -71,16 +71,18 @@ pub struct Unresolved {
     /// one is never approved for isolation on this reader's word.
     pub aliases: bool,
     /// Whether a service or a top-level volume holds a value this reader
-    /// could not read: one behind a YAML tag (`!override`, `!reset`), or a
-    /// flow collection or quoted scalar closed only on a later line. A bind
-    /// mount written in one is as invisible as one behind an alias.
+    /// could not read — one behind a YAML tag (`!override`, `!reset`), or a
+    /// flow collection or quoted scalar closed only on a later line — or
+    /// the file goes on past its first YAML document, which compose merges
+    /// the others into. A bind mount written in any of them is as
+    /// invisible as one behind an alias.
     pub unread: bool,
 }
 
 /// What [`Unresolved::unread`] stands for, in the words every message
 /// about it uses.
-const UNREAD: &str = "YAML tags or values spread over several lines (`!override`, a `[` or a \
-                      quote closed on a later line)";
+const UNREAD: &str = "YAML tags, values spread over several lines or a second document \
+                      (`!override`, a `[` or a quote closed on a later line, `---`)";
 
 impl Unresolved {
     pub fn any(&self) -> bool {

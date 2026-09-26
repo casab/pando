@@ -11,7 +11,7 @@ use anyhow::{Result, bail};
 // ---- parsing --------------------------------------------------------------
 
 pub fn parse(text: &str) -> Result<ComposeFile> {
-    let node = parse_document(text)?;
+    let (node, more) = parse_document(text)?;
     let Node::Map(top) = node else {
         bail!("a compose file is a mapping at its top level");
     };
@@ -24,7 +24,9 @@ pub fn parse(text: &str) -> Result<ComposeFile> {
             .map(|(_, value)| value)
     };
     file.unresolved.aliases = read().any(refers_elsewhere);
-    file.unresolved.unread = read().any(holds_unread);
+    // Compose merges every document of a file into the first, so a second
+    // one can add anything to a service, a bind mount among it.
+    file.unresolved.unread = more || read().any(holds_unread);
     for (key, value) in &top {
         match key.as_str() {
             "services" => {
@@ -318,35 +320,56 @@ struct Line {
     text: String,
 }
 
-fn parse_document(text: &str) -> Result<Node> {
-    let lines = significant_lines(text);
+/// The file's first YAML document, and whether another one follows it.
+fn parse_document(text: &str) -> Result<(Node, bool)> {
+    let (lines, more) = significant_lines(text);
     if lines.is_empty() {
-        return Ok(Node::Map(Vec::new()));
+        return Ok((Node::Map(Vec::new()), more));
     }
     let mut at = 0usize;
     let node = parse_block(&lines, &mut at, lines[0].indent)?;
-    Ok(node)
+    Ok((node, more))
 }
 
-/// Comments and blank lines removed, tabs refused.
+/// The lines of the file's first YAML document, comments and blank lines
+/// removed, tabs refused, and whether another document follows it.
+///
+/// A byte-order mark, `%` directives and the `---` that starts the
+/// document are not part of it. Kept, `---` ended the top-level mapping
+/// before its first key and the file read as declaring no services, and
+/// a mark made its first key `\u{feff}services`. A `---` or `...` after
+/// the document's first line ends it.
 ///
 /// YAML forbids a tab as indentation, and a compose file indented with one
 /// is a file docker itself will not read; saying so beats parsing it into
 /// a shape that silently loses a service.
-fn significant_lines(text: &str) -> Vec<Line> {
+fn significant_lines(text: &str) -> (Vec<Line>, bool) {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut out = Vec::new();
+    let mut ended = false;
     for raw in text.lines() {
         let without_comment = strip_comment(raw);
         if without_comment.trim().is_empty() {
             continue;
         }
         let indent = without_comment.len() - without_comment.trim_start().len();
+        let text = without_comment.trim_end();
+        if indent == 0 && matches!(text, "---" | "...") {
+            ended = !out.is_empty();
+            continue;
+        }
+        if indent == 0 && text.starts_with('%') && out.is_empty() {
+            continue;
+        }
+        if ended {
+            return (out, true);
+        }
         out.push(Line {
             indent,
-            text: without_comment.trim_end().to_string(),
+            text: text.to_string(),
         });
     }
-    out
+    (out, false)
 }
 
 /// A `#` starts a comment only at the start of a token, and never inside a

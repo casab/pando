@@ -111,7 +111,8 @@ pub fn resolve_included(
                  own reader does not read, and `docker compose config` could not resolve them \
                  here — a bind mount written in one would be invisible to pando, and an isolated \
                  copy could write its data into your repository. Make `docker compose config` \
-                 work for this file, or write each of those values on one line, without a tag"
+                 work for this file, or write it as one document with each of those values on \
+                 one line and without a tag"
             );
         }
         check_mounts(name, service, file, repository)?;

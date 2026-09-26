@@ -285,6 +285,53 @@ fn a_file_with_no_services_is_not_an_error() {
     assert_eq!(parse("volumes:\n  a:\n").unwrap().services.len(), 0);
 }
 
+// yamllint asks for the `---`, and an editor may save the mark. Each of
+// these read as a file declaring no services, which compose reads fine,
+// so a start was refused for a service the file has.
+#[test]
+fn a_document_marker_a_directive_or_a_byte_order_mark_hides_no_service() {
+    for head in [
+        "---\n",
+        "--- # the stack\n",
+        "%YAML 1.2\n---\n",
+        "\u{feff}",
+        "\u{feff}---\n",
+    ] {
+        let text = format!("{head}services:\n  db:\n    image: postgres:16\n...\n");
+        let file = parse(&text).unwrap();
+        assert_eq!(
+            file.services.keys().collect::<Vec<_>>(),
+            vec!["db"],
+            "{text:?}"
+        );
+        assert!(!file.unresolved.any(), "{text:?}: {:?}", file.unresolved);
+        assert_eq!(
+            resolve_included(&file, &["db".into()], &[]).unwrap(),
+            vec![("db".to_string(), 5432)]
+        );
+    }
+}
+
+// Compose merges a file's second document into its first, so the bind
+// mount here is one `up` makes. Stopping at the `---` without a word
+// approved the service on its first half.
+#[test]
+fn a_second_document_is_never_approved_on_half_a_file() {
+    let file = parse(
+        "services:\n  db:\n    image: postgres:16\n---\n\
+         services:\n  db:\n    volumes:\n      - ./pgdata:/var/lib/postgresql/data\n",
+    )
+    .unwrap();
+    assert_eq!(file.services["db"].image.as_deref(), Some("postgres:16"));
+    assert!(file.unresolved.unread);
+    let err = format!(
+        "{:#}",
+        resolve_included(&file, &["db".into()], &[]).unwrap_err()
+    );
+    assert!(err.contains("docker compose config"), "{err}");
+    assert!(err.contains("second document"), "{err}");
+}
+
 #[test]
 fn find_prefers_composes_own_order() {
     let dir = tempfile::tempdir().unwrap();
@@ -904,8 +951,8 @@ fn every_key_not_followed_is_named_in_one_sentence() {
     assert_eq!(
         unresolved.describe().unwrap(),
         "`extends:` (on db), a top-level `include:`, YAML aliases or merge keys (`*`, `<<:`) and \
-         YAML tags or values spread over several lines (`!override`, a `[` or a quote closed on \
-         a later line)"
+         YAML tags, values spread over several lines or a second document (`!override`, a `[` \
+         or a quote closed on a later line, `---`)"
     );
 }
 
