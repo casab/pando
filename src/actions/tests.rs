@@ -9461,6 +9461,46 @@ fn a_compose_record_docker_could_not_be_asked_about_is_kept_beside_the_native_on
     assert_eq!(services[0].pid, Some(4242));
 }
 
+// The compose leftover beside a native server was taken for a server of
+// the kind config runs the service as, in either direction. Switched back
+// to compose, the start stopped the native server and brought the
+// leftover's old volume up as if nothing had moved: its hooks were not
+// run again, and the app ran on data from before the switch.
+#[test]
+fn a_compose_leftover_does_not_hide_a_service_moving_back_to_compose() {
+    let mut fx = fixture();
+    let compose: Config = toml::from_str(
+        "[[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
+         include = [\"postgres\"]\nenv = { DATABASE_URL = \"postgres\" }\n",
+    )
+    .unwrap();
+    fx.config.services = compose.services;
+    let mut record = WorktreeRecord::new(fx.root.clone(), false);
+    record.mode = Some(crate::state::ServiceMode::Isolated);
+    record.services = vec![
+        state::ServiceRecord {
+            name: "postgres".to_string(),
+            kind: state::ServiceKind::Native,
+            port: Some(15432),
+            pid: Some(4242),
+            pgid: Some(4242),
+            compose_project: None,
+        },
+        state::ServiceRecord {
+            name: "postgres".to_string(),
+            kind: state::ServiceKind::Compose,
+            port: None,
+            pid: None,
+            pgid: None,
+            compose_project: Some("pando-acme-feat-one".to_string()),
+        },
+    ];
+    assert_eq!(
+        super::services::changed_kinds(&fx.config, &record),
+        vec![("postgres".to_string(), state::ServiceKind::Compose)]
+    );
+}
+
 // Two starts of one worktree at once — the TUI and an agent — both found
 // no native server running and both spawned one on the same data
 // directory, and the second pid was written over the first: a live server

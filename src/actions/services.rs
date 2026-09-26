@@ -368,12 +368,16 @@ fn changes_kind(native: &[String], roles: &[String], service: &state::ServiceRec
 /// the ones a start moves onto a server of the other kind — each with the
 /// kind it runs as now.
 ///
-/// A leftover [`replace_stopped_containers`] keeps beside a record of the
-/// kind its service runs as now is not one: that server is up already, on
-/// the data it has had since the start that switched it. Every start
-/// until docker can be asked found the change again, and ran the hooks
-/// after the services again over the same data. [`leave_changed_kinds`]
-/// still returns its containers, for a start that can ask about them.
+/// The compose leftover [`replace_stopped_containers`] keeps beside the
+/// native record that replaced it is not one while config runs the
+/// service natively: that server is up already, on the data it has had
+/// since the start that switched it. Every start until docker can be
+/// asked found the change again, and ran the hooks after the services
+/// again over the same data. [`leave_changed_kinds`] still returns its
+/// containers, for a start that can ask about them. Once config runs the
+/// service in compose again, the native record is one: the leftover is no
+/// server of the kind it moves back to, and its volume holds the data from
+/// before the switch.
 pub(super) fn changed_kinds(
     config: &Config,
     record: &WorktreeRecord,
@@ -381,10 +385,11 @@ pub(super) fn changed_kinds(
     let native = native_names(config);
     let roles = service_roles(config);
     let switched = |service: &state::ServiceRecord| {
-        record
-            .services
-            .iter()
-            .any(|s| s.name == service.name && s.kind == kind_of(&native, &service.name))
+        service.kind == state::ServiceKind::Compose
+            && record
+                .services
+                .iter()
+                .any(|s| s.name == service.name && s.kind == state::ServiceKind::Native)
     };
     record
         .services
