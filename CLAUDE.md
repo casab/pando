@@ -49,6 +49,13 @@ worktree's own — with main's database and slot untouched. The TUI's `d`
 said what would go and dropped exactly that. The maintainer's own first
 run is next: the grant on their server, once.
 
+Later the same day the whole project was audited, by module and then
+by concern, and about 230 commits fixed what the audit and the reviews
+of its own fixes found: data safety in isolated and namespaced mode, the
+lifecycle, detection, share, the CLI, the TUI and doctor. None of it is
+released; 0.3.0 is still the last tag. The findings it left for the
+maintainer, each with why, are in `plans/open-follow-ups.md`.
+
 What is left is not a phase. `plans/open-follow-ups.md` carries the known
 edges, each with who found it and where it belongs, and the release
 checklist in `docs/08-roadmap.md` is untouched: no licence, no CI, no
@@ -138,6 +145,14 @@ database, a prod schema dump, and cookie auth."
   `cfg!(test)`; tests set `pr_list` by hand, and `gh` parsing is tested
   on fixed JSON or a stand-in `gh` script. A fork's pull request is
   tested by pushing to `refs/pull/<n>/head` on a bare fixture origin.
+- Tests are hermetic: none reads the developer's shell profile or
+  depends on a tool it installs. Every login shell a test starts gets an
+  empty HOME (`process::login_shell` under `cfg(test)`,
+  `common::hermetic_home` for the integration tests), and a fixture that
+  runs a package manager or a runtime gets a stand-in in the test's own
+  pando `bin` (`common::fake_pnpm`, `common::fake_node`, beside the fake
+  docker and cloudflared). A test that passes only with a real tool, or
+  only because a shell is slow, is not done.
 - Never run two `cargo test`s at once. Two tests are load-sensitive
   (`plans/open-follow-ups.md`); under a parallel build they fail for
   reasons that have nothing to do with the change. Rerun a readiness or
