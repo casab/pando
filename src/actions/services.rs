@@ -52,36 +52,60 @@ pub(super) fn stop_containers(
 /// `stop`: these are the containers of services that run natively now,
 /// and one that is not running only because Docker is not can come back
 /// with Docker, onto the port the native server is given.
+///
+/// A container that cannot come back does not hold the switch up. Compose
+/// is asked first which of the services still has one, because it fails a
+/// stop by project of a service it has none for — one removed outside
+/// pando, by the `down -v` a start prints. And a docker that cannot be run
+/// at all is a note: there is no Docker for a container to come back with.
 pub(super) fn stop_service_containers(
     paths: &PandoPaths,
     containers: &[(String, Vec<String>)],
+    progress: &dyn Fn(&str),
 ) -> Result<()> {
     let program = services::docker_program(paths);
     for (project, services) in containers {
+        let (them, they) = match services.len() {
+            1 => ("the compose container", "it"),
+            _ => ("the compose containers", "they"),
+        };
+        let refused = |e: anyhow::Error| match services::is_daemon_down(&e) {
+            true => anyhow::anyhow!(
+                "Docker is not running, so {them} of {} in {project} cannot be stopped, and \
+                 {they} can come back with Docker onto the port the native server is given — \
+                 start Docker, then start this worktree again",
+                services.join(", ")
+            ),
+            false => anyhow::anyhow!("could not reach the services of {project}: {e:#}"),
+        };
         let compose = services::Compose::by_project(&program, project.as_str());
-        match compose.stop_services(services) {
-            Ok(()) => {}
-            Err(e) if services::is_daemon_down(&e) => {
-                let (them, they) = match services.len() {
-                    1 => ("the compose container", "it"),
-                    _ => ("the compose containers", "they"),
-                };
-                bail!(
-                    "Docker is not running, so {them} of {} in {project} cannot be stopped, and \
-                     {they} can come back with Docker onto the port the native server is given \
-                     — start Docker, then start this worktree again",
+        let left: Vec<String> = match compose.ps() {
+            Ok(statuses) => services
+                .iter()
+                .filter(|service| statuses.iter().any(|c| &c.service == *service))
+                .cloned()
+                .collect(),
+            Err(e) if services::is_docker_missing(&e) => {
+                progress(&format!(
+                    "docker cannot be run here, so {them} of {} in {project} cannot be running \
+                     either — nothing to stop",
                     services.join(", ")
-                )
+                ));
+                continue;
             }
-            Err(e) => bail!("could not reach the services of {project}: {e:#}"),
+            Err(e) => return Err(refused(e)),
+        };
+        if !left.is_empty() {
+            compose.stop_services(&left).map_err(refused)?;
         }
     }
     Ok(())
 }
 
 /// Writes the native record of each service whose compose containers
-/// [`stop_service_containers`] has just stopped, over the compose record
-/// [`planned_services`] kept for it until then.
+/// [`stop_service_containers`] has just stopped, or found could not come
+/// back, over the compose record [`planned_services`] kept for it until
+/// then.
 ///
 /// That record is the only thing that can find those containers again,
 /// so it goes only once they are stopped: a start that failed first, or

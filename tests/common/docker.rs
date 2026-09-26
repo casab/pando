@@ -410,6 +410,11 @@ def do_logs():
 
 def do_stop():
     state = read_state()
+    # Asked by project, compose knows a service only by its containers.
+    for name in REST:
+        if name not in state:
+            sys.stderr.write("no such service: %s\n" % name)
+            sys.exit(1)
     kill_all(state, REST)
     write_state(state)
 

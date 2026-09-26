@@ -716,7 +716,7 @@ fn start_checked(
         }
         progress(&line);
     }
-    stop_service_containers(paths, &changed_kind).map_err(undo)?;
+    stop_service_containers(paths, &changed_kind, progress).map_err(undo)?;
     replace_stopped_containers(paths, name, &changed_kind).map_err(undo)?;
     // And the containers a stale record replaced above left up, on a start
     // that is not about to bring that compose project up again itself.

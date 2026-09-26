@@ -683,13 +683,11 @@ fn a_compose_service_that_becomes_native_is_stopped_before_the_server_starts() {
     );
 }
 
-// The native record was saved over the compose one before the container
-// was stopped. A stop Docker could not do — the daemon down, or a stop
-// that timed out — then left a container that could come back onto the
-// native server's port with no record left to find it, and every later
-// start of the native server failing on a port in use.
-#[test]
-fn a_compose_container_docker_could_not_stop_is_stopped_by_the_next_start() {
+/// A worktree started isolated with postgres in compose, its config then
+/// switched to postgres natively: the record still names the compose
+/// project, and the next isolated start is the switch. Returned with the
+/// compose record as the first start left it.
+fn switched_from_compose() -> (Nat, String, state::ServiceRecord) {
     let dir = TempDir::new().unwrap();
     let root = build(Kind::NextPnpmCompose, dir.path()).root;
     let home = dir.path().join("pando-home");
@@ -723,8 +721,6 @@ fn a_compose_container_docker_could_not_stop_is_stopped_by_the_next_start() {
     let name = new_worktree(&f, "feat/one");
     start_isolated(&f, &name);
     let before = f.service(&name, "postgres");
-    let project = before.compose_project.clone().unwrap();
-    let _down = common::docker::down_on_drop(&f.home, &project);
 
     std::fs::write(
         f.paths.config_file(),
@@ -735,6 +731,43 @@ fn a_compose_container_docker_could_not_stop_is_stopped_by_the_next_start() {
     )
     .unwrap();
     f.config = config::load(&f.paths).unwrap().config;
+    (f, name, before)
+}
+
+/// Takes a compose project's containers and volumes down, as a developer
+/// running the `down -v` a start prints does.
+fn compose_down(f: &Nat, project: &str) {
+    let out = std::process::Command::new(f.home.join("bin").join("docker"))
+        .args(["compose", "-p", project, "down", "-v"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+}
+
+/// The switch from compose to postgres natively, run to the end: the
+/// native record, with a live server on the port the container had.
+fn assert_switched(f: &Nat, name: &str, before: &state::ServiceRecord) {
+    let native = f.service(name, "postgres");
+    assert_eq!(native.kind, ServiceKind::Native, "{native:?}");
+    assert_eq!(native.compose_project, None);
+    assert!(
+        process::is_alive(native.pid.unwrap()),
+        "a native server runs"
+    );
+    assert_eq!(native.port, before.port, "on the port the container had");
+}
+
+// The native record was saved over the compose one before the container
+// was stopped. A stop Docker could not do — the daemon down, or a stop
+// that timed out — then left a container that could come back onto the
+// native server's port with no record left to find it, and every later
+// start of the native server failing on a port in use.
+#[test]
+fn a_compose_container_docker_could_not_stop_is_stopped_by_the_next_start() {
+    let (f, name, before) = switched_from_compose();
+    let project = before.compose_project.clone().unwrap();
+    let _down = common::docker::down_on_drop(&f.home, &project);
+
     common::docker::daemon_down(&f.home);
     let refused = actions::start(
         &f.paths,
@@ -771,19 +804,68 @@ fn a_compose_container_docker_could_not_stop_is_stopped_by_the_next_start() {
         Vec::<(String, u16)>::new(),
         "the container was stopped"
     );
-    let native = f.service(&name, "postgres");
-    assert_eq!(native.kind, ServiceKind::Native);
-    assert_eq!(native.compose_project, None);
-    assert!(
-        process::is_alive(native.pid.unwrap()),
-        "a native server runs"
-    );
-    assert_eq!(native.port, before.port, "on the port the container had");
+    assert_switched(&f, &name, &before);
     let said = said.into_inner();
     assert!(
         said.iter().any(|m| m.contains("postgres runs natively now")
             && m.contains(&format!("docker compose -p {project} down -v"))),
         "nothing else names the project, so the start says how its data goes: {said:?}"
+    );
+}
+
+// Compose, asked by project, fails a stop of a service it has no
+// container for. A container removed outside pando — by the `down -v`
+// the switch itself prints — failed every switch after it on that stop,
+// and the compose record that was kept to retry it was kept for ever.
+#[test]
+fn a_compose_record_whose_container_is_gone_gives_way_to_the_native_server() {
+    let (f, name, before) = switched_from_compose();
+    let project = before.compose_project.clone().unwrap();
+    compose_down(&f, &project);
+
+    start_isolated(&f, &name);
+
+    assert_switched(&f, &name, &before);
+    let asked = common::docker::invocations_for(&f.home, &project);
+    assert!(
+        !asked.contains(&format!("compose -p {project} stop postgres")),
+        "there was nothing to stop: {asked:?}"
+    );
+}
+
+// A docker that cannot be run — uninstalled, or gone from the PATH —
+// failed the stop of the container a native server replaces, so the
+// switch was refused on every start after it: nothing could stop that
+// container, or find it gone.
+#[test]
+fn a_compose_record_docker_cannot_be_run_for_gives_way_to_the_native_server() {
+    let (f, name, before) = switched_from_compose();
+    let project = before.compose_project.clone().unwrap();
+    // Docker goes, and its containers with it.
+    compose_down(&f, &project);
+    std::fs::write(
+        f.home.join("bin").join("docker"),
+        "#!/nonexistent/python3\n",
+    )
+    .unwrap();
+
+    let said = std::cell::RefCell::new(Vec::<String>::new());
+    actions::start(
+        &f.paths,
+        &f.config,
+        &name,
+        None,
+        actions::Mode::Isolated,
+        &|m| said.borrow_mut().push(m.to_string()),
+    )
+    .unwrap();
+
+    assert_switched(&f, &name, &before);
+    let said = said.into_inner();
+    assert!(
+        said.iter()
+            .any(|m| m.contains("docker cannot be run here") && m.contains(&project)),
+        "{said:?}"
     );
 }
 

@@ -119,6 +119,15 @@ pub fn is_daemon_down(e: &anyhow::Error) -> bool {
     e.downcast_ref::<DaemonDown>().is_some()
 }
 
+/// Whether an error is, underneath its context, a docker that could not
+/// be run at all: nothing called `docker` on the PATH, or a shim whose
+/// interpreter is gone. Unlike a daemon that is down, there is no Docker
+/// here for a container to come back with.
+pub fn is_docker_missing(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<std::io::Error>()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+}
+
 /// The docker executable pando runs.
 ///
 /// `<home>/bin/docker` when it is there and executable, else whatever
@@ -1228,6 +1237,26 @@ mod tests {
         let compose = Compose::by_project(paths.home.join("bin").join("docker"), "pando-x-y");
         let err = format!("{:#}", compose.stop().unwrap_err());
         assert!(err.contains("needs Docker"), "{err}");
+    }
+
+    // A switch to a native service stops the compose container first, and
+    // a docker that cannot be run failed that stop for ever: there is no
+    // Docker left for the container to come back with, where a daemon
+    // that is only down still has one.
+    #[test]
+    fn a_docker_that_cannot_be_run_is_told_from_one_whose_daemon_is_down() {
+        let (_dir, paths) = home_with_shim("#!/nonexistent/interpreter\n");
+        let compose = Compose::by_project(docker_program(&paths), "pando-x-y");
+        let err = compose.ps().unwrap_err().context("asking about x");
+        assert!(is_docker_missing(&err), "{err:#}");
+        assert!(!is_daemon_down(&err), "{err:#}");
+
+        let (_dir, paths) = home_with_shim(
+            "#!/bin/sh\necho 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock.' >&2\nexit 1\n",
+        );
+        let compose = Compose::by_project(docker_program(&paths), "pando-x-y");
+        let err = compose.ps().unwrap_err();
+        assert!(!is_docker_missing(&err), "{err:#}");
     }
 
     #[test]
