@@ -834,7 +834,18 @@ impl App {
                 self.filter.clear();
                 self.end_filter();
             }
-            KeyCode::Enter => self.end_filter(),
+            KeyCode::Enter => {
+                // Enter settles on the row the filter found. A worktree
+                // `n` made that is listed by now does not take the cursor
+                // from it, then or on a later discovery: `s` next started
+                // that one, not the row just picked. A filter that left
+                // no row to settle on still gives the cursor to it.
+                if self.selected_worktree().is_some() {
+                    self.select_on_arrival
+                        .take_if(|name| self.worktrees.iter().any(|w| w.name == *name));
+                }
+                self.end_filter();
+            }
             KeyCode::Backspace => {
                 self.filter.pop();
                 self.refilter();
@@ -850,7 +861,8 @@ impl App {
     }
 
     /// Leaves the filter line, for a worktree `n` made while it was being
-    /// typed if one arrived, and for the row it was on otherwise.
+    /// typed if one arrived and is still waiting, and for the row it was
+    /// on otherwise.
     fn end_filter(&mut self) {
         self.mode = Mode::Normal;
         let keep = self

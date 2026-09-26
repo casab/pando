@@ -814,6 +814,39 @@ fn a_created_worktree_waits_for_a_filter_being_typed() {
     }
 }
 
+// But enter on a row the filter found is a choice. The arrival waiting
+// for it cleared the filter and took the cursor, and `s` next started the
+// worktree `n` made instead of the row just picked.
+#[test]
+fn enter_on_a_filtered_row_keeps_it_over_a_created_worktree() {
+    let mut app = test_app(&["feat+one", "fix+two"]);
+    app.select_on_arrival = Some("feat+new".to_string());
+    press(&mut app, KeyCode::Char('/'));
+    type_str(&mut app, "fi");
+    app.apply_snapshot(listing(&app, &["feat+one", "fix+two", "feat+new"]));
+    type_str(&mut app, "x");
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.mode, Mode::Normal);
+    assert_eq!(app.filter, "fix", "the filter is kept");
+    assert_eq!(
+        app.selected_worktree().map(|w| w.name.as_str()),
+        Some("fix+two")
+    );
+    assert!(
+        app.select_on_arrival.is_none(),
+        "and the arrival is done with"
+    );
+
+    // Nor does the next discovery hand it the cursor.
+    app.apply_snapshot(listing(&app, &["feat+one", "fix+two", "feat+new"]));
+    press(&mut app, KeyCode::Char('s'));
+    let pending = app.pending.as_ref().expect("s started something");
+    assert_eq!(
+        (pending.name.as_str(), pending.kind),
+        ("fix+two", PendingKind::Start)
+    );
+}
+
 // A worktree removed while the cursor is on it — by `d`, or from the CLI —
 // leaves the cursor on its neighbour, not back at the top of a long list.
 #[test]
