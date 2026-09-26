@@ -771,8 +771,27 @@ pub fn list_prs(root: &Path) -> Result<Vec<PrInfo>> {
     Ok(merge_pr_lists(open, recent))
 }
 
+/// A list is pages of API calls, a round trip each, so it is given longer
+/// than [`GH_TIMEOUT`]. Bounded all the same: the TUI asks for the next
+/// list only once this one has answered, so a `gh` that never did left
+/// the picker asking GitHub until the TUI was restarted.
+const GH_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 fn gh_pr_list(root: &Path, state: &str, limit: &str) -> Result<Vec<PrInfo>> {
-    let out = Command::new("gh")
+    gh_pr_list_with(Path::new("gh"), root, state, limit, GH_LIST_TIMEOUT)
+}
+
+/// [`gh_pr_list`] with the program and the deadline named, for a test's
+/// stand-in. Never prompts, as [`gh_account_with`] does not.
+fn gh_pr_list_with(
+    program: &Path,
+    root: &Path,
+    state: &str,
+    limit: &str,
+    timeout: std::time::Duration,
+) -> Result<Vec<PrInfo>> {
+    let mut command = Command::new(program);
+    command
         .current_dir(root)
         .args([
             "pr",
@@ -784,8 +803,15 @@ fn gh_pr_list(root: &Path, state: &str, limit: &str) -> Result<Vec<PrInfo>> {
             "--json",
             "number,title,headRefName,author,isDraft,state,url,isCrossRepository",
         ])
-        .output()
-        .context("spawn gh — is the GitHub CLI installed?")?;
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1");
+    let out = match crate::project::output_within(command, timeout) {
+        Ok(out) => out,
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            anyhow::bail!("gh pr list did not answer in {}s", timeout.as_secs())
+        }
+        Err(e) => return Err(e).context("spawn gh — is the GitHub CLI installed?"),
+    };
     if !out.status.success() {
         anyhow::bail!(
             "gh pr list failed: {}",
@@ -1534,6 +1560,40 @@ bare
             gh_account_with(&gh, bin.path()),
             GhAccount::Unknown("error connecting to api.github.com".to_string())
         );
+    }
+
+    // A `gh pr list` with no deadline that never answered left the TUI's
+    // picker asking GitHub, with `p` refused, until the TUI was restarted.
+    #[test]
+    fn a_gh_pr_list_that_does_not_answer_is_an_error_in_time() {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = tempdir().unwrap();
+        let gh = bin.path().join("gh");
+        std::fs::write(&gh, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let asked = std::time::Instant::now();
+        let err = gh_pr_list_with(
+            &gh,
+            bin.path(),
+            "open",
+            "10",
+            std::time::Duration::from_millis(300),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("did not answer"), "{err:#}");
+        assert!(asked.elapsed() < std::time::Duration::from_secs(10));
+
+        let gh = fake_gh(bin.path(), "[]", "", 0);
+        let listed = gh_pr_list_with(
+            &gh,
+            bin.path(),
+            "open",
+            "10",
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(listed.is_empty());
     }
 
     #[test]
