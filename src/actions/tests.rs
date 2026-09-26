@@ -10613,6 +10613,58 @@ fn a_slot_two_records_name_is_let_go_by_the_one_starting_and_emptied_by_neither(
     assert!(!redis.join("flushed").exists());
 }
 
+// A running worktree keeps a slot another record names too: a start that
+// leaves its processes running, or replaces only one of them, cannot move
+// them, and a record naming a new slot under them would leave the old one
+// to the other record alone, for its `rm` to empty under the running app.
+#[test]
+fn a_running_worktree_keeps_a_slot_another_record_names_and_rm_of_the_other_empties_nothing() {
+    let (ns, redis) = slots_fixture(MAIN_ENV_WITH_REDIS);
+    let (report, _) = ns.start(Mode::Namespaced).unwrap();
+    let _running = guard(&report);
+    hold(&ns, [(1, false)]);
+    let kept = "redis: slot 1 is kept while this worktree runs — w1's record names it too — stop \
+                it and start it again, and it gets one of its own";
+
+    let (report, said) = ns.start(Mode::Remembered).unwrap();
+    let _again = guard(&report);
+    assert!(report.started.is_empty(), "{said:?}");
+    assert!(said.iter().any(|l| l == kept), "{said:?}");
+
+    std::fs::remove_file(&ns.seen).unwrap();
+    let (said, progress) = collecting();
+    let report = super::restart(
+        &ns.fx.paths,
+        &ns.fx.config,
+        &ns.name,
+        Some("dev"),
+        Mode::Remembered,
+        &progress,
+    )
+    .unwrap();
+    let _restarted = guard(&report);
+    assert!(
+        said.borrow().iter().any(|l| l == kept),
+        "{:?}",
+        said.borrow()
+    );
+    assert_eq!(ns.env_line("REDIS_DB").as_deref(), Some("1"));
+    let ours: Vec<String> = ns
+        .record()
+        .namespaces
+        .into_iter()
+        .filter(|n| n.service == "redis")
+        .map(|n| n.name)
+        .collect();
+    assert_eq!(ours, vec!["1".to_string()]);
+
+    super::rm(&ns.fx.paths, "w1", false, false, &noop).unwrap();
+    assert!(
+        !redis.join("flushed").exists(),
+        "the running app's slot was emptied"
+    );
+}
+
 // A worktree given main's second slot before main's every slot was known
 // keeps it no longer: the next start lets it go, unemptied, and gives the
 // worktree one of its own.

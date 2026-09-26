@@ -355,12 +355,26 @@ fn start_checked(
         _ => None,
     };
     // A slot this start was given that another worktree's record names by
-    // now was freed from this one while it was starting and given out
-    // again: writing it back below would hand one slot to two worktrees.
+    // now, and this one's no longer does, was freed from this one while it
+    // was starting and given out again: writing it back below would hand
+    // one slot to two worktrees. One both records still name is one
+    // `prepare` kept, and said so, because this worktree runs on it.
+    let ours = |namespace: &state::NamespaceRecord| {
+        store
+            .worktrees
+            .get(name)
+            .or(inherited.as_ref())
+            .is_some_and(|record| {
+                record
+                    .namespaces
+                    .iter()
+                    .any(|ns| crate::namespace::same_namespace(ns, namespace))
+            })
+    };
     for namespace in ready
         .iter()
         .flat_map(|ready| &ready.namespaces)
-        .filter(|namespace| namespace.kind == state::NamespaceKind::Slot)
+        .filter(|namespace| namespace.kind == state::NamespaceKind::Slot && !ours(namespace))
     {
         if let Some(other) = namespaced::recorded_elsewhere(&store, name, namespace) {
             bail!(

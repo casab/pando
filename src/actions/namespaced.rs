@@ -710,7 +710,8 @@ fn ensure_database(
 /// The one state records is kept only while it is this worktree's alone
 /// and not the main checkout's: one the main checkout's env files name, or
 /// one another worktree's record names too, is let go — never emptied —
-/// and a new one given, with a line saying why.
+/// and a new one given, with a line saying why. While the worktree runs it
+/// is kept all the same, and the line says how to move it.
 fn ensure_slot(
     paths: &PandoPaths,
     name: &str,
@@ -743,6 +744,14 @@ fn ensure_slot(
         let kept = slot(&recorded);
         match hold_on(paths, name, target, &kept)? {
             Held::Kept => return Ok((kept, false)),
+            Held::Running(why) => {
+                progress(&format!(
+                    "{}: slot {recorded} is kept while this worktree runs — {why} — stop it and \
+                     start it again, and it gets one of its own",
+                    target.service
+                ));
+                return Ok((kept, false));
+            }
             Held::LetGo(why) => progress(&format!(
                 "{}: slot {recorded} is let go, not emptied — {why} — and this worktree gets one \
                  of its own",
@@ -884,6 +893,9 @@ fn first_empty(
 enum Held {
     /// Still this worktree's alone, and marked as used now.
     Kept,
+    /// Not this worktree's alone, and why, but kept and marked as used
+    /// all the same, because the worktree runs.
+    Running(String),
     /// Taken out of this worktree's record, unemptied, and why.
     LetGo(String),
     /// No longer in its record: a start that freed it since has emptied
@@ -901,6 +913,13 @@ enum Held {
 /// written before slots were taken under the lock, or edited by hand — is
 /// shared by two apps already: this worktree lets it go as the other's,
 /// rather than go on sharing it or stop every start of both.
+///
+/// Except while the worktree runs. A start that leaves its processes
+/// running — one already up, a `restart --only` — cannot move them, and a
+/// restart that would could still fail after the slot went; a record
+/// naming another slot while they go on using this one leaves this one to
+/// the other record alone, and that worktree's `rm` would empty it under
+/// them. So it is let go at the first start after the worktree stops.
 fn hold_on(
     paths: &PandoPaths,
     name: &str,
@@ -930,12 +949,25 @@ fn hold_on(
         (false, None) => None,
     };
     let record = store.worktrees.get_mut(name).expect("just read");
-    match &why {
-        Some(_) => record.namespaces.retain(|ns| !own(ns)),
-        None => keep(record, kept),
+    let held = match why {
+        None => Held::Kept,
+        Some(why) if runs(record) => Held::Running(why),
+        Some(why) => Held::LetGo(why),
+    };
+    match &held {
+        Held::LetGo(_) => record.namespaces.retain(|ns| !own(ns)),
+        _ => keep(record, kept),
     }
     crate::state::save(&paths.state_file(), &store)?;
-    Ok(why.map_or(Held::Kept, Held::LetGo))
+    Ok(held)
+}
+
+/// Whether anything of a worktree runs, as state says: a process whose
+/// leader is alive and whose start did not fail.
+fn runs(record: &crate::state::WorktreeRecord) -> bool {
+    record.processes.values().any(|p| {
+        !matches!(p.phase, crate::state::Phase::Failed { .. }) && crate::process::is_alive(p.pid)
+    })
 }
 
 /// The slots pando may give a worktree on a target's server: every one it
@@ -979,10 +1011,7 @@ impl Holder {
 fn slot_holders(store: &crate::state::State, target: &Target) -> Vec<Holder> {
     let mut out = Vec::new();
     for (worktree, record) in &store.worktrees {
-        let running = record.processes.values().any(|p| {
-            !matches!(p.phase, crate::state::Phase::Failed { .. })
-                && crate::process::is_alive(p.pid)
-        });
+        let running = runs(record);
         for ns in &record.namespaces {
             let here = crate::state::NamespaceRecord {
                 host: target.host.clone(),
