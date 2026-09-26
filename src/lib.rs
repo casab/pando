@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! catalog · paths · term · remedy · theme → compose → project · config · ports · process · runtime · state
-//!       · template · recipes
+//!       · env_command · template · recipes
 //!       → detect · hooks · worktree · cache · log_tail · observe · services
 //!         · native · namespace · decisions
 //!       → tunnel · share_proxy
@@ -48,6 +48,7 @@ pub mod config;
 pub mod decisions;
 pub mod detect;
 pub mod doctor;
+pub mod env_command;
 pub mod hooks;
 pub mod log_tail;
 pub mod namespace;

@@ -10,6 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use super::App;
+use crate::env_command;
 
 /// What the environment says about how to leave pando, read once at
 /// startup rather than in a key handler, and injected by tests.
@@ -92,23 +93,25 @@ const GUI_EDITORS: &[&str] = &[
     "open",
 ];
 
-/// Splits `$EDITOR` the way most tools do: on whitespace. Quoting is not
-/// understood — a value that needs it is rare enough to leave to a shell.
+/// Splits `$EDITOR` the way a shell would, so a program whose path has a
+/// space in it can be quoted: `"/Applications/My Editor.app/…" -w`.
+/// `None` when there is nothing to run, or no telling where it ends.
 fn split_command(command: &str) -> Option<(String, Vec<String>)> {
-    let mut words = command.split_whitespace().map(str::to_string);
+    let mut words = env_command::words(command).ok()?.into_iter();
     let program = words.next()?;
     Some((program, words.collect()))
 }
 
 /// Whether an editor command wants the terminal.
 pub fn is_terminal_editor(command: &str) -> bool {
-    let Some((program, _)) = split_command(command) else {
-        return false;
-    };
-    let base = Path::new(&program)
+    split_command(command).is_some_and(|(program, _)| program_wants_terminal(&program))
+}
+
+fn program_wants_terminal(program: &str) -> bool {
+    let base = Path::new(program)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or(program);
+        .unwrap_or_else(|| program.to_string());
     !GUI_EDITORS.contains(&base.as_str())
 }
 
@@ -172,6 +175,11 @@ pub fn plan_editor(env: &LaunchEnv, path: &Path, label: &str) -> Result<LaunchRe
         return Err("set $VISUAL or $EDITOR to open a worktree in your editor".to_string());
     };
     let Some((program, mut args)) = split_command(&command) else {
+        if env_command::words(&command).is_err() {
+            return Err(format!(
+                "$VISUAL / $EDITOR has a quote that never closes: {command}"
+            ));
+        }
         return Err("$VISUAL / $EDITOR is empty".to_string());
     };
     args.push(path.display().to_string());
@@ -179,7 +187,7 @@ pub fn plan_editor(env: &LaunchEnv, path: &Path, label: &str) -> Result<LaunchRe
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| program.clone());
-    if !is_terminal_editor(&command) {
+    if !program_wants_terminal(&program) {
         return Ok(LaunchRequest {
             launch: Launch::Detached {
                 program,

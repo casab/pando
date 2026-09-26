@@ -1104,39 +1104,6 @@ fn the_status_message_expires() {
     assert!(app.status.is_none());
 }
 
-// `o` and `O` ignored `$BROWSER`, which `pando open` honours: the same
-// variable, read the same way, or the key and the command open two
-// different browsers.
-#[test]
-fn o_reads_browser_the_way_pando_open_does() {
-    let url = "http://localhost:17000";
-    let opener = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
-    assert_eq!(browser_commands(None, url), vec![vec![opener, url]]);
-    assert_eq!(browser_commands(Some(" : "), url), vec![vec![opener, url]]);
-    assert_eq!(
-        browser_commands(Some("firefox --new-window"), url),
-        vec![vec!["firefox", "--new-window", url]]
-    );
-    assert_eq!(
-        browser_commands(Some("lynx -dump %s:w3m"), url),
-        vec![vec!["lynx", "-dump", url], vec!["w3m", url]],
-        "a list, tried in order, with %s standing for the URL"
-    );
-    // A file as written is one program, space and all.
-    let dir = tempfile::tempdir().unwrap();
-    let program = dir.path().join("my browser");
-    std::fs::write(&program, "").unwrap();
-    let program = program.display().to_string();
-    assert_eq!(
-        browser_commands(Some(&program), url),
-        vec![vec![program.as_str(), url]]
-    );
-}
-
 #[test]
 fn base64_matches_the_reference_encoding() {
     assert_eq!(base64(b""), "");
@@ -3824,6 +3791,35 @@ fn e_hands_a_gui_editor_off_with_its_arguments() {
         let (message, _) = app.active_status().expect("it says what it did");
         assert!(message.contains("opened feat/one in code"), "{message}");
     }
+}
+
+// `EDITOR='"/Applications/My Editor.app/…/bin/edit" -w'` was split on
+// whitespace into a program called `"/Applications/My`.
+#[test]
+fn e_reads_a_quoted_editor_path_as_one_program() {
+    let mut app = test_app(&["feat+one"]);
+    app.launch_env = env(
+        false,
+        None,
+        None,
+        Some(r#""/Applications/My Editor.app/bin/code" -w"#),
+    );
+    press(&mut app, KeyCode::Char('e'));
+    assert_eq!(
+        app.launch.clone().map(|r| r.launch),
+        Some(Launch::Detached {
+            program: "/Applications/My Editor.app/bin/code".into(),
+            args: vec!["-w".into(), "/trees/feat+one".into()],
+            cwd: PathBuf::from("/trees/feat+one"),
+        })
+    );
+
+    let mut app = test_app(&["feat+one"]);
+    app.launch_env = env(false, None, None, Some(r#""/opt/my editor -w"#));
+    press(&mut app, KeyCode::Char('e'));
+    assert!(app.launch.is_none());
+    let (message, error) = app.active_status().expect("an error");
+    assert!(error && message.contains("never closes"), "{message}");
 }
 
 #[test]

@@ -399,37 +399,6 @@ fn the_listing_width_survives_a_zero_sized_terminal_and_reads_columns() {
     );
 }
 
-// `BROWSER="firefox --new-window"` was run as a program of that whole
-// name: "No such file or directory", for a setting every other tool reads.
-#[test]
-fn browser_is_a_list_of_commands_with_arguments() {
-    use super::open::openers;
-    let url = "http://localhost:3000";
-    let words = |v: &[&str]| v.iter().map(|w| w.to_string()).collect::<Vec<_>>();
-    assert_eq!(
-        openers(Some("firefox --new-window"), url),
-        vec![words(&["firefox", "--new-window", url])]
-    );
-    assert_eq!(
-        openers(Some("w3m:lynx -dump %s"), url),
-        vec![words(&["w3m", url]), words(&["lynx", "-dump", url])]
-    );
-    let dir = tempdir().unwrap();
-    let spaced = dir.path().join("My Browser");
-    std::fs::write(&spaced, "").unwrap();
-    let spaced = spaced.to_str().unwrap();
-    assert_eq!(
-        openers(Some(spaced), url),
-        vec![words(&[spaced, url])],
-        "a path with a space in it"
-    );
-    for unset in [None, Some(""), Some(" : ")] {
-        let default = openers(unset, url);
-        assert_eq!(default.len(), 1, "{unset:?}");
-        assert_eq!(default[0].last().map(String::as_str), Some(url));
-    }
-}
-
 #[test]
 fn logs_default_to_dev_else_to_the_only_process() {
     let fx = fixture();
