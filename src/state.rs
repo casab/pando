@@ -568,7 +568,8 @@ fn read_boot_id() -> Option<String> {
 /// of a stranger (a terminal's shell leads a group of its own). So a file
 /// written during another boot keeps what outlives a restart — ports,
 /// roles, hooks, the compose projects that name containers and volumes,
-/// the mode — and loses every pid.
+/// the mode — and loses every pid, the process groups of a share still
+/// coming up among them.
 ///
 /// A file with no boot recorded, or a system that cannot say, keeps them:
 /// not knowing is not evidence of a restart.
@@ -583,6 +584,7 @@ fn forget_previous_boot(state: &mut State, written: Option<&str>, now: Option<&s
         record.processes.clear();
         record.observed_ports.clear();
         record.share = None;
+        record.pending_shares.clear();
         for service in record.services.iter_mut() {
             service.pid = None;
             service.pgid = None;
@@ -1501,7 +1503,14 @@ mod tests {
         };
         let dir = tempdir().unwrap();
         let path = dir.path().join("state.json");
-        let state = full_state();
+        let mut state = full_state();
+        if let Some(rec) = state.worktrees.get_mut("feat+x") {
+            rec.pending_shares.push(PendingShare {
+                owner_pid: 4343,
+                since: at(10),
+                pgids: vec![7100, 7101],
+            });
+        }
         save(&path, &state).unwrap();
         assert_eq!(load(&path).unwrap(), state, "this boot's pids are kept");
 
@@ -1512,6 +1521,10 @@ mod tests {
         let rec = &loaded.worktrees["feat+x"];
         assert!(rec.processes.is_empty(), "{:?}", rec.processes);
         assert!(rec.share.is_none());
+        assert!(
+            rec.pending_shares.is_empty(),
+            "a share still coming up names groups this boot gave to others"
+        );
         assert!(rec.observed_ports.is_empty());
         assert!(
             rec.services
