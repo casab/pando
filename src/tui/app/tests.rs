@@ -5197,7 +5197,11 @@ fn tab_in_the_create_modal_cycles_the_base() {
     press(&mut app, KeyCode::Tab);
     assert_eq!(base(&app).as_deref(), Some("origin/release"));
     press(&mut app, KeyCode::Tab);
-    assert_eq!(base(&app), None, "and back to the default");
+    assert_eq!(
+        base(&app).as_deref(),
+        Some("origin/main"),
+        "and back to the default, chosen now"
+    );
     press(&mut app, KeyCode::BackTab);
     assert_eq!(base(&app).as_deref(), Some("origin/release"));
 }
@@ -5294,7 +5298,41 @@ fn tab_starts_from_the_configured_base_and_reaches_the_repository_default() {
     press(&mut app, KeyCode::Tab);
     assert_eq!(base(&app).as_deref(), Some("release"));
     press(&mut app, KeyCode::Tab);
-    assert_eq!(base(&app), None, "and back to the configured base");
+    assert_eq!(
+        base(&app).as_deref(),
+        Some("develop"),
+        "and back to the configured base"
+    );
+}
+
+// A base tab chose stays chosen as the name is typed, even one that was
+// the untouched base when tab reached it: the untouched base follows the
+// name, and `hotfix/y` would fork from its rule's base instead.
+#[test]
+fn a_base_tab_chose_survives_typing_a_name_with_another_base() {
+    let mut app = test_app(&["feat+one"]);
+    app.default_base = Some("origin/main".into());
+    app.config.project.base = Some("develop".into());
+    app.config.branches.rules.push(crate::config::BranchRule {
+        match_: "hotfix/*".into(),
+        base: "release".into(),
+    });
+    open_create_with(&mut app, &[]);
+    let base = |app: &App| match &app.modal {
+        Some(Modal::Create { base, .. }) => base.clone(),
+        other => panic!("expected the create modal, got {other:?}"),
+    };
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(base(&app).as_deref(), Some("origin/main"));
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(base(&app).as_deref(), Some("develop"), "walked round to it");
+    type_str(&mut app, "hotfix/y");
+    assert_eq!(app.implied_base("hotfix/y").as_deref(), Some("release"));
+    assert_eq!(
+        base(&app).as_deref(),
+        Some("develop"),
+        "the branch forks from what was picked"
+    );
 }
 
 // ---- the all tab -----------------------------------------------------

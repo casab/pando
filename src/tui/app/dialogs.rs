@@ -16,8 +16,8 @@ pub enum Modal {
         input: String,
         branches: BranchLoadState,
         selected: usize,
-        /// What a new branch forks from, when it is not the default base.
-        /// Tab walks the choices.
+        /// What a new branch forks from, once tab has chosen it. Until
+        /// then, none: it forks from the base the config gives its name.
         base: Option<String>,
     },
     /// `p`: the project's open pull requests, narrowed by what is typed.
@@ -310,9 +310,9 @@ impl App {
             KeyCode::Esc => return,
             // The base a new branch forks from, walked in place: the one
             // it forks from untouched first, then the repository's
-            // default, then every branch the picker read. Only the first
-            // is no choice at all, so the config's base can be passed
-            // over for the repository's default, as `new --base` can.
+            // default, then every branch the picker read. Whatever tab
+            // lands on is chosen, the first included: the untouched base
+            // follows the name as it is typed, and a choice stays put.
             KeyCode::Tab | KeyCode::BackTab => {
                 let implied = self.implied_base(&input);
                 let leading: Vec<&str> = implied
@@ -338,8 +338,7 @@ impl App {
                         None if forward => 0,
                         None => choices.len() - 1,
                     };
-                    let chosen = choices[next].clone();
-                    base = (Some(&chosen) != implied.as_ref()).then_some(chosen);
+                    base = Some(choices[next].clone());
                 }
             }
             KeyCode::Down => selected = (selected + 1).min(rows.len().saturating_sub(1)),
