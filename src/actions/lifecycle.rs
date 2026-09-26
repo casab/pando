@@ -846,6 +846,29 @@ fn start_checked(
         .entry(name.to_string())
         .or_insert_with(|| WorktreeRecord::new(canonical.clone(), false));
 
+    // And the namespaces this start was given have to still be this
+    // worktree's. Its record named them when the lock was let go, with none
+    // of its processes up, so another worktree's namespaced start that found
+    // every slot held could offer it as stopped, empty its slot, forget it
+    // and give it out again. Spawning past that put this app on a slot only
+    // another record names, whose `rm` empties it under the app.
+    if let Some(gone) = ready
+        .iter()
+        .flat_map(|ready| &ready.namespaces)
+        .find(|namespace| {
+            !record
+                .namespaces
+                .iter()
+                .any(|ns| crate::namespace::same_namespace(ns, namespace))
+        })
+    {
+        return Err(anyhow::anyhow!(
+            "{} was freed from this worktree while this start was starting, so nothing was \
+             started here — start it again, and it gets one of its own",
+            crate::namespace::describe(gone)
+        ));
+    }
+
     // The lock was let go for the hooks and the services, and another start
     // of this worktree — the TUI's key pressed twice, or the TUI and the
     // CLI at once — may have spawned a process in the meantime. Spawning a

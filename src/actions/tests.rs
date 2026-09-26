@@ -10766,6 +10766,58 @@ fn a_slot_given_to_another_worktree_while_this_one_started_is_not_written_back()
     assert!(!redis.join("flushed").exists());
 }
 
+// The same after the start has written the slot down and let the lock go
+// for its hooks: its record names the slot and none of its processes is
+// up, so another worktree's start can offer it as stopped, empty it and
+// take it. The app was spawned onto that slot all the same, which only the
+// other record named, for its `rm` to empty under it. The start stops.
+#[test]
+fn a_slot_freed_from_this_worktree_while_its_hooks_ran_is_not_spawned_onto() {
+    let (ns, _redis) = slots_fixture(MAIN_ENV_WITH_REDIS);
+    let paths = ns.fx.paths.clone();
+    let name = ns.name.clone();
+    let progress = |line: &str| {
+        if !line.starts_with("running the schema hook") {
+            return;
+        }
+        // What a start freeing this worktree's slot, and taking it, does.
+        let mut store = state::load(&paths.state_file()).unwrap();
+        store
+            .worktrees
+            .get_mut(&name)
+            .unwrap()
+            .namespaces
+            .retain(|n| n.service != "redis");
+        store
+            .worktrees
+            .insert("w-racer".into(), slot_holder(1, false, 0));
+        state::save(&paths.state_file(), &store).unwrap();
+    };
+    let e = format!(
+        "{:#}",
+        super::start(
+            &ns.fx.paths,
+            &ns.fx.config,
+            &ns.name,
+            None,
+            Mode::Namespaced,
+            &progress
+        )
+        .unwrap_err()
+    );
+    assert!(
+        e.contains("redis slot 1 was freed from this worktree while this start was starting"),
+        "{e}"
+    );
+    let store = ns.fx.state();
+    assert!(store.worktrees[&ns.name].processes.is_empty());
+    assert_ne!(
+        store.worktrees[&ns.name].mode,
+        Some(crate::state::ServiceMode::Namespaced)
+    );
+    assert!(!ns.seen.exists(), "the app was started");
+}
+
 // Two records naming one slot — a state written before slots were taken
 // under the lock, or edited by hand — stop neither worktree for good: the
 // one starting lets it go, unemptied, as the other's, and gets its own.
