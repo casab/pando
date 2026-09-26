@@ -1364,6 +1364,61 @@ fn restart_only_of_the_process_a_share_points_at_keeps_the_share() {
     assert!(crate::process::is_alive(tunnel.pid), "and its tunnel is up");
 }
 
+// A whole restart stops everything first, its share included, and did so
+// in silence: the row lost its URL, and whoever the URL was sent to found
+// out before the developer did.
+#[test]
+fn a_restart_that_closes_a_share_says_which_url_and_how_to_get_a_new_one() {
+    let mut fx = fixture();
+    with_dev(&mut fx, dev("sleep 30"));
+    let name = worktree_named(&fx, "feat/one");
+    let first = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+    let _guard = guard(&first);
+    let _tunnel = share_through_a_live_tunnel(&fx, &name);
+
+    let said = std::cell::RefCell::new(Vec::<String>::new());
+    let report = restart(&fx.paths, &fx.config, &name, None, &|line| {
+        said.borrow_mut().push(line.to_string())
+    })
+    .unwrap();
+    let _g2 = guard(&report);
+    assert!(fx.state().worktrees[&name].share.is_none());
+    let said = said.into_inner();
+    assert!(
+        said.contains(&share_closed(&name, "https://x.trycloudflare.com")),
+        "{said:?}"
+    );
+    assert!(
+        said.iter()
+            .any(|line| line.contains(&format!("`pando share {name}`"))),
+        "{said:?}"
+    );
+}
+
+#[test]
+fn stopping_everything_says_which_public_url_it_closed() {
+    let fx = fixture();
+    let name = worktree_named(&fx, "feat/shared");
+    let mut store = fx.state();
+    store
+        .worktrees
+        .get_mut(&name)
+        .expect("new wrote a record")
+        .share = Some(share_record_of(4_000_001, None));
+    state::save(&fx.paths.state_file(), &store).unwrap();
+
+    let said = std::cell::RefCell::new(Vec::<String>::new());
+    super::stop_all_with(&fx.paths, |_| Ok(()), &|line| {
+        said.borrow_mut().push(line.to_string())
+    })
+    .unwrap();
+    let said = said.into_inner();
+    assert!(
+        said.contains(&share_closed(&name, "https://x.trycloudflare.com")),
+        "{said:?}"
+    );
+}
+
 // The name is checked against config, not against what happens to be
 // running: the same typo used to produce two different messages
 // depending on unrelated state, and only one of them listed the names

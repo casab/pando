@@ -25,7 +25,7 @@ use super::services::{
     preflight_isolation, resolve_service_env, service_roles, shared_service_env, stop_containers,
     stop_service_pumps, undo_failed_isolation, worktree_url,
 };
-use super::share::{share_target_is_up, sweep_dead_shares_with, take_share_down};
+use super::share::{share_closed, share_target_is_up, sweep_dead_shares_with, take_share_down};
 // Only for the intra-doc link above `sweep_orphaned_groups`.
 #[cfg(doc)]
 use super::share::sweep_dead_shares;
@@ -1090,7 +1090,9 @@ pub fn stop(
     let outcome = {
         let _lock = state::lock(&paths.lock_file())?;
         let mut store = state::load(&paths.state_file())?;
+        let shared = public_url(&store, name);
         let outcome = stop_recorded(&mut store, name, only, &mut projects)?;
+        say_if_closed(&store, name, shared, progress);
         // `reconcile` drops dead-leader records for every worktree in the
         // project, not only this one, so every one is signalled first — and
         // a sibling's half-dead share along with them.
@@ -1145,8 +1147,12 @@ pub fn stop_all_with(
         // One worktree that will not die must not leave the rest running —
         // and must not lose its record either. The failures are collected
         // and reported once every other group has been signalled.
+        let shared = public_url(&store, &name);
         match stop_recorded_with(&mut store, &name, None, &stop, &mut projects) {
-            Ok(StopOutcome::Stopped(_)) => stopped.push(name),
+            Ok(StopOutcome::Stopped(_)) => {
+                say_if_closed(&store, &name, shared, progress);
+                stopped.push(name);
+            }
             Ok(StopOutcome::NotRunning) => {}
             Err(e) => failures.push(format!("stopping {name}: {e:#}")),
         }
@@ -1183,6 +1189,29 @@ pub fn stop_all_with(
     }
     stop_containers(paths, &projects, progress)?;
     Ok(stopped)
+}
+
+/// The public URL `name` is shared at, read before a stop so that one which
+/// closes it can say which.
+fn public_url(store: &state::State, name: &str) -> Option<String> {
+    let share = store.worktrees.get(name)?.share.as_ref()?;
+    Some(share.public_url.clone())
+}
+
+/// Says so when the stop that just ran closed the share `shared` was read
+/// from, restart's stop half included: a URL that stops answering with
+/// nothing said is one the developer finds out about from whoever they
+/// sent it to.
+fn say_if_closed(
+    store: &state::State,
+    name: &str,
+    shared: Option<String>,
+    progress: &dyn Fn(&str),
+) {
+    let Some(url) = shared else { return };
+    if store.worktrees.get(name).is_some_and(|r| r.share.is_none()) {
+        progress(&share_closed(name, &url));
+    }
 }
 
 /// Signals the process groups recorded for `name` and drops their records.

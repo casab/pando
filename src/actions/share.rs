@@ -51,6 +51,16 @@ pub(super) fn take_share_down(
     }
 }
 
+/// What a stop says of the public URL it closed. A quick tunnel's host is
+/// random, so the URL the developer handed out is gone for good and the
+/// next share is a different one: worth one line rather than a row that
+/// quietly loses its URL.
+pub(super) fn share_closed(name: &str, public_url: &str) -> String {
+    format!(
+        "{name}: its public URL {public_url} is closed — `pando share {name}` gives it a new one"
+    )
+}
+
 /// How long `[share].auth_cmd` may take before the share gives up on it.
 ///
 /// A script that waits on something that never comes would otherwise hold
