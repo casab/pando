@@ -113,6 +113,7 @@ pub(super) fn tools_report(
                 .map(|d| format!("{}{d}", probe.detail_label)),
             needed_for: probe.needed_for.clone(),
             found: present,
+            asked: failure.is_none(),
         });
     }
     if failure.is_none() {

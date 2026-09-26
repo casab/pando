@@ -271,6 +271,10 @@ pub struct ToolReport {
     /// Why pando looked for it.
     pub needed_for: String,
     pub found: bool,
+    /// Whether the shell answered when asked about it. When it did not, a
+    /// tool with no path was never looked for rather than not found.
+    #[serde(skip)]
+    pub asked: bool,
 }
 
 /// One worktree, as git sees it and as pando's own records do.
@@ -377,6 +381,11 @@ pub struct NativeServiceReport {
     pub socket_root: String,
     /// The engine binaries the recipe needs and where each resolved.
     pub engine: Vec<EngineBinary>,
+    /// Whether the shell answered when asked where the engine is. When it
+    /// did not, a binary with no path was never looked for rather than
+    /// not found.
+    #[serde(skip)]
+    pub engine_asked: bool,
     /// The first line the engine printed when asked for its version.
     pub version: Option<String>,
     /// How to install it. Printed, never run.

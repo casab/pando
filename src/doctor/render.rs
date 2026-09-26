@@ -298,6 +298,11 @@ fn render_tools(out: &mut String, tools: &[ToolReport], style: &Style) {
             (_, Some(path)) if !path.starts_with('/') => format!("a shell builtin ({path})"),
             (Some(version), Some(path)) => format!("{version}  ({})", style.tilde(path)),
             (None, Some(path)) => format!("found, and said nothing  ({})", style.tilde(path)),
+            // A shell that never answered has not said it is missing.
+            _ if !tool.asked => style.paint(
+                &format!("no answer from the shell — {}", tool.needed_for),
+                Paint::Faint,
+            ),
             _ => style.paint(&format!("not found — {}", tool.needed_for), Paint::Warn),
         };
         if let Some(detail) = &tool.detail {
@@ -468,6 +473,9 @@ fn render_services(out: &mut String, services: &ServicesReport) {
                 "",
                 &match &binary.path {
                     Some(path) => format!("{} at {path}", binary.name),
+                    None if !native.engine_asked => {
+                        format!("{}: no answer from the shell", binary.name)
+                    }
                     None => format!("{} is not on PATH", binary.name),
                 },
             );
@@ -476,6 +484,7 @@ fn render_services(out: &mut String, services: &ServicesReport) {
             row(out, "", version);
         }
         if let Some(install) = &native.install
+            && native.engine_asked
             && native.engine.iter().any(|b| b.path.is_none())
         {
             row(

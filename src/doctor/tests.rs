@@ -967,6 +967,10 @@ fn a_probe_that_never_finished_claims_nothing_about_the_machine() {
         "{:?}",
         messages(&report)
     );
+    // Nor do its rows: a tool nobody could ask about is not "not found".
+    let text = report.render();
+    assert!(!text.contains("not found — "), "{text}");
+    assert!(text.contains("no answer from the shell"), "{text}");
 }
 
 // Every process, hook and share runs behind the prelude, so one that
@@ -1616,6 +1620,42 @@ fn an_engine_this_machine_does_not_have_is_a_line_and_not_a_crash() {
     assert!(text.contains("postgres is not on PATH"), "{text}");
     assert!(text.contains("brew install postgresql"), "{text}");
     assert!(text.contains("pando never will"), "{text}");
+}
+
+#[test]
+fn an_engine_probe_the_shell_never_answered_claims_nothing_about_the_engine() {
+    let fx = fixture();
+    write_project_config(
+        &fx,
+        "[[services]]\nkind = \"native\"\nname = \"postgres\"\n",
+    );
+    // Every other question is answered; the engine's is not, the way a
+    // login shell that overran its deadline answers.
+    let shell = |script: &str| match script.contains(NATIVE_BIN_MARK) {
+        true => None,
+        false => every_tool(script),
+    };
+    let report = report_of(&fx, &shell);
+    let native = native_of(&report, "postgres");
+    assert!(!native.engine.is_empty(), "its binaries are still listed");
+    assert!(native.engine.iter().all(|b| b.path.is_none()));
+    assert!(
+        !mentions(&report, "not on PATH"),
+        "a shell that did not answer is not evidence the engine is missing: {:?}",
+        messages(&report)
+    );
+    assert!(
+        mentions(
+            &report,
+            "could not ask the shell where the \"postgres\" recipe's engine is"
+        ),
+        "{:?}",
+        messages(&report)
+    );
+    let text = report.render();
+    assert!(!text.contains("is not on PATH"), "{text}");
+    assert!(!text.contains("install it with"), "{text}");
+    assert!(text.contains("no answer from the shell"), "{text}");
 }
 
 #[test]

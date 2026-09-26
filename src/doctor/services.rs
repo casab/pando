@@ -219,6 +219,7 @@ fn native_report(
             datadir: datadir.display().to_string(),
             socket_root,
             engine: Vec::new(),
+            engine_asked: true,
             version: None,
             install: None,
             env_key: None,
@@ -275,7 +276,31 @@ fn native_report(
         }
         let (mapping, _) = entry.env_map(Some(&resolved.recipe));
         report.env_key = mapping.keys().next().cloned();
-        let (engine, version) = probe_engine(machine, &bin_dir, &resolved.recipe);
+        let Some((engine, version)) = probe_engine(machine, &bin_dir, &resolved.recipe) else {
+            // The shell did not answer. That is not evidence about the
+            // engine, so its binaries are listed and nothing is claimed
+            // about them.
+            findings.push(Finding::note(
+                Section::Services,
+                format!(
+                    "pando could not ask the shell where the {:?} recipe's engine is: the shell \
+                     did not answer inside its deadline",
+                    resolved.recipe.name
+                ),
+            ));
+            report.engine = resolved
+                .recipe
+                .binaries
+                .iter()
+                .map(|name| EngineBinary {
+                    name: name.clone(),
+                    path: None,
+                })
+                .collect();
+            report.engine_asked = false;
+            out.push(report);
+            continue;
+        };
         let missing: Vec<&str> = engine
             .iter()
             .filter(|b| b.path.is_none())
@@ -328,7 +353,7 @@ pub(super) const NATIVE_BIN_MARK: &str = "pando-native-bin ";
 pub(super) const NATIVE_VERSION_MARK: &str = "pando-native-version ";
 
 /// Where each of a recipe's binaries resolved, and what the first of them
-/// says its version is.
+/// says its version is, or `None` when the shell did not answer.
 ///
 /// Asked through the same injected shell the tools probe uses, and with
 /// the same PATH the start path would give the recipe — pando's own `bin`
@@ -337,10 +362,10 @@ fn probe_engine(
     machine: &Machine<'_>,
     bin_dir: &Path,
     recipe: &recipes::Recipe,
-) -> (Vec<EngineBinary>, Option<String>) {
+) -> Option<(Vec<EngineBinary>, Option<String>)> {
     let binaries = recipe.binaries.clone();
     if binaries.is_empty() {
-        return (Vec::new(), None);
+        return Some((Vec::new(), None));
     }
     let mut script = format!(
         "export PATH={}:\"$PATH\"\n",
@@ -360,20 +385,7 @@ fn probe_engine(
             "printf '{NATIVE_VERSION_MARK}%s\\n' \"$({version} 2>&1 | head -n 1)\""
         );
     }
-    let Some(text) = (machine.shell)(&script) else {
-        // The shell did not answer. That is not evidence about the
-        // engine, so nothing is claimed about it.
-        return (
-            binaries
-                .iter()
-                .map(|name| EngineBinary {
-                    name: name.clone(),
-                    path: None,
-                })
-                .collect(),
-            None,
-        );
-    };
+    let text = (machine.shell)(&script)?;
     let mut found: BTreeMap<String, String> = BTreeMap::new();
     let mut version = None;
     for line in text.lines() {
@@ -399,7 +411,7 @@ fn probe_engine(
     // A version printed by a binary that is not there is the shell
     // reporting its own "command not found", not an engine.
     let version = version.filter(|_| found.contains_key(&binaries[0]));
-    (engine, version)
+    Some((engine, version))
 }
 
 /// The worktrees that already have data for this service, and what their
