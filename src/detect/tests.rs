@@ -1859,6 +1859,33 @@ fn workspace_globs_are_read_from_every_convention() {
     .unwrap();
     assert_eq!(workspace_globs(dir.path()), vec!["apps/*"]);
 
+    // Every other way pnpm accepts the same list. Read only the first way,
+    // a plain pnpm workspace had no apps and fell back to the root script
+    // without a word.
+    for (text, expected) in [
+        (
+            "packages:\n- apps/*\n- packages/*\n",
+            &["apps/*", "packages/*"][..],
+        ),
+        (
+            "# the workspace\npackages: # members\n  - 'apps/*' # web and api\n  - packages/* # shared\n",
+            &["apps/*", "packages/*"],
+        ),
+        (
+            "packages: ['apps/*', \"packages/*\"] # both\n",
+            &["apps/*", "packages/*"],
+        ),
+        // The next key ends the list, at any column its items sit at.
+        (
+            "packages:\n- apps/*\nonlyBuiltDependencies:\n- esbuild\n",
+            &["apps/*"],
+        ),
+    ] {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("pnpm-workspace.yaml"), text).unwrap();
+        assert_eq!(workspace_globs(dir.path()), expected, "{text:?}");
+    }
+
     let dir = tempdir().unwrap();
     std::fs::write(
         dir.path().join("package.json"),

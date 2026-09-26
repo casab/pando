@@ -79,32 +79,67 @@ pub(super) fn workspace_globs(root: &Path) -> Vec<String> {
     globs
 }
 
-/// The string items of a top-level YAML list, for one key. Enough for
-/// `packages:` followed by `  - 'apps/*'` lines, and nothing more.
+/// The string items of a top-level YAML list, for one key. Enough for the
+/// ways a `packages:` list is written: `- 'apps/*'` items indented under
+/// the key or at its own column, or a `['apps/*']` flow list on its line,
+/// with comments after any of them. Nothing more.
 fn yaml_string_list(text: &str, key: &str) -> Vec<String> {
+    let item = |text: &str| text.trim().trim_matches(['"', '\'']).to_string();
     let mut out = Vec::new();
     let mut inside = false;
     for line in text.lines() {
-        let trimmed = line.trim_end();
-        if trimmed.trim_start().starts_with('#') || trimmed.trim().is_empty() {
+        let line = without_comment(line);
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             continue;
         }
-        if !line.starts_with([' ', '\t']) {
-            inside = trimmed.trim_end_matches(':') == key && trimmed.ends_with(':');
+        // A column-zero line is the next key, unless it is an item of this
+        // one: YAML lets a list sit at its key's own column.
+        let indented = line.starts_with([' ', '\t']);
+        let own_item = inside && trimmed.starts_with('-');
+        if !(indented || own_item) {
+            let value = trimmed
+                .strip_prefix(key)
+                .and_then(|rest| rest.strip_prefix(':'))
+                .map(str::trim);
+            inside = value == Some("");
+            if let Some(list) = value
+                .and_then(|value| value.strip_prefix('['))
+                .and_then(|value| value.strip_suffix(']'))
+            {
+                out.extend(list.split(',').map(item).filter(|glob| !glob.is_empty()));
+            }
             continue;
         }
         if !inside {
             continue;
         }
-        let Some(item) = trimmed.trim_start().strip_prefix('-') else {
+        let Some(glob) = trimmed.strip_prefix('-').map(item) else {
             continue;
         };
-        let item = item.trim().trim_matches(['"', '\'']).to_string();
-        if !item.is_empty() {
-            out.push(item);
+        if !glob.is_empty() {
+            out.push(glob);
         }
     }
     out
+}
+
+/// A YAML line without its comment. A `#` starts one only at the start of
+/// a token, and never inside quotes: `- 'apps/#1'` is a glob.
+fn without_comment(line: &str) -> &str {
+    let mut quote: Option<char> = None;
+    let mut previous = ' ';
+    for (at, c) in line.char_indices() {
+        match quote {
+            Some(open) if c == open => quote = None,
+            Some(_) => {}
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c == '#' && previous.is_whitespace() => return &line[..at],
+            None => {}
+        }
+        previous = c;
+    }
+    line
 }
 
 /// The directories a workspace glob names.
