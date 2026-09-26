@@ -724,6 +724,34 @@ fn an_isolated_start_refuses_a_service_key_it_cannot_expand_whoever_named_it() {
     );
 }
 
+// A `$` in a password was taken for a variable nothing sets, and an
+// isolated start that had worked failed on a key a recipe supplied. The
+// app's own loader reads `pa$word` as written, and so does pando now.
+#[test]
+fn a_password_with_a_bare_dollar_is_handed_on_as_written_isolated_or_shared() {
+    let mut fx = fixture();
+    let services: Config =
+        toml::from_str("[[services]]\nkind = \"native\"\nname = \"postgres\"\n").unwrap();
+    fx.config.services = services.services;
+    std::fs::write(
+        fx.root.join(".env"),
+        "DATABASE_URL=postgres://app:pa$PANDO_TEST_UNSET_WORD@localhost:5432/shop\n",
+    )
+    .unwrap();
+    let ports = BTreeMap::from([("postgres".to_string(), 17_004)]);
+    let env =
+        super::services::resolve_service_env(&fx.paths, &fx.config, &fx.root, &ports).unwrap();
+    assert_eq!(
+        env.get("DATABASE_URL").map(String::as_str),
+        Some("postgres://app:pa$PANDO_TEST_UNSET_WORD@localhost:17004/shop")
+    );
+    let shared = super::services::shared_service_env(&fx.paths, &fx.config);
+    assert_eq!(
+        shared.get("DATABASE_URL").map(String::as_str),
+        Some("postgres://app:pa$PANDO_TEST_UNSET_WORD@localhost:5432/shop")
+    );
+}
+
 #[test]
 fn a_process_that_owns_no_ports_starts_and_reaches_running() {
     let mut fx = fixture();

@@ -656,6 +656,27 @@ fn a_login_that_holds_a_reference_nothing_sets_is_not_tried() {
     assert_eq!(login.user.as_deref(), Some("root"));
 }
 
+// A password with a `$` in it stopped a namespaced start, taken for a
+// variable nothing sets. The app's loader reads it as written; so does
+// the login.
+#[test]
+fn a_password_with_a_bare_dollar_is_the_login_as_written() {
+    let root = main_checkout(
+        "DATABASE_PORT=3306\nDATABASE_USER=app\nDATABASE_PASSWORD=pa$PANDO_TEST_UNSET_WORD\n",
+    );
+    let login = login_from_env_files(root.path(), &keys(&["DATABASE_PORT"]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(login.user.as_deref(), Some("app"));
+    assert_eq!(
+        login.env(Some("MYSQL_PWD")),
+        vec![(
+            "MYSQL_PWD".to_string(),
+            "pa$PANDO_TEST_UNSET_WORD".to_string()
+        )]
+    );
+}
+
 // A config and a login both end up in error messages and `{:?}`s; neither
 // may carry the password there.
 #[test]
