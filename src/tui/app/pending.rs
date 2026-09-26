@@ -23,10 +23,15 @@ const SPINNER_FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "�
 const NO_PROCESSES: &str = "no processes configured";
 
 /// Whether a line an action said on its way is worth the header as well
-/// as `m`: one that calls itself a warning, or says something could not
-/// be done. Matched loosely too: a miss still leaves the line in `m`.
+/// as `m`: one that calls itself a warning, says something could not be
+/// done, or says a public URL is closed — which a stop or a whole restart
+/// does, and otherwise the row just loses the URL, and whoever it was
+/// sent to finds out first. Matched loosely too: a miss still leaves the
+/// line in `m`.
 fn is_warning(line: &str) -> bool {
-    line.starts_with("warning:") || line.contains("could not")
+    line.starts_with("warning:")
+        || line.contains("could not")
+        || (line.contains("public URL") && line.contains("is closed"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1069,6 +1069,18 @@ impl App {
         self.post(message.into(), StatusKind::Success, STATUS_TTL);
     }
 
+    /// A success that goes to `m` and leaves an error still fresh on the
+    /// header where it is. For the line that says a start is ready, which
+    /// the row says too: the error it would replace — the public URL a
+    /// restart closed, a warning from a hook — the row does not.
+    fn set_success_behind_error(&mut self, message: impl Into<String>) {
+        let error = self.flash().filter(|s| s.is_error()).cloned();
+        self.set_success(message);
+        if error.is_some() {
+            self.status = error;
+        }
+    }
+
     /// A success worth more than a glance: a public URL somebody is about
     /// to read out or type.
     pub fn set_lasting(&mut self, message: impl Into<String>) {
@@ -1316,10 +1328,10 @@ impl App {
         match awaited.readiness(self.record_for(&name), crate::process::is_alive) {
             Readiness::Ready => {
                 let label = self.label_of(&name);
-                match awaited.url {
-                    Some(url) => self.set_success(format!("{label} is ready — {url}")),
-                    None => self.set_success(format!("{label} is ready")),
-                }
+                self.set_success_behind_error(match awaited.url {
+                    Some(url) => format!("{label} is ready — {url}"),
+                    None => format!("{label} is ready"),
+                });
             }
             // Kept, with what this read has shown.
             Readiness::Waiting => self.awaiting_ready = Some(awaited),

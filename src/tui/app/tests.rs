@@ -4722,6 +4722,50 @@ fn x_on_a_worktree_that_is_not_running_says_so() {
     assert_eq!(status.kind, StatusKind::Info);
 }
 
+// A stop closes the worktree's share, and said so only as a line on its
+// way, which the "stopped" after it replaced: the row lost its public
+// URL and the header never said which URL had gone, or how to get
+// another.
+#[test]
+fn x_on_a_shared_worktree_says_which_public_url_it_closed() {
+    let (dir, mut app) = app_with_logs(&["feat+one"]);
+    let tunnel = crate::testutil::spawn_guarded(
+        "exec sleep 300",
+        dir.path(),
+        &dir.path().join("tunnel.log"),
+    );
+    let mut record = WorktreeRecord::new("/trees/feat+one", true);
+    record.share = Some(crate::state::ShareRecord {
+        tunnel_pid: tunnel.pid,
+        tunnel_pgid: tunnel.pgid,
+        public_url: "https://x.trycloudflare.com".into(),
+        local_port: 17_342,
+        started_at: Utc::now(),
+        log_path: dir.path().join("tunnel.log"),
+        proxy_pid: None,
+        proxy_pgid: None,
+        proxy_port: None,
+    });
+    let mut store = State::new();
+    store.worktrees.insert("feat+one".into(), record);
+    crate::state::save(&app.paths.state_file(), &store).unwrap();
+    app.state = store;
+
+    press(&mut app, KeyCode::Char('x'));
+    wait_for_pending(&mut app);
+    let (message, is_error) = app.active_status().expect("a status");
+    assert!(
+        message.contains("https://x.trycloudflare.com is closed"),
+        "{message}"
+    );
+    assert!(message.contains("`pando share feat+one`"), "{message}");
+    assert!(is_error, "said as a closed share is everywhere else");
+    assert!(
+        !crate::process::is_alive(tunnel.pid),
+        "and the tunnel is down"
+    );
+}
+
 // The checkout worked and the install after it did not: the worktree is
 // kept, and "could not create feat/x: feat/x was created, but …" said
 // both at once.
@@ -5039,6 +5083,47 @@ fn a_restart_is_not_ready_on_a_read_from_before_it() {
     assert_eq!(status.kind, StatusKind::Success);
     assert_eq!(status.message, "feat/one is ready");
     assert!(app.awaiting_ready.is_none());
+}
+
+// A whole restart — `r`, or `P` on a worktree with one process — closes
+// its share and says so on its way. The lines after that one replaced
+// it, then the outcome, then the "ready" the next refresh brought: the
+// header never said the URL handed out was gone.
+#[test]
+fn a_restart_that_closed_a_public_url_still_says_so_once_it_is_ready() {
+    let mut app = test_app(&["feat+one"]);
+    with_process(&mut app, "feat+one", Phase::Starting { since: Utc::now() });
+    let closed = "feat+one: its public URL https://x.trycloudflare.com is closed — \
+                  `pando share feat+one` gives it a new one";
+    pending_that_says(
+        &mut app,
+        "feat+one",
+        PendingKind::Restart,
+        &["stopping dev", closed, "starting dev"],
+        Ok(PendingOutcome::Started(
+            "feat+one".into(),
+            Some("http://localhost:17342".into()),
+            vec![("dev".into(), 4242)],
+        )),
+    );
+    wait_for_pending(&mut app);
+    assert_eq!(app.active_status(), Some((closed, true)));
+
+    let mut state = app.state.clone();
+    let record = state.worktrees.get_mut("feat+one").unwrap();
+    record.processes.get_mut("dev").unwrap().phase = running_phase();
+    app.handle_event(refreshed(state));
+    assert!(app.awaiting_ready.is_none(), "ready was said");
+    assert_eq!(
+        app.messages.back().map(|m| m.message.as_str()),
+        Some("feat/one is ready — http://localhost:17342"),
+        "in m"
+    );
+    assert_eq!(
+        app.active_status(),
+        Some((closed, true)),
+        "and the header still says which URL is gone"
+    );
 }
 
 // A start that returned while dev was still starting waited on dev's pid,

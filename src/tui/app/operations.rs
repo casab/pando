@@ -387,6 +387,9 @@ impl App {
 
     /// `P`: only the process the detail pane's `▸` marks — `restart
     /// --only`. The others keep running, and so do their logs.
+    ///
+    /// On a worktree with one process it is `r`, a whole restart, and so
+    /// unlike `restart --only` it closes a public URL — and says which.
     pub(super) fn restart_selected_process(&mut self) {
         let Some(name) = self.selected_name() else {
             return;
