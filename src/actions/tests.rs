@@ -12841,6 +12841,61 @@ fn doctor_never_lists_a_database_another_projects_record_holds() {
     );
 }
 
+// A project whose state does not load may hold any of them, as it may any
+// slot. Its databases were counted as nobody's, and doctor said no pando
+// project held one, with the command that drops that project's live
+// worktree's database. It is said with that project now, and no command.
+#[test]
+fn doctor_offers_no_drop_while_another_projects_state_cannot_be_read() {
+    let (ns, _redis) = stopped_namespaced();
+    std::fs::write(ns.fake.join("dbs/shop__feat_theirs"), "").unwrap();
+    let file = ns
+        .fx
+        .paths
+        .projects_dir()
+        .join("other-1a2b3c4d")
+        .join("state.json");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, "{\"version\": 99, \"worktrees\": {}}").unwrap();
+    let leftovers = namespace_leftovers(&ns.fx.paths, &ns.fx.config, &ns.fx.state());
+    assert_eq!(leftovers.len(), 1, "{leftovers:?}");
+    assert_eq!(leftovers[0].name, "shop__feat_theirs");
+    assert_eq!(leftovers[0].by_hand, None);
+    assert!(
+        leftovers[0]
+            .unread
+            .as_ref()
+            .is_some_and(|(project, why)| project == "other-1a2b3c4d" && why.contains("99")),
+        "{leftovers:?}"
+    );
+
+    // doctor reads config from disk, as it always does.
+    std::fs::write(
+        ns.fx.paths.config_file(),
+        "[dev]\ncmd = \"sleep 30\"\nports = []\n\n\
+         [[services]]\nkind = \"native\"\nname = \"mariadb\"\nenv = { DATABASE_PORT = \"mariadb\" }\n",
+    )
+    .unwrap();
+    let report = crate::doctor::run(&ns.fx.paths);
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.message.contains("shop__feat_theirs"))
+        .unwrap_or_else(|| panic!("{:?}", report.findings));
+    assert!(
+        finding
+            .message
+            .contains("project other-1a2b3c4d's state could not be read")
+            && !finding
+                .message
+                .contains("no pando project's record holds it"),
+        "{}",
+        finding.message
+    );
+    assert_eq!(finding.fix, None);
+    assert_eq!(ns.fake("dropped"), "");
+}
+
 // Anyone who may make a database under the prefix can put a statement in
 // its name. It is still listed, with no command: the one printed for it
 // dropped the main database as well.

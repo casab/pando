@@ -1812,8 +1812,9 @@ fn named_elsewhere(
 }
 
 /// A database named like a worktree's of this project that no pando
-/// project's record holds: one `rm` could not drop, one whose record was
-/// lost, or one somebody else made under that name.
+/// project's record holds, as far as their records can be read: one `rm`
+/// could not drop, one whose record was lost, or one somebody else made
+/// under that name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Leftover {
     pub service: String,
@@ -1821,8 +1822,11 @@ pub struct Leftover {
     pub address: String,
     pub name: String,
     /// The command that drops it, for a person: pando never drops what it
-    /// has no record of.
+    /// has no record of. `None` while `unread` is not.
     pub by_hand: Option<String>,
+    /// Another project whose state could not be read, and why: it may
+    /// hold this database, as a worktree's, so no command drops it.
+    pub unread: Option<(String, String)>,
 }
 
 /// Every leftover database of this project on the servers it namespaces
@@ -1834,7 +1838,9 @@ pub struct Leftover {
 /// for leftovers, and not being able to look is not one. One another
 /// project's record holds — a second clone of the repository on the same
 /// server names its worktrees' databases the same way — is that project's,
-/// and not listed.
+/// and not listed. While another project's state cannot be read, it may
+/// hold any of them: each is listed with that project, and with no
+/// command.
 pub fn namespace_leftovers(
     paths: &PandoPaths,
     config: &Config,
@@ -1850,6 +1856,9 @@ pub fn namespace_leftovers(
     let stores: Vec<&crate::state::State> = std::iter::once(store)
         .chain(others.iter().filter_map(|(_, other)| other.as_ref().ok()))
         .collect();
+    let unread = others
+        .iter()
+        .find_map(|(project, other)| Some((project.clone(), other.as_ref().err()?.clone())));
     let mut out = Vec::new();
     for target in plan(paths, config).targets {
         if target.namespace.kind != NamespaceKind::Database || target.namespace.list.is_none() {
@@ -1888,7 +1897,11 @@ pub fn namespace_leftovers(
             out.push(Leftover {
                 service: target.service.clone(),
                 address: server.address(),
-                by_hand: server.by_hand(&name),
+                by_hand: match unread {
+                    Some(_) => None,
+                    None => server.by_hand(&name),
+                },
+                unread: unread.clone(),
                 name,
             });
         }
