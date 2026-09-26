@@ -809,8 +809,11 @@ impl App {
             KeyCode::Char('T') => self.open_theme_picker(),
             KeyCode::Char('R') => {
                 self.spawn_discovery();
-                // An account switched in another terminal shows here too.
+                // An account switched in another terminal shows here too,
+                // and so does a pull request merged, closed or opened
+                // since the last fetch.
                 self.spawn_gh_account_check();
+                self.spawn_pr_fetch();
                 self.set_status("refreshing…");
             }
             KeyCode::Char('?') => {
