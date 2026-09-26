@@ -188,7 +188,14 @@ pub fn share_with(
     let proxy = match (&cookie, share_port) {
         (Some(cookie), Some(port)) => {
             progress("starting the share proxy");
-            Some(spawn_proxy(paths, name, port, target_port, cookie)?)
+            let proxy = spawn_proxy(paths, name, port, target_port, cookie)?;
+            // Before a tunnel is published onto it, and the last moment
+            // anything knows its process group if it never came up.
+            if let Err(e) = share_proxy::await_listening(&proxy) {
+                let _ = proc::stop(proxy.pgid, STOP_GRACE);
+                return Err(e);
+            }
+            Some(proxy)
         }
         _ => None,
     };
@@ -238,6 +245,21 @@ pub fn share_with(
             pre_authed,
             already: true,
         });
+    }
+    // Ours, once more, before it is recorded. Another share of this
+    // worktree that started a moment earlier holds the proxy's port, so
+    // this proxy can pass for listening and then lose the bind; recorded,
+    // it is a share whose proxy is dead, and the other share, giving way
+    // to it, stops the only proxy that worked.
+    if let Some(proxy) = &proxy
+        && !proc::is_alive(proxy.pid)
+    {
+        let said = share_proxy::last_words(proxy);
+        let _ = tunnel::stop_share(&record);
+        bail!(
+            "the share proxy of {shown} exited while its tunnel was starting ({said}); the \
+             tunnel was closed again"
+        );
     }
     if let Err(e) = share_target_port(&shown, existing_record) {
         let _ = tunnel::stop_share(&record);

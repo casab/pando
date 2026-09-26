@@ -2344,9 +2344,10 @@ fn shared_fixture() -> Option<(Fx, String, Vec<Detached>, StartReport)> {
 
 /// A stand-in for the real proxy, which re-execs the running binary —
 /// inside a library test that is the test harness, which exits at once.
-/// This one is a detached process group with a pid, which is all the
-/// assertions here are about: that it is started, recorded, and taken
-/// down again when the share it belongs to fails.
+/// This one is a detached process group with a pid that listens on the
+/// proxy's port, which is all the assertions here are about: that it is
+/// started, waited for, recorded, and taken down again when the share it
+/// belongs to fails.
 fn stub_proxy(
     paths: &PandoPaths,
     name: &str,
@@ -2354,9 +2355,24 @@ fn stub_proxy(
     _upstream: u16,
     _cookie: &str,
 ) -> Result<share_proxy::ProxySpawn> {
+    stub_proxy_running(
+        paths,
+        name,
+        listen,
+        &format!("exec {}", python_listener(listen)),
+    )
+}
+
+/// [`stub_proxy`], running whatever the test needs its proxy to do.
+fn stub_proxy_running(
+    paths: &PandoPaths,
+    name: &str,
+    listen: u16,
+    shell_cmd: &str,
+) -> Result<share_proxy::ProxySpawn> {
     let log_path = paths.log_file(name, share_proxy::PROXY_LOG);
     let spawn = proc::spawn_detached(SpawnOptions {
-        shell_cmd: "exec sleep 300",
+        shell_cmd,
         cwd: &std::env::temp_dir(),
         log_file: &log_path,
         env: &[],
@@ -2763,6 +2779,95 @@ fn a_tunnel_that_never_opens_takes_the_proxy_down_with_it() {
     );
 }
 
+/// A provider that is installed and must never be asked for a tunnel.
+struct UnreachedProvider;
+
+impl tunnel::Provider for UnreachedProvider {
+    fn name(&self) -> &'static str {
+        "cloudflared"
+    }
+    fn ensure_present(&self, _: &PandoPaths) -> Result<()> {
+        Ok(())
+    }
+    fn start(&self, _: &PandoPaths, _: &str, _: u16) -> Result<tunnel::TunnelSpawn> {
+        panic!("a tunnel was opened onto a proxy that never listened")
+    }
+}
+
+// `share_proxy::spawn` returns before the child binds anything, so a
+// proxy that could not bind was found by the first visitor, through a
+// tunnel already published onto it.
+#[test]
+fn a_proxy_that_cannot_bind_fails_the_share_before_a_tunnel_is_opened() {
+    let Some((fx, name, _guards, _)) = shared_fixture() else {
+        return;
+    };
+    let mut config = fx.config.clone();
+    config.share.auth_cmd = Some("printf 'session=abc'".to_string());
+    let failing = |paths: &PandoPaths, name: &str, listen: u16, _: u16, _: &str| {
+        stub_proxy_running(
+            paths,
+            name,
+            listen,
+            "echo 'pando: bind the share proxy: Address already in use' >&2; exit 1",
+        )
+    };
+
+    let err = share_with(
+        &fx.paths,
+        &config,
+        &name,
+        &UnreachedProvider,
+        &failing,
+        &noop,
+    )
+    .unwrap_err();
+    let message = format!("{err:#}");
+    assert!(message.contains("before it was listening"), "{message}");
+    assert!(
+        message.contains("Address already in use"),
+        "the proxy's own complaint is the diagnosis: {message}"
+    );
+    assert!(fx.state().worktrees[&name].share.is_none());
+}
+
+// Two shares of one worktree get the same proxy port. The one whose
+// proxy lost the bind saw the other's proxy listening, published a
+// tunnel, and recorded a share with a dead proxy; the other then gave
+// way to it by stopping the only proxy that worked.
+#[test]
+fn a_share_whose_proxy_died_while_its_tunnel_opened_is_never_recorded() {
+    let Some((fx, name, _guards, _)) = shared_fixture() else {
+        return;
+    };
+    crate::testutil::fake_cloudflared(
+        &fx.paths.home,
+        &format!("sleep 2\necho 'INF |  {FAKE_TUNNEL_URL}  |'\nexec sleep 300\n"),
+    );
+    let mut config = fx.config.clone();
+    config.share.auth_cmd = Some("printf 'session=abc'".to_string());
+    // The port answers for another share's proxy; this one gives up on
+    // it a moment later, the way a lost bind does.
+    let held = std::sync::Mutex::new(Vec::new());
+    let losing = |paths: &PandoPaths, name: &str, listen: u16, _: u16, _: &str| {
+        held.lock()
+            .unwrap()
+            .push(std::net::TcpListener::bind(("127.0.0.1", listen))?);
+        stub_proxy_running(paths, name, listen, "exec sleep 0.2")
+    };
+    let provider = tunnel::provider_for(None).unwrap();
+
+    let err = share_with(&fx.paths, &config, &name, provider.as_ref(), &losing, &noop).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("exited while its tunnel was starting"),
+        "{err:#}"
+    );
+    assert!(
+        fx.state().worktrees[&name].share.is_none(),
+        "a share whose proxy is dead is a public URL onto nothing"
+    );
+}
+
 // The real cloudflared fails the same way, through the same path.
 #[test]
 fn a_provider_that_exits_fails_the_share_and_records_nothing() {
@@ -2889,7 +2994,7 @@ fn sharing_and_restarting_leave_every_port_where_it_was() {
     };
     let mut config = fx.config.clone();
     config.share.auth_cmd = Some("printf 'session=abc'".to_string());
-    share(&fx.paths, &config, &name, &noop).unwrap();
+    share_stubbed(&fx, &config, &name).unwrap();
     let _share = share_guard(&fx, &name);
 
     assert_eq!(

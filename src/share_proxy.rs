@@ -17,7 +17,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::paths::PandoPaths;
 use crate::ports;
@@ -31,6 +31,11 @@ pub const ENV_COOKIE: &str = "PANDO_SHARE_COOKIE";
 
 /// The hidden subcommand that runs the proxy in this same binary.
 pub const SUBCOMMAND: &str = "__share-proxy";
+
+/// How long a spawned proxy has to start listening. Binding is the first
+/// thing it does, so this is one exec on a loaded machine.
+const LISTEN_TIMEOUT: Duration = Duration::from_secs(5);
+const LISTEN_POLL: Duration = Duration::from_millis(50);
 
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a client may take to finish sending its request headers.
@@ -96,6 +101,57 @@ pub fn spawn_with(
         listen_port,
         log_path,
     })
+}
+
+/// Waits until a spawned proxy is listening, and fails with the last line
+/// of its log when it exits first or never binds.
+///
+/// [`spawn`] returns before the child has bound anything, so a proxy that
+/// could not — its port taken, its binary replaced — was found only by the
+/// first visitor, through a tunnel already published onto it.
+///
+/// Alive *and* listening, because the port can answer for a proxy that is
+/// about to exit: another share of the same worktree started a moment
+/// earlier holds it, and this one's bind fails a moment later. That one
+/// is caught again when the share is recorded.
+pub fn await_listening(proxy: &ProxySpawn) -> Result<()> {
+    let deadline = Instant::now() + LISTEN_TIMEOUT;
+    loop {
+        let listening = ports::something_is_listening(proxy.listen_port);
+        if !process::is_alive(proxy.pid) {
+            bail!(
+                "the share proxy exited before it was listening — {}",
+                last_words(proxy)
+            );
+        }
+        if listening {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "the share proxy was not listening on port {} within {}s — {}",
+                proxy.listen_port,
+                LISTEN_TIMEOUT.as_secs(),
+                last_words(proxy)
+            );
+        }
+        thread::sleep(LISTEN_POLL);
+    }
+}
+
+/// The last line a proxy logged, for an error about it. Never the cookie:
+/// nothing the proxy prints carries it.
+pub fn last_words(proxy: &ProxySpawn) -> String {
+    std::fs::read_to_string(&proxy.log_path)
+        .ok()
+        .and_then(|log| {
+            log.lines()
+                .rev()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| format!("nothing in {}", proxy.log_path.display()))
 }
 
 /// The command line the proxy is spawned with. Ports only — the cookie is
