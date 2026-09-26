@@ -732,7 +732,9 @@ fn has_entries(dir: &Path) -> bool {
 }
 
 /// The placeholders a recipe command may use. Deliberately small: a recipe
-/// is about one server in one directory on one port.
+/// is about one server in one directory on one port. `{datadir}`,
+/// `{socket_dir}` and `{log}` are shell-quoted already, so a recipe writes
+/// them bare: `--datadir={datadir}`, `{datadir}/pando.pid`.
 const KNOWN: [&str; 7] = [
     "port",
     "datadir",
@@ -754,12 +756,17 @@ impl template::Resolver for Native {
                 self.service
             ),
         };
+        // A path comes back shell-quoted, the way a namespace recipe's
+        // `{host}` and `{user}` do: it is built from the repository's
+        // directory name and the branch's, and either may hold a space, a
+        // paren or a quote that would split or break the command.
+        let path = |path: &Path| shell_quote(&path.display().to_string());
         match (key, arg) {
             ("port", None) => Ok(self.port.to_string()),
-            ("datadir", None) => Ok(self.datadir.display().to_string()),
-            ("socket_dir", None) => Ok(self.socket_dir.display().to_string()),
+            ("datadir", None) => Ok(path(&self.datadir)),
+            ("socket_dir", None) => Ok(path(&self.socket_dir)),
             ("service", None) => Ok(self.service.clone()),
-            ("log", None) => Ok(self.log_file.display().to_string()),
+            ("log", None) => Ok(path(&self.log_file)),
             ("db_user", None) => named(&self.db_user, "db_user", "user"),
             ("db_name", None) => named(&self.db_name, "db_name", "database name"),
             (key, Some(arg)) if KNOWN.contains(&key) => {
@@ -858,6 +865,58 @@ mod tests {
             )),
             "{rendered}"
         );
+    }
+
+    // The data directory is named after the repository's directory and the
+    // branch, and git takes `fix(db)` and `it's` as branch names. Spliced
+    // in bare, a space split `initdb`'s argument and a paren was a syntax
+    // error, so every built-in recipe failed for that repository.
+    #[test]
+    fn a_path_placeholder_reaches_the_command_as_one_word_whatever_it_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("My App");
+        crate::testutil::init_repo(&root);
+        let paths = PandoPaths {
+            home: dir.path().join("home"),
+            project: crate::project::ProjectRef {
+                id: "My App-00000000".to_string(),
+                root,
+                display_name: "My App".to_string(),
+            },
+        };
+        paths.ensure_home().unwrap();
+        let native = Native::plan(
+            &paths,
+            "fix(db)+it's;a&b",
+            "db",
+            recipe("kind = \"service\"\nname = \"r\"\n\n[service]\ncmd = \"x\"\n"),
+            17_400,
+            None,
+        )
+        .unwrap();
+        for (placeholder, want) in [
+            ("{datadir}", &native.datadir),
+            ("{socket_dir}", &native.socket_dir),
+            ("{log}", &native.log_file),
+        ] {
+            let script = native
+                .shell_cmd(&format!(
+                    "printf %s {placeholder}; printf '|%s' {placeholder}/x"
+                ))
+                .unwrap();
+            let out = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(&script)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{placeholder}: {script}");
+            let want = want.display().to_string();
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                format!("{want}|{want}/x"),
+                "{placeholder}"
+            );
+        }
     }
 
     #[test]
@@ -1556,7 +1615,10 @@ mod tests {
         assert!(cmd.contains("-p 17402"), "{cmd}");
         assert!(cmd.contains("listen_addresses=127.0.0.1"), "{cmd}");
         assert!(
-            cmd.contains(&format!("-k {}", native.socket_dir.display())),
+            cmd.contains(&format!(
+                "-k {}",
+                shell_quote(&native.socket_dir.display().to_string())
+            )),
             "{cmd}"
         );
         let create = native.shell_cmd(service.create.as_ref().unwrap()).unwrap();
