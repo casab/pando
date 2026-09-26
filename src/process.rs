@@ -29,18 +29,28 @@ pub struct SpawnResult {
 /// Starts a command in its own session, writing its output to a log file.
 ///
 /// `status_file`, when given, is how a caller learns *how* the process
-/// ended. pando is not the parent by the time anything asks — `start`
-/// returns and the process is reparented — so `waitpid` has nothing to
-/// say, and the shell records the status itself: an `EXIT` trap that
-/// writes `$?` beside the log. The file is only ever as good as the shell
-/// managing to run its trap, so every reader treats a missing one as "not
-/// known" rather than as a failure.
+/// ended. `waitpid` has nothing to say by the time anything asks — `start`
+/// returns and the process is reparented, and a pando that stays has
+/// reaped it already (below) — so the shell records the status itself: an
+/// `EXIT` trap that writes `$?` beside the log. The file is only ever as
+/// good as the shell managing to run its trap, so every reader treats a
+/// missing one as "not known" rather than as a failure.
 ///
 /// The trap is also what stops bash from `exec`ing the command in its
 /// place, so the recorded pid is the shell rather than the command. That
 /// costs one process and changes nothing that reads it: the shell waits
 /// for the command, so it is alive for exactly as long, and both are in
 /// the group `stop` signals.
+///
+/// The process is reaped the moment it ends, by a thread that waits on its
+/// pid for as long as this pando runs. That matters in the TUI, which is
+/// the parent of everything it starts: an unreaped leader is a zombie that
+/// keeps its group in being, and another pando cannot tell from outside
+/// that the group is empty — macOS answers `EPERM` for it — so a `stop`
+/// from the command line would wait out its whole grace for nothing. The
+/// thread waits on this pid only; a wait on any child would take the
+/// statuses other waits in the process are there for. A pando that exits
+/// first leaves the process to be reparented, as before.
 pub fn spawn_detached(opts: SpawnOptions<'_>) -> Result<SpawnResult> {
     if let Some(parent) = opts.log_file.parent() {
         std::fs::create_dir_all(parent)
@@ -91,12 +101,18 @@ pub fn spawn_detached(opts: SpawnOptions<'_>) -> Result<SpawnResult> {
         });
     }
 
-    let child = cmd.spawn().context("spawn detached bash")?;
+    let mut child = cmd.spawn().context("spawn detached bash")?;
     let pid = child.id();
     // After setsid() the child's pgid equals its pid (it becomes session leader).
     let pgid = pid as i32;
-    // Drop child handle without waiting — the process runs on independently.
-    std::mem::drop(child);
+    // Waited on rather than dropped, so that it is reaped when it ends. The
+    // status the wait returns goes nowhere: the status file is what says
+    // how the process ended.
+    let _ = std::thread::Builder::new()
+        .name(format!("reap-{pid}"))
+        .spawn(move || {
+            let _ = child.wait();
+        });
 
     Ok(SpawnResult { pid, pgid })
 }
@@ -770,6 +786,41 @@ mod tests {
             recorded_exit_status(&status),
             Some(0),
             "a process pando signalled did not finish on its own"
+        );
+    }
+
+    /// The TUI is the parent of everything it starts, and a leader it never
+    /// reaps stays a zombie that keeps its group in being: a `stop` from
+    /// another pando then waits out its whole grace on a group with nothing
+    /// in it. Nothing here asks after the process, since `is_alive` would
+    /// reap it: `ps` looks, from outside, as that `stop` would.
+    #[test]
+    fn a_detached_process_that_ends_leaves_no_zombie_behind() {
+        let dir = tempdir().unwrap();
+        let log = dir.path().join("log.txt");
+        let r = spawn_detached(SpawnOptions {
+            shell_cmd: "exit 0",
+            cwd: dir.path(),
+            log_file: &log,
+            env: &[],
+            status_file: None,
+        })
+        .unwrap();
+        let listed = || {
+            let out = Command::new("ps")
+                .args(["-o", "stat=", "-p", &r.pid.to_string()])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !listed().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            listed(),
+            "",
+            "the ended leader is still in the process table"
         );
     }
 
