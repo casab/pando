@@ -2033,6 +2033,29 @@ fn one_candidate_per_engine_however_many_keys_name_it() {
     let _ = dir;
 }
 
+// A Postgres with an extension built in is still the project's database.
+// Unknown, `db` on it matched no key, counted as nothing the app talks
+// to, and a plain native postgres took its place without the extension.
+#[test]
+fn a_postgres_flavoured_image_is_the_database_its_env_example_addresses() {
+    let (dir, signals) = project(
+        &[("DATABASE_URL", "postgresql://postgres@localhost:5432/app")],
+        Some("services:\n  db:\n    image: pgvector/pgvector:pg16\n    ports: [\"5432:5432\"]\n"),
+    );
+    let compose = compose_services_proposal(dir.path(), &signals, None).unwrap();
+    assert_eq!(values(&compose), vec!["db"]);
+    assert_eq!(
+        compose.candidates[0]
+            .service
+            .as_ref()
+            .and_then(|hint| hint.env_key.as_deref()),
+        Some("DATABASE_URL")
+    );
+    let evidence = machine(true, &[("postgres", true)]);
+    let choice = choice_of(&dir, &signals, &evidence, None);
+    assert_eq!(choice.mechanism, Some("compose"), "{:?}", choice.evidence);
+}
+
 // The shape Phase 6 exists for: a project that needs services and has
 // no file describing them. There is no compose option at all, so the
 // preference never comes into it.

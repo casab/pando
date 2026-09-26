@@ -69,16 +69,22 @@ const fn utility(name: &'static str, ports: &'static [u16]) -> Image {
     }
 }
 
-pub const IMAGES: [Image; 15] = [
-    app(
-        "postgres",
-        &["DATABASE", "DB", "POSTGRES", "PG", "POSTGRESQL"],
-        &[5432],
-    ),
+const POSTGRES: &[&str] = &["DATABASE", "DB", "POSTGRES", "PG", "POSTGRESQL"];
+
+pub const IMAGES: [Image; 21] = [
+    app("postgres", POSTGRES, &[5432]),
     app("postgis", &["DATABASE", "DB", "POSTGRES", "PG"], &[5432]),
+    // Postgres with an extension built in, or packaged by somebody else:
+    // `pgvector/pgvector`, `bitnami/postgresql`, `timescale/timescaledb`.
+    app("pgvector", POSTGRES, &[5432]),
+    app("postgresql", POSTGRES, &[5432]),
+    app("timescaledb", POSTGRES, &[5432]),
+    app("timescaledb-ha", POSTGRES, &[5432]),
     app("mysql", &["DATABASE", "DB", "MYSQL"], &[3306]),
     app("mariadb", &["DATABASE", "DB", "MYSQL", "MARIADB"], &[3306]),
     app("redis", &["REDIS", "CACHE"], &[6379]),
+    app("redis-stack", &["REDIS", "CACHE"], &[6379]),
+    app("redis-stack-server", &["REDIS", "CACHE"], &[6379]),
     app("valkey", &["REDIS", "VALKEY", "CACHE"], &[6379]),
     app("mongo", &["MONGO", "MONGODB", "DATABASE"], &[27017]),
     app(
@@ -143,5 +149,14 @@ mod tests {
         assert_eq!(ports("redis@sha256:abc"), Some(&[6379u16][..]));
         assert_eq!(ports("kafka"), None);
         assert!(known("nginx").is_none());
+        assert_eq!(
+            known("pgvector/pgvector:pg16").map(|i| i.name),
+            Some("pgvector")
+        );
+        assert_eq!(ports("bitnami/postgresql:16"), Some(&[5432u16][..]));
+        assert_eq!(
+            ports("redis/redis-stack-server:latest"),
+            Some(&[6379u16][..])
+        );
     }
 }
