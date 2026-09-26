@@ -187,43 +187,80 @@ fn match_one(pattern: &str, value: &str) -> bool {
 /// Runs a hook to completion, appending everything it printed to its own
 /// log. Fails with the log path, because that is where the reason is.
 ///
-/// `.output()` rather than an inherited stdio: nothing pando runs may write
-/// to the terminal, and a hook started from the TUI would otherwise paint
-/// over the frame.
+/// The log file is the hook's stdout and its stderr both, rather than an
+/// inherited stdio: nothing pando runs may write to the terminal, and a
+/// hook started from the TUI would otherwise paint over the frame. The
+/// child is handed the file itself, not a pipe pando drains once it exits,
+/// so the log fills while a three-minute install runs, keeps its lines in
+/// the order they were printed, and keeps them when pando is interrupted
+/// before the hook finishes.
 pub fn run(log_file: &Path, shell_cmd: &str, cwd: &Path, env: &[(String, String)]) -> Result<()> {
     if let Some(parent) = log_file.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create log dir {}", parent.display()))?;
     }
+    let out = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_file)
+        .with_context(|| format!("open log file {}", log_file.display()))?;
+    // Where this run's output begins, so the reason a failure gives is
+    // this run's closing line and never an earlier run's.
+    let start = out.metadata().map(|m| m.len()).unwrap_or(0);
+    let err = out
+        .try_clone()
+        .context("clone log file handle for stderr")?;
     let mut command = Command::new("bash");
     command
         .arg("-lc")
         .arg(shell_cmd)
         .current_dir(cwd)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(out)
+        .stderr(err);
     for (key, value) in env {
         command.env(key, value);
     }
-    let out = command
-        .output()
+    let status = command
+        .status()
         .with_context(|| format!("run {shell_cmd:?}"))?;
 
-    let mut text = String::new();
-    text.push_str(&String::from_utf8_lossy(&out.stdout));
-    text.push_str(&String::from_utf8_lossy(&out.stderr));
-    append(log_file, &text);
+    // A hook's last line ends in a newline, so whatever the log gets next
+    // starts a line of its own.
+    let text = printed_since(log_file, start);
+    if !text.is_empty() && !text.ends_with('\n') {
+        append(log_file, "\n");
+    }
 
-    if out.status.success() {
+    if status.success() {
         return Ok(());
     }
     let reason = last_line(&text);
     anyhow::bail!(
         "exited {}{reason} — the whole log is at {}",
-        out.status.code().unwrap_or(-1),
+        status.code().unwrap_or(-1),
         log_file.display()
     )
+}
+
+/// How much of a run's output is read back for its reason. The closing
+/// line is all that is wanted, and an install's log can be large.
+const TAIL_BYTES: u64 = 16 * 1024;
+
+/// The end of what a log gained after `start`, at most [`TAIL_BYTES`] of
+/// it. Empty when the log cannot be read back.
+fn printed_since(log_file: &Path, start: u64) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(log_file) else {
+        return String::new();
+    };
+    let end = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let from = start.max(end.saturating_sub(TAIL_BYTES));
+    let mut bytes = Vec::new();
+    if file.seek(SeekFrom::Start(from)).is_err() || file.read_to_end(&mut bytes).is_err() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// Runs a pre-start check whose *answer* is its output rather than its
@@ -518,6 +555,57 @@ mod tests {
         let text = std::fs::read_to_string(&log).unwrap();
         assert!(text.contains("installing"), "{text}");
         assert!(text.contains("a-warning"), "stderr too: {text}");
+    }
+
+    #[test]
+    fn a_hook_s_output_is_in_its_log_while_it_is_still_running() {
+        let dir = tempdir().unwrap();
+        let log = dir.path().join("logs/feat+one/install.log");
+        // The hook looks for its own first line in the log before it
+        // exits: held back until the end, it is not there to find.
+        run(
+            &log,
+            "echo resolving-packages && grep -q resolving-packages \"$HOOK_LOG\"",
+            dir.path(),
+            &[("HOOK_LOG".to_string(), log.display().to_string())],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_hook_s_log_keeps_its_lines_in_the_order_they_were_printed() {
+        let dir = tempdir().unwrap();
+        let log = dir.path().join("install.log");
+        run(
+            &log,
+            "echo out-one && echo err-one >&2 && echo out-two",
+            dir.path(),
+            &[],
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(text, "out-one\nerr-one\nout-two\n");
+    }
+
+    #[test]
+    fn a_failing_hook_s_reason_is_its_own_and_never_an_earlier_run_s() {
+        let dir = tempdir().unwrap();
+        let log = dir.path().join("install.log");
+        run(&log, "echo EARLIER_REASON >&2 && exit 1", dir.path(), &[]).unwrap_err();
+        let err = run(&log, "exit 4", dir.path(), &[]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("exited 4"), "{msg}");
+        assert!(!msg.contains("EARLIER_REASON"), "{msg}");
+    }
+
+    #[test]
+    fn a_hook_s_last_line_is_ended_in_its_log() {
+        let dir = tempdir().unwrap();
+        let log = dir.path().join("install.log");
+        run(&log, "printf no-newline", dir.path(), &[]).unwrap();
+        run(&log, "echo next-run", dir.path(), &[]).unwrap();
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(text, "no-newline\nnext-run\n");
     }
 
     #[test]
