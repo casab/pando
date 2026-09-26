@@ -250,10 +250,10 @@ pub fn adopt(
         );
     }
     let to = paths.project_dir();
-    if to.exists() {
+    if let Some(kept) = kept_in(paths, &to) {
         anyhow::bail!(
-            "{} already exists — pando will not merge two project folders, and moving {old_id} \
-             on top of it would lose whichever it overwrote",
+            "{} already exists, holding {kept} — pando will not merge two project folders, and \
+             moving {old_id} on top of it would lose whichever it overwrote",
             to.display()
         );
     }
@@ -305,12 +305,10 @@ pub fn adopt(
     // one inside the repository.
     paths.ensure_home()?;
     // `ensure_home` creates the *new* project directory, and a rename onto
-    // an existing directory fails. It is pando's own, it was created a
-    // moment ago, and it is empty.
-    if to.is_dir() {
-        std::fs::remove_dir(&to)
-            .with_context(|| format!("clear the empty {} to move onto it", to.display()))?;
-    }
+    // one that is not empty fails. It is pando's own and holds nothing pando
+    // cannot make again: made a moment ago, or by a command run since the
+    // move — the TUI makes it on its first frame, and fills its cache.
+    clear_rebuildable(paths, &to)?;
     std::fs::rename(&from, &to)
         .with_context(|| format!("move {} to {}", from.display(), to.display()))?;
 
@@ -333,6 +331,75 @@ pub fn adopt(
         rewritten,
         notices,
     })
+}
+
+/// The first thing in this repository's own project folder that pando
+/// could not make again, named, or `None` when there is nothing: no folder
+/// at all, or one a command made by opening this repository before
+/// anything was recorded in it. Opening the TUI once after a move does
+/// that.
+fn kept_in(paths: &PandoPaths, dir: &Path) -> Option<String> {
+    let unlisted = |e: std::io::Error| format!("what pando could not list ({e})");
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => return Some(unlisted(e)),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => return Some(unlisted(e)),
+        };
+        if !rebuildable(paths, &entry.path()) {
+            return Some(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+/// Whether an entry of this repository's project folder holds nothing to
+/// lose: the cache, which pando rebuilds, or an empty file or directory —
+/// a lock file, or the `worktrees/` the TUI watches before there is one.
+fn rebuildable(paths: &PandoPaths, path: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if meta.is_dir() && path == paths.cache_dir() {
+        return true;
+    }
+    match meta.is_dir() {
+        true => std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none()),
+        false => meta.is_file() && meta.len() == 0,
+    }
+}
+
+/// Empties this repository's project folder and removes it, so the old one
+/// can be moved onto it. Each entry is looked at again as it goes, and one
+/// that is not [`rebuildable`] — written since `adopt` checked — stops it
+/// before anything has moved.
+fn clear_rebuildable(paths: &PandoPaths, dir: &Path) -> anyhow::Result<()> {
+    let clear = || -> std::io::Result<Option<PathBuf>> {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            if !rebuildable(paths, &path) {
+                return Ok(Some(path));
+            }
+            match std::fs::symlink_metadata(&path)?.is_dir() {
+                true => std::fs::remove_dir_all(&path)?,
+                false => std::fs::remove_file(&path)?,
+            }
+        }
+        std::fs::remove_dir(dir)?;
+        Ok(None)
+    };
+    match clear().with_context(|| format!("clear {} to move onto it", dir.display()))? {
+        None => Ok(()),
+        Some(kept) => anyhow::bail!(
+            "{} was written while the folder was being adopted — nothing was moved; adopt \
+             again once nothing else is using this repository",
+            kept.display()
+        ),
+    }
 }
 
 /// The notice for a move whose records could not be rewritten after it.

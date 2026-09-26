@@ -2787,11 +2787,49 @@ fn adopting_refuses_when_this_repository_already_has_a_folder() {
 
     let err = adopt(&fx.paths, &old_id, &yes).unwrap_err();
     let text = format!("{err:#}");
-    assert!(text.contains("already exists"), "{text}");
+    assert!(
+        text.contains("already exists, holding pando.toml"),
+        "{text}"
+    );
     assert!(
         fx.home.join("projects").join(&old_id).is_dir(),
         "and nothing moved"
     );
+}
+
+// Opening the TUI once after a move makes this repository's folder, with
+// an empty `worktrees/` and a cache in it. `--adopt` refused it as a
+// folder it would lose by overwriting, and doctor kept offering the
+// `--adopt` it refused.
+#[test]
+fn adopting_moves_onto_a_folder_that_holds_only_what_pando_rebuilds() {
+    let fx = fixture();
+    let old_id = format!("{}-deadbeef", fx.paths.project.display_name);
+    let gone = fx.root.parent().expect("a parent").join("somewhere-else");
+    let from = stale_project_folder(&fx, &old_id, &gone, "feat+one");
+    let to = fx.paths.project_dir();
+    std::fs::create_dir_all(to.join("worktrees")).expect("worktrees dir");
+    std::fs::create_dir_all(fx.paths.cache_dir()).expect("cache dir");
+    std::fs::write(fx.paths.enrich_cache_file(), "{}").expect("enrich cache");
+    std::fs::write(fx.paths.lock_file(), "").expect("lock");
+
+    let adoption = adopt(&fx.paths, &old_id, &yes).expect("adopt");
+    assert_eq!(adoption.to, to);
+    assert!(!from.exists(), "the old folder moved");
+    assert!(fx.paths.config_file().is_file(), "its config came with it");
+    assert!(
+        to.join("worktrees/feat+one").is_dir(),
+        "and so did its worktrees"
+    );
+
+    // A worktree directory is something of its own, cache or not.
+    let fx = fixture();
+    let from = stale_project_folder(&fx, &old_id, &gone, "feat+one");
+    std::fs::create_dir_all(fx.paths.project_dir().join("worktrees/feat+two")).expect("worktree");
+    std::fs::create_dir_all(fx.paths.cache_dir()).expect("cache dir");
+    let err = adopt(&fx.paths, &old_id, &yes).unwrap_err();
+    assert!(format!("{err:#}").contains("holding worktrees"), "{err:#}");
+    assert!(from.is_dir(), "and nothing moved");
 }
 
 #[test]
