@@ -117,7 +117,8 @@ pub struct Service {
     pub ports: Vec<Port>,
     pub volumes: Vec<Mount>,
     pub container_name: Option<String>,
-    /// Whether the service declares a `healthcheck`. Readiness prefers it:
+    /// Whether the service declares a `healthcheck` that is not turned
+    /// off with `disable: true` or `test: ["NONE"]`. Readiness prefers it:
     /// a connect succeeding says the socket is open, not that the database
     /// will answer a query.
     pub healthcheck: bool,

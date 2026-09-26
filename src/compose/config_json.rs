@@ -51,7 +51,7 @@ fn service_from_json(value: &serde_json::Value) -> Service {
             .and_then(|v| v.as_str())
             .map(str::to_string),
         container_name: string("container_name"),
-        healthcheck: value.get("healthcheck").is_some_and(|v| !v.is_null()),
+        healthcheck: value.get("healthcheck").is_some_and(declares_healthcheck),
         ..Service::default()
     };
     if let Some(ports) = value.get("ports").and_then(|v| v.as_array()) {
@@ -93,6 +93,19 @@ fn service_from_json(value: &serde_json::Value) -> Service {
         out.depends_on = depends.keys().cloned().collect();
     }
     out
+}
+
+/// Whether a `healthcheck` leaves docker a check to run. Compose keeps
+/// `{"disable": true}` and `{"test": ["NONE"]}` as they were written, and
+/// docker reports no health for either.
+fn declares_healthcheck(value: &serde_json::Value) -> bool {
+    value.is_object()
+        && value.get("disable").and_then(|v| v.as_bool()) != Some(true)
+        && value
+            .get("test")
+            .and_then(|test| test.get(0))
+            .and_then(|v| v.as_str())
+            != Some("NONE")
 }
 
 fn top_volume_from_json(project: &str, key: &str, value: &serde_json::Value) -> TopVolume {

@@ -188,6 +188,49 @@ services:
     assert_eq!(file.services["api"].depends_on, vec!["db"]);
 }
 
+// Docker reports no health at all for a check the file turns off, so a
+// readiness wait for `healthy` on one of these ran out its whole timeout
+// while the service was serving.
+#[test]
+fn a_healthcheck_the_file_turns_off_is_not_one_readiness_waits_for() {
+    let text = r#"
+services:
+  disabled:
+    image: redis:7
+    healthcheck:
+      disable: true
+  none:
+    image: redis:7
+    healthcheck:
+      test: ["NONE"]
+  tuned:
+    image: redis:7
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      disable: false
+"#;
+    let file = parse(text).unwrap();
+    assert!(!file.services["disabled"].healthcheck);
+    assert!(!file.services["none"].healthcheck);
+    assert!(file.services["tuned"].healthcheck);
+
+    // Compose keeps both opt-outs as written.
+    let file = parse_config_json(
+        r#"{"name": "p", "services": {
+            "disabled": {"image": "redis:7", "healthcheck": {"disable": true}},
+            "none": {"image": "redis:7", "healthcheck": {"test": ["NONE"]}},
+            "shell": {"image": "redis:7", "healthcheck": {"test": ["CMD-SHELL", "NONE"]}}
+        }}"#,
+    )
+    .unwrap();
+    assert!(!file.services["disabled"].healthcheck);
+    assert!(!file.services["none"].healthcheck);
+    assert!(
+        file.services["shell"].healthcheck,
+        "`test: NONE` as a string is a shell command, not an opt-out"
+    );
+}
+
 #[test]
 fn a_service_with_no_ports_falls_back_to_the_image_table() {
     let text = "services:\n  cache:\n    image: redis:7-alpine\n  odd:\n    image: acme/thing\n";

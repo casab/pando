@@ -90,7 +90,7 @@ fn service(node: &Node) -> Service {
             "container_name" => out.container_name = value.scalar().map(str::to_string),
             // Only that it is there. What it runs is docker's business;
             // pando asks `docker compose ps` whether it passed.
-            "healthcheck" => out.healthcheck = true,
+            "healthcheck" => out.healthcheck = declares_healthcheck(value),
             "ports" => out.ports = value.items().iter().filter_map(port).collect(),
             "volumes" => out.volumes = value.items().iter().filter_map(mount).collect(),
             // Both forms: a list of names, or a map of name to condition.
@@ -108,6 +108,32 @@ fn service(node: &Node) -> Service {
         }
     }
     out
+}
+
+/// Whether a `healthcheck:` block leaves docker a check to run.
+/// `disable: true` and a `test:` list that starts with `NONE` are
+/// compose's two ways of turning one off, and docker then reports no
+/// health at all, so readiness waiting for `healthy` would never end.
+/// An alias stands for a block this reader never sees, and counts.
+fn declares_healthcheck(node: &Node) -> bool {
+    let fields = match node {
+        Node::Map(fields) => fields,
+        Node::Alias(_) => return true,
+        Node::Scalar(_) | Node::Seq(_) => return false,
+    };
+    let get = |want: &str| {
+        fields
+            .iter()
+            .find(|(key, _)| key == want)
+            .map(|(_, value)| value)
+    };
+    if get("disable").and_then(Node::scalar) == Some("true") {
+        return false;
+    }
+    !matches!(
+        get("test"),
+        Some(Node::Seq(test)) if test.first().and_then(Node::scalar) == Some("NONE")
+    )
 }
 
 fn top_volume(node: &Node) -> TopVolume {
