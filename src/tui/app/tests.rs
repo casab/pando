@@ -69,6 +69,7 @@ pub fn refreshed_with(state: State, warning: Option<&str>, notices: Vec<String>)
             state,
             warning: warning.map(str::to_string),
             notices,
+            ..Default::default()
         },
         ran: true,
     }))

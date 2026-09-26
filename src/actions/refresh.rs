@@ -23,6 +23,10 @@ use super::share::sweep_dead_shares;
 pub struct Refreshed {
     pub state: state::State,
     pub warning: Option<String>,
+    /// Whether `warning` is why the state file could not be read at all,
+    /// so `state` is empty for want of one rather than because nothing is
+    /// recorded. A save that failed leaves it false: what was read stands.
+    pub unreadable: bool,
     /// What the refresh itself did, one line each. A share whose tunnel
     /// died is closed here rather than in silence: the URL a developer had
     /// open stops working, and they should be told once rather than
@@ -40,6 +44,7 @@ pub fn refresh(paths: &PandoPaths) -> Refreshed {
         return Refreshed {
             state: state::State::new(),
             warning: Some(format!("{e:#}")),
+            unreadable: true,
             notices: Vec::new(),
         };
     }
@@ -49,6 +54,7 @@ pub fn refresh(paths: &PandoPaths) -> Refreshed {
             return Refreshed {
                 state: state::State::new(),
                 warning: Some(format!("{e:#}")),
+                unreadable: true,
                 notices: Vec::new(),
             };
         }
@@ -59,6 +65,7 @@ pub fn refresh(paths: &PandoPaths) -> Refreshed {
             return Refreshed {
                 state: state::State::new(),
                 warning: Some(format!("{e:#}")),
+                unreadable: true,
                 notices: Vec::new(),
             };
         }
@@ -100,6 +107,7 @@ pub fn refresh(paths: &PandoPaths) -> Refreshed {
             return Refreshed {
                 state: store,
                 warning: Some(format!("{e:#}")),
+                unreadable: false,
                 notices,
             };
         }
@@ -107,6 +115,7 @@ pub fn refresh(paths: &PandoPaths) -> Refreshed {
     Refreshed {
         state: store,
         warning: None,
+        unreadable: false,
         notices,
     }
 }
@@ -128,6 +137,7 @@ pub fn inspect(paths: &PandoPaths) -> Refreshed {
             return Refreshed {
                 state: state::State::new(),
                 warning: Some(format!("{e:#}")),
+                unreadable: true,
                 notices: Vec::new(),
             };
         }
@@ -141,6 +151,7 @@ pub fn inspect(paths: &PandoPaths) -> Refreshed {
     Refreshed {
         state: store,
         warning: None,
+        unreadable: false,
         notices: Vec::new(),
     }
 }

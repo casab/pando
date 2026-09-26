@@ -496,6 +496,7 @@ impl App {
                             state,
                             warning,
                             notices,
+                            ..
                         },
                     ran,
                 } = *quick;

@@ -350,6 +350,53 @@ fn a_wait_tells_what_its_refresh_forgot() {
     );
 }
 
+// A refresh that read the state and could not save what it changed was
+// taken for one that could not read it: `open` of a worktree never
+// started answered with the save's error, not "not running", and a wait
+// whose worktree stopped did not say it stopped.
+#[test]
+fn a_refresh_that_only_failed_to_save_still_answers_about_the_worktree() {
+    let fx = fixture();
+    let one = actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
+    let two = actions::new(&fx.paths, &fx.config, "feat/two", None, &|_| {}).unwrap();
+    let mut exited = std::process::Command::new("true").spawn().unwrap();
+    exited.wait().unwrap();
+    let mut store = crate::state::load(&fx.paths.state_file()).unwrap();
+    // Forgotten by every refresh, so every refresh has something to save.
+    store
+        .worktrees
+        .get_mut(&one)
+        .unwrap()
+        .services
+        .push(crate::state::ServiceRecord {
+            name: "mariadb".into(),
+            kind: crate::state::ServiceKind::Native,
+            port: Some(17_004),
+            pid: Some(exited.id()),
+            pgid: None,
+            compose_project: None,
+        });
+    store.worktrees.remove(&two);
+    crate::state::save(&fx.paths.state_file(), &store).unwrap();
+    // A save writes here first, and cannot.
+    std::fs::create_dir(fx.paths.state_file().with_extension("json.tmp")).unwrap();
+    let refreshed = actions::refresh(&fx.paths);
+    assert!(refreshed.warning.is_some() && !refreshed.unreadable);
+
+    let named = super::names::Named::of(&fx.paths, Some("feat/two"), &two);
+    let err =
+        super::open::url_to_open(&fx.paths, &with_dev(&fx.config), &named, false).unwrap_err();
+    assert_eq!(
+        format!("{err:#}"),
+        "feat/two is not running — `pando start feat/two` starts it"
+    );
+    let err = super::wait::wait_ready(&fx.paths, &named, None, &quiet).unwrap_err();
+    assert_eq!(
+        format!("{err:#}"),
+        "feat/two has nothing running — it stopped while pando waited"
+    );
+}
+
 fn fake_process(started_at: chrono::DateTime<Utc>) -> ProcessRecord {
     ProcessRecord {
         pid: 1,

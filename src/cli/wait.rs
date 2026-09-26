@@ -187,9 +187,11 @@ pub(super) fn wait_ready(
             }
         }
         let Some(record) = refreshed.state.worktrees.get(name.as_str()) else {
-            // A state file pando could not use says nothing about whether
-            // anything stopped.
-            if let Some(warning) = &refreshed.warning {
+            // A state file pando could not read says nothing about whether
+            // anything stopped. One it read and could not save still does.
+            if refreshed.unreadable
+                && let Some(warning) = &refreshed.warning
+            {
                 bail!("{warning}");
             }
             bail!("{shown} has nothing running — it stopped while pando waited");

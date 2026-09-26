@@ -22,9 +22,12 @@ pub(super) fn url_to_open(
     let Named { dir, shown, typed } = named;
     let refreshed = actions::refresh(paths);
     let record = refreshed.state.worktrees.get(dir.as_str());
-    // A state file pando could not use says nothing about this worktree,
-    // so its reason is the answer, not "not running".
-    if let (None, Some(warning)) = (record, &refreshed.warning) {
+    // A state file pando could not read says nothing about this worktree,
+    // so its reason is the answer, not "not running". One it read and
+    // could not save still does, and the warning is said with the rest.
+    if refreshed.unreadable
+        && let Some(warning) = &refreshed.warning
+    {
         bail!("{warning}");
     }
     // Said before the answer: a tunnel that died is why there is no public
