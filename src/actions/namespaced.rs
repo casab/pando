@@ -710,8 +710,8 @@ fn ensure_database(
 /// The one state records is kept only while it is this worktree's alone
 /// and not the main checkout's: one the main checkout's env files name, or
 /// one another worktree's record names too, is let go — never emptied —
-/// and a new one given, with a line saying why. While the worktree runs it
-/// is kept all the same, and the line says how to move it.
+/// and a new one given, with a line saying why. While the worktree runs on
+/// it, it is kept all the same, and the line says how to move it.
 fn ensure_slot(
     paths: &PandoPaths,
     name: &str,
@@ -904,7 +904,7 @@ enum Held {
     /// Still this worktree's alone, and marked as used now.
     Kept,
     /// Not this worktree's alone, and why, but kept and marked as used
-    /// all the same, because the worktree runs.
+    /// all the same, because the worktree runs on it.
     Running(String),
     /// Taken out of this worktree's record, unemptied, and why.
     LetGo(String),
@@ -924,12 +924,14 @@ enum Held {
 /// shared by two apps already: this worktree lets it go as the other's,
 /// rather than go on sharing it or stop every start of both.
 ///
-/// Except while the worktree runs. A start that leaves its processes
+/// Except while the worktree runs on it. A start that leaves its processes
 /// running — one already up, a `restart --only` — cannot move them, and a
 /// restart that would could still fail after the slot went; a record
 /// naming another slot while they go on using this one leaves this one to
 /// the other record alone, and that worktree's `rm` would empty it under
-/// them. So it is let go at the first start after the worktree stops.
+/// them. So it is let go at the first start after the worktree stops. A
+/// worktree running shared or isolated is not on it, and the start that
+/// makes it namespaced replaces every process, so that start lets it go.
 fn hold_on(
     paths: &PandoPaths,
     name: &str,
@@ -948,13 +950,12 @@ fn hold_on(
     if !recorded {
         return Ok(Held::Gone);
     }
-    let why = not_alone(&store, name, target, kept);
-    let record = store.worktrees.get_mut(name).expect("just read");
-    let held = match why {
+    let held = match not_alone(&store, name, target, kept) {
         None => Held::Kept,
-        Some(why) if runs(record) => Held::Running(why),
+        Some(why) if runs_on_its_slots(paths, &store, name) => Held::Running(why),
         Some(why) => Held::LetGo(why),
     };
+    let record = store.worktrees.get_mut(name).expect("just read");
     match &held {
         Held::LetGo(_) => record.namespaces.retain(|ns| !own(ns)),
         _ => keep(record, kept),
@@ -990,6 +991,16 @@ fn runs(record: &crate::state::WorktreeRecord) -> bool {
     record.processes.values().any(|p| {
         !matches!(p.phase, crate::state::Phase::Failed { .. }) && crate::process::is_alive(p.pid)
     })
+}
+
+/// Whether a worktree's app is on the slots its record names, for a
+/// namespaced start to leave it there: something of it runs, and in
+/// namespaced mode, as a record written for this worktree says. Running
+/// shared or isolated it is on other data, and a record left at another
+/// path has its processes stopped by the start that finds it.
+fn runs_on_its_slots(paths: &PandoPaths, store: &crate::state::State, name: &str) -> bool {
+    store.worktrees.get(name).is_some_and(runs)
+        && super::lifecycle::recorded_mode(paths, name) == crate::state::ServiceMode::Namespaced
 }
 
 /// The slots pando may give a worktree on a target's server: every one it
@@ -1269,7 +1280,8 @@ pub(super) fn free_slots_if_full(
         // new one, and is asked now, not only on its next attempt.
         if holders.iter().any(|holder| {
             holder.worktree == name
-                && (holder.running || not_alone(&store, name, &target, &holder.namespace).is_none())
+                && (not_alone(&store, name, &target, &holder.namespace).is_none()
+                    || runs_on_its_slots(paths, &store, name))
         }) {
             continue;
         }

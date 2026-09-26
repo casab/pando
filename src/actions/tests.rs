@@ -10795,6 +10795,81 @@ fn a_running_worktree_keeps_a_slot_another_record_names_and_rm_of_the_other_empt
     );
 }
 
+// A worktree running shared is on the main checkout's data, not on the
+// slot its record still names from a namespaced run, and the start that
+// makes it namespaced replaces every process: a slot another record names
+// too is let go then, and a terminal start asks for one first when every
+// other slot is held, rather than keeping one its app was never on.
+#[test]
+fn a_worktree_running_shared_lets_a_slot_another_record_names_go_when_started_namespaced() {
+    let (ns, redis) = slots_fixture(MAIN_ENV_WITH_REDIS);
+    let (report, _) = ns.start(Mode::Namespaced).unwrap();
+    let namespaced = guard(&report);
+    assert_eq!(ns.env_line("REDIS_DB").as_deref(), Some("1"));
+    drop(namespaced);
+    stop(&ns.fx.paths, &ns.name, None).unwrap();
+    std::fs::remove_file(&ns.seen).unwrap();
+    let (report, _) = ns.start(Mode::Shared).unwrap();
+    let _shared = guard(&report);
+    assert_eq!(ns.env_line("REDIS_DB"), None);
+    hold(&ns, (1..=15).map(|n| (n, false)));
+
+    free_w2(&ns);
+    assert_eq!(
+        std::fs::read_to_string(redis.join("flushed")).unwrap(),
+        "2\n"
+    );
+
+    std::fs::remove_file(&ns.seen).unwrap();
+    let (report, said) = ns.start(Mode::Namespaced).unwrap();
+    let _namespaced = guard(&report);
+    assert!(
+        said.iter().any(|l| l
+            == "redis: slot 1 is let go, not emptied — w1's record names it too — and this \
+                worktree gets one of its own"),
+        "{said:?}"
+    );
+    assert_eq!(ns.env_line("REDIS_DB").as_deref(), Some("2"));
+    let ours: Vec<String> = ns
+        .record()
+        .namespaces
+        .into_iter()
+        .filter(|n| n.service == "redis")
+        .map(|n| n.name)
+        .collect();
+    assert_eq!(ours, vec!["2".to_string()]);
+    assert_eq!(
+        std::fs::read_to_string(redis.join("flushed")).unwrap(),
+        "2\n",
+        "w1's slot was emptied"
+    );
+}
+
+// A record left at another path by a worktree of the same name has its
+// processes stopped by the start that finds it, so they are not on its
+// slot for the start to keep: one another record names too is let go.
+#[test]
+fn a_record_left_at_another_path_keeps_no_slot_another_record_names_for_its_processes() {
+    let (ns, _redis) = slots_fixture(MAIN_ENV_WITH_REDIS);
+    let (report, _) = ns.start(Mode::Namespaced).unwrap();
+    let _running = guard(&report);
+    assert_eq!(ns.env_line("REDIS_DB").as_deref(), Some("1"));
+    hold(&ns, [(1, false)]);
+    let mut store = ns.fx.state();
+    store.worktrees.get_mut(&ns.name).unwrap().path = PathBuf::from("/abs/elsewhere");
+    state::save(&ns.fx.paths.state_file(), &store).unwrap();
+
+    std::fs::remove_file(&ns.seen).unwrap();
+    let (report, said) = ns.start(Mode::Namespaced).unwrap();
+    let _again = guard(&report);
+    assert!(
+        said.iter()
+            .any(|l| l.starts_with("redis: slot 1 is let go, not emptied")),
+        "{said:?}"
+    );
+    assert_eq!(ns.env_line("REDIS_DB").as_deref(), Some("2"));
+}
+
 // A worktree given main's second slot before main's every slot was known
 // keeps it no longer: the next start lets it go, unemptied, and gives the
 // worktree one of its own.
