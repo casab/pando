@@ -804,6 +804,13 @@ fn docker_missing_is_a_note_only_when_the_project_declares_compose_services() {
         "{}",
         docker.message
     );
+    // pando runs docker itself, so a prelude is not the way to reach it.
+    let fix = docker.fix.as_deref().unwrap_or_default();
+    assert!(!fix.contains("prelude"), "{fix}");
+    assert!(
+        fix.contains(&fx.home.join("bin").join("docker").display().to_string()),
+        "{fix}"
+    );
 }
 
 #[test]
@@ -859,12 +866,13 @@ fn the_program_a_config_tells_pando_to_run_is_a_problem_when_it_is_missing() {
 fn every_tool_but(missing: &'static str) -> impl Fn(&str) -> Option<String> {
     move |script: &str| {
         let answer = every_tool(script)?;
-        // Each probe is one `if … fi` line of the script, in index order.
+        // Each probe is one `if … fi` line of the script, naming its index.
         let asked = format!("command -v '{missing}' ");
         let Some(index) = script
             .lines()
-            .filter(|l| l.starts_with("if "))
-            .position(|l| l.contains(&asked))
+            .find(|l| l.contains(&asked))
+            .and_then(|l| l.split(TOOL_PATH_MARK).nth(1))
+            .and_then(|rest| rest.split(' ').next())
         else {
             return Some(answer);
         };
@@ -1023,11 +1031,58 @@ fn the_tool_script_runs_behind_the_prelude_a_real_spawn_would_use() {
         detail_label: "",
         needed_for: "worktrees".to_string(),
         missing: None,
+        direct: false,
     }];
     let script = tool_script(&probes, "nvm use 22");
     assert!(script.starts_with("nvm use 22 && {"), "{script}");
     assert!(script.contains("command -v 'git'"), "{script}");
     assert!(tool_script(&probes, "").starts_with("if "));
+}
+
+// pando runs docker itself, on the PATH it was started with: a prelude
+// that finds it helps no isolated start, so it must not help the probe.
+#[test]
+fn a_tool_pando_runs_itself_is_looked_for_without_the_prelude() {
+    let dir = TempDir::new().unwrap();
+    let only_prelude = dir.path().join("only-on-the-prelude");
+    std::fs::create_dir_all(&only_prelude).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let fake = only_prelude.join("pando-fake-docker");
+        std::fs::write(&fake, "#!/bin/sh\necho 'Docker version 27'\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let probe = |direct: bool| ToolProbe {
+        name: "docker".to_string(),
+        program: "pando-fake-docker".to_string(),
+        args: "--version",
+        detail_args: None,
+        detail_label: "",
+        needed_for: "isolated starts".to_string(),
+        missing: None,
+        direct,
+    };
+    let probes = vec![probe(true), probe(false)];
+    let prelude = format!(
+        "export PATH={}:\"$PATH\"",
+        crate::process::shell_quote(&only_prelude.display().to_string())
+    );
+    let script = tool_script(&probes, &prelude);
+    let out = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains(TOOL_DONE_MARK), "{script}\n{text}");
+    assert!(
+        !text.contains(&format!("{TOOL_PATH_MARK}0 ")),
+        "the prelude found it for the direct probe: {text}"
+    );
+    assert!(
+        text.contains(&format!("{TOOL_PATH_MARK}1 ")),
+        "and the same program behind the prelude is found: {text}"
+    );
 }
 
 #[test]

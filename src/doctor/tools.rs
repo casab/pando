@@ -35,6 +35,12 @@ pub(super) struct ToolProbe {
     /// What to say when it is not there. `None` means a line and nothing
     /// more — a tool this project has not asked pando to run.
     pub(super) missing: Option<(Severity, String)>,
+    /// Whether pando runs it itself rather than through the login shell.
+    /// Such a tool is looked for on the PATH pando was started with and
+    /// with no prelude in front, because that is where `Command::new`
+    /// looks: a profile or a prelude that finds it helps nothing that
+    /// runs it.
+    pub(super) direct: bool,
 }
 
 #[derive(Default)]
@@ -51,9 +57,10 @@ pub(super) fn tools_report(
     findings: &mut Vec<Finding>,
 ) -> Vec<ToolReport> {
     let probes = tool_probes(paths, config);
-    // Run behind the prelude, because every command pando runs is run
-    // behind it: a package manager that only exists after `nvm use` is
-    // there for a real spawn and would read as missing here.
+    // Run behind the prelude, because every command pando spawns through
+    // the shell is run behind it: a package manager that only exists after
+    // `nvm use` is there for a real spawn and would read as missing here.
+    // A tool pando runs itself is not, and is asked without it.
     let prelude = config.runtime.prelude.clone().unwrap_or_default();
     let (found, failure) = probe_tools(machine.shell, &probes, prelude.trim());
     match &failure {
@@ -91,17 +98,26 @@ pub(super) fn tools_report(
             && failure.is_none()
             && let Some((severity, reason)) = &probe.missing
         {
-            findings.push(Finding {
-                section: Section::Tools,
-                severity: *severity,
-                message: format!(
-                    "{} is not on the PATH `bash -lc` has — {reason}",
-                    probe.name
+            let (on, fix) = match probe.direct {
+                true => (
+                    "the PATH pando was started with",
+                    format!(
+                        "install it so it is on the PATH pando is started with, or put a shim \
+                         at {}",
+                        paths.home.join("bin").join(&probe.name).display()
+                    ),
                 ),
-                fix: Some(
+                false => (
+                    "the PATH `bash -lc` has",
                     "install it, or set [runtime].prelude so a login bash shell finds it"
                         .to_string(),
                 ),
+            };
+            findings.push(Finding {
+                section: Section::Tools,
+                severity: *severity,
+                message: format!("{} is not on {on} — {reason}", probe.name),
+                fix: Some(fix),
             });
         }
         out.push(ToolReport {
@@ -117,13 +133,20 @@ pub(super) fn tools_report(
         });
     }
     if failure.is_none() {
-        daemon_check(paths, config, machine, prelude.trim(), &mut out, findings);
+        daemon_check(paths, config, machine, &mut out, findings);
     }
     out
 }
 
-/// Marks the daemon probe's own output, so a chatty prelude cannot be
-/// read as the answer.
+/// The assignment that gives a script the PATH pando itself was started
+/// with, which is where a program pando runs directly is looked for.
+fn own_path() -> String {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    format!("PATH={}", proc::shell_quote(&path.to_string_lossy()))
+}
+
+/// Marks the daemon probe's own output, so a chatty login profile cannot
+/// be read as the answer.
 pub(super) const DAEMON_MARK: &str = "pando-docker-daemon:";
 
 /// How long the daemon gets to answer. `docker info` against a daemon
@@ -146,13 +169,13 @@ pub(super) enum Daemon {
 ///
 /// `docker --version` answers without a daemon, so a tools line that only
 /// showed the client said nothing about whether `start --isolated` could
-/// work. Same shell as every other probe, behind the same prelude, and
+/// work. Same shell as every other probe, but on the PATH pando runs
+/// docker with and with no prelude, as the docker probe itself is, and
 /// bounded by its own short watchdog.
 fn daemon_check(
     paths: &PandoPaths,
     config: &Config,
     machine: &Machine<'_>,
-    prelude: &str,
     tools: &mut [ToolReport],
     findings: &mut Vec<Finding>,
 ) {
@@ -167,7 +190,7 @@ fn daemon_check(
         return;
     }
     let program = services::docker_program(paths).display().to_string();
-    let answer = (machine.shell)(&daemon_script(&program, prelude))
+    let answer = (machine.shell)(&daemon_script(&program, &own_path()))
         .map(|text| parse_daemon(&text))
         .unwrap_or(Daemon::Unknown);
     let state = match &answer {
@@ -205,8 +228,9 @@ fn daemon_check(
 /// [`DAEMON_WAIT_SECS`], then its exit status behind [`DAEMON_MARK`].
 ///
 /// The watchdog's own output goes to /dev/null so it cannot hold the
-/// command substitution's pipe open after docker has answered.
-pub(super) fn daemon_script(program: &str, prelude: &str) -> String {
+/// command substitution's pipe open after docker has answered. `before`
+/// runs first, and the probe only when it succeeds.
+pub(super) fn daemon_script(program: &str, before: &str) -> String {
     let program = proc::shell_quote(program);
     let body = format!(
         "__pando_d=$( {program} info --format '{{{{.ServerVersion}}}}' 2>&1 & __pando_p=$!; \
@@ -214,9 +238,9 @@ pub(super) fn daemon_script(program: &str, prelude: &str) -> String {
          wait $__pando_p; __pando_s=$?; kill $__pando_w 2>/dev/null; \
          echo \"{DAEMON_MARK}$__pando_s\" )\nprintf '%s\\n' \"$__pando_d\"\n"
     );
-    match prelude {
+    match before {
         "" => body,
-        prelude => format!("{prelude} && {{\n{body}}}"),
+        before => format!("{before} && {{\n{body}}}"),
     }
 }
 
@@ -256,11 +280,13 @@ fn tool_probes(paths: &PandoPaths, config: &Config) -> Vec<ToolProbe> {
             Severity::Problem,
             "pando has nothing to manage without it".to_string(),
         )),
+        direct: false,
     }];
 
     // The shim hook `services::docker_program` already knows about, so a
     // developer whose docker is not on PATH is reported through the same
-    // binary an isolated start would use.
+    // binary an isolated start would use — and looked for where that start
+    // looks, since pando runs docker itself rather than through the shell.
     let docker = services::docker_program(paths).display().to_string();
     let isolates = config
         .services
@@ -283,6 +309,7 @@ fn tool_probes(paths: &PandoPaths, config: &Config) -> Vec<ToolProbe> {
         detail_label: "context: ",
         needed_for: needed.to_string(),
         missing: missing_docker.clone(),
+        direct: true,
     });
     probes.push(ToolProbe {
         name: "docker compose".to_string(),
@@ -295,6 +322,7 @@ fn tool_probes(paths: &PandoPaths, config: &Config) -> Vec<ToolProbe> {
         // news twice, and when docker is there a compose plugin that is
         // not is reported by the line.
         missing: None,
+        direct: true,
     });
     probes.push(ToolProbe {
         name: "cloudflared".to_string(),
@@ -303,8 +331,10 @@ fn tool_probes(paths: &PandoPaths, config: &Config) -> Vec<ToolProbe> {
         detail_args: None,
         detail_label: "",
         needed_for: "`pando share`, which publishes a worktree at a public URL".to_string(),
-        // `share` is opt-in and says this itself. A line is enough.
+        // `share` is opt-in and says this itself. A line is enough. Direct,
+        // because `share` checks for it on pando's own PATH before it runs.
         missing: None,
+        direct: true,
     });
 
     for (program, needed_for, missing) in project_programs(paths, config) {
@@ -319,6 +349,7 @@ fn tool_probes(paths: &PandoPaths, config: &Config) -> Vec<ToolProbe> {
             detail_label: "",
             needed_for,
             missing,
+            direct: false,
         });
     }
     probes
@@ -510,12 +541,21 @@ enum ProbeFailure {
 }
 
 /// One shell script for every probe, composed the way a real spawn is.
+///
+/// A tool pando runs itself is asked first, in a subshell on the PATH
+/// pando was started with and outside the prelude; every other one behind
+/// the prelude, as a spawn is.
 pub(super) fn tool_script(probes: &[ToolProbe], prelude: &str) -> String {
+    let mut direct = String::new();
     let mut body = String::new();
     for (index, probe) in probes.iter().enumerate() {
+        let out = match probe.direct {
+            true => &mut direct,
+            false => &mut body,
+        };
         let program = proc::shell_quote(&probe.program);
         let _ = write!(
-            body,
+            out,
             "if __pando_p=$(command -v {program} 2>/dev/null); then \
              printf '{TOOL_PATH_MARK}{index} %s\\n' \"$__pando_p\"; \
              printf '{TOOL_VERSION_MARK}{index} %s\\n' \
@@ -524,16 +564,20 @@ pub(super) fn tool_script(probes: &[ToolProbe], prelude: &str) -> String {
         );
         if let Some(detail) = probe.detail_args {
             let _ = write!(
-                body,
+                out,
                 "printf '{TOOL_DETAIL_MARK}{index} %s\\n' \
                  \"$({program} {detail} 2>&1 | head -n 1)\"; "
             );
         }
-        let _ = writeln!(body, "fi");
+        let _ = writeln!(out, "fi");
     }
     let _ = writeln!(body, "echo {TOOL_DONE_MARK}");
-    match prelude {
+    let body = match prelude {
         "" => body,
         prelude => format!("{prelude} && {{\n{body}}}"),
+    };
+    match direct.is_empty() {
+        true => body,
+        false => format!("( {}\n{direct})\n{body}", own_path()),
     }
 }
