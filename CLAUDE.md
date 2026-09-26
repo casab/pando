@@ -29,6 +29,18 @@ its own orchestration runs as that one script with its apps' ports; and a
 project that gitignores its lockfile gets the plain install. Proved on a
 temporary clone of the origin project: zero questions, web and api up.
 
+On 2026-09-26 namespaced mode was built, from
+`plans/database-per-branch.md`: a third, experimental start mode —
+`start --namespaced`, or the TUI's enter chooser — that keeps the main
+checkout's servers and gives a worktree a database and a Redis slot of its
+own in them. `state::ServiceMode` replaced the isolated flag; what a
+namespace is on an engine is a recipe's `[namespace]` table; every drop
+and flush goes through `namespace::may_drop`. It writes into a server the
+developer owns, which Invariant 1 does not cover: `docs/02-principles.md`
+says what holds it. Its tests against real servers are
+`tests/namespaced.rs`, gated like `tests/engines.rs` and run against
+throwaway MariaDB and Redis servers the tests start themselves.
+
 What is left is not a phase. `plans/open-follow-ups.md` carries the known
 edges, each with who found it and where it belongs, and the release
 checklist in `docs/08-roadmap.md` is untouched: no licence, no CI, no
@@ -108,6 +120,11 @@ database, a prod schema dump, and cookie auth."
   not written either. To see what a start would do there, clone it into a
   temporary directory and run pando against the clone. Nothing learnt from
   it goes into a committed file except in generic terms.
+- Nothing under test reaches a developer's own database server.
+  Namespaced mode's tests drive a fake client in the test's own pando
+  `bin`, and `tests/namespaced.rs` (gated by `PANDO_TEST_NATIVE=1`)
+  starts its own throwaway MariaDB and Redis on free ports in temporary
+  directories.
 - Nothing under test reaches GitHub. The TUI's `gh` workers
   (`spawn_pr_fetch`, `spawn_gh_account_check`) return early under
   `cfg!(test)`; tests set `pr_list` by hand, and `gh` parsing is tested

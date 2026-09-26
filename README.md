@@ -35,6 +35,9 @@ Your repository works the same way.
   Redis, MariaDB, whatever your compose file declares — or, on a machine
   that would rather not run Docker, the same databases natively from a
   recipe you can override
+- Or, experimentally, a database and a Redis slot of its own inside the
+  servers your main checkout already runs: no server to start, nothing to
+  wait for, and main's data untouched
 - Shares any running worktree through a public tunnel URL
 - Turns an open pull request into a running worktree: pick it from the
   list, press enter — a fork's too
@@ -47,6 +50,13 @@ Built for people, and for agents, who work on several branches at once.
 pando never writes into your repository. Not a config file, not a gitignore
 line, not a lockfile change. Everything it learns and everything it runs lives
 under `~/.pando`.
+
+One mode writes somewhere that is yours all the same: a namespaced
+worktree gets a database of its own in your own database server. That is
+opt-in, named after your main database so it can never be it, limited by a
+grant you give once to that prefix and nothing else, and dropped only by
+`rm`, only when pando's own records say pando made it. See
+[Shared, namespaced, isolated](#shared-namespaced-isolated).
 
 ## First run
 
@@ -96,7 +106,8 @@ parsing English, and answers come back through one validated write path.
 ```
 pando                 open the TUI for the repo you are in
 pando new <branch>    create a worktree and branch from the default base
-pando start <name>    start its dev server; --isolated for private services
+pando start <name>    start its dev server; --isolated for private services,
+                      --namespaced (experimental) for its own database in yours
 pando stop [name]     stop one worktree; --all for every one
 pando restart <name>  stop and start again, keeping the ports
 pando ls              list worktrees: status, URL, ports, git; -l for paths
@@ -177,6 +188,52 @@ The log viewer has a tab per log, led by an `all` tab that merges every
 process's when there are several. `1`–`9` switch tabs, `/` searches, `f`
 filters by level, and `e`/`E` jump between errors.
 
+### Shared, namespaced, isolated
+
+A worktree's code, processes, dependencies, ports and logs are its own
+whatever it runs on. Its mode decides what happens to its data:
+
+- **shared** — the main checkout's database and cache, data and all. The
+  default, and the way back from the other two: `start --shared`, or `S`.
+- **namespaced** (experimental) — the main checkout's servers, with a
+  database and a Redis slot of the worktree's own in them: `shop__feat_x`
+  beside `shop`, slot 3 beside slot 0. The database is built by the
+  branch's own schema step, never copied from main's, and both are kept
+  through a switch to another mode until `rm` drops them.
+  `start --namespaced`, or the chooser on enter.
+- **isolated** — servers of its own on ports of its own: containers from
+  your compose file, or native engines from a recipe. `start --isolated`,
+  or `i`.
+
+A namespaced start writes into a server you own, so it is careful:
+
+- It logs in as your app does, with the user and password beside the
+  address in the main checkout's `.env`. Where there are none it asks
+  once, keeps the answer in pando's own config for the project (mode
+  0600), and hands it to the database client in its environment, never
+  on a command line.
+- That login has to be allowed to make databases named after the main
+  one, and only those. The first start that is not allowed stops with
+  nothing made and prints the grant to run once, as an administrator:
+
+  ```sql
+  GRANT ALL ON `shop\_\_%`.* TO 'app'@'localhost';
+  ```
+
+- A Redis slot is given out only where the app reads a slot setting
+  (`REDIS_DB`, or the path of its URL), and only while the slot is empty:
+  keys pando did not put there are somebody else's. When all fifteen are
+  held, the start asks which stopped worktree gives its slot up.
+- `rm` drops only what pando's records say it made, on the server it made
+  it on, and never the main checkout's database or slot whatever a record
+  says. `doctor` lists a database named for a worktree that no record
+  holds, with the command that drops it, and never drops it itself.
+
+MariaDB and MySQL databases and Redis slots are what it makes today;
+every other service stays shared, and a namespaced start says so for each.
+What a namespace is on an engine is a recipe's `[namespace]` table, so
+another engine is a recipe rather than a release.
+
 ### Themes
 
 `T` in the TUI lists the colour themes, each with a swatch of its
@@ -242,8 +299,11 @@ lifecycle; detached dev servers with their own ports, logs and readiness;
 several processes per worktree; the log viewer; private per-worktree
 services from the project's own compose file; public tunnel URLs; `init`,
 `doctor` and `signals`; native service recipes for machines without
-Docker; the JSON contract an agent reads; and a worktree from any open
-pull request in the TUI.
+Docker; the JSON contract an agent reads; a worktree from any open
+pull request in the TUI; and, experimentally, namespaced worktrees — a
+database and a Redis slot of their own in the main checkout's servers,
+tested against throwaway MariaDB and Redis servers the tests start
+themselves.
 
 macOS is what it is developed and tested on. The Unix-only parts have
 Linux branches written and no CI, so Linux is intended rather than

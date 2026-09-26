@@ -144,7 +144,7 @@ Four more facts that are not visible in the shape:
 | `dev_cmd` | rules | ask only when several scripts are plausible dev servers |
 | `port_env` | rules | which variables carry the ports. The env example beats a framework convention |
 | `services` | rules + **human** | which services get a private copy — see §5 for the mechanism |
-| `schema_hook` | rules + **human** | the command that brings a fresh database to the schema. Always a question — it touches data — and only an isolated start asks it. The hook runs on isolated starts only unless its entry says `on = "always"`; `null` answers "no" and writes it with `on = "never"` |
+| `schema_hook` | rules + **human** | the command that brings a fresh database to the schema. Always a question — it touches data — and only an isolated or namespaced start asks it. The hook runs on those starts only unless its entry says `on = "always"`; `null` answers "no" and writes it with `on = "never"` |
 | `provision` | rules, mostly | which local files a worktree needs. Seeding from an example needs a human |
 
 ## 4. Writing: `pando init --answers`, and nothing else
@@ -418,6 +418,10 @@ Absolute. None of these has an exception worth taking.
   and their decision to make.
 - **Never take a `needs_a_human` option without a human.** If nobody is
   there to ask, exit and say which question is open.
+- **Never start a worktree namespaced unless the developer asked for it.**
+  It writes into their own database server. It is experimental, it needs
+  a grant only they can give, and `rm` of a namespaced worktree drops its
+  database.
 
 ---
 
@@ -552,6 +556,7 @@ pando new <branch>               # create a worktree
 pando start <name>               # start it; returns once spawned
 pando start <name> --wait        # …and block until it is ready
 pando start <name> --isolated    # …with private copies of its services
+pando start <name> --namespaced  # …experimental: its own database and slot in the main checkout's servers
 pando stop <name>
 pando share <name>               # publish it at a public URL
 pando unshare <name>
@@ -577,6 +582,25 @@ a `source` key. Pass `--source` when you know which log you want.
 | `1` | read stderr. It is one sentence. **Do not retry** — a failure that repeats is a failure that repeats |
 | `2` | you asked wrongly: a bad flag, or an answers file naming a question pando does not ask. Fix the request |
 | `3` | **a question is unanswered, and it is on stderr** with its options. Answer it through `init --answers`, or put it to the human. Never retry unchanged, and never add `--yes` to make it go away |
+
+Two questions come only from a namespaced start, and `init --answers`
+cannot answer either:
+
+- **`login`** — which login may create and drop the worktree's own
+  databases, when the main checkout's env files carry none. It is a
+  password: never guess one, never put one in an answers file or a
+  command line. Tell the human, who writes `[namespaced.<service>]` with
+  `user` and `password` in the file stderr names, or runs the start on a
+  terminal and types it.
+- **`free_slot`** — which stopped worktree gives up its Redis slot when
+  every slot is held. Its answer empties that slot. Never answer it:
+  report the list to the human, who can answer it on a terminal or `rm`
+  a worktree they no longer need.
+
+A namespaced start that stops with a `GRANT …` statement on stderr means
+the app's login may not make databases under that prefix. Report the
+statement; running it is the human's, as an administrator of their own
+server.
 
 `--yes` is not a way past exit 3. It takes the rules' own preferred option,
 which is a decision you are making on the developer's behalf with no
