@@ -1,5 +1,5 @@
-//! Namespaced mode's leftovers: databases named for a worktree of this
-//! project that no worktree's record holds.
+//! Namespaced mode's leftovers: databases named like a worktree's of this
+//! project that no pando project's record holds.
 
 use crate::actions;
 use crate::config::Config;
@@ -22,8 +22,9 @@ pub(super) fn leftover_findings(paths: &PandoPaths, config: &Config, findings: &
         let finding = Finding::note(
             Section::Services,
             format!(
-                "{}: database {} on {} is named for a worktree of this project, and no \
-                 worktree's record holds it — one `rm` could not drop, or whose record was lost",
+                "{}: database {} on {} is named like a worktree's of this project, and no pando \
+                 project's record holds it — one `rm` could not drop, one whose record was lost, \
+                 or one that is not pando's at all",
                 leftover.service, leftover.name, leftover.address
             ),
         );

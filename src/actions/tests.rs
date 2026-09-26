@@ -10434,6 +10434,37 @@ fn doctor_lists_a_leftover_database_with_the_command_that_drops_it() {
     assert_eq!(plain.fake("argv"), "", "no server was asked anything");
 }
 
+// A second clone of the repository on the same server names its
+// worktrees' databases the same way: one its record holds is its own, and
+// never listed here as this project's leftover.
+#[test]
+fn doctor_never_lists_a_database_another_projects_record_holds() {
+    let (ns, _redis) = stopped_namespaced();
+    std::fs::write(ns.fake.join("dbs/shop__feat_theirs"), "").unwrap();
+    std::fs::write(ns.fake.join("dbs/shop__feat_gone"), "").unwrap();
+    let mut theirs = WorktreeRecord::new("/abs/clone/feat+theirs", true);
+    theirs.namespaces.push(crate::state::NamespaceRecord {
+        service: "db".into(),
+        recipe: "mariadb".into(),
+        kind: crate::state::NamespaceKind::Database,
+        host: "127.0.0.1".into(),
+        port: 3306,
+        name: "SHOP__FEAT_THEIRS".into(),
+        main: "shop".into(),
+        keys: Vec::new(),
+        used_at: Utc::now(),
+    });
+    hold_elsewhere(&ns, theirs);
+    let leftovers = namespace_leftovers(&ns.fx.paths, &ns.fx.config, &ns.fx.state());
+    assert_eq!(
+        leftovers
+            .iter()
+            .map(|l| l.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["shop__feat_gone"]
+    );
+}
+
 #[test]
 fn doctor_reports_a_leftover_database_as_a_note_with_its_fix() {
     let (ns, _redis) = stopped_namespaced();
@@ -10453,7 +10484,12 @@ fn doctor_reports_a_leftover_database_as_a_note_with_its_fix() {
         .unwrap_or_else(|| panic!("{:?}", report.findings));
     assert_eq!(finding.severity, crate::doctor::Severity::Note);
     assert!(
-        finding.message.contains("no worktree's record holds it"),
+        finding
+            .message
+            .contains("no pando project's record holds it")
+            && finding
+                .message
+                .contains("or one that is not pando's at all"),
         "{}",
         finding.message
     );

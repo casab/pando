@@ -1565,8 +1565,9 @@ pub(super) fn drop_namespaces(
     }
 }
 
-/// A database named for a worktree of this project that no worktree's
-/// record holds: one `rm` could not drop, or one whose record was lost.
+/// A database named like a worktree's of this project that no pando
+/// project's record holds: one `rm` could not drop, one whose record was
+/// lost, or one somebody else made under that name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Leftover {
     pub service: String,
@@ -1584,7 +1585,10 @@ pub struct Leftover {
 ///
 /// Read-only: a listing, never a drop. A server that does not answer, or
 /// a login nothing gives, is skipped rather than reported: this is a look
-/// for leftovers, and not being able to look is not one.
+/// for leftovers, and not being able to look is not one. One another
+/// project's record holds — a second clone of the repository on the same
+/// server names its worktrees' databases the same way — is that project's,
+/// and not listed.
 pub fn namespace_leftovers(
     paths: &PandoPaths,
     config: &Config,
@@ -1596,6 +1600,10 @@ pub fn namespace_leftovers(
     if !namespaced {
         return Vec::new();
     }
+    let others = other_projects(paths);
+    let stores: Vec<&crate::state::State> = std::iter::once(store)
+        .chain(others.iter().filter_map(|(_, other)| other.as_ref().ok()))
+        .collect();
     let mut out = Vec::new();
     for target in plan(paths, config).targets {
         if target.namespace.kind != NamespaceKind::Database || target.namespace.list.is_none() {
@@ -1608,11 +1616,23 @@ pub fn namespace_leftovers(
             continue;
         };
         for name in names {
-            let held = store.worktrees.values().any(|record| {
-                record.namespaces.iter().any(|ns| {
-                    ns.kind == NamespaceKind::Database
-                        && ns.port == target.port
-                        && ns.name.eq_ignore_ascii_case(&name)
+            let listed = crate::state::NamespaceRecord {
+                service: target.service.clone(),
+                recipe: target.recipe.clone(),
+                kind: NamespaceKind::Database,
+                host: target.host.clone(),
+                port: target.port,
+                name: name.clone(),
+                main: target.main.clone(),
+                keys: Vec::new(),
+                used_at: chrono::Utc::now(),
+            };
+            let held = stores.iter().any(|store| {
+                store.worktrees.values().any(|record| {
+                    record
+                        .namespaces
+                        .iter()
+                        .any(|ns| namespace::same_namespace(ns, &listed))
                 })
             });
             if held {
