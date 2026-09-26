@@ -49,15 +49,11 @@ pub fn satisfies(spec: &str, version: &str) -> Verdict {
 
 /// One `||` alternative: every comparator in it has to hold.
 fn satisfies_all(clause: &str, resolved: &[u64]) -> Verdict {
-    let comparators: Vec<&str> = clause
-        .split(|c: char| c.is_whitespace() || c == ',')
-        .filter(|part| !part.is_empty())
-        .collect();
-    if comparators.is_empty() {
+    let Some(comparators) = comparators(clause) else {
         return Verdict::Unknown;
-    }
+    };
     let mut verdict = Verdict::Satisfied;
-    for comparator in comparators {
+    for comparator in &comparators {
         match compare(comparator, resolved) {
             // A comparator that definitely fails fails the clause, however
             // little is understood about the others.
@@ -67,6 +63,40 @@ fn satisfies_all(clause: &str, resolved: &[u64]) -> Verdict {
         }
     }
     verdict
+}
+
+/// The comparators of one alternative, each as one word `compare` reads.
+///
+/// node-semver lets an operator stand apart from its version (`>= 18`) and
+/// writes a range as `18 - 22`; both are put back together here, the range
+/// as `>=18 <=22`. `None` for a clause of any other shape — an operator
+/// with nothing after it, a `-` that is not a whole hyphen range, or no
+/// words at all — because read word by word those become an exact pin
+/// that refuses every other version.
+fn comparators(clause: &str) -> Option<Vec<String>> {
+    let words: Vec<&str> = clause
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|part| !part.is_empty())
+        .collect();
+    if let [low, "-", high] = words.as_slice() {
+        return Some(vec![format!(">={low}"), format!("<={high}")]);
+    }
+    let mut out = Vec::new();
+    let mut words = words.into_iter();
+    while let Some(word) = words.next() {
+        if word == "-" {
+            return None;
+        }
+        if word
+            .chars()
+            .all(|c| matches!(c, '<' | '>' | '=' | '^' | '~' | '!'))
+        {
+            out.push(format!("{word}{}", words.next()?));
+        } else {
+            out.push(word.to_string());
+        }
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 fn compare(comparator: &str, resolved: &[u64]) -> Verdict {
@@ -112,8 +142,20 @@ fn compare(comparator: &str, resolved: &[u64]) -> Verdict {
             }
         }
         _ => {
-            let Some(against) = concrete(&pattern) else {
+            let Some(mut against) = concrete(&pattern) else {
                 return Verdict::Unknown;
+            };
+            // A bound that names fewer than three components takes in
+            // everything under the ones it names, as node-semver reads it:
+            // `<=22` is `<23`, and `>22` is `>=23`. Filled out with zeros
+            // instead, `<=22` would refuse 22.5.0.
+            let op = match op {
+                Op::Le | Op::Gt if against.len() < 3 => {
+                    let last = against.len() - 1;
+                    against[last] += 1;
+                    if op == Op::Le { Op::Lt } else { Op::Ge }
+                }
+                _ => op,
             };
             let ordering = cmp_versions(resolved, &against);
             let held = match op {

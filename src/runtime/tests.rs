@@ -380,6 +380,24 @@ fn the_comparisons_a_version_file_and_an_engines_range_actually_use() {
         (">=18 <21", "24.21.0", Verdict::Mismatch),
         (">=18 <21", "20.11.0", Verdict::Satisfied),
         (">=18 || >=20", "24.0.0", Verdict::Satisfied),
+        // An operator may stand apart from its version.
+        (">= 18", "22.0.0", Verdict::Satisfied),
+        (">= 18 < 21", "20.1.0", Verdict::Satisfied),
+        (">= 18 < 21", "22.0.0", Verdict::Mismatch),
+        ("^ 18", "18.2.0", Verdict::Satisfied),
+        // A hyphen range, whose partial upper end takes in its minors.
+        ("18 - 22", "20.1.0", Verdict::Satisfied),
+        ("18 - 22", "22.5.0", Verdict::Satisfied),
+        ("18 - 22", "23.0.0", Verdict::Mismatch),
+        ("18 - 22", "16.0.0", Verdict::Mismatch),
+        ("18.2.0 - 22.1.3", "22.1.4", Verdict::Mismatch),
+        // And so does any partial bound that includes its end.
+        ("<=22", "22.5.0", Verdict::Satisfied),
+        ("<=22", "23.0.0", Verdict::Mismatch),
+        ("<=22.3", "22.3.9", Verdict::Satisfied),
+        (">22", "22.5.0", Verdict::Mismatch),
+        (">22", "23.0.0", Verdict::Satisfied),
+        (">22.1.0", "22.1.1", Verdict::Satisfied),
         ("^18.0.0", "18.20.1", Verdict::Satisfied),
         ("^18.0.0", "19.0.0", Verdict::Mismatch),
         ("^0.2.3", "0.2.9", Verdict::Satisfied),
@@ -392,6 +410,9 @@ fn the_comparisons_a_version_file_and_an_engines_range_actually_use() {
         ("stable", "1.75.0", Verdict::Unknown),
         ("", "22.0.0", Verdict::Unknown),
         (">=18 lts/*", "24.0.0", Verdict::Unknown),
+        (">=", "22.0.0", Verdict::Unknown),
+        (">=18 - 22", "20.0.0", Verdict::Unknown),
+        ("18 - 22 <25", "20.0.0", Verdict::Unknown),
         // A definite failure is still a failure, whatever sits beside it.
         ("<18 lts/*", "24.0.0", Verdict::Mismatch),
     ] {
