@@ -207,7 +207,18 @@ impl Compose {
     /// has none: pulling an image takes as long as the network does, and
     /// a start is never run under the state lock.
     fn run(&self, rest: &[&str], timeout: Option<Duration>) -> Result<String> {
-        let args = self.args(rest);
+        self.run_with(&[], rest, timeout)
+    }
+
+    /// [`Self::run`] with global flags ahead of the verb, which is the only
+    /// place compose reads them.
+    fn run_with(
+        &self,
+        globals: &[&str],
+        rest: &[&str],
+        timeout: Option<Duration>,
+    ) -> Result<String> {
+        let args = self.args(&[globals, rest].concat());
         let mut command = Command::new(&self.program);
         command.args(&args).stdin(Stdio::null());
         if let Some(dir) = &self.dir {
@@ -262,8 +273,17 @@ impl Compose {
     /// `extends:`, a top-level `include:` and YAML aliases are followed and
     /// every default is filled in — none of which pando's own reader does. Nothing is
     /// created or started: `config` only prints.
+    ///
+    /// Every profile is on. Compose leaves a service whose profile is not
+    /// active out of `config`, while `up -d <service>` turns on the profile
+    /// of a service it is given by name, so without them a profiled
+    /// service pando would bring up is one this file says is not there.
     pub fn config(&self) -> Result<crate::compose::ComposeFile> {
-        let text = self.run(&["config", "--format", "json"], Some(PROBE_TIMEOUT))?;
+        let text = self.run_with(
+            &["--profile", "*"],
+            &["config", "--format", "json"],
+            Some(PROBE_TIMEOUT),
+        )?;
         crate::compose::parse_config_json(&text)
     }
 
@@ -1127,6 +1147,37 @@ mod tests {
     // OrbStack's socket, and newer docker clients, say it another way; read
     // as a generic failure it made `stop` and `rm` fail where a daemon that
     // is down has nothing to stop.
+    // Compose drops a service whose profile is not active from `config`,
+    // and a file with an `include:` is read through `config`: an included
+    // `db` with `profiles: [db]` was refused as one the file did not
+    // declare, while `up -d db` would have started it.
+    #[test]
+    fn composes_own_reading_keeps_a_profiled_service() {
+        let (_dir, paths) = home_with_shim(
+            "#!/bin/sh\nall=\nprev=\nfor a in \"$@\"; do\n  \
+             [ \"$a\" = config ] && break\n  \
+             [ \"$prev\" = --profile ] && [ \"$a\" = '*' ] && all=1\n  \
+             prev=$a\ndone\n\
+             if [ -n \"$all\" ]; then\n  \
+             echo '{\"name\":\"p\",\"services\":{\"cache\":{\"image\":\"redis:7\"},\
+             \"db\":{\"image\":\"postgres:16\",\"profiles\":[\"db\"]}}}'\n\
+             else\n  \
+             echo '{\"name\":\"p\",\"services\":{\"cache\":{\"image\":\"redis:7\"}}}'\n\
+             fi\n",
+        );
+        let compose = Compose::new(
+            docker_program(&paths),
+            "p",
+            vec![paths.root().join("compose.yaml")],
+            paths.root(),
+        );
+        let file = compose.config().unwrap();
+        assert_eq!(
+            file.services.keys().collect::<Vec<_>>(),
+            vec!["cache", "db"]
+        );
+    }
+
     #[test]
     fn a_daemon_down_in_the_newer_wording_is_recognised() {
         let (_dir, paths) = home_with_shim(

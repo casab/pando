@@ -204,7 +204,7 @@ def scan():
             files.append(nxt)
             i += 2
             continue
-        if a == "--format" and nxt is not None:
+        if a in ("--format", "--profile") and nxt is not None:
             i += 2
             continue
         if a.startswith("-"):
