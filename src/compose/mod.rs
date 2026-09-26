@@ -70,12 +70,13 @@ pub struct Unresolved {
     /// bind mount among it — is invisible to this reader, so a file with
     /// one is never approved for isolation on this reader's word.
     pub aliases: bool,
-    /// Whether a service or a top-level volume holds a value this reader
-    /// could not read — one behind a YAML tag (`!override`, `!reset`), or a
-    /// flow collection or quoted scalar closed only on a later line — or
-    /// the file goes on past its first YAML document, which compose merges
-    /// the others into. A bind mount written in any of them is as
-    /// invisible as one behind an alias.
+    /// Whether a value this reader takes anything from, in a service or a
+    /// top-level volume, is one it could not read — one behind a YAML tag
+    /// (`!override`, `!reset`), or a flow collection or quoted scalar
+    /// closed only on a later line — or a value anywhere goes on over
+    /// lines this reader takes for keys, or the file goes on past its
+    /// first YAML document, which compose merges the others into. A bind
+    /// mount written in any of them is as invisible as one behind an alias.
     pub unread: bool,
 }
 

@@ -26,7 +26,14 @@ pub fn parse(text: &str) -> Result<ComposeFile> {
     file.unresolved.aliases = read().any(refers_elsewhere);
     // Compose merges every document of a file into the first, so a second
     // one can add anything to a service, a bind mount among it.
-    file.unresolved.unread = more || read().any(holds_unread);
+    file.unresolved.unread = more
+        || top.iter().any(|(key, value)| match (key.as_str(), value) {
+            ("services", Node::Map(services)) => {
+                services.iter().any(|(_, body)| service_unread(body))
+            }
+            ("services" | "volumes", value) => holds_unread(value),
+            (_, value) => holds_spilled(value),
+        });
     for (key, value) in &top {
         match key.as_str() {
             "services" => {
@@ -63,7 +70,7 @@ fn has_key(node: &Node, want: &str) -> bool {
 fn refers_elsewhere(node: &Node) -> bool {
     match node {
         Node::Alias(_) => true,
-        Node::Scalar(_) | Node::Unread => false,
+        Node::Scalar(_) | Node::Unread | Node::Spilled => false,
         Node::Seq(items) => items.iter().any(refers_elsewhere),
         Node::Map(fields) => fields
             .iter()
@@ -74,11 +81,49 @@ fn refers_elsewhere(node: &Node) -> bool {
 /// Whether anything under `node` is a value this reader could not read.
 fn holds_unread(node: &Node) -> bool {
     match node {
-        Node::Unread => true,
+        Node::Unread | Node::Spilled => true,
         Node::Scalar(_) | Node::Alias(_) => false,
         Node::Seq(items) => items.iter().any(holds_unread),
         Node::Map(fields) => fields.iter().any(|(_, value)| holds_unread(value)),
     }
+}
+
+/// Whether anything under `node` is a value that went on over lines this
+/// reader takes for keys of its own (see [`Node::Spilled`]).
+fn holds_spilled(node: &Node) -> bool {
+    match node {
+        Node::Spilled => true,
+        Node::Scalar(_) | Node::Alias(_) | Node::Unread => false,
+        Node::Seq(items) => items.iter().any(holds_spilled),
+        Node::Map(fields) => fields.iter().any(|(_, value)| holds_spilled(value)),
+    }
+}
+
+/// Whether what [`service`] reads of a service body is a value this reader
+/// could not read: the body itself, anything under `ports:`, `volumes:`
+/// and `depends_on:`, or the `image:`, `build:` (and its `context:`),
+/// `container_name:` or `healthcheck:` value.
+///
+/// Nothing else counts, unless it spilled over the keys after it. A
+/// `command:`, an `environment:` or a healthcheck's `test:` list that
+/// Prettier wrapped onto the lines under it holds no port and no mount,
+/// and counting one doubted a file read whole.
+fn service_unread(body: &Node) -> bool {
+    let Node::Map(fields) = body else {
+        return holds_unread(body);
+    };
+    let unread = |node: &Node| *node == Node::Unread;
+    holds_spilled(body)
+        || fields
+            .iter()
+            .any(|(key, value)| match (key.as_str(), value) {
+                ("ports" | "volumes" | "depends_on", value) => holds_unread(value),
+                ("build", Node::Map(build)) => build
+                    .iter()
+                    .any(|(key, value)| key == "context" && unread(value)),
+                ("image" | "build" | "container_name" | "healthcheck", value) => unread(value),
+                _ => false,
+            })
 }
 
 fn service(node: &Node) -> Service {
@@ -135,7 +180,7 @@ fn service(node: &Node) -> Service {
 fn declares_healthcheck(node: &Node) -> bool {
     let fields = match node {
         Node::Map(fields) => fields,
-        Node::Alias(_) | Node::Unread => return true,
+        Node::Alias(_) | Node::Unread | Node::Spilled => return true,
         Node::Scalar(_) | Node::Seq(_) => return false,
     };
     let get = |want: &str| {
@@ -194,7 +239,7 @@ fn port(node: &Node) -> Option<Port> {
                 host: get("host_ip").map(str::to_string),
             })
         }
-        Node::Seq(_) | Node::Alias(_) | Node::Unread => None,
+        Node::Seq(_) | Node::Alias(_) | Node::Unread | Node::Spilled => None,
     }
 }
 
@@ -261,7 +306,7 @@ fn mount(node: &Node) -> Option<Mount> {
                 Some(_) => None,
             }
         }
-        Node::Seq(_) | Node::Alias(_) | Node::Unread => None,
+        Node::Seq(_) | Node::Alias(_) | Node::Unread | Node::Spilled => None,
     }
 }
 
@@ -288,10 +333,15 @@ enum Node {
     /// Kept as a node of its own rather than read as the text `*name`, so
     /// the file can say it was not read whole.
     Alias(String),
-    /// A value this reader could not read (see [`unread`]). Nothing in it
-    /// is taken for a port or a mount, and the file says it was not read
-    /// whole.
+    /// A value this reader could not read (see [`unread`] and
+    /// [`value_on`]). Nothing in it is taken for a port or a mount, and
+    /// where this reader reads it the file says it was not read whole.
     Unread,
+    /// An unread flow collection or quoted scalar that goes on over a line
+    /// no deeper than its own key, which compose takes as part of it and
+    /// this reader as a key of its own. The keys after it may be misread
+    /// too, so it says the file was not read whole wherever it sits.
+    Spilled,
 }
 
 impl Node {
@@ -408,7 +458,7 @@ fn parse_block(lines: &[Line], at: &mut usize, indent: usize) -> Result<Node> {
     }
     if opens_a_value(text) {
         *at += 1;
-        return Ok(one_line(text));
+        return Ok(value_on(lines, *at, text, indent));
     }
     parse_map(lines, at, indent)
 }
@@ -420,7 +470,15 @@ fn parse_seq(lines: &[Line], at: &mut usize, indent: usize) -> Result<Node> {
             break;
         }
         let trimmed = line.text.trim_start();
-        if line.indent > indent || !trimmed.starts_with('-') {
+        // A line under an entry, or one closing its brackets, goes on with
+        // that entry's value. Ending the sequence there left the entries
+        // after it to the mapping above, which ended at the first of them
+        // and lost every key after it.
+        if line.indent > indent || closes_only(trimmed) {
+            *at += 1;
+            continue;
+        }
+        if !trimmed.starts_with('-') {
             break;
         }
         let rest = without_anchor(trimmed[1..].trim_start());
@@ -465,7 +523,7 @@ fn parse_seq(lines: &[Line], at: &mut usize, indent: usize) -> Result<Node> {
                 }
                 items.push(Node::Map(entries));
             }
-            None => items.push(one_line(&rest)),
+            None => items.push(value_on(lines, *at, &rest, indent)),
         }
     }
     Ok(Node::Seq(items))
@@ -505,7 +563,7 @@ fn parse_map(lines: &[Line], at: &mut usize, indent: usize) -> Result<Node> {
 fn inline_value(lines: &[Line], at: &mut usize, value: String, indent: usize) -> Result<Node> {
     let value = without_anchor(&value);
     if !value.is_empty() {
-        return Ok(one_line(value));
+        return Ok(value_on(lines, *at, value, indent));
     }
     let Some(next) = lines.get(*at) else {
         return Ok(Node::Scalar(String::new()));
@@ -551,6 +609,102 @@ fn one_line(text: &str) -> Node {
         .or_else(|| flow(text))
         .or_else(|| unread(text))
         .unwrap_or_else(|| Node::Scalar(unquote(text)))
+}
+
+/// The value `text` on the line just read, the one before `at`, whose key
+/// or `-` sits at `indent`.
+///
+/// A flow collection or quoted scalar still open at the end of its line is
+/// not read. Every block here skips the lines deeper than its own column
+/// and a line of closing brackets at it, so when the value goes on only
+/// over such lines, what follows it is read as compose reads it and the
+/// value is [`Node::Unread`]. Compose also takes one that goes on over a
+/// line no deeper than its key, which this reader would read as a key of
+/// its own; that one is [`Node::Spilled`].
+fn value_on(lines: &[Line], at: usize, text: &str, indent: usize) -> Node {
+    let start = without_properties(text);
+    if !start.starts_with(['[', '{', '"', '\'']) {
+        return one_line(text);
+    }
+    let mut flow = Flow::default();
+    flow.read(start);
+    if !flow.open() {
+        return one_line(text);
+    }
+    for line in &lines[at..] {
+        if line.indent < indent || (line.indent == indent && !closes_only(&line.text)) {
+            return Node::Spilled;
+        }
+        flow.read(&line.text);
+        if !flow.open() {
+            return Node::Unread;
+        }
+    }
+    // Never closed, which compose does not read either.
+    Node::Spilled
+}
+
+/// How far a flow collection or quoted scalar read so far is from closed.
+#[derive(Default)]
+struct Flow {
+    /// `[` and `{` not yet closed.
+    depth: usize,
+    /// The quote a scalar is still open in.
+    quote: Option<char>,
+}
+
+impl Flow {
+    fn open(&self) -> bool {
+        self.depth > 0 || self.quote.is_some()
+    }
+
+    /// Reads on through one more line of it. A quote starts a scalar only
+    /// where a token does, so the `'` in `[it's]` opens nothing.
+    fn read(&mut self, text: &str) {
+        let mut chars = text.chars().peekable();
+        let mut previous = ' ';
+        while let Some(c) = chars.next() {
+            match self.quote {
+                Some('"') if c == '\\' => {
+                    chars.next();
+                }
+                Some('\'') if c == '\'' && chars.peek() == Some(&'\'') => {
+                    chars.next();
+                }
+                Some(quote) if c == quote => self.quote = None,
+                Some(_) => {}
+                None => match c {
+                    '"' | '\'' if previous.is_whitespace() || "[{,:".contains(previous) => {
+                        self.quote = Some(c)
+                    }
+                    '[' | '{' => self.depth += 1,
+                    ']' | '}' => self.depth = self.depth.saturating_sub(1),
+                    _ => {}
+                },
+            }
+            previous = c;
+        }
+    }
+}
+
+/// Whether a line holds nothing but brackets closing a flow collection.
+fn closes_only(text: &str) -> bool {
+    text.trim()
+        .chars()
+        .all(|c| matches!(c, ']' | '}' | ',' | ' '))
+}
+
+/// `text` without the anchor and the tag in front of it, if any: where the
+/// value itself starts.
+fn without_properties(text: &str) -> &str {
+    let mut text = text.trim_start();
+    while text.starts_with(['&', '!']) {
+        text = match text.split_once(char::is_whitespace) {
+            Some((_, rest)) => rest.trim_start(),
+            None => "",
+        };
+    }
+    text
 }
 
 /// Whether `text` starts a value rather than a mapping entry: an alias, a

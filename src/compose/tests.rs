@@ -917,6 +917,99 @@ fn a_value_this_reader_cannot_read_is_never_approved_on_half_a_file() {
     }
 }
 
+// Prettier wraps a flow list too long for its line onto the lines under
+// it. Under a key this reader never reads it hides no port and no mount,
+// but it marked the file half read, so `doctor` and `signals` doubted a
+// file read whole and an isolated start with no Docker to ask refused it.
+#[test]
+fn a_value_spread_over_several_lines_where_nothing_is_read_leaves_the_file_whole() {
+    let file = parse(
+        "services:\n  db:\n    image: postgres:16\n    command: [\n      \"postgres\",\n      \
+         \"-c\",\n      \"fsync=off\"\n    ]\n    environment: [\n      \"POSTGRES_PASSWORD=x\"\n    \
+         ]\n    healthcheck:\n      test:\n        [\n          \"CMD-SHELL\",\n          \
+         \"pg_isready -U postgres\",\n        ]\n    volumes:\n      - \
+         pgdata:/var/lib/postgresql/data\nvolumes:\n  pgdata:\n",
+    )
+    .unwrap();
+    assert!(!file.unresolved.any(), "{:?}", file.unresolved);
+    assert!(file.services["db"].healthcheck);
+    assert_eq!(
+        file.services["db"].volumes,
+        vec![Mount::Named("pgdata".to_string())]
+    );
+    assert_eq!(
+        resolve_included(&file, &["db".into()], &[]).unwrap(),
+        vec![("db".to_string(), 5432)]
+    );
+}
+
+// What the reader does read still counts wherever it sits: a service body,
+// its `ports:`, or a top-level volume's body spread over several lines.
+#[test]
+fn a_value_spread_over_several_lines_where_something_is_read_still_counts() {
+    for text in [
+        "services:\n  db: {\n    image: postgres:16,\n    volumes: [\"./pgdata:/data\"]\n  }\n",
+        "services:\n  db:\n    image: postgres:16\n    ports: [\n      \"5432:5432\"\n    ]\n",
+        "services:\n  db:\n    image: postgres:16\n    volumes:\n      - pgdata:/data\n\
+         volumes:\n  pgdata: {\n    driver_opts: {o: bind, device: /srv/pg}\n  }\n",
+        "services: {\n  db: {image: postgres:16}\n}\n",
+    ] {
+        let file = parse(text).unwrap();
+        assert!(file.unresolved.unread, "{text}");
+    }
+}
+
+// Compose 5.0.1 reads each of these with the bind mount in it: a flow list
+// or a quote may go on over lines no deeper than its key. This reader took
+// those lines for keys of the services map, ended `db` there and never saw
+// its `volumes:`, so the value counts even under a key nothing reads.
+#[test]
+fn a_value_that_goes_on_over_the_keys_after_it_counts_wherever_it_sits() {
+    for spilled in [
+        "    environment: [\n  \"POSTGRES_PASSWORD=x\"\n  ]\n",
+        "    command: \"postgres\n  -c fsync=off\"\n",
+    ] {
+        let text = format!(
+            "services:\n  db:\n    image: postgres:16\n{spilled}    volumes:\n      - \
+             ./pgdata:/var/lib/postgresql/data\n"
+        );
+        let file = parse(&text).unwrap();
+        assert!(file.unresolved.unread, "{text}");
+        let err = format!(
+            "{:#}",
+            resolve_included(&file, &["db".into()], &[]).unwrap_err()
+        );
+        assert!(err.contains("docker compose config"), "{err}");
+    }
+    // Under a top-level key nothing reads, its lines are top-level keys to
+    // this reader, and one of them replaced `db` with a service of nothing.
+    let file = parse(
+        "services:\n  db:\n    image: postgres:16\n    volumes:\n      - \
+         ./pgdata:/var/lib/postgresql/data\nx-note: [\nservices: {db: {image: postgres:16}}\n]\n",
+    )
+    .unwrap();
+    assert!(file.unresolved.unread);
+}
+
+// An entry of a sequence written at its key's own column went on over the
+// line under it, the sequence ended there, and the mapping above ended at
+// the next entry: every key after it, `volumes:` among them, was lost.
+#[test]
+fn an_entry_continued_under_itself_ends_neither_its_sequence_nor_the_service() {
+    let file = parse(
+        "services:\n  db:\n    image: postgres:16\n    command:\n    - \"postgres\n      \
+         -c fsync=off\"\n    - -c\n    - [\n      \"x\"\n    ]\n    - max_connections=200\n    \
+         volumes:\n    - ./pgdata:/var/lib/postgresql/data\n",
+    )
+    .unwrap();
+    assert!(!file.unresolved.any(), "{:?}", file.unresolved);
+    assert_eq!(
+        file.services["db"].volumes,
+        vec![Mount::Bind("./pgdata".to_string())]
+    );
+    assert!(resolve_included(&file, &["db".into()], &[]).is_err());
+}
+
 // A flow list on the line under its key is read, not taken for the first
 // key of a mapping, and nor is a flow mapping written as a service's body.
 #[test]
