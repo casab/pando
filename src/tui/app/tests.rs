@@ -388,6 +388,43 @@ fn service_health_reaches_the_app_off_the_ui_thread() {
     );
 }
 
+// Every request for a discovery started one, so a backlog of ticks — or a
+// state lock held a long time — stacked up workers queued on the lock. One
+// asked for while one runs is still run, once, after it.
+#[test]
+fn a_discovery_asked_for_while_one_runs_runs_once_after_it() {
+    let mut app = test_app(&["feat+one"]);
+    let rx = app.event_rx.take().expect("the app owns its receiver");
+    let next_discovery = |within: Duration| {
+        let deadline = Instant::now() + within;
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match rx.recv_timeout(left) {
+                Ok(event @ AppEvent::Discovered(_)) => return Some(event),
+                Ok(_) => {}
+                Err(_) => return None,
+            }
+        }
+        None
+    };
+    for _ in 0..3 {
+        app.spawn_discovery();
+    }
+    assert!(app.discovering && app.discover_again);
+    let landed = next_discovery(Duration::from_secs(10)).expect("the first lands");
+    app.handle_event(landed);
+    assert!(
+        app.discovering && !app.discover_again,
+        "the one asked for meanwhile runs now"
+    );
+    let landed = next_discovery(Duration::from_secs(10)).expect("and lands");
+    app.handle_event(landed);
+    assert!(!app.discovering);
+    assert!(
+        next_discovery(Duration::from_millis(500)).is_none(),
+        "two workers for three requests, not three"
+    );
+}
+
 fn type_str(app: &mut App, text: &str) {
     for c in text.chars() {
         press(app, KeyCode::Char(c));

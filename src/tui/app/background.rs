@@ -359,7 +359,15 @@ impl App {
         });
     }
 
-    pub fn spawn_discovery(&self) {
+    /// A fresh listing and a full refresh, off the UI thread. One at a
+    /// time: asked for while one runs, it runs again once that one lands,
+    /// rather than stacking up behind the state lock.
+    pub fn spawn_discovery(&mut self) {
+        if self.discovering {
+            self.discover_again = true;
+            return;
+        }
+        self.discovering = true;
         let paths = self.paths.clone();
         let tx = self.event_tx.clone();
         let known_base = if self.tick.is_multiple_of(super::GIT_ALL_EVERY) {

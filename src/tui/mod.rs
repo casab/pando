@@ -12,6 +12,7 @@ use notify_debouncer_full::{DebouncedEvent, Debouncer, RecommendedCache, new_deb
 use ratatui::crossterm::event;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::thread;
 use std::time::Duration;
@@ -71,7 +72,8 @@ fn main_loop(
 
     let gate = Arc::new(InputGate::default());
     spawn_input_thread(app.event_tx.clone(), Arc::clone(&gate));
-    spawn_tick_thread(app.event_tx.clone());
+    let tick_waiting = Arc::new(AtomicBool::new(false));
+    spawn_tick_thread(app.event_tx.clone(), Arc::clone(&tick_waiting));
     // The watcher is an optimisation for pando's own worktrees; the slow
     // tick's porcelain refresh is the source of truth, and it sees adopted
     // worktrees anywhere on disk.
@@ -82,12 +84,12 @@ fn main_loop(
         let Ok(ev) = event_rx.recv() else {
             return Ok(());
         };
-        let mut redraw = app.handle_event(ev);
+        let mut redraw = deliver(app, ev, &tick_waiting);
         // Coalesce whatever piled up while drawing, so a burst (typing, a
         // resize, an enrichment flood) costs one redraw.
         loop {
             match event_rx.try_recv() {
-                Ok(more) => redraw |= app.handle_event(more),
+                Ok(more) => redraw |= deliver(app, more, &tick_waiting),
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
             }
@@ -168,10 +170,27 @@ fn spawn_input_thread(tx: Sender<AppEvent>, gate: Arc<InputGate>) {
     });
 }
 
-fn spawn_tick_thread(tx: Sender<AppEvent>) {
+/// Hands an event to the app. A tick taken lets the tick thread send the
+/// next one.
+fn deliver(app: &mut app::App, ev: AppEvent, tick_waiting: &AtomicBool) -> bool {
+    if matches!(ev, AppEvent::Tick) {
+        tick_waiting.store(false, Ordering::Release);
+    }
+    app.handle_event(ev)
+}
+
+/// A tick every `TICK_INTERVAL`, and never a second one while the last is
+/// still waiting in the channel. A tick is time passing, not work to do:
+/// while a shell or editor has the terminal the loop takes nothing, and
+/// every tick queued meanwhile would be replayed on the way back, with a
+/// discovery for every twentieth of them.
+fn spawn_tick_thread(tx: Sender<AppEvent>, waiting: Arc<AtomicBool>) {
     thread::spawn(move || {
         loop {
             thread::sleep(TICK_INTERVAL);
+            if waiting.swap(true, Ordering::AcqRel) {
+                continue;
+            }
             if tx.send(AppEvent::Tick).is_err() {
                 return;
             }
@@ -288,6 +307,28 @@ mod tests {
             &watched(),
             &[event_with_paths(&[PathBuf::from("/somewhere/else")])]
         ));
+    }
+
+    // A tick is time, not work: a suspended shell's half hour of them was
+    // replayed on the way back, and every twentieth started a discovery.
+    #[test]
+    fn a_tick_not_yet_taken_is_not_joined_by_another() {
+        let (tx, rx) = mpsc::channel();
+        let waiting = Arc::new(AtomicBool::new(false));
+        spawn_tick_thread(tx, Arc::clone(&waiting));
+        let first = rx.recv_timeout(Duration::from_secs(10));
+        assert!(matches!(first, Ok(AppEvent::Tick)), "no first tick");
+        thread::sleep(TICK_INTERVAL * 4);
+        assert!(rx.try_recv().is_err(), "a second tick queued behind it");
+        waiting.store(false, Ordering::Release);
+        let next = rx.recv_timeout(Duration::from_secs(10));
+        assert!(
+            matches!(next, Ok(AppEvent::Tick)),
+            "and none once it was taken"
+        );
+        // Closed, so the thread's next send fails and it ends.
+        drop(rx);
+        waiting.store(false, Ordering::Release);
     }
 
     #[test]

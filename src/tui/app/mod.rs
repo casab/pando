@@ -188,6 +188,12 @@ pub struct App {
     /// One refresh at a time. A scan of listening sockets can take a moment,
     /// and stacking them up behind a slow one helps nobody.
     pub refreshing: bool,
+    /// One discovery at a time: each is a `git worktree list` and a full
+    /// refresh behind the state lock. One asked for while another runs is
+    /// remembered, and runs when it lands, so its reason is still read.
+    pub discovering: bool,
+    /// A discovery was asked for while one ran.
+    pub discover_again: bool,
     /// Whether the project's services are answering. Computed on the
     /// refresh worker, never in a paint or a key handler.
     pub service_health: ServiceHealth,
@@ -311,6 +317,8 @@ impl App {
             service_health: ServiceHealth::default(),
             question_checked: Vec::new(),
             refreshing: false,
+            discovering: false,
+            discover_again: false,
             log_tails: LogTails::default(),
             tail_index: 0,
             tail_scroll: 0,
@@ -407,20 +415,23 @@ impl App {
                 self.spawn_discovery();
                 false
             }
-            AppEvent::Discovered(result) => match *result {
-                Ok(snapshot) => {
-                    let fresh = self.apply_snapshot(snapshot);
-                    if !fresh.is_empty() {
-                        self.hydrate_from_cache();
-                        self.spawn_enrichment(Some(fresh));
+            AppEvent::Discovered(result) => {
+                self.discovering = false;
+                match *result {
+                    Ok(snapshot) => {
+                        let fresh = self.apply_snapshot(snapshot);
+                        if !fresh.is_empty() {
+                            self.hydrate_from_cache();
+                            self.spawn_enrichment(Some(fresh));
+                        }
                     }
-                    true
+                    Err(e) => self.set_error(format!("refresh failed: {e}")),
                 }
-                Err(e) => {
-                    self.set_error(format!("refresh failed: {e}"));
-                    true
+                if std::mem::take(&mut self.discover_again) {
+                    self.spawn_discovery();
                 }
-            },
+                true
+            }
             AppEvent::Enrich(update) => {
                 self.note_commit_age(&update.name, update.head_age.as_deref());
                 let changed = match self.worktrees.iter_mut().find(|w| w.name == update.name) {
@@ -1296,6 +1307,8 @@ impl App {
             service_health: ServiceHealth::default(),
             question_checked: Vec::new(),
             refreshing: false,
+            discovering: false,
+            discover_again: false,
             log_tails: LogTails::default(),
             tail_index: 0,
             tail_scroll: 0,
