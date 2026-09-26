@@ -731,6 +731,46 @@ fn a_library_crate_matches_no_framework() {
     assert_eq!(framework(dir.path(), &s).unwrap().name, "Rust");
 }
 
+// `go run .` in a module whose root is not a main package fails on every
+// start: "no Go files" where the commands live under `cmd/`, "is not a
+// main package" in a library.
+#[test]
+fn a_go_module_whose_root_is_not_a_main_package_matches_no_framework() {
+    for files in [
+        &[("go.mod", "module x\n"), ("lib.go", "package lib\n")][..],
+        &[
+            ("go.mod", "module x\n"),
+            ("cmd/api/main.go", "package main\n"),
+            ("internal/db/db.go", "package db\n"),
+        ],
+        &[
+            ("go.mod", "module x\n"),
+            ("x.go", "package x\n"),
+            ("main_test.go", "package main\n"),
+        ],
+        &[
+            ("go.mod", "module x\n"),
+            ("x.go", "// package main\npackage x\n"),
+        ],
+    ] {
+        let (dir, s) = marker_fixture(files);
+        assert!(framework(dir.path(), &s).is_none(), "{files:?}");
+        assert!(dev_cmd_proposal(&s, framework(dir.path(), &s)).is_none());
+    }
+
+    let (dir, s) = marker_fixture(&[
+        ("go.mod", "module x\n"),
+        (
+            "main.go",
+            "// Copyright the authors.\n\n//go:build !windows\n\n/* The server.\n   It serves. */\n\
+             package main // the command\n",
+        ),
+    ]);
+    let rule = framework(dir.path(), &s);
+    assert_eq!(rule.unwrap().name, "Go");
+    assert_eq!(values(&dev_of(&s, rule)), vec!["go run ."]);
+}
+
 // `config.ru` is every Rack app's and `bin/dev` is a helper in any
 // language: read as Rails, a Sinatra app and a Go repo were both given
 // `bin/rails server`, which is not there to run.
@@ -738,7 +778,11 @@ fn a_library_crate_matches_no_framework() {
 fn a_file_other_projects_have_too_does_not_make_one_rails() {
     let (dir, s) = marker_fixture(&[("Gemfile", ""), ("config.ru", "run App\n")]);
     assert!(framework(dir.path(), &s).is_none());
-    let (dir, s) = marker_fixture(&[("go.mod", "module x\n"), ("bin/dev", "#!/bin/sh\n")]);
+    let (dir, s) = marker_fixture(&[
+        ("go.mod", "module x\n"),
+        ("main.go", "package main\n"),
+        ("bin/dev", "#!/bin/sh\n"),
+    ]);
     assert_eq!(framework(dir.path(), &s).unwrap().name, "Go");
     let (dir, s) = marker_fixture(&[
         ("config.ru", ""),

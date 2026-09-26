@@ -68,6 +68,7 @@ fn passes(root: &Path, guard: Guard) -> bool {
     match guard {
         Guard::Marker => true,
         Guard::BinaryCrate => binary_crate(root),
+        Guard::GoMain => go_main(root),
         Guard::Mentions(files, needle) => files.iter().any(|file| {
             std::fs::read_to_string(root.join(file)).is_ok_and(|text| text.contains(needle))
         }),
@@ -102,6 +103,61 @@ fn binary_crate(root: &Path) -> bool {
     std::fs::read_to_string(root.join("Cargo.toml"))
         .map(|text| text.contains("[[bin]]"))
         .unwrap_or(false)
+}
+
+/// Whether a Go module's root is a main package: one of its `.go` files,
+/// tests aside, declares `package main`. A library, and a module whose
+/// commands live under `cmd/`, are level zero as a library crate is:
+/// `go run .` there fails on every start.
+fn go_main(root: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        name.ends_with(".go")
+            && !name.ends_with("_test.go")
+            && std::fs::read_to_string(entry.path())
+                .is_ok_and(|text| go_package(&text) == Some("main"))
+    })
+}
+
+/// The package a Go file declares: the first `package` clause, past the
+/// comments and build constraints before it.
+fn go_package(text: &str) -> Option<&str> {
+    let mut in_block = false;
+    for line in text.lines() {
+        let mut line = line.trim();
+        if in_block {
+            let Some((_, rest)) = line.split_once("*/") else {
+                continue;
+            };
+            in_block = false;
+            line = rest.trim();
+        }
+        while let Some(rest) = line.strip_prefix("/*") {
+            match rest.split_once("*/") {
+                Some((_, after)) => line = after.trim(),
+                None => {
+                    in_block = true;
+                    line = "";
+                }
+            }
+        }
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        let clause = line.strip_prefix("package")?;
+        if !clause.starts_with(char::is_whitespace) {
+            return None;
+        }
+        return clause
+            .split_whitespace()
+            .next()
+            .map(|name| name.trim_end_matches(';'));
+    }
+    None
 }
 
 #[cfg(test)]
