@@ -247,9 +247,11 @@ impl App {
     where
         F: FnOnce() -> Result<PendingOutcome, String> + Send + 'static,
     {
+        // By what the spinner calls it: a stop-all has no worktree's name,
+        // and a create's name is the directory, not the branch typed.
         if let Some(p) = &self.pending {
-            let busy = p.name.clone();
-            self.set_error(format!("already busy with {busy}"));
+            let busy = format!("{} {}", p.kind.verb(), p.label);
+            self.set_error(format!("already busy {busy}"));
             return false;
         }
         let (tx, rx) = mpsc::channel();

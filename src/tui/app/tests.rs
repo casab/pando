@@ -3790,6 +3790,25 @@ fn a_spinner_is_not_kept_in_the_history() {
     assert!(app.messages.is_empty());
 }
 
+// A stop-all has no worktree's name, so the refusal named nothing; a
+// create's name is the directory, not the branch that was typed.
+#[test]
+fn a_second_action_is_refused_with_what_the_first_is_called() {
+    // Nothing is polled, so the first action is still in flight however
+    // soon its worker gives up on paths that do not exist.
+    let mut app = test_app(&["feat+one"]);
+    app.stop_everything();
+    press(&mut app, KeyCode::Char('s'));
+    let (message, _) = app.active_status().unwrap();
+    assert_eq!(message, "already busy stopping everything");
+
+    let mut app = test_app(&["feat+one"]);
+    assert!(app.spawn_create("feat/pay".into(), None));
+    press(&mut app, KeyCode::Char('s'));
+    let (message, _) = app.active_status().unwrap();
+    assert_eq!(message, "already busy creating feat/pay");
+}
+
 // A start blocked on a question is not starting anything: the status line
 // and the row say it is waiting, rather than counting seconds.
 #[test]
@@ -3821,7 +3840,7 @@ fn a_message_said_while_an_action_runs_is_not_spun_over() {
     }
     assert_eq!(
         app.active_status(),
-        Some(("already busy with feat+one", true))
+        Some(("already busy starting feat/one", true))
     );
 
     app.status.as_mut().unwrap().at = Instant::now() - ERROR_TTL - Duration::from_secs(1);
