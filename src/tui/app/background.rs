@@ -237,22 +237,7 @@ impl App {
         if !snapshot.notices.is_empty() {
             self.set_error(snapshot.notices.join(" · "));
         }
-        // A worktree `n` just made takes the cursor the moment it is
-        // listed. A filter that would hide it is cleared, or the cursor
-        // has nowhere to go.
-        let arrived = self
-            .select_on_arrival
-            .take_if(|name| self.worktrees.iter().any(|w| w.name == *name));
-        let keep = match arrived {
-            Some(name) => {
-                self.filter.clear();
-                self.mode = super::Mode::Normal;
-                self.tail_index = 0;
-                self.tail_scroll = 0;
-                Some(name)
-            }
-            None => keep,
-        };
+        let keep = self.take_arrival().or(keep);
         self.refilter_keeping(keep.clone(), row);
         // The worktree under the cursor went away, and the cursor is on
         // its neighbour now: whose tail it shows starts over, as a move
@@ -263,6 +248,28 @@ impl App {
             self.tail_scroll = 0;
         }
         fresh
+    }
+
+    /// The worktree `n` just made, once a discovery has listed it: it takes
+    /// the cursor, and a filter that would hide it is cleared, or the
+    /// cursor has nowhere to go.
+    ///
+    /// Not while the filter line has the keyboard. Out of filter mode, the
+    /// rest of what is being typed lands on the list as commands — `d` ⏎
+    /// removes the worktree just made — so the arrival waits for the
+    /// filter to be done with.
+    pub(super) fn take_arrival(&mut self) -> Option<String> {
+        if self.typing_filter() {
+            return None;
+        }
+        let name = self
+            .select_on_arrival
+            .take_if(|name| self.worktrees.iter().any(|w| w.name == *name))?;
+        self.filter.clear();
+        self.mode = super::Mode::Normal;
+        self.tail_index = 0;
+        self.tail_scroll = 0;
+        Some(name)
     }
 
     pub(super) fn hydrate_from_cache(&mut self) {

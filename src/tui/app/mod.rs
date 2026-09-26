@@ -546,11 +546,15 @@ impl App {
                     | Modal::Question { .. }
             )
         );
-        let filtering = self.mode == Mode::Filter && matches!(self.view, View::List);
         let searching = self
             .log_view()
             .is_some_and(|view| view.search_mode == SearchMode::Typing);
-        modal || filtering || searching
+        modal || self.typing_filter() || searching
+    }
+
+    /// Whether the list's filter line has the keyboard.
+    fn typing_filter(&self) -> bool {
+        self.mode == Mode::Filter && matches!(self.view, View::List)
     }
 
     /// A question that arrived while somebody was typing, opened once they
@@ -800,10 +804,9 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 self.filter.clear();
-                self.mode = Mode::Normal;
-                self.refilter();
+                self.end_filter();
             }
-            KeyCode::Enter => self.mode = Mode::Normal,
+            KeyCode::Enter => self.end_filter(),
             KeyCode::Backspace => {
                 self.filter.pop();
                 self.refilter();
@@ -816,6 +819,16 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Leaves the filter line, for a worktree `n` made while it was being
+    /// typed if one arrived, and for the row it was on otherwise.
+    fn end_filter(&mut self) {
+        self.mode = Mode::Normal;
+        let keep = self
+            .take_arrival()
+            .or_else(|| self.selected_worktree().map(|w| w.name.clone()));
+        self.refilter_keeping(keep, 0);
     }
 
     // ---- processes -------------------------------------------------------

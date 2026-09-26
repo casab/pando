@@ -679,6 +679,42 @@ fn a_created_worktree_is_selected_when_it_arrives() {
     assert!(app.select_on_arrival.is_none(), "and it is done with");
 }
 
+// Not in the middle of a filter being typed: the arrival switched the list
+// out of filter mode, and the rest of the filter ran as list keys — `d` ⏎
+// removed the worktree just made. It waits for the filter to be done with.
+#[test]
+fn a_created_worktree_waits_for_a_filter_being_typed() {
+    for end in [KeyCode::Enter, KeyCode::Esc] {
+        let mut app = test_app(&["feat+one", "fix+two"]);
+        app.select_on_arrival = Some("feat+new".to_string());
+        press(&mut app, KeyCode::Char('/'));
+        type_str(&mut app, "fi");
+        app.apply_snapshot(Snapshot {
+            main: wt("acme-shop"),
+            worktrees: vec![wt("feat+one"), wt("fix+two"), wt("feat+new")],
+            created_by_pando: BTreeMap::new(),
+            state: State::new(),
+            warning: None,
+            notices: Vec::new(),
+            default_base: None,
+        });
+        assert_eq!(app.mode, Mode::Filter, "{end:?}: still typing");
+        type_str(&mut app, "xd");
+        assert_eq!(app.filter, "fixd", "{end:?}: the keys stay the filter's");
+        assert!(app.modal.is_none(), "{end:?}: d opened nothing");
+        assert!(app.select_on_arrival.is_some(), "{end:?}: it waits");
+
+        press(&mut app, end);
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(
+            app.selected_worktree().map(|w| w.name.as_str()),
+            Some("feat+new"),
+            "{end:?}: and takes the cursor once the filter is done with"
+        );
+        assert!(app.select_on_arrival.is_none(), "{end:?}");
+    }
+}
+
 // A worktree removed while the cursor is on it — by `d`, or from the CLI —
 // leaves the cursor on its neighbour, not back at the top of a long list.
 #[test]
