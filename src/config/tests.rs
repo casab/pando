@@ -1620,6 +1620,37 @@ fn two_processes_whose_names_differ_only_in_case_are_refused() {
     assert!(e.contains("differ only in case"), "{e}");
 }
 
+// Two services are held apart by an exact lookup, so `redis` and `Redis`
+// passed, and on macOS both wrote logs/<worktree>/redis.log.
+#[test]
+fn two_services_whose_names_differ_only_in_case_are_refused() {
+    let f = fixture();
+    for (services, escape) in [
+        (
+            "[[services]]\nkind = \"native\"\nname = \"redis\"\n\n\
+             [[services]]\nkind = \"compose\"\nfile = \"c.yml\"\ninclude = [\"Redis\"]\n",
+            "drop it from `include`",
+        ),
+        (
+            "[[services]]\nkind = \"compose\"\nfile = \"c.yml\"\ninclude = [\"redis\", \"Redis\"]\n",
+            "drop it from `include`",
+        ),
+        (
+            "[[services]]\nkind = \"native\"\nname = \"redis\"\n\n\
+             [[services]]\nkind = \"native\"\nname = \"Redis\"\n",
+            "rename it",
+        ),
+    ] {
+        write_home(&f, services);
+        let e = format!("{:#}", load(&f.paths).unwrap_err());
+        assert!(
+            e.contains("the service \"Redis\" differs only in case from the service \"redis\""),
+            "{e}"
+        );
+        assert!(e.contains(escape), "{e}");
+    }
+}
+
 #[test]
 fn a_native_service_name_that_is_a_path_is_refused() {
     let f = fixture();

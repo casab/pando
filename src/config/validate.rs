@@ -237,6 +237,18 @@ fn claim_service_name(
              port and belongs to one thing; rename the process's role, or {escape}"
         );
     }
+    // Two services whose names differ only in case are two roles, but on
+    // a filesystem that ignores case they are one log, and whichever
+    // starts last truncates the other's.
+    if let Some((other, _)) = role_owner.iter().find(|(role, owner)| {
+        owner.starts_with("the service") && crate::paths::same_log_source(role, name)
+    }) {
+        bail!(
+            "the service {name:?} differs only in case from the service {other:?} — on a \
+             filesystem that ignores it, as macOS's does, both write the one log \
+             logs/<worktree>/{name}.log; {escape}"
+        );
+    }
     // A process owning some other role still writes its log under its
     // own name, and whichever of the two starts last truncates the other's.
     if let Some(process) = config
