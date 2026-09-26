@@ -165,6 +165,11 @@ pub struct Target {
     /// lines are dropped: they are not commands.
     #[serde(default)]
     pub recipe: Vec<String>,
+    /// Whether the file sets something at its top that every recipe runs
+    /// with: make's `export` or `include`, a justfile's `set` or `export`.
+    /// Not published, so a target keeps the shape `agent/json.md` gives it.
+    #[serde(skip)]
+    pub file_sets_env: bool,
 }
 
 impl Target {
@@ -172,7 +177,7 @@ impl Target {
     /// runner loses nothing. See `target_candidates` for why the bar is
     /// this high.
     pub fn sole_command(&self) -> Option<&str> {
-        if !self.prereqs.is_empty() {
+        if !self.prereqs.is_empty() || self.file_sets_env {
             return None;
         }
         let [only] = self.recipe.as_slice() else {
@@ -219,6 +224,7 @@ pub(super) fn parse_targets(root: &Path) -> BTreeMap<String, Target> {
             continue;
         };
         let lines: Vec<&str> = text.lines().collect();
+        let file_sets_env = sets_env(&lines, tool);
         for (i, line) in lines.iter().enumerate() {
             // A target starts at column zero and its name is one word.
             if line.starts_with([' ', '\t']) {
@@ -268,10 +274,46 @@ pub(super) fn parse_targets(root: &Path) -> BTreeMap<String, Target> {
                 tool: tool.to_string(),
                 prereqs: before.split_whitespace().map(str::to_string).collect(),
                 recipe,
+                file_sets_env,
             });
         }
     }
     out
+}
+
+/// Whether a makefile or justfile has a line at its top level that changes
+/// the environment or the shell of every recipe in it.
+///
+/// For make: `export` and `.EXPORT_ALL_VARIABLES`, which hand variables to
+/// each recipe's shell; `include`, `-include` and `sinclude`, because the
+/// file included is usually `.env` beside an `export`, or a makefile that
+/// exports on its own; and an assignment to `SHELL` or `.SHELLFLAGS`. For
+/// just: any `set`, among them `dotenv-load`, `export`, `shell` and
+/// `working-directory`, and `export NAME := …`. A recipe line lifted out of
+/// such a file runs without any of it.
+fn sets_env(lines: &[&str], tool: &str) -> bool {
+    lines
+        .iter()
+        .filter(|line| !line.starts_with([' ', '\t']))
+        .any(|line| {
+            let head = line
+                .split(|c: char| c.is_whitespace() || matches!(c, ':' | '=' | '?' | '+' | '!'))
+                .next()
+                .unwrap_or("");
+            match tool {
+                "just" => matches!(head, "set" | "export"),
+                _ => matches!(
+                    head,
+                    "export"
+                        | ".EXPORT_ALL_VARIABLES"
+                        | "include"
+                        | "-include"
+                        | "sinclude"
+                        | "SHELL"
+                        | ".SHELLFLAGS"
+                ),
+            }
+        })
 }
 
 /// The indented recipe under the target on line `at`, one entry per command.

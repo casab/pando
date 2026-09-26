@@ -319,7 +319,11 @@ pub(super) fn dev_cmd_proposal(
 /// is make's own, `$$` included, which is how a makefile escapes one *for*
 /// the shell; `{{` for just, which passes `$VAR` through untouched. A `-`
 /// or `+` line prefix disqualifies it too, because those say how the runner
-/// should treat the command and vanish with the runner. There the original
+/// should treat the command and vanish with the runner. So does a file
+/// whose top level changes every recipe's environment — `include .env` and
+/// `export`, just's `set dotenv-load` — because pando does not load that
+/// file into the process, and the server would start without the variables
+/// the runner hands it. There the original
 /// reasoning still holds and is kept: the recipe is the command, and
 /// leaving `make` in the middle only adds a process between pando and the
 /// server, with its own output and its own view of a signal.

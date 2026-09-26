@@ -236,6 +236,67 @@ fn a_line_prefix_that_is_a_directive_keeps_the_target_with_its_runner() {
     assert_eq!(targets["dev"].command("dev"), "make dev");
 }
 
+/// `include .env` and `export` hand every recipe the project's
+/// variables, and `set dotenv-load` does the same in a justfile. pando
+/// does not load that file into the process, so the recipe line on its
+/// own would start the server without them.
+#[test]
+fn a_file_that_sets_every_recipes_environment_keeps_its_runner() {
+    let cases: [(&str, &str, &str, &str); 6] = [
+        (
+            "Makefile",
+            "include .env\nexport\n\nrun:\n\tgo run ./cmd/server\n",
+            "run",
+            "make run",
+        ),
+        (
+            "Makefile",
+            "export DATABASE_URL ?= postgres://localhost/app\nrun:\n\t./app\n",
+            "run",
+            "make run",
+        ),
+        (
+            "Makefile",
+            ".EXPORT_ALL_VARIABLES:\nrun:\n\t./app\n",
+            "run",
+            "make run",
+        ),
+        (
+            "Makefile",
+            "SHELL := /bin/zsh\nrun:\n\t./app\n",
+            "run",
+            "make run",
+        ),
+        (
+            "justfile",
+            "set dotenv-load\n\ndev:\n    uv run app\n",
+            "dev",
+            "just dev",
+        ),
+        (
+            "justfile",
+            "export RUST_LOG := \"debug\"\n\ndev:\n    cargo run\n",
+            "dev",
+            "just dev",
+        ),
+    ];
+    for (file, text, name, expected) in cases {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(file), text).unwrap();
+        let targets = parse_targets(dir.path());
+        assert_eq!(targets[name].command(name), expected, "{text:?}");
+    }
+    // A plain variable is make's alone, and a recipe that does not read
+    // it through `$(…)` never sees it: the line is still the command.
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Makefile"),
+        "BIN := app\nexporter:\n\t./export.sh\nrun:\n\tgo run .\n",
+    )
+    .unwrap();
+    assert_eq!(parse_targets(dir.path())["run"].command("run"), "go run .");
+}
+
 /// A blank line and a column-zero comment sit among recipe lines
 /// without ending the recipe — make ignores both — so a recipe read as
 /// ending at the first of them would be truncated all over again.

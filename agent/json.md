@@ -152,7 +152,9 @@ command a target runs:
 
 pando proposes `make dev` for that target and only proposes a recipe line
 itself when the target *is* that line: no prerequisites, one command, no `$`
-in a makefile or `{{` in a justfile, and no `-` or `+` prefix.
+in a makefile or `{{` in a justfile, no `-` or `+` prefix, and nothing at the
+top of the file that every recipe runs with — make's `export` or `include`,
+a justfile's `set` or `export`.
 
 `extends`, `include` and `error` are why a services proposal can be missing
 or under-ticked: they are the parts of a compose file this build did not
