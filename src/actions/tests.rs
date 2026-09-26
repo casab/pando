@@ -6526,27 +6526,7 @@ fn the_root_env_given_to_a_workspace_app_is_linked_not_seeded() {
 #[test]
 fn new_names_the_submodules_it_left_empty() {
     let fx = fixture();
-    let library = tempdir().unwrap();
-    git(
-        library.path(),
-        &["init", "--quiet", "--initial-branch=main"],
-    );
-    std::fs::write(library.path().join("lib.txt"), "x\n").unwrap();
-    git(library.path(), &["add", "."]);
-    git(library.path(), &["commit", "--quiet", "-m", "lib"]);
-    git(
-        &fx.root,
-        &[
-            "-c",
-            "protocol.file.allow=always",
-            "submodule",
-            "add",
-            "--quiet",
-            &library.path().display().to_string(),
-            "vendor/lib",
-        ],
-    );
-    git(&fx.root, &["commit", "--quiet", "-m", "a submodule"]);
+    let _library = with_submodule(&fx);
 
     let said = std::cell::RefCell::new(Vec::<String>::new());
     let name = new(&fx.paths, &fx.config, "feat/sub", None, &|line: &str| {
@@ -6580,6 +6560,76 @@ fn new_names_the_submodules_it_left_empty() {
     )
     .unwrap();
     assert!(!quiet.borrow().iter().any(|l| l.contains("submodule")));
+}
+
+/// A submodule at `vendor/lib` committed to the fixture's main branch,
+/// cloned from the repository in the returned directory.
+fn with_submodule(fx: &Fx) -> TempDir {
+    let library = tempdir().unwrap();
+    git(
+        library.path(),
+        &["init", "--quiet", "--initial-branch=main"],
+    );
+    std::fs::write(library.path().join("lib.txt"), "x\n").unwrap();
+    git(library.path(), &["add", "."]);
+    git(library.path(), &["commit", "--quiet", "-m", "lib"]);
+    git(
+        &fx.root,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "--quiet",
+            &library.path().display().to_string(),
+            "vendor/lib",
+        ],
+    );
+    git(&fx.root, &["commit", "--quiet", "-m", "a submodule"]);
+    library
+}
+
+// A clean worktree with its submodules filled — which `new` says how to
+// do — passes `git status`, and `git worktree remove` still refuses it
+// without `--force`. Asked only then, `rm` had already stopped the dev
+// server and taken the worktree's volumes down.
+#[test]
+fn rm_refuses_a_worktree_with_a_submodule_before_stopping_anything() {
+    let mut fx = fixture();
+    let _library = with_submodule(&fx);
+    with_dev(&mut fx, dev("sleep 30"));
+    let name = worktree_named(&fx, "feat/sub");
+    git(
+        &fx.worktrees_dir().join(&name),
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--init",
+            "--quiet",
+        ],
+    );
+    let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+    let _guard = guard(&outcome);
+    let pid = outcome.started[0].record.pid;
+
+    let err = rm(&fx.paths, &name, false, false).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("submodules in it (vendor/lib)"), "{msg}");
+    assert!(msg.contains("nothing was stopped or removed"), "{msg}");
+    assert!(crate::remedy::for_cli(&msg).contains("--force"), "{msg}");
+    assert!(proc::is_alive(pid), "the dev server was stopped first");
+    assert!(fx.state().worktrees[&name].processes.contains_key("dev"));
+    assert_eq!(fx.names(), vec![name.clone()]);
+
+    rm(&fx.paths, &name, false, true).unwrap();
+    assert!(fx.names().is_empty());
+
+    // Left empty, as `new` leaves them, they are nothing git objects to.
+    let empty = worktree_named(&fx, "feat/empty");
+    rm(&fx.paths, &empty, false, false).unwrap();
+    assert!(fx.names().is_empty());
 }
 
 #[test]

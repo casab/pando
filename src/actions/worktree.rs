@@ -257,6 +257,46 @@ fn dirty_entry(worktree: &Worktree) -> Result<Option<String>> {
         .map(|entry| entry.trim().to_string()))
 }
 
+/// The submodule `git worktree remove` would refuse over, when there is
+/// one: without `--force`, git removes no worktree with a submodule checked
+/// out in it, or with a `modules` directory in its git directory, however
+/// clean its status is. `new` itself says how to fill a worktree's
+/// submodules, so a clean worktree that has them is an ordinary one.
+///
+/// A prunable worktree has nothing to refuse, and a git that could not
+/// answer is an error, both as in [`dirty_entry`].
+fn submodule_in(worktree: &Worktree) -> Result<Option<String>> {
+    if worktree.prunable {
+        return Ok(None);
+    }
+    let answer = |args: &[&str]| -> Result<String> {
+        let out = crate::project::git(&worktree.path, args)?;
+        if !out.status.success() {
+            bail!(
+                "git {} failed: {}",
+                args[0],
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    // `<mode> <object> <stage>\t<path>`, and a submodule's mode is 160000.
+    // git counts one as checked out when its directory has a `.git`.
+    let index = answer(&["ls-files", "--stage", "-z"])?;
+    let checked_out = index
+        .split('\0')
+        .filter_map(|entry| entry.split_once('\t'))
+        .filter(|(meta, _)| meta.starts_with("160000 "))
+        .map(|(_, path)| path)
+        .find(|path| worktree.path.join(path).join(".git").exists());
+    if let Some(path) = checked_out {
+        return Ok(Some(path.to_string()));
+    }
+    let modules =
+        PathBuf::from(answer(&["rev-parse", "--absolute-git-dir"])?.trim()).join("modules");
+    Ok(modules.is_dir().then(|| modules.display().to_string()))
+}
+
 /// Undoes a `new` that failed after `git worktree add`. The worktree goes;
 /// so does the branch, but only when pando created it in this same call —
 /// a branch that existed before is the user's work, not pando's to delete.
@@ -364,9 +404,23 @@ pub fn rm(
     // git's own refusal is the last one, so it is asked first: stopping the
     // dev server and *then* being told the worktree stays leaves a process
     // that is gone, a worktree that is not, and a record blaming the
-    // process for pando's kill. The question is the one git asks without
-    // `--force`; ignored files never block a removal and do not show here.
+    // process for pando's kill. The questions are the two git asks without
+    // `--force`, in its order; ignored files never block a removal and do
+    // not show here.
     if !force {
+        match submodule_in(target) {
+            Ok(None) => {}
+            Ok(Some(what)) => bail!(
+                "{shown} has submodules in it ({what}), and git removes such a worktree only \
+                 when forced — nothing was stopped or removed; {}",
+                remedy::DISCARD_CHANGES
+            ),
+            Err(e) => bail!(
+                "could not tell whether {shown} has submodules in it: {e:#} — nothing was \
+                 stopped or removed; check it with `git submodule status`, or {}",
+                remedy::DISCARD_CHANGES
+            ),
+        }
         match dirty_entry(target) {
             Ok(None) => {}
             Ok(Some(entry)) => bail!(
