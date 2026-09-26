@@ -293,7 +293,7 @@ warnings`, and `cargo fmt --check`.
 
 ## Status
 
-Version 0.3.0, built and not published. Every command above is
+Version 0.4.0, built and not published. Every command above is
 implemented and covered by tests, in this order: worktrees and their
 lifecycle; detached dev servers with their own ports, logs and readiness;
 several processes per worktree; the log viewer; private per-worktree
@@ -303,7 +303,9 @@ Docker; the JSON contract an agent reads; a worktree from any open
 pull request in the TUI; and, experimentally, namespaced worktrees — a
 database and a Redis slot of their own in the main checkout's servers,
 tested against throwaway MariaDB and Redis servers the tests start
-themselves.
+themselves. 0.4.0 adds no command: it is all of that after a review of
+the whole project and the fixes it found, with a test suite that reads
+no developer's shell profile and needs none of their tools.
 
 macOS is what it is developed and tested on. The Unix-only parts have
 Linux branches written and no CI, so Linux is intended rather than

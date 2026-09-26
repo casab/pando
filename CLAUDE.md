@@ -52,9 +52,9 @@ run is next: the grant on their server, once.
 Later the same day the whole project was audited, by module and then
 by concern, and about 230 commits fixed what the audit and the reviews
 of its own fixes found: data safety in isolated and namespaced mode, the
-lifecycle, detection, share, the CLI, the TUI and doctor. None of it is
-released; 0.3.0 is still the last tag. The findings it left for the
-maintainer, each with why, are in `plans/open-follow-ups.md`.
+lifecycle, detection, share, the CLI, the TUI and doctor, and 0.4.0 was
+built and tagged with them. The findings it left for the maintainer,
+each with why, are in `plans/open-follow-ups.md`.
 
 What is left is not a phase. `plans/open-follow-ups.md` carries the known
 edges, each with who found it and where it belongs, and the release
