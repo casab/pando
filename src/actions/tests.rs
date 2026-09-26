@@ -8725,6 +8725,61 @@ fn a_native_server_whose_service_is_now_compose_is_stopped_and_forgotten() {
     assert_eq!(planned[0].pid, None, "the server's pid is not a log pump");
 }
 
+// The native record of a service that was compose was written over the
+// compose one before its container was stopped, so a stop that failed
+// left nothing in pando able to find that container again.
+#[test]
+fn a_compose_record_whose_service_is_now_native_stays_until_its_container_is_stopped() {
+    let mut fx = fixture();
+    let native: Config = toml::from_str(
+        "[[services]]\nkind = \"native\"\nname = \"postgres\"\n\
+         env = { DATABASE_URL = \"postgres\" }\n",
+    )
+    .unwrap();
+    fx.config.services = native.services;
+    let mut record = WorktreeRecord::new(fx.root.clone(), false);
+    record.services = vec![state::ServiceRecord {
+        name: "postgres".to_string(),
+        kind: state::ServiceKind::Compose,
+        port: Some(15432),
+        pid: None,
+        pgid: None,
+        compose_project: Some("pando-acme-feat-one".to_string()),
+    }];
+    let containers = vec![(
+        "pando-acme-feat-one".to_string(),
+        vec!["postgres".to_string()],
+    )];
+
+    let left = super::services::leave_changed_kinds(&fx.paths, &fx.config, "feat+one", &mut record)
+        .unwrap();
+    assert_eq!(left, containers);
+    let ports = BTreeMap::from([("postgres".to_string(), 15433)]);
+    record.services = super::services::planned_services(&fx.config, &ports, &record);
+    assert_eq!(record.services.len(), 1, "{:?}", record.services);
+    assert_eq!(record.services[0].kind, state::ServiceKind::Compose);
+    assert_eq!(
+        record.services[0].compose_project.as_deref(),
+        Some("pando-acme-feat-one")
+    );
+    assert_eq!(record.services[0].port, Some(15433));
+    let again =
+        super::services::leave_changed_kinds(&fx.paths, &fx.config, "feat+one", &mut record)
+            .unwrap();
+    assert_eq!(again, containers, "a start that could not stop it retries");
+
+    fx.paths.ensure_home().unwrap();
+    let mut store = state::State::default();
+    store.worktrees.insert("feat+one".to_string(), record);
+    state::save(&fx.paths.state_file(), &store).unwrap();
+    super::services::replace_stopped_containers(&fx.paths, "feat+one", &containers).unwrap();
+    let services = &fx.state().worktrees["feat+one"].services;
+    assert_eq!(services.len(), 1, "{services:?}");
+    assert_eq!(services[0].kind, state::ServiceKind::Native);
+    assert_eq!(services[0].compose_project, None);
+    assert_eq!(services[0].port, Some(15433));
+}
+
 // 0.2.0 could leave a compose record with a project and no port on a
 // worktree that is not isolated — a failed isolated start. `status` and
 // the TUI showed it as `postgres  no port` for ever. It is still what `rm`

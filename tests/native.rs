@@ -683,6 +683,110 @@ fn a_compose_service_that_becomes_native_is_stopped_before_the_server_starts() {
     );
 }
 
+// The native record was saved over the compose one before the container
+// was stopped. A stop Docker could not do — the daemon down, or a stop
+// that timed out — then left a container that could come back onto the
+// native server's port with no record left to find it, and every later
+// start of the native server failing on a port in use.
+#[test]
+fn a_compose_container_docker_could_not_stop_is_stopped_by_the_next_start() {
+    let dir = TempDir::new().unwrap();
+    let root = build(Kind::NextPnpmCompose, dir.path()).root;
+    let home = dir.path().join("pando-home");
+    common::docker::install(&home);
+    postgres::install(&home);
+    let paths = paths_for(&home, &root);
+    std::fs::create_dir_all(paths.project_dir()).unwrap();
+    let config_with = |services: &str| {
+        format!(
+            "[project]\nprovision = [\".env\"]\ninstall = \"true\"\n\n\
+             [dev]\ncmd = '''{}'''\nports = {{ PORT = \"web\" }}\n\n{services}",
+            listener_printing("DATABASE_URL")
+        )
+    };
+    std::fs::write(
+        paths.config_file(),
+        config_with(
+            "[[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
+             include = [\"postgres\"]\nenv = { DATABASE_URL = \"postgres\" }\n",
+        ),
+    )
+    .unwrap();
+    let config = config::load(&paths).unwrap().config;
+    let mut f = Nat {
+        _dir: dir,
+        root,
+        home,
+        paths,
+        config,
+    };
+    let name = new_worktree(&f, "feat/one");
+    start_isolated(&f, &name);
+    let before = f.service(&name, "postgres");
+    let project = before.compose_project.clone().unwrap();
+    let _down = common::docker::down_on_drop(&f.home, &project);
+
+    std::fs::write(
+        f.paths.config_file(),
+        config_with(
+            "[[services]]\nkind = \"native\"\nname = \"postgres\"\n\
+             env = { DATABASE_URL = \"postgres\" }\n",
+        ),
+    )
+    .unwrap();
+    f.config = config::load(&f.paths).unwrap().config;
+    common::docker::daemon_down(&f.home);
+    let refused = actions::start(
+        &f.paths,
+        &f.config,
+        &name,
+        None,
+        actions::Mode::Isolated,
+        &|_| {},
+    )
+    .unwrap_err();
+    assert!(
+        format!("{refused:#}").contains("Docker is not running"),
+        "{refused:#}"
+    );
+    let kept = f.service(&name, "postgres");
+    assert_eq!(kept.kind, ServiceKind::Compose, "{kept:?}");
+    assert_eq!(kept.compose_project.as_deref(), Some(project.as_str()));
+    assert_eq!(kept.pid, None, "its log pump was stopped");
+
+    std::fs::remove_file(common::docker::state_dir(&f.home).join("daemon-down")).unwrap();
+    let said = std::cell::RefCell::new(Vec::<String>::new());
+    actions::start(
+        &f.paths,
+        &f.config,
+        &name,
+        None,
+        actions::Mode::Isolated,
+        &|m| said.borrow_mut().push(m.to_string()),
+    )
+    .unwrap();
+
+    assert_eq!(
+        common::docker::services_up(&f.home, &project),
+        Vec::<(String, u16)>::new(),
+        "the container was stopped"
+    );
+    let native = f.service(&name, "postgres");
+    assert_eq!(native.kind, ServiceKind::Native);
+    assert_eq!(native.compose_project, None);
+    assert!(
+        process::is_alive(native.pid.unwrap()),
+        "a native server runs"
+    );
+    assert_eq!(native.port, before.port, "on the port the container had");
+    let said = said.into_inner();
+    assert!(
+        said.iter().any(|m| m.contains("postgres runs natively now")
+            && m.contains(&format!("docker compose -p {project} down -v"))),
+        "nothing else names the project, so the start says how its data goes: {said:?}"
+    );
+}
+
 // ---- a data directory the fingerprint cannot see --------------------------
 
 // The other half of the hook-fingerprint bug, and the one only a native

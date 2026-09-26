@@ -47,26 +47,75 @@ pub(super) fn stop_containers(
 
 /// Stops only the named services' containers of each compose project,
 /// leaving the rest of the project running and every volume in place.
+///
+/// A daemon that is not running is a failure here, not the note it is to
+/// `stop`: these are the containers of services that run natively now,
+/// and one that is not running only because Docker is not can come back
+/// with Docker, onto the port the native server is given.
 pub(super) fn stop_service_containers(
     paths: &PandoPaths,
     containers: &[(String, Vec<String>)],
-    progress: &dyn Fn(&str),
 ) -> Result<()> {
+    let program = services::docker_program(paths);
     for (project, services) in containers {
-        stop_compose_projects(
-            paths,
-            std::slice::from_ref(project),
-            |compose| compose.stop_services(services),
-            |project| {
-                format!(
-                    "Docker is not running, so the services of {project} are not either — \
-                     nothing to stop"
+        let compose = services::Compose::by_project(&program, project.as_str());
+        match compose.stop_services(services) {
+            Ok(()) => {}
+            Err(e) if services::is_daemon_down(&e) => {
+                let (them, they) = match services.len() {
+                    1 => ("the compose container", "it"),
+                    _ => ("the compose containers", "they"),
+                };
+                bail!(
+                    "Docker is not running, so {them} of {} in {project} cannot be stopped, and \
+                     {they} can come back with Docker onto the port the native server is given \
+                     — start Docker, then start this worktree again",
+                    services.join(", ")
                 )
-            },
-            progress,
-        )?;
+            }
+            Err(e) => bail!("could not reach the services of {project}: {e:#}"),
+        }
     }
     Ok(())
+}
+
+/// Writes the native record of each service whose compose containers
+/// [`stop_service_containers`] has just stopped, over the compose record
+/// [`planned_services`] kept for it until then.
+///
+/// That record is the only thing that can find those containers again,
+/// so it goes only once they are stopped: a start that failed first, or
+/// was refused because Docker was not running, leaves it for the next
+/// start to stop them.
+pub(super) fn replace_stopped_containers(
+    paths: &PandoPaths,
+    name: &str,
+    stopped: &[(String, Vec<String>)],
+) -> Result<()> {
+    if stopped.is_empty() {
+        return Ok(());
+    }
+    let _lock = state::lock(&paths.lock_file())?;
+    let mut store = state::load(&paths.state_file())?;
+    let Some(record) = store.worktrees.get_mut(name) else {
+        return Ok(());
+    };
+    for service in record.services.iter_mut() {
+        let stopped_here = stopped.iter().any(|(project, services)| {
+            service.compose_project.as_ref() == Some(project) && services.contains(&service.name)
+        });
+        if service.kind == state::ServiceKind::Compose && stopped_here {
+            *service = state::ServiceRecord {
+                name: service.name.clone(),
+                kind: state::ServiceKind::Native,
+                port: service.port,
+                pid: None,
+                pgid: None,
+                compose_project: None,
+            };
+        }
+    }
+    state::save(&paths.state_file(), &store)
 }
 
 /// Removes the containers, network and volumes of every compose project
@@ -240,7 +289,9 @@ fn kind_of(native: &[String], service: &str) -> state::ServiceKind {
 /// process — a log pump, or the native server itself — is stopped here,
 /// under the lock, as a switch to the shared services stops it. Its
 /// containers are returned, by compose project, for
-/// [`stop_service_containers`] once the lock is let go.
+/// [`stop_service_containers`] once the lock is let go — and a compose
+/// record whose containers a start could not stop is still here for the
+/// next one, so they are returned again.
 pub(super) fn leave_changed_kinds(
     paths: &PandoPaths,
     config: &Config,
@@ -282,7 +333,13 @@ pub(super) fn leave_changed_kinds(
 /// beside live services does not lose the pid that stops it — but only a
 /// record of the same kind: one whose service config now runs the other
 /// way is written fresh, once [`leave_changed_kinds`] has stopped what it
-/// ran. A record for a service config no longer includes is kept too: it
+/// ran. Not a compose record that names a project, though: it is kept, on
+/// the port the native server is to have and without its log pump, until
+/// [`replace_stopped_containers`] writes the native record once its
+/// containers are stopped, because until then nothing else in pando can
+/// find them.
+///
+/// A record for a service config no longer includes is kept too: it
 /// still names the compose project, and dropping it would leave a
 /// container and its volume with nothing in pando able to take them down
 /// — but its *port* is blanked, because the window has moved on and
@@ -303,6 +360,21 @@ pub(super) fn planned_services(
         // lose a container pando can never find again, or keep a database
         // record for a process that exited.
         let kind = kind_of(&native, &service);
+        // Kept as it is, pump aside, until its containers are stopped.
+        let replaced = record.services.iter().find(|s| {
+            s.name == service
+                && s.kind == state::ServiceKind::Compose
+                && s.compose_project.is_some()
+        });
+        if let (state::ServiceKind::Native, Some(replaced)) = (kind, replaced) {
+            out.push(state::ServiceRecord {
+                port: ports.get(&service).copied(),
+                pid: None,
+                pgid: None,
+                ..replaced.clone()
+            });
+            continue;
+        }
         let existing = record
             .services
             .iter()

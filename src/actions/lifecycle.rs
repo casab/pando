@@ -22,9 +22,9 @@ use super::runtime::with_prelude;
 use super::services::{
     FRESH_DATA_DIR, Fresh, bring_up_services, clear_native_sockets, compose_projects,
     forget_hooks_after_services, forget_unstarted_services, has_live_services, leave_changed_kinds,
-    planned_services, preflight_isolation, resolve_service_env, service_roles, shared_service_env,
-    stop_containers, stop_service_containers, stop_service_pumps, undo_failed_isolation,
-    worktree_url,
+    planned_services, preflight_isolation, replace_stopped_containers, resolve_service_env,
+    service_roles, shared_service_env, stop_containers, stop_service_containers,
+    stop_service_pumps, undo_failed_isolation, worktree_url,
 };
 use super::share::{share_closed, share_target_is_up, sweep_dead_shares_with, take_share_down};
 // Only for the intra-doc link above `sweep_orphaned_groups`.
@@ -627,8 +627,9 @@ fn start_checked(
         .collect();
     // The containers of services that were compose and are native now,
     // stopped once the lock is let go: the port the native server is about
-    // to be given is the one they publish. A project no record names any
-    // more is one `rm` cannot take the data of, so the start says how.
+    // to be given is the one they publish. Their compose records stay
+    // until they are stopped, and a project no other record names is one
+    // `rm` cannot take the data of after that, so the start says how.
     let mut changed_kind: Vec<(String, Vec<String>)> = Vec::new();
     let mut unnamed: Vec<String> = Vec::new();
     if let Some(record) = store.worktrees.get_mut(name) {
@@ -636,11 +637,16 @@ fn start_checked(
         if isolate {
             changed_kind = leave_changed_kinds(paths, config, name, record)?;
             record.services = planned_services(config, &assignment.ports, record);
-            let named = compose_projects(record);
             unnamed = changed_kind
                 .iter()
+                .filter(|(project, replaced)| {
+                    !record.services.iter().any(|s| {
+                        s.kind == state::ServiceKind::Compose
+                            && s.compose_project.as_ref() == Some(project)
+                            && !replaced.contains(&s.name)
+                    })
+                })
                 .map(|(project, _)| project.clone())
-                .filter(|project| !named.contains(project))
                 .collect();
         }
         // Written into the record this start saves and spawns from, not
@@ -659,6 +665,16 @@ fn start_checked(
     // long as it takes; holding the state lock through any of them would
     // freeze `pando ls` and the TUI's tick.
     drop(_lock);
+
+    // Every failure between here and the services being up leaves a
+    // worktree that is still the shared one it was: nothing of the
+    // isolated attempt may outlive it.
+    let undo = |e: anyhow::Error| -> anyhow::Error {
+        if becoming_isolated {
+            undo_failed_isolation(paths, config, name, &shared_ports);
+        }
+        e
+    };
 
     // Outside the lock, like every other compose call: `docker compose
     // stop` takes seconds, and holding the state lock through it would
@@ -700,7 +716,8 @@ fn start_checked(
         }
         progress(&line);
     }
-    stop_service_containers(paths, &changed_kind, progress)?;
+    stop_service_containers(paths, &changed_kind).map_err(undo)?;
+    replace_stopped_containers(paths, name, &changed_kind).map_err(undo)?;
     // And the containers a stale record replaced above left up, on a start
     // that is not about to bring that compose project up again itself.
     if !isolate && !inherited_projects.is_empty() {
@@ -710,16 +727,6 @@ fn start_checked(
         ));
         stop_containers(paths, &inherited_projects, progress)?;
     }
-
-    // Every failure between here and the services being up leaves a
-    // worktree that is still the shared one it was: nothing of the
-    // isolated attempt may outlive it.
-    let undo = |e: anyhow::Error| -> anyhow::Error {
-        if becoming_isolated {
-            undo_failed_isolation(paths, config, name, &shared_ports);
-        }
-        e
-    };
 
     // Everything the app is told about where its services are. Computed
     // from the allocated ports alone, so a hook that runs before the
