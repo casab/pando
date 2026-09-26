@@ -9,6 +9,7 @@ use crate::catalog::package_managers::{self, Ecosystem};
 use crate::config::PortsSpec;
 
 use super::apply::dedup_by_value;
+use super::frameworks::runs;
 use super::proposal::{Candidate, Proposal, Slot};
 use super::signals::Signals;
 
@@ -292,14 +293,9 @@ pub(super) fn dev_cmd_proposal(
     signals: &Signals,
     rule: Option<&'static FrameworkRule>,
 ) -> Option<Proposal> {
-    let runner = script_runner(signals);
     let scripts: Vec<Candidate> = ranked_scripts(signals)
         .into_iter()
-        .map(|(name, _body)| Candidate {
-            value: format!("{runner}{name}"),
-            why: format!("package.json scripts.{name}"),
-            ..Candidate::default()
-        })
+        .map(|(name, body)| script_candidate(signals, rule, &name, &body))
         .collect();
     let targets = target_candidates(signals);
     // Where the scripts only build a backend's assets, they start the asset
@@ -349,10 +345,57 @@ pub(super) fn dev_cmd_proposal(
     let sure_script = signals
         .scripts
         .get("dev")
-        .is_some_and(|body| !is_multiplexer(body));
+        .filter(|body| !is_multiplexer(body))
+        .map(|body| script_candidate(signals, rule, "dev", body).value);
     let decided =
-        candidates.len() == 1 || (sure_script && candidates[0].value == format!("{runner}dev"));
+        candidates.len() == 1 || sure_script.is_some_and(|dev| candidates[0].value == dev);
     Some(Proposal::of(Slot::DevCmd, candidates, decided))
+}
+
+/// Running the project's own `name` script.
+///
+/// A framework that takes its port on the command line gets its flag
+/// appended, as a workspace app does: `npm run dev -- --port {port:web}`
+/// runs what the project already runs, on the port pando chose, and owns
+/// the web role. Told nothing, Vite moves itself to the next free port and
+/// pando holds no role for it, so the worktree has no URL to open or share.
+/// Only a script that runs the framework's own CLI, as one server, on no
+/// port of its own: in a custom server or a fan-out the flag would reach
+/// something else, and where the script names a port it would be said
+/// twice.
+fn script_candidate(
+    signals: &Signals,
+    rule: Option<&'static FrameworkRule>,
+    name: &str,
+    body: &str,
+) -> Candidate {
+    let value = format!("{}{name}", script_runner(signals));
+    let why = format!("package.json scripts.{name}");
+    let flagged = rule.filter(|rule| {
+        rule.port == PortMechanism::InCommand
+            && !rule.scripts_build_assets
+            && runs(rule, body)
+            && !is_multiplexer(body)
+            && fixed_port(body).is_none()
+    });
+    let Some((rule, flag)) = flagged.and_then(|rule| Some((rule, rule.port_flag?))) else {
+        return Candidate {
+            value,
+            why,
+            ..Candidate::default()
+        };
+    };
+    let role = crate::config::WEB_ROLE;
+    Candidate {
+        value: format!(
+            "{value} {}{}",
+            script_args(signals),
+            flag.replace("{port}", &format!("{{port:{role}}}"))
+        ),
+        why: format!("{why}, told its port with the {} flag", rule.name),
+        ports: Some(PortsSpec::List(vec![role.to_string()])),
+        ..Candidate::default()
+    }
 }
 
 /// Makefile or justfile targets that look like they start something.

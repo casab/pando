@@ -46,7 +46,7 @@ fn names_a_script(rule: &FrameworkRule, signals: &Signals) -> bool {
 }
 
 /// Whether `body` runs one of the rule's script markers.
-fn runs(rule: &FrameworkRule, body: &str) -> bool {
+pub(super) fn runs(rule: &FrameworkRule, body: &str) -> bool {
     rule.script_markers
         .iter()
         .any(|needle| mentions(body, needle))

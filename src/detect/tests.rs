@@ -829,6 +829,105 @@ fn a_backend_building_its_assets_with_vite_is_run_by_its_own_server() {
     );
 }
 
+// Run as `npm run dev` with no port, a worktree's Vite moved itself to
+// the next free port and pando held no role for it: no URL, nothing to
+// share, and a second Angular worktree found 4200 taken.
+#[test]
+fn a_single_apps_script_is_given_the_port_flag_its_framework_takes() {
+    for (files, expected) in [
+        (
+            &[
+                ("vite.config.ts", "export default {}\n"),
+                (
+                    "package.json",
+                    r#"{ "scripts": { "dev": "vite", "build": "vite build" } }"#,
+                ),
+                ("package-lock.json", "{}\n"),
+            ][..],
+            "npm run dev -- --port {port:web}",
+        ),
+        (
+            &[
+                ("svelte.config.js", "export default {}\n"),
+                ("package.json", r#"{ "scripts": { "dev": "vite dev" } }"#),
+                ("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"),
+            ],
+            "pnpm dev --port {port:web}",
+        ),
+        (
+            &[
+                ("astro.config.mjs", "export default {}\n"),
+                ("package.json", r#"{ "scripts": { "dev": "astro dev" } }"#),
+                ("package-lock.json", "{}\n"),
+            ],
+            "npm run dev -- --port {port:web}",
+        ),
+        (
+            &[
+                ("angular.json", "{}\n"),
+                (
+                    "package.json",
+                    r#"{ "scripts": { "start": "ng serve", "build": "ng build" } }"#,
+                ),
+                ("package-lock.json", "{}\n"),
+            ],
+            "npm run start -- --port {port:web}",
+        ),
+    ] {
+        let (dir, s) = marker_fixture(files);
+        let proposal = dev_of(&s, framework(dir.path(), &s));
+        assert_eq!(values(&proposal), vec![expected]);
+        assert!(proposal.decided, "{expected}");
+        let first = proposal.preferred().unwrap();
+        assert_eq!(first.ports, Some(PortsSpec::List(vec!["web".to_string()])));
+        let mut config = Config::default();
+        apply(Slot::DevCmd, first, &mut config);
+        assert!(
+            !still_needed(Slot::PortEnv, &config),
+            "the command already carries the port: {expected}"
+        );
+    }
+
+    // `dev` is still the answer among its siblings once it carries the flag.
+    let (dir, s) = marker_fixture(&[
+        ("vite.config.ts", "export default {}\n"),
+        (
+            "package.json",
+            r#"{ "scripts": { "dev": "vite", "start": "vite" } }"#,
+        ),
+        ("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"),
+    ]);
+    let proposal = dev_of(&s, framework(dir.path(), &s));
+    assert_eq!(
+        values(&proposal),
+        vec!["pnpm dev --port {port:web}", "pnpm start --port {port:web}"]
+    );
+    assert!(proposal.decided);
+}
+
+// The flag is Vite's, and only Vite's own CLI is handed it: a custom
+// server would be given an option it never reads, a fan-out would hand
+// it to whichever process comes last, and a port the script names would
+// be said twice.
+#[test]
+fn a_script_that_is_not_the_frameworks_own_server_is_not_given_its_flag() {
+    for body in [
+        "node server.js",
+        "vite --port 5173",
+        "concurrently \\\"vite\\\" \\\"tsc -w\\\"",
+    ] {
+        let manifest = format!(r#"{{ "scripts": {{ "dev": "{body}" }} }}"#);
+        let (dir, s) = marker_fixture(&[
+            ("vite.config.ts", "export default {}\n"),
+            ("package.json", &manifest),
+            ("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"),
+        ]);
+        let proposal = dev_of(&s, framework(dir.path(), &s));
+        assert_eq!(proposal.candidates[0].value, "pnpm dev", "{body}");
+        assert_eq!(proposal.candidates[0].ports, None, "{body}");
+    }
+}
+
 // The port a `dev: vite --port 5173` fixes is the asset server's. The
 // app is Phoenix's own server, and PORT is still how it is told one.
 #[test]
