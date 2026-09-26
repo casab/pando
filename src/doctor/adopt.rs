@@ -6,6 +6,7 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 
 use crate::paths::PandoPaths;
+use crate::process as proc;
 use crate::state;
 
 use super::render::plural;
@@ -22,8 +23,8 @@ pub struct Adoptable {
     pub id: String,
     pub path: String,
     /// The repository that folder belonged to, when it can be worked out —
-    /// from a worktree's own `.git` file, which names the repository it
-    /// was linked from.
+    /// from the `.git` of a checkout it holds or records, which names the
+    /// repository that checkout belongs to.
     pub old_root: Option<String>,
     /// The worktree directories still sitting inside it.
     pub worktrees: Vec<String>,
@@ -77,8 +78,13 @@ pub(super) fn adoptable(paths: &PandoPaths) -> Vec<Adoptable> {
         // A folder whose repository is still there belongs to a live
         // project — two checkouts of the same repository under different
         // directories is an ordinary thing, and adopting one of them would
-        // be stealing it.
-        if old_root.as_deref().is_some_and(Path::exists) {
+        // be stealing it. One that names no repository but still has
+        // something running is some checkout's own too.
+        let in_use = match &old_root {
+            Some(root) => root.exists(),
+            None => running_process(&entry.path()).is_some(),
+        };
+        if in_use {
             continue;
         }
         out.push(Adoptable {
@@ -94,13 +100,32 @@ pub(super) fn adoptable(paths: &PandoPaths) -> Vec<Adoptable> {
 
 /// The repository a project folder belonged to.
 ///
-/// Nothing writes `project.root`, so the honest source is a worktree's own
-/// `.git` file: git writes `gitdir: <repository>/.git/worktrees/<name>`
-/// into it, and that names the checkout it was linked from. A folder with
-/// no worktrees left has nothing to say, and says `None` rather than a
+/// Nothing writes `project.root`, so the honest sources are the checkouts
+/// the folder knows about: each worktree still inside it, and each one its
+/// state file records, which covers a worktree kept in a configured
+/// `worktrees_dir` and a main checkout that was started. A worktree's own
+/// `.git` file names the repository it was linked from; a main checkout's
+/// `.git` is a directory, and the checkout is the repository. A folder
+/// with none of these has nothing to say, and says `None` rather than a
 /// guess.
+///
+/// Where they name more than one, one that is still there wins: a folder
+/// a live checkout still points at is that checkout's own.
 fn recorded_root(project_dir: &Path) -> Option<PathBuf> {
-    if let Some(root) = std::fs::read_to_string(project_dir.join("pando.toml"))
+    let mut first = None;
+    for root in candidate_roots(project_dir) {
+        if root.exists() {
+            return Some(root);
+        }
+        first.get_or_insert(root);
+    }
+    first
+}
+
+/// Every repository a project folder's contents name, in the order
+/// [`recorded_root`] trusts them.
+fn candidate_roots(project_dir: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = std::fs::read_to_string(project_dir.join("pando.toml"))
         .ok()
         .and_then(|text| text.parse::<toml_edit::DocumentMut>().ok())
         .and_then(|doc| {
@@ -108,30 +133,54 @@ fn recorded_root(project_dir: &Path) -> Option<PathBuf> {
                 doc.get("project")?.get("root")?.as_str()?.to_string(),
             ))
         })
-    {
-        return Some(root);
+        .into_iter()
+        .collect();
+    let mut checkouts: Vec<PathBuf> = worktree_names(project_dir)
+        .iter()
+        .map(|name| project_dir.join("worktrees").join(name))
+        .collect();
+    // A state file this build cannot read says nothing here; `adopt`
+    // refuses to move a folder that holds one.
+    if let Ok(store) = state::load(&project_dir.join("state.json")) {
+        checkouts.extend(store.worktrees.into_values().map(|record| record.path));
     }
-    for name in worktree_names(project_dir) {
-        let marker = project_dir.join("worktrees").join(&name).join(".git");
-        let Ok(text) = std::fs::read_to_string(&marker) else {
-            continue;
-        };
-        let Some(gitdir) = text.lines().find_map(|l| l.strip_prefix("gitdir:")) else {
-            continue;
-        };
-        let gitdir = PathBuf::from(gitdir.trim());
-        // `<root>/.git/worktrees/<name>` — three components back to the
-        // checkout it was linked from. Absolute, because git writes it
-        // absolute and a relative one climbing out of three components
-        // leaves an empty path that would read as "its repository was at
-        // , and is not there now".
-        if let Some(root) = gitdir.ancestors().nth(3)
-            && root.is_absolute()
-        {
-            return Some(root.to_path_buf());
-        }
+    out.extend(
+        checkouts
+            .iter()
+            .filter_map(|checkout| checkout_root(checkout)),
+    );
+    out
+}
+
+/// The repository a checkout belongs to, read from its `.git`.
+fn checkout_root(checkout: &Path) -> Option<PathBuf> {
+    let marker = checkout.join(".git");
+    if marker.is_dir() {
+        return checkout.is_absolute().then(|| checkout.to_path_buf());
     }
-    None
+    let text = std::fs::read_to_string(&marker).ok()?;
+    let gitdir = PathBuf::from(text.lines().find_map(|l| l.strip_prefix("gitdir:"))?.trim());
+    // `<root>/.git/worktrees/<name>` — three components back to the
+    // checkout it was linked from. Absolute, because git writes it
+    // absolute and a relative one climbing out of three components
+    // leaves an empty path that would read as "its repository was at
+    // , and is not there now".
+    let root = gitdir.ancestors().nth(3)?;
+    root.is_absolute().then(|| root.to_path_buf())
+}
+
+/// A process pando started from a project folder that is still running.
+///
+/// Asked only of a folder that names no repository: without one, a
+/// running process is the one sign left that some checkout still uses it.
+fn running_process(project_dir: &Path) -> Option<u32> {
+    let store = state::load(&project_dir.join("state.json")).ok()?;
+    store
+        .worktrees
+        .values()
+        .flat_map(|record| record.processes.values())
+        .find(|process| process.alive(proc::is_alive, proc::group_alive))
+        .map(|process| process.pid)
 }
 
 fn worktree_names(project_dir: &Path) -> Vec<String> {
@@ -204,6 +253,16 @@ pub fn adopt(
             "{old_id} belongs to the repository at {} — it is still there, so this is not a \
              repository that moved",
             root.display()
+        );
+    }
+    if old_root.is_none()
+        && let Some(pid) = running_process(&from)
+    {
+        anyhow::bail!(
+            "nothing in {old_id} says which repository it belonged to, and a process it \
+             recorded is still running (pid {pid}) — a folder something runs from is still some \
+             checkout's own, so it is not moved; once nothing it started is running, adopt it \
+             again"
         );
     }
     // Before anything moves, because everything after the rename is

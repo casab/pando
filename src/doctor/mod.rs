@@ -139,19 +139,14 @@ pub fn run_on(paths: &PandoPaths, machine: &Machine<'_>) -> Report {
 fn adoption_report(paths: &PandoPaths, findings: &mut Vec<Finding>) -> Vec<Adoptable> {
     let found = adoptable(paths);
     for entry in &found {
-        findings.push(
-            Finding::note(
+        let finding = match &entry.old_root {
+            Some(root) => Finding::note(
                 Section::Adoption,
                 format!(
                     "{} holds a project folder for a repository called {:?} that is no longer \
-                     where it was{} — the id is a hash of the path, so this repository moving \
-                     gave it a new one and left that folder behind",
-                    entry.id,
-                    paths.project.display_name,
-                    match &entry.old_root {
-                        Some(root) => format!(" ({root})"),
-                        None => String::new(),
-                    }
+                     where it was ({root}) — the id is a hash of the path, so this repository \
+                     moving gave it a new one and left that folder behind",
+                    entry.id, paths.project.display_name,
                 ),
             )
             .with_fix(format!(
@@ -159,7 +154,25 @@ fn adoption_report(paths: &PandoPaths, findings: &mut Vec<Finding>) -> Vec<Adopt
                  config, its state and its worktrees",
                 entry.id
             )),
-        );
+            // Nothing says where its repository is, so nothing says it
+            // moved: another checkout by the same name may be using it.
+            None => Finding::note(
+                Section::Adoption,
+                format!(
+                    "{} holds a project folder for a repository called {:?}, and pando cannot \
+                     tell which repository it belonged to — another checkout by that name may \
+                     still be using it",
+                    entry.id, paths.project.display_name,
+                ),
+            )
+            .with_fix(format!(
+                "if it was this repository's before a move, `pando doctor --adopt {}` moves it \
+                 under this repository's id, with its config, its state and its worktrees — \
+                 and a checkout that still uses it loses them",
+                entry.id
+            )),
+        };
+        findings.push(finding);
     }
     found
 }

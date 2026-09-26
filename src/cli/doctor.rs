@@ -29,12 +29,22 @@ pub fn adopt_project<W: Write>(
         let mut err = std::io::stderr();
         writeln!(err, "pando: move {}", plan.from.display())?;
         writeln!(err, "           to {}", plan.to.display())?;
-        if let Some(root) = &plan.old_root {
-            writeln!(
+        match &plan.old_root {
+            Some(root) => writeln!(
                 err,
                 "       its repository was at {}, and is not there now",
                 root.display()
-            )?;
+            )?,
+            None => {
+                writeln!(
+                    err,
+                    "       nothing in it says which repository it belonged to; if another"
+                )?;
+                writeln!(
+                    err,
+                    "       checkout still uses it, that checkout loses its config and state"
+                )?;
+            }
         }
         if !plan.worktrees.is_empty() {
             writeln!(

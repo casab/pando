@@ -2038,6 +2038,72 @@ fn a_folder_whose_repository_is_still_there_is_left_alone() {
     );
 }
 
+// A live project's folder often has no worktree inside it: one kept in a
+// configured `worktrees_dir` lives elsewhere, and a started main checkout
+// is only a record. Both are in its state file, and both name a
+// repository that is still there.
+#[test]
+fn a_folder_whose_recorded_checkouts_are_still_there_is_left_alone() {
+    let fx = fixture();
+    let base = fx.root.parent().expect("a parent");
+    let live = base.join("elsewhere").join("repo");
+    std::fs::create_dir_all(live.join(".git")).expect("the live checkout");
+    let outside = base.join("custom-worktrees").join("feat+one");
+    std::fs::create_dir_all(&outside).expect("a worktree outside the folder");
+    std::fs::write(
+        outside.join(".git"),
+        format!("gitdir: {}/.git/worktrees/feat+one\n", live.display()),
+    )
+    .expect("git marker");
+    for (name, checkout) in [("feat+one", &outside), ("repo", &live)] {
+        let old_id = format!("{}-deadbeef", fx.paths.project.display_name);
+        let dir = fx.home.join("projects").join(&old_id);
+        std::fs::create_dir_all(&dir).expect("project folder");
+        let record = state::WorktreeRecord::new(checkout, true);
+        state::save(&dir.join("state.json"), &one_worktree(name, record)).expect("state");
+
+        let report = report(&fx);
+        assert!(report.adoption.is_empty(), "{name}: {:?}", report.adoption);
+        let err = adopt(&fx.paths, &old_id, &yes).unwrap_err();
+        assert!(format!("{err:#}").contains("is still there"), "{err:#}");
+        assert!(dir.is_dir(), "{name}: and nothing moved");
+        std::fs::remove_dir_all(&dir).expect("clear");
+    }
+}
+
+#[test]
+fn a_folder_that_names_no_repository_and_still_runs_something_is_not_moved() {
+    let fx = fixture();
+    let old_id = format!("{}-deadbeef", fx.paths.project.display_name);
+    let dir = fx.home.join("projects").join(&old_id);
+    std::fs::create_dir_all(&dir).expect("project folder");
+    let mut record = state::WorktreeRecord::new(dir.join("gone"), true);
+    record.processes.insert(
+        "dev".to_string(),
+        state::ProcessRecord {
+            // This test's own process: one that is certainly running.
+            pid: std::process::id(),
+            pgid: 999_999,
+            started_at: chrono::Utc::now(),
+            log_path: dir.join("dev.log"),
+            ready_port: None,
+            ready_timeout_s: None,
+            observed_ports: Vec::new(),
+            swept: false,
+            phase: state::Phase::Running {
+                since: chrono::Utc::now(),
+            },
+        },
+    );
+    state::save(&dir.join("state.json"), &one_worktree("gone", record)).expect("state");
+
+    assert!(report(&fx).adoption.is_empty(), "it is not offered");
+    let err = adopt(&fx.paths, &old_id, &yes).unwrap_err();
+    assert!(format!("{err:#}").contains("still running"), "{err:#}");
+    assert!(dir.is_dir(), "and nothing moved");
+    assert!(!fx.paths.project_dir().exists());
+}
+
 #[test]
 fn a_git_marker_that_does_not_name_an_absolute_repository_says_it_does_not_know() {
     let fx = fixture();
@@ -2058,6 +2124,25 @@ fn a_git_marker_that_does_not_name_an_absolute_repository_says_it_does_not_know(
             .contains("nothing in it says which repository it belonged to"),
         "{}",
         report.render()
+    );
+    // Nor does its finding say the repository moved: it cannot know.
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.section == Section::Adoption)
+        .expect("a finding");
+    assert!(
+        !finding.message.contains("no longer where it was"),
+        "{}",
+        finding.message
+    );
+    assert!(
+        finding
+            .fix
+            .as_deref()
+            .is_some_and(|fix| fix.contains("a checkout that still uses it loses them")),
+        "{:?}",
+        finding.fix
     );
 }
 
