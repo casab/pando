@@ -731,6 +731,15 @@ const MAX_INITIAL_BYTES_PER_LINE: u64 = 512;
 /// is one giant line cannot stall a poll on the UI thread.
 const MAX_INITIAL_WINDOW: u64 = 8 * 1024 * 1024;
 
+/// The most bytes a read of the last `capacity` lines spans, and so the
+/// longest line a tail of that capacity holds: a line longer than this is
+/// the fragment a window starting inside it would drop.
+fn window_ceiling(capacity: usize) -> u64 {
+    (capacity as u64)
+        .saturating_mul(MAX_INITIAL_BYTES_PER_LINE)
+        .max(MAX_INITIAL_WINDOW)
+}
+
 /// Where a read of the last lines of a file of `size` bytes starts, no
 /// earlier than `from`, and whether that is partway through a line. The
 /// first read of a file starts from 0; a tail that fell behind starts
@@ -752,7 +761,7 @@ fn window_start(
     if size - from <= first {
         return Ok((from, false));
     }
-    let ceiling = first.max(MAX_INITIAL_WINDOW);
+    let ceiling = window_ceiling(capacity);
     // `capacity` whole lines take one newline more: the first one ends the
     // line the window starts partway through.
     let wanted = (capacity as u64).saturating_add(1);
@@ -866,6 +875,9 @@ pub struct LogTail {
     /// i.e. where `leftover`'s first byte lives. Source of each pushed line's
     /// `file_offset`.
     line_start_offset: u64,
+    /// Whether the line being read grew past [`window_ceiling`], so the
+    /// rest of it is dropped up to its newline rather than held.
+    overlong: bool,
     /// Levels of lines evicted from the front during the most recent `poll`.
     /// Lets the viewer realign absolute indices (search matches, scroll) after
     /// the ring buffer drops old lines. Cleared at the top of every `poll`.
@@ -901,6 +913,7 @@ impl LogTail {
             offset: 0,
             leftover: String::new(),
             line_start_offset: 0,
+            overlong: false,
             evicted_levels: Vec::new(),
             lines_seen: 0,
             block_id_counter: 0,
@@ -1006,6 +1019,7 @@ impl LogTail {
         if rewritten {
             self.offset = 0;
             self.leftover.clear();
+            self.overlong = false;
             self.line_start_offset = 0;
             self.open_block = None;
             self.anchor.clear();
@@ -1029,6 +1043,7 @@ impl LogTail {
                     self.evicted_levels
                         .extend(self.buffer.drain(..).map(|line| line.level));
                     self.leftover.clear();
+                    self.overlong = false;
                     self.open_block = None;
                     self.anchor.clear();
                 }
@@ -1074,9 +1089,10 @@ impl LogTail {
         self.unread = self.offset + (unfinished as u64) < size;
         self.remember_anchor(&raw);
         let mut chunk = String::from_utf8_lossy(&raw).into_owned();
-        if skip_partial_first_line {
+        if skip_partial_first_line || self.overlong {
             chunk = match chunk.find('\n') {
                 Some(newline) => {
+                    self.overlong = false;
                     self.line_start_offset = seek_pos + newline as u64 + 1;
                     chunk[newline + 1..].to_string()
                 }
@@ -1091,16 +1107,19 @@ impl LogTail {
             return Ok(false);
         }
 
+        // Only the new bytes are searched for the end of a line: `leftover`
+        // holds no newline, and splitting it again with every read made
+        // each poll cost as much as the unfinished line had grown.
+        let Some(last) = chunk.rfind('\n') else {
+            self.leftover.push_str(&chunk);
+            self.cap_leftover();
+            return Ok(false);
+        };
         let mut combined = std::mem::take(&mut self.leftover);
-        combined.push_str(&chunk);
-
-        let ends_with_newline = combined.ends_with('\n');
-        let mut parts: Vec<&str> = combined.split('\n').collect();
-        if !ends_with_newline {
-            self.leftover = parts.pop().unwrap_or("").to_string();
-        } else {
-            parts.pop();
-        }
+        combined.push_str(&chunk[..last]);
+        self.leftover = chunk[last + 1..].to_string();
+        self.cap_leftover();
+        let parts: Vec<&str> = combined.split('\n').collect();
 
         let added = !parts.is_empty();
         let mut cursor = self.line_start_offset;
@@ -1125,6 +1144,18 @@ impl LogTail {
         }
         self.line_start_offset = cursor;
         Ok(added)
+    }
+
+    /// Drops the unfinished line once it is longer than [`window_ceiling`],
+    /// and the rest of it with it as it arrives, as a window starting inside
+    /// it would. A process that redraws a progress line with `\r` never
+    /// ends that line, and holding it whole grew the tail for as long as
+    /// the process ran.
+    fn cap_leftover(&mut self) {
+        if self.leftover.len() as u64 > window_ceiling(self.capacity) {
+            self.leftover = String::new();
+            self.overlong = true;
+        }
     }
 
     /// Whether the bytes before `offset` are still the ones this tail read
@@ -1489,6 +1520,47 @@ mod tests {
         append(&path, "\ntail-line\n");
         assert!(tail.poll().unwrap());
         assert_eq!(plain_lines(&tail).last().unwrap(), "tail-line");
+    }
+
+    // A progress bar redrawn with `\r` never ends its line. Every poll
+    // held the whole of it and split it again, so the tail grew, and each
+    // poll on the UI thread took longer, for as long as the process ran.
+    #[test]
+    fn an_unfinished_line_is_held_no_longer_than_a_window_reads() {
+        for bounded in [false, true] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("progress.log");
+            write_all(&path, "start\n");
+            let mut tail = LogTail::new(path.clone(), 4);
+            tail.poll().unwrap();
+
+            let redraw = "\r".to_string() + &"x".repeat(1024 * 1024 - 1);
+            for _ in 0..9 {
+                append(&path, &redraw);
+                if bounded {
+                    tail.poll_bounded(2 * 1024 * 1024).unwrap();
+                } else {
+                    tail.poll().unwrap();
+                }
+                assert!(
+                    tail.leftover.len() as u64 <= MAX_INITIAL_WINDOW,
+                    "held {} bytes of one line",
+                    tail.leftover.len()
+                );
+            }
+            // The line that outgrew it goes whole, as the fragment a
+            // window starting inside it would; what follows is read as
+            // ever, at its own offset.
+            append(&path, "\nafter\n");
+            if bounded {
+                tail.poll_bounded(2 * 1024 * 1024).unwrap();
+            } else {
+                tail.poll().unwrap();
+            }
+            assert_eq!(plain_lines(&tail), ["start", "after"], "bounded: {bounded}");
+            let size = std::fs::metadata(&path).unwrap().len();
+            assert_eq!(tail.lines().back().unwrap().file_offset, size - 6);
+        }
     }
 
     #[test]
