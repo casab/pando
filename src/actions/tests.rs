@@ -10767,6 +10767,51 @@ fn two_starts_at_once_never_record_the_same_slot() {
     assert_eq!(ours, vec!["2"]);
 }
 
+// The same across projects on one Redis. Each project's lock is its own,
+// and each start read the other projects' records before either wrote:
+// two starts at once could both be given one empty slot, with nothing
+// after to say so. A slot is handed out under a lock every project takes,
+// held from reading the others' records to writing this one's.
+#[test]
+fn a_slot_is_handed_out_under_a_lock_every_project_takes() {
+    let (ns, redis) = slots_fixture(MAIN_ENV_WITH_REDIS);
+    let marks = tempdir().unwrap();
+    std::fs::write(
+        redis.join("on-size-1"),
+        format!(
+            "touch '{m}/sizing'\n\
+             i=0\nwhile [ ! -e '{m}/release' ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done\n",
+            m = marks.path().display()
+        ),
+    )
+    .unwrap();
+    std::thread::scope(|scope| {
+        let starting = scope.spawn(|| ns.start(Mode::Namespaced));
+        let sizing = wait_until(Duration::from_secs(20), || {
+            marks.path().join("sizing").exists()
+        });
+        let held = sizing
+            && state::try_lock(&ns.fx.paths.slots_lock_file())
+                .unwrap()
+                .is_none();
+        std::fs::write(marks.path().join("release"), "").unwrap();
+        let (report, said) = starting.join().unwrap().unwrap();
+        let _guard = guard(&report);
+        assert!(sizing, "slot 1 was never sized");
+        assert!(
+            held,
+            "slot 1 was sized outside the lock every project takes"
+        );
+        assert_eq!(ns.env_line("REDIS_DB").as_deref(), Some("1"), "{said:?}");
+    });
+    assert!(
+        state::try_lock(&ns.fx.paths.slots_lock_file())
+            .unwrap()
+            .is_some(),
+        "and let go once the slot was recorded"
+    );
+}
+
 // A slot freed from this worktree while it was starting, and given to
 // another, is not written back into its record: the start stops, and the
 // slot stays the other one's alone.

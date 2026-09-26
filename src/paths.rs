@@ -68,6 +68,13 @@ impl PandoPaths {
         self.project_dir().join("state.lock")
     }
 
+    /// The lock a namespaced start hands out a slot under, the same for
+    /// every project on this machine: a Redis on a port is the machine's,
+    /// and each project's own lock covers only its own records.
+    pub fn slots_lock_file(&self) -> PathBuf {
+        self.home.join("slots.lock")
+    }
+
     pub fn cache_dir(&self) -> PathBuf {
         self.project_dir().join("cache")
     }

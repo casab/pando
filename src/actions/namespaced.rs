@@ -781,6 +781,12 @@ fn ensure_slot(
         store = crate::state::load(&paths.state_file())?;
     }
     let holders = slot_holders(&store, target);
+    // Every project's, from reading the others' records to writing this
+    // one's: each project's own lock is its own, and two starts in two
+    // projects that each read the other's records before either wrote
+    // would both be given the same empty slot. Taken before the project's
+    // lock whenever both are held, and never while it is.
+    let _slots = crate::state::lock(&paths.slots_lock_file())?;
     let others = other_projects(paths);
     none_while_unread(&others, target)?;
     let elsewhere = slots_elsewhere(&others, target);
