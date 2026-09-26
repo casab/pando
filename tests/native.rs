@@ -867,6 +867,29 @@ fn a_compose_record_docker_cannot_be_run_for_gives_way_to_the_native_server() {
             .any(|m| m.contains("docker cannot be run here") && m.contains(&project)),
         "{said:?}"
     );
+    // Nothing here could tell the container was gone — a docker missing
+    // only from this PATH still has its daemon — so the record that names
+    // the project stays, beside the native one, for what can ask.
+    let record = f.record(&name);
+    assert!(
+        record
+            .services
+            .iter()
+            .any(|s| s.kind == ServiceKind::Compose
+                && s.compose_project.as_deref() == Some(project.as_str())
+                && s.port.is_none()),
+        "{:?}",
+        record.services
+    );
+    let server = f.service(&name, "postgres").pid;
+
+    // Docker back, the next start finds no container left and lets the
+    // record go, with the server left as it was.
+    common::docker::install(&f.home);
+    start_isolated(&f, &name);
+    let record = f.record(&name);
+    assert_eq!(record.services.len(), 1, "{:?}", record.services);
+    assert_eq!(f.service(&name, "postgres").pid, server);
 }
 
 // ---- a data directory the fingerprint cannot see --------------------------

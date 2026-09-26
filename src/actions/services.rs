@@ -65,17 +65,22 @@ pub(super) fn stop_containers(
 /// is asked first which of the services still has one, because it fails a
 /// stop by project of a service it has none for — one removed outside
 /// pando, by the `down -v` a start prints. And a docker that cannot be run
-/// at all is a note: there is no Docker for a container to come back with.
+/// at all is a note, not a refusal: an uninstalled Docker would otherwise
+/// refuse every start. It is not taken to mean the containers are gone,
+/// though — a docker only missing from this PATH still has a daemon — so
+/// those are returned, by compose project, for
+/// [`replace_stopped_containers`] to keep the records of.
 pub(super) fn stop_service_containers(
     paths: &PandoPaths,
     containers: &[(String, Vec<String>)],
     progress: &dyn Fn(&str),
-) -> Result<()> {
+) -> Result<Vec<(String, Vec<String>)>> {
     let program = services::docker_program(paths);
+    let mut unasked: Vec<(String, Vec<String>)> = Vec::new();
     for (project, services) in containers {
-        let (them, they) = match services.len() {
-            1 => ("the compose container", "it"),
-            _ => ("the compose containers", "they"),
+        let (them, they, it) = match services.len() {
+            1 => ("the compose container", "it", "it"),
+            _ => ("the compose containers", "they", "them"),
         };
         let refused = |e: anyhow::Error| match services::is_daemon_down(&e) {
             true => anyhow::anyhow!(
@@ -95,10 +100,11 @@ pub(super) fn stop_service_containers(
                 .collect(),
             Err(e) if services::is_docker_missing(&e) => {
                 progress(&format!(
-                    "docker cannot be run here, so {them} of {} in {project} cannot be running \
-                     either — nothing to stop",
+                    "docker cannot be run here, so {them} of {} in {project} cannot be asked to \
+                     stop — the record that names {it} is kept, for a start, stop or rm that can",
                     services.join(", ")
                 ));
+                unasked.push((project.clone(), services.clone()));
                 continue;
             }
             Err(e) => return Err(refused(e)),
@@ -107,22 +113,26 @@ pub(super) fn stop_service_containers(
             compose.stop_services(&left).map_err(refused)?;
         }
     }
-    Ok(())
+    Ok(unasked)
 }
 
 /// Writes the native record of each service whose compose containers
-/// [`stop_service_containers`] has just stopped, or found could not come
-/// back, over the compose record [`planned_services`] kept for it until
-/// then.
+/// [`stop_service_containers`] has just stopped, or found gone, over the
+/// compose record [`planned_services`] kept for it until then.
 ///
 /// That record is the only thing that can find those containers again,
 /// so it goes only once they are stopped: a start that failed first, or
 /// was refused because Docker was not running, leaves it for the next
-/// start to stop them.
+/// start to stop them. One docker could not be asked about at all —
+/// `unasked` — is kept as a leftover beside the native record, with no
+/// port: the start goes on without it, and `stop`, `rm` and the next start
+/// can still find its containers. A native record already there, beside
+/// a leftover a start before this one kept, is the one kept.
 pub(super) fn replace_stopped_containers(
     paths: &PandoPaths,
     name: &str,
     stopped: &[(String, Vec<String>)],
+    unasked: &[(String, Vec<String>)],
 ) -> Result<()> {
     if stopped.is_empty() {
         return Ok(());
@@ -132,21 +142,49 @@ pub(super) fn replace_stopped_containers(
     let Some(record) = store.worktrees.get_mut(name) else {
         return Ok(());
     };
-    for service in record.services.iter_mut() {
-        let stopped_here = stopped.iter().any(|(project, services)| {
-            service.compose_project.as_ref() == Some(project) && services.contains(&service.name)
-        });
-        if service.kind == state::ServiceKind::Compose && stopped_here {
-            *service = state::ServiceRecord {
+    let named = |list: &[(String, Vec<String>)], service: &state::ServiceRecord| {
+        service.kind == state::ServiceKind::Compose
+            && list.iter().any(|(project, services)| {
+                service.compose_project.as_ref() == Some(project)
+                    && services.contains(&service.name)
+            })
+    };
+    let native: Vec<String> = record
+        .services
+        .iter()
+        .filter(|s| s.kind == state::ServiceKind::Native)
+        .map(|s| s.name.clone())
+        .collect();
+    let mut services: Vec<state::ServiceRecord> = Vec::new();
+    let mut leftovers: Vec<state::ServiceRecord> = Vec::new();
+    for service in std::mem::take(&mut record.services) {
+        if !named(stopped, &service) {
+            services.push(service);
+            continue;
+        }
+        if !native.contains(&service.name) {
+            services.push(state::ServiceRecord {
                 name: service.name.clone(),
                 kind: state::ServiceKind::Native,
                 port: service.port,
                 pid: None,
                 pgid: None,
                 compose_project: None,
-            };
+            });
+        }
+        if named(unasked, &service) {
+            leftovers.push(state::ServiceRecord {
+                port: None,
+                pid: None,
+                pgid: None,
+                ..service
+            });
         }
     }
+    // After every record that runs a service, so a lookup by name finds
+    // the native record first.
+    services.extend(leftovers);
+    record.services = services;
     state::save(&paths.state_file(), &store)
 }
 
@@ -383,6 +421,8 @@ pub(super) fn leave_changed_kinds(
 /// — but its *port* is blanked, because the window has moved on and
 /// another service has that number now. `status` would otherwise show two
 /// services on one port, and only one of them would be telling the truth.
+/// So is the leftover [`replace_stopped_containers`] keeps beside a native
+/// record of the same name, after it.
 pub(super) fn planned_services(
     config: &Config,
     ports: &BTreeMap<String, u16>,
@@ -398,13 +438,19 @@ pub(super) fn planned_services(
         // lose a container pando can never find again, or keep a database
         // record for a process that exited.
         let kind = kind_of(&native, &service);
-        // Kept as it is, pump aside, until its containers are stopped.
+        let existing = record
+            .services
+            .iter()
+            .find(|s| s.name == service && s.kind == kind);
+        // Kept as it is, pump aside, until its containers are stopped —
+        // unless a native record of the name is there already: it is then
+        // a leftover, kept below.
         let replaced = record.services.iter().find(|s| {
             s.name == service
                 && s.kind == state::ServiceKind::Compose
                 && s.compose_project.is_some()
         });
-        if let (state::ServiceKind::Native, Some(replaced)) = (kind, replaced) {
+        if let (state::ServiceKind::Native, Some(replaced), None) = (kind, replaced, existing) {
             out.push(state::ServiceRecord {
                 port: ports.get(&service).copied(),
                 pid: None,
@@ -413,10 +459,6 @@ pub(super) fn planned_services(
             });
             continue;
         }
-        let existing = record
-            .services
-            .iter()
-            .find(|s| s.name == service && s.kind == kind);
         out.push(state::ServiceRecord {
             name: service.clone(),
             kind,
@@ -435,7 +477,13 @@ pub(super) fn planned_services(
         });
     }
     for service in &record.services {
-        if !out.iter().any(|kept| kept.name == service.name) {
+        let listed = out.iter().any(|kept| kept.name == service.name);
+        let leftover = service.kind == state::ServiceKind::Compose
+            && service.compose_project.is_some()
+            && !out
+                .iter()
+                .any(|kept| kept.name == service.name && kept.kind == service.kind);
+        if !listed || leftover {
             out.push(state::ServiceRecord {
                 port: None,
                 ..service.clone()
@@ -1253,7 +1301,7 @@ fn start_one_native(
     if let Some(record) = store
         .worktrees
         .get_mut(name)
-        .and_then(|r| r.services.iter_mut().find(|s| s.name == service.service))
+        .and_then(|r| native_record(&mut r.services, &service.service))
     {
         record.pid = Some(spawned.pid);
         record.pgid = Some(spawned.pgid);
@@ -1285,8 +1333,25 @@ fn recorded_native_pid(paths: &PandoPaths, name: &str, service: &str) -> Result<
     Ok(store
         .worktrees
         .get(name)
-        .and_then(|record| record.services.iter().find(|s| s.name == service))
+        .and_then(|record| {
+            record
+                .services
+                .iter()
+                .find(|s| s.name == service && s.kind == state::ServiceKind::Native)
+        })
         .and_then(|s| s.pid))
+}
+
+/// The native record of `service`: by kind as well as name, because a
+/// compose leftover of the same name can sit beside it — see
+/// [`replace_stopped_containers`].
+fn native_record<'a>(
+    services: &'a mut [state::ServiceRecord],
+    service: &str,
+) -> Option<&'a mut state::ServiceRecord> {
+    services
+        .iter_mut()
+        .find(|s| s.name == service && s.kind == state::ServiceKind::Native)
 }
 
 /// Signals every native service this call started and forgets its pid, so
@@ -1306,7 +1371,7 @@ fn stop_native_services(paths: &PandoPaths, name: &str, started: &[native::Nativ
         let Some(record) = store
             .worktrees
             .get_mut(name)
-            .and_then(|r| r.services.iter_mut().find(|s| s.name == service.service))
+            .and_then(|r| native_record(&mut r.services, &service.service))
         else {
             continue;
         };
@@ -1536,11 +1601,21 @@ pub fn service_statuses(record: &WorktreeRecord) -> Vec<ServiceStatus> {
 /// Every service record a worktree carries, leftovers included — what
 /// `status --json` publishes. The shape was published with them in it, and
 /// a program reads `project` there to find the volumes; hiding a row is a
-/// decision about a screen, not about the contract.
+/// decision about a screen, not about the contract. The one left out is
+/// the compose leftover [`replace_stopped_containers`] keeps beside a
+/// native record of the same name: the shape is a map by name, and that
+/// name is the native service's now.
 pub fn recorded_service_statuses(record: &WorktreeRecord) -> Vec<ServiceStatus> {
     record
         .services
         .iter()
+        .filter(|service| {
+            service.kind != state::ServiceKind::Compose
+                || !record
+                    .services
+                    .iter()
+                    .any(|other| other.name == service.name && other.kind != service.kind)
+        })
         .map(|service| ServiceStatus {
             name: service.name.clone(),
             port: service.port,
