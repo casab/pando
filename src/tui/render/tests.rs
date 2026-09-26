@@ -3441,6 +3441,43 @@ fn a_running_worktree_with_no_mode_written_runs_shared_in_the_chooser() {
     assert!(!rendered.contains("every process restarts"), "{rendered}");
 }
 
+// The theme picker says why it shows the half it does: the system, or
+// whatever pins it — never the system when the system had no say.
+#[test]
+fn the_theme_picker_says_what_decided_dark_or_light() {
+    use crate::theme::{Appearance, AppearanceOrigin};
+    let mut app = test_app(&["feat+one"]);
+    for (appearance, origin, wanted) in [
+        (
+            Appearance::Dark,
+            AppearanceOrigin::System,
+            "dark half, as the system is — [ui] appearance pins one",
+        ),
+        (
+            Appearance::Light,
+            AppearanceOrigin::Config,
+            "light half, as [ui] appearance pins it",
+        ),
+        (
+            Appearance::Light,
+            AppearanceOrigin::Env,
+            "light half, as PANDO_APPEARANCE pins it",
+        ),
+    ] {
+        app.theme.appearance = appearance;
+        app.theme.appearance_origin = origin;
+        app.modal = Some(Modal::Theme {
+            selected: 0,
+            before: crate::theme::palette(),
+        });
+        let rendered = text_of(&draw(&mut app, 160, 40));
+        assert!(rendered.contains(wanted), "{wanted}:\n{rendered}");
+        if origin != AppearanceOrigin::System {
+            assert!(!rendered.contains("as the system is"), "{rendered}");
+        }
+    }
+}
+
 // Decision 11: namespaced has a colour of its own, wherever the word is.
 #[test]
 fn namespaced_is_painted_in_its_own_colour_in_the_list_and_the_chooser() {

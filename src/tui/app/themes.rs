@@ -4,7 +4,9 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use std::sync::{Arc, Mutex};
 
-use crate::theme::{self, Appearance, Origin, Palette, Resolved, Settings, Theme};
+use crate::theme::{
+    self, Appearance, AppearanceOrigin, Origin, Palette, Resolved, Settings, Theme,
+};
 
 use super::dialogs::Modal;
 use super::{App, LogTails};
@@ -16,6 +18,8 @@ pub struct ThemeState {
     pub name: String,
     pub origin: Origin,
     pub appearance: Appearance,
+    /// What decided the appearance: the system, or what pins it.
+    pub appearance_origin: AppearanceOrigin,
     /// What the config says, shared with the watcher that follows it: a
     /// choice saved here is the one the watcher compares against next.
     pub settings: Arc<Mutex<Settings>>,
@@ -29,6 +33,7 @@ impl ThemeState {
             name: theme::DEFAULT_THEME.to_string(),
             origin: Origin::Default,
             appearance: Appearance::Dark,
+            appearance_origin: AppearanceOrigin::System,
             settings: Arc::new(Mutex::new(settings)),
         }
     }
@@ -43,6 +48,7 @@ impl App {
         self.theme.name = resolved.name;
         self.theme.origin = resolved.origin;
         self.theme.appearance = resolved.appearance;
+        self.theme.appearance_origin = resolved.appearance_origin;
         for warning in resolved.warnings {
             self.set_error(warning);
         }

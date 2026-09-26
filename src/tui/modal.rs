@@ -19,8 +19,8 @@ use super::app::{
 use super::render::{centered_box, chunk_cells, text_width, truncate, truncate_middle, wrap_text};
 use crate::state::ServiceMode;
 use crate::theme::{
-    blue, border, cyan, green, highlight_bg, magenta, namespaced, orange, red, surface, text,
-    text_dim, text_muted, yellow,
+    AppearanceOrigin, blue, border, cyan, green, highlight_bg, magenta, namespaced, orange, red,
+    surface, text, text_dim, text_muted, yellow,
 };
 use crate::worktree::{BranchSource, PrState};
 
@@ -975,14 +975,20 @@ fn render_theme_picker(f: &mut Frame, area: Rect, app: &App, selected: usize) {
         })
         .collect();
     lines.push(Line::raw(""));
+    // Why this half, and the knob that would change it: only a system
+    // choice points at the key that pins one.
+    let half = appearance.word();
+    let why = match app.theme.appearance_origin {
+        AppearanceOrigin::System => {
+            format!("{half} half, as the system is — [ui] appearance pins one")
+        }
+        AppearanceOrigin::Config => format!("{half} half, as [ui] appearance pins it"),
+        AppearanceOrigin::Env => {
+            format!("{half} half, as {} pins it", crate::theme::APPEARANCE_ENV)
+        }
+    };
     lines.push(Line::styled(
-        truncate(
-            &format!(
-                "{} half, as the system is — [ui] appearance pins one",
-                appearance.word()
-            ),
-            cap,
-        ),
+        truncate(&why, cap),
         Style::new().fg(text_muted()),
     ));
     lines.push(Line::from(vec![

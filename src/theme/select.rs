@@ -83,15 +83,30 @@ fn first_line(path: &Path) -> Option<String> {
     (!line.is_empty()).then(|| line.to_string())
 }
 
-/// Dark or light: the environment, then the config, then the system. The
-/// system is asked by running a program, so this blocks for a moment —
-/// call it at startup or on a watcher, never from a key handler.
-pub fn appearance(settings: &Settings) -> Appearance {
-    let pinned = std::env::var(APPEARANCE_ENV)
+/// What decided dark or light, for the picker to say whether the system
+/// did or something pins it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppearanceOrigin {
+    Env,
+    Config,
+    System,
+}
+
+/// Dark or light, and what decided it: the environment, then the config,
+/// then the system. The system is asked by running a program, so this
+/// blocks for a moment — call it at startup or on a watcher, never from a
+/// key handler.
+pub fn appearance(settings: &Settings) -> (Appearance, AppearanceOrigin) {
+    if let Some(pinned) = std::env::var(APPEARANCE_ENV)
         .ok()
         .and_then(|v| Appearance::parse(&v))
-        .or_else(|| settings.appearance.as_deref().and_then(Appearance::parse));
-    pinned.unwrap_or_else(system_appearance)
+    {
+        return (pinned, AppearanceOrigin::Env);
+    }
+    if let Some(pinned) = settings.appearance.as_deref().and_then(Appearance::parse) {
+        return (pinned, AppearanceOrigin::Config);
+    }
+    (system_appearance(), AppearanceOrigin::System)
 }
 
 /// macOS says `Dark` for `AppleInterfaceStyle` in dark mode and has no

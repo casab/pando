@@ -48,7 +48,9 @@ mod select;
 
 pub use catalog::{BUILT_IN, DEFAULT_THEME, Source, Theme, find, themes};
 pub use palette::{Palette, Rgb, Variant};
-pub use select::{APPEARANCE_ENV, Appearance, Origin, Settings, THEME_ENV, appearance, choose};
+pub use select::{
+    APPEARANCE_ENV, Appearance, AppearanceOrigin, Origin, Settings, THEME_ENV, appearance, choose,
+};
 
 use ratatui::style::Color;
 use std::path::Path;
@@ -93,7 +95,7 @@ fn fallback() -> Palette {
         let appearance = if cfg!(test) {
             Appearance::Dark
         } else {
-            appearance(&Settings::default())
+            appearance(&Settings::default()).0
         };
         let (all, _) = themes(None);
         find(&all, DEFAULT_THEME)
@@ -106,13 +108,14 @@ pub fn palette() -> Palette {
     active().unwrap_or_else(fallback)
 }
 
-/// A theme resolved for this run: which one, why, dark or light, and what
-/// could not be honoured along the way.
+/// A theme resolved for this run: which one, why, dark or light and why,
+/// and what could not be honoured along the way.
 #[derive(Debug, Clone)]
 pub struct Resolved {
     pub name: String,
     pub origin: Origin,
     pub appearance: Appearance,
+    pub appearance_origin: AppearanceOrigin,
     pub palette: Palette,
     pub warnings: Vec<String>,
 }
@@ -124,7 +127,7 @@ pub struct Resolved {
 pub fn resolve(settings: &Settings, themes_dir: Option<&Path>) -> Resolved {
     let (all, mut warnings) = themes(themes_dir);
     let (name, origin) = choose(settings);
-    let appearance = appearance(settings);
+    let (appearance, appearance_origin) = appearance(settings);
     let theme = match find(&all, &name) {
         Some(theme) => theme,
         None => {
@@ -138,6 +141,7 @@ pub fn resolve(settings: &Settings, themes_dir: Option<&Path>) -> Resolved {
         name: theme.name.clone(),
         origin,
         appearance,
+        appearance_origin,
         palette: theme.palette(appearance),
         warnings,
     }

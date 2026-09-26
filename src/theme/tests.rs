@@ -141,6 +141,27 @@ fn a_theme_is_chosen_from_the_file_then_the_config_then_the_default() {
     assert_eq!(choose(&none), (DEFAULT_THEME.into(), Origin::Default));
 }
 
+// A half the config pins says so, rather than passing for the system's.
+#[test]
+fn a_pinned_appearance_says_what_pinned_it() {
+    // The environment is left alone: other tests run beside this one.
+    if std::env::var(APPEARANCE_ENV).is_ok() {
+        return;
+    }
+    let settings = Settings {
+        appearance: Some("light".into()),
+        ..Settings::default()
+    };
+    assert_eq!(
+        appearance(&settings),
+        (Appearance::Light, AppearanceOrigin::Config)
+    );
+    assert_eq!(
+        resolve(&settings, None).appearance_origin,
+        AppearanceOrigin::Config
+    );
+}
+
 #[test]
 fn an_unknown_theme_falls_back_to_the_default_and_says_so() {
     if std::env::var(THEME_ENV).is_ok() {
