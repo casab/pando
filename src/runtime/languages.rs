@@ -203,6 +203,15 @@ pub struct Manager {
     /// The line that switches to the version the repository's own file
     /// names. Only the source-and-eval family has one.
     pub use_line: Option<&'static str>,
+    /// The version files `use_line` reads. A requirement stated anywhere
+    /// else — `engines`, `.tool-versions`, a file another manager reads —
+    /// is one a bare `use` cannot find, and it fails the whole prelude.
+    pub use_reads: &'static [&'static str],
+    /// Whether the init line on its own puts a version on PATH: a shim
+    /// directory does, and `fnm env` and rvm's script switch to the
+    /// default. A manager whose init line does not is no fix without its
+    /// `use_line`.
+    pub init_activates: bool,
     /// How it installs a version, with `{spec}` and `{language}`. Printed,
     /// never run: mutating the developer's machine is not pando's job.
     pub install: Option<&'static str>,
@@ -247,6 +256,8 @@ const VOLTA: Manager = Manager {
     markers: &[".volta/bin"],
     init: "export PATH=\"{path}:$PATH\"",
     use_line: None,
+    use_reads: &[],
+    init_activates: true,
     install: Some("volta install {language}@{spec}"),
     uses_alias: false,
 };
@@ -257,6 +268,8 @@ const MISE: Manager = Manager {
     markers: &[".local/share/mise/shims"],
     init: "export PATH=\"{path}:$PATH\"",
     use_line: None,
+    use_reads: &[],
+    init_activates: true,
     install: Some("mise install {language}@{spec}"),
     uses_alias: false,
 };
@@ -267,6 +280,8 @@ const ASDF: Manager = Manager {
     markers: &[".asdf/shims"],
     init: "export PATH=\"{path}:$PATH\"",
     use_line: None,
+    use_reads: &[],
+    init_activates: true,
     install: Some("asdf install {language} {spec}"),
     uses_alias: true,
 };
@@ -284,6 +299,11 @@ const NVM: Manager = Manager {
     // machine shares, and `nvm use` with no argument takes the version
     // from the repository's own `.nvmrc`.
     use_line: Some("nvm use >/dev/null"),
+    // Only `.nvmrc`: in a directory with a `.node-version` alone, `nvm use`
+    // exits 127 with "No .nvmrc file found".
+    use_reads: &[".nvmrc"],
+    // Sourced with `--no-use`, nvm switches to no version at all.
+    init_activates: false,
     install: Some("nvm install {spec}"),
     uses_alias: false,
 };
@@ -299,6 +319,8 @@ const FNM: Manager = Manager {
     ],
     init: "eval \"$({path} env)\"",
     use_line: Some("fnm use >/dev/null"),
+    use_reads: &[".nvmrc", ".node-version"],
+    init_activates: true,
     install: Some("fnm install {spec}"),
     uses_alias: false,
 };
@@ -309,6 +331,8 @@ const PYENV: Manager = Manager {
     markers: &[".pyenv/shims"],
     init: "export PATH=\"{path}:$PATH\"",
     use_line: None,
+    use_reads: &[],
+    init_activates: true,
     install: Some("pyenv install {spec}"),
     uses_alias: false,
 };
@@ -319,6 +343,8 @@ const RBENV: Manager = Manager {
     markers: &[".rbenv/shims"],
     init: "export PATH=\"{path}:$PATH\"",
     use_line: None,
+    use_reads: &[],
+    init_activates: true,
     install: Some("rbenv install {spec}"),
     uses_alias: false,
 };
@@ -329,6 +355,8 @@ const RVM: Manager = Manager {
     markers: &[".rvm/scripts/rvm"],
     init: ". \"{path}\"",
     use_line: Some("rvm use . >/dev/null"),
+    use_reads: &[".ruby-version"],
+    init_activates: true,
     install: Some("rvm install {spec}"),
     uses_alias: false,
 };
@@ -339,6 +367,8 @@ const RUSTUP: Manager = Manager {
     markers: &[".cargo/bin"],
     init: "export PATH=\"{path}:$PATH\"",
     use_line: None,
+    use_reads: &[],
+    init_activates: true,
     install: Some("rustup toolchain install {spec}"),
     uses_alias: false,
 };
@@ -349,6 +379,8 @@ const JENV: Manager = Manager {
     markers: &[".jenv/shims"],
     init: "export PATH=\"{path}:$PATH\"",
     use_line: None,
+    use_reads: &[],
+    init_activates: true,
     // jenv manages JDKs that are already on the machine; it installs none.
     install: None,
     uses_alias: false,
@@ -360,6 +392,8 @@ const SDKMAN: Manager = Manager {
     markers: &[".sdkman/bin/sdkman-init.sh"],
     init: ". \"{path}\"",
     use_line: None,
+    use_reads: &[],
+    init_activates: true,
     install: Some("sdk install java {spec}"),
     uses_alias: false,
 };

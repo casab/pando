@@ -447,7 +447,7 @@ fn a_source_and_eval_manager_gets_an_init_line_and_a_use_line() {
     // Scoped to the injected home: Homebrew installs nvm and fnm
     // outside `$HOME`, so an unfiltered count is a fact about the host
     // and not about the code.
-    let fixes = from_home(node(), &home, from_version_file(node(), &requirement));
+    let fixes = from_home(node(), &home, &requirement);
     assert_eq!(fixes.len(), 1, "{fixes:?}");
     let line = &fix_from(&fixes, "nvm").line;
     assert!(line.contains("nvm.sh"), "{line}");
@@ -457,15 +457,48 @@ fn a_source_and_eval_manager_gets_an_init_line_and_a_use_line() {
     assert!(!line.contains("nvm use 22"), "{line}");
 }
 
-// A requirement that came from `engines` is not in a file nvm can
-// read, so there is nothing for a bare `nvm use` to find.
+// A requirement that came from `engines` is not in a file fnm can read,
+// so there is nothing for a bare `fnm use` to find. `fnm env` alone
+// still switches to fnm's default, which may be what is asked for.
 #[test]
-fn a_requirement_no_manager_can_read_gets_the_init_line_alone() {
-    let home = home_with(&[".nvm/nvm.sh"]);
+fn a_requirement_the_manager_cannot_read_gets_the_init_line_alone() {
+    let home = home_with(&[".local/share/fnm/fnm"]);
     let requirement = Requirement::new("node", ">=18", "package.json engines.node".into());
-    let fixes = from_home(node(), &home, from_version_file(node(), &requirement));
-    let nvm = fix_from(&fixes, "nvm");
-    assert!(!nvm.line.contains("nvm use"), "{nvm:?}");
+    let fixes = from_home(node(), &home, &requirement);
+    let fnm = fix_from(&fixes, "fnm");
+    assert!(!fnm.line.contains("fnm use"), "{fnm:?}");
+}
+
+// nvm reads `.nvmrc` and nothing else, so `nvm use` beside a
+// `.node-version` exits 127 and fails the whole prelude; and sourced
+// with `--no-use` and no `use`, nvm switches to no version at all.
+// Either line would be refused after it was picked.
+#[test]
+fn nvm_is_not_offered_for_a_requirement_it_cannot_read() {
+    let home = home_with(&[".nvm/nvm.sh", ".local/share/fnm/fnm"]);
+    for source in [
+        ".node-version",
+        "package.json engines.node",
+        ".tool-versions",
+    ] {
+        let requirement = Requirement::new("node", "22", source.into());
+        let offered: Vec<&str> = from_home(node(), &home, &requirement)
+            .iter()
+            .map(|fix| fix.manager)
+            .collect();
+        assert_eq!(offered, vec!["fnm"], "{source}");
+    }
+    let requirement = Requirement::new("node", "22", ".node-version".into());
+    let fixes = from_home(node(), &home, &requirement);
+    assert!(
+        fix_from(&fixes, "fnm").line.ends_with("fnm use >/dev/null"),
+        "fnm reads .node-version itself: {fixes:?}"
+    );
+}
+
+/// A requirement from `.nvmrc`, the file nvm and fnm both read.
+fn nvmrc() -> Requirement {
+    Requirement::new("node", "22", ".nvmrc".into())
 }
 
 // A shim manager resolves per directory by itself. When it fails it is
@@ -474,9 +507,9 @@ fn a_requirement_no_manager_can_read_gets_the_init_line_alone() {
 /// Only the fixes that came from the injected home. A manager can also
 /// be installed system-wide — Homebrew puts nvm in its own prefix —
 /// and whether this machine has one is not something a test decides.
-fn from_home(language: &Language, home: &TempDir, reads_version_file: bool) -> Vec<Fix> {
+fn from_home(language: &Language, home: &TempDir, requirement: &Requirement) -> Vec<Fix> {
     let home_path = home.path().display().to_string();
-    fixes(language, home.path(), reads_version_file)
+    fixes(language, home.path(), requirement)
         .into_iter()
         .filter(|fix| fix.line.contains(&home_path))
         .collect()
@@ -503,7 +536,7 @@ fn fix_from<'a>(fixes: &'a [Fix], manager: &str) -> &'a Fix {
 #[test]
 fn a_shim_manager_gets_a_path_line_and_never_a_use_line() {
     let home = home_with(&[".volta/bin"]);
-    let fixes = from_home(node(), &home, true);
+    let fixes = from_home(node(), &home, &nvmrc());
     let volta = fix_from(&fixes, "volta");
     assert!(volta.line.starts_with("export PATH="), "{volta:?}");
     assert!(!volta.line.contains("use"), "{volta:?}");
@@ -514,14 +547,14 @@ fn a_shim_manager_gets_a_path_line_and_never_a_use_line() {
 fn only_the_managers_this_machine_has_are_offered() {
     let empty = TempDir::new().unwrap();
     assert!(
-        from_home(node(), &empty, true).is_empty(),
+        from_home(node(), &empty, &nvmrc()).is_empty(),
         "a home with no manager in it offers no line"
     );
 
     // And the order is the table's: a PATH line is the sturdier fix in
     // a non-interactive shell, so it comes first.
     let home = home_with(&[".nvm/nvm.sh", ".volta/bin"]);
-    let offered: Vec<&str> = from_home(node(), &home, true)
+    let offered: Vec<&str> = from_home(node(), &home, &nvmrc())
         .iter()
         .map(|fix| fix.manager)
         .collect();

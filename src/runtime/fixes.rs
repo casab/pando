@@ -23,21 +23,26 @@ pub struct Fix {
 /// PATH line is the sturdier fix in a non-interactive shell, so it is the
 /// one a question preselects.
 ///
-/// `reads_version_file` says whether the requirement came from a file the
-/// manager itself knows how to read, which is the only case where a `use`
-/// line belongs: it takes the version from the repository, so one line in
-/// a machine-wide file is right for every project on the machine.
-pub fn fixes(language: &Language, home: &Path, reads_version_file: bool) -> Vec<Fix> {
+/// A `use` line belongs only where the requirement came from a file that
+/// manager reads itself: it takes the version from the repository, so one
+/// line in a machine-wide file is right for every project on the machine.
+/// A manager whose init line switches to nothing on its own, and whose
+/// `use` line cannot read the requirement, is not offered at all: its line
+/// could never change what resolves.
+pub fn fixes(language: &Language, home: &Path, requirement: &Requirement) -> Vec<Fix> {
     language
         .managers
         .iter()
         .filter_map(|manager| {
             let path = manager.installed_at(home)?;
             let mut line = manager.init.replace("{path}", &path.display().to_string());
-            if let Some(use_line) = manager.use_line
-                && reads_version_file
-            {
-                line = format!("{line} && {use_line}");
+            let use_line = manager
+                .use_line
+                .filter(|_| manager.use_reads.contains(&requirement.source.as_str()));
+            match use_line {
+                Some(use_line) => line = format!("{line} && {use_line}"),
+                None if !manager.init_activates => return None,
+                None => {}
             }
             let why = match manager.family {
                 Family::Shim => format!(
@@ -65,13 +70,4 @@ pub fn installed(language: &Language, home: &Path) -> Vec<&'static Manager> {
         .iter()
         .filter(|manager| manager.installed_at(home).is_some())
         .collect()
-}
-
-/// Whether the requirement was stated in a file this language's managers
-/// read themselves.
-pub fn from_version_file(language: &Language, requirement: &Requirement) -> bool {
-    language
-        .files
-        .iter()
-        .any(|source| source.file == requirement.source)
 }

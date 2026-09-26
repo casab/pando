@@ -37,14 +37,10 @@ pub(super) fn runtime_report(
             .into_iter()
             .map(|manager| manager.name)
             .collect();
-        let fixes: Vec<String> = runtime::fixes(
-            entry,
-            &machine.home,
-            runtime::from_version_file(entry, requirement),
-        )
-        .into_iter()
-        .map(|fix| format!("{}  ({})", fix.line, fix.why))
-        .collect();
+        let fixes: Vec<String> = runtime::fixes(entry, &machine.home, requirement)
+            .into_iter()
+            .map(|fix| format!("{}  ({})", fix.line, fix.why))
+            .collect();
         let report = LanguageReport {
             language: requirement.language.clone(),
             spec: requirement.spec.clone(),

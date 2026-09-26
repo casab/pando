@@ -303,13 +303,7 @@ fn runtime_report(
 fn prelude_proposal(check: &crate::runtime::Check, home: &Path) -> detect::Proposal {
     let requirement = &check.requirement;
     let candidates = crate::runtime::language(&requirement.language)
-        .map(|language| {
-            crate::runtime::fixes(
-                language,
-                home,
-                crate::runtime::from_version_file(language, requirement),
-            )
-        })
+        .map(|language| crate::runtime::fixes(language, home, requirement))
         .unwrap_or_default()
         .into_iter()
         .map(|fix| detect::Candidate {
