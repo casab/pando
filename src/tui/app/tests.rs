@@ -4862,6 +4862,27 @@ fn a_create_whose_install_failed_says_it_was_created_and_goes_to_it() {
     assert_eq!(app.select_on_arrival, None);
 }
 
+// Kept over a record another command wrote while git checked it out:
+// "could not create feat/x: … the worktree and that record are kept"
+// said both at once, and the cursor stayed where it was.
+#[test]
+fn a_create_kept_over_a_raced_record_says_so_and_goes_to_it() {
+    let mut app = test_app(&["feat+one"]);
+    let error = format!(
+        "feat/x was checked out at /trees/feat+x, but another pando command recorded \
+         \"feat+x\" while git was checking it out — {}, but it did not get its install step",
+        actions::KEPT_OVER_RACED_RECORD
+    );
+    let reported = error.clone();
+    app.spawn_pending("feat+x".into(), PendingKind::Create, move || Err(reported));
+    app.pending.as_mut().unwrap().label = "feat/x".into();
+    wait_for_pending(&mut app);
+    let (message, is_error) = app.active_status().unwrap();
+    assert_eq!(message, error);
+    assert!(is_error, "it still lacks what new gives a worktree");
+    assert_eq!(app.select_on_arrival.as_deref(), Some("feat+x"));
+}
+
 /// Starts `kind` on `name` with a worker that says `lines` on its way and
 /// then reports `outcome` at once, the way a quick `rm` does.
 fn pending_that_says(

@@ -7749,6 +7749,8 @@ fn new_keeps_a_record_another_command_wrote_while_git_checked_out() {
     });
     let msg = format!("{err:#}");
     assert!(msg.contains("another pando command recorded"), "{msg}");
+    // What the TUI reads to go to the kept worktree, not "could not create".
+    assert!(msg.contains(KEPT_OVER_RACED_RECORD), "{msg}");
     assert!(msg.contains("provisioned files (.env)"), "{msg}");
     assert!(msg.contains("install step"), "{msg}");
     assert!(

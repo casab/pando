@@ -499,8 +499,12 @@ impl App {
                 // A create whose install step failed kept its worktree, and
                 // says so itself: "could not create" in front of it
                 // contradicted it, and the cursor goes to it as to any
-                // worktree `n` made.
-                if kind == PendingKind::Create && e.contains(actions::CREATED_BUT_INSTALL_FAILED) {
+                // worktree `n` made. One that another command recorded
+                // while git checked it out is kept the same way.
+                if kind == PendingKind::Create
+                    && (e.contains(actions::CREATED_BUT_INSTALL_FAILED)
+                        || e.contains(actions::KEPT_OVER_RACED_RECORD))
+                {
                     self.set_error_about(&name, format!("{e}{also}"));
                     self.select_on_arrival = Some(name);
                     self.spawn_discovery();

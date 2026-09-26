@@ -24,6 +24,11 @@ use crate::remedy;
 /// it as made.
 pub const CREATED_BUT_INSTALL_FAILED: &str = "was created, but its install step failed";
 
+/// What `new` says when another command recorded the worktree while git
+/// checked it out. The worktree is kept here too, so a caller may treat
+/// it as made.
+pub const KEPT_OVER_RACED_RECORD: &str = "the worktree and that record are kept";
+
 pub use crate::worktree::sanitize_branch_to_dir;
 
 /// Which of the three shapes `new` is in. Mirrors the decision git itself
@@ -266,7 +271,7 @@ fn refuse_over_raced_record(
 ) -> anyhow::Error {
     let head = format!(
         "{branch} was checked out at {}, but another pando command recorded {dir_name:?} \
-         while git was checking it out — the worktree and that record are kept",
+         while git was checking it out — {KEPT_OVER_RACED_RECORD}",
         target.display()
     );
     if let Some(record) = store.worktrees.get_mut(dir_name)
