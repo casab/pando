@@ -1068,6 +1068,32 @@ fn the_detail_pane_lists_every_process_with_its_phase() {
     );
 }
 
+// A reason cut to fit says it was cut: the ellipsis is the last cell
+// inside the pane, not the first one past its border.
+#[test]
+fn a_process_row_cut_to_the_pane_ends_in_an_ellipsis() {
+    let mut app = test_app(&["feat+one"]);
+    with_process(&mut app, "feat+one", running_phase());
+    with_second_process(
+        &mut app,
+        "feat+one",
+        "api",
+        crate::state::Phase::Failed {
+            at: chrono::Utc::now(),
+            reason: "something else is listening on port 17343; stop it, or stop the \
+                     worktree that owns it"
+                .into(),
+        },
+    );
+    let rendered = text_of(&draw(&mut app, 120, 30));
+    let row = rendered
+        .lines()
+        .find(|l| l.contains("api") && l.contains("failed    "))
+        .unwrap_or_else(|| panic!("no process row for api:\n{rendered}"));
+    let inside = row.trim_end_matches('│').trim_end();
+    assert!(inside.ends_with('…'), "{row}");
+}
+
 // One process has nothing to disambiguate, and a tmux split has no rows
 // to spare for saying the same thing twice.
 #[test]

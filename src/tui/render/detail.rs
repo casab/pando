@@ -586,6 +586,9 @@ fn process_rows<'a>(app: &App, name: &str, width: usize) -> Vec<Line<'a>> {
                 ),
                 Phase::Failed { reason, .. } => format!("failed    {reason}"),
             };
+            // What comes before the detail: ` ▸ `, the glyph, and the
+            // name padded between a space and two.
+            let lead = 3 + text_width(glyph) + 1 + label_width + 2;
             Line::from(vec![
                 Span::styled(format!(" {marker} "), Style::new().fg(text_muted())),
                 Span::styled(glyph, Style::new().fg(color)),
@@ -594,7 +597,7 @@ fn process_rows<'a>(app: &App, name: &str, width: usize) -> Vec<Line<'a>> {
                     Style::new().fg(text_dim()),
                 ),
                 Span::styled(
-                    truncate(&detail, width.saturating_sub(label_width + 7)),
+                    truncate(&detail, width.saturating_sub(lead)),
                     Style::new().fg(text_muted()),
                 ),
             ])
