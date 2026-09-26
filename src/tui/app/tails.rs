@@ -135,13 +135,20 @@ impl App {
         let Some((key, _, path)) = self.tail_target() else {
             return false;
         };
+        let known = self.log_tails.get(&key).is_some();
         let tail = self.log_tails.touch(&key, path);
         let seen = tail.lines_seen();
         let grew = tail.poll().unwrap_or(false);
-        let arrived = (tail.lines_seen() - seen) as usize;
         let lines = tail.lines().len();
         // The scroll counts back from the newest line, so a tail scrolled
-        // back moves by what arrived and stays on the lines being read.
+        // back moves by what arrived and stays on the lines being read. A
+        // tail just opened — a theme change reads every log again — read
+        // what was already there, and none of that arrived.
+        let arrived = if known {
+            (tail.lines_seen() - seen) as usize
+        } else {
+            0
+        };
         if self.tail_scroll > 0 {
             let max = self.max_tail_scroll(lines);
             self.tail_scroll = self.tail_scroll.saturating_add(arrived).min(max);

@@ -1244,6 +1244,32 @@ fn a_scrolled_back_tail_stays_on_its_lines_as_new_ones_arrive() {
     assert_eq!(after, before);
 }
 
+// A theme change reads every log again into new tails, and the first
+// read of one counted every line in its window as arrived, so a tail
+// scrolled back jumped to its oldest page when the system turned dark.
+#[test]
+fn a_scrolled_back_tail_stays_on_its_lines_through_a_theme_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, _log) = app_tailing_numbered_lines(dir.path(), 100);
+    draw(&mut app, 120, 30);
+    app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+    let before = numbered_lines_shown(&text_of(&draw(&mut app, 120, 30)));
+    assert!(!before.is_empty() && !before.contains(&"line 99".to_string()));
+
+    let resolved = crate::theme::Resolved {
+        name: crate::theme::DEFAULT_THEME.to_string(),
+        origin: crate::theme::Origin::Default,
+        appearance: crate::theme::Appearance::Light,
+        appearance_origin: crate::theme::AppearanceOrigin::System,
+        palette: crate::theme::palette(),
+        warnings: Vec::new(),
+    };
+    app.handle_event(crate::tui::app::AppEvent::Theme(Box::new(resolved)));
+    app.handle_event(crate::tui::app::AppEvent::Tick);
+    let after = numbered_lines_shown(&text_of(&draw(&mut app, 120, 30)));
+    assert_eq!(after, before);
+}
+
 // The scroll stopped one line short of the whole buffer, so paging back
 // far enough left one line at the top of the tail and the rows under it
 // blank.
