@@ -878,6 +878,46 @@ fn a_probe_that_never_finished_claims_nothing_about_the_machine() {
     );
 }
 
+// Every process, hook and share runs behind the prelude, so one that
+// fails is every spawn failing. It was a note, and in a repository that
+// pins no runtime nothing else said it, so doctor exited 0.
+#[test]
+fn a_prelude_that_fails_in_front_of_the_probe_is_a_problem_naming_its_file() {
+    let fx = fixture();
+    write_project_config(&fx, "[runtime]\nprelude = \"source ~/.nvm/nvm.sh\"\n");
+    let shell =
+        |_: &str| Some("bash: /Users/someone/.nvm/nvm.sh: No such file or directory\n".to_string());
+    let report = report_of(&fx, &shell);
+    assert!(!report.healthy(), "{:?}", messages(&report));
+    let problem = report
+        .findings
+        .iter()
+        .find(|f| f.section == Section::Tools && f.severity == Severity::Problem)
+        .unwrap_or_else(|| panic!("{:?}", messages(&report)));
+    assert!(
+        problem.message.contains("\"source ~/.nvm/nvm.sh\""),
+        "{}",
+        problem.message
+    );
+    assert!(
+        problem.message.contains("No such file or directory"),
+        "{}",
+        problem.message
+    );
+    assert!(
+        problem
+            .message
+            .contains(&fx.paths.config_file().display().to_string()),
+        "{}",
+        problem.message
+    );
+    assert!(
+        !mentions(&report, "is not on the PATH"),
+        "a prelude that failed says nothing about what the PATH has: {:?}",
+        messages(&report)
+    );
+}
+
 #[test]
 fn the_tool_script_runs_behind_the_prelude_a_real_spawn_would_use() {
     let probes = vec![ToolProbe {

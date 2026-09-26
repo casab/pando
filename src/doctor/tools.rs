@@ -56,11 +56,30 @@ pub(super) fn tools_report(
     // there for a real spawn and would read as missing here.
     let prelude = config.runtime.prelude.clone().unwrap_or_default();
     let (found, failure) = probe_tools(machine.shell, &probes, prelude.trim());
-    if let Some(failure) = &failure {
-        findings.push(Finding::note(
+    match &failure {
+        Some(ProbeFailure::Unanswered(why)) => findings.push(Finding::note(
             Section::Tools,
-            format!("pando could not ask this shell what it has: {failure}"),
-        ));
+            format!("pando could not ask this shell what it has: {why}"),
+        )),
+        // A problem, not a note: every process, hook and share runs behind
+        // the same prelude, so every one of them fails the same way — and
+        // the runtime section says so only for a language the repository
+        // pins.
+        Some(ProbeFailure::Prelude(last)) => findings.push(Finding::problem(
+            Section::Tools,
+            format!(
+                "the prelude {:?}{} fails before any command runs — {last}; every process, \
+                 hook and share runs behind it",
+                prelude.trim(),
+                match crate::config::prelude_origin(paths) {
+                    Some(from) => format!(" in {}", from.display()),
+                    None => String::new(),
+                }
+            ),
+            "fix that line, or set `[runtime].prelude = \"\"` if this machine needs nothing in \
+             front of a command",
+        )),
+        None => {}
     }
     let mut out = Vec::new();
     for (index, probe) in probes.iter().enumerate() {
@@ -375,7 +394,7 @@ fn probe_tools(
     shell: runtime::Shell<'_>,
     probes: &[ToolProbe],
     prelude: &str,
-) -> (BTreeMap<usize, ToolFound>, Option<String>) {
+) -> (BTreeMap<usize, ToolFound>, Option<ProbeFailure>) {
     if probes.is_empty() {
         return (BTreeMap::new(), None);
     }
@@ -383,7 +402,9 @@ fn probe_tools(
     let Some(text) = shell(&script) else {
         return (
             BTreeMap::new(),
-            Some("the shell did not answer inside its deadline".to_string()),
+            Some(ProbeFailure::Unanswered(
+                "the shell did not answer inside its deadline".to_string(),
+            )),
         );
     };
     let mut found: BTreeMap<usize, ToolFound> = BTreeMap::new();
@@ -424,7 +445,8 @@ fn probe_tools(
         return (found, None);
     }
     // The body never ran. With a prelude set that is the prelude's
-    // failure, and it is the same one every spawn would hit.
+    // failure, and it is the same one every spawn would hit. A body that
+    // printed a mark did run, so the prelude in front of it got through.
     let last = text
         .lines()
         .map(str::trim)
@@ -432,13 +454,22 @@ fn probe_tools(
         .find(|line| !line.is_empty())
         .unwrap_or("no output")
         .to_string();
-    (
-        found,
-        Some(match prelude.is_empty() {
-            true => format!("the probe did not finish — {last}"),
-            false => format!("the prelude in front of it failed — {last}"),
-        }),
-    )
+    let failure = match prelude.is_empty() || !found.is_empty() {
+        true => ProbeFailure::Unanswered(format!("the probe did not finish — {last}")),
+        false => ProbeFailure::Prelude(last),
+    };
+    (found, Some(failure))
+}
+
+/// Why the tools probe claims nothing about this machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProbeFailure {
+    /// The shell did not answer, or stopped before the end of the probe
+    /// with nothing in front of it that could have stopped it.
+    Unanswered(String),
+    /// The prelude in front of the probe failed, and this is the last
+    /// thing it said.
+    Prelude(String),
 }
 
 /// One shell script for every probe, composed the way a real spawn is.
