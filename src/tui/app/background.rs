@@ -183,19 +183,27 @@ pub fn snapshot(paths: &PandoPaths, known_base: Option<String>, scan: bool) -> R
 /// far more than everything else the idle TUI does. The scan only moves a
 /// process forward while it is `Starting`; a `Running` one changes phase
 /// when its process dies, which a signal probe sees without spawning
-/// anything. So when nothing is starting and every recorded pid is alive,
-/// the state file is read as it stands. The full refresh still runs with
-/// every discovery, so ports a running server opens later are captured
-/// within one slow tick.
+/// anything. So when nothing is starting and every running process is
+/// alive, the state file is read as it stands. The full refresh still runs
+/// with every discovery, so ports a running server opens later are
+/// captured within one slow tick.
 pub(super) fn refresh_if_needed(paths: &PandoPaths) -> QuickRefresh {
     match state::load(&paths.state_file()) {
-        Ok(store) if !needs_advance(&store, crate::process::is_alive) => QuickRefresh {
-            refreshed: actions::Refreshed {
-                state: store,
-                ..Default::default()
-            },
-            ran: false,
-        },
+        Ok(store)
+            if !needs_advance(
+                &store,
+                crate::process::is_alive,
+                crate::process::group_alive,
+            ) =>
+        {
+            QuickRefresh {
+                refreshed: actions::Refreshed {
+                    state: store,
+                    ..Default::default()
+                },
+                ran: false,
+            }
+        }
         _ => QuickRefresh {
             refreshed: actions::refresh(paths),
             ran: true,
@@ -203,21 +211,31 @@ pub(super) fn refresh_if_needed(paths: &PandoPaths) -> QuickRefresh {
     }
 }
 
-/// Whether a refresh could change anything: a process still starting, or
-/// any pid the state vouches for gone. Deliberately wider than what
-/// advancing checks — a dead leader whose group lives on still takes the
-/// full path — so skipping is only ever done when it is certainly a no-op
-/// for phases.
+/// Whether a refresh could change anything: a process still starting, a
+/// running one advancing would call dead, or a share's or native service's
+/// pid gone.
+///
+/// A running process is asked by the rule advancing reads it with,
+/// [`state::ProcessRecord::alive`], not by its leader alone. A portless
+/// process whose command backgrounded its work and returned has a dead
+/// leader for as long as it runs, and advancing keeps it Running all that
+/// time: asking the leader sent every tick down the full path, a `ps` and
+/// an `lsof` a second, to change nothing. The group probe is a signal, so
+/// it spawns nothing either.
 ///
 /// A service counts only when it is native, the one kind the refresh
 /// forgets: a compose service's pid is its log pump, which nothing on the
 /// read path clears, so a dead one would take the full path every second
 /// until the next mutation and change nothing.
-pub(super) fn needs_advance(store: &State, is_alive: impl Fn(u32) -> bool) -> bool {
+pub(super) fn needs_advance(
+    store: &State,
+    is_alive: impl Fn(u32) -> bool,
+    group_alive: impl Fn(i32) -> bool,
+) -> bool {
     store.worktrees.values().any(|record| {
         let process = record.processes.values().any(|p| match p.phase {
             state::Phase::Starting { .. } => true,
-            state::Phase::Running { .. } => !is_alive(p.pid),
+            state::Phase::Running { .. } => !p.alive(&is_alive, &group_alive),
             state::Phase::Failed { .. } => false,
         });
         let share = record

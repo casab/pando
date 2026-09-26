@@ -6321,7 +6321,7 @@ fn a_refresh_with_everything_running_and_alive_has_nothing_to_advance() {
     with_second_process(&mut app, "feat+a", "api", running_phase());
     with_process(&mut app, "feat+b", running_phase());
     with_share(&mut app, "feat+b", Some(18_000));
-    assert!(!background::needs_advance(&app.state, |_| true));
+    assert!(!background::needs_advance(&app.state, |_| true, |_| false));
 }
 
 #[test]
@@ -6329,7 +6329,7 @@ fn a_starting_process_always_takes_the_full_refresh() {
     // The scan is how a starting process becomes running.
     let mut app = test_app(&["feat+a"]);
     with_process(&mut app, "feat+a", Phase::Starting { since: Utc::now() });
-    assert!(background::needs_advance(&app.state, |_| true));
+    assert!(background::needs_advance(&app.state, |_| true, |_| false));
 }
 
 #[test]
@@ -6338,13 +6338,25 @@ fn any_dead_pid_the_state_vouches_for_takes_the_full_refresh() {
     with_process(&mut app, "feat+a", running_phase());
     with_second_process(&mut app, "feat+a", "api", running_phase());
     // The second process (4343) died.
-    assert!(background::needs_advance(&app.state, |pid| pid != 4343));
+    assert!(background::needs_advance(
+        &app.state,
+        |pid| pid != 4343,
+        |_| false
+    ));
 
     let mut app = test_app(&["feat+a"]);
     with_process(&mut app, "feat+a", running_phase());
     with_share(&mut app, "feat+a", Some(18_000));
-    assert!(background::needs_advance(&app.state, |pid| pid != 5151));
-    assert!(background::needs_advance(&app.state, |pid| pid != 5252));
+    assert!(background::needs_advance(
+        &app.state,
+        |pid| pid != 5151,
+        |_| false
+    ));
+    assert!(background::needs_advance(
+        &app.state,
+        |pid| pid != 5252,
+        |_| false
+    ));
 
     let mut app = test_app(&["feat+a"]);
     with_process(&mut app, "feat+a", running_phase());
@@ -6357,8 +6369,34 @@ fn any_dead_pid_the_state_vouches_for_takes_the_full_refresh() {
         pgid: Some(6161),
         compose_project: None,
     });
-    assert!(!background::needs_advance(&app.state, |_| true));
-    assert!(background::needs_advance(&app.state, |pid| pid != 6161));
+    assert!(!background::needs_advance(&app.state, |_| true, |_| false));
+    assert!(background::needs_advance(
+        &app.state,
+        |pid| pid != 6161,
+        |_| false
+    ));
+}
+
+#[test]
+fn a_portless_process_whose_leader_backgrounded_it_is_not_a_reason_to_scan() {
+    // `cmd = "./bin/worker &"`: the shell leader is gone for as long as
+    // the worker runs, and advancing keeps it Running by its group.
+    let mut app = test_app(&["feat+a"]);
+    with_process(&mut app, "feat+a", running_phase());
+    let record = app.state.worktrees.get_mut("feat+a").unwrap();
+    record.processes.get_mut("dev").unwrap().ready_port = None;
+    assert!(!background::needs_advance(&app.state, |_| false, |_| true));
+    // Its group gone too: advancing fails it, so the full path runs.
+    assert!(background::needs_advance(&app.state, |_| false, |_| false));
+}
+
+#[test]
+fn a_ported_process_whose_leader_died_takes_the_full_refresh_whatever_its_group() {
+    // An orphan holding the group open is how a crashed server looks, and
+    // advancing fails it.
+    let mut app = test_app(&["feat+a"]);
+    with_process(&mut app, "feat+a", running_phase());
+    assert!(background::needs_advance(&app.state, |_| false, |_| true));
 }
 
 #[test]
@@ -6376,7 +6414,11 @@ fn a_dead_compose_log_pump_is_not_a_reason_to_scan() {
         pgid: Some(7171),
         compose_project: Some("pando-feat-a".into()),
     });
-    assert!(!background::needs_advance(&app.state, |pid| pid != 7171));
+    assert!(!background::needs_advance(
+        &app.state,
+        |pid| pid != 7171,
+        |_| false
+    ));
 }
 
 #[test]
@@ -6391,7 +6433,7 @@ fn a_failed_process_whose_pid_is_gone_is_not_a_reason_to_scan() {
             reason: "exited".into(),
         },
     );
-    assert!(!background::needs_advance(&app.state, |_| false));
+    assert!(!background::needs_advance(&app.state, |_| false, |_| false));
 }
 
 #[test]
