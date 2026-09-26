@@ -686,7 +686,8 @@ fn a_compose_service_that_becomes_native_is_stopped_before_the_server_starts() {
 /// A worktree started isolated with postgres in compose, its config then
 /// switched to postgres natively: the record still names the compose
 /// project, and the next isolated start is the switch. Returned with the
-/// compose record as the first start left it.
+/// compose record as the first start left it. A `migrate` hook runs after
+/// the services, and a start that forgets it says so.
 fn switched_from_compose() -> (Nat, String, state::ServiceRecord) {
     let dir = TempDir::new().unwrap();
     let root = build(Kind::NextPnpmCompose, dir.path()).root;
@@ -698,7 +699,9 @@ fn switched_from_compose() -> (Nat, String, state::ServiceRecord) {
     let config_with = |services: &str| {
         format!(
             "[project]\nprovision = [\".env\"]\ninstall = \"true\"\n\n\
-             [dev]\ncmd = '''{}'''\nports = {{ PORT = \"web\" }}\n\n{services}",
+             [dev]\ncmd = '''{}'''\nports = {{ PORT = \"web\" }}\n\n{services}\n\
+             [[hooks]]\nname = \"migrate\"\nafter = \"services\"\n\
+             fingerprint = [\"package.json\"]\ncmd = \"true\"\n",
             listener_printing("DATABASE_URL")
         )
     };
@@ -867,6 +870,11 @@ fn a_compose_record_docker_cannot_be_run_for_gives_way_to_the_native_server() {
             .any(|m| m.contains("docker cannot be run here") && m.contains(&project)),
         "{said:?}"
     );
+    assert!(
+        said.iter()
+            .any(|m| m.contains("on other data") && m.contains("migrate")),
+        "the switch itself runs the migration again: {said:?}"
+    );
     // Nothing here could tell the container was gone — a docker missing
     // only from this PATH still has its daemon — so the record that names
     // the project stays, beside the native one, for what can ask.
@@ -882,6 +890,27 @@ fn a_compose_record_docker_cannot_be_run_for_gives_way_to_the_native_server() {
         record.services
     );
     let server = f.service(&name, "postgres").pid;
+
+    // The leftover is not a service moving to other data: every start
+    // after the switch, while docker could not be run, forgot the hooks
+    // after the services and ran them again over the same native data.
+    let said = std::cell::RefCell::new(Vec::<String>::new());
+    let report = actions::start(
+        &f.paths,
+        &f.config,
+        &name,
+        None,
+        actions::Mode::Remembered,
+        &|m| said.borrow_mut().push(m.to_string()),
+    )
+    .unwrap();
+    assert!(report.started_nothing(), "the dev server stays up");
+    let said = said.into_inner();
+    assert!(
+        !said.iter().any(|m| m.contains("on other data")),
+        "{said:?}"
+    );
+    assert_eq!(f.service(&name, "postgres").pid, server);
 
     // Docker back, the next start finds no container left and lets the
     // record go, with the server left as it was.

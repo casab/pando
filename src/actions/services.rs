@@ -365,18 +365,31 @@ fn changes_kind(native: &[String], roles: &[String], service: &state::ServiceRec
 }
 
 /// The services of a worktree's record whose kind config has changed —
-/// the ones [`leave_changed_kinds`] stops — each with the kind it runs as
-/// now.
+/// the ones a start moves onto a server of the other kind — each with the
+/// kind it runs as now.
+///
+/// A leftover [`replace_stopped_containers`] keeps beside a record of the
+/// kind its service runs as now is not one: that server is up already, on
+/// the data it has had since the start that switched it. Every start
+/// until docker can be asked found the change again, and ran the hooks
+/// after the services again over the same data. [`leave_changed_kinds`]
+/// still returns its containers, for a start that can ask about them.
 pub(super) fn changed_kinds(
     config: &Config,
     record: &WorktreeRecord,
 ) -> Vec<(String, state::ServiceKind)> {
     let native = native_names(config);
     let roles = service_roles(config);
+    let switched = |service: &state::ServiceRecord| {
+        record
+            .services
+            .iter()
+            .any(|s| s.name == service.name && s.kind == kind_of(&native, &service.name))
+    };
     record
         .services
         .iter()
-        .filter(|service| changes_kind(&native, &roles, service))
+        .filter(|service| changes_kind(&native, &roles, service) && !switched(service))
         .map(|service| (service.name.clone(), kind_of(&native, &service.name)))
         .collect()
 }

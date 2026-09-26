@@ -9359,9 +9359,16 @@ fn a_compose_record_docker_could_not_be_asked_about_is_kept_beside_the_native_on
     assert_eq!(shown[0].port, Some(15432));
 
     // The next start asks about the container again, and keeps the
-    // native server it may have running beside the leftover.
+    // native server it may have running beside the leftover — which is
+    // not a service moving to other data: the native one is up on its own.
     record.services[0].pid = Some(4242);
     record.services[0].pgid = Some(4242);
+    assert_eq!(
+        super::services::changed_kinds(&fx.config, &record),
+        Vec::new(),
+        "{:?}",
+        record.services
+    );
     let again =
         super::services::leave_changed_kinds(&fx.paths, &fx.config, "feat+one", &mut record)
             .unwrap();
