@@ -18,9 +18,13 @@ pub fn parse(text: &str) -> Result<ComposeFile> {
     let mut file = ComposeFile::default();
     // Only under the two keys this reader takes anything from: an alias in
     // an `x-` block that nothing here reads changes nothing pando decides.
-    file.unresolved.aliases = top.iter().any(|(key, value)| {
-        matches!(key.as_str(), "services" | "volumes") && refers_elsewhere(value)
-    });
+    let read = || {
+        top.iter()
+            .filter(|(key, _)| matches!(key.as_str(), "services" | "volumes"))
+            .map(|(_, value)| value)
+    };
+    file.unresolved.aliases = read().any(refers_elsewhere);
+    file.unresolved.unread = read().any(holds_unread);
     for (key, value) in &top {
         match key.as_str() {
             "services" => {
@@ -57,11 +61,21 @@ fn has_key(node: &Node, want: &str) -> bool {
 fn refers_elsewhere(node: &Node) -> bool {
     match node {
         Node::Alias(_) => true,
-        Node::Scalar(_) => false,
+        Node::Scalar(_) | Node::Unread => false,
         Node::Seq(items) => items.iter().any(refers_elsewhere),
         Node::Map(fields) => fields
             .iter()
             .any(|(key, value)| key == "<<" || refers_elsewhere(value)),
+    }
+}
+
+/// Whether anything under `node` is a value this reader could not read.
+fn holds_unread(node: &Node) -> bool {
+    match node {
+        Node::Unread => true,
+        Node::Scalar(_) | Node::Alias(_) => false,
+        Node::Seq(items) => items.iter().any(holds_unread),
+        Node::Map(fields) => fields.iter().any(|(_, value)| holds_unread(value)),
     }
 }
 
@@ -114,11 +128,12 @@ fn service(node: &Node) -> Service {
 /// `disable: true` and a `test:` list that starts with `NONE` are
 /// compose's two ways of turning one off, and docker then reports no
 /// health at all, so readiness waiting for `healthy` would never end.
-/// An alias stands for a block this reader never sees, and counts.
+/// An alias stands for a block this reader never sees, and counts, and so
+/// does a block it could not read.
 fn declares_healthcheck(node: &Node) -> bool {
     let fields = match node {
         Node::Map(fields) => fields,
-        Node::Alias(_) => return true,
+        Node::Alias(_) | Node::Unread => return true,
         Node::Scalar(_) | Node::Seq(_) => return false,
     };
     let get = |want: &str| {
@@ -169,7 +184,7 @@ fn port(node: &Node) -> Option<Port> {
                 host: get("host_ip").map(str::to_string),
             })
         }
-        Node::Seq(_) | Node::Alias(_) => None,
+        Node::Seq(_) | Node::Alias(_) | Node::Unread => None,
     }
 }
 
@@ -236,7 +251,7 @@ fn mount(node: &Node) -> Option<Mount> {
                 Some(_) => None,
             }
         }
-        Node::Seq(_) | Node::Alias(_) => None,
+        Node::Seq(_) | Node::Alias(_) | Node::Unread => None,
     }
 }
 
@@ -263,6 +278,10 @@ enum Node {
     /// Kept as a node of its own rather than read as the text `*name`, so
     /// the file can say it was not read whole.
     Alias(String),
+    /// A value this reader could not read (see [`unread`]). Nothing in it
+    /// is taken for a port or a mount, and the file says it was not read
+    /// whole.
+    Unread,
 }
 
 impl Node {
@@ -342,14 +361,23 @@ fn strip_comment(line: &str) -> String {
     line.to_string()
 }
 
-/// A block at `indent`: either a sequence of `-` entries or a mapping.
+/// A block at `indent`: a sequence of `-` entries, a mapping, or a value
+/// that starts on the line under its key.
+///
+/// `volumes:` with `["./data:/x"]` on the next line is that list, and a
+/// `{` or a tag there is not the first key of a mapping: read as one, the
+/// bind mount inside it was lost without a trace.
 fn parse_block(lines: &[Line], at: &mut usize, indent: usize) -> Result<Node> {
-    if lines
-        .get(*at)
-        .is_some_and(|line| line.text.trim_start().starts_with("- "))
-        || lines.get(*at).is_some_and(|line| line.text.trim() == "-")
-    {
+    let Some(first) = lines.get(*at) else {
+        return parse_map(lines, at, indent);
+    };
+    let text = first.text.trim_start();
+    if text.starts_with("- ") || text == "-" {
         return parse_seq(lines, at, indent);
+    }
+    if opens_a_value(text) {
+        *at += 1;
+        return Ok(one_line(text));
     }
     parse_map(lines, at, indent)
 }
@@ -379,11 +407,13 @@ fn parse_seq(lines: &[Line], at: &mut usize, indent: usize) -> Result<Node> {
             }
             continue;
         }
-        if let Some(node) = alias(&rest).or_else(|| flow(&rest)) {
-            items.push(node);
-            continue;
-        }
-        match split_key(&rest) {
+        // `- {type: bind,` is a flow mapping still open, not a key.
+        let entry = if opens_a_value(&rest) {
+            None
+        } else {
+            split_key(&rest)
+        };
+        match entry {
             // `- target: 80` opens a mapping whose remaining keys are
             // indented to where `target` starts.
             Some((key, value)) => {
@@ -404,7 +434,7 @@ fn parse_seq(lines: &[Line], at: &mut usize, indent: usize) -> Result<Node> {
                 }
                 items.push(Node::Map(entries));
             }
-            None => items.push(Node::Scalar(unquote(&rest))),
+            None => items.push(one_line(&rest)),
         }
     }
     Ok(Node::Seq(items))
@@ -482,12 +512,38 @@ fn split_key(text: &str) -> Option<(String, String)> {
     None
 }
 
-/// A value written on one line: an alias, a flow collection, or a scalar.
+/// A value written on one line: an alias, a flow collection, a scalar, or
+/// one this reader could not read from its line.
 fn one_line(text: &str) -> Node {
     let text = without_anchor(text);
     alias(text)
         .or_else(|| flow(text))
+        .or_else(|| unread(text))
         .unwrap_or_else(|| Node::Scalar(unquote(text)))
+}
+
+/// Whether `text` starts a value rather than a mapping entry: an alias, a
+/// flow collection, or a tag, none of which a compose file writes as a
+/// key.
+fn opens_a_value(text: &str) -> bool {
+    text.trim_start().starts_with(['*', '[', '{', '!'])
+}
+
+/// A value this reader cannot take from its one line: a tag (`!override`,
+/// `!reset`), which changes what the value after it means, or a flow
+/// collection or a quoted scalar closed only on a later line.
+///
+/// Read as the text on its line, each of these came out as a mount with no
+/// source, an anonymous volume that is isolated already, whatever bind
+/// mount the lines after it held. Those lines are still not read, but the
+/// file now says so.
+fn unread(text: &str) -> Option<Node> {
+    let text = text.trim();
+    let open = |start: char, end: char| {
+        text.starts_with(start) && (text.len() < 2 || !text.ends_with(end))
+    };
+    let unclosed = open('[', ']') || open('{', '}') || open('"', '"') || open('\'', '\'');
+    (text.starts_with('!') || unclosed).then_some(Node::Unread)
 }
 
 /// `&name` at the front of a value, dropped. What follows it — on the line,

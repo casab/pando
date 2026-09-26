@@ -4,6 +4,7 @@
 use super::ComposeFile;
 use super::Mount;
 use super::Service;
+use super::UNREAD;
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 
@@ -81,9 +82,9 @@ pub fn resolve_included(
             )
         })?;
         // A mount this reader never saw is not one it can refuse, and an
-        // alias, a merge key or `extends:` can carry one in. Compose
-        // resolves them when it can; when it could not, half a file
-        // approves nothing.
+        // alias, a merge key, `extends:` or a value it could not read can
+        // carry one in. Compose resolves them when it can; when it could
+        // not, half a file approves nothing.
         if file.unresolved.extends.contains(name) {
             bail!(
                 "service {name:?} is not isolated: it uses `extends:`, which pando's own reader \
@@ -101,6 +102,15 @@ pub fn resolve_included(
                  one would be invisible to pando, and an isolated copy could write its data into \
                  your repository. Make `docker compose config` work for this file, or write out \
                  in {name:?} what the alias brings in"
+            );
+        }
+        if file.unresolved.unread {
+            bail!(
+                "service {name:?} is not isolated: the compose file uses {UNREAD}, which pando's \
+                 own reader does not read, and `docker compose config` could not resolve them \
+                 here — a bind mount written in one would be invisible to pando, and an isolated \
+                 copy could write its data into your repository. Make `docker compose config` \
+                 work for this file, or write each of those values on one line, without a tag"
             );
         }
         check_mounts(name, service, file, repository)?;

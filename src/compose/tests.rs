@@ -747,16 +747,81 @@ fn an_alias_outside_services_and_a_quoted_star_leave_the_file_whole() {
     );
 }
 
+/// A bind mount into the worktree, in each shape this reader cannot take
+/// from one line. Compose reads every one of them, and Prettier writes the
+/// first when a flow list grows too long for its line.
+const UNREADABLE: [&str; 5] = [
+    "    volumes: [\n      \"./pgdata:/var/lib/postgresql/data\"\n    ]\n",
+    "    volumes:\n      - {\n        type: bind,\n        source: ./pgdata,\n        \
+     target: /var/lib/postgresql/data\n      }\n",
+    "    volumes: !override\n      - ./pgdata:/var/lib/postgresql/data\n",
+    "    volumes:\n      - \"./pgdata\\\n        :/var/lib/postgresql/data\"\n",
+    "    volumes:\n      [\n        \"./pgdata:/var/lib/postgresql/data\"\n      ]\n",
+];
+
+// Each of these read as a mount with no source, an anonymous volume, and
+// nothing said the file was only half read, so `docker compose config`
+// was never asked and `up` bound `./pgdata` into the worktree.
+#[test]
+fn a_value_this_reader_cannot_read_is_never_approved_on_half_a_file() {
+    for volumes in UNREADABLE {
+        let text = format!("services:\n  db:\n    image: postgres:16\n{volumes}");
+        let file = parse(&text).unwrap();
+        assert!(file.unresolved.unread, "{text}");
+        assert!(file.unresolved.any(), "so compose is asked: {text}");
+        assert!(
+            !file.services["db"].volumes.contains(&Mount::Anonymous),
+            "not a mount with no source: {text}"
+        );
+        let err = format!(
+            "{:#}",
+            resolve_included(&file, &["db".into()], &[]).unwrap_err()
+        );
+        assert!(err.contains("\"db\""), "{err}");
+        assert!(err.contains("docker compose config"), "{err}");
+        assert!(
+            err.contains("`!override`"),
+            "it names what it could not read: {err}"
+        );
+    }
+}
+
+// A flow list on the line under its key is read, not taken for the first
+// key of a mapping, and nor is a flow mapping written as a service's body.
+#[test]
+fn a_flow_collection_under_its_key_is_read() {
+    let file = parse(
+        "services:\n  db:\n    image: postgres:16\n    volumes:\n      \
+         [\"./pgdata:/var/lib/postgresql/data\"]\n  \
+         cache:\n    {image: redis:7, volumes: [\"./cache:/data\"]}\n",
+    )
+    .unwrap();
+    assert!(!file.unresolved.any(), "{:?}", file.unresolved);
+    assert_eq!(
+        file.services["db"].volumes,
+        vec![Mount::Bind("./pgdata".to_string())]
+    );
+    assert_eq!(
+        file.services["cache"].volumes,
+        vec![Mount::Bind("./cache".to_string())]
+    );
+    assert!(resolve_included(&file, &["db".into()], &[]).is_err());
+    assert!(resolve_included(&file, &["cache".into()], &[]).is_err());
+}
+
 #[test]
 fn every_key_not_followed_is_named_in_one_sentence() {
     let unresolved = Unresolved {
         extends: vec!["db".to_string()],
         include: true,
         aliases: true,
+        unread: true,
     };
     assert_eq!(
         unresolved.describe().unwrap(),
-        "`extends:` (on db), a top-level `include:` and YAML aliases or merge keys (`*`, `<<:`)"
+        "`extends:` (on db), a top-level `include:`, YAML aliases or merge keys (`*`, `<<:`) and \
+         YAML tags or values spread over several lines (`!override`, a `[` or a quote closed on \
+         a later line)"
     );
 }
 
