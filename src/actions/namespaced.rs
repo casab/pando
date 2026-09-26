@@ -762,7 +762,7 @@ fn ensure_slot(
         bail!(
             "every slot of {} on {} that pando gives out is held — {}. `pando start` on a \
              terminal asks which stopped one to free; `pando rm` of one you no longer need frees \
-             its slot with it",
+             its slot with it{}",
             target.service,
             server.address(),
             holders
@@ -770,7 +770,8 @@ fn ensure_slot(
                 .map(Holder::describe)
                 .chain(elsewhere.iter().map(Elsewhere::describe))
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(", "),
+            elsewhere_hint(paths, &elsewhere)
         );
     }
     bail!(
@@ -913,12 +914,16 @@ fn slot_holders(store: &crate::state::State, target: &Target) -> Vec<Holder> {
     out
 }
 
-/// Every other project pando keeps state for on this machine, by id.
+/// Every other project pando keeps state for on this machine, by id: its
+/// state, or why that could not be read.
 ///
 /// A Redis on a port is the machine's, not a project's: a slot another
 /// project's worktree holds, or its main checkout uses, is not this one's
-/// to give out or to empty. A state file that cannot be read says nothing.
-fn other_projects(paths: &PandoPaths) -> Vec<(String, crate::state::State)> {
+/// to give out or to empty. A state file that cannot be read is kept as
+/// why, so [`namespace::may_drop`] empties nothing while one cannot.
+fn other_projects(
+    paths: &PandoPaths,
+) -> Vec<(String, std::result::Result<crate::state::State, String>)> {
     let Ok(entries) = std::fs::read_dir(paths.projects_dir()) else {
         return Vec::new();
     };
@@ -929,9 +934,7 @@ fn other_projects(paths: &PandoPaths) -> Vec<(String, crate::state::State)> {
         if id == paths.project_id() || !file.is_file() {
             continue;
         }
-        if let Ok(store) = crate::state::load(&file) {
-            out.push((id, store));
-        }
+        out.push((id, crate::state::load(&file).map_err(|e| format!("{e:#}"))));
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
@@ -944,23 +947,85 @@ struct Elsewhere {
     slot: u32,
     /// `feat+x of project shop-1a2b3c4d`.
     whose: String,
+    /// The project's id: its directory under pando's home.
+    project: String,
+    /// The checkout the slot is recorded for is gone from this machine: a
+    /// worktree's directory, or the repository it was linked from.
+    gone: bool,
 }
 
 impl Elsewhere {
-    /// `slot 3 (feat+x of project shop-1a2b3c4d)`.
+    /// `slot 3 (feat+x of project shop-1a2b3c4d)`, and `, whose checkout
+    /// is gone` inside the brackets when it is.
     fn describe(&self) -> String {
-        format!("slot {} ({})", self.slot, self.whose)
+        format!(
+            "slot {} ({}{})",
+            self.slot,
+            self.whose,
+            match self.gone {
+                true => ", whose checkout is gone",
+                false => "",
+            }
+        )
     }
+}
+
+/// Where the records of the other projects holding slots are, for the end
+/// of an "every slot is held" error: nothing in this project can let them
+/// go, and a project whose repository is gone holds its slots until its
+/// directory is removed. Empty when no other project holds one.
+fn elsewhere_hint(paths: &PandoPaths, elsewhere: &[Elsewhere]) -> String {
+    let mut dirs: Vec<String> = elsewhere
+        .iter()
+        .map(|other| {
+            paths
+                .projects_dir()
+                .join(&other.project)
+                .display()
+                .to_string()
+        })
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    if dirs.is_empty() {
+        return String::new();
+    }
+    format!(
+        ". Another project's slots are held by its records in {}: one whose repository is gone \
+         holds them until that directory is removed",
+        dirs.join(", ")
+    )
+}
+
+/// Whether the repository the worktree at `path` was linked from is gone:
+/// git writes `gitdir: <repository>/.git/worktrees/<name>` into its `.git`
+/// file, and that is not there any more.
+fn repository_gone(path: &std::path::Path) -> bool {
+    std::fs::read_to_string(path.join(".git"))
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find_map(|line| line.strip_prefix("gitdir:"))
+                .map(|gitdir| !std::path::Path::new(gitdir.trim()).exists())
+        })
+        .unwrap_or(false)
 }
 
 /// Every slot pando could give out on this target's server that other
 /// projects' states record, as a worktree's or as their main checkout's
-/// own.
-fn slots_elsewhere(others: &[(String, crate::state::State)], target: &Target) -> Vec<Elsewhere> {
+/// own. A state that could not be read records none.
+fn slots_elsewhere(
+    others: &[(String, std::result::Result<crate::state::State, String>)],
+    target: &Target,
+) -> Vec<Elsewhere> {
     let allocatable = allocatable(target);
     let mut out = Vec::new();
     for (project, store) in others {
+        let Ok(store) = store else {
+            continue;
+        };
         for (worktree, record) in &store.worktrees {
+            let repository_gone = repository_gone(&record.path);
             for ns in &record.namespaces {
                 let here = crate::state::NamespaceRecord {
                     host: target.host.clone(),
@@ -975,12 +1040,16 @@ fn slots_elsewhere(others: &[(String, crate::state::State)], target: &Target) ->
                     out.push(Elsewhere {
                         slot,
                         whose: format!("{worktree} of project {project}"),
+                        project: project.clone(),
+                        gone: repository_gone || !record.path.exists(),
                     });
                 }
                 if let Ok(slot) = ns.main.trim().parse::<u32>() {
                     out.push(Elsewhere {
                         slot,
                         whose: format!("the main checkout of project {project}"),
+                        project: project.clone(),
+                        gone: repository_gone,
                     });
                 }
             }
@@ -1046,7 +1115,7 @@ pub(super) fn free_slots_if_full(
         if stopped.is_empty() {
             bail!(
                 "every slot of {} on {}:{} is held by a running worktree{} — {}. Stop one of this \
-                 project's, and its slot can be freed",
+                 project's, and its slot can be freed{}",
                 target.service,
                 target.host,
                 target.port,
@@ -1059,7 +1128,8 @@ pub(super) fn free_slots_if_full(
                     .chain(&elsewhere)
                     .cloned()
                     .collect::<Vec<_>>()
-                    .join(", ")
+                    .join(", "),
+                elsewhere_hint(paths, &others)
             );
         }
         let question = Question {

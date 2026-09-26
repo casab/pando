@@ -372,7 +372,7 @@ fn a_slot_another_project_records_is_never_emptied() {
     let theirs = |namespaces: Vec<NamespaceRecord>| {
         vec![(
             "shop-1a2b3c4d".to_string(),
-            state(&[("feat+y", namespaces)]),
+            Ok(state(&[("feat+y", namespaces)])),
         )]
     };
     let e = format!(
@@ -395,6 +395,29 @@ fn a_slot_another_project_records_is_never_emptied() {
     let mut other_server = slot("3", "3");
     other_server.port = 6380;
     may_drop(&st, "feat+x", &ns, &[], &theirs(vec![other_server])).unwrap();
+}
+
+// A project whose state cannot be read may record the same one: nothing is
+// dropped or emptied until it can be, and the refusal says which and why.
+#[test]
+fn nothing_is_dropped_while_another_projects_state_cannot_be_read() {
+    for ns in [slot("3", "0"), database("shop__feat_x", "shop")] {
+        let st = state(&[("feat+x", vec![ns.clone()])]);
+        let unreadable = vec![(
+            "shop-1a2b3c4d".to_string(),
+            Err("parse state file /home/projects/shop-1a2b3c4d/state.json".to_string()),
+        )];
+        let e = format!(
+            "{:#}",
+            may_drop(&st, "feat+x", &ns, &[], &unreadable).unwrap_err()
+        );
+        assert!(
+            e.contains("project shop-1a2b3c4d")
+                && e.contains("could not be read")
+                && e.contains("shop-1a2b3c4d/state.json"),
+            "{e}"
+        );
+    }
 }
 
 #[test]

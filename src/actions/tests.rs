@@ -9657,11 +9657,71 @@ fn every_slot_held_counts_another_projects_and_offers_only_this_ones() {
         question
             .details
             .iter()
-            .any(|d| d.contains("slot 15 (feat+theirs of project other-1a2b3c4d)")),
+            .any(|d| d.contains("slot 15 (feat+theirs of project other-1a2b3c4d")),
         "{:?}",
         question.details
     );
     assert!(!redis.join("flushed").exists());
+}
+
+// A project deleted without `pando rm` still holds its slots, and nothing
+// here can let them go: the error names its records' directory, and says
+// its checkout is gone.
+#[test]
+fn every_slot_held_names_where_another_projects_records_are() {
+    let (ns, redis) = slots_fixture(MAIN_ENV_WITH_REDIS);
+    hold(&ns, (1..=14).map(|n| (n, true)));
+    hold_elsewhere(&ns, slot_holder(15, false, 1));
+    let ask = |q: &Question| -> Result<Answer> { panic!("asked {:?}", q.slot) };
+    let e = format!(
+        "{:#}",
+        resolve_for_start(
+            &ns.fx.paths,
+            &ns.fx.config,
+            &ns.name,
+            Mode::Namespaced,
+            &ask,
+            &noop
+        )
+        .unwrap_err()
+    );
+    let dir = ns.fx.paths.projects_dir().join("other-1a2b3c4d");
+    assert!(
+        e.contains("slot 15 (feat+theirs of project other-1a2b3c4d, whose checkout is gone)"),
+        "{e}"
+    );
+    assert!(
+        e.contains(&format!("held by its records in {}", dir.display()))
+            && e.contains("until that directory is removed"),
+        "{e}"
+    );
+    assert!(!redis.join("flushed").exists());
+}
+
+// A project whose state does not load may record the same slot: `rm`
+// leaves it, says which project and why, and empties nothing.
+#[test]
+fn rm_empties_no_slot_while_another_projects_state_cannot_be_read() {
+    let (ns, redis) = stopped_namespaced();
+    let file = ns
+        .fx
+        .paths
+        .projects_dir()
+        .join("other-1a2b3c4d")
+        .join("state.json");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, "{\"version\": 99, \"worktrees\": {}}").unwrap();
+    let (said, progress) = collecting();
+    super::rm(&ns.fx.paths, &ns.name, false, false, &progress).unwrap();
+    let said = said.borrow().clone();
+    assert!(
+        said.iter()
+            .any(|l| l.contains("redis slot 1 is left as it is")
+                && l.contains("project other-1a2b3c4d as well, whose state could not be read")),
+        "{said:?}"
+    );
+    assert!(!redis.join("flushed").exists());
+    assert_eq!(ns.fake("dropped"), "", "and no database was dropped");
 }
 
 // Two namespaced starts at once: the slot each is given is taken under the

@@ -34,7 +34,8 @@ use super::name::{MARKER, MAX_NAME, is_plain};
 ///   as that project's main checkout's own. Two records claiming one
 ///   database are a state file that is wrong about something, and the
 ///   drop that would empty the other worktree's data is not the way to
-///   find out which.
+///   find out which. A project whose state cannot be read (`Err`, with
+///   why) may name it too, so nothing is dropped while one cannot.
 ///
 /// The grant a developer gives the app's login is a second wall on the
 /// server's side: it covers `<main>__%` and nothing else.
@@ -43,7 +44,7 @@ pub fn may_drop(
     worktree: &str,
     namespace: &NamespaceRecord,
     main_now: &[&str],
-    others: &[(String, State)],
+    others: &[(String, std::result::Result<State, String>)],
 ) -> Result<()> {
     let what = describe(namespace);
     let recorded = state
@@ -97,6 +98,20 @@ pub fn may_drop(
             }
         }
     }
+    // Saying nothing is not saying it holds nothing.
+    if let Some((project, why)) = others
+        .iter()
+        .find_map(|(project, other)| Some((project, other.as_ref().err()?)))
+    {
+        bail!(
+            "{what} may be recorded by project {project} as well, whose state could not be read \
+             — {why} — so pando drops nothing until it can be"
+        );
+    }
+    let others: Vec<(&String, &State)> = others
+        .iter()
+        .filter_map(|(project, other)| Some((project, other.as_ref().ok()?)))
+        .collect();
     let mut elsewhere: Vec<String> = state
         .worktrees
         .iter()
@@ -109,7 +124,7 @@ pub fn may_drop(
         })
         .map(|(name, _)| name.clone())
         .collect();
-    for (project, other) in others {
+    for (project, other) in &others {
         for (name, record) in &other.worktrees {
             if record
                 .namespaces
