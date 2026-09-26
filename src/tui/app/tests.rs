@@ -5784,6 +5784,24 @@ fn any_dead_pid_the_state_vouches_for_takes_the_full_refresh() {
 }
 
 #[test]
+fn a_dead_compose_log_pump_is_not_a_reason_to_scan() {
+    // Its container stopped under it; the refresh has nothing to do about
+    // that, and would be asked to every second until the next mutation.
+    let mut app = test_app(&["feat+a"]);
+    with_process(&mut app, "feat+a", running_phase());
+    let record = app.state.worktrees.get_mut("feat+a").unwrap();
+    record.services.push(crate::state::ServiceRecord {
+        name: "postgres".into(),
+        kind: crate::state::ServiceKind::Compose,
+        port: Some(15_432),
+        pid: Some(7171),
+        pgid: Some(7171),
+        compose_project: Some("pando-feat-a".into()),
+    });
+    assert!(!background::needs_advance(&app.state, |pid| pid != 7171));
+}
+
+#[test]
 fn a_failed_process_whose_pid_is_gone_is_not_a_reason_to_scan() {
     // Failed is the phase that outlives its process; nothing advances it.
     let mut app = test_app(&["feat+a"]);

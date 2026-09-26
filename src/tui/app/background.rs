@@ -183,6 +183,11 @@ pub(super) fn refresh_if_needed(paths: &PandoPaths) -> actions::Refreshed {
 /// advancing checks — a dead leader whose group lives on still takes the
 /// full path — so skipping is only ever done when it is certainly a no-op
 /// for phases.
+///
+/// A service counts only when it is native, the one kind the refresh
+/// forgets: a compose service's pid is its log pump, which nothing on the
+/// read path clears, so a dead one would take the full path every second
+/// until the next mutation and change nothing.
 pub(super) fn needs_advance(store: &State, is_alive: impl Fn(u32) -> bool) -> bool {
     store.worktrees.values().any(|record| {
         let process = record.processes.values().any(|p| match p.phase {
@@ -197,7 +202,7 @@ pub(super) fn needs_advance(store: &State, is_alive: impl Fn(u32) -> bool) -> bo
         let service = record
             .services
             .iter()
-            .any(|s| s.pid.is_some_and(|p| !is_alive(p)));
+            .any(|s| s.kind == state::ServiceKind::Native && s.pid.is_some_and(|p| !is_alive(p)));
         process || share || service
     })
 }
