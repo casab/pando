@@ -751,32 +751,32 @@ fn read_env_files(worktree: &Path) -> Vec<(String, std::collections::BTreeMap<St
 /// file, so a comment read into it breaks an app that connects fine
 /// without pando.
 pub fn parse_env(text: &str) -> std::collections::BTreeMap<String, String> {
-    let mut out = std::collections::BTreeMap::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let line = line.strip_prefix("export ").unwrap_or(line);
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let key = key.trim();
-        if key.is_empty() {
-            continue;
-        }
-        let value = value.trim();
-        let value = match value.chars().next() {
-            // An unclosed quote is kept as written: there is no telling
-            // where the value was meant to end.
-            Some(quote @ ('"' | '\'')) => {
-                closing_quote(&value[1..], quote).map_or(value, |end| &value[1..1 + end])
-            }
-            _ => without_comment(value),
-        };
-        out.insert(key.to_string(), value.to_string());
+    text.lines().filter_map(parse_env_line).collect()
+}
+
+/// One line of an env file as [`parse_env`] reads it: `None` for a blank
+/// line, a comment, or a line with no key.
+pub fn parse_env_line(line: &str) -> Option<(String, String)> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
     }
-    out
+    let line = line.strip_prefix("export ").unwrap_or(line);
+    let (key, value) = line.split_once('=')?;
+    let key = key.trim();
+    if key.is_empty() {
+        return None;
+    }
+    let value = value.trim();
+    let value = match value.chars().next() {
+        // An unclosed quote is kept as written: there is no telling
+        // where the value was meant to end.
+        Some(quote @ ('"' | '\'')) => {
+            closing_quote(&value[1..], quote).map_or(value, |end| &value[1..1 + end])
+        }
+        _ => without_comment(value),
+    };
+    Some((key.to_string(), value.to_string()))
 }
 
 /// Where the quote that opened a value closes, in the text after it. A

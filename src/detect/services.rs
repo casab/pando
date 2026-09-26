@@ -173,9 +173,7 @@ pub(super) fn recipe_for_address(value: &str) -> Option<&'static str> {
     // A bare number, or the port at the end of a URL whose scheme said
     // nothing. The default port is weaker evidence than a scheme and is
     // only ever reached when the scheme was silent.
-    let port = crate::services::parse_env(&format!("X={value}"))
-        .get("X")
-        .and_then(|v| port_of(v))?;
+    let port = port_of(value)?;
     SERVICE_ADDRESSES
         .iter()
         .find(|(_, _, default)| *default == port)

@@ -341,6 +341,10 @@ impl Signals {
 }
 
 /// Entries of the first env example file that exists, in file order.
+///
+/// Read the way the app's env file is, with `export`, quotes and a
+/// trailing comment dropped: `API_PORT="4000"` is port 4000, and
+/// `export PORT=3000` declares `PORT`.
 pub(super) fn env_example(root: &Path) -> Vec<(String, String)> {
     for name in ENV_EXAMPLES {
         let Ok(text) = std::fs::read_to_string(root.join(name)) else {
@@ -348,11 +352,7 @@ pub(super) fn env_example(root: &Path) -> Vec<(String, String)> {
         };
         return text
             .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .filter_map(|l| l.split_once('='))
-            .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
-            .filter(|(key, _)| !key.is_empty())
+            .filter_map(crate::services::parse_env_line)
             .collect();
     }
     Vec::new()

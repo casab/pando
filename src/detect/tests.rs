@@ -968,6 +968,42 @@ fn a_port_flag_is_handed_on_the_way_the_package_manager_expects() {
     assert_eq!(processes["api"].cmd, "npm run dev");
 }
 
+// An env example read raw kept the quotes: `"4000"` was no port, and
+// `"http://localhost:4000"` no URL, so the web app kept pointing at the
+// main checkout's api without a word.
+#[test]
+fn an_env_example_is_read_without_its_quotes_and_export() {
+    let dir = tempdir().unwrap();
+    workspace(dir.path());
+    std::fs::write(
+        dir.path().join(".env.example"),
+        "export WEB_PORT=5173\nexport API_PORT=\"4000\"\n\
+         VITE_API_URL='http://localhost:4000' # the api\n",
+    )
+    .unwrap();
+    assert_eq!(
+        signals(dir.path()).env_example,
+        vec![
+            ("WEB_PORT".to_string(), "5173".to_string()),
+            ("API_PORT".to_string(), "4000".to_string()),
+            (
+                "VITE_API_URL".to_string(),
+                "http://localhost:4000".to_string()
+            ),
+        ]
+    );
+    let processes = proposed_processes(dir.path()).candidates[0]
+        .processes
+        .clone()
+        .unwrap();
+    assert_eq!(
+        processes["web"].env["VITE_API_URL"],
+        "http://localhost:{port:api}"
+    );
+    assert_eq!(processes["web"].env["API_PORT"], "{port:api}");
+    assert_eq!(processes["api"].env["WEB_PORT"], "{port:web}");
+}
+
 // The create-turbo layout: each app's own script names its port, and the
 // root only fans out with `turbo run dev`. Given `PORT` and a role, each
 // app would bind its own port anyway and fail its readiness wait.
@@ -1865,6 +1901,18 @@ fn the_engine_comes_from_the_scheme_or_the_port_and_never_from_the_key() {
         assert_eq!(values_of(&native), vec![expected], "{value}");
         let _ = dir;
     }
+}
+
+// Quoted, the scheme read as `"postgres`, and a port that is not the
+// default had nothing left to name the engine by.
+#[test]
+fn a_quoted_address_in_the_env_example_still_names_its_engine() {
+    let dir = seed_fixture(&[(
+        ".env.example",
+        "DATABASE_URL=\"postgres://localhost:5433/db\"\n",
+    )]);
+    let native = native_candidates(&signals(dir.path()), &MachineEvidence::unknown());
+    assert_eq!(values_of(&native), vec!["postgres"]);
 }
 
 fn values_of(candidates: &[Candidate]) -> Vec<&str> {
