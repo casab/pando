@@ -738,9 +738,18 @@ fn read_env_files(worktree: &Path) -> Vec<(String, std::collections::BTreeMap<St
     out
 }
 
-/// `KEY=value` lines, with `export` and surrounding quotes dropped. Not a
-/// dotenv implementation: it reads what a key looks like, and the only
-/// thing pando does with the answer is swap a number inside it.
+/// `KEY=value` lines, with `export`, surrounding quotes and a trailing
+/// comment dropped. Not a dotenv implementation: it reads what a key looks
+/// like, and the only thing pando does with the answer is swap a number
+/// inside it.
+///
+/// A value in quotes ends at its closing quote, and whatever follows is
+/// dropped. An unquoted one ends at a `#` that starts a word — at the
+/// start, or after a space or a tab — which is how compose and
+/// python-dotenv read it; a `#` inside a password or a URL is kept. The
+/// value goes into the app's environment, ahead of the app's own dotenv
+/// file, so a comment read into it breaks an app that connects fine
+/// without pando.
 pub fn parse_env(text: &str) -> std::collections::BTreeMap<String, String> {
     let mut out = std::collections::BTreeMap::new();
     for line in text.lines() {
@@ -757,14 +766,44 @@ pub fn parse_env(text: &str) -> std::collections::BTreeMap<String, String> {
             continue;
         }
         let value = value.trim();
-        let value = match (value.starts_with('"'), value.starts_with('\'')) {
-            (true, _) if value.len() >= 2 && value.ends_with('"') => &value[1..value.len() - 1],
-            (_, true) if value.len() >= 2 && value.ends_with('\'') => &value[1..value.len() - 1],
-            _ => value,
+        let value = match value.chars().next() {
+            // An unclosed quote is kept as written: there is no telling
+            // where the value was meant to end.
+            Some(quote @ ('"' | '\'')) => {
+                closing_quote(&value[1..], quote).map_or(value, |end| &value[1..1 + end])
+            }
+            _ => without_comment(value),
         };
         out.insert(key.to_string(), value.to_string());
     }
     out
+}
+
+/// Where the quote that opened a value closes, in the text after it. A
+/// `\"` inside double quotes does not close them.
+fn closing_quote(text: &str, quote: char) -> Option<usize> {
+    let mut escaped = false;
+    for (i, c) in text.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' if quote == '"' => escaped = true,
+            c if c == quote => return Some(i),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// An unquoted value up to the `#` that starts its comment, if it has one.
+fn without_comment(value: &str) -> &str {
+    let mut previous = ' ';
+    for (i, c) in value.char_indices() {
+        if c == '#' && matches!(previous, ' ' | '\t') {
+            return value[..i].trim_end();
+        }
+        previous = c;
+    }
+    value
 }
 
 /// A service being waited on: which port it was given, and whether its
@@ -1302,6 +1341,26 @@ mod tests {
     }
 
     #[test]
+    fn a_commented_value_is_rewritten_without_its_comment() {
+        let dir = worktree_with(&[(
+            ".env",
+            "DATABASE_URL=postgres://app:app@localhost:5432/app  # local docker\n\
+             DB_PORT=5432 # default\n",
+        )]);
+        let env = app_env(
+            dir.path(),
+            &map(&[("DATABASE_URL", "postgres"), ("DB_PORT", "postgres")]),
+            &ports(&[("postgres", 17_004)]),
+        )
+        .unwrap();
+        assert_eq!(
+            env["DATABASE_URL"],
+            "postgres://app:app@localhost:17004/app"
+        );
+        assert_eq!(env["DB_PORT"], "17004", "a commented port is still a port");
+    }
+
+    #[test]
     fn a_url_that_names_the_compose_service_as_its_host_is_pointed_at_localhost() {
         let dir = worktree_with(&[(
             ".env.example",
@@ -1430,6 +1489,36 @@ mod tests {
         assert_eq!(parsed["C"], "three");
         assert_eq!(parsed["D"], "four=five");
         assert_eq!(parsed.len(), 4);
+    }
+
+    // An inline comment is the developer's note, not part of the value.
+    // Read into it, the URL pando puts in the app's environment, ahead of
+    // the app's own dotenv file, names a database called `app  # local
+    // docker`.
+    #[test]
+    fn an_inline_comment_is_not_part_of_the_value() {
+        let parsed = parse_env(
+            "URL=postgres://app:app@localhost:5432/app  # local docker\n\
+             E=5432 # default\nF=\"x\" # c\nG=postgres://u:p#w@h:1/d\nH=a#b\n\
+             I='y'# c\nJ=\"a \\\" # b\"\nK=\"open\n",
+        );
+        assert_eq!(parsed["URL"], "postgres://app:app@localhost:5432/app");
+        assert_eq!(parsed["E"], "5432");
+        assert_eq!(parsed["F"], "x");
+        assert_eq!(
+            parsed["G"], "postgres://u:p#w@h:1/d",
+            "a `#` in a word stays"
+        );
+        assert_eq!(parsed["H"], "a#b");
+        assert_eq!(parsed["I"], "y");
+        assert_eq!(
+            parsed["J"], "a \\\" # b",
+            "an escaped quote does not close it"
+        );
+        assert_eq!(
+            parsed["K"], "\"open",
+            "an unclosed quote is kept as written"
+        );
     }
 
     #[test]
