@@ -139,7 +139,8 @@ pub(super) struct Target {
 pub(super) enum Tell {
     /// A key of its own: `DATABASE_NAME=shop`, `REDIS_DB=0`.
     Key(String),
-    /// The path of a URL: `mysql://…/shop`, `redis://…/0`.
+    /// The path of a URL: `mysql://…/shop`, `redis://…/0` — and for a
+    /// slot, the `db` its query names too, `redis://…?db=0`.
     UrlPath(String),
 }
 
@@ -378,11 +379,19 @@ fn target(
     })
 }
 
+/// The query parameter a Redis URL can name its slot by instead of its
+/// path, `redis://localhost:6379?db=2`: redis-py, and the clients built on
+/// it, read it before the path.
+const SLOT_PARAMETER: &str = "db";
+
 /// Every slot the main checkout's env files name, the one it is known by
-/// first, and every key that says which one the app uses: the path of
-/// each URL — none is slot 0 — and a key of its own beside the address,
-/// `REDIS_DB` next to `REDIS_PORT`. An app that reads neither has nowhere
-/// to be told another slot, and stays shared.
+/// first, and every key that says which one the app uses: each URL, by
+/// its query's `db` and by its path — none is slot 0 — and a key of its
+/// own beside the address, `REDIS_DB` next to `REDIS_PORT`. An app that
+/// reads neither has nowhere to be told another slot, and stays shared.
+///
+/// A URL's `db` and its path are both main's: one client reads the one,
+/// another the other.
 fn slot_main(
     root: &std::path::Path,
     keys: &[String],
@@ -392,9 +401,17 @@ fn slot_main(
     let mut tells: Vec<Tell> = Vec::new();
     for (key, url) in urls {
         let (_, path) = crate::services::url_identity(url);
-        let slot = path.unwrap_or_else(|| "0".to_string());
-        if slot.chars().all(|c| c.is_ascii_digit()) {
-            add_main(&mut mains, slot);
+        let slots: Vec<String> = crate::services::url_query_values(url, SLOT_PARAMETER)
+            .into_iter()
+            .chain(std::iter::once(path.unwrap_or_else(|| "0".to_string())))
+            .collect();
+        if slots
+            .iter()
+            .all(|slot| !slot.is_empty() && slot.chars().all(|c| c.is_ascii_digit()))
+        {
+            for slot in slots {
+                add_main(&mut mains, slot);
+            }
             tells.push(Tell::UrlPath(key.clone()));
         }
     }
@@ -1591,6 +1608,16 @@ pub(super) fn namespaced_env(
                              the main checkout's",
                             namespace.name
                         );
+                    };
+                    // A client that reads the query's `db` before the path
+                    // would go on using main's slot through it.
+                    let rewritten = match namespace.kind {
+                        NamespaceKind::Slot => crate::services::with_url_query_value(
+                            &rewritten,
+                            SLOT_PARAMETER,
+                            &namespace.name,
+                        ),
+                        NamespaceKind::Database => rewritten,
                     };
                     env.insert(key.clone(), rewritten);
                 }

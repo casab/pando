@@ -10409,6 +10409,61 @@ fn a_slot_a_key_names_beside_a_url_with_no_path_is_the_main_checkouts_too() {
     );
 }
 
+// A URL can name its slot in its query, `?db=2`, which redis-py and the
+// clients built on it read before the path. It was read as slot 0: slot 2
+// was given out while it was empty, and the URL the worktree got still
+// said `db=2`, so its app went on using main's slot whatever pando
+// recorded. That slot is main's, never given out or emptied, and the
+// worktree's URL names its own in both places.
+#[test]
+fn a_slot_a_urls_query_names_is_the_main_checkouts_and_the_worktree_is_told_its_own_there() {
+    let (ns, redis) = slots_fixture_keyed(
+        "DATABASE_PORT=3306\nDATABASE_NAME=shop\nDATABASE_USER=app\n\
+         REDIS_URL=redis://localhost:6379?db=2\n",
+        &["REDIS_URL"],
+    );
+    hold(&ns, [(1, false)]);
+    let (report, _) = ns.start(Mode::Namespaced).unwrap();
+    let running = guard(&report);
+    assert_eq!(
+        ns.env_line("REDIS_URL").as_deref(),
+        Some("redis://localhost:6379/3?db=3")
+    );
+    drop(running);
+    stop(&ns.fx.paths, &ns.name, None).unwrap();
+
+    let mut store = ns.fx.state();
+    for slot in store
+        .worktrees
+        .get_mut(&ns.name)
+        .unwrap()
+        .namespaces
+        .iter_mut()
+        .filter(|n| n.service == "redis")
+    {
+        slot.name = "2".into();
+    }
+    state::save(&ns.fx.paths.state_file(), &store).unwrap();
+    // rm reads config from disk, as it always does.
+    std::fs::write(
+        ns.fx.paths.config_file(),
+        "[dev]\ncmd = \"sleep 30\"\nports = []\n\n\
+         [[services]]\nkind = \"native\"\nname = \"mariadb\"\nenv = { DATABASE_PORT = \"mariadb\" }\n\n\
+         [[services]]\nkind = \"native\"\nname = \"redis\"\nenv = { REDIS_URL = \"redis\" }\n",
+    )
+    .unwrap();
+    let (said, progress) = collecting();
+    super::rm(&ns.fx.paths, &ns.name, false, false, &progress).unwrap();
+    let said = said.borrow().clone();
+    assert!(
+        said.iter()
+            .any(|l| l.contains("redis slot 2 is left as it is")
+                && l.contains("main checkout's own slot")),
+        "{said:?}"
+    );
+    assert!(!redis.join("flushed").exists(), "main's slot was emptied");
+}
+
 /// Writes a state for another project under the same pando home, with
 /// one worktree holding `record`.
 fn hold_elsewhere(ns: &Namespaced, record: WorktreeRecord) {

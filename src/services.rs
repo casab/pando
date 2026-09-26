@@ -699,6 +699,50 @@ pub fn with_url_path(value: &str, path: &str) -> Option<String> {
     ))
 }
 
+/// Every value a URL's query string gives the parameter `name`, as
+/// written: `2` for `db` in `redis://localhost:6379?db=2`. Empty when the
+/// URL has no query, or none by that name.
+pub fn url_query_values(value: &str, name: &str) -> Vec<String> {
+    let Some((start, end)) = query_span(value) else {
+        return Vec::new();
+    };
+    value[start..end]
+        .split('&')
+        .filter_map(|pair| pair.split_once('=').filter(|(key, _)| *key == name))
+        .map(|(_, value)| value.to_string())
+        .collect()
+}
+
+/// A URL with every value its query string gives the parameter `name`
+/// replaced by `new`, and everything else as it was. A URL with no such
+/// parameter comes back as it was.
+pub fn with_url_query_value(value: &str, name: &str, new: &str) -> String {
+    let Some((start, end)) = query_span(value) else {
+        return value.to_string();
+    };
+    let query: Vec<String> = value[start..end]
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((key, _)) if key == name => format!("{key}={new}"),
+            _ => pair.to_string(),
+        })
+        .collect();
+    format!("{}{}{}", &value[..start], query.join("&"), &value[end..])
+}
+
+/// Where a URL's query string is, between its `?` and its `#` or its end.
+fn query_span(value: &str) -> Option<(usize, usize)> {
+    let at = value.find(['?', '#'])?;
+    if !value[at..].starts_with('?') {
+        return None;
+    }
+    let start = at + 1;
+    let end = value[start..]
+        .find('#')
+        .map_or(value.len(), |at| start + at);
+    Some((start, end))
+}
+
 /// `%40` as `@`; anything that is not a valid escape stays as written.
 fn percent_decoded(text: &str) -> String {
     let bytes = text.as_bytes();
@@ -1427,6 +1471,23 @@ mod tests {
             "postgres://acme:secret@localhost:17004/acme?sslmode=disable"
         );
         assert_eq!(env["REDIS_URL"], "redis://localhost:17006");
+    }
+
+    #[test]
+    fn a_query_parameter_is_read_and_replaced_and_nothing_else_is() {
+        let url = "redis://:pw@localhost:6379/1?ssl=true&db=2#main";
+        assert_eq!(url_query_values(url, "db"), vec!["2".to_string()]);
+        assert!(url_query_values(url, "ssl_db").is_empty());
+        assert_eq!(
+            with_url_query_value(url, "db", "7"),
+            "redis://:pw@localhost:6379/1?ssl=true&db=7#main"
+        );
+        assert!(url_query_values("redis://localhost:6379/2", "db").is_empty());
+        assert!(url_query_values("redis://localhost:6379#?db=2", "db").is_empty());
+        assert_eq!(
+            with_url_query_value("redis://localhost:6379/2", "db", "7"),
+            "redis://localhost:6379/2"
+        );
     }
 
     #[test]
