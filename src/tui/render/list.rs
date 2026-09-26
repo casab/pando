@@ -573,12 +573,11 @@ pub(super) fn signal_text(wt: &Worktree) -> String {
     out
 }
 
+/// Gone is red; locked and uncommitted both need a look, which is yellow.
 pub(super) fn signal_color(wt: &Worktree) -> Color {
     if wt.prunable {
         red()
-    } else if wt.locked {
-        magenta()
-    } else if wt.dirty == Some(true) {
+    } else if wt.locked || wt.dirty == Some(true) {
         yellow()
     } else {
         text_dim()

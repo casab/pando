@@ -1064,7 +1064,7 @@ fn render_remove(f: &mut Frame, area: Rect, label: &str, blockers: &[RemoveBlock
     // or from git refusing after the dialog has gone.
     for blocker in blockers {
         let (mark, color) = match blocker {
-            RemoveBlocker::Locked(_) => ("⚠", magenta()),
+            RemoveBlocker::Locked(_) => ("⚠", yellow()),
             RemoveBlocker::Dirty => ("*", yellow()),
             RemoveBlocker::DirtyUnknown => ("?", text_muted()),
             RemoveBlocker::Running => ("●", yellow()),

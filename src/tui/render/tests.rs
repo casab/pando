@@ -3095,6 +3095,27 @@ fn the_detail_title_leads_with_the_rows_glyph() {
     assert_eq!(style_at(&buf, "╭ ● feat/one", "●").fg, Some(green()));
 }
 
+// Magenta means isolated, or a merged pull request, and nothing else: a
+// shared worktree's branch is painted as a branch is everywhere, and a
+// lock is something to look at.
+#[test]
+fn only_isolation_is_painted_magenta_in_the_detail_pane() {
+    let mut app = test_app(&["feat+one"]);
+    app.worktrees[0].locked = true;
+    let buf = draw(&mut app, 140, 30);
+    let branch = style_at(&buf, "│ branch ", "feat/one");
+    assert_eq!(branch.fg, Some(crate::theme::text()), "{branch:?}");
+    assert_eq!(style_at(&buf, "│ branch ", "locked").fg, Some(yellow()));
+    assert_ne!(yellow(), crate::theme::magenta());
+
+    app.modal = Some(Modal::Remove {
+        name: "feat+one".into(),
+        created_by_pando: true,
+    });
+    let buf = draw(&mut app, 140, 30);
+    assert_eq!(fg_of(&buf, "locked"), Some(yellow()));
+}
+
 #[test]
 fn the_header_counts_with_the_lists_glyphs() {
     let mut app = test_app(&["up", "broken"]);

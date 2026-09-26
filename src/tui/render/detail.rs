@@ -386,12 +386,12 @@ fn branch_rows<'a>(wt: &crate::worktree::Worktree, width: usize) -> Vec<Line<'a>
         return vec![detail_row(
             "branch",
             vec![
-                Span::styled(branch.to_string(), Style::new().fg(magenta())),
+                Span::styled(branch.to_string(), Style::new().fg(text())),
                 Span::styled(drift, drift_style),
             ],
         )];
     }
-    let mut rows = wrapped_rows("branch", branch, Style::new().fg(magenta()), width);
+    let mut rows = wrapped_rows("branch", branch, Style::new().fg(text()), width);
     if !drift.is_empty() {
         rows.push(Line::from(vec![
             Span::raw(" ".repeat(LABEL_WIDTH)),
