@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use std::io::IsTerminal;
 use std::process::ExitCode;
 
 use pando::cli::{Cli, dispatch, to_stderr};
@@ -115,6 +116,14 @@ fn run(cli: Cli) -> Result<()> {
     actions::guard_write_locations(&paths, &loaded.config)?;
     match cli.command {
         Some(command) => dispatch(command, &paths, &loaded.config),
+        // The TUI draws on stdout. Into a pipe it drew for nobody, and
+        // waited for keys nobody would press.
+        None if !std::io::stdout().is_terminal() => Err(pando::cli::UsageError(
+            "`pando` with no command opens the TUI, which needs a terminal — `pando --help` \
+             lists the commands, and `pando ls` the worktrees"
+                .to_string(),
+        )
+        .into()),
         None => tui::run(paths, loaded.config),
     }
 }

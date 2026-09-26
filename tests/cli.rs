@@ -460,6 +460,18 @@ fn an_unknown_subcommand_is_a_usage_error() {
     assert_eq!(code(&e.pando(&["rm"])), EXIT_USAGE, "missing argument");
 }
 
+// Bare `pando` from a script or an agent: the TUI panicked with 101 when
+// there was no terminal to take, and drew into the pipe waiting for keys
+// when there was one.
+#[test]
+fn bare_pando_with_no_terminal_is_a_usage_error_that_names_the_commands() {
+    let e = env();
+    let out = e.pando(&[]);
+    assert_eq!(code(&out), EXIT_USAGE, "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "", "nothing is drawn into the pipe");
+    assert!(stderr(&out).contains("`pando --help`"), "{}", stderr(&out));
+}
+
 #[test]
 fn help_and_version_work_outside_a_repository() {
     let e = env();

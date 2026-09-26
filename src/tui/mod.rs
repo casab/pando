@@ -57,7 +57,16 @@ pub fn run(paths: PandoPaths, config: Config) -> Result<()> {
         themes_dir,
         watched,
     );
-    let mut terminal = ratatui::init();
+    // A process with no terminal to take is told so rather than panicking.
+    // Raw mode is switched on before the screen, so a failure between the
+    // two still gives it back.
+    let mut terminal = match ratatui::try_init() {
+        Ok(terminal) => terminal,
+        Err(e) => {
+            let _ = ratatui::try_restore();
+            return Err(anyhow::Error::new(e).context("could not open the terminal for the TUI"));
+        }
+    };
     let result = main_loop(&mut terminal, &mut app, &worktrees_dir);
     ratatui::restore();
     result
