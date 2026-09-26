@@ -718,20 +718,23 @@ fn find_pattern(s: &str, limit: usize) -> Option<PatternMatch> {
     best
 }
 
-/// Byte budget per buffered line for the first read of an existing file.
-/// A fresh tailer only ever displays the last `capacity` lines, so it seeks
-/// to `capacity * this` bytes before EOF instead of parsing the whole file —
-/// dev logs grow to hundreds of MB and the first poll runs on the UI thread.
+/// Byte budget per buffered line for the first read of an existing file,
+/// and for a poll that finds more than that unread. A tailer only ever
+/// displays the last `capacity` lines, so it seeks to `capacity * this`
+/// bytes before EOF instead of parsing the whole file — dev logs grow to
+/// hundreds of MB and the polls run on the UI thread.
 const MAX_INITIAL_BYTES_PER_LINE: u64 = 512;
 
-/// The most a first read grows its window to while it holds too few whole
-/// lines: room for a final line a dev server dumps whole — a large JSON
-/// response, a state object — and small enough that a log which is one
-/// giant line cannot stall the UI thread's first poll.
+/// The most a read of the last lines grows its window to while it holds
+/// too few whole lines: room for a final line a dev server dumps whole — a
+/// large JSON response, a state object — and small enough that a log which
+/// is one giant line cannot stall a poll on the UI thread.
 const MAX_INITIAL_WINDOW: u64 = 8 * 1024 * 1024;
 
-/// Where the first read of a file of `size` bytes starts, and whether that
-/// is partway through a line.
+/// Where a read of the last lines of a file of `size` bytes starts, no
+/// earlier than `from`, and whether that is partway through a line. The
+/// first read of a file starts from 0; a tail that fell behind starts
+/// from where it stopped.
 ///
 /// The window starts `capacity` × [`MAX_INITIAL_BYTES_PER_LINE`] bytes
 /// before the end and doubles while it holds fewer than `capacity` whole
@@ -739,10 +742,15 @@ const MAX_INITIAL_WINDOW: u64 = 8 * 1024 * 1024;
 /// are longer than the budget still prints fifty, and a log that ends in
 /// a line longer than the window still shows that line. Newlines are
 /// counted, never parsed, and each byte is counted once.
-fn initial_start(file: &mut File, size: u64, capacity: usize) -> std::io::Result<(u64, bool)> {
+fn window_start(
+    file: &mut File,
+    from: u64,
+    size: u64,
+    capacity: usize,
+) -> std::io::Result<(u64, bool)> {
     let first = (capacity as u64).saturating_mul(MAX_INITIAL_BYTES_PER_LINE);
-    if size <= first {
-        return Ok((0, false));
+    if size - from <= first {
+        return Ok((from, false));
     }
     let ceiling = first.max(MAX_INITIAL_WINDOW);
     // `capacity` whole lines take one newline more: the first one ends the
@@ -750,13 +758,13 @@ fn initial_start(file: &mut File, size: u64, capacity: usize) -> std::io::Result
     let wanted = (capacity as u64).saturating_add(1);
     let mut start = size - first;
     let mut newlines = count_newlines(file, start, size)?;
-    while newlines < wanted && start > 0 && size - start < ceiling {
-        let next = size - (2 * (size - start)).min(ceiling).min(size);
+    while newlines < wanted && start > from && size - start < ceiling {
+        let next = size - (2 * (size - start)).min(ceiling).min(size - from);
         newlines += count_newlines(file, next, start)?;
         start = next;
     }
-    if start == 0 {
-        return Ok((0, false));
+    if start == from {
+        return Ok((from, false));
     }
     // A newline just before the window means it starts on a line, and that
     // line is whole. One that cannot be read is taken as a partial line:
@@ -925,7 +933,9 @@ impl LogTail {
 
     /// How many lines this tail has ever read, across evictions and
     /// truncations. A follower prints `lines_seen() - printed_so_far` from
-    /// the back of the buffer and is never silently left behind.
+    /// the back of the buffer and is never silently left behind. Lines an
+    /// unbounded poll skips without reading — all of a long gap but its
+    /// last window — are not counted, and none of them is in the buffer.
     pub fn lines_seen(&self) -> u64 {
         self.lines_seen
     }
@@ -1000,14 +1010,31 @@ impl LogTail {
             self.anchor.clear();
         }
         let mut skip_partial_first_line = false;
-        // A bounded poll reads from the start of a file that was rewritten:
-        // every line in it is new to a follower.
-        if self.offset == 0 && bound.is_none() {
-            let (start, partial) = initial_start(&mut file, size, self.capacity)
+        // An unbounded poll keeps only the last `capacity` lines, so it
+        // reads no more of the file than a first read would. A tail left
+        // unpolled — another row selected, the viewer open, the TUI
+        // suspended — read the whole gap into memory on the UI thread to
+        // keep the end of it. A bounded poll never skips: it reads from
+        // the start of a file that was rewritten, and every line is new
+        // to a follower.
+        if bound.is_none() {
+            let (start, partial) = window_start(&mut file, self.offset, size, self.capacity)
                 .with_context(|| format!("read log {}", self.path.display()))?;
-            self.offset = start;
-            self.line_start_offset = start;
-            skip_partial_first_line = partial;
+            if start > self.offset {
+                if self.offset > 0 {
+                    // What is buffered lies before lines that are never
+                    // read, so it goes, as reading them would have pushed
+                    // it out.
+                    self.evicted_levels
+                        .extend(self.buffer.drain(..).map(|line| line.level));
+                    self.leftover.clear();
+                    self.open_block = None;
+                    self.anchor.clear();
+                }
+                self.offset = start;
+                self.line_start_offset = start;
+                skip_partial_first_line = partial;
+            }
         }
         if size == self.offset {
             return Ok(false);
@@ -1389,6 +1416,40 @@ mod tests {
             }
             assert_eq!(printed, backlog, "reading at most {bound} bytes at once");
         }
+    }
+
+    // A tail left unpolled — another row selected, the viewer open, the
+    // TUI suspended — read the whole gap into memory on the UI thread to
+    // keep the last few lines of it.
+    #[test]
+    fn a_tail_that_fell_far_behind_reads_only_the_end_of_the_gap() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("log.txt");
+        write_all(&path, "old\n");
+        let mut tail = LogTail::new(path.clone(), 4);
+        tail.poll().unwrap();
+        let before = tail.lines_seen();
+
+        let gap: String = (0..10_000).map(|i| format!("line {i}\n")).collect();
+        append(&path, &gap);
+        tail.poll().unwrap();
+        assert_eq!(
+            plain_lines(&tail),
+            ["line 9996", "line 9997", "line 9998", "line 9999"]
+        );
+        let read = tail.lines_seen() - before;
+        assert!(
+            read < 1_000,
+            "only the end of the gap is read: {read} lines"
+        );
+        assert_eq!(tail.evicted_levels().len(), 1, "the old line goes");
+
+        // It reads on from there like any other poll, not as if the file
+        // had been rewritten.
+        append(&path, "next\n");
+        tail.poll().unwrap();
+        assert_eq!(tail.lines_seen() - before, read + 1);
+        assert_eq!(plain_lines(&tail).last().unwrap(), "next");
     }
 
     // A window that starts right after a newline starts on a whole line.
