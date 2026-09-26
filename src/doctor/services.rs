@@ -142,7 +142,10 @@ pub(super) fn services_report(
 ///
 /// Asked of the same function the start path asks, through the shell
 /// doctor was given, so the report is the decision rather than a second
-/// opinion about it.
+/// opinion about it. Once config has answered, a start runs what config
+/// says and asks detection nothing, so that is what is reported; what
+/// detection would choose is a line of its own, and only where it would
+/// now choose differently.
 fn isolation_report(
     paths: &PandoPaths,
     config: &Config,
@@ -157,15 +160,66 @@ fn isolation_report(
         None => detect::MachineEvidence::unknown(),
     };
     let choice = detect::service_choice_for(paths.root(), &signals, &evidence, config);
+    let (mechanism, lines) = match configured_isolation(config) {
+        Some((mechanism, mut lines)) => {
+            if let Some(detected) = choice.mechanism
+                && !config.services.iter().any(|s| service_kind(s) == detected)
+            {
+                lines.push(format!(
+                    "detection alone would choose {detected} now: {}",
+                    choice.evidence.join("; ")
+                ));
+            }
+            (mechanism, lines)
+        }
+        None => (choice.mechanism, choice.evidence),
+    };
     IsolationReport {
-        mechanism: choice.mechanism.map(str::to_string),
+        mechanism: mechanism.map(str::to_string),
         prefer: config.isolation.prefer.clone(),
         answered,
-        evidence: choice
-            .evidence
+        evidence: lines
             .iter()
             .map(|line| super::config::with_real_user_config(paths, line))
             .collect(),
+    }
+}
+
+/// What config already says about isolation: the mechanism a start runs,
+/// named after the first `[[services]]` entry, and one line per entry that
+/// says it. `None` while config says nothing.
+fn configured_isolation(config: &Config) -> Option<(Option<&'static str>, Vec<String>)> {
+    if config.isolation.none {
+        return Some((
+            None,
+            vec!["`[isolation] none` says this project has nothing to isolate".to_string()],
+        ));
+    }
+    let first = config.services.first()?;
+    let lines = config
+        .services
+        .iter()
+        .map(|service| match service {
+            ServiceConfig::Compose { file, include, .. } => match include.is_empty() {
+                true => format!("`[[services]]` names the compose file {file}"),
+                false => format!(
+                    "`[[services]]` names the compose file {file}, for {}",
+                    include.join(", ")
+                ),
+            },
+            ServiceConfig::Native { name, .. } => {
+                format!("`[[services]]` names the native service {name}")
+            }
+        })
+        .collect();
+    Some((Some(service_kind(first)), lines))
+}
+
+/// A `[[services]]` entry's `kind`, spelled the way the file spells it.
+fn service_kind(service: &ServiceConfig) -> &'static str {
+    match service {
+        ServiceConfig::Compose { .. } => "compose",
+        ServiceConfig::Native { .. } => "native",
     }
 }
 

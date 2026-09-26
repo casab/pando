@@ -1516,6 +1516,60 @@ fn doctor_names_the_preference_and_the_engine_that_overruled_it() {
 }
 
 #[test]
+fn an_answered_project_is_reported_as_its_config_says_and_not_as_detection_would_choose() {
+    let fx = fixture();
+    std::fs::write(
+        fx.root.join(".env.example"),
+        "DATABASE_URL=postgres://acme:acme@localhost:5432/acme\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fx.root.join("docker-compose.yml"),
+        "services:\n  postgres:\n    image: postgres:16\n",
+    )
+    .unwrap();
+    write_project_config(
+        &fx,
+        "[[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
+         include = [\"postgres\"]\n",
+    );
+    // No docker and the engine installed: detection alone would pick
+    // native, and a start still runs the compose entry config names.
+    let report = report_of(&fx, &shell_with(&["postgres"]));
+    let isolation = &report.services.isolation;
+    assert!(isolation.answered);
+    assert_eq!(isolation.mechanism.as_deref(), Some("compose"));
+    let said = isolation.evidence.join(" | ");
+    assert!(
+        said.contains("`[[services]]` names the compose file docker-compose.yml, for postgres"),
+        "{said}"
+    );
+    assert!(
+        said.contains("detection alone would choose native now"),
+        "{said}"
+    );
+    let text = report.render();
+    assert!(
+        text.contains("compose, as this project's config already says"),
+        "{text}"
+    );
+
+    // `[isolation] none` is an answer too: nothing, whatever the compose
+    // file offers.
+    write_project_config(&fx, "[isolation]\nnone = true\n");
+    let report = report_of(&fx, &shell_with(&["docker", "postgres"]));
+    let isolation = &report.services.isolation;
+    assert!(isolation.answered);
+    assert_eq!(isolation.mechanism, None);
+    let said = isolation.evidence.join(" | ");
+    assert!(said.contains("`[isolation] none` says"), "{said}");
+    assert!(
+        said.contains("detection alone would choose compose now"),
+        "{said}"
+    );
+}
+
+#[test]
 fn a_project_with_nothing_to_isolate_says_that_rather_than_guessing() {
     let fx = fixture();
     let report = report_of(&fx, &shell_with(&["docker", "postgres"]));
