@@ -193,6 +193,18 @@ impl Plan {
     }
 }
 
+/// Why the next namespaced start's steps after the services would not run
+/// on data of the worktree's own: [`Plan::not_own_data`] of the plan that
+/// start makes. `None` when they would.
+///
+/// Public because `doctor` says at rest whether that start runs a hook
+/// scoped to data of the worktree's own. Its own answer went by the
+/// namespaces a worktree recorded, and a database of its own beside one
+/// that stays on main's read as data of its own.
+pub fn namespaced_not_own_data(paths: &PandoPaths, config: &Config) -> Option<String> {
+    plan(paths, config).not_own_data()
+}
+
 /// Which of the project's services a namespaced start gives the worktree a
 /// namespace in, read from config, the recipes, and the main checkout's
 /// env files.

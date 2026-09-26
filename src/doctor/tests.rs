@@ -2074,6 +2074,73 @@ fn the_schema_question_with_no_way_to_say_no_is_reported_once() {
     assert!(hits <= 1, "said at most once: {:?}", messages(&report));
 }
 
+// A namespaced start runs a hook scoped to data of its own only where no
+// service its steps could reach stays on the main checkout's. doctor went
+// by the database the worktree recorded, so one beside a postgres pando
+// knows no namespace for read as a hook the next start runs again.
+#[test]
+fn a_hook_a_namespaced_start_skips_beside_a_shared_database_is_not_one_it_runs_again() {
+    let fx = fixture();
+    // No login in it, so nothing asks a server; and a client in pando's
+    // bin, which every namespace command finds first, answers nothing.
+    std::fs::write(
+        fx.root.join(".env"),
+        "DATABASE_PORT=3306\nDATABASE_NAME=shop\nPOSTGRES_PORT=5432\n",
+    )
+    .expect("env");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = fx.home.join("bin");
+        std::fs::create_dir_all(&bin).expect("bin");
+        std::fs::write(bin.join("mariadb"), "#!/bin/sh\nexit 1\n").expect("fake client");
+        std::fs::set_permissions(bin.join("mariadb"), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+    }
+    let mut record = state::WorktreeRecord::new(&fx.root, false);
+    record.mode = Some(state::ServiceMode::Namespaced);
+    record.namespaces.push(state::NamespaceRecord {
+        service: "mariadb".to_string(),
+        recipe: "mariadb".to_string(),
+        kind: state::NamespaceKind::Database,
+        host: "127.0.0.1".to_string(),
+        port: 3306,
+        name: "shop__feat_one".to_string(),
+        main: "shop".to_string(),
+        keys: vec!["DATABASE_PORT".to_string()],
+        used_at: chrono::Utc::now(),
+    });
+    record.hooks.insert(
+        "schema".to_string(),
+        state::HookRecord {
+            fingerprint: Some("before this change".to_string()),
+            ran_at: chrono::Utc::now(),
+        },
+    );
+    write_state(&fx, &one_worktree("feat+one", record));
+    let mariadb = "[[services]]\nkind = \"native\"\nname = \"mariadb\"\n\
+                   env = { DATABASE_PORT = \"mariadb\" }\n\n";
+    let postgres = "[[services]]\nkind = \"native\"\nname = \"postgres\"\n\
+                    env = { POSTGRES_PORT = \"postgres\" }\n\n";
+    let will_run_again = |services: &str| {
+        write_project_config(
+            &fx,
+            &format!(
+                "{services}[[hooks]]\nname = \"schema\"\nafter = \"services\"\ncmd = \"true\"\n"
+            ),
+        );
+        let report = report(&fx);
+        report.hooks[0].runs[0].will_run_again
+    };
+    assert!(
+        will_run_again(mariadb),
+        "on a database of its own, with its inputs changed, the next start runs it"
+    );
+    assert!(
+        !will_run_again(&format!("{mariadb}{postgres}")),
+        "beside a postgres that stays on the main checkout's data, the next start skips it"
+    );
+}
+
 // ---- worktrees --------------------------------------------------
 
 /// A state file, written through the real types: doctor reads state

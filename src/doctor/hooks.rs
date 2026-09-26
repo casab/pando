@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use crate::config::{self, Config};
 use crate::paths::PandoPaths;
-use crate::state::{NamespaceKind, ServiceMode, WorktreeRecord};
+use crate::state::{ServiceMode, WorktreeRecord};
 use crate::{actions, detect};
 
 use super::report::{Finding, HookReport, HookRunReport, Section, WorktreeReport};
@@ -24,6 +24,15 @@ pub(super) fn hooks_report(
         true => Vec::new(),
         false => crate::worktree::discover(&paths.project).unwrap_or_default(),
     };
+    // Whether a namespaced start has data of its own is its plan's answer,
+    // read from the config, recipes and env files that start reads.
+    let namespaced_own_data = !config.hooks.is_empty()
+        && view
+            .state
+            .worktrees
+            .values()
+            .any(|record| record.mode() == ServiceMode::Namespaced)
+        && actions::namespaced_not_own_data(paths, config).is_none();
     let no_services = BTreeMap::new();
     let mut out = Vec::new();
     for hook in &config.hooks {
@@ -61,7 +70,7 @@ pub(super) fn hooks_report(
                 worktree: &record.path,
                 ports: &record.ports,
                 service_env: &no_services,
-                own_data: own_data(record),
+                own_data: own_data(record, namespaced_own_data),
                 not_own: None,
             };
             runs.push(HookRunReport {
@@ -95,15 +104,13 @@ pub(super) fn hooks_report(
 
 /// Whether the next start in this worktree has data of its own, which is
 /// what a hook scoped to isolated starts runs on: a plain start keeps the
-/// mode it last ran in, and a namespaced one has data of its own only
-/// where it has a database of its own.
-fn own_data(record: &WorktreeRecord) -> bool {
+/// mode it last ran in, and a namespaced one has it when `namespaced` says
+/// so: a database of its own, and no service its steps could reach left
+/// on the main checkout's data.
+fn own_data(record: &WorktreeRecord, namespaced: bool) -> bool {
     match record.mode() {
         ServiceMode::Isolated => true,
-        ServiceMode::Namespaced => record
-            .namespaces
-            .iter()
-            .any(|namespace| namespace.kind == NamespaceKind::Database),
+        ServiceMode::Namespaced => namespaced,
         ServiceMode::Shared => false,
     }
 }
