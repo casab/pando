@@ -12638,6 +12638,55 @@ fn freeing_a_slot_goes_through_the_guard() {
     assert_eq!(store.worktrees["w2"].namespaces.len(), 1, "still recorded");
 }
 
+// A stopped worktree the guard refuses for good — its record claims the
+// main checkout's slot — is nothing a question could free. Nothing was
+// asked, the start went on, and its error said a terminal start asks which
+// one to free, so every terminal start after it did the same. It stops
+// now, saying why that one cannot be freed, and no start says it asks.
+#[test]
+fn a_stopped_worktree_the_guard_always_refuses_stops_the_start_and_is_never_said_to_be_asked_about()
+{
+    let (ns, redis) = slots_fixture(
+        "DATABASE_PORT=3306\nDATABASE_NAME=shop\nDATABASE_USER=app\nREDIS_PORT=6379\nREDIS_DB=5\n",
+    );
+    let mut store = ns.fx.state();
+    for n in (1..=15).filter(|n| *n != 5) {
+        store
+            .worktrees
+            .insert(format!("w{n}"), slot_holder(n, n != 1, 1));
+    }
+    store.worktrees.get_mut("w1").unwrap().namespaces[0].main = "1".into();
+    state::save(&ns.fx.paths.state_file(), &store).unwrap();
+    let ask = |q: &Question| -> Result<Answer> { panic!("asked {:?}", q.options) };
+    let e = format!(
+        "{:#}",
+        resolve_for_start(
+            &ns.fx.paths,
+            &ns.fx.config,
+            &ns.name,
+            Mode::Namespaced,
+            &ask,
+            &noop
+        )
+        .unwrap_err()
+    );
+    assert!(
+        e.contains("w1 (slot 1, last ran")
+            && e.contains("main checkout's own slot")
+            && e.contains("w2 (slot 2, running)")
+            && e.contains("Stop one of this project's running ones"),
+        "{e}"
+    );
+    assert!(!e.contains("on a terminal asks"), "{e}");
+
+    // A start that does not ask finds every slot held, and does not say
+    // that one which does would.
+    let e = format!("{:#}", ns.start(Mode::Namespaced).unwrap_err());
+    assert!(e.contains("every slot of redis"), "{e}");
+    assert!(!e.contains("on a terminal asks"), "{e}");
+    assert!(!redis.join("flushed").exists());
+}
+
 // ---- rm and doctor, for namespaces --------------------------------------------
 
 /// A namespaced worktree with a database and a slot, started and stopped.
