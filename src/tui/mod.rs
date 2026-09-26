@@ -38,7 +38,8 @@ const INPUT_POLL: Duration = Duration::from_millis(50);
 
 pub fn run(paths: PandoPaths, config: Config) -> Result<()> {
     // The terminal is the TUI's from here on: a hook that prompted on it
-    // would draw over the frame and wait on keys pando reads.
+    // would draw over the frame and wait on keys pando reads. A hook
+    // detached from it is hung up on when pando is.
     crate::hooks::detach_from_terminal();
     // Before anything creates a directory under it: the watcher and the
     // enrichment cache both `create_dir_all` their way down, and a home made
@@ -69,6 +70,9 @@ pub fn run(paths: PandoPaths, config: Config) -> Result<()> {
     };
     let result = main_loop(&mut terminal, &mut app, &worktrees_dir);
     ratatui::restore();
+    // `q` twice abandons what is in flight, and nothing waits for a hook
+    // once the TUI has gone.
+    crate::hooks::hang_up_detached();
     result
 }
 
