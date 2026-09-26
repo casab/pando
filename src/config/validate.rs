@@ -55,9 +55,24 @@ pub fn validate(config: &Config, project: &ProjectRef) -> Result<()> {
         );
     }
     // A hook writes `logs/<worktree>/<name>.log` under exactly the same
-    // rules as a process, and shares the namespace with it.
+    // rules as a process, and shares the namespace with it. A process of
+    // the same name truncates that log when it spawns, erasing what a hook
+    // before it appended, and a `dev` hook's lines land in the running
+    // process's log.
     for hook in &config.hooks {
         crate::paths::validate_owned_log_source("hook name", &hook.name)?;
+        if let Some(process) = config
+            .processes
+            .keys()
+            .find(|process| crate::paths::same_log_source(process, &hook.name))
+        {
+            bail!(
+                "the hook {:?} and the process {process:?} have the same name — both write the \
+                 log logs/<worktree>/{process}.log, so the process's start would truncate what \
+                 the hook appended; rename one of them",
+                hook.name
+            );
+        }
     }
     for probe in &config.probes {
         if probe.name.trim().is_empty() {
@@ -178,8 +193,8 @@ fn validate_services(config: &Config) -> Result<()> {
 }
 
 /// The rules every service name is held to, whichever kind of service it
-/// is: it is a log file component, it must not collide with a hook's log,
-/// and it owns a role no process may also own.
+/// is: it is a log file component, it must not collide with a hook's or a
+/// process's log, and it owns a role no process may also own.
 ///
 /// `escape` is what the developer can do about a collision, which differs
 /// between the two kinds — a compose service can be dropped from
@@ -195,11 +210,16 @@ fn claim_service_name(
     // name both write `logs/<worktree>/<name>.log`: the service's log
     // truncates it, the hook appends to it, and `logs --source <name>`
     // shows a mixture of the two.
-    if config.hooks.iter().any(|hook| hook.name == name) {
+    if let Some(hook) = config
+        .hooks
+        .iter()
+        .find(|hook| crate::paths::same_log_source(&hook.name, name))
+    {
         bail!(
-            "the hook {name:?} and the service {name:?} have the same name — both write the \
+            "the hook {:?} and the service {name:?} have the same name — both write the \
              log logs/<worktree>/{name}.log, so the service's log would truncate what the \
-             hook appended; rename one of them"
+             hook appended; rename one of them",
+            hook.name
         );
     }
     if let Some(owner) = role_owner.get(name) {
@@ -215,6 +235,19 @@ fn claim_service_name(
         bail!(
             "the service {name:?} and {owner} both claim the role {name:?} — a role is one \
              port and belongs to one thing; rename the process's role, or {escape}"
+        );
+    }
+    // A process owning some other role still writes its log under its
+    // own name, and whichever of the two starts last truncates the other's.
+    if let Some(process) = config
+        .processes
+        .keys()
+        .find(|process| crate::paths::same_log_source(process, name))
+    {
+        bail!(
+            "the service {name:?} and the process {process:?} have the same name — both write \
+             the log logs/<worktree>/{name}.log, so whichever starts last would truncate the \
+             other's; rename the process, or {escape}"
         );
     }
     role_owner.insert(name.to_string(), format!("the service {name:?}"));
@@ -236,6 +269,17 @@ fn validate_processes(config: &Config) -> Result<()> {
     let mut owner: BTreeMap<String, String> = BTreeMap::new();
     for (name, process) in &config.processes {
         crate::paths::validate_owned_log_source("process name", name)?;
+        if let Some(other) = config
+            .processes
+            .keys()
+            .find(|other| *other != name && crate::paths::same_log_source(other, name))
+        {
+            bail!(
+                "processes {other:?} and {name:?} differ only in case — on a filesystem that \
+                 ignores it, as macOS's does, both write the one log logs/<worktree>/{name}.log; \
+                 rename one of them"
+            );
+        }
         let roles = process.roles();
         for role in &roles {
             // What `{port:<role>}` can spell: anything else is not read as a

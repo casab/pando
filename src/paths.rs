@@ -287,14 +287,27 @@ pub fn validate_log_source(kind: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// The same check plus [`RESERVED_LOG_SOURCES`].
+/// Whether two log names open one file. The same name in another case
+/// does: macOS's filesystem ignores case by default, so a process called
+/// `Install` writes `install.log`, and `Web` the log of `web`.
+pub fn same_log_source(a: &str, b: &str) -> bool {
+    a == b || a.to_lowercase() == b.to_lowercase()
+}
+
+fn is_reserved_log_source(name: &str) -> bool {
+    RESERVED_LOG_SOURCES
+        .iter()
+        .any(|reserved| same_log_source(reserved, name))
+}
+
+/// The same check plus [`RESERVED_LOG_SOURCES`], in any case.
 ///
 /// Process and hook names go through this one. `logs --source` does not:
 /// `--source install` is how the install hook's log is read, and refusing
 /// to read a log pando itself wrote would be absurd.
 pub fn validate_owned_log_source(kind: &str, name: &str) -> Result<()> {
     validate_log_source(kind, name)?;
-    if RESERVED_LOG_SOURCES.contains(&name) {
+    if is_reserved_log_source(name) {
         anyhow::bail!(
             "{kind} {name:?} is reserved for pando's own logs ({}) — pando would truncate that \
              log on every start; pick another name",
@@ -311,7 +324,7 @@ fn suggest_log_source(name: &str) -> Option<&str> {
     let last = name
         .rsplit(['/', '\\'])
         .find(|part| !part.trim().is_empty())?;
-    (last != "." && last != ".." && !RESERVED_LOG_SOURCES.contains(&last)).then_some(last)
+    (last != "." && last != ".." && !is_reserved_log_source(last)).then_some(last)
 }
 
 /// Refuses a location pando would write to that lies inside the repository,
@@ -547,6 +560,20 @@ mod tests {
         validate_owned_log_source("process name", "installer").unwrap();
         // And `logs --source install` still reads the hook's own log.
         validate_log_source("log source", "install").unwrap();
+    }
+
+    // macOS ignores case by default: a process called `Install` opened
+    // install.log and truncated the install step's output on every start.
+    #[test]
+    fn a_reserved_log_name_is_refused_in_any_case() {
+        for name in ["Install", "TUNNEL", "Proxy"] {
+            let err = validate_owned_log_source("process name", name)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("reserved"), "{err}");
+        }
+        assert!(same_log_source("Web", "web"));
+        assert!(!same_log_source("web", "webs"));
     }
 
     // `[processes."apps/web"]` is a name a developer plausibly writes, so

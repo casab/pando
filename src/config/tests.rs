@@ -1493,6 +1493,73 @@ fn a_native_service_may_not_share_a_name_with_a_hook() {
     );
     let e = format!("{:#}", load(&f.paths).unwrap_err());
     assert!(e.contains("logs/<worktree>/migrate.log"), "{e}");
+
+    // macOS ignores case by default, so `Migrate` is the same log.
+    write_home(
+        &f,
+        "[[services]]\nkind = \"native\"\nname = \"migrate\"\n\n\
+             [[hooks]]\nname = \"Migrate\"\nafter = \"services\"\ncmd = \"m\"\n",
+    );
+    let e = format!("{:#}", load(&f.paths).unwrap_err());
+    assert!(
+        e.contains("the hook \"Migrate\" and the service \"migrate\""),
+        "{e}"
+    );
+}
+
+// A process, a hook and a service all write `logs/<worktree>/<name>.log`.
+// Only a hook and a service were held apart, so a hook named like a
+// process had what it printed erased when the process spawned, and a
+// process named like a service shared its log with the service.
+#[test]
+fn a_process_may_not_share_a_name_with_a_hook() {
+    let f = fixture();
+    for hook in ["api", "API"] {
+        write_home(
+            &f,
+            &format!(
+                "[processes.api]\ncmd = \"npm run dev\"\nports = [\"api\"]\n\n\
+                 [[hooks]]\nname = \"{hook}\"\nafter = \"install\"\ncmd = \"npm run build\"\n"
+            ),
+        );
+        let e = format!("{:#}", load(&f.paths).unwrap_err());
+        assert!(
+            e.contains(&format!("the hook \"{hook}\" and the process \"api\"")),
+            "{e}"
+        );
+        assert!(e.contains("logs/<worktree>/api.log"), "{e}");
+    }
+}
+
+#[test]
+fn a_process_may_not_share_a_name_with_a_service() {
+    let f = fixture();
+    for service in [
+        "[[services]]\nkind = \"compose\"\nfile = \"c.yml\"\ninclude = [\"db\"]\n",
+        "[[services]]\nkind = \"native\"\nname = \"db\"\n",
+    ] {
+        write_home(
+            &f,
+            &format!("[processes.db]\ncmd = \"x\"\nports = [\"web\"]\n\n{service}"),
+        );
+        let e = format!("{:#}", load(&f.paths).unwrap_err());
+        assert!(
+            e.contains("the service \"db\" and the process \"db\""),
+            "{e}"
+        );
+    }
+}
+
+#[test]
+fn two_processes_whose_names_differ_only_in_case_are_refused() {
+    let f = fixture();
+    write_home(
+        &f,
+        "[processes.web]\ncmd = \"x\"\nports = [\"web\"]\n\n\
+         [processes.Web]\ncmd = \"y\"\nports = [\"admin\"]\n",
+    );
+    let e = format!("{:#}", load(&f.paths).unwrap_err());
+    assert!(e.contains("differ only in case"), "{e}");
 }
 
 #[test]
