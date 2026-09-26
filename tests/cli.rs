@@ -1573,6 +1573,55 @@ fn logs_reads_a_file_with_invalid_utf8_before_a_short_timestamp() {
     assert!(stdout(&out).contains("after"), "{}", stdout(&out));
 }
 
+// No CLI verb prints a colour, yet the first line `logs` read asked the
+// system whether it was in dark mode: a `defaults` run on macOS, for
+// colours nobody saw.
+#[test]
+fn logs_asks_the_system_nothing_about_colours_it_never_prints() {
+    use std::os::unix::fs::PermissionsExt;
+    let e = env();
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+    let log = e.log_file("feat+one", "dev");
+    std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+    std::fs::write(&log, "ready in 412ms\nError: boom\n").unwrap();
+
+    let dir = e.home.parent().unwrap();
+    let bin = dir.join("counting-defaults");
+    let calls = dir.join("defaults-calls.log");
+    std::fs::create_dir_all(&bin).unwrap();
+    let shim = bin.join("defaults");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n",
+            calls.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_pando"))
+        .env("PANDO_HOME", &e.home)
+        .env("PATH", path)
+        // What would answer before the system is asked.
+        .env_remove("PANDO_APPEARANCE")
+        .current_dir(&e.root)
+        .args(["logs", "feat+one"])
+        .output()
+        .expect("run pando");
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("Error: boom"), "{}", stdout(&out));
+    assert_eq!(
+        std::fs::read_to_string(&calls).unwrap_or_default(),
+        "",
+        "nothing asked the system"
+    );
+}
+
 #[test]
 fn a_crashed_process_stays_visible_as_failed() {
     let e = env();

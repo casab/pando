@@ -86,21 +86,24 @@ pub fn set_palette(palette: Palette) {
     ACTIVE.with(|a| a.set(Some(palette)));
 }
 
-/// What paints before anything chose a theme: the default theme, dark or
-/// light as the system is. Under test always dark, so nothing depends on
-/// the machine running it.
+/// What colours before anything chose a theme: the default theme's dark
+/// half.
+///
+/// Nobody sees it, so the system is not asked which half: a CLI verb
+/// prints its log lines as plain text, and the TUI chooses its theme
+/// before its first frame and reads its tails again when it does. Asking
+/// was a `defaults` run on macOS for every `pando logs`, and for every
+/// `status` or `doctor` that read a failure's log.
 fn fallback() -> Palette {
     static FALLBACK: std::sync::OnceLock<Palette> = std::sync::OnceLock::new();
     *FALLBACK.get_or_init(|| {
-        let appearance = if cfg!(test) {
-            Appearance::Dark
-        } else {
-            appearance(&Settings::default()).0
-        };
-        let (all, _) = themes(None);
-        find(&all, DEFAULT_THEME)
-            .expect("the default theme is built in")
-            .palette(appearance)
+        let (name, text) = BUILT_IN
+            .iter()
+            .find(|(name, _)| *name == DEFAULT_THEME)
+            .expect("the default theme is built in");
+        Theme::parse(name, text, Source::BuiltIn)
+            .unwrap_or_else(|e| panic!("built-in theme {name} does not parse: {e}"))
+            .palette(Appearance::Dark)
     })
 }
 
