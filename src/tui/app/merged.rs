@@ -5,7 +5,9 @@
 //! appends whatever each one grew by. What was already in the files when
 //! the tab opened has no arrival order to recover — a log line carries no
 //! clock pando can trust — so that backlog comes one source after another,
-//! and everything after it is interleaved as it lands.
+//! and everything after it is interleaved as it lands. What one poll
+//! brings is shared out so that it fits the buffer, and no source's lines
+//! push out another's that arrived with them.
 
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
@@ -93,7 +95,8 @@ impl MergedTail {
     /// Starts merging a process that was not there when the tab opened —
     /// a process added to the config and started, or one whose log
     /// appeared only now. Its backlog arrives with the next poll, after
-    /// what is already merged. A name already merged is left alone.
+    /// what is already merged, and no more of it than its share of the
+    /// buffer. A name already merged is left alone.
     pub fn add_source(&mut self, name: String, path: PathBuf) {
         if self.sources.iter().any(|s| s.name == name) {
             return;
@@ -117,25 +120,39 @@ impl MergedTail {
     /// arrived.
     pub fn poll(&mut self) -> anyhow::Result<bool> {
         self.evicted.clear();
-        let mut grew = false;
-        for index in 0..self.sources.len() {
-            let source = &mut self.sources[index];
+        // Every source is read before any of it is pushed, so what they
+        // brought together can be shared out first.
+        let mut reads = Vec::with_capacity(self.sources.len());
+        for source in &mut self.sources {
             let last = source.tail.lines().back().map(|line| line.file_offset);
+            let backlog = source.merged == 0;
             // One unreadable log is not a reason to stop showing the rest.
             let _ = source.tail.poll();
             let seen = source.tail.lines_seen();
-            let new = (seen - source.merged).min(source.tail.lines().len() as u64) as usize;
+            let lines = source.tail.lines();
+            let new = (seen - source.merged).min(lines.len() as u64) as usize;
             source.merged = seen;
-            if new == 0 {
+            // The file was emptied and written again — a restart — and
+            // what follows is a new run, not more of the old one. Judged
+            // on the first line that arrived, whether it is taken or not.
+            let restarted = new > 0 && restarted_at(last, &lines[lines.len() - new]);
+            reads.push(SourceRead {
+                backlog,
+                restarted,
+                new,
+            });
+        }
+        let takes = self.takes(&reads);
+        let mut grew = false;
+        for (index, (read, take)) in reads.into_iter().zip(takes).enumerate() {
+            if read.new == 0 {
                 continue;
             }
-            let start = source.tail.lines().len() - new;
-            let restarted = restarted_at(last, &source.tail.lines()[start]);
-            let fresh: Vec<ParsedLine> = source.tail.lines().range(start..).cloned().collect();
+            let source = &self.sources[index];
+            let len = source.tail.lines().len();
+            let fresh: Vec<ParsedLine> = source.tail.lines().range(len - take..).cloned().collect();
             let name = source.name.clone();
-            // The file was emptied and written again — a restart — and
-            // what follows is a new run, not more of the old one.
-            if restarted {
+            if read.restarted {
                 let line = self.restart_marker(index, &name);
                 self.push(line);
             }
@@ -146,6 +163,31 @@ impl MergedTail {
             grew = true;
         }
         Ok(grew)
+    }
+
+    /// How many of each source's new lines a poll adds, the newest ones.
+    ///
+    /// Together they fit the buffer, with the restart markers the poll
+    /// adds, shared evenly between the sources that brought more than
+    /// their share: pushed one source after another, a busy log's lines
+    /// evicted every line of the sources before it. A backlog — what a log
+    /// held before any of it was merged — is held to its source's share
+    /// of the buffer, so a process that joins an open tab cannot push out
+    /// what is already there.
+    fn takes(&self, reads: &[SourceRead]) -> Vec<usize> {
+        let joining = reads.iter().filter(|read| read.backlog).count();
+        let backlogs: Vec<usize> = reads
+            .iter()
+            .map(|read| if read.backlog { read.new } else { 0 })
+            .collect();
+        let backlogs = fair_shares(&backlogs, self.capacity * joining / reads.len().max(1));
+        let wants: Vec<usize> = reads
+            .iter()
+            .zip(backlogs)
+            .map(|(read, backlog)| if read.backlog { backlog } else { read.new })
+            .collect();
+        let markers = reads.iter().filter(|read| read.restarted).count();
+        fair_shares(&wants, self.capacity.saturating_sub(markers))
     }
 
     fn push(&mut self, line: ParsedLine) {
@@ -196,6 +238,33 @@ impl MergedTail {
         parsed.styled = Line::from(spans);
         parsed
     }
+}
+
+/// What one poll read from a source.
+struct SourceRead {
+    /// Whether nothing of the source had been merged before, so what it
+    /// brought is its log's backlog.
+    backlog: bool,
+    /// Whether its log started over, which the tab marks.
+    restarted: bool,
+    /// How many of the tail's lines are new since the last merge.
+    new: usize,
+}
+
+/// Splits `room` between `wants` as evenly as they allow: each gets what
+/// it wants or an equal share of what the smaller wants left, whichever
+/// is less.
+fn fair_shares(wants: &[usize], room: usize) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..wants.len()).collect();
+    order.sort_by_key(|&at| wants[at]);
+    let mut left = room;
+    let mut shares = vec![0; wants.len()];
+    for (served, at) in order.into_iter().enumerate() {
+        let share = (left / (wants.len() - served)).min(wants[at]);
+        shares[at] = share;
+        left -= share;
+    }
+    shares
 }
 
 /// What the `all` tab says where a source's log was emptied and written

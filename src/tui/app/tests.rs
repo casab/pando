@@ -5350,6 +5350,94 @@ fn merged_block_ids_stay_distinct_when_a_source_joins() {
     assert_eq!(ids.len(), 4, "one id per block: {ids:?}");
 }
 
+/// A log of `count` lines, `name 0` to `name {count - 1}`, in `dir`.
+fn numbered_log(dir: &std::path::Path, name: &str, count: usize) -> PathBuf {
+    let path = dir.join(format!("{name}.log"));
+    let body: String = (0..count).map(|i| format!("{name} {i}\n")).collect();
+    std::fs::write(&path, body).unwrap();
+    path
+}
+
+fn merged_plain(merged: &MergedTail) -> Vec<String> {
+    merged.lines().iter().map(|p| p.plain.clone()).collect()
+}
+
+// Backlogs were pushed one source after another into one buffer, so a
+// busy log evicted every line of the quiet one merged before it.
+#[test]
+fn a_backlog_that_fills_the_all_tab_leaves_the_other_processes_their_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let web = numbered_log(dir.path(), "web", 3);
+    let api = numbered_log(dir.path(), "api", 30);
+    let mut merged = MergedTail::new(vec![("web".into(), web), ("api".into(), api)], 10);
+    merged.poll().unwrap();
+    let plain = merged_plain(&merged);
+    let from = |name: &str| plain.iter().filter(|l| l.starts_with(name)).count();
+    assert_eq!(from("web"), 3, "{plain:?}");
+    assert_eq!(from("api"), 7, "the rest of the buffer: {plain:?}");
+    assert_eq!(plain.last().unwrap(), "api │ api 29", "the newest kept");
+}
+
+#[test]
+fn two_backlogs_that_each_fill_the_all_tab_share_it_evenly() {
+    let dir = tempfile::tempdir().unwrap();
+    let web = numbered_log(dir.path(), "web", 30);
+    let api = numbered_log(dir.path(), "api", 30);
+    let mut merged = MergedTail::new(vec![("web".into(), web), ("api".into(), api)], 10);
+    merged.poll().unwrap();
+    let plain = merged_plain(&merged);
+    let expected: Vec<String> = (25..30)
+        .map(|i| format!("web │ web {i}"))
+        .chain((25..30).map(|i| format!("api │ api {i}")))
+        .collect();
+    assert_eq!(plain, expected);
+}
+
+#[test]
+fn a_process_that_joins_with_a_long_log_takes_only_its_share_of_the_all_tab() {
+    let dir = tempfile::tempdir().unwrap();
+    let web = numbered_log(dir.path(), "web", 4);
+    let api = numbered_log(dir.path(), "api", 4);
+    let mut merged = MergedTail::new(vec![("web".into(), web), ("api".into(), api)], 12);
+    merged.poll().unwrap();
+    let worker = numbered_log(dir.path(), "worker", 100);
+    merged.add_source("worker".into(), worker);
+    merged.poll().unwrap();
+    let plain = merged_plain(&merged);
+    let from = |name: &str| plain.iter().filter(|l| l.starts_with(name)).count();
+    assert_eq!(from("worker"), 4, "a third of the buffer: {plain:?}");
+    assert_eq!((from("web"), from("api")), (4, 4), "{plain:?}");
+}
+
+// A restart is judged on the first line of the new run, which the share
+// may leave out, and its marker is not evicted by the lines after it.
+#[test]
+fn a_restart_is_marked_when_the_all_tab_takes_only_part_of_the_new_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let api = numbered_log(dir.path(), "api", 1);
+    let web = numbered_log(dir.path(), "web", 1);
+    let mut merged = MergedTail::new(
+        vec![("api".into(), api.clone()), ("web".into(), web.clone())],
+        10,
+    );
+    merged.poll().unwrap();
+    let body: String = (0..8).map(|i| format!("api new {i}\n")).collect();
+    std::fs::write(&api, body).unwrap();
+    let more: String = (1..9).map(|i| format!("web {i}\n")).collect();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&web)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, more.as_bytes()))
+        .unwrap();
+    merged.poll().unwrap();
+    let plain = merged_plain(&merged);
+    let marker = format!("api │ {}", super::merged::RESTART_MARKER);
+    assert_eq!(plain.len(), 10, "{plain:?}");
+    assert_eq!(plain[0], marker, "{plain:?}");
+    assert!(plain[1].starts_with("api │ api new"), "{plain:?}");
+    assert_eq!(plain.last().unwrap(), "web │ web 8");
+}
+
 #[test]
 fn a_json_block_in_the_all_tab_still_inspects_as_json() {
     let (_dir, mut app) = two_process_app();
