@@ -196,6 +196,22 @@ fn walk_table(table: &toml_edit::Table, prefix: &str, out: &mut Vec<KeyReport>) 
                 note: comment(value.decor().suffix().and_then(|s| s.as_str())),
                 ignored: false,
             }),
+            // A login written inline is walked key by key, the way one
+            // written as a table is, so its password is hidden too.
+            toml_edit::Item::Value(toml_edit::Value::InlineTable(inline))
+                if path == "namespaced" || path.starts_with("namespaced.") =>
+            {
+                if let Some(note) = comment(inline.decor().suffix().and_then(|s| s.as_str())) {
+                    out.push(KeyReport {
+                        key: path.clone(),
+                        value: None,
+                        raw: None,
+                        note: Some(note),
+                        ignored: false,
+                    });
+                }
+                walk_table(&inline.clone().into_table(), &path, out);
+            }
             toml_edit::Item::Value(value) => out.push(KeyReport {
                 key: path,
                 value: Some(value_repr(value)),

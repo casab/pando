@@ -2469,3 +2469,45 @@ fn a_namespace_login_is_reported_without_its_password() {
     }
     assert!(text.contains("namespaced.mariadb.password"), "{text}");
 }
+
+#[test]
+fn a_namespace_login_written_inline_is_reported_without_its_password() {
+    let fx = fixture();
+    write_project_config(
+        &fx,
+        "[namespaced]\nmariadb = { user = \"root\", password = \"hunter2\" }\n",
+    );
+    std::fs::write(
+        fx.root.join("pando.toml"),
+        "namespaced = { redis = { password = \"committed-secret\" } }\n",
+    )
+    .unwrap();
+    let report = report(&fx);
+    let project = &report.config.layers[2];
+    let password = project
+        .keys
+        .iter()
+        .find(|k| k.key == "namespaced.mariadb.password")
+        .expect("the key is named");
+    assert_eq!(password.value.as_deref(), Some("(hidden)"));
+    assert!(password.raw.is_none());
+    let user = project
+        .keys
+        .iter()
+        .find(|k| k.key == "namespaced.mariadb.user")
+        .expect("the user is named");
+    assert_eq!(user.value.as_deref(), Some("\"root\""));
+    let committed = &report.config.layers[0];
+    let leaked = committed
+        .keys
+        .iter()
+        .find(|k| k.key == "namespaced.redis.password")
+        .expect("named in the committed layer too");
+    assert!(leaked.ignored, "and ignored there");
+    let json = serde_json::to_string(&report).unwrap();
+    let text = report.render();
+    for shown in [&json, &text] {
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(!shown.contains("committed-secret"), "{shown}");
+    }
+}
