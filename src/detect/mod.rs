@@ -38,6 +38,7 @@ pub use apply::{
     fills_one_dev_process, join_list, may_fill_dev, native_entry, roles_in, service_entry, snippet,
     still_needed,
 };
+pub use dev::lockfiles_ignored;
 pub use frameworks::framework;
 pub use proposal::{
     Candidate, ComposeResolver, Proposal, ServiceHint, Slot, propose, propose_with,

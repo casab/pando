@@ -118,14 +118,11 @@ fn check_install(root: &Path, config: &Config, findings: &mut Vec<Finding>) {
         else {
             continue;
         };
-        // The plain install pando proposes itself where the lockfile is
+        // The plain install pando proposes itself where the lockfiles are
         // gitignored: the file it rewrites is one git ignores, so it
         // cannot change the repository.
         if manager.unlocked_install == Some(step.trim())
-            && manager
-                .lockfiles
-                .first()
-                .is_some_and(|lockfile| crate::detect::is_gitignored(root, lockfile))
+            && crate::detect::lockfiles_ignored(root, manager)
         {
             continue;
         }

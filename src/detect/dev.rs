@@ -16,9 +16,10 @@ use super::signals::Signals;
 ///
 /// A lockfile the project gitignores is not frozen against anything: a new
 /// worktree is checked out without it, so the frozen install fails there.
-/// Such a project, and a JavaScript one with no lockfile whose lockfile
-/// name is gitignored, gets its manager's plain install instead — the file
-/// it writes is one git ignores, so it cannot change the repository.
+/// Such a project, and a JavaScript one with no lockfile, gets its
+/// manager's plain install instead where every lockfile name that manager
+/// writes is gitignored — the file it writes is one git ignores, so it
+/// cannot change the repository.
 pub(super) fn install_proposal(root: &Path, signals: &Signals) -> Option<Proposal> {
     let mut candidates: Vec<Candidate> = Vec::new();
     for lock in &signals.lockfiles {
@@ -50,22 +51,42 @@ pub(super) fn install_proposal(root: &Path, signals: &Signals) -> Option<Proposa
     Some(Proposal::of(Slot::Install, candidates, decided))
 }
 
-/// The plain install of `manager`, when its lockfile is gitignored.
+/// The plain install of `manager`, when its lockfiles are gitignored.
 fn unlocked_install(
     root: &Path,
     manager: Option<&'static package_managers::PackageManager>,
 ) -> Option<Candidate> {
     let manager = manager?;
     let cmd = manager.unlocked_install?;
-    let lockfile = manager.lockfiles.first()?;
-    if !super::signals::is_gitignored(root, lockfile) {
+    if !lockfiles_ignored(root, manager) {
         return None;
     }
+    let verb = match manager.lockfiles.len() {
+        1 => "is",
+        _ => "are",
+    };
     Some(Candidate {
         value: cmd.to_string(),
-        why: format!("{lockfile} is gitignored, so {cmd} cannot change the repository"),
+        why: format!(
+            "{} {verb} gitignored, so {cmd} cannot change the repository",
+            listed(manager.lockfiles)
+        ),
         ..Candidate::default()
     })
+}
+
+/// Whether every lockfile `manager` writes is one the project gitignores,
+/// which is when its plain install cannot change the repository.
+///
+/// Every name, not the first: bun writes `bun.lock` or `bun.lockb`
+/// depending on its version, and a tracked `bun.lock` beside a `bun.lockb`
+/// left in the gitignore is a lockfile the plain install would rewrite.
+pub fn lockfiles_ignored(root: &Path, manager: &package_managers::PackageManager) -> bool {
+    !manager.lockfiles.is_empty()
+        && manager
+            .lockfiles
+            .iter()
+            .all(|lockfile| super::signals::is_gitignored(root, lockfile))
 }
 
 pub(super) fn version_files_proposal(signals: &Signals) -> Option<Proposal> {

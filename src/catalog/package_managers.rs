@@ -71,8 +71,8 @@ pub struct PackageManager {
     pub install: Option<FrozenInstall>,
     pub install_shape: Option<InstallShape>,
     /// The install for a project that keeps no lockfile in git: proposed
-    /// only when this manager's lockfile is gitignored, because then the
-    /// lockfile it writes cannot change the repository, and a frozen
+    /// only when every lockfile of this manager is gitignored, because then
+    /// the lockfile it writes cannot change the repository, and a frozen
     /// install has nothing in a new worktree to be frozen against.
     /// `None` where no such form is proposed: outside JavaScript, a
     /// project without a lockfile configures its own install.

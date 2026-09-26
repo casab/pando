@@ -771,6 +771,42 @@ fn a_gitignored_lockfile_gets_the_plain_install() {
     assert_eq!(values(&proposal), vec!["npm install"]);
 }
 
+// `bun.lockb` left in the gitignore after the move to `bun.lock`: the
+// tracked `bun.lock` is what the plain install would rewrite.
+#[test]
+fn a_tracked_bun_lock_beside_an_ignored_bun_lockb_gets_the_frozen_install() {
+    let dir = seed_fixture(&[
+        ("package.json", r#"{ "scripts": { "dev": "vite" } }"#),
+        (".gitignore", "bun.lockb\n"),
+        ("bun.lock", "{}\n"),
+    ]);
+    crate::testutil::git(dir.path(), &["add", "bun.lock"]);
+    let proposal = install_proposal(dir.path(), &signals(dir.path())).unwrap();
+    assert_eq!(values(&proposal), vec!["bun install --frozen-lockfile"]);
+}
+
+// With no lockfile a bun of 1.2 or later writes `bun.lock`, which this
+// gitignore does not cover.
+#[test]
+fn no_lockfile_and_only_one_of_buns_names_ignored_is_no_install() {
+    let dir = seed_fixture(&[
+        ("package.json", r#"{ "packageManager": "bun@1.2.0" }"#),
+        (".gitignore", "bun.lockb\n"),
+    ]);
+    assert!(install_proposal(dir.path(), &signals(dir.path())).is_none());
+
+    std::fs::write(dir.path().join(".gitignore"), "bun.lockb\nbun.lock\n").unwrap();
+    let proposal = install_proposal(dir.path(), &signals(dir.path())).unwrap();
+    assert_eq!(values(&proposal), vec!["bun install"]);
+    assert!(
+        proposal.candidates[0]
+            .why
+            .contains("bun.lockb and bun.lock are gitignored"),
+        "{}",
+        proposal.candidates[0].why
+    );
+}
+
 #[test]
 fn the_declared_package_manager_installs_a_project_with_no_lockfile() {
     let dir = seed_fixture(&[

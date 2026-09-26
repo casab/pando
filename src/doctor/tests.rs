@@ -579,6 +579,22 @@ fn the_plain_install_is_fine_where_the_lockfile_is_gitignored() {
     );
 }
 
+// A `bun.lockb` in the gitignore says nothing about the `bun.lock` the
+// project tracks, which is what `bun install` would rewrite.
+#[test]
+fn the_plain_install_is_a_problem_where_only_another_lockfile_name_is_ignored() {
+    let fx = fixture();
+    std::fs::write(fx.root.join(".gitignore"), "bun.lockb\n").unwrap();
+    std::fs::write(fx.root.join("bun.lock"), "{}\n").unwrap();
+    write_project_config(&fx, "[project]\ninstall = \"bun install\"\n");
+    let report = report(&fx);
+    assert!(
+        mentions(&report, "non-frozen install"),
+        "{:?}",
+        report.findings
+    );
+}
+
 #[test]
 fn a_frozen_install_and_a_command_pando_has_no_opinion_about_are_both_fine() {
     for install in [
