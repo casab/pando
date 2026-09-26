@@ -11249,7 +11249,9 @@ fn a_slot_the_server_could_not_be_asked_about_fails_the_start_and_frees_nothing(
 // A recorded slot the start will let go is no slot of its own: with every
 // other one held by a stopped worktree, a terminal start asks which one
 // frees its slot the first time, rather than failing to say that it asks.
-// While the worktree runs it keeps the slot, so nothing is asked then.
+// The other record naming that slot is not offered, since the guard would
+// not empty a slot two records name. While the worktree runs it keeps the
+// slot, so nothing is asked then.
 #[test]
 fn a_start_that_will_let_its_slot_go_asks_which_stopped_worktree_frees_one() {
     let (ns, redis) = slots_fixture(MAIN_ENV_WITH_REDIS);
@@ -11271,9 +11273,22 @@ fn a_start_that_will_let_its_slot_go_asks_which_stopped_worktree_frees_one() {
 
     let question = free_w2(&ns);
     assert!(
-        question.options.iter().all(|(value, _)| *value != ns.name),
+        question
+            .options
+            .iter()
+            .all(|(value, _)| *value != ns.name && value != "w1"),
         "{:?}",
         question.options
+    );
+    assert_eq!(question.options.len(), 14);
+    assert!(
+        question
+            .details
+            .iter()
+            .any(|d| d.starts_with("not offered: w1 (slot 1, last ran")
+                && d.contains(&format!("is recorded for {} as well", ns.name))),
+        "{:?}",
+        question.details
     );
     assert_eq!(
         std::fs::read_to_string(redis.join("flushed")).unwrap(),
@@ -11288,6 +11303,59 @@ fn a_start_that_will_let_its_slot_go_asks_which_stopped_worktree_frees_one() {
         "{said:?}"
     );
     assert_eq!(ns.env_line("REDIS_DB").as_deref(), Some("2"));
+}
+
+// A stopped worktree whose slot this one's record names too is no answer
+// either, so with it the only stopped one nothing is asked: the start lets
+// this worktree's claim go and says every slot is held, and the next one
+// offers the other, whose slot is then its alone to give up.
+#[test]
+fn a_stopped_worktree_sharing_this_ones_slot_is_offered_once_this_one_lets_it_go() {
+    let (ns, redis) = slots_fixture(MAIN_ENV_WITH_REDIS);
+    let (report, _) = ns.start(Mode::Namespaced).unwrap();
+    drop(guard(&report));
+    stop(&ns.fx.paths, &ns.name, None).unwrap();
+    hold(
+        &ns,
+        std::iter::once((1, false)).chain((2..=15).map(|n| (n, true))),
+    );
+    let ask = |q: &Question| -> Result<Answer> { panic!("asked {:?}", q.options) };
+    resolve_for_start(
+        &ns.fx.paths,
+        &ns.fx.config,
+        &ns.name,
+        Mode::Remembered,
+        &ask,
+        &noop,
+    )
+    .unwrap();
+    let e = format!("{:#}", ns.start(Mode::Remembered).unwrap_err());
+    assert!(
+        e.contains("every slot of redis") && e.contains("w1 (slot 1, last ran"),
+        "{e}"
+    );
+
+    let asked = std::cell::RefCell::new(None::<Question>);
+    let ask = |q: &Question| -> Result<Answer> {
+        asked.replace(Some(q.clone()));
+        Ok(Answer::Choice(0))
+    };
+    resolve_for_start(
+        &ns.fx.paths,
+        &ns.fx.config,
+        &ns.name,
+        Mode::Remembered,
+        &ask,
+        &noop,
+    )
+    .unwrap();
+    let question = asked.into_inner().expect("asked which one to free");
+    let offered: Vec<&str> = question.options.iter().map(|(v, _)| v.as_str()).collect();
+    assert_eq!(offered, vec!["w1"]);
+    assert_eq!(
+        std::fs::read_to_string(redis.join("flushed")).unwrap(),
+        "1\n"
+    );
 }
 
 // Slots nobody holds but full of somebody else's keys are no free slot
@@ -11358,8 +11426,10 @@ fn freeing_no_slot_starts_nothing_and_empties_nothing() {
     assert_eq!(ns.fake("created"), "", "nothing was made either");
 }
 
-// The guard stands behind the question: a holder whose record claims the
-// main checkout's own slot is never emptied, whatever was answered.
+// The guard stands before the question and behind it: a holder whose
+// record claims the main checkout's own slot is not offered, and one whose
+// slot another record comes to name while the question is asked is never
+// emptied, whatever was answered.
 #[test]
 fn freeing_a_slot_goes_through_the_guard() {
     let (ns, redis) = slots_fixture(
@@ -11375,10 +11445,28 @@ fn freeing_a_slot_goes_through_the_guard() {
     store.worktrees.get_mut("w1").unwrap().namespaces[0].main = "1".into();
     state::save(&ns.fx.paths.state_file(), &store).unwrap();
     let ask = |q: &Question| -> Result<Answer> {
+        assert!(
+            q.options.iter().all(|(value, _)| value != "w1"),
+            "{:?}",
+            q.options
+        );
+        assert!(
+            q.details
+                .iter()
+                .any(|d| d.starts_with("not offered: w1 (slot 1")
+                    && d.contains("main checkout's own slot")),
+            "{:?}",
+            q.details
+        );
+        let mut store = ns.fx.state();
+        store
+            .worktrees
+            .insert("w16".into(), slot_holder(2, false, 1));
+        state::save(&ns.fx.paths.state_file(), &store).unwrap();
         let index = q
             .options
             .iter()
-            .position(|(value, _)| value == "w1")
+            .position(|(value, _)| value == "w2")
             .unwrap();
         Ok(Answer::Choice(index))
     };
@@ -11394,13 +11482,11 @@ fn freeing_a_slot_goes_through_the_guard() {
         )
         .unwrap_err()
     );
-    assert!(e.contains("main checkout's own slot"), "{e}");
+    assert!(e.contains("is recorded for w16 as well"), "{e}");
     assert!(!redis.join("flushed").exists());
-    assert_eq!(
-        ns.fx.state().worktrees["w1"].namespaces.len(),
-        1,
-        "still recorded"
-    );
+    let store = ns.fx.state();
+    assert_eq!(store.worktrees["w1"].namespaces.len(), 1, "still recorded");
+    assert_eq!(store.worktrees["w2"].namespaces.len(), 1, "still recorded");
 }
 
 // ---- rm and doctor, for namespaces --------------------------------------------

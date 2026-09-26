@@ -1258,10 +1258,11 @@ fn since(at: chrono::DateTime<chrono::Utc>) -> String {
 /// stopped worktree gives its slot up, and empties and frees the one
 /// chosen, through the guard, before anything else of this start happens.
 ///
-/// The server is asked only when a stopped worktree holds one, so there
-/// is something to offer. A running worktree is never offered: its app
-/// is using the slot. When every holder is running, the start stops
-/// naming them. A script gets exit 3 with the list, as for any question.
+/// The server is asked only when a stopped worktree holds one it could
+/// offer. A running worktree is never offered: its app is using the slot.
+/// Nor is a stopped one whose slot the guard would not empty. When every
+/// holder is running, the start stops naming them. A script gets exit 3
+/// with the list, as for any question.
 pub(super) fn free_slots_if_full(
     paths: &PandoPaths,
     config: &Config,
@@ -1295,7 +1296,26 @@ pub(super) fn free_slots_if_full(
         none_while_unread(&projects, &target)?;
         let others = slots_elsewhere(&projects, &target);
         let elsewhere: Vec<String> = others.iter().map(Elsewhere::describe).collect();
-        let stopped: Vec<&Holder> = holders.iter().filter(|holder| !holder.running).collect();
+        // A stopped worktree is offered only where the guard would empty
+        // its slot once it is chosen: not one another record names too —
+        // this worktree's own among them, until its start lets it go — nor
+        // one the main checkout's env files name. One it would not is said
+        // why, and is no answer to ask for.
+        let mains: Vec<&str> = target.mains.iter().map(String::as_str).collect();
+        let mut stopped: Vec<&Holder> = Vec::new();
+        let mut refused: Vec<String> = Vec::new();
+        for holder in holders.iter().filter(|holder| !holder.running) {
+            match namespace::may_drop(
+                &store,
+                &holder.worktree,
+                &holder.namespace,
+                &mains,
+                &projects,
+            ) {
+                Ok(()) => stopped.push(holder),
+                Err(why) => refused.push(format!("not offered: {} — {why:#}", holder.describe())),
+            }
+        }
         let running: Vec<String> = holders
             .iter()
             .filter(|holder| holder.running)
@@ -1313,7 +1333,7 @@ pub(super) fn free_slots_if_full(
                 continue;
             }
         }
-        if stopped.is_empty() {
+        if stopped.is_empty() && refused.is_empty() {
             bail!(
                 "every slot of {} on {}:{} is held by a running worktree{} — {}. Stop one of this \
                  project's, and its slot can be freed{}",
@@ -1332,6 +1352,11 @@ pub(super) fn free_slots_if_full(
                     .join(", "),
                 elsewhere_hint(paths, &others)
             );
+        }
+        // Nothing a question could free: the start goes on, lets go what
+        // it lets go, and says who holds what when it finds none free.
+        if stopped.is_empty() {
+            continue;
         }
         let reasons = unusable.reasons();
         let question = Question {
@@ -1378,6 +1403,7 @@ pub(super) fn free_slots_if_full(
                 (!running.is_empty())
                     .then(|| format!("running, so not offered: {}", running.join(", "))),
             )
+            .chain(refused)
             .chain((!elsewhere.is_empty()).then(|| {
                 format!(
                     "another project's, so not offered: {}",
