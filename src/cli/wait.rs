@@ -227,7 +227,7 @@ pub(super) fn wait_ready(
                 if !tail.is_empty() {
                     notice(&format!("the last lines of the {process} log:"));
                     for line in &tail {
-                        eprintln!("  {line}");
+                        super::to_stderr(&format!("  {line}\n"));
                     }
                 }
                 bail!(

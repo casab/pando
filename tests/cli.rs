@@ -1861,6 +1861,49 @@ fn a_reader_that_stops_early_ends_logs_quietly_with_success() {
     assert_eq!(stderr(&out), "");
 }
 
+// `pando start x 2>&1 | grep -q starting`: every notice after the reader
+// left panicked, and one between two spawns lost the record of the first,
+// so `stop` could not reach a process that went on holding its port. The
+// error paths exited 101 the same way instead of their documented codes.
+#[test]
+fn a_stderr_nobody_reads_loses_no_process_and_changes_no_exit_code() {
+    fn unread(e: &Env, args: &[&str]) -> i32 {
+        let (reader, writer) = std::io::pipe().expect("a pipe");
+        drop(reader);
+        let out = Command::new(env!("CARGO_BIN_EXE_pando"))
+            .env("PANDO_HOME", &e.home)
+            .current_dir(&e.root)
+            .args(args)
+            .stderr(writer)
+            .output()
+            .expect("run pando");
+        code(&out)
+    }
+    let e = env();
+    e.write_config(PAIR);
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+
+    assert_eq!(unread(&e, &["start", "feat+one"]), EXIT_OK);
+    let v = status_of(&e);
+    assert_eq!(
+        v["worktrees"][0]["processes"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        vec!["api", "web"],
+        "both processes are recorded, so stop reaches them"
+    );
+
+    assert_eq!(unread(&e, &["stop", "nothing-like-it"]), EXIT_ERROR);
+    assert_eq!(unread(&e, &["status", "--env"]), EXIT_USAGE);
+    assert_eq!(unread(&e, &["stop", "feat+one"]), EXIT_OK);
+    assert_eq!(status_porcelain(&e.root), "");
+
+    let messy = env_of(Kind::NextMessy);
+    assert_eq!(unread(&messy, &["init"]), EXIT_NEEDS_ANSWER);
+}
+
 // `logs -f` read everything written since its last poll at once and kept
 // the newest 4096 lines of it, so a burst of more — or the backlog after
 // a pager stopped reading — lost its middle with no marker.

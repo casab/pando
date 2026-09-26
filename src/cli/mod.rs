@@ -679,7 +679,7 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             // The summary goes to stderr on this path: stdout is the
             // config, so `pando init --dry-run > preview.toml` is a file
             // and nothing else.
-            eprint!("{}", render_init(&report, "would write"));
+            to_stderr(&render_init(&report, "would write"));
             Ok(())
         }
         Command::Signals => signals_json(paths, config, &mut out),
@@ -921,7 +921,15 @@ fn with_a_way_past(paths: &PandoPaths, e: anyhow::Error) -> anyhow::Error {
 /// Everything pando narrates goes to stderr, so a command's stdout stays
 /// exactly what a script asked for.
 fn notice(message: &str) {
-    eprintln!("pando: {message}");
+    to_stderr(&format!("pando: {message}\n"));
+}
+
+/// Text on stderr, dropped when nothing reads stderr any more. `eprint!`
+/// panics there instead, and a panic between a spawn and the save that
+/// records it leaves a process nothing can stop — or turns exit 1, 2 or 3
+/// into a panic's 101.
+pub fn to_stderr(text: &str) {
+    let _ = std::io::stderr().lock().write_all(text.as_bytes());
 }
 
 /// A next step, for a person at a terminal: printed only when stderr is
@@ -931,10 +939,8 @@ fn hint(message: &str) {
     use std::io::IsTerminal;
     if std::io::stderr().is_terminal() {
         let style = crate::term::Style::for_stderr();
-        eprintln!(
-            "{}",
-            style.paint(&format!("pando: {message}"), crate::term::Paint::Faint)
-        );
+        let line = style.paint(&format!("pando: {message}"), crate::term::Paint::Faint);
+        to_stderr(&format!("{line}\n"));
     }
 }
 
@@ -963,10 +969,10 @@ fn url_suffix(url: Option<&str>) -> String {
 /// parseable, and none of this is part of the documented shape.
 fn report_refresh(refreshed: &actions::Refreshed) {
     if let Some(warning) = &refreshed.warning {
-        eprintln!("pando: {warning}");
+        notice(warning);
     }
-    for notice in &refreshed.notices {
-        eprintln!("pando: {notice}");
+    for line in &refreshed.notices {
+        notice(line);
     }
 }
 

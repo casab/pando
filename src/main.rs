@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use std::process::ExitCode;
 
-use pando::cli::{Cli, dispatch};
+use pando::cli::{Cli, dispatch, to_stderr};
 use pando::paths::{PandoPaths, default_home};
 use pando::{actions, config, project, tui};
 
@@ -28,7 +28,7 @@ fn main() -> ExitCode {
             let needs = e
                 .downcast_ref::<actions::NeedsAnswer>()
                 .expect("just checked");
-            eprint!("{}", pando::cli::render_needs_answer(needs));
+            to_stderr(&pando::cli::render_needs_answer(needs));
             ExitCode::from(EXIT_NEEDS_ANSWER)
         }
         // And a question that was answered *wrongly* is not a failure
@@ -38,7 +38,7 @@ fn main() -> ExitCode {
             if e.downcast_ref::<pando::cli::UsageError>().is_some()
                 || e.downcast_ref::<actions::RefusedAnswer>().is_some() =>
         {
-            eprintln!("pando: {}", pando::remedy::for_cli(&format!("{e:#}")));
+            say(&e);
             ExitCode::from(EXIT_USAGE)
         }
         // `doctor` has already printed every problem it found, with what
@@ -52,12 +52,19 @@ fn main() -> ExitCode {
         // `pando logs | head`. Nothing failed, so nothing is said.
         Err(e) if pando::cli::stdout_closed(&e) => ExitCode::SUCCESS,
         Err(e) => {
-            // `{:#}` flattens the context chain onto one line: a CLI failure
-            // is one sentence, not a stack.
-            eprintln!("pando: {}", pando::remedy::for_cli(&format!("{e:#}")));
+            say(&e);
             ExitCode::from(EXIT_ERROR)
         }
     }
+}
+
+/// The error on stderr. `{:#}` flattens the context chain onto one line: a
+/// CLI failure is one sentence, not a stack.
+fn say(e: &anyhow::Error) {
+    to_stderr(&format!(
+        "pando: {}\n",
+        pando::remedy::for_cli(&format!("{e:#}"))
+    ));
 }
 
 fn run(cli: Cli) -> Result<()> {
@@ -93,14 +100,15 @@ fn run(cli: Cli) -> Result<()> {
         Ok(loaded) => loaded,
         Err(e) if needs_config => return Err(e),
         Err(e) => {
-            eprintln!(
-                "pando: {e:#} — carrying on without it; `new`, `start` and `restart` need it fixed"
-            );
+            to_stderr(&format!(
+                "pando: {e:#} — carrying on without it; `new`, `start` and `restart` need it \
+                 fixed\n"
+            ));
             config::load_without_home(&paths)
         }
     };
     for warning in &loaded.warnings {
-        eprintln!("pando: {warning}");
+        to_stderr(&format!("pando: {warning}\n"));
     }
     // Once, before dispatch: every command shares the same home, so a home
     // in the working tree is worth refusing even on a read-only command.
