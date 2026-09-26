@@ -1375,6 +1375,38 @@ fn restart_replaces_every_process_and_keeps_every_port() {
     }
 }
 
+// `status --env` merges the processes in name order, each with the env
+// it started with: two processes that both map `PORT` leave the last
+// one's port, not the first one's pushed onto every later one.
+#[test]
+fn the_env_for_a_command_run_by_hand_takes_a_shared_key_from_the_last_process_by_name() {
+    let mut fx = fixture();
+    for role in ["api", "web"] {
+        fx.config.processes.insert(
+            role.to_string(),
+            ProcessConfig {
+                cmd: "sleep 30".to_string(),
+                ports: Some(PortsSpec::Map(BTreeMap::from([(
+                    "PORT".to_string(),
+                    role.to_string(),
+                )]))),
+                ..Default::default()
+            },
+        );
+    }
+    let name = worktree_named(&fx, "feat/one");
+    let mut store = fx.state();
+    store
+        .worktrees
+        .entry(name.clone())
+        .or_insert_with(|| WorktreeRecord::new(fx.worktrees_dir().join(&name), true))
+        .ports = BTreeMap::from([("api".to_string(), 17009), ("web".to_string(), 17008)]);
+    state::save(&fx.paths.state_file(), &store).unwrap();
+
+    let env = resolved_env(&fx.paths, &fx.config, &name).unwrap();
+    assert_eq!(env.get("PORT").map(String::as_str), Some("17008"));
+}
+
 // ---- stop ------------------------------------------------------------
 
 #[test]

@@ -1435,6 +1435,10 @@ pub fn resolved_env(
         )?),
         state::ServiceMode::Shared => {}
     }
+    // Each process is handed the services alone, as `start` hands them:
+    // a key an earlier process set is not a service, and must not replace
+    // a later process's own port.
+    let service_env = out.clone();
     for (process_name, process) in &config.processes {
         let log_file = paths.log_file(name, process_name);
         let ctx = template::Context {
@@ -1449,7 +1453,7 @@ pub fn resolved_env(
         };
         // Through the same function the processes are started with, so a
         // developer who evals this gets exactly what the dev server got.
-        for (var, value) in process_env(paths, name, &worktree, process, &out.clone(), &ctx)
+        for (var, value) in process_env(paths, name, &worktree, process, &service_env, &ctx)
             .with_context(|| format!("in process {process_name}"))?
         {
             out.insert(var, value);
