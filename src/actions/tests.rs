@@ -528,6 +528,58 @@ fn a_process_that_backgrounds_its_server_is_not_called_dead() {
     );
 }
 
+/// The same shape, from the side that acts on it. The read path kept
+/// that process Running, but the orphan sweep every mutation runs still
+/// asked the leader alone: a `stop` of a sibling SIGKILLed the app, and
+/// the record then read Failed as "exited", blaming the developer's
+/// command for a kill pando did. And a second `start` of the worktree
+/// called it not running, stopped it, and ran it again.
+#[test]
+fn a_process_that_backgrounds_itself_survives_a_mutation_elsewhere() {
+    let mut fx = fixture();
+    with_dev(
+        &mut fx,
+        ProcessConfig {
+            cmd: "sleep 30 &".to_string(),
+            ports: Some(crate::config::PortsSpec::List(Vec::new())),
+            ..Default::default()
+        },
+    );
+    let name = worktree_named(&fx, "feat/one");
+    let sibling = worktree_named(&fx, "feat/two");
+    let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+    let _guard = guard(&outcome);
+    let started = outcome.started[0].record.clone();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while crate::process::is_alive(started.pid) {
+        assert!(
+            Instant::now() < deadline,
+            "the leader never exited, so this test would prove nothing"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Every mutation sweeps the whole project, not only its own worktree.
+    stop(&fx.paths, &sibling, None).unwrap();
+    assert!(
+        crate::process::group_alive(started.pgid),
+        "a stop of another worktree killed this one's app"
+    );
+    let record = fx.state().worktrees[&name].processes["dev"].clone();
+    assert!(
+        matches!(record.phase, Phase::Running { .. }),
+        "{:?}",
+        record.phase
+    );
+    assert!(!record.swept, "nothing was signalled: {record:?}");
+
+    let again = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+    let _again = guard(&again);
+    assert!(again.started_nothing(), "it was started twice: {again:?}");
+    assert_eq!(again.already_running[0].record.pgid, started.pgid);
+    assert!(crate::process::group_alive(started.pgid));
+}
+
 /// A desktop application, a worker, a watcher: something that owns no
 /// port and never will. `ports = []` is a written answer, and it has
 /// to be a workable one — a readiness rule that waits for a socket

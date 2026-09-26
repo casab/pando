@@ -586,6 +586,26 @@ fn record_alive(
     ready_port.is_none() && group_alive(pgid)
 }
 
+impl ProcessRecord {
+    /// Whether this process still has something behind it, by the rule
+    /// [`reconcile`] and [`advance_phases`] read it with.
+    ///
+    /// For the paths that act on the answer: the orphan sweep, and a start
+    /// deciding what is already up. They have to agree with `status`,
+    /// which calls a portless process whose leader backgrounded it and
+    /// returned Running — and a mutation that asked the leader alone
+    /// killed that process as an orphan.
+    pub fn alive(&self, is_alive: impl Fn(u32) -> bool, group_alive: impl Fn(i32) -> bool) -> bool {
+        record_alive(
+            self.pid,
+            self.pgid,
+            self.ready_port,
+            &is_alive,
+            &group_alive,
+        )
+    }
+}
+
 pub fn reconcile(
     state: &mut State,
     is_alive: impl Fn(u32) -> bool,

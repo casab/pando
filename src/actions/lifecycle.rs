@@ -402,7 +402,7 @@ fn start_checked(
             let live = matches!(
                 existing.phase,
                 Phase::Starting { .. } | Phase::Running { .. }
-            ) && proc::is_alive(existing.pid);
+            ) && existing.alive(proc::is_alive, proc::group_alive);
             if selected && live && !mode_changed {
                 already.push(process.clone());
             } else if selected && live && keeps_serving {
@@ -795,7 +795,7 @@ fn start_checked(
             continue;
         };
         let live = matches!(p.phase, Phase::Starting { .. } | Phase::Running { .. })
-            && proc::is_alive(p.pid);
+            && p.alive(proc::is_alive, proc::group_alive);
         if !live {
             continue;
         }
@@ -1014,7 +1014,7 @@ fn every_process_running(
     selection.iter().all(|(process, _)| {
         record.processes.get(process).is_some_and(|p| {
             matches!(p.phase, Phase::Starting { .. } | Phase::Running { .. })
-                && proc::is_alive(p.pid)
+                && p.alive(proc::is_alive, proc::group_alive)
         })
     })
 }
@@ -1346,7 +1346,12 @@ pub(super) fn sweep_orphaned_groups_with(
             // since wrapped around onto an unrelated session leader gets
             // killed. One signal per record bounds that to the window
             // between the leader dying and the first mutation after it.
-            if p.swept || proc::is_alive(p.pid) {
+            //
+            // Alive by the read path's rule, not the leader alone: a
+            // process that owns no port and backgrounded itself is one
+            // `status` calls Running, and `reconcile` keeps its record, so
+            // there is no orphan here to signal — only an app to kill.
+            if p.swept || p.alive(proc::is_alive, proc::group_alive) {
                 continue;
             }
             match stop(p.pgid) {
