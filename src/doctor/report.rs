@@ -247,7 +247,8 @@ pub struct LanguageReport {
     pub resolved_from: Option<String>,
     /// `satisfied`, `mismatch`, or `unknown`.
     pub verdict: &'static str,
-    /// Why the probe never got as far as asking, when it did not.
+    /// Why the probe never got as far as asking, when it did not; or what
+    /// the binary answered instead of a version, when it exited non-zero.
     pub failure: Option<String>,
     /// The version managers for this language that this machine has.
     pub managers: Vec<&'static str>,

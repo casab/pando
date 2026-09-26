@@ -53,7 +53,8 @@ pub(super) fn runtime_report(
                 Verdict::Unknown => "unknown",
             },
             failure: match check.resolved.ran {
-                true => None,
+                // Only a binary that exited non-zero leaves one here.
+                true => check.resolved.failure.clone(),
                 false => Some(
                     check
                         .resolved
@@ -99,12 +100,19 @@ fn mismatch_finding(
         "{} {} ({})",
         language.language, language.spec, language.source
     );
-    let got = match (&language.resolved, &language.resolved_from) {
-        (Some(version), Some(path)) => format!("`bash -lc` here resolves {version}, from {path}"),
-        _ => match &language.failure {
-            Some(failure) => format!("the prelude never got as far as asking: {failure}"),
-            None => format!("`bash -lc` here has no {} at all", language.language),
-        },
+    let got = match (
+        &language.resolved,
+        &language.resolved_from,
+        &language.failure,
+    ) {
+        (Some(version), Some(path), _) => {
+            format!("`bash -lc` here resolves {version}, from {path}")
+        }
+        (None, Some(path), Some(failure)) => {
+            format!("`bash -lc` here finds {path}, and it fails: {failure}")
+        }
+        (_, _, Some(failure)) => format!("the prelude never got as far as asking: {failure}"),
+        (_, _, None) => format!("`bash -lc` here has no {} at all", language.language),
     };
     let mut fix = String::new();
     let _ = writeln!(

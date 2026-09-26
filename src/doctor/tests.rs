@@ -1226,6 +1226,31 @@ fn a_mismatch_nobody_has_been_asked_about_is_a_note_with_the_question_coming() {
     assert_eq!(report.runtime.languages[0].verdict, "mismatch");
 }
 
+// A shim whose pinned version is not installed names that version in its
+// error. doctor called it satisfied; it is a mismatch, and says what the
+// shim said.
+#[test]
+fn a_shim_whose_version_is_not_installed_is_a_mismatch_in_its_own_words() {
+    let fx = fixture();
+    pin_node(&fx, "22");
+    let error = "nodenv: version `22' is not installed (set by .nvmrc)";
+    let shell = |script: &str| {
+        if script.contains(TOOL_DONE_MARK) {
+            return every_tool(script);
+        }
+        Some(crate::runtime::probe_failure("/n/shims/node", error, 1))
+    };
+    let report = report_of(&fx, &shell);
+    let node = &report.runtime.languages[0];
+    assert_eq!(node.verdict, "mismatch");
+    assert_eq!(node.resolved, None);
+    assert_eq!(node.failure.as_deref(), Some(error));
+    let said = format!("finds /n/shims/node, and it fails: {error}");
+    assert!(mentions(&report, &said), "{:?}", messages(&report));
+    let text = report.render();
+    assert!(text.contains(&said), "{text}");
+}
+
 #[test]
 fn a_mismatch_with_a_prelude_that_says_nothing_is_needed_is_a_problem() {
     let fx = fixture();

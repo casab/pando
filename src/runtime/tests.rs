@@ -234,7 +234,7 @@ fn node() -> &'static Language {
 
 /// A shell that answers with whatever a test decided this machine is.
 fn machine(path: &str, version: &str) -> impl Fn(&str) -> Option<String> {
-    let reply = format!("{PATH_MARK}{path}\n{VERSION_MARK}{version}\n{DONE_MARK}\n");
+    let reply = probe_reply(path, version);
     move |_cmd: &str| Some(reply.clone())
 }
 
@@ -306,6 +306,65 @@ fn a_binary_that_is_not_there_at_all_is_a_mismatch() {
         check.resolved.ran,
         "the probe ran; there was nothing to find"
     );
+}
+
+// pyenv, rbenv and nodenv shims answer for a version that is not
+// installed with that version's number, in an error, and exit 1. The
+// number is what was asked for, not what resolved.
+#[test]
+fn a_shim_whose_version_is_not_installed_is_a_mismatch_with_its_own_error() {
+    let error = "pyenv: version `3.12.1' is not installed (set by /repo/.python-version)";
+    let shell = |_: &str| Some(probe_failure("/home/dev/.pyenv/shims/python3", error, 1));
+    let requirement = Requirement::new("python", "3.12.1", ".python-version".into());
+    let check = check(&requirement, "", &shell);
+    assert_eq!(check.verdict, Verdict::Mismatch);
+    assert_eq!(check.resolved.version, None, "nothing resolved");
+    assert_eq!(check.resolved.failure.as_deref(), Some(error));
+    assert!(check.resolved.ran);
+
+    // With nothing on its first line, the status is what is said.
+    let silent = |_: &str| Some(probe_failure("/usr/bin/node", "", 127));
+    let check = check_node("22", &silent);
+    assert_eq!(check.verdict, Verdict::Mismatch);
+    assert_eq!(
+        check.resolved.failure.as_deref(),
+        Some("it exited with status 127")
+    );
+}
+
+// The fakes above stand in for this: a real shell, a binary that fails
+// the way a shim does, and a prelude that turns on `set -e`.
+#[test]
+fn a_real_shell_reports_the_status_the_binary_exited_with() {
+    let bin = TempDir::new().unwrap();
+    let node = bin.path().join("node");
+    std::fs::write(
+        &node,
+        "#!/bin/sh\necho \"nodenv: version \\`22' is not installed\" >&2\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&node, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let shell = |command: &str| {
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(command)
+            .output()
+            .ok()?;
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let prelude = format!("set -e; export PATH=\"{}:$PATH\"", bin.path().display());
+    let requirement = Requirement::new("node", "22", ".node-version".into());
+    let failing = check(&requirement, &prelude, &shell);
+    assert_eq!(failing.verdict, Verdict::Mismatch, "{failing:?}");
+    assert_eq!(
+        failing.resolved.failure.as_deref(),
+        Some("nodenv: version `22' is not installed")
+    );
+
+    std::fs::write(&node, "#!/bin/sh\necho v22.11.0\n").unwrap();
+    let working = check(&requirement, &prelude, &shell);
+    assert_eq!(working.verdict, Verdict::Satisfied, "{working:?}");
+    assert_eq!(working.resolved.version.as_deref(), Some("22.11.0"));
 }
 
 #[test]

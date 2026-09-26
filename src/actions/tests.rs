@@ -8629,6 +8629,43 @@ fn a_prelude_that_does_not_work_is_refused_rather_than_written() {
     );
 }
 
+// A shim whose pinned version is not installed names that version in its
+// error. Read as the version resolving, it passed the check, was cached,
+// and let the prelude offered for it be written, and every process then
+// died of the shim's error.
+#[test]
+fn a_shim_whose_version_is_not_installed_is_neither_passed_nor_remembered() {
+    let fx = fixture_pinning(".nvmrc", "22");
+    let machine = FakeMachine::with_nvm();
+    let error = "nodenv: version `22' is not installed (set by .nvmrc)";
+    let shell = |_: &str| {
+        Some(crate::runtime::probe_failure(
+            "/home/dev/.nodenv/shims/node",
+            error,
+            1,
+        ))
+    };
+    let (ask, asked) = scripted(vec![Answer::Auto(0)]);
+
+    let err = resolve_runtime_slot(&fx, &fx.config, &ask, &shell, machine.home.path()).unwrap_err();
+    let report = asked.borrow()[0].details.join("\n");
+    assert!(
+        report.contains(&format!(
+            "finds node at /home/dev/.nodenv/shims/node, and it fails: {error}"
+        )),
+        "the question says what the shim said: {report}"
+    );
+    assert!(
+        format!("{err:#}").contains("does not work"),
+        "the line offered for it is checked the same way: {err:#}"
+    );
+    assert!(!fx.paths.user_config_file().exists(), "nothing is written");
+    assert!(
+        !fx.paths.runtime_cache_file().exists(),
+        "and nothing is remembered as a pass"
+    );
+}
+
 // The same refusal, when a program handed the line in, is a mistake in
 // its input rather than a failure: the usage-error shape, exit 2, so a
 // program can tell "my answer was bad" from "the command broke". A person

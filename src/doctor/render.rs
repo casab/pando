@@ -236,15 +236,20 @@ fn render_runtime(out: &mut String, runtime: &RuntimeReport) {
             &language.language,
             &format!("wants {} ({})", language.spec, language.source),
         );
-        let has = match (&language.resolved, &language.resolved_from) {
-            (Some(version), Some(path)) => {
+        let has = match (
+            &language.resolved,
+            &language.resolved_from,
+            &language.failure,
+        ) {
+            (Some(version), Some(path), _) => {
                 format!("`bash -lc` resolves {version}, from {path}")
             }
-            (Some(version), None) => format!("`bash -lc` resolves {version}"),
-            _ => match &language.failure {
-                Some(failure) => format!("the probe never ran: {failure}"),
-                None => format!("`bash -lc` here has no {} at all", language.language),
-            },
+            (Some(version), None, _) => format!("`bash -lc` resolves {version}"),
+            (None, Some(path), Some(failure)) => {
+                format!("`bash -lc` finds {path}, and it fails: {failure}")
+            }
+            (None, _, Some(failure)) => format!("the probe never ran: {failure}"),
+            (None, _, None) => format!("`bash -lc` here has no {} at all", language.language),
         };
         row(out, "", &has);
         row(

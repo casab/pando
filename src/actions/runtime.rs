@@ -262,12 +262,21 @@ fn runtime_report(
             None => "the prelude itself failed".to_string(),
         });
     } else {
-        lines.push(match (&check.resolved.version, &check.resolved.path) {
-            (Some(version), Some(path)) => {
-                format!("`bash -lc` here resolves {language} {version}, from {path}")
-            }
-            _ => format!("`bash -lc` here has no {language} at all"),
-        });
+        lines.push(
+            match (
+                &check.resolved.version,
+                &check.resolved.path,
+                &check.resolved.failure,
+            ) {
+                (Some(version), Some(path), _) => {
+                    format!("`bash -lc` here resolves {language} {version}, from {path}")
+                }
+                (None, Some(path), Some(failure)) => {
+                    format!("`bash -lc` here finds {language} at {path}, and it fails: {failure}")
+                }
+                _ => format!("`bash -lc` here has no {language} at all"),
+            },
+        );
     }
     lines.push(
         "pando runs every command with `bash -lc`, which is not your interactive shell".to_string(),

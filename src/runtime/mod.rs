@@ -273,7 +273,7 @@ fn is_pin(spec: &str) -> bool {
 }
 
 #[cfg(test)]
-pub(crate) use probe::probe_reply;
+pub(crate) use probe::{probe_failure, probe_reply};
 
 #[cfg(test)]
 mod tests;
