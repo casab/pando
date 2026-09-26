@@ -259,9 +259,10 @@ const GO_TOOL_COMMANDS: [&str; 13] = [
 /// name, or with the module's own, `cmd/shop` in `example.com/shop`, then
 /// the rest in directory order. Where there are several and none has a
 /// server's name, none: `cmd/migrate` and `cmd/seed` are tools, and taken
-/// as the dev server one would run against the database and exit. Empty
-/// for a module whose root is a main package, and for a library, which
-/// is level zero as a library crate is.
+/// as the dev server one would run against the database and exit. A lone
+/// command with a tool's name is no server either. Empty for a module
+/// whose root is a main package, and for a library, which is level zero
+/// as a library crate is.
 pub(super) fn go_commands(root: &Path) -> Vec<String> {
     if go_main(root) {
         return Vec::new();
@@ -275,6 +276,7 @@ pub(super) fn go_commands(root: &Path) -> Vec<String> {
         .collect();
     names.sort();
     if names.len() < 2 {
+        names.retain(|name| !GO_TOOL_COMMANDS.contains(&name.as_str()));
         return names;
     }
     let module = go_module_name(root);

@@ -953,6 +953,15 @@ fn a_go_modules_server_under_cmd_is_offered_before_its_tools() {
             ("cmd/migrate/main.go", "package main\n"),
             ("cmd/lint/main.go", "package main\n"),
         ],
+        // A library's lone tool is no more a server than several are.
+        &[
+            ("go.mod", "module example.com/acme/lib\n"),
+            ("cmd/gen/main.go", "package main\n"),
+        ],
+        &[
+            ("go.mod", "module example.com/acme/migrate\n"),
+            ("cmd/migrate/main.go", "package main\n"),
+        ],
     ] {
         let (dir, s) = marker_fixture(files);
         assert!(framework(dir.path(), &s).is_none(), "{files:?}");
