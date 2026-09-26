@@ -250,6 +250,35 @@ pub(super) fn fixed_port(script: &str) -> Option<u16> {
     None
 }
 
+/// The port a script fixes for itself, run under `rule`: on its command
+/// line, or by assigning the variable its app reads the port from,
+/// `PORT=4000 tsx watch src/index.ts` or `cross-env PORT=3001 next dev`.
+/// The shell that runs the script sets that variable over the one pando
+/// exported, so a role for it would be a port nothing binds.
+///
+/// Not the assignment for a framework told its port by a flag pando
+/// appends: the flag wins over the variable, so pando's port still does.
+/// As with the flag, only a number counts: `PORT=${PORT:-4000}` reads
+/// the port it is given.
+pub(super) fn own_port(script: &str, rule: Option<&FrameworkRule>) -> Option<u16> {
+    let flagged =
+        rule.is_some_and(|rule| rule.port == PortMechanism::InCommand && rule.port_flag.is_some());
+    let variable = match rule.map(|rule| rule.port) {
+        Some(PortMechanism::Env(name)) => name,
+        _ => "PORT",
+    };
+    let assigned = || {
+        script.split_whitespace().find_map(|word| {
+            let value = word.strip_prefix(variable)?.strip_prefix('=')?;
+            value.trim_matches(['"', '\'']).parse().ok()
+        })
+    };
+    fixed_port(script).or_else(|| match flagged {
+        true => None,
+        false => assigned(),
+    })
+}
+
 pub(super) fn lockfiles(signals: &Signals) -> impl Iterator<Item = &str> {
     signals.lockfiles.iter().map(String::as_str)
 }
@@ -545,13 +574,13 @@ pub(super) fn port_proposal(
 ) -> Option<Proposal> {
     // Not where the script that would run fixes its own port: the flag
     // wins over every variable, the framework's and the env example's
-    // alike, and a role for it is a port nothing binds. A backend whose
-    // scripts only build its assets is not run by them, so their port is
-    // the asset server's.
+    // alike, an inline `PORT=4000` over the one pando exports, and a role
+    // for it is a port nothing binds. A backend whose scripts only build
+    // its assets is not run by them, so their port is the asset server's.
     if !rule.is_some_and(|rule| rule.scripts_build_assets)
         && ranked_scripts(signals)
             .first()
-            .is_some_and(|(_, body)| fixed_port(body).is_some())
+            .is_some_and(|(_, body)| own_port(body, rule).is_some())
     {
         return None;
     }

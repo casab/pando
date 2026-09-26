@@ -8,7 +8,7 @@ use crate::catalog::frameworks::{FrameworkRule, PortMechanism};
 use crate::config::{PortsSpec, ProcessConfig, ReadySpec};
 
 use super::apply::DEV;
-use super::dev::{fixed_port, is_multiplexer, script_args, script_runner};
+use super::dev::{is_multiplexer, own_port, script_args, script_runner};
 use super::frameworks::script_framework;
 use super::proposal::{Candidate, Proposal, Slot};
 use super::signals::{Signals, parse_scripts, present};
@@ -28,9 +28,9 @@ pub struct WorkspaceApp {
     pub default_port: Option<u16>,
     /// How this app takes a port, from its own framework rule.
     pub port: PortMechanism,
-    /// The port its own dev script fixes on the command line, which no
-    /// port pando hands it can move: `next dev --port 3000` binds 3000
-    /// whatever `PORT` says. Such an app owns no role.
+    /// The port its own dev script fixes, which no port pando hands it can
+    /// move: `next dev --port 3000` binds 3000 whatever `PORT` says, and
+    /// so does `PORT=3000 next dev`. Such an app owns no role.
     pub fixed_port: Option<u16>,
 }
 
@@ -174,7 +174,7 @@ pub fn workspace_apps(root: &Path, signals: &Signals) -> Vec<WorkspaceApp> {
                 continue;
             };
             let rule = script_framework(&path, &app, script);
-            let fixed = fixed_port(script);
+            let fixed = own_port(script, rule);
             let mut cmd = format!("{runner}dev");
             // A framework that takes its port on the command line gets the
             // flag appended to its own script: `pnpm dev --port 1234`, or

@@ -1493,6 +1493,67 @@ fn an_app_whose_dev_script_fixes_its_port_owns_no_role() {
     );
 }
 
+// The shell that runs `PORT=4000 tsx watch …` sets PORT over the one
+// pando exported: given a role, the api bound 4000, the readiness wait
+// timed out on the reserved port, and the next worktree hit 4000 too.
+#[test]
+fn an_app_whose_dev_script_assigns_its_port_owns_no_role() {
+    let dir = tempdir().unwrap();
+    workspace(dir.path());
+    std::fs::write(
+        dir.path().join("apps/api/package.json"),
+        r#"{ "scripts": { "dev": "PORT=4000 tsx watch src/index.ts" } }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("apps/web/package.json"),
+        r#"{ "scripts": { "dev": "PORT=3000 vite" } }"#,
+    )
+    .unwrap();
+    let apps = workspace_apps(dir.path(), &signals(dir.path()));
+    let api = apps.iter().find(|app| app.name == "api").unwrap();
+    assert_eq!(api.fixed_port, Some(4000));
+    assert_eq!(api.default_port, Some(4000));
+    let processes = proposed_processes(dir.path()).candidates[0]
+        .processes
+        .clone()
+        .unwrap();
+    let api = &processes["api"];
+    assert!(api.roles().is_empty(), "{:?}", api.ports);
+    assert!(api.ready.is_none());
+    assert!(!api.env.contains_key("PORT"), "{:?}", api.env);
+    // Vite's flag wins over the variable, so pando's port still does.
+    assert_eq!(processes["web"].cmd, "pnpm dev --port {port:web}");
+    assert_eq!(processes["web"].roles(), vec!["web"]);
+}
+
+// Next reads PORT, and the script's own assignment of it is the one the
+// server sees, however it is spelt.
+#[test]
+fn a_dev_script_that_assigns_its_own_port_is_not_given_the_framework_one() {
+    let next = RULES.iter().find(|r| r.name == "Next.js").unwrap();
+    for body in [
+        "PORT=3001 next dev",
+        "cross-env PORT=3001 next dev",
+        "env PORT='3001' next dev",
+    ] {
+        let signals = Signals {
+            env_example: env_pairs(&["PORT"]),
+            ..scripts(&[("dev", body)])
+        };
+        assert!(port_proposal(&signals, Some(next)).is_none(), "{body}");
+    }
+    // A port it reads from what it is given is still one it is given.
+    for body in ["PORT=${PORT:-3001} next dev", "NEXT_PORT=3001 next dev"] {
+        let signals = scripts(&[("dev", body)]);
+        assert_eq!(
+            values(&port_proposal(&signals, Some(next)).unwrap()),
+            vec!["PORT"],
+            "{body}"
+        );
+    }
+}
+
 /// Adds an app with a Node dev script to the `workspace` fixture.
 fn add_app(dir: &Path, name: &str) {
     let app = dir.join("apps").join(name);
