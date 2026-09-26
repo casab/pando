@@ -391,8 +391,10 @@ pub(super) fn share_ready_budget(store: &state::State, name: &str) -> Option<Dur
         _ => None,
     };
     let (timeout_s, since) = match share_owner(record) {
-        Some(process) => starting(process)?,
-        None => {
+        ShareOwner::Recorded(process) => starting(process)?,
+        // Nothing is coming up to serve it, whatever its siblings are doing.
+        ShareOwner::Absent(_) => return None,
+        ShareOwner::Unknown => {
             if record
                 .processes
                 .values()
@@ -426,28 +428,53 @@ pub(super) fn share_ready_budget(store: &state::State, name: &str) -> Option<Dur
 /// `Starting` counts — a worktree that is coming up is not one with
 /// nothing serving, and tearing its share down would be the same mistake
 /// inverted.
-fn share_target_is_up(record: &WorktreeRecord, is_alive: &impl Fn(u32) -> bool) -> bool {
+///
+/// A sibling does not count. The URL is one process's port, so when that
+/// process was stopped with `--only`, or never started by a `start --only`
+/// of something else, nothing is serving it however much else is up.
+pub(super) fn share_target_is_up(record: &WorktreeRecord, is_alive: &impl Fn(u32) -> bool) -> bool {
     let up = |p: &state::ProcessRecord| {
         matches!(p.phase, Phase::Running { .. } | Phase::Starting { .. }) && is_alive(p.pid)
     };
     match share_owner(record) {
-        Some(process) => up(process),
+        ShareOwner::Recorded(process) => up(process),
+        ShareOwner::Absent(_) => false,
         // A record written before pando tracked who owns what: anything up
         // is as much as it can say.
-        None => record.processes.values().any(up),
+        ShareOwner::Unknown => record.processes.values().any(up),
     }
 }
 
-/// The process whose port a share of this worktree publishes, when the
-/// record says who owns what.
-fn share_owner(record: &WorktreeRecord) -> Option<&state::ProcessRecord> {
-    let role = url_role(record)?;
-    let owner = record
+/// Who serves the port a share of this worktree publishes.
+enum ShareOwner<'a> {
+    /// The process that owns the URL's role, as its record stands.
+    Recorded(&'a state::ProcessRecord),
+    /// The process that owns the URL's role, named, with no record: it was
+    /// stopped on its own, or a `start --only` never started it.
+    Absent(&'a str),
+    /// A record written before pando tracked who owns what.
+    Unknown,
+}
+
+/// The owner of the URL's role, told apart from a record that names none:
+/// the two need opposite answers, and one `None` for both read a stopped
+/// owner as "anything running will do".
+fn share_owner(record: &WorktreeRecord) -> ShareOwner<'_> {
+    let Some(role) = url_role(record) else {
+        return ShareOwner::Unknown;
+    };
+    let Some(owner) = record
         .roles
         .iter()
         .find(|(_, roles)| roles.contains(&role))
-        .map(|(process, _)| process)?;
-    record.processes.get(owner)
+        .map(|(process, _)| process)
+    else {
+        return ShareOwner::Unknown;
+    };
+    match record.processes.get(owner) {
+        Some(process) => ShareOwner::Recorded(process),
+        None => ShareOwner::Absent(owner),
+    }
 }
 
 /// The port a share points at: the one the worktree's own URL uses, and
@@ -476,7 +503,13 @@ pub(super) fn share_target_port(name: &str, record: &WorktreeRecord) -> Result<u
             "{name} failed to start ({reason}) — `pando logs {name}` says why; there is nothing \
              for a public URL to point at yet"
         ),
-        None => bail!("{name} is not running — start it first, then share it"),
+        None => match share_owner(record) {
+            ShareOwner::Absent(owner) if !record.processes.is_empty() => bail!(
+                "{name} is not running {owner}, the process its URL points at — start it, then \
+                 share it"
+            ),
+            _ => bail!("{name} is not running — start it first, then share it"),
+        },
     }
     // What is really serving, not what pando asked for.
     Ok(observed_port_for_role(record, &role).unwrap_or(assigned))
@@ -484,10 +517,13 @@ pub(super) fn share_target_port(name: &str, record: &WorktreeRecord) -> Result<u
 
 /// The phase of the process a share would publish: the owner of the URL's
 /// role, or — for a record written before pando tracked who owns what —
-/// the best of what the worktree is running.
+/// the best of what the worktree is running. `None` when the owner is not
+/// running, whatever its siblings are.
 fn share_state(record: &WorktreeRecord) -> Option<Phase> {
-    if let Some(process) = share_owner(record) {
-        return Some(process.phase.clone());
+    match share_owner(record) {
+        ShareOwner::Recorded(process) => return Some(process.phase.clone()),
+        ShareOwner::Absent(_) => return None,
+        ShareOwner::Unknown => {}
     }
     let best = |wanted: fn(&Phase) -> bool| {
         record

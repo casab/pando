@@ -25,7 +25,7 @@ use super::services::{
     preflight_isolation, resolve_service_env, service_roles, shared_service_env, stop_containers,
     stop_service_pumps, undo_failed_isolation, worktree_url,
 };
-use super::share::{sweep_dead_shares_with, take_share_down};
+use super::share::{share_target_is_up, sweep_dead_shares_with, take_share_down};
 // Only for the intra-doc link above `sweep_orphaned_groups`.
 #[cfg(doc)]
 use super::share::sweep_dead_shares;
@@ -1337,13 +1337,12 @@ pub(super) fn stop_recorded_with(
         services_to_stop.extend(compose_projects(record));
     }
     // And the public URL, once nothing is left for it to point at. A
-    // `--only` stop of one process of several leaves the share up, because
-    // its siblings are still serving; a `--only` stop of the last one does
-    // not, because a tunnel onto nothing is worse than no tunnel.
-    let still_serving = record
-        .processes
-        .values()
-        .any(|p| matches!(p.phase, Phase::Starting { .. } | Phase::Running { .. }));
+    // `--only` stop of a process the URL does not point at leaves the
+    // share up, because what it publishes is still serving; a `--only`
+    // stop of the one it does point at, or of the last one, does not,
+    // because a tunnel onto nothing is worse than no tunnel. Phase alone:
+    // what this stop signalled is already out of the record.
+    let still_serving = share_target_is_up(record, &|_| true);
     if only.is_none() || !still_serving {
         take_share_down(record, &stop, &mut failures);
     }

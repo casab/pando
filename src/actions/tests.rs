@@ -3441,6 +3441,104 @@ fn stopping_the_last_process_takes_the_share_down_even_with_only() {
     );
 }
 
+/// A shared worktree whose `web` process owns the URL and whose `api`
+/// process owns a port of its own, with only the processes named up.
+fn shared_web_and_api(running: &[&str]) -> state::State {
+    let mut store = state_with_share(share_record_of(4242, Some(8484)));
+    let record = store.worktrees.get_mut("feat+one").unwrap();
+    for (process, port) in [("web", 17000), ("api", 17001)] {
+        record.ports.insert(process.to_string(), port);
+        record
+            .roles
+            .insert(process.to_string(), vec![process.to_string()]);
+    }
+    for (pid, process) in running.iter().enumerate() {
+        record
+            .processes
+            .insert(process.to_string(), fake_record(100 + pid as i32));
+    }
+    store
+}
+
+// `roles` and `ports` are written for every process at every start, and
+// a stopped process leaves `processes`. So a URL whose owner was stopped
+// on its own looked like a record that names no owner, and the api still
+// running kept a public URL up onto a port nothing listened on.
+#[test]
+fn stopping_the_process_the_url_points_at_takes_the_share_down_even_with_only() {
+    let mut store = shared_web_and_api(&["web", "api"]);
+    let mut projects = Vec::new();
+    stop_recorded_with(
+        &mut store,
+        "feat+one",
+        Some("web"),
+        MissingOnly::IsAnError,
+        |_| Ok(()),
+        &mut projects,
+    )
+    .unwrap();
+    assert!(
+        store.worktrees["feat+one"].share.is_none(),
+        "the api is up, but the URL is the web process's port"
+    );
+
+    let mut store = shared_web_and_api(&["web", "api"]);
+    stop_recorded_with(
+        &mut store,
+        "feat+one",
+        Some("api"),
+        MissingOnly::IsAnError,
+        |_| Ok(()),
+        &mut projects,
+    )
+    .unwrap();
+    assert!(
+        store.worktrees["feat+one"].share.is_some(),
+        "and stopping what the URL does not point at leaves it up"
+    );
+}
+
+#[test]
+fn a_share_of_a_worktree_not_running_the_urls_owner_is_refused_by_name() {
+    let store = shared_web_and_api(&["api"]);
+    let record = &store.worktrees["feat+one"];
+    let message = format!("{:#}", share_target_port("feat+one", record).unwrap_err());
+    assert!(
+        message.contains("not running web"),
+        "a `start --only api` has nothing on the URL's port: {message}"
+    );
+}
+
+#[test]
+fn a_share_whose_urls_owner_was_stopped_on_its_own_is_closed() {
+    let mut store = shared_web_and_api(&["api"]);
+    let notices = sweep_dead_shares_with(&mut store, |_| true, |_| Ok(()));
+    assert!(store.worktrees["feat+one"].share.is_none());
+    assert!(
+        notices[0].contains("nothing is serving"),
+        "{:?}",
+        notices[0]
+    );
+}
+
+#[test]
+fn a_share_does_not_wait_on_a_sibling_of_the_urls_owner() {
+    let mut store = shared_web_and_api(&[]);
+    let mut api = fake_record(200);
+    api.phase = Phase::Starting { since: Utc::now() };
+    store
+        .worktrees
+        .get_mut("feat+one")
+        .unwrap()
+        .processes
+        .insert("api".to_string(), api);
+    assert_eq!(
+        share_ready_budget(&store, "feat+one"),
+        None,
+        "the api coming up is not the web process coming up"
+    );
+}
+
 // A worktree whose every process crashed still has a tunnel up.
 #[test]
 fn stopping_a_worktree_with_nothing_running_still_closes_its_share() {
