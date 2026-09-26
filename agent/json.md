@@ -283,10 +283,13 @@ something to know that breaks nothing. Every finding carries its own `fix`.
 `config.layers[].keys[].note` is the provenance of every key pando wrote,
 verbatim from the file and so with the comment's own `#` on the front:
 `# detected: <evidence>`, `# answered: <date>`, `# answered: a program,
-<date>`, or `# answered: --yes took the first of N options`. A key with a
-comment a developer wrote themselves carries that instead, and one with no
-comment carries `null`. It is how a developer, or a program, tells what
-decided each line.
+<date>`, `# answered: --yes took the first of N options`, or, for the
+services question, whose answer is a set, `# answered: --yes took the
+<taken> of <offered> the rules resolved`. A `[[services]]` entry's note
+is on the entry's own key, its place in the list: `services[0]`. A key
+with a comment a developer wrote themselves carries that instead, and one
+with no comment carries `null`. It is how a developer, or a program, tells
+what decided each line.
 
 A `# detected:` value that pando's rules **would not write now** is a
 finding in the `config` section, at `note`. pando asks each question once

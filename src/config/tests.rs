@@ -197,6 +197,64 @@ fn an_answered_note_records_the_date() {
     assert!(after.contains(&format!("# answered: {today}")), "{after}");
 }
 
+/// agent/json.md lists the forms a provenance note takes and calls any
+/// other comment the developer's own, so a form missing from the list
+/// reads to a program as a person's decision: the `--yes` answer to the
+/// services question was missing from it. Each note is written the way
+/// pando writes it and looked for in the document with its variable parts
+/// spelled as the document spells them. The match is exhaustive: a new
+/// note does not compile here until the document says what it looks like.
+#[test]
+fn every_provenance_note_pando_writes_is_a_form_agent_json_documents() {
+    let doc = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("agent/json.md"))
+        .expect("read agent/json.md");
+    // Hard-wrapped, so a form can straddle lines.
+    let doc = doc.split_whitespace().collect::<Vec<_>>().join(" ");
+    for note in [
+        Note::Detected("<evidence>".into()),
+        Note::Answered,
+        Note::TookFirst(7),
+        Note::TookRuled {
+            taken: 3,
+            offered: 5,
+        },
+        Note::Program,
+    ] {
+        let f = fixture();
+        set_detected(
+            &f.paths,
+            Layer::Project,
+            &["dev"],
+            "cmd",
+            "pnpm dev",
+            note.clone(),
+        )
+        .unwrap();
+        let text = home_text(&f);
+        let written = text
+            .lines()
+            .find_map(|line| line.strip_prefix("cmd = \"pnpm dev\"  "))
+            .unwrap_or_else(|| panic!("no note beside the key: {text}"));
+        let form = match note {
+            Note::Detected(_) => written.to_string(),
+            Note::Answered | Note::Program => {
+                let (head, date) = written.split_at(written.len() - "YYYY-MM-DD".len());
+                assert!(
+                    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok(),
+                    "{written}"
+                );
+                format!("{head}<date>")
+            }
+            Note::TookFirst(_) => written.replace('7', "N"),
+            Note::TookRuled { .. } => written.replace('3', "<taken>").replace('5', "<offered>"),
+        };
+        assert!(
+            doc.contains(&format!("`{form}`")),
+            "agent/json.md does not document the note {form:?}"
+        );
+    }
+}
+
 #[test]
 fn patching_the_same_value_twice_replaces_the_note_and_not_the_file() {
     let f = fixture();
