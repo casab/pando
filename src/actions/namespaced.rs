@@ -784,9 +784,10 @@ fn recorded_database(
 ///
 /// The one state records is kept only while it is this worktree's alone
 /// and not the main checkout's: one the main checkout's env files name, or
-/// one another worktree's record names too, is let go — never emptied —
-/// and a new one given, with a line saying why. While the worktree runs on
-/// it, it is kept all the same, and the line says how to move it.
+/// one another worktree's record names too — of this project or another —
+/// is let go, never emptied, and a new one given, with a line saying why.
+/// While the worktree runs on it, it is kept all the same, and the line
+/// says how to move it.
 fn ensure_slot(
     paths: &PandoPaths,
     name: &str,
@@ -806,6 +807,14 @@ fn ensure_slot(
         keys: target.keys.clone(),
         used_at: chrono::Utc::now(),
     };
+    // Every project's, from reading the others' records to writing this
+    // one's: each project's own lock is its own, and two starts in two
+    // projects that each read the other's records before either wrote
+    // would both be given the same empty slot, or both let go of one
+    // their records share. Taken before the project's lock whenever both
+    // are held, and never while it is.
+    let _slots = crate::state::lock(&paths.slots_lock_file())?;
+    let others = other_projects(paths);
     let mut store = crate::state::load(&paths.state_file())?;
     let recorded = store.worktrees.get(name).and_then(|record| {
         record
@@ -818,7 +827,7 @@ fn ensure_slot(
     });
     if let Some(recorded) = recorded {
         let kept = slot(&recorded);
-        match hold_on(paths, name, target, &kept)? {
+        match hold_on(paths, name, target, &kept, &others)? {
             Held::Kept => return Ok((kept, false)),
             Held::Running(why) => {
                 progress(&format!(
@@ -838,13 +847,6 @@ fn ensure_slot(
         store = crate::state::load(&paths.state_file())?;
     }
     let holders = slot_holders(&store, target);
-    // Every project's, from reading the others' records to writing this
-    // one's: each project's own lock is its own, and two starts in two
-    // projects that each read the other's records before either wrote
-    // would both be given the same empty slot. Taken before the project's
-    // lock whenever both are held, and never while it is.
-    let _slots = crate::state::lock(&paths.slots_lock_file())?;
-    let others = other_projects(paths);
     none_while_unread(&others, target)?;
     let elsewhere = slots_elsewhere(&others, target);
     let mut unusable = Unusable::default();
@@ -1012,12 +1014,15 @@ enum Held {
 /// under the lock against state as it is by then.
 ///
 /// Kept only while the record still names it, the main checkout's env
-/// files do not, and no other worktree's record does. Writing back one a
-/// start has freed since would hand one slot to two worktrees. One the
-/// main checkout names is main's data. And one two records name — a state
-/// written before slots were taken under the lock, or edited by hand — is
-/// shared by two apps already: this worktree lets it go as the other's,
-/// rather than go on sharing it or stop every start of both.
+/// files do not, and no other worktree's record does — of this project or
+/// of another in `others` — nor another project's main checkout's. Writing
+/// back one a start has freed since would hand one slot to two worktrees.
+/// One a main checkout names is its data. And one two records name — a
+/// state written before slots were taken under the lock, or edited by
+/// hand — is shared by two apps already: this worktree lets it go as the
+/// other's, rather than go on sharing it or stop every start of both. The
+/// caller holds the slots lock `others` was read under, so two projects'
+/// starts never both let one go.
 ///
 /// Except while the worktree runs on it. A start that leaves its processes
 /// running — one already up, a `restart --only` — cannot move them, and a
@@ -1032,6 +1037,7 @@ fn hold_on(
     name: &str,
     target: &Target,
     kept: &crate::state::NamespaceRecord,
+    others: &[(String, std::result::Result<crate::state::State, String>)],
 ) -> Result<Held> {
     let _lock = crate::state::lock(&paths.lock_file())?;
     let mut store = crate::state::load(&paths.state_file())?;
@@ -1045,7 +1051,7 @@ fn hold_on(
     if !recorded {
         return Ok(Held::Gone);
     }
-    let held = match not_alone(&store, name, target, kept) {
+    let held = match not_alone(&store, name, target, kept, others) {
         None => Held::Kept,
         Some(why) if runs_on_its_slots(paths, &store, name) => Held::Running(why),
         Some(why) => Held::LetGo(why),
@@ -1060,13 +1066,15 @@ fn hold_on(
 }
 
 /// Why the slot a worktree's record names is not its alone, when it is
-/// not: the main checkout's env files name it, or another worktree's
-/// record does too.
+/// not: the main checkout's env files name it, another worktree's record
+/// does too — of this project, or of another in `others` — or another
+/// project's records say its main checkout uses it.
 fn not_alone(
     store: &crate::state::State,
     name: &str,
     target: &Target,
     slot: &crate::state::NamespaceRecord,
+    others: &[(String, std::result::Result<crate::state::State, String>)],
 ) -> Option<String> {
     let n = slot.name.trim().parse::<u32>().ok();
     let mains = target
@@ -1076,7 +1084,10 @@ fn not_alone(
     match (mains, recorded_elsewhere(store, name, slot)) {
         (true, _) => Some("the main checkout's env files name it".to_string()),
         (false, Some(other)) => Some(format!("{other}'s record names it too")),
-        (false, None) => None,
+        (false, None) => slots_elsewhere(others, target)
+            .into_iter()
+            .find(|other| Some(other.slot) == n)
+            .map(|other| other.names_it()),
     }
 }
 
@@ -1218,12 +1229,25 @@ struct Elsewhere {
     whose: String,
     /// The project's id: its directory under pando's home.
     project: String,
+    /// It is the one its main checkout uses, not a worktree's.
+    main: bool,
     /// The checkout the slot is recorded for is gone from this machine: a
     /// worktree's directory, or the repository it was linked from.
     gone: bool,
 }
 
 impl Elsewhere {
+    /// Why a slot this worktree's record names is not its alone, when
+    /// another project records it: `feat+x of project shop-1a2b3c4d's
+    /// record names it too`, `the main checkout of project shop-1a2b3c4d
+    /// uses it`.
+    fn names_it(&self) -> String {
+        match self.main {
+            true => format!("{} uses it", self.whose),
+            false => format!("{}'s record names it too", self.whose),
+        }
+    }
+
     /// `slot 3 (feat+x of project shop-1a2b3c4d)`, and `, whose checkout
     /// is gone` inside the brackets when it is.
     fn describe(&self) -> String {
@@ -1327,6 +1351,7 @@ fn slots_elsewhere(
                         slot,
                         whose: format!("{worktree} of project {project}"),
                         project: project.clone(),
+                        main: false,
                         gone: repository_gone || !record.path.exists(),
                     });
                 }
@@ -1336,6 +1361,7 @@ fn slots_elsewhere(
                             slot,
                             whose: format!("the main checkout of project {project}"),
                             project: project.clone(),
+                            main: true,
                             gone: repository_gone,
                         });
                     }
@@ -1386,12 +1412,13 @@ pub(super) fn free_slots_if_full(
         }
         let store = crate::state::load(&paths.state_file())?;
         let holders = slot_holders(&store, &target);
+        let projects = other_projects(paths);
         // A slot this worktree's record names is one its start goes on
         // with, unless [`hold_on`] will let it go: then the start needs a
         // new one, and is asked now, not only on its next attempt.
         if holders.iter().any(|holder| {
             holder.worktree == name
-                && (not_alone(&store, name, &target, &holder.namespace).is_none()
+                && (not_alone(&store, name, &target, &holder.namespace, &projects).is_none()
                     || runs_on_its_slots(paths, &store, name))
         }) {
             continue;
@@ -1408,7 +1435,6 @@ pub(super) fn free_slots_if_full(
             .collect();
         // Before anything is asked: the start this is for gives out no
         // slot then, and freeing one would be refused by the guard anyway.
-        let projects = other_projects(paths);
         none_while_unread(&projects, &target)?;
         let others = slots_elsewhere(&projects, &target);
         let elsewhere: Vec<String> = others.iter().map(Elsewhere::describe).collect();

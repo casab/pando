@@ -11953,6 +11953,55 @@ fn a_slot_two_records_name_is_let_go_by_the_one_starting_and_emptied_by_neither(
     assert!(!redis.join("flushed").exists());
 }
 
+// The same when the other record is another project's: a Redis on a port
+// is the machine's, and a slot two projects' records name — one recorded
+// before slots were handed out under a lock every project takes — was kept
+// by both, shared for good with nothing to say so. Nor is a slot another
+// project's main checkout uses kept.
+#[test]
+fn a_slot_another_projects_record_names_too_is_let_go_by_the_one_starting_and_emptied_by_neither() {
+    let (ns, redis) = slots_fixture(MAIN_ENV_WITH_REDIS);
+    let (report, _) = ns.start(Mode::Namespaced).unwrap();
+    drop(guard(&report));
+    stop(&ns.fx.paths, &ns.name, None).unwrap();
+    hold_elsewhere(&ns, slot_holder(1, false, 1));
+
+    let (report, said) = ns.start(Mode::Remembered).unwrap();
+    let running = guard(&report);
+    assert!(
+        said.iter().any(|l| l
+            == "redis: slot 1 is let go, not emptied — feat+theirs of project other-1a2b3c4d's \
+                record names it too — and this worktree gets one of its own"),
+        "{said:?}"
+    );
+    assert_eq!(ns.env_line("REDIS_DB").as_deref(), Some("2"));
+    let ours = || -> Vec<String> {
+        ns.record()
+            .namespaces
+            .into_iter()
+            .filter(|n| n.service == "redis")
+            .map(|n| n.name)
+            .collect()
+    };
+    assert_eq!(ours(), vec!["2".to_string()]);
+    drop(running);
+    stop(&ns.fx.paths, &ns.name, None).unwrap();
+
+    let mut theirs = slot_holder(5, false, 1);
+    theirs.namespaces[0].main = "2".into();
+    hold_elsewhere(&ns, theirs);
+    let (report, said) = ns.start(Mode::Remembered).unwrap();
+    let _guard = guard(&report);
+    assert!(
+        said.iter().any(|l| l
+            == "redis: slot 2 is let go, not emptied — the main checkout of project \
+                other-1a2b3c4d uses it — and this worktree gets one of its own"),
+        "{said:?}"
+    );
+    assert_eq!(ours(), vec!["1".to_string()]);
+    assert!(!redis.join("flushed").exists());
+}
+
 // A running worktree keeps a slot another record names too: a start that
 // leaves its processes running, or replaces only one of them, cannot move
 // them, and a record naming a new slot under them would leave the old one
