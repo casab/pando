@@ -740,6 +740,13 @@ fn window_ceiling(capacity: usize) -> u64 {
         .max(MAX_INITIAL_WINDOW)
 }
 
+/// How many of its reads a bounded poll holds one unfinished line across:
+/// past that it keeps what it holds and drops the rest up to the newline.
+/// `logs -f` reads a megabyte at a time, so it holds a line of up to
+/// 256 MiB whole: far longer than any response a dev server dumps on one
+/// line, and a limit on a progress line redrawn with `\r` for hours.
+const MAX_READS_PER_LINE: u64 = 256;
+
 /// Where a read of the last lines of a file of `size` bytes starts, no
 /// earlier than `from`, and whether that is partway through a line. The
 /// first read of a file starts from 0; a tail that fell behind starts
@@ -875,8 +882,9 @@ pub struct LogTail {
     /// i.e. where `leftover`'s first byte lives. Source of each pushed line's
     /// `file_offset`.
     line_start_offset: u64,
-    /// Whether the line being read grew past [`window_ceiling`], so the
-    /// rest of it is dropped up to its newline rather than held.
+    /// Whether the line being read grew past its ceiling, so the rest of it
+    /// is dropped up to its newline rather than held. What `leftover` still
+    /// holds of it is pushed as the line when that newline comes.
     overlong: bool,
     /// Levels of lines evicted from the front during the most recent `poll`.
     /// Lets the viewer realign absolute indices (search matches, scroll) after
@@ -969,7 +977,8 @@ impl LogTail {
     /// at most `capacity` whole lines, so no line is evicted before the
     /// follower has seen it and a backlog is never held in memory whole.
     /// The rest stays in the file, and [`has_unread`](Self::has_unread)
-    /// says so.
+    /// says so. A line longer than [`MAX_READS_PER_LINE`] reads is cut to
+    /// that.
     ///
     /// Only after a first [`poll`](Self::poll): this never skips to the
     /// end, which is how that one shows only the last lines.
@@ -1089,22 +1098,32 @@ impl LogTail {
         self.unread = self.offset + (unfinished as u64) < size;
         self.remember_anchor(&raw);
         let mut chunk = String::from_utf8_lossy(&raw).into_owned();
+        let mut cut = false;
         if skip_partial_first_line || self.overlong {
             chunk = match chunk.find('\n') {
                 Some(newline) => {
                     self.overlong = false;
+                    // A bounded poll's line ends here, cut to what it held.
+                    if !self.leftover.is_empty() {
+                        let held = std::mem::take(&mut self.leftover);
+                        self.push_line(&held, self.line_start_offset);
+                        cut = true;
+                    }
                     self.line_start_offset = seek_pos + newline as u64 + 1;
                     chunk[newline + 1..].to_string()
                 }
                 None => {
-                    self.line_start_offset = self.offset;
+                    // What is held still starts where its line does.
+                    if self.leftover.is_empty() {
+                        self.line_start_offset = self.offset;
+                    }
                     String::new()
                 }
             };
         }
 
         if chunk.is_empty() {
-            return Ok(false);
+            return Ok(cut);
         }
 
         // Only the new bytes are searched for the end of a line: `leftover`
@@ -1113,7 +1132,7 @@ impl LogTail {
         let Some(last) = chunk.rfind('\n') else {
             self.leftover.push_str(&chunk);
             self.cap_leftover(bound);
-            return Ok(false);
+            return Ok(cut);
         };
         let mut combined = std::mem::take(&mut self.leftover);
         combined.push_str(&chunk[..last]);
@@ -1146,20 +1165,34 @@ impl LogTail {
         Ok(added)
     }
 
-    /// Drops the unfinished line once it is longer than [`window_ceiling`],
-    /// and the rest of it with it as it arrives, as a window starting inside
-    /// it would. A process that redraws a progress line with `\r` never
-    /// ends that line, and holding it whole grew the tail for as long as
-    /// the process ran.
+    /// Stops holding the unfinished line once it is longer than its
+    /// ceiling, and drops the rest of it up to its newline as it arrives. A
+    /// process that redraws a progress line with `\r` never ends that line,
+    /// and holding it whole grew the tail for as long as the process ran.
     ///
-    /// A bounded poll holds the line whole, however long it grows: a
-    /// follower prints every line, and one dropped here went missing from
-    /// `logs -f` without a sign. Each poll still costs only what it read.
+    /// An unbounded poll drops the line whole past [`window_ceiling`], as a
+    /// window starting inside it would. A bounded poll keeps the first
+    /// [`MAX_READS_PER_LINE`] reads of it and pushes those as the line when
+    /// its newline comes: a follower prints every line, and one dropped
+    /// here went missing from `logs -f` without a sign.
     fn cap_leftover(&mut self, bound: Option<u64>) {
-        if bound.is_none() && self.leftover.len() as u64 > window_ceiling(self.capacity) {
-            self.leftover = String::new();
-            self.overlong = true;
+        let ceiling = match bound {
+            None => window_ceiling(self.capacity),
+            Some(max) => max.saturating_mul(MAX_READS_PER_LINE),
+        };
+        if self.leftover.len() as u64 <= ceiling {
+            return;
         }
+        self.overlong = true;
+        if bound.is_none() {
+            self.leftover = String::new();
+            return;
+        }
+        let mut end = ceiling as usize;
+        while !self.leftover.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.leftover.truncate(end);
     }
 
     /// Whether the bytes before `offset` are still the ones this tail read
@@ -1592,6 +1625,59 @@ mod tests {
         assert_eq!(lines[1].plain.len(), long.len(), "the long line whole");
         assert_eq!(lines[1].file_offset, 6);
         assert_eq!(lines[2].plain, "after");
+    }
+
+    // A follower held a line that never ends whole, so `logs -f` beside a
+    // progress bar redrawn with `\r` grew for as long as the process ran,
+    // and printed all of it at once when a newline finally came.
+    #[test]
+    fn a_follower_holds_no_more_of_a_line_than_its_reads_allow() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("progress.log");
+        write_all(&path, "start\n");
+        let mut tail = LogTail::new(path.clone(), 4);
+        tail.poll().unwrap();
+
+        let read = 4096;
+        let ceiling = (read * MAX_READS_PER_LINE) as usize;
+        // Redraws of one read each, after a byte, each ending in a
+        // character of two bytes: the ceiling lands inside one.
+        append(&path, "\r");
+        let redraw = "x".repeat(read as usize - 2) + "é";
+        for _ in 0..MAX_READS_PER_LINE + 16 {
+            append(&path, &redraw);
+            loop {
+                tail.poll_bounded(read).unwrap();
+                if !tail.has_unread() {
+                    break;
+                }
+            }
+            assert!(
+                tail.leftover.len() <= ceiling,
+                "held {} bytes of one line",
+                tail.leftover.len()
+            );
+        }
+        assert_eq!(tail.lines_seen(), 1, "nothing printed while it runs");
+
+        // It is printed as far as it was held, and what follows is read as
+        // ever, at its own offset.
+        append(&path, "\nafter\n");
+        loop {
+            tail.poll_bounded(read).unwrap();
+            if !tail.has_unread() {
+                break;
+            }
+        }
+        assert_eq!(tail.lines_seen(), 3);
+        let lines: Vec<_> = tail.lines().iter().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[1].plain.len() <= ceiling);
+        assert!(lines[1].plain.len() > ceiling - 4, "cut at the ceiling");
+        assert_eq!(lines[1].file_offset, 6);
+        assert_eq!(lines[2].plain, "after");
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(lines[2].file_offset, size - 6);
     }
 
     #[test]
