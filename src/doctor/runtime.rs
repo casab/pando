@@ -3,7 +3,7 @@
 
 use std::fmt::Write as _;
 
-use crate::actions::Machine;
+use crate::actions::{self, Machine};
 use crate::config::{self, Config};
 use crate::paths::PandoPaths;
 use crate::runtime::{self, Verdict};
@@ -69,7 +69,12 @@ pub(super) fn runtime_report(
             managers,
             fixes,
         };
-        if check.verdict == Verdict::Mismatch {
+        // Not where every command goes through a runner that finds the
+        // interpreter itself, such as `uv run`: a start skips the check
+        // there, so what the shell resolves on its own breaks nothing.
+        if check.verdict == Verdict::Mismatch
+            && !actions::runs_through_runner(paths.root(), config, entry, effective, machine.shell)
+        {
             findings.push(mismatch_finding(&report, prelude.as_deref(), &prelude_from));
         }
         languages.push(report);

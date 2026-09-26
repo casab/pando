@@ -173,7 +173,10 @@ fn first_mismatch(
 /// pyenv. Only when the project uses the runner (its lockfile is there),
 /// every configured process and hook goes through it (nothing configured yet counts,
 /// since detection proposes the runner's form), and the shell finds it.
-fn runs_through_runner(
+///
+/// Public because `doctor` reports a mismatch only where a start would act
+/// on one, and a start skips the language this answers true for.
+pub fn runs_through_runner(
     root: &Path,
     config: &Config,
     language: &crate::runtime::Language,

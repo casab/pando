@@ -1001,6 +1001,58 @@ fn a_mismatch_with_a_prelude_set_names_the_prelude_and_the_file_it_is_in() {
     );
 }
 
+// A start skips the runtime check for a language whose every command goes
+// through `uv run`, which finds the pinned Python itself. doctor checked
+// it anyway, so a project that starts without a question read as one
+// whose prelude was broken, and doctor failed.
+#[test]
+fn a_mismatch_uv_run_resolves_for_every_command_is_not_reported() {
+    let fx = fixture();
+    std::fs::write(fx.root.join(".python-version"), "3.12\n").expect("write .python-version");
+    std::fs::write(fx.root.join("uv.lock"), "version = 1\n").expect("write uv.lock");
+    let shell = |has_uv: bool| {
+        move |script: &str| -> Option<String> {
+            if script.contains(TOOL_DONE_MARK) {
+                return every_tool(script);
+            }
+            if script.contains("command -v uv") {
+                return Some(if has_uv { "pando-runner-ok\n" } else { "" }.to_string());
+            }
+            Some(crate::runtime::probe_reply("/usr/bin/python3", "3.9.6"))
+        }
+    };
+    let runtime_findings = |report: &Report| -> Vec<String> {
+        report
+            .findings
+            .iter()
+            .filter(|f| f.section == Section::Runtime)
+            .map(|f| f.message.clone())
+            .collect()
+    };
+    for prelude in ["", "[runtime]\nprelude = \"source ~/.profile-extra\"\n\n"] {
+        write_project_config(
+            &fx,
+            &format!("{prelude}[dev]\ncmd = \"uv run python manage.py runserver\"\n"),
+        );
+        let report = report_of(&fx, &shell(true));
+        assert!(
+            runtime_findings(&report).is_empty(),
+            "{prelude:?}: {:?}",
+            messages(&report)
+        );
+        assert!(report.healthy(), "{prelude:?}: {:?}", messages(&report));
+
+        // A shell with no uv gets the interpreter it resolves, so the
+        // mismatch is real there.
+        let report = report_of(&fx, &shell(false));
+        assert!(
+            !runtime_findings(&report).is_empty(),
+            "{prelude:?}: {:?}",
+            messages(&report)
+        );
+    }
+}
+
 #[test]
 fn a_mismatch_offers_the_prelude_of_a_manager_this_machine_really_has() {
     let fx = fixture();
