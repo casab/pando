@@ -9,7 +9,7 @@ use crate::catalog::package_managers::{self, Ecosystem};
 use crate::config::PortsSpec;
 
 use super::apply::dedup_by_value;
-use super::frameworks::runs;
+use super::frameworks::{only_builds, runs};
 use super::proposal::{Candidate, Proposal, Slot};
 use super::signals::Signals;
 
@@ -359,10 +359,10 @@ pub(super) fn dev_cmd_proposal(
 /// runs what the project already runs, on the port pando chose, and owns
 /// the web role. Told nothing, Vite moves itself to the next free port and
 /// pando holds no role for it, so the worktree has no URL to open or share.
-/// Only a script that runs the framework's own CLI, as one server, on no
-/// port of its own: in a custom server or a fan-out the flag would reach
-/// something else, and where the script names a port it would be said
-/// twice.
+/// Only a script that runs the framework's own server, alone, on no port
+/// of its own: a custom server or a fan-out would hand the flag to
+/// something else, a build refuses it, and where the script names a port
+/// it would be said twice.
 fn script_candidate(
     signals: &Signals,
     rule: Option<&'static FrameworkRule>,
@@ -375,6 +375,7 @@ fn script_candidate(
         rule.port == PortMechanism::InCommand
             && !rule.scripts_build_assets
             && runs(rule, body)
+            && !only_builds(rule, body)
             && !is_multiplexer(body)
             && fixed_port(body).is_none()
     });

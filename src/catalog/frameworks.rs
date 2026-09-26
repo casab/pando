@@ -44,6 +44,10 @@ pub struct FrameworkRule {
     /// vite_ruby. Its command then leads the scripts, which run the asset
     /// server, not the app.
     pub scripts_build_assets: bool,
+    /// Any one of these in a script body runs this framework's build and
+    /// not its server: a library's `vite build --watch` binds no port, and
+    /// its CLI refuses the `--port` a server would be given.
+    pub build_markers: &'static [&'static str],
 }
 
 /// What a marker match must also pass, for a marker file that more than
@@ -79,6 +83,7 @@ pub const RULES: [FrameworkRule; 12] = [
         port_flag: Some("--port {port}"),
         guard: Guard::Marker,
         scripts_build_assets: false,
+        build_markers: &[],
     },
     FrameworkRule {
         name: "Nuxt",
@@ -90,6 +95,7 @@ pub const RULES: [FrameworkRule; 12] = [
         port_flag: Some("--port {port}"),
         guard: Guard::Marker,
         scripts_build_assets: false,
+        build_markers: &[],
     },
     // Astro sits on Vite but has its own CLI, its own default port and its
     // own command, so it comes before the Vite row that would claim it.
@@ -103,6 +109,7 @@ pub const RULES: [FrameworkRule; 12] = [
         port_flag: Some("--port {port}"),
         guard: Guard::Marker,
         scripts_build_assets: false,
+        build_markers: &[],
     },
     FrameworkRule {
         name: "Angular",
@@ -114,6 +121,8 @@ pub const RULES: [FrameworkRule; 12] = [
         port_flag: Some("--port {port}"),
         guard: Guard::Marker,
         scripts_build_assets: false,
+        // A library's `ng build --watch`.
+        build_markers: &["ng build"],
     },
     // The app servers come before the Vite row: a Laravel app has a
     // vite.config.js and a `dev: vite` script, and so do Django and Rails
@@ -128,6 +137,7 @@ pub const RULES: [FrameworkRule; 12] = [
         port_flag: None,
         guard: Guard::Marker,
         scripts_build_assets: true,
+        build_markers: &[],
     },
     FrameworkRule {
         name: "Rails",
@@ -141,6 +151,7 @@ pub const RULES: [FrameworkRule; 12] = [
         port_flag: Some("-p {port}"),
         guard: Guard::Marker,
         scripts_build_assets: true,
+        build_markers: &[],
     },
     FrameworkRule {
         name: "Phoenix",
@@ -154,6 +165,7 @@ pub const RULES: [FrameworkRule; 12] = [
         // umbrella keeps at its root beside a `mix.exs` that has none.
         guard: Guard::Mentions(&["mix.exs", "mix.lock"], ":phoenix,"),
         scripts_build_assets: true,
+        build_markers: &[],
     },
     FrameworkRule {
         name: "Laravel",
@@ -165,6 +177,7 @@ pub const RULES: [FrameworkRule; 12] = [
         port_flag: Some("--port {port}"),
         guard: Guard::Marker,
         scripts_build_assets: true,
+        build_markers: &[],
     },
     FrameworkRule {
         name: "Vite",
@@ -191,6 +204,9 @@ pub const RULES: [FrameworkRule; 12] = [
         port_flag: Some("--port {port}"),
         guard: Guard::Marker,
         scripts_build_assets: false,
+        // Library mode's `vite build --watch`. Not `vite preview`, which
+        // serves the build and takes `--port`.
+        build_markers: &["vite build"],
     },
     FrameworkRule {
         name: "Go",
@@ -202,6 +218,7 @@ pub const RULES: [FrameworkRule; 12] = [
         port_flag: None,
         guard: Guard::Marker,
         scripts_build_assets: false,
+        build_markers: &[],
     },
     FrameworkRule {
         name: "Rust",
@@ -215,6 +232,7 @@ pub const RULES: [FrameworkRule; 12] = [
         port_flag: None,
         guard: Guard::BinaryCrate,
         scripts_build_assets: false,
+        build_markers: &[],
     },
     FrameworkRule {
         name: "Node",
@@ -226,6 +244,7 @@ pub const RULES: [FrameworkRule; 12] = [
         port_flag: None,
         guard: Guard::Marker,
         scripts_build_assets: false,
+        build_markers: &[],
     },
 ];
 

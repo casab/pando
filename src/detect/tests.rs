@@ -975,6 +975,49 @@ fn a_workspace_apps_other_scripts_do_not_say_what_its_dev_script_runs() {
     assert_eq!(admin.default_port, Some(8000));
 }
 
+// Handed `--port`, a library's `vite build --watch` exited on an option
+// Vite's build does not take, and without it the watcher would still
+// bind no port, so the readiness wait failed the whole worktree.
+#[test]
+fn a_package_whose_dev_script_only_builds_is_given_no_server_port() {
+    let dir = tempdir().unwrap();
+    workspace(dir.path());
+    for (app, marker, dev) in [
+        ("ui", "vite.config.ts", "vite build --watch"),
+        ("widgets", "angular.json", "ng build --watch"),
+    ] {
+        std::fs::create_dir_all(dir.path().join("apps").join(app)).unwrap();
+        std::fs::write(dir.path().join("apps").join(app).join(marker), "{}\n").unwrap();
+        std::fs::write(
+            dir.path().join("apps").join(app).join("package.json"),
+            format!(r#"{{ "scripts": {{ "dev": "{dev}" }} }}"#),
+        )
+        .unwrap();
+    }
+    let processes = proposed_processes(dir.path()).candidates[0]
+        .processes
+        .clone()
+        .unwrap();
+    for app in ["ui", "widgets"] {
+        let process = &processes[app];
+        assert_eq!(process.cmd, "pnpm dev", "{app}");
+        assert!(process.roles().is_empty(), "{app}: {:?}", process.ports);
+        assert!(process.ready.is_none(), "{app}");
+    }
+    assert_eq!(processes["web"].cmd, "pnpm dev --port {port:web}");
+
+    let (dir, s) = marker_fixture(&[
+        ("vite.config.ts", "export default {}\n"),
+        (
+            "package.json",
+            r#"{ "scripts": { "dev": "vite build --watch" } }"#,
+        ),
+    ]);
+    let proposal = dev_of(&s, framework(dir.path(), &s));
+    assert_eq!(values(&proposal), vec!["npm run dev"]);
+    assert_eq!(proposal.candidates[0].ports, None);
+}
+
 // ---- install ---------------------------------------------------------
 
 // Invariant 1: a lockfile can never change because pando ran an

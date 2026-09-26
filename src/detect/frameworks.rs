@@ -27,16 +27,27 @@ pub fn framework(root: &Path, signals: &Signals) -> Option<&'static FrameworkRul
 /// script names when it names one: a Laravel app's `dev: vite` is Vite.
 /// Only that script: a `css: node build-css.js` beside a Django app's
 /// `dev: python manage.py runserver` says nothing about what `dev` runs.
+/// None for a script that runs the rule's build and not its server: a
+/// library's `vite build --watch` is a watcher, not a Vite server.
 pub(super) fn script_framework(
     root: &Path,
     signals: &Signals,
     dev: &str,
 ) -> Option<&'static FrameworkRule> {
     let rule = framework(root, signals)?;
-    if !rule.scripts_build_assets {
-        return Some(rule);
-    }
-    RULES.iter().find(|other| runs(other, dev)).or(Some(rule))
+    let rule = match rule.scripts_build_assets {
+        false => rule,
+        true => RULES.iter().find(|other| runs(other, dev)).unwrap_or(rule),
+    };
+    (!only_builds(rule, dev)).then_some(rule)
+}
+
+/// Whether `body` runs one of the rule's build markers: the framework's
+/// build, which serves nothing.
+pub(super) fn only_builds(rule: &FrameworkRule, body: &str) -> bool {
+    rule.build_markers
+        .iter()
+        .any(|needle| mentions(body, needle))
 }
 
 /// Whether one of the project's script bodies runs one of the rule's
