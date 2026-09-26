@@ -37,6 +37,9 @@ const FS_DEBOUNCE: Duration = Duration::from_millis(500);
 const INPUT_POLL: Duration = Duration::from_millis(50);
 
 pub fn run(paths: PandoPaths, config: Config) -> Result<()> {
+    // The terminal is the TUI's from here on: a hook that prompted on it
+    // would draw over the frame and wait on keys pando reads.
+    crate::hooks::detach_from_terminal();
     // Before anything creates a directory under it: the watcher and the
     // enrichment cache both `create_dir_all` their way down, and a home made
     // by one of those would carry the umask instead of 0700.

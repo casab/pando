@@ -14,6 +14,11 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Whether hooks and probes start with no controlling terminal; see
+/// [`detach_from_terminal`].
+static DETACHED: AtomicBool = AtomicBool::new(false);
 
 /// Directories never walked when matching a fingerprint glob. Dependency
 /// trees and build output are enormous and are never what a hook is keyed
@@ -202,6 +207,44 @@ fn match_one(pattern: &str, value: &str) -> bool {
     pi == p.len()
 }
 
+/// Starts every hook and probe from now on in a session of its own, with
+/// no controlling terminal.
+///
+/// For the TUI, once it owns the screen. A tool in a hook that prompts on
+/// `/dev/tty` — git asking for a username, ssh for a passphrase, sudo —
+/// drew over the frame and waited for ever on keys the TUI read first;
+/// with no terminal the prompt fails at once, and what it printed is the
+/// hook's reason. From the CLI the terminal is the developer's, and a hook
+/// that asks is answered there.
+pub fn detach_from_terminal() {
+    DETACHED.store(true, Ordering::Relaxed);
+}
+
+/// `bash -lc` running `shell_cmd` in `cwd` with `env` added and nothing on
+/// stdin, in a session of its own when `detached`.
+fn shell(shell_cmd: &str, cwd: &Path, env: &[(String, String)], detached: bool) -> Command {
+    let mut command = Command::new("bash");
+    command
+        .arg("-lc")
+        .arg(shell_cmd)
+        .current_dir(cwd)
+        .stdin(Stdio::null());
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    if detached {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            command.pre_exec(|| {
+                nix::unistd::setsid()
+                    .map(|_| ())
+                    .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
+            });
+        }
+    }
+    command
+}
+
 /// Runs a hook to completion, appending everything it printed to its own
 /// log. Fails with the log path, because that is where the reason is.
 ///
@@ -211,7 +254,8 @@ fn match_one(pattern: &str, value: &str) -> bool {
 /// child is handed the file itself, not a pipe pando drains once it exits,
 /// so the log fills while a three-minute install runs, keeps its lines in
 /// the order they were printed, and keeps them when pando is interrupted
-/// before the hook finishes.
+/// before the hook finishes. A hook the TUI starts has no terminal at all
+/// to open: [`detach_from_terminal`].
 pub fn run(log_file: &Path, shell_cmd: &str, cwd: &Path, env: &[(String, String)]) -> Result<()> {
     if let Some(parent) = log_file.parent() {
         std::fs::create_dir_all(parent)
@@ -228,17 +272,8 @@ pub fn run(log_file: &Path, shell_cmd: &str, cwd: &Path, env: &[(String, String)
     let err = out
         .try_clone()
         .context("clone log file handle for stderr")?;
-    let mut command = Command::new("bash");
-    command
-        .arg("-lc")
-        .arg(shell_cmd)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(out)
-        .stderr(err);
-    for (key, value) in env {
-        command.env(key, value);
-    }
+    let mut command = shell(shell_cmd, cwd, env, DETACHED.load(Ordering::Relaxed));
+    command.stdout(out).stderr(err);
     let status = command
         .status()
         .with_context(|| format!("run {shell_cmd:?}"))?;
@@ -290,17 +325,8 @@ fn printed_since(log_file: &Path, start: u64) -> String {
 /// sees; a `logs --source native-abi` tab for it would be empty on every
 /// run that mattered.
 pub fn probe(shell_cmd: &str, cwd: &Path, env: &[(String, String)]) -> Result<Option<String>> {
-    let mut command = Command::new("bash");
-    command
-        .arg("-lc")
-        .arg(shell_cmd)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for (key, value) in env {
-        command.env(key, value);
-    }
+    let mut command = shell(shell_cmd, cwd, env, DETACHED.load(Ordering::Relaxed));
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let out = command
         .output()
         .with_context(|| format!("run the probe {shell_cmd:?}"))?;
@@ -659,5 +685,46 @@ mod tests {
         let text = std::fs::read_to_string(&log).unwrap();
         assert!(text.contains("apps/web"), "{text}");
         assert!(text.contains("name=feat+one"), "{text}");
+    }
+
+    // ---- the terminal ----------------------------------------------------
+
+    /// What a hook says about where it runs: its pid and its process
+    /// group, and whether it could open a terminal to prompt on.
+    const WHERE_AM_I: &str = "echo \"ids $$ $(ps -o pgid= -p $$)\"; \
+        if (exec 3</dev/tty) 2>/dev/null; then echo 'tty open'; else echo 'no tty'; fi";
+
+    fn where_it_ran(detached: bool) -> (String, String, bool) {
+        let dir = tempdir().unwrap();
+        let out = shell(WHERE_AM_I, dir.path(), &[], detached)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let ids = text
+            .lines()
+            .find_map(|line| line.strip_prefix("ids "))
+            .unwrap_or_else(|| panic!("{text}"));
+        let (pid, pgid) = ids.split_once(' ').unwrap();
+        let tty = text.lines().any(|line| line == "tty open");
+        (pid.trim().to_string(), pgid.trim().to_string(), tty)
+    }
+
+    // From the TUI a hook that prompted on /dev/tty drew over the frame
+    // and waited for ever on keys the TUI read. Detached, it leads a
+    // session of its own with no terminal in it, so the prompt fails.
+    #[test]
+    fn a_detached_hook_has_no_terminal_to_prompt_on() {
+        let (pid, pgid, tty) = where_it_ran(true);
+        assert_eq!(pid, pgid, "it leads a process group of its own");
+        assert!(!tty, "and there is no terminal for it to open");
+    }
+
+    // From the CLI the terminal is the developer's, and a hook that asks
+    // is answered there.
+    #[test]
+    fn a_hook_is_not_detached_unless_the_tui_asked() {
+        assert!(!DETACHED.load(Ordering::Relaxed));
+        let (_, pgid, _) = where_it_ran(false);
+        assert_eq!(pgid, nix::unistd::getpgrp().to_string());
     }
 }
