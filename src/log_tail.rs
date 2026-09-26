@@ -1188,6 +1188,14 @@ impl LogTail {
         }
     }
 
+    /// Lets go of every buffered line but the newest `keep`, for a reader
+    /// that copies lines out as each poll brings them: the next poll still
+    /// knows where this one ended, and nothing is held twice.
+    pub fn keep_newest(&mut self, keep: usize) {
+        let extra = self.buffer.len().saturating_sub(keep);
+        self.buffer.drain(..extra);
+    }
+
     /// Pushes the unterminated final line, when there is one, as a line.
     /// Whether it pushed anything.
     ///

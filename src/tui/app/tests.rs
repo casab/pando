@@ -5969,6 +5969,30 @@ fn a_process_that_joins_with_a_long_log_takes_only_its_share_of_the_all_tab() {
     assert_eq!((from("web"), from("api")), (4, 4), "{plain:?}");
 }
 
+// Each source kept a buffer the size of the whole tab beside it, though
+// the tab only ever reads back a source's newest line.
+#[test]
+fn the_all_tab_holds_each_line_it_merged_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let web = numbered_log(dir.path(), "web", 30);
+    let api = numbered_log(dir.path(), "api", 30);
+    let mut merged = MergedTail::new(vec![("web".into(), web.clone()), ("api".into(), api)], 10);
+    merged.poll().unwrap();
+    assert_eq!(merged.held_by_sources(), [1, 1]);
+
+    // And it reads on from there as it did.
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&web)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, b"web 30\nweb 31\n"))
+        .unwrap();
+    merged.poll().unwrap();
+    let plain = merged_plain(&merged);
+    assert_eq!(plain.len(), 10, "{plain:?}");
+    assert_eq!(plain[plain.len() - 2..], ["web │ web 30", "web │ web 31"]);
+    assert_eq!(merged.held_by_sources(), [1, 1]);
+}
+
 // A restart is judged on the first line of the new run, which the share
 // may leave out, and its marker is not evicted by the lines after it.
 #[test]

@@ -162,7 +162,19 @@ impl MergedTail {
             }
             grew = true;
         }
+        // What a source brought is copied into the buffer now. It keeps
+        // only its newest line, which the next poll's restart check reads,
+        // rather than a second copy of its log the size of the whole tab.
+        for source in &mut self.sources {
+            source.tail.keep_newest(1);
+        }
         Ok(grew)
+    }
+
+    /// How many lines each source's own tail holds, in tab order.
+    #[cfg(test)]
+    pub fn held_by_sources(&self) -> Vec<usize> {
+        self.sources.iter().map(|s| s.tail.lines().len()).collect()
     }
 
     /// How many of each source's new lines a poll adds, the newest ones.
