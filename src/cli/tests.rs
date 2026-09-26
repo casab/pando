@@ -2629,23 +2629,36 @@ fn the_brief_only_names_commands_pando_has() {
 ///
 /// The README has its own check; this is the second place the verbs
 /// are written down by hand, and the last one that was unguarded.
+///
+/// Only the list itself counts, and it is held to clap both ways: the
+/// rest of the file says "new", "start" and "open" in prose, so a search
+/// of the whole file passed with any of the three gone from the list.
 #[test]
 fn claude_md_lists_every_verb_pando_has() {
     use clap::CommandFactory;
+    use std::collections::BTreeSet;
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("CLAUDE.md");
     let text = std::fs::read_to_string(&path).expect("CLAUDE.md");
     // Hard-wrapped, so the list can straddle lines.
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    for sub in Cli::command().get_subcommands() {
-        let name = sub.get_name();
-        if name == "help" || sub.is_hide_set() {
-            continue;
-        }
-        assert!(
-            flat.contains(&format!(" {name} ")) || flat.contains(&format!(" {name}`")),
-            "CLAUDE.md calls its verb list canonical and does not name {name:?}"
-        );
-    }
+    let marker = "CLI verbs, used identically in every document: `";
+    let at = flat
+        .find(marker)
+        .expect("CLAUDE.md has its canonical verb list");
+    let rest = &flat[at + marker.len()..];
+    let listed: BTreeSet<&str> = rest[..rest.find('`').expect("the list's closing backtick")]
+        .split_whitespace()
+        .collect();
+    let command = Cli::command();
+    let verbs: BTreeSet<&str> = command
+        .get_subcommands()
+        .filter(|sub| sub.get_name() != "help" && !sub.is_hide_set())
+        .map(|sub| sub.get_name())
+        .collect();
+    assert_eq!(
+        listed, verbs,
+        "CLAUDE.md calls its verb list canonical, and it is not the verbs pando has"
+    );
 }
 
 /// The README's own command list, against clap.
