@@ -735,7 +735,7 @@ fn a_password_with_a_bare_dollar_is_handed_on_as_written_isolated_or_shared() {
     fx.config.services = services.services;
     std::fs::write(
         fx.root.join(".env"),
-        "DATABASE_URL=postgres://app:pa$PANDO_TEST_UNSET_WORD@localhost:5432/shop\n",
+        "DATABASE_URL=postgres://app:pa$pando_test_unset_word@localhost:5432/shop\n",
     )
     .unwrap();
     let ports = BTreeMap::from([("postgres".to_string(), 17_004)]);
@@ -743,13 +743,52 @@ fn a_password_with_a_bare_dollar_is_handed_on_as_written_isolated_or_shared() {
         super::services::resolve_service_env(&fx.paths, &fx.config, &fx.root, &ports).unwrap();
     assert_eq!(
         env.get("DATABASE_URL").map(String::as_str),
-        Some("postgres://app:pa$PANDO_TEST_UNSET_WORD@localhost:17004/shop")
+        Some("postgres://app:pa$pando_test_unset_word@localhost:17004/shop")
     );
     let shared = super::services::shared_service_env(&fx.paths, &fx.config);
     assert_eq!(
         shared.get("DATABASE_URL").map(String::as_str),
-        Some("postgres://app:pa$PANDO_TEST_UNSET_WORD@localhost:5432/shop")
+        Some("postgres://app:pa$pando_test_unset_word@localhost:5432/shop")
     );
+}
+
+// Taken for a `$` in a password, a bare `$DB_USER` that `.env.local` sets
+// was exported as written by a shared start, ahead of the app's own
+// loader, which then kept it: the app logged in as a user called
+// `$DB_USER`. An isolated start rewrote the port around it.
+#[test]
+fn a_bare_variable_nothing_pando_reads_sets_is_left_to_the_apps_loader_in_every_mode() {
+    let mut fx = fixture();
+    let services: Config = toml::from_str(
+        "[[services]]\nkind = \"native\"\nname = \"postgres\"\n\
+         env = { DATABASE_URL = \"postgres\" }\n",
+    )
+    .unwrap();
+    fx.config.services = services.services;
+    std::fs::write(
+        fx.root.join(".env"),
+        "DATABASE_URL=postgres://$PANDO_TEST_UNSET_USER:$PANDO_TEST_UNSET_PASSWORD@localhost:5432/app\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fx.root.join(".env.local"),
+        "PANDO_TEST_UNSET_USER=app\nPANDO_TEST_UNSET_PASSWORD=pw\n",
+    )
+    .unwrap();
+    let shared = super::services::shared_service_env(&fx.paths, &fx.config);
+    assert_eq!(shared.get("DATABASE_URL"), None);
+
+    let ports = BTreeMap::from([("postgres".to_string(), 17_004)]);
+    let e =
+        super::services::resolve_service_env(&fx.paths, &fx.config, &fx.root, &ports).unwrap_err();
+    assert!(
+        format!("{e:#}").contains("DATABASE_URL in .env holds $PANDO_TEST_UNSET_USER"),
+        "{e:#}"
+    );
+
+    let plan = super::namespaced::plan(&fx.paths, &fx.config);
+    assert!(plan.targets.is_empty(), "{:?}", plan.targets);
+    assert_eq!(plan.shared_data, vec!["postgres".to_string()]);
 }
 
 #[test]

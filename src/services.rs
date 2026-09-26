@@ -809,11 +809,11 @@ pub fn value_in_env(dir: &Path, key: &str) -> Result<Option<String>, Unresolved>
     Ok(value_in_files(&files, key)?.map(|(_, value)| value.to_string()))
 }
 
-/// An env key whose value holds a braced reference that neither pando's
-/// environment nor an earlier line of its file sets: a variable of a shell
-/// pando was not started from, or of a file it does not read, like
-/// `.env.local`. What the app's own loader makes of it is not something
-/// pando can know.
+/// An env key whose value holds a reference, as [`parse_env`] tells one
+/// from a `$` in a password, that neither pando's environment nor an
+/// earlier line of its file sets: a variable of a shell pando was not
+/// started from, or of a file it does not read, like `.env.local`. What
+/// the app's own loader makes of it is not something pando can know.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unresolved {
     pub key: String,
@@ -901,8 +901,8 @@ fn read_env_files(worktree: &Path) -> Vec<(String, ParsedEnv)> {
 #[derive(Debug, Default)]
 struct ParsedEnv {
     values: std::collections::BTreeMap<String, String>,
-    /// Each key whose value holds a braced reference nothing sets, with the
-    /// first such reference as written: `${DB_USER}`. Its value keeps it as
+    /// Each key whose value holds a reference nothing sets, with the first
+    /// such reference as written: `${DB_USER}`. Its value keeps it as
     /// written.
     unresolved: std::collections::BTreeMap<String, String>,
 }
@@ -930,12 +930,15 @@ struct ParsedEnv {
 /// expanded `postgres://${POSTGRES_USER}@…`; handed it unexpanded, ahead
 /// of that loader, the app logged in as a user called `${POSTGRES_USER}`.
 ///
-/// A reference nothing defines is left as written. A braced one makes the
-/// key it is in, and any key built from that one, known to hold it:
-/// [`value_in_env`] says so rather than hand it on. A bare `$word` does
-/// not: it is as often a `$` in a password as a reference, and
-/// python-dotenv, which expands only braces, reads `pa$word` as written
-/// too.
+/// A reference nothing defines is left as written. A braced `${NAME}`
+/// makes the key it is in, and any key built from that one, known to hold
+/// it: [`value_in_env`] says so rather than hand it on. So does a bare
+/// `$NAME` whose name is written the way environment variables are, in
+/// capitals, digits and underscores: dotenv-expand and the Ruby dotenv gem
+/// read `$DB_USER` from a file pando does not read, like `.env.local`. Any
+/// other bare `$word` that names nothing is a `$` and the word after it,
+/// handed on as written: `pa$word` is a password, and python-dotenv, which
+/// expands only braces, reads it as written too.
 pub fn parse_env(text: &str) -> std::collections::BTreeMap<String, String> {
     parse_env_in(text, &|name| std::env::var(name).ok()).values
 }
@@ -1006,7 +1009,7 @@ fn env_entry(line: &str) -> Option<(&str, &str, Option<char>)> {
 /// A value with its references expanded, as [`expand`] makes it.
 struct Expanded {
     text: String,
-    /// The first braced reference in it that nothing sets, as written.
+    /// The first reference in it that nothing sets, as written.
     unresolved: Option<String>,
 }
 
@@ -1043,7 +1046,7 @@ fn expand(value: &str, lookup: &dyn Fn(&str) -> Option<Expanded>) -> Expanded {
                 let written = &tail[..1 + reference.len];
                 Expanded {
                     text: written.to_string(),
-                    unresolved: reference.braced.then(|| written.to_string()),
+                    unresolved: reference.names_a_variable().then(|| written.to_string()),
                 }
             }
         };
@@ -1070,6 +1073,19 @@ struct Reference<'a> {
     /// Whether the default stands in for an empty value too: `:-` rather
     /// than `-`.
     or_empty: bool,
+}
+
+impl Reference<'_> {
+    /// Whether it names a variable even when nothing sets it, rather than
+    /// being a `$` and the word after it: braced, or a bare name written
+    /// the way environment variables are, `$DB_USER` but not `$word`.
+    fn names_a_variable(&self) -> bool {
+        self.braced
+            || self
+                .name
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+    }
 }
 
 /// The reference at the start of `text`, the text after a `$`, if one is
@@ -2069,7 +2085,7 @@ mod tests {
     fn a_bare_dollar_word_that_names_nothing_is_itself_and_handed_on() {
         let parsed = parse_env_in(
             "PASSWORD=pa$word\nURL=postgres://app:${PASSWORD}@localhost/shop\n\
-             DEFAULTED=${NOPE:-pa$word}\n",
+             DEFAULTED=${NOPE:-pa$word}\nMIXED=pa$Word\nDIGITS=pa$x1y\n",
             &|_| None,
         );
         assert_eq!(parsed.values["PASSWORD"], "pa$word");
@@ -2078,11 +2094,13 @@ mod tests {
             "postgres://app:pa$word@localhost/shop"
         );
         assert_eq!(parsed.values["DEFAULTED"], "pa$word");
+        assert_eq!(parsed.values["MIXED"], "pa$Word");
+        assert_eq!(parsed.values["DIGITS"], "pa$x1y");
         assert!(parsed.unresolved.is_empty(), "{:?}", parsed.unresolved);
 
         let dir = worktree_with(&[(
             ".env",
-            "DATABASE_URL=postgres://app:pa$PANDO_TEST_UNSET_WORD@localhost:5432/shop\n",
+            "DATABASE_URL=postgres://app:pa$pando_test_unset_word@localhost:5432/shop\n",
         )]);
         let env = app_env(
             dir.path(),
@@ -2092,12 +2110,63 @@ mod tests {
         .unwrap();
         assert_eq!(
             env["DATABASE_URL"],
-            "postgres://app:pa$PANDO_TEST_UNSET_WORD@localhost:17004/shop"
+            "postgres://app:pa$pando_test_unset_word@localhost:17004/shop"
         );
         assert_eq!(
             value_in_env(dir.path(), "DATABASE_URL").unwrap().as_deref(),
-            Some("postgres://app:pa$PANDO_TEST_UNSET_WORD@localhost:5432/shop")
+            Some("postgres://app:pa$pando_test_unset_word@localhost:5432/shop")
         );
+    }
+
+    // Taken for a `$` in a password, a bare `$DB_USER` that `.env.local`
+    // sets was handed on as written, ahead of the app's own loader, which
+    // would have expanded it: the app logged in as a user called
+    // `$DB_USER`.
+    #[test]
+    fn a_bare_name_written_as_a_variable_is_one_even_when_nothing_sets_it() {
+        let parsed = parse_env_in(
+            "URL=postgres://$DB_USER:$DB_PASSWORD@localhost:5432/app\nBUILT=${URL}\n\
+             ONE=$_\nSET=$APP_HOME/data\n",
+            &|name| (name == "APP_HOME").then(|| "/srv/app".to_string()),
+        );
+        let unresolved = |key: &str| parsed.unresolved.get(key).map(String::as_str);
+        assert_eq!(unresolved("URL"), Some("$DB_USER"));
+        assert_eq!(
+            unresolved("BUILT"),
+            Some("$DB_USER"),
+            "built from a key that holds one"
+        );
+        assert_eq!(unresolved("ONE"), Some("$_"));
+        assert_eq!(unresolved("SET"), None);
+        assert_eq!(
+            parsed.values["URL"],
+            "postgres://$DB_USER:$DB_PASSWORD@localhost:5432/app"
+        );
+        assert_eq!(parsed.values["SET"], "/srv/app/data");
+
+        let dir = worktree_with(&[
+            (
+                ".env",
+                "DATABASE_URL=postgres://$PANDO_TEST_UNSET_USER@localhost:5432/app\n",
+            ),
+            (".env.local", "PANDO_TEST_UNSET_USER=app\n"),
+        ]);
+        let unresolved = Unresolved {
+            key: "DATABASE_URL".into(),
+            file: ".env".into(),
+            reference: "$PANDO_TEST_UNSET_USER".into(),
+        };
+        assert_eq!(
+            value_in_env(dir.path(), "DATABASE_URL"),
+            Err(unresolved.clone())
+        );
+        let e = app_env(
+            dir.path(),
+            &map(&[("DATABASE_URL", "postgres")]),
+            &ports(&[("postgres", 17_004)]),
+        )
+        .unwrap_err();
+        assert_eq!(e.downcast_ref::<Unresolved>(), Some(&unresolved));
     }
 
     // Handed on as written, ahead of the app's own loader, `${DB_USER}` was

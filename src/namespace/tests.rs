@@ -656,13 +656,25 @@ fn a_login_that_holds_a_reference_nothing_sets_is_not_tried() {
     assert_eq!(login.user.as_deref(), Some("root"));
 }
 
+// A bare `$DB_USER` is a variable, set perhaps in a file pando does not
+// read; tried as written, the login was a user called `$DB_USER`.
+#[test]
+fn a_login_that_holds_a_bare_variable_nothing_sets_is_not_tried() {
+    let root = main_checkout(
+        "DATABASE_PORT=3306\nDATABASE_USER=$PANDO_TEST_UNSET_USER\nDATABASE_PASSWORD=pw\n",
+    );
+    let e = login_from_env_files(root.path(), &keys(&["DATABASE_PORT"])).unwrap_err();
+    assert_eq!(e.key, "DATABASE_USER");
+    assert_eq!(e.reference, "$PANDO_TEST_UNSET_USER");
+}
+
 // A password with a `$` in it stopped a namespaced start, taken for a
 // variable nothing sets. The app's loader reads it as written; so does
 // the login.
 #[test]
 fn a_password_with_a_bare_dollar_is_the_login_as_written() {
     let root = main_checkout(
-        "DATABASE_PORT=3306\nDATABASE_USER=app\nDATABASE_PASSWORD=pa$PANDO_TEST_UNSET_WORD\n",
+        "DATABASE_PORT=3306\nDATABASE_USER=app\nDATABASE_PASSWORD=pa$pando_test_unset_word\n",
     );
     let login = login_from_env_files(root.path(), &keys(&["DATABASE_PORT"]))
         .unwrap()
@@ -672,7 +684,7 @@ fn a_password_with_a_bare_dollar_is_the_login_as_written() {
         login.env(Some("MYSQL_PWD")),
         vec![(
             "MYSQL_PWD".to_string(),
-            "pa$PANDO_TEST_UNSET_WORD".to_string()
+            "pa$pando_test_unset_word".to_string()
         )]
     );
 }
