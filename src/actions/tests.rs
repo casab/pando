@@ -10114,6 +10114,7 @@ fn only_one_process_cannot_be_started_onto_namespaces_and_nothing_is_made() {
 /// keys as `slot-<n>` says, a slot past 15 is out of range, and `flushed`
 /// records every slot emptied. A script at `on-size-<n>` runs once, the
 /// first time slot `n` is sized: what another command does meanwhile.
+/// Sizing slot `n` fails with what `fail-<n>` says, when there is one.
 fn fake_redis(paths: &PandoPaths) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let state = paths.home.join("fake-redis");
@@ -10130,6 +10131,7 @@ case "$*" in
   *DBSIZE*)
     if [ "$last" -ge "$(cat "$state/databases" 2>/dev/null || echo 16)" ]; then echo "ERR DB index is out of range" >&2; exit 1; fi
     if [ -f "$state/on-size-$last" ]; then sh "$state/on-size-$last"; rm -f "$state/on-size-$last"; fi
+    if [ -f "$state/fail-$last" ]; then cat "$state/fail-$last" >&2; exit 1; fi
     cat "$state/slot-$last" 2>/dev/null || echo 0 ;;
   *FLUSHDB*) echo 0 > "$state/slot-$last"; echo "$last" >> "$state/flushed"; echo OK ;;
   *) echo "unexpected: $*" >&2; exit 9 ;;
@@ -11002,6 +11004,43 @@ fn a_redis_with_fewer_slots_than_the_recipe_asks_which_stopped_worktree_frees_on
         std::fs::read_to_string(redis.join("flushed")).unwrap(),
         "2\n"
     );
+}
+
+// Only a slot the server says is out of range ends the walk: one it could
+// not be asked about for any other reason says nothing of the slots after
+// it, so the start fails with what the server said, and asks nobody to
+// give up their keys while an empty slot may be there.
+#[test]
+fn a_slot_the_server_could_not_be_asked_about_fails_the_start_and_frees_nothing() {
+    let (ns, redis) = slots_fixture(MAIN_ENV_WITH_REDIS);
+    hold(&ns, (1..=3).map(|n| (n, false)));
+    std::fs::write(
+        redis.join("fail-4"),
+        "Could not connect to Redis at 127.0.0.1:6379: Connection reset by peer\n",
+    )
+    .unwrap();
+    let ask = |q: &Question| -> Result<Answer> { panic!("asked {:?}", q.slot) };
+    let e = format!(
+        "{:#}",
+        resolve_for_start(
+            &ns.fx.paths,
+            &ns.fx.config,
+            &ns.name,
+            Mode::Namespaced,
+            &ask,
+            &noop
+        )
+        .unwrap_err()
+    );
+    assert!(
+        e.contains("how full slot 4 is") && e.contains("Connection reset by peer"),
+        "{e}"
+    );
+
+    let e = format!("{:#}", ns.start(Mode::Namespaced).unwrap_err());
+    assert!(e.contains("Connection reset by peer"), "{e}");
+    assert!(!e.contains("none from it on is given out"), "{e}");
+    assert!(!redis.join("flushed").exists());
 }
 
 // A recorded slot the start will let go is no slot of its own: with every

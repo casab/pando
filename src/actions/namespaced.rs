@@ -765,7 +765,7 @@ fn ensure_slot(
     let elsewhere = slots_elsewhere(&other_projects(paths), target);
     let mut unusable = Unusable::default();
     let mut slots = unheld(target, &holders, &elsewhere);
-    while let Some(n) = first_empty(server, &slots, &mut unusable) {
+    while let Some(n) = first_empty(server, &slots, &mut unusable)? {
         // Taken under the lock, against state as it is by now: another
         // worktree's start running beside this one may have been given it
         // first, and neither app has written to it for its size to show.
@@ -830,7 +830,7 @@ fn unheld(target: &Target, holders: &[Holder], elsewhere: &[Elsewhere]) -> Vec<u
 struct Unusable {
     /// Each one the server says holds keys.
     full: Vec<u32>,
-    /// The one the server could not be asked about, and what it said: a
+    /// The one the server says is out of range, and what it said: a
     /// server with fewer slots than its recipe says has none from there on.
     ended: Option<(u32, String)>,
 }
@@ -864,28 +864,36 @@ impl Unusable {
     }
 }
 
+/// What a Redis answers for a slot past its last one: `ERR DB index is
+/// out of range`.
+const PAST_THE_LAST: &str = "out of range";
+
 /// The first of `slots` the server says is empty, asked in order, with
 /// every one passed on the way written into `unusable`.
 ///
-/// Asked only of a server that has answered a ping with the login, so a
-/// slot it cannot say the size of is one it does not have — a Redis with
-/// fewer databases than its recipe's `slots` — and none after it is asked.
+/// A slot the server says is out of range is one it does not have — a
+/// Redis with fewer databases than its recipe's `slots` — and none after
+/// it is asked. Any other failure to size one is the start's: a timeout,
+/// a dropped connection or a refused login says nothing about which slots
+/// are free, and taking it for the end would ask which stopped worktree's
+/// keys to delete while an empty one may be there.
 fn first_empty(
     server: &namespace::Server<'_>,
     slots: &[u32],
     unusable: &mut Unusable,
-) -> Option<u32> {
+) -> Result<Option<u32>> {
     for &n in slots {
         match server.size(n) {
-            Ok(0) => return Some(n),
+            Ok(0) => return Ok(Some(n)),
             Ok(_) => unusable.full.push(n),
-            Err(e) => {
+            Err(e) if format!("{e:#}").contains(PAST_THE_LAST) => {
                 unusable.ended = Some((n, format!("{e:#}")));
-                return None;
+                return Ok(None);
             }
+            Err(e) => return Err(e),
         }
     }
-    None
+    Ok(None)
 }
 
 /// What became of the slot a worktree's record names, as [`hold_on`]
@@ -1259,7 +1267,7 @@ pub(super) fn free_slots_if_full(
             }
             let server = server_for(paths, config, &target)?;
             server.ping()?;
-            if first_empty(&server, &unheld, &mut unusable).is_some() {
+            if first_empty(&server, &unheld, &mut unusable)?.is_some() {
                 continue;
             }
         }
