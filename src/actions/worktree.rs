@@ -1015,9 +1015,14 @@ pub(super) fn fetch_branch(
 
 /// A bare base name would fork from the possibly stale local branch, so a
 /// worktree created weeks after the last fetch would silently miss
-/// everything merged since. Anything already qualified is used untouched.
+/// everything merged since. A name already qualified with its remote is
+/// used untouched; that is told from the refs, not from a slash, because
+/// `release/1.2` is a branch name too.
 fn resolve_create_base(root: &Path, base: &str) -> String {
-    if !base.contains('/') && ref_exists(root, &format!("refs/remotes/origin/{base}")) {
+    if base.contains('/') && ref_exists(root, &format!("refs/remotes/{base}")) {
+        return base.to_string();
+    }
+    if ref_exists(root, &format!("refs/remotes/origin/{base}")) {
         return format!("origin/{base}");
     }
     base.to_string()

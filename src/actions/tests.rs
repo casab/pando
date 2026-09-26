@@ -7100,6 +7100,56 @@ fn a_bare_base_name_prefers_the_remote_tracking_ref() {
     );
 }
 
+// A base with a slash in its name — `release/1.2`, as a `[branches].rules`
+// base often is — was taken for one already qualified with its remote:
+// refused when only origin had it, and forked from a stale local copy when
+// there was one.
+#[test]
+fn a_base_with_a_slash_in_its_name_prefers_the_remote_tracking_ref_too() {
+    let fx = fixture_with_origin(&["release/1.2"]);
+    let last_commit = |name: &str| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(fx.worktrees_dir().join(name))
+            .args(["log", "-1", "--format=%s"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    let name = new(&fx.paths, &fx.config, "fix/one", Some("release/1.2"), &noop).unwrap();
+    assert_eq!(last_commit(&name), "remote work", "only origin has it");
+
+    git(&fx.root, &["branch", "release/1.2", "origin/release/1.2"]);
+    let seed = fx.root.parent().unwrap().join("seed");
+    git(
+        &seed,
+        &["commit", "--quiet", "--allow-empty", "-m", "origin moved"],
+    );
+    git(&seed, &["push", "--quiet", "origin", "release/1.2"]);
+    git(&fx.root, &["fetch", "--quiet", "origin"]);
+    let name = new(&fx.paths, &fx.config, "fix/two", Some("release/1.2"), &noop).unwrap();
+    assert_eq!(
+        last_commit(&name),
+        "origin moved",
+        "the stale local copy is not the fork point"
+    );
+
+    let name = new(
+        &fx.paths,
+        &fx.config,
+        "fix/three",
+        Some("origin/main"),
+        &noop,
+    )
+    .unwrap();
+    assert_eq!(
+        last_commit(&name),
+        "root",
+        "a qualified name is used as it is"
+    );
+}
+
 #[test]
 fn new_refuses_an_invalid_branch_name_before_creating_anything() {
     let fx = fixture();
