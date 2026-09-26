@@ -1388,7 +1388,14 @@ bare
         let all = stream_updates(&repo, &wts, &["feat+a", "feat+b"], None);
         let one = stream_updates(&repo, &wts, &["feat+a"], Some("main"));
         assert_eq!(one.len(), 1);
-        assert_eq!(one["feat+a"], all["feat+a"]);
+        // head_age is git's relative time ("N seconds ago"), read at each
+        // call: two reads can straddle a second, so it is compared apart.
+        let without_age = |u: &EnrichUpdate| EnrichUpdate {
+            head_age: None,
+            ..u.clone()
+        };
+        assert_eq!(without_age(&one["feat+a"]), without_age(&all["feat+a"]));
+        assert!(one["feat+a"].head_age.is_some());
         assert_eq!(one["feat+a"].ahead_behind, Some((2, 1)));
         assert_eq!(one["feat+a"].head_subject.as_deref(), Some("a 2"));
     }
