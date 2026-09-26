@@ -1929,3 +1929,37 @@ fn a_namespace_login_is_read_from_pandos_own_file_and_nowhere_else() {
     assert_eq!(mariadb.password.as_deref(), Some("hunter2"));
     assert!(!format!("{:?}", loaded.config).contains("hunter2"));
 }
+
+// A file pando prints whole is printed without a login's password,
+// however the login was written, and with everything else as it was.
+#[test]
+fn a_printed_config_hides_every_namespace_password_and_nothing_else() {
+    let text = "# my project\n[dev]\ncmd = \"next dev\"  # detected: package.json\n\n\
+                [namespaced]\ncache = { user = \"u\", password = \"inline-secret\" }\n\n\
+                [namespaced.db]  # answered: 2026-09-26\nuser = \"root\"\n\
+                password = \"table-secret\"  # typed at a start\n";
+    assert_eq!(
+        hide_passwords(text),
+        "# my project\n[dev]\ncmd = \"next dev\"  # detected: package.json\n\n\
+         [namespaced]\ncache = { user = \"u\", password = \"(hidden)\" }\n\n\
+         [namespaced.db]  # answered: 2026-09-26\nuser = \"root\"\n\
+         password = \"(hidden)\"  # typed at a start\n"
+    );
+    assert_eq!(
+        hide_passwords("namespaced.db.password = \"dotted-secret\"\n"),
+        "namespaced.db.password = \"(hidden)\"\n"
+    );
+    // A password anywhere else is not a login pando keeps, and a file
+    // with none is returned exactly as it was.
+    let other = "[dev]\ncmd = \"x\"\nenv = { password = \"not-a-login\" }\n";
+    assert_eq!(hide_passwords(other), other);
+}
+
+#[test]
+fn a_printed_config_that_does_not_parse_hides_every_line_naming_a_password() {
+    let text = "[namespaced.db\nuser = \"root\"\npassword = \"s3cret\"\n";
+    assert_eq!(
+        hide_passwords(text),
+        "[namespaced.db\nuser = \"root\"\npassword = \"(hidden)\"\n"
+    );
+}

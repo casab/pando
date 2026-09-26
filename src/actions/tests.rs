@@ -5585,6 +5585,44 @@ fn a_dry_run_sees_the_developers_own_recipes_and_shims() {
     assert!(!fx.paths.home.join("preview").exists());
 }
 
+// The preview prints pando's own file for the project whole, and that is
+// where a login typed at a namespaced start is kept. It printed the
+// password; doctor, reading the same file, never has.
+#[test]
+fn a_dry_run_prints_a_namespace_login_without_its_password() {
+    let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");
+    let kept = "[namespaced]\ncache = { password = \"t0ps3cret\" }\n\n\
+                [namespaced.db]  # answered: 2026-09-26\nuser = \"root\"\npassword = \"s3cret\"\n";
+    std::fs::create_dir_all(fx.paths.project_dir()).unwrap();
+    std::fs::write(fx.paths.config_file(), kept).unwrap();
+
+    let (_, preview) =
+        init_dry_run(&fx.paths, &fx.config, &Answering::asking(&refuse), &noop).unwrap();
+    let body = preview
+        .iter()
+        .find(|(path, _)| *path == fx.paths.config_file())
+        .map(|(_, body)| body.as_str())
+        .expect("the pass changes the project file, so it is previewed");
+    assert!(body.contains(r#"cmd = "pnpm dev""#), "{body}");
+    assert!(!body.contains("s3cret"), "{body}");
+    assert!(!body.contains("t0ps3cret"), "{body}");
+    assert!(
+        body.contains(
+            "[namespaced.db]  # answered: 2026-09-26\nuser = \"root\"\npassword = \"(hidden)\"\n"
+        ),
+        "{body}"
+    );
+    assert!(
+        body.contains("cache = { password = \"(hidden)\" }"),
+        "{body}"
+    );
+    // Only what is printed: the file itself keeps the login it holds.
+    assert_eq!(
+        std::fs::read_to_string(fx.paths.config_file()).unwrap(),
+        kept
+    );
+}
+
 #[test]
 fn init_takes_every_slot_a_rule_decided_and_asks_nothing() {
     let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");

@@ -22,6 +22,7 @@
 
 mod edit;
 mod layers;
+mod redact;
 mod schema;
 mod suggest;
 mod validate;
@@ -31,6 +32,7 @@ pub use edit::{
     set_detected_array_entry, set_detected_table, write,
 };
 pub use layers::{Loaded, load, load_without_home};
+pub use redact::{HIDDEN, hide_passwords, is_password};
 pub use schema::{
     BranchRule, BranchesSection, Config, HookConfig, HookPoint, HookScope, ISOLATION_KINDS,
     IsolationSection, LoginConfig, PortsSpec, ProbeConfig, ProcessConfig, ProjectSection,

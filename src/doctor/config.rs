@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use crate::config::Config;
+use crate::config::{Config, HIDDEN, is_password};
 use crate::paths::PandoPaths;
 use crate::{ports, state};
 
@@ -247,15 +247,6 @@ fn walk_table(table: &toml_edit::Table, prefix: &str, out: &mut Vec<KeyReport>) 
             toml_edit::Item::None => {}
         }
     }
-}
-
-/// What a password's value reads as in the report.
-pub(super) const HIDDEN: &str = "(hidden)";
-
-/// `namespaced.<service>.password`: a login pando keeps for namespaced
-/// starts.
-fn is_password(key: &str) -> bool {
-    key.starts_with("namespaced.") && key.ends_with(".password")
 }
 
 /// A value without the whitespace and comments around it: the report lines

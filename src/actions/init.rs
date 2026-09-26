@@ -119,7 +119,9 @@ fn init_slots(
 /// Returns the report and the files as they would be, each with the path
 /// it would really land at. The same pass, the same resolver and the same
 /// renderer: a preview that re-implemented the writing would be a preview
-/// of something else.
+/// of something else. The one difference is a namespace login's password,
+/// which reads as `(hidden)`: the files are printed, and a login is never
+/// a line of output.
 ///
 /// The copies live in a scratch directory under pando's **own home**,
 /// which is one of the three places Invariant 1 names — a preview is not
@@ -206,7 +208,8 @@ pub fn init_dry_run(
         .filter_map(|(real, preview)| {
             let body = std::fs::read_to_string(preview).ok()?;
             let before = std::fs::read_to_string(real).ok();
-            (before.as_deref() != Some(body.as_str())).then(|| (real.clone(), body))
+            (before.as_deref() != Some(body.as_str()))
+                .then(|| (real.clone(), config::hide_passwords(&body)))
         })
         .collect();
     Ok((
