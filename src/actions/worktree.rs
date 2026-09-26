@@ -56,6 +56,21 @@ pub fn new(
         bail!("{dir_name:?} is the main checkout's directory name");
     }
     if let Some(found) = existing.worktrees.iter().find(|w| w.name == dir_name) {
+        // A prunable entry is one whose directory is gone, and "already
+        // exists at" a path that is not there says nothing about the one
+        // command that clears it.
+        if found.prunable {
+            bail!(
+                "git still lists a worktree named {dir_name:?} at {}, but a prunable one ({}) — \
+                 `pando rm {}` clears that entry, and then this can run again",
+                found.path.display(),
+                found
+                    .prunable_reason
+                    .as_deref()
+                    .unwrap_or("its directory is gone"),
+                found.display_name()
+            );
+        }
         bail!(
             "a worktree named {dir_name:?} already exists at {}",
             found.path.display()

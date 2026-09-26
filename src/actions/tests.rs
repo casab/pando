@@ -7104,6 +7104,28 @@ fn rm_clears_one_prunable_entry_and_leaves_the_others_alone() {
     );
 }
 
+// git still lists a worktree whose directory was deleted, and `new` said
+// it "already exists at" a path that was not there, with nothing about
+// the `rm` that clears the entry.
+#[test]
+fn new_over_a_prunable_entry_names_the_rm_that_clears_it() {
+    let fx = fixture();
+    let name = new(&fx.paths, &fx.config, "feat/gone", None, &noop).unwrap();
+    std::fs::remove_dir_all(fx.worktrees_dir().join(&name)).unwrap();
+
+    let err = new(&fx.paths, &fx.config, "feat/gone", None, &noop).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("prunable"), "{msg}");
+    assert!(msg.contains("`pando rm feat/gone`"), "{msg}");
+    assert!(!msg.contains("already exists"), "{msg}");
+
+    rm(&fx.paths, &name, false, false).unwrap();
+    assert_eq!(
+        new(&fx.paths, &fx.config, "feat/gone", None, &noop).unwrap(),
+        name
+    );
+}
+
 #[test]
 fn rm_refuses_the_main_checkout_and_an_unknown_name() {
     let fx = fixture();
