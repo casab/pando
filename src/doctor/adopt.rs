@@ -74,15 +74,16 @@ pub(super) fn adoptable(paths: &PandoPaths) -> Vec<Adoptable> {
         {
             continue;
         }
-        let old_root = recorded_root(&entry.path());
+        let (old_root, ours) = recorded_root(paths.root(), &entry.path());
         // A folder whose repository is still there belongs to a live
         // project — two checkouts of the same repository under different
         // directories is an ordinary thing, and adopting one of them would
         // be stealing it. One that names no repository but still has
-        // something running is some checkout's own too.
+        // something running is some checkout's own too, unless that
+        // checkout is one of this repository's.
         let in_use = match &old_root {
             Some(root) => root.exists(),
-            None => running_process(&entry.path()).is_some(),
+            None => !ours && running_process(&entry.path()).is_some(),
         };
         if in_use {
             continue;
@@ -111,15 +112,25 @@ pub(super) fn adoptable(paths: &PandoPaths) -> Vec<Adoptable> {
 ///
 /// Where they name more than one, one that is still there wins: a folder
 /// a live checkout still points at is that checkout's own.
-fn recorded_root(project_dir: &Path) -> Option<PathBuf> {
+///
+/// One that names `this_root` is left out, and said apart as `true`: a
+/// worktree kept in a configured `worktrees_dir` that `git worktree
+/// repair` pointed at the repository after it moved is no live other
+/// checkout, but a sign the folder is this repository's.
+fn recorded_root(this_root: &Path, project_dir: &Path) -> (Option<PathBuf>, bool) {
     let mut first = None;
+    let mut ours = false;
     for root in candidate_roots(project_dir) {
+        if std::fs::canonicalize(&root).is_ok_and(|root| root == this_root) {
+            ours = true;
+            continue;
+        }
         if root.exists() {
-            return Some(root);
+            return (Some(root), ours);
         }
         first.get_or_insert(root);
     }
-    first
+    (first, ours)
 }
 
 /// Every repository a project folder's contents name, in the order
@@ -171,8 +182,9 @@ fn checkout_root(checkout: &Path) -> Option<PathBuf> {
 
 /// A process pando started from a project folder that is still running.
 ///
-/// Asked only of a folder that names no repository: without one, a
-/// running process is the one sign left that some checkout still uses it.
+/// Asked only of a folder that names no repository, this one included:
+/// without one, a running process is the one sign left that some checkout
+/// still uses it.
 fn running_process(project_dir: &Path) -> Option<u32> {
     let store = state::load(&project_dir.join("state.json")).ok()?;
     store
@@ -245,7 +257,7 @@ pub fn adopt(
             to.display()
         );
     }
-    let old_root = recorded_root(&from);
+    let (old_root, ours) = recorded_root(paths.root(), &from);
     if let Some(root) = &old_root
         && root.exists()
     {
@@ -256,6 +268,7 @@ pub fn adopt(
         );
     }
     if old_root.is_none()
+        && !ours
         && let Some(pid) = running_process(&from)
     {
         anyhow::bail!(

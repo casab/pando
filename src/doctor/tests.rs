@@ -2454,6 +2454,64 @@ fn a_folder_that_names_no_repository_and_still_runs_something_is_not_moved() {
     assert!(!fx.paths.project_dir().exists());
 }
 
+// After a move, `git worktree repair` points a worktree kept in a
+// configured `worktrees_dir` at the repository where it is now: this one.
+// That read as a live other checkout using the folder, so the folder the
+// move left behind was not offered, and `--adopt` refused it by naming
+// the repository it was run from.
+#[test]
+fn a_folder_whose_recorded_worktree_names_this_repository_is_adopted() {
+    let fx = fixture();
+    let outside = fx
+        .root
+        .parent()
+        .expect("a parent")
+        .join("custom-worktrees")
+        .join("feat+one");
+    std::fs::create_dir_all(&outside).expect("a worktree outside the folder");
+    std::fs::write(
+        outside.join(".git"),
+        format!("gitdir: {}/.git/worktrees/feat+one\n", fx.root.display()),
+    )
+    .expect("git marker");
+    let old_id = format!("{}-deadbeef", fx.paths.project.display_name);
+    let dir = fx.home.join("projects").join(&old_id);
+    std::fs::create_dir_all(&dir).expect("project folder");
+    let mut record = state::WorktreeRecord::new(&outside, false);
+    // Still running from before the move, which is no other checkout's
+    // either: the worktree it runs in is this repository's.
+    record.processes.insert(
+        "dev".to_string(),
+        state::ProcessRecord {
+            pid: std::process::id(),
+            pgid: 999_999,
+            started_at: chrono::Utc::now(),
+            log_path: dir.join("dev.log"),
+            ready_port: None,
+            ready_timeout_s: None,
+            observed_ports: Vec::new(),
+            swept: false,
+            phase: state::Phase::Running {
+                since: chrono::Utc::now(),
+            },
+        },
+    );
+    state::save(&dir.join("state.json"), &one_worktree("feat+one", record)).expect("state");
+
+    let report = report(&fx);
+    assert_eq!(report.adoption.len(), 1, "{:?}", report.adoption);
+    assert_eq!(
+        report.adoption[0].old_root, None,
+        "this repository is not where it was"
+    );
+    adopt(&fx.paths, &old_id, &yes).expect("adopt");
+    assert!(!dir.exists(), "the old folder moved");
+    assert!(
+        fx.paths.project_dir().join("state.json").is_file(),
+        "under this repository's id"
+    );
+}
+
 #[test]
 fn a_git_marker_that_does_not_name_an_absolute_repository_says_it_does_not_know() {
     let fx = fixture();
