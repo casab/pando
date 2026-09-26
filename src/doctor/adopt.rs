@@ -169,15 +169,15 @@ fn checkout_root(checkout: &Path) -> Option<PathBuf> {
     if marker.is_dir() {
         return checkout.is_absolute().then(|| checkout.to_path_buf());
     }
-    let text = std::fs::read_to_string(&marker).ok()?;
-    let gitdir = PathBuf::from(text.lines().find_map(|l| l.strip_prefix("gitdir:"))?.trim());
+    let gitdir = crate::worktree::linked_gitdir(checkout)?;
     // `<root>/.git/worktrees/<name>` — three components back to the
-    // checkout it was linked from. Absolute, because git writes it
-    // absolute and a relative one climbing out of three components
-    // leaves an empty path that would read as "its repository was at
-    // , and is not there now".
+    // checkout it was linked from. A root whose own `.git` is a file is a
+    // linked checkout and not a repository: a relative
+    // `.git/worktrees/<name>` climbs back to the checkout itself, which
+    // git never writes, and that is no repository rather than one that is
+    // still there.
     let root = gitdir.ancestors().nth(3)?;
-    root.is_absolute().then(|| root.to_path_buf())
+    (root.is_absolute() && !root.join(".git").is_file()).then(|| root.to_path_buf())
 }
 
 /// A process pando started from a project folder that is still running.

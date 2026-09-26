@@ -11439,6 +11439,44 @@ fn every_slot_held_names_where_another_projects_records_are() {
     assert!(!redis.join("flushed").exists());
 }
 
+// git 2.48 and later can write a worktree's `gitdir:` relative to the
+// worktree. It was resolved from pando's own directory instead, so a live
+// project's slot read as one whose checkout is gone.
+#[test]
+fn a_relative_gitdir_is_resolved_from_the_worktree_that_holds_the_slot() {
+    let (ns, _redis) = slots_fixture(MAIN_ENV_WITH_REDIS);
+    hold(&ns, (1..=14).map(|n| (n, true)));
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join("shop/.git/worktrees/feat+theirs")).unwrap();
+    let worktree = dir.path().join("worktrees/feat+theirs");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(
+        worktree.join(".git"),
+        "gitdir: ../../shop/.git/worktrees/feat+theirs\n",
+    )
+    .unwrap();
+    let mut theirs = slot_holder(15, false, 1);
+    theirs.path = worktree;
+    hold_elsewhere(&ns, theirs);
+    let ask = |q: &Question| -> Result<Answer> { panic!("asked {:?}", q.slot) };
+    let e = format!(
+        "{:#}",
+        resolve_for_start(
+            &ns.fx.paths,
+            &ns.fx.config,
+            &ns.name,
+            Mode::Namespaced,
+            &ask,
+            &noop
+        )
+        .unwrap_err()
+    );
+    assert!(
+        e.contains("slot 15 (feat+theirs of project other-1a2b3c4d)"),
+        "{e}"
+    );
+}
+
 // A project whose state does not load may record the same slot: `rm`
 // leaves it, says which project and why, and empties nothing.
 #[test]

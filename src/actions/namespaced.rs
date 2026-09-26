@@ -1200,14 +1200,7 @@ fn elsewhere_hint(paths: &PandoPaths, elsewhere: &[Elsewhere]) -> String {
 /// git writes `gitdir: <repository>/.git/worktrees/<name>` into its `.git`
 /// file, and that is not there any more.
 fn repository_gone(path: &std::path::Path) -> bool {
-    std::fs::read_to_string(path.join(".git"))
-        .ok()
-        .and_then(|text| {
-            text.lines()
-                .find_map(|line| line.strip_prefix("gitdir:"))
-                .map(|gitdir| !std::path::Path::new(gitdir.trim()).exists())
-        })
-        .unwrap_or(false)
+    crate::worktree::linked_gitdir(path).is_some_and(|gitdir| !gitdir.exists())
 }
 
 /// Stops a start that would give out a slot while another project's state

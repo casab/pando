@@ -2732,6 +2732,45 @@ fn a_git_marker_that_does_not_name_an_absolute_repository_says_it_does_not_know(
     );
 }
 
+// git 2.48 and later write a worktree's `gitdir:` relative to the worktree
+// when `worktree.useRelativePaths` is set. doctor kept only an absolute
+// one, so a live clone by the same name whose worktrees were made that way
+// named no repository, and with nothing running its folder was offered.
+#[test]
+fn a_relative_gitdir_names_the_repository_it_climbs_back_to() {
+    let fx = fixture();
+    let old_id = format!("{}-deadbeef", fx.paths.project.display_name);
+    let other = fx.root.parent().expect("a parent").join("still-here");
+    std::fs::create_dir_all(other.join(".git/worktrees/feat+one")).expect("the other clone");
+    let wt = fx
+        .home
+        .join("projects")
+        .join(&old_id)
+        .join("worktrees/feat+one");
+    std::fs::create_dir_all(&wt).expect("worktree dir");
+    // The worktree, `worktrees/`, the folder, `projects/` and the home.
+    std::fs::write(
+        wt.join(".git"),
+        "gitdir: ../../../../../still-here/.git/worktrees/feat+one\n",
+    )
+    .expect("marker");
+    assert!(
+        report(&fx).adoption.is_empty(),
+        "a live clone's folder is not offered"
+    );
+    let err = adopt(&fx.paths, &old_id, &yes).unwrap_err();
+    assert!(format!("{err:#}").contains("is still there"), "{err:#}");
+
+    // Once that repository has gone, the folder says where it was.
+    std::fs::remove_dir_all(&other).expect("the clone moves away");
+    let report = report(&fx);
+    assert_eq!(report.adoption.len(), 1, "{:?}", report.adoption);
+    assert_eq!(
+        report.adoption[0].old_root.as_deref(),
+        Some(other.display().to_string().as_str())
+    );
+}
+
 #[test]
 fn a_folder_for_a_differently_named_repository_is_not_this_one_moved() {
     let fx = fixture();

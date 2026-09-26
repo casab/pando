@@ -188,6 +188,38 @@ pub fn porcelain_paths(root: &Path) -> Result<Vec<PathBuf>> {
         .collect())
 }
 
+/// The git directory a linked checkout's `.git` file names —
+/// `<repository>/.git/worktrees/<name>` — as an absolute path. `None` when
+/// its `.git` is not such a file.
+///
+/// Git writes it absolute, or relative to the checkout when
+/// `worktree.useRelativePaths` is set (git 2.48 and later), and resolves a
+/// relative one from the checkout's own directory, so that is where it is
+/// resolved here. The `..` in it are folded by hand, because what a caller
+/// wants to know is often that the directory is no longer there.
+pub fn linked_gitdir(checkout: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(checkout.join(".git")).ok()?;
+    let named = text.lines().find_map(|l| l.strip_prefix("gitdir:"))?.trim();
+    if named.is_empty() {
+        return None;
+    }
+    let named = Path::new(named);
+    if named.is_absolute() {
+        return Some(named.to_path_buf());
+    }
+    let mut out = std::fs::canonicalize(checkout).unwrap_or_else(|_| checkout.to_path_buf());
+    for part in named.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            part => out.push(part),
+        }
+    }
+    Some(out)
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PorcelainEntry {
     pub path: PathBuf,
@@ -1829,6 +1861,75 @@ bare
         assert_eq!(
             entries[0].prunable_reason.as_deref(),
             Some("gitdir file points to non-existent location")
+        );
+    }
+
+    // `git worktree add --relative-paths`, or `worktree.useRelativePaths`,
+    // writes the gitdir relative to the worktree, and git resolves it from
+    // there — whether or not the repository is still where it names.
+    #[test]
+    fn a_relative_gitdir_is_resolved_from_the_worktree_it_is_in() {
+        let dir = tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let checkout = base.join("home/worktrees/feat+one");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::write(
+            checkout.join(".git"),
+            "gitdir: ../../../repo/.git/worktrees/feat+one\n",
+        )
+        .unwrap();
+        assert_eq!(
+            linked_gitdir(&checkout),
+            Some(base.join("repo/.git/worktrees/feat+one"))
+        );
+
+        std::fs::write(
+            checkout.join(".git"),
+            "gitdir: /abs/repo/.git/worktrees/x\n",
+        )
+        .unwrap();
+        assert_eq!(
+            linked_gitdir(&checkout),
+            Some(PathBuf::from("/abs/repo/.git/worktrees/x"))
+        );
+
+        std::fs::write(checkout.join(".git"), "gitdir: \n").unwrap();
+        assert_eq!(linked_gitdir(&checkout), None, "an empty one names nothing");
+        std::fs::remove_file(checkout.join(".git")).unwrap();
+        std::fs::create_dir(checkout.join(".git")).unwrap();
+        assert_eq!(
+            linked_gitdir(&checkout),
+            None,
+            "a main checkout's is a directory"
+        );
+    }
+
+    // The form git itself writes, end to end.
+    #[test]
+    fn the_gitdir_git_writes_with_relative_paths_is_the_one_it_uses() {
+        let (_dir, repo) = repo_with_worktrees(&[]);
+        let path = repo.parent().unwrap().join("trees/rel");
+        git(
+            &repo,
+            &[
+                "-c",
+                "worktree.useRelativePaths=true",
+                "worktree",
+                "add",
+                "-b",
+                "rel",
+                path.to_str().unwrap(),
+            ],
+        );
+        let gitdir = linked_gitdir(&path).expect("a linked worktree");
+        assert!(
+            gitdir.is_dir(),
+            "{} is where git keeps it",
+            gitdir.display()
+        );
+        assert_eq!(
+            std::fs::canonicalize(&gitdir).unwrap(),
+            std::fs::canonicalize(repo.join(".git/worktrees/rel")).unwrap()
         );
     }
 }
