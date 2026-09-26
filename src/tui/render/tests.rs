@@ -1196,6 +1196,70 @@ fn the_tail_header_names_every_process_and_marks_the_one_it_shows() {
     );
 }
 
+/// An app whose selected worktree's tail follows a real log of `count`
+/// lines, `line 0` onward, polled once.
+fn app_tailing_numbered_lines(dir: &std::path::Path, count: usize) -> (App, std::path::PathBuf) {
+    let log = dir.join("dev.log");
+    let body: String = (0..count).map(|i| format!("line {i}\n")).collect();
+    std::fs::write(&log, body).unwrap();
+    let mut app = test_app(&["feat+one"]);
+    with_process(&mut app, "feat+one", running_phase());
+    let record = app.state.worktrees.get_mut("feat+one").unwrap();
+    record.processes.get_mut("dev").unwrap().log_path = log.clone();
+    app.handle_event(crate::tui::app::AppEvent::Tick);
+    (app, log)
+}
+
+/// The numbered lines a paint shows, top to bottom.
+fn numbered_lines_shown(painted: &str) -> Vec<String> {
+    painted
+        .lines()
+        .filter_map(|row| {
+            let at = row.find("line ")?;
+            let digits: String = row[at + 5..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            (!digits.is_empty()).then(|| format!("line {digits}"))
+        })
+        .collect()
+}
+
+// The tail's scroll counts back from the newest line, and nothing moved
+// it as lines arrived, so what the reader had paged back to slid out of
+// view at the log's rate.
+#[test]
+fn a_scrolled_back_tail_stays_on_its_lines_as_new_ones_arrive() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, log) = app_tailing_numbered_lines(dir.path(), 40);
+    draw(&mut app, 120, 30);
+    app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+    let before = numbered_lines_shown(&text_of(&draw(&mut app, 120, 30)));
+    assert!(!before.is_empty() && !before.contains(&"line 39".to_string()));
+
+    let mut file = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+    std::io::Write::write_all(&mut file, b"line 40\nline 41\nline 42\n").unwrap();
+    app.handle_event(crate::tui::app::AppEvent::Tick);
+    let after = numbered_lines_shown(&text_of(&draw(&mut app, 120, 30)));
+    assert_eq!(after, before);
+}
+
+// The scroll stopped one line short of the whole buffer, so paging back
+// far enough left one line at the top of the tail and the rows under it
+// blank.
+#[test]
+fn paging_back_through_the_tail_stops_at_a_full_first_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, _log) = app_tailing_numbered_lines(dir.path(), 40);
+    draw(&mut app, 120, 30);
+    for _ in 0..10 {
+        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+    }
+    let shown = numbered_lines_shown(&text_of(&draw(&mut app, 120, 30)));
+    assert_eq!(shown.len(), app.tail_rows, "{shown:?}");
+    assert_eq!(shown[0], "line 0");
+}
+
 // Level colours are what make an error findable in a wall of output.
 #[test]
 fn log_levels_are_painted_in_their_own_colours() {

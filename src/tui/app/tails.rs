@@ -113,10 +113,16 @@ impl App {
             .tail_target()
             .and_then(|(key, _, _)| self.log_tails.get(&key).map(|t| t.lines().len()))
             .unwrap_or(0);
-        let max = lines.saturating_sub(1);
+        let max = self.max_tail_scroll(lines);
         // Negative is "up", which in a tail means further back.
         let next = self.tail_scroll as isize - delta;
         self.tail_scroll = next.clamp(0, max as isize) as usize;
+    }
+
+    /// How far back a tail of `lines` lines scrolls: to its oldest page,
+    /// which still fills the tail's rows.
+    fn max_tail_scroll(&self, lines: usize) -> usize {
+        lines.saturating_sub(self.tail_rows.max(1))
     }
 
     /// Reads whatever the log on screen has grown by — the viewer's when it
@@ -129,6 +135,17 @@ impl App {
         let Some((key, _, path)) = self.tail_target() else {
             return false;
         };
-        self.log_tails.touch(&key, path).poll().unwrap_or(false)
+        let tail = self.log_tails.touch(&key, path);
+        let seen = tail.lines_seen();
+        let grew = tail.poll().unwrap_or(false);
+        let arrived = (tail.lines_seen() - seen) as usize;
+        let lines = tail.lines().len();
+        // The scroll counts back from the newest line, so a tail scrolled
+        // back moves by what arrived and stays on the lines being read.
+        if self.tail_scroll > 0 {
+            let max = self.max_tail_scroll(lines);
+            self.tail_scroll = self.tail_scroll.saturating_add(arrived).min(max);
+        }
+        grew
     }
 }
