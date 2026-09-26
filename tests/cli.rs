@@ -2948,6 +2948,41 @@ fn signals_says_what_its_compose_reader_could_not_follow() {
     assert_eq!(signals["compose"][0]["services"][0], "db");
 }
 
+// A config that declares its processes has answered the dev command and
+// its ports, and the resolver never asks either. Published as open, a
+// program that watches `answered` sent them again on every run and was
+// told each time that nothing asked about them.
+#[test]
+fn signals_publishes_the_dev_command_answered_when_config_declares_its_processes() {
+    let e = env_of(Kind::NextMessy);
+    e.write_config(
+        "[processes.web]\ncmd = \"pnpm dev:web\"\nports = [\"web\"]\n\n\
+         [processes.api]\ncmd = \"pnpm dev:api\"\nports = [\"api\"]\n",
+    );
+    let signals = signals_of(&e);
+    for name in ["dev_cmd", "port_env"] {
+        let slot = signals["slots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["slot"] == name)
+            .unwrap_or_else(|| panic!("no slot named {name}"));
+        assert_eq!(slot["answered"], true, "{slot:#}");
+    }
+
+    // A preview, so the questions this fixture still has stay open.
+    let out = e.pando_stdin(
+        &["init", "--answers", "-", "--dry-run"],
+        r#"{"dev_cmd": "pnpm dev"}"#,
+    );
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("dev_cmd is already answered"),
+        "{}",
+        stderr(&out)
+    );
+}
+
 // The names `signals` publishes are the names an answers file uses,
 // because both are the slot's own. Proven by answering what it reports.
 #[test]

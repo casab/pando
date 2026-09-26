@@ -310,7 +310,7 @@ pub(super) fn init_asker(
 pub(super) fn report_unused(answers: &Answers, before: &Config) {
     for slot in answers.unasked() {
         let name = slot_name(slot);
-        if actions::already_answered(slot, before) {
+        if actions::settled(slot, before) {
             notice(&format!(
                 "{name} is already answered — the answers file was not applied to it"
             ));

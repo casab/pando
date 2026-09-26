@@ -680,7 +680,9 @@ pub fn resolve_on(
         }
         RuntimeOutcome::Fine => {}
     }
-    if prelude_proposal.is_none() && slots.iter().all(|slot| already_answered(*slot, &config)) {
+    // Of the config as loaded, so [`settled`]'s answer holds: nothing in
+    // this run has changed it yet.
+    if prelude_proposal.is_none() && slots.iter().all(|slot| settled(*slot, &config)) {
         return Ok(config);
     }
     let signals = detect::signals(paths.root());
@@ -1413,12 +1415,31 @@ pub(super) fn slot_label(slot: Slot) -> &'static str {
     }
 }
 
-/// Whether config already says what this slot needs, from any layer.
+/// Whether nothing about this slot is left to ask, of the config as it
+/// was loaded.
 ///
 /// Public because it is the one answer to "is there still a question
-/// here": `init` reports it, `signals` publishes it, and a second
-/// implementation of it would be a second opinion.
-pub fn already_answered(slot: Slot, config: &Config) -> bool {
+/// here": `init` reports it, `signals` publishes it, an answers file's
+/// unused values are explained by it, and a second implementation of it
+/// would be a second opinion.
+///
+/// [`already_answered`], plus the one thing that function cannot say: a
+/// config whose processes are not the lone `[dev]` detection may fill has
+/// answered the dev command and its ports by declaring them, which is why
+/// the resolver never asks either. Not for use mid-run — once a deferred
+/// answer puts `[dev].cmd` in memory, the same test would skip the port
+/// question that answer is waiting on.
+pub fn settled(slot: Slot, config: &Config) -> bool {
+    already_answered(slot, config)
+        || (matches!(slot, Slot::DevCmd | Slot::PortEnv) && !detect::may_fill_dev(config))
+}
+
+/// Whether config already says what this slot needs, from any layer.
+///
+/// Re-read by the resolver on every slot, of a config earlier answers in
+/// the same run have changed; what a reader outside the run wants is
+/// [`settled`].
+fn already_answered(slot: Slot, config: &Config) -> bool {
     match slot {
         Slot::Install => config.project.install.is_some(),
         Slot::VersionFiles => !config.runtime.version_files.is_empty(),
@@ -1430,7 +1451,10 @@ pub fn already_answered(slot: Slot, config: &Config) -> bool {
         // worktree needs a local file of theirs, and an answer nothing
         // records is asked again on every `new`.
         Slot::Provision => config.project.provision.is_some(),
-        Slot::Services => !config.services.is_empty(),
+        // `[isolation] none` included: it is how the native half records
+        // "none of them", and a reader that missed it published the slot
+        // open for good and probed the machine on every isolated start.
+        Slot::Services => !detect::still_needed(slot, config),
         Slot::SchemaHook => !config.hooks.is_empty(),
         // Both of these now live in one place, because they are the same
         // question asked twice: has anything already said what this

@@ -11,7 +11,7 @@ use crate::detect::{self, Slot};
 use crate::paths::PandoPaths;
 use crate::process as proc;
 
-use super::questions::{Answering, already_answered, resolve_silencing, slot_label};
+use super::questions::{Answering, resolve_silencing, settled, slot_label};
 use super::services::service_roles;
 // Only for the intra-doc links above `ALL_SLOTS` and `init_dry_run`.
 #[cfg(doc)]
@@ -103,7 +103,7 @@ fn init_slots(
 ) -> Result<InitReport> {
     let before: Vec<bool> = ALL_SLOTS
         .iter()
-        .map(|slot| already_answered(*slot, config))
+        .map(|slot| settled(*slot, config))
         .collect();
     resolve_silencing(paths, config, slots, &[], answers, progress)?;
     // Read back from disk rather than reported from memory. The summary is
@@ -311,7 +311,7 @@ fn init_report(paths: &PandoPaths, loaded: &config::Loaded, before: &[bool]) -> 
             slot: *slot,
             label: slot_label(*slot),
             value: slot_value(&loaded.config, *slot),
-            answered_now: !before[i] && already_answered(*slot, &loaded.config),
+            answered_now: !before[i] && settled(*slot, &loaded.config),
         })
         .collect();
     let user_file = slots
@@ -410,11 +410,12 @@ fn ports_summary(ports: &config::PortsSpec) -> String {
 }
 
 /// The services a worktree would run private copies of. `none` when an
-/// entry exists and includes nothing, which is the written-down answer
-/// "none of them"; `None` when no entry exists at all.
+/// entry exists and includes nothing, or when `[isolation] none` says so,
+/// which are the two written-down answers "none of them"; `None` when
+/// nothing says anything at all.
 fn services_summary(config: &Config) -> Option<String> {
     if config.services.is_empty() {
-        return None;
+        return config.isolation.none.then(|| "none".to_string());
     }
     let mut names: Vec<String> = Vec::new();
     for service in &config.services {

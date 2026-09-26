@@ -171,7 +171,7 @@ pub fn signals_json<W: Write>(paths: &PandoPaths, config: &Config, out: &mut W) 
             .map(|slot| SlotOut {
                 slot: *slot,
                 prompt: slot.prompt(),
-                answered: actions::already_answered(*slot, config),
+                answered: actions::settled(*slot, config),
                 proposal: proposals.iter().find(|p| p.slot == *slot).map(proposal_out),
             })
             .collect(),

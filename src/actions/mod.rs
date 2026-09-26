@@ -35,8 +35,8 @@ pub use namespaced::{
 };
 pub use questions::{
     Answer, Answering, Ask, NEW_SLOTS, NeedsAnswer, Question, RefusedAnswer, START_SLOTS,
-    Volunteered, already_answered, question_for, recommended, resolve, resolve_for_new,
-    resolve_for_start, resolve_on, resolve_process, resolve_silencing,
+    Volunteered, question_for, recommended, resolve, resolve_for_new, resolve_for_start,
+    resolve_on, resolve_process, resolve_silencing, settled,
 };
 pub use refresh::{FAILURE_SHOWN_LINES, Refreshed, failure_tail, inspect, refresh};
 pub use runtime::{Machine, runtime_shell, user_home, with_prelude};

@@ -67,7 +67,7 @@ pub(super) fn hooks_report(
 /// The schema question is always a question — it touches data — and only
 /// an isolated start asks it, so an unanswered one is worth a note.
 fn schema_slot_finding(paths: &PandoPaths, config: &Config, findings: &mut Vec<Finding>) {
-    if actions::already_answered(detect::Slot::SchemaHook, config) {
+    if actions::settled(detect::Slot::SchemaHook, config) {
         return;
     }
     let signals = detect::signals(paths.root());

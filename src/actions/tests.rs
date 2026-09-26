@@ -5260,6 +5260,49 @@ fn a_program_saying_no_to_a_schema_step_nobody_found_writes_nothing_and_carries_
     );
 }
 
+// What `signals` publishes as `answered`, and what `init` reports, is
+// what the resolver really asks. A config that declares two processes
+// is never asked for a dev command or its ports, and was published as
+// open on both forever; so was the services slot after a native project
+// answered "none of them", which is written as `[isolation] none`.
+#[test]
+fn a_slot_the_resolver_will_never_ask_is_settled() {
+    let mut two = Config::default();
+    two.processes.insert("web".to_string(), dev("pnpm dev:web"));
+    two.processes.insert("api".to_string(), dev("pnpm dev:api"));
+    assert!(settled(Slot::DevCmd, &two));
+    assert!(settled(Slot::PortEnv, &two));
+
+    // A `[dev]` written by hand with no ports is an answer about them.
+    let mut by_hand = Config::default();
+    by_hand.processes.insert(
+        "dev".to_string(),
+        ProcessConfig {
+            cmd: "./serve".to_string(),
+            ..Default::default()
+        },
+    );
+    assert!(settled(Slot::PortEnv, &by_hand));
+
+    // A lone `[dev]` with no command is the shape detection fills.
+    let mut lone = Config::default();
+    lone.processes
+        .insert("dev".to_string(), ProcessConfig::default());
+    assert!(!settled(Slot::DevCmd, &lone));
+    assert!(!settled(Slot::PortEnv, &lone));
+    assert!(!settled(Slot::DevCmd, &Config::default()));
+
+    let mut none = Config::default();
+    assert!(!settled(Slot::Services, &none));
+    none.isolation.none = true;
+    assert!(settled(Slot::Services, &none));
+    assert_eq!(
+        super::init::slot_value(&none, Slot::Services).as_deref(),
+        Some("none"),
+        "and `init` says what the answer was"
+    );
+}
+
 // Ask just in time, once: the second pass has nothing left to ask,
 // which is what writing the first one down was for.
 #[test]
