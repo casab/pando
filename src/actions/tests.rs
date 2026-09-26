@@ -6,7 +6,7 @@ use crate::ports;
 use crate::process::{self as proc, SpawnOptions};
 use crate::project::ProjectRef;
 use crate::share_proxy;
-use crate::state::{self, Phase, ProcessRecord, ShareRecord, WorktreeRecord};
+use crate::state::{self, PendingShare, Phase, ProcessRecord, ShareRecord, WorktreeRecord};
 use crate::testutil::git;
 use crate::tunnel;
 use crate::worktree;
@@ -2414,7 +2414,13 @@ impl tunnel::Provider for MissingProvider {
     fn ensure_present(&self, _: &PandoPaths) -> Result<()> {
         bail!("cloudflared is not installed — `brew install cloudflared`")
     }
-    fn start(&self, _: &PandoPaths, _: &str, _: u16) -> Result<tunnel::TunnelSpawn> {
+    fn start(
+        &self,
+        _: &PandoPaths,
+        _: &str,
+        _: u16,
+        _: &dyn Fn(i32),
+    ) -> Result<tunnel::TunnelSpawn> {
         panic!("a missing provider must never be asked to start anything")
     }
 }
@@ -2430,7 +2436,13 @@ impl tunnel::Provider for FailingProvider {
     fn ensure_present(&self, _: &PandoPaths) -> Result<()> {
         Ok(())
     }
-    fn start(&self, _: &PandoPaths, _: &str, _: u16) -> Result<tunnel::TunnelSpawn> {
+    fn start(
+        &self,
+        _: &PandoPaths,
+        _: &str,
+        _: u16,
+        _: &dyn Fn(i32),
+    ) -> Result<tunnel::TunnelSpawn> {
         bail!("cloudflared published no URL within 30s — tail: 429 Too Many Requests")
     }
 }
@@ -2794,7 +2806,13 @@ impl tunnel::Provider for UnreachedProvider {
     fn ensure_present(&self, _: &PandoPaths) -> Result<()> {
         Ok(())
     }
-    fn start(&self, _: &PandoPaths, _: &str, _: u16) -> Result<tunnel::TunnelSpawn> {
+    fn start(
+        &self,
+        _: &PandoPaths,
+        _: &str,
+        _: u16,
+        _: &dyn Fn(i32),
+    ) -> Result<tunnel::TunnelSpawn> {
         panic!("a tunnel was opened onto a proxy that never listened")
     }
 }
@@ -2887,7 +2905,13 @@ impl tunnel::Provider for DiallingProvider {
     fn ensure_present(&self, _: &PandoPaths) -> Result<()> {
         Ok(())
     }
-    fn start(&self, paths: &PandoPaths, name: &str, _: u16) -> Result<tunnel::TunnelSpawn> {
+    fn start(
+        &self,
+        paths: &PandoPaths,
+        name: &str,
+        _: u16,
+        spawned: &dyn Fn(i32),
+    ) -> Result<tunnel::TunnelSpawn> {
         let log_path = paths.log_file(name, tunnel::TUNNEL_LOG);
         let spawn = proc::spawn_detached(SpawnOptions {
             shell_cmd: "exec sleep 300",
@@ -2896,6 +2920,7 @@ impl tunnel::Provider for DiallingProvider {
             env: &[],
             status_file: None,
         })?;
+        spawned(spawn.pgid);
         Ok(tunnel::TunnelSpawn {
             pid: spawn.pid,
             pgid: spawn.pgid,
@@ -3033,6 +3058,159 @@ fn a_share_of_a_dev_server_that_refuses_its_host_says_how_to_let_it_in() {
             .any(|m| m.contains("refuses the public URL's host") && m.contains("allowedHosts")),
         "{said:?}"
     );
+}
+
+// A share records its tunnel only once it has published, up to thirty
+// seconds after spawning it. A pando that died in between — a Ctrl-C, a
+// TUI quit mid-share — left the tunnel and the proxy running with nothing
+// able to name them, so they are written down before the wait.
+#[test]
+fn a_share_names_what_it_has_spawned_while_its_tunnel_comes_up() {
+    let Some((fx, name, _guards, _)) = shared_fixture() else {
+        return;
+    };
+    let mut config = fx.config.clone();
+    config.share.auth_cmd = Some("printf 'session=abc'".to_string());
+    let proxies = std::sync::Mutex::new(Vec::new());
+    let watched = |paths: &PandoPaths, name: &str, listen: u16, upstream: u16, cookie: &str| {
+        let spawn = stub_proxy(paths, name, listen, upstream, cookie)?;
+        proxies.lock().unwrap().push(spawn.pgid);
+        Ok(spawn)
+    };
+    let seen = std::sync::Mutex::new(Vec::new());
+    let provider = PendingWatcher {
+        paths: &fx.paths,
+        seen: &seen,
+    };
+
+    share_with(&fx.paths, &config, &name, &provider, &watched, &noop).unwrap();
+    let _share = share_guard(&fx, &name);
+
+    let seen = seen.into_inner().unwrap();
+    let tunnel = fx.state().worktrees[&name]
+        .share
+        .clone()
+        .unwrap()
+        .tunnel_pgid;
+    assert_eq!(
+        seen,
+        vec![PendingShare {
+            owner_pid: std::process::id(),
+            pgids: vec![proxies.into_inner().unwrap()[0], tunnel],
+        }],
+        "the proxy and the tunnel, before the tunnel's wait"
+    );
+    assert!(
+        fx.state().worktrees[&name].pending_shares.is_empty(),
+        "and nothing once the share is recorded"
+    );
+}
+
+/// A provider that publishes at once, and reads back what state says is
+/// pending for the worktree the moment its tunnel exists.
+struct PendingWatcher<'a> {
+    paths: &'a PandoPaths,
+    seen: &'a std::sync::Mutex<Vec<PendingShare>>,
+}
+
+impl tunnel::Provider for PendingWatcher<'_> {
+    fn name(&self) -> &'static str {
+        "cloudflared"
+    }
+    fn ensure_present(&self, _: &PandoPaths) -> Result<()> {
+        Ok(())
+    }
+    fn start(
+        &self,
+        paths: &PandoPaths,
+        name: &str,
+        _: u16,
+        spawned: &dyn Fn(i32),
+    ) -> Result<tunnel::TunnelSpawn> {
+        let log_path = paths.log_file(name, tunnel::TUNNEL_LOG);
+        let spawn = proc::spawn_detached(SpawnOptions {
+            shell_cmd: "exec sleep 300",
+            cwd: &std::env::temp_dir(),
+            log_file: &log_path,
+            env: &[],
+            status_file: None,
+        })?;
+        spawned(spawn.pgid);
+        let store = state::load(&self.paths.state_file())?;
+        *self.seen.lock().unwrap() = store.worktrees[name].pending_shares.clone();
+        Ok(tunnel::TunnelSpawn {
+            pid: spawn.pid,
+            pgid: spawn.pgid,
+            public_url: FAKE_TUNNEL_URL.to_string(),
+            log_path,
+            unconnected: None,
+        })
+    }
+}
+
+#[test]
+fn a_share_that_fails_leaves_nothing_pending() {
+    let Some((fx, name, _guards, _)) = shared_fixture() else {
+        return;
+    };
+    let mut config = fx.config.clone();
+    config.share.auth_cmd = Some("printf 'session=abc'".to_string());
+    share_with(
+        &fx.paths,
+        &config,
+        &name,
+        &FailingProvider,
+        &stub_proxy,
+        &noop,
+    )
+    .unwrap_err();
+    assert!(fx.state().worktrees[&name].pending_shares.is_empty());
+}
+
+/// A worktree with a share of `owner`'s still coming up, which has
+/// spawned the groups `pgids`.
+fn state_with_a_pending_share(owner: u32, pgids: Vec<i32>) -> state::State {
+    let mut store = state::State::new();
+    let mut record = WorktreeRecord::new("/tmp/feat+one", true);
+    record.pending_shares.push(PendingShare {
+        owner_pid: owner,
+        pgids,
+    });
+    store.worktrees.insert("feat+one".to_string(), record);
+    store
+}
+
+#[test]
+fn a_share_whose_pando_died_before_its_tunnel_was_up_is_stopped_by_the_sweep() {
+    let mut store = state_with_a_pending_share(4_000_001, vec![4242, 8484]);
+    let signalled = std::sync::Mutex::new(Vec::new());
+    let notices = sweep_dead_shares_with(
+        &mut store,
+        |pid| pid != 4_000_001,
+        |pgid| {
+            signalled.lock().unwrap().push(pgid);
+            Ok(())
+        },
+    );
+    assert_eq!(signalled.into_inner().unwrap(), vec![4242, 8484]);
+    assert!(store.worktrees["feat+one"].pending_shares.is_empty());
+    assert!(notices[0].contains("interrupted"), "{notices:?}");
+}
+
+#[test]
+fn a_share_still_coming_up_in_a_live_pando_is_left_to_it() {
+    let mut store = state_with_a_pending_share(4_000_001, vec![4242]);
+    let notices = sweep_dead_shares_with(&mut store, |_| true, |_| bail!("must not signal"));
+    assert!(notices.is_empty(), "{notices:?}");
+    assert_eq!(store.worktrees["feat+one"].pending_shares.len(), 1);
+}
+
+#[test]
+fn an_interrupted_share_that_will_not_stop_keeps_its_groups_named() {
+    let mut store = state_with_a_pending_share(4_000_001, vec![4242]);
+    let notices = sweep_dead_shares_with(&mut store, |_| false, |_| bail!("stuck"));
+    assert_eq!(store.worktrees["feat+one"].pending_shares.len(), 1);
+    assert!(notices[0].contains("would not stop"), "{notices:?}");
 }
 
 // The real cloudflared fails the same way, through the same path.

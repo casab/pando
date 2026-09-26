@@ -11,7 +11,7 @@ use crate::paths::PandoPaths;
 use crate::ports;
 use crate::process as proc;
 use crate::share_proxy;
-use crate::state::{self, Phase, ShareRecord, WorktreeRecord};
+use crate::state::{self, PendingShare, Phase, ShareRecord, WorktreeRecord};
 use crate::tunnel;
 use crate::worktree::Worktree;
 
@@ -190,10 +190,12 @@ pub fn share_with(
         (Some(cookie), Some(port)) => {
             progress("starting the share proxy");
             let proxy = spawn_proxy(paths, name, port, target_port, cookie)?;
+            note_pending(paths, name, proxy.pgid);
             // Before a tunnel is published onto it, and the last moment
             // anything knows its process group if it never came up.
             if let Err(e) = share_proxy::await_listening(&proxy) {
                 let _ = proc::stop(proxy.pgid, STOP_GRACE);
+                forget_pending(paths, name);
                 return Err(e);
             }
             Some(proxy)
@@ -203,7 +205,8 @@ pub fn share_with(
     let upstream = proxy.as_ref().map_or(target_port, |p| p.listen_port);
 
     progress(&format!("opening a {} tunnel", provider.name()));
-    let spawn = match provider.start(paths, name, upstream) {
+    let noted = |pgid| note_pending(paths, name, pgid);
+    let spawn = match provider.start(paths, name, upstream, &noted) {
         Ok(spawn) => spawn,
         Err(e) => {
             // Nothing has recorded the proxy yet, so this is the last
@@ -211,6 +214,7 @@ pub fn share_with(
             if let Some(proxy) = &proxy {
                 let _ = proc::stop(proxy.pgid, STOP_GRACE);
             }
+            forget_pending(paths, name);
             return Err(e);
         }
     };
@@ -232,6 +236,9 @@ pub fn share_with(
     // down here rather than becoming a process with no record.
     let lock = state::lock(&paths.lock_file())?;
     let mut store = state::load(&paths.state_file())?;
+    // No longer pending from here, whichever way it goes: recorded, or
+    // stopped. Every way out saves the store without it.
+    drop_pending(&mut store, name);
     let Some(existing_record) = store.worktrees.get(name) else {
         let _ = tunnel::stop_share(&record);
         bail!("{shown} was removed while its tunnel was starting; the tunnel was closed again");
@@ -240,6 +247,7 @@ pub fn share_with(
         let public_url = won.public_url.clone();
         let pre_authed = won.proxy_pid.is_some();
         let _ = tunnel::stop_share(&record);
+        let _ = state::save(&paths.state_file(), &store);
         return Ok(ShareOutcome {
             name: name.to_string(),
             public_url,
@@ -257,6 +265,7 @@ pub fn share_with(
     {
         let said = share_proxy::last_words(proxy);
         let _ = tunnel::stop_share(&record);
+        let _ = state::save(&paths.state_file(), &store);
         bail!(
             "the share proxy of {shown} exited while its tunnel was starting ({said}); the \
              tunnel was closed again"
@@ -264,6 +273,7 @@ pub fn share_with(
     }
     if let Err(e) = share_target_port(&shown, existing_record) {
         let _ = tunnel::stop_share(&record);
+        let _ = state::save(&paths.state_file(), &store);
         return Err(e.context(format!(
             "{shown} stopped while its tunnel was starting; the tunnel was closed again"
         )));
@@ -347,6 +357,52 @@ pub(super) fn host_refusal(target_port: u16, public_url: &str) -> Option<String>
     ))
 }
 
+/// Writes down a process group this share has spawned, before anything
+/// waits on it: what a sweep stops if this pando dies before the share is
+/// recorded. Best effort, since the share itself does not depend on it.
+fn note_pending(paths: &PandoPaths, name: &str, pgid: i32) {
+    let Ok(_lock) = state::lock(&paths.lock_file()) else {
+        return;
+    };
+    let Ok(mut store) = state::load(&paths.state_file()) else {
+        return;
+    };
+    let Some(record) = store.worktrees.get_mut(name) else {
+        return;
+    };
+    let me = std::process::id();
+    match record.pending_shares.iter_mut().find(|p| p.owner_pid == me) {
+        Some(pending) => pending.pgids.push(pgid),
+        None => record.pending_shares.push(PendingShare {
+            owner_pid: me,
+            pgids: vec![pgid],
+        }),
+    }
+    let _ = state::save(&paths.state_file(), &store);
+}
+
+/// Drops this pando's pending share of `name`, which is recorded or
+/// stopped.
+fn drop_pending(store: &mut state::State, name: &str) {
+    if let Some(record) = store.worktrees.get_mut(name) {
+        let me = std::process::id();
+        record.pending_shares.retain(|p| p.owner_pid != me);
+    }
+}
+
+/// [`drop_pending`] under the lock, for a share that stopped what it had
+/// spawned before it got as far as recording anything.
+fn forget_pending(paths: &PandoPaths, name: &str) {
+    let Ok(_lock) = state::lock(&paths.lock_file()) else {
+        return;
+    };
+    let Ok(mut store) = state::load(&paths.state_file()) else {
+        return;
+    };
+    drop_pending(&mut store, name);
+    let _ = state::save(&paths.state_file(), &store);
+}
+
 /// Takes a worktree's public URL down.
 pub fn unshare(paths: &PandoPaths, name: &str) -> Result<()> {
     paths.ensure_home()?;
@@ -382,6 +438,9 @@ pub fn unshare(paths: &PandoPaths, name: &str) -> Result<()> {
 /// serves the wrong thing, and a proxy whose tunnel died is unreachable.
 /// Either way both groups are signalled, because a dead leader is not a
 /// dead group.
+///
+/// So is a share that never got as far as a record, because the pando
+/// waiting on its tunnel died first: see [`PendingShare`].
 pub(super) fn sweep_dead_shares(store: &mut state::State) -> Vec<String> {
     sweep_dead_shares_with(store, proc::is_alive, |pgid| proc::stop(pgid, STOP_GRACE))
 }
@@ -395,6 +454,7 @@ pub(super) fn sweep_dead_shares_with(
 ) -> Vec<String> {
     let mut notices = Vec::new();
     for (name, record) in store.worktrees.iter_mut() {
+        sweep_interrupted_shares(name, record, &is_alive, &stop, &mut notices);
         let Some(share) = record.share.clone() else {
             continue;
         };
@@ -430,6 +490,46 @@ pub(super) fn sweep_dead_shares_with(
         }
     }
     notices
+}
+
+/// Stops what a share spawned when the pando waiting on it is gone, and
+/// drops the [`PendingShare`] that named it.
+///
+/// Every group it names is signalled, and the entry is kept only when one
+/// would not stop: it holds the only pgids anything can use to try again.
+fn sweep_interrupted_shares(
+    name: &str,
+    record: &mut WorktreeRecord,
+    is_alive: &impl Fn(u32) -> bool,
+    stop: &impl Fn(i32) -> Result<()>,
+    notices: &mut Vec<String>,
+) {
+    let mut kept = Vec::new();
+    for pending in std::mem::take(&mut record.pending_shares) {
+        if is_alive(pending.owner_pid) {
+            kept.push(pending);
+            continue;
+        }
+        let failures: Vec<String> = pending
+            .pgids
+            .iter()
+            .filter_map(|&pgid| stop(pgid).err().map(|e| format!("group {pgid}: {e:#}")))
+            .collect();
+        if failures.is_empty() {
+            notices.push(format!(
+                "{name}: a share was interrupted before its tunnel was up, so what it had \
+                 started is stopped"
+            ));
+        } else {
+            notices.push(format!(
+                "{name}: a share was interrupted before its tunnel was up, and what it had \
+                 started would not stop ({})",
+                failures.join("; ")
+            ));
+            kept.push(pending);
+        }
+    }
+    record.pending_shares = kept;
 }
 
 /// How often the readiness wait asks whether the target is up yet. The

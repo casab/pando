@@ -84,7 +84,17 @@ pub trait Provider {
     /// Publishes `local_port` and returns once a public URL exists and
     /// the provider's edge has a connection to serve it on — or, with the
     /// URL, the reason it does not yet, once the deadline passes.
-    fn start(&self, paths: &PandoPaths, name: &str, local_port: u16) -> Result<TunnelSpawn>;
+    ///
+    /// `spawned` is told the tunnel's process group the moment there is
+    /// one, before the wait, so the caller can write it down somewhere
+    /// that outlives this process.
+    fn start(
+        &self,
+        paths: &PandoPaths,
+        name: &str,
+        local_port: u16,
+        spawned: &dyn Fn(i32),
+    ) -> Result<TunnelSpawn>;
 }
 
 /// The provider `[share].provider` names, or the default when it names
@@ -114,8 +124,14 @@ impl Provider for Cloudflared {
         )
     }
 
-    fn start(&self, paths: &PandoPaths, name: &str, local_port: u16) -> Result<TunnelSpawn> {
-        start_tunnel(paths, name, local_port)
+    fn start(
+        &self,
+        paths: &PandoPaths,
+        name: &str,
+        local_port: u16,
+        spawned: &dyn Fn(i32),
+    ) -> Result<TunnelSpawn> {
+        start_tunnel_with(paths, name, local_port, spawned)
     }
 }
 
@@ -176,6 +192,17 @@ fn program_is_runnable(program: &Path) -> bool {
 
 /// Spawns a quick tunnel onto `local_port` and waits for its public URL.
 pub fn start_tunnel(paths: &PandoPaths, name: &str, local_port: u16) -> Result<TunnelSpawn> {
+    start_tunnel_with(paths, name, local_port, &|_| {})
+}
+
+/// [`start_tunnel`], telling `spawned` the tunnel's process group before
+/// the wait.
+fn start_tunnel_with(
+    paths: &PandoPaths,
+    name: &str,
+    local_port: u16,
+    spawned: &dyn Fn(i32),
+) -> Result<TunnelSpawn> {
     let log_path = paths.log_file(name, TUNNEL_LOG);
     // `spawn_detached` opens the log with O_APPEND, so after
     // share → unshare → share the dead session's URL is still in the file
@@ -211,6 +238,7 @@ pub fn start_tunnel(paths: &PandoPaths, name: &str, local_port: u16) -> Result<T
         status_file: None,
     })
     .context("spawn cloudflared")?;
+    spawned(spawn.pgid);
 
     match await_url(spawn.pid, &log_path) {
         Ok(published) => Ok(TunnelSpawn {

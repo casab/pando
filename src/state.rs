@@ -147,6 +147,10 @@ pub struct WorktreeRecord {
     pub share_port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub share: Option<ShareRecord>,
+    /// Shares of this worktree that are still coming up, one per pando
+    /// waiting on one. See [`PendingShare`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_shares: Vec<PendingShare>,
 }
 
 impl WorktreeRecord {
@@ -165,6 +169,7 @@ impl WorktreeRecord {
             hooks: BTreeMap::new(),
             share_port: None,
             share: None,
+            pending_shares: Vec::new(),
         }
     }
 
@@ -366,6 +371,25 @@ pub struct ShareRecord {
     pub proxy_pgid: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_port: Option<u16>,
+}
+
+/// A share whose tunnel is still coming up, written down before anything
+/// waits on it.
+///
+/// A share spawns its proxy and its tunnel in sessions of their own and
+/// records them as a [`ShareRecord`] only once the tunnel has published,
+/// up to thirty seconds later. A pando that died in between — a Ctrl-C, a
+/// TUI quit mid-share — left both running with no record: a public URL,
+/// and a proxy holding the auth cookie, that nothing could name again.
+/// This names them for that window. The share that owns it drops it once
+/// it is recorded or stopped, and a sweep stops what it names once the
+/// pando that owns it is gone.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PendingShare {
+    /// The pando process waiting on the share.
+    pub owner_pid: u32,
+    /// Every process group spawned for it so far.
+    pub pgids: Vec<i32>,
 }
 
 impl State {

@@ -508,3 +508,66 @@ fn the_hidden_subcommand_is_not_advertised() {
         "the proxy subcommand must stay out of help:\n{help}"
     );
 }
+
+// A share spawns its tunnel in a session of its own and records it only
+// once the tunnel has published, up to thirty seconds later. A pando
+// killed in between — a Ctrl-C, a TUI quit mid-share — left the tunnel
+// running with nothing able to name it: `unshare` said "not shared", and
+// neither `stop` nor `rm` ever saw it.
+#[test]
+fn a_share_killed_before_its_tunnel_is_up_leaves_nothing_running() {
+    let Some(cli) = cli_env() else { return };
+    // A tunnel that never publishes, so the share is still waiting on it
+    // when it is killed.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let fake = cli.home.join("bin").join("cloudflared");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\necho 'INF Requesting new quick Tunnel on trycloudflare.com...'\n\
+             exec sleep 300\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    assert_eq!(code(&cli.run(&["new", "feat/one"])), 0);
+    cli.start_and_wait("feat+one");
+
+    let mut sharing = Command::new(pando_bin())
+        .env("PANDO_HOME", &cli.home)
+        .current_dir(&cli.root)
+        .args(["share", "feat+one"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("run pando share");
+    let paths = paths_for(&cli.home, &cli.root);
+    let pending = || {
+        pando::state::load(&paths.state_file())
+            .ok()
+            .and_then(|state| state.worktrees.get("feat+one").cloned())
+            .map(|record| record.pending_shares)
+            .unwrap_or_default()
+    };
+    let noted = wait_until(Duration::from_secs(20), || !pending().is_empty());
+    // SIGKILL: nothing of the share's own clean-up runs.
+    let _ = sharing.kill();
+    let _ = sharing.wait();
+    assert!(noted, "the tunnel was never written down while it came up");
+    let groups = pending()[0].pgids.clone();
+    assert!(
+        groups.iter().any(|&pgid| pando::process::group_alive(pgid)),
+        "the tunnel should still be up once the share that spawned it is gone"
+    );
+
+    // Any read path, as the next command anyone types would be.
+    let status = cli.run(&["status"]);
+    assert_eq!(code(&status), 0, "{}", stderr_of(&status));
+    assert!(
+        wait_until(Duration::from_secs(10), || groups
+            .iter()
+            .all(|&pgid| !pando::process::group_alive(pgid))),
+        "a tunnel outlived the share that spawned it, with nothing left to name it"
+    );
+    assert!(pending().is_empty(), "{:?}", pending());
+}
