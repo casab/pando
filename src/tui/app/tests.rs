@@ -452,6 +452,43 @@ fn a_discovery_asked_for_while_one_runs_runs_once_after_it() {
     );
 }
 
+// The slow git tick's discovery resolves the base branch again. Put off
+// behind one already running, it ran once the tick had moved on and
+// reused the old base for another thirty seconds.
+#[test]
+fn a_discovery_put_off_on_the_slow_git_tick_still_resolves_the_base() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("acme-shop");
+    crate::testutil::init_repo(&root);
+    let paths = PandoPaths::new(
+        dir.path().join("pando-home"),
+        ProjectRef::from_root(&root).unwrap(),
+    );
+    let mut app = App::new_for_test(paths, Config::default(), Vec::new());
+    let rx = app.event_rx.take().expect("the app owns its receiver");
+    app.default_base = Some("stale".into());
+    app.discovering = true;
+    app.tick = GIT_ALL_EVERY;
+    app.spawn_discovery();
+    assert!(app.discover_again, "put off behind the one in flight");
+
+    app.tick = GIT_ALL_EVERY + 1;
+    app.handle_event(AppEvent::Discovered(Box::new(Ok(Snapshot {
+        default_base: Some("stale".into()),
+        ..listing(&app, &[])
+    }))));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let snapshot = loop {
+        let left = deadline
+            .checked_duration_since(Instant::now())
+            .expect("the discovery put off lands");
+        if let Ok(AppEvent::Discovered(result)) = rx.recv_timeout(left) {
+            break result.expect("the fixture lists");
+        }
+    };
+    assert_eq!(snapshot.default_base.as_deref(), Some("main"));
+}
+
 fn type_str(app: &mut App, text: &str) {
     for c in text.chars() {
         press(app, KeyCode::Char(c));

@@ -413,6 +413,10 @@ impl App {
     /// time: asked for while one runs, it runs again once that one lands,
     /// rather than stacking up behind the state lock.
     pub fn spawn_discovery(&mut self) {
+        // Kept with the request rather than read off the tick it runs on:
+        // the slow git tick's discovery, put off behind another, runs
+        // once the tick has moved on.
+        self.resolve_base |= self.tick.is_multiple_of(super::GIT_ALL_EVERY);
         if self.discovering {
             self.discover_again = true;
             return;
@@ -420,7 +424,7 @@ impl App {
         self.discovering = true;
         let paths = self.paths.clone();
         let tx = self.event_tx.clone();
-        let known_base = if self.tick.is_multiple_of(super::GIT_ALL_EVERY) {
+        let known_base = if std::mem::take(&mut self.resolve_base) {
             None
         } else {
             self.default_base.clone()

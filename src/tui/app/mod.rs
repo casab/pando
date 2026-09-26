@@ -195,6 +195,10 @@ pub struct App {
     pub discovering: bool,
     /// A discovery was asked for while one ran.
     pub discover_again: bool,
+    /// The next discovery resolves the base branch again rather than
+    /// reusing the last answer: the slow git tick asked for it, perhaps
+    /// while another discovery ran.
+    pub resolve_base: bool,
     /// Whether the project's services are answering. Computed on the
     /// refresh worker, never in a paint or a key handler.
     pub service_health: ServiceHealth,
@@ -321,6 +325,7 @@ impl App {
             refreshing: false,
             discovering: false,
             discover_again: false,
+            resolve_base: false,
             log_tails: LogTails::default(),
             tail_index: 0,
             tail_scroll: 0,
@@ -1353,6 +1358,7 @@ impl App {
             refreshing: false,
             discovering: false,
             discover_again: false,
+            resolve_base: false,
             log_tails: LogTails::default(),
             tail_index: 0,
             tail_scroll: 0,
