@@ -11390,6 +11390,55 @@ fn a_slot_a_urls_query_names_is_the_main_checkouts_and_the_worktree_is_told_its_
     assert!(!redis.join("flushed").exists(), "main's slot was emptied");
 }
 
+// A slot recorded before the query's `db` was read has main's as slot 0,
+// and a start only marked it used: `status --env`, which finds the slot by
+// the main checkout's today, found none and said to start it namespaced
+// again, which changed nothing. A start records main's as it is now.
+#[test]
+fn a_start_records_the_slot_the_main_checkout_is_known_by_now() {
+    let (mut ns, _redis) = slots_fixture_keyed(
+        "DATABASE_PORT=3306\nDATABASE_NAME=shop\nDATABASE_USER=app\n\
+         REDIS_URL=redis://localhost:6379?db=2\n",
+        &["REDIS_URL"],
+    );
+    ns.fx.config.processes.get_mut("dev").unwrap().ports =
+        Some(PortsSpec::Map(BTreeMap::from([(
+            "PORT".to_string(),
+            "web".to_string(),
+        )])));
+    let (report, _) = ns.start(Mode::Namespaced).unwrap();
+    drop(guard(&report));
+    stop(&ns.fx.paths, &ns.name, None).unwrap();
+    let mut store = ns.fx.state();
+    for slot in store
+        .worktrees
+        .get_mut(&ns.name)
+        .unwrap()
+        .namespaces
+        .iter_mut()
+        .filter(|n| n.service == "redis")
+    {
+        slot.main = "0".into();
+        slot.mains = Vec::new();
+    }
+    state::save(&ns.fx.paths.state_file(), &store).unwrap();
+
+    let (report, _) = ns.start(Mode::Namespaced).unwrap();
+    let _guard = guard(&report);
+    let slot = ns
+        .record()
+        .namespaces
+        .into_iter()
+        .find(|n| n.service == "redis")
+        .unwrap();
+    assert_eq!((slot.name.as_str(), slot.main.as_str()), ("1", "2"));
+    let env = resolved_env(&ns.fx.paths, &ns.fx.config, &ns.name).unwrap();
+    assert_eq!(
+        env.get("REDIS_URL").map(String::as_str),
+        Some("redis://localhost:6379/1?db=1")
+    );
+}
+
 /// Writes a state for another project under the same pando home, with
 /// one worktree holding `record`.
 fn hold_elsewhere(ns: &Namespaced, record: WorktreeRecord) {

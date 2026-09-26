@@ -1701,6 +1701,12 @@ pub(super) fn keep(
             if !namespace.mains.is_empty() {
                 existing.mains = namespace.mains.clone();
             }
+            // A slot's main is the one the main checkout's env files name
+            // first today, which [`namespaced_env`] finds it by. A
+            // database's name is made from its main, so that one stays.
+            if existing.kind == NamespaceKind::Slot {
+                existing.main = namespace.main.clone();
+            }
         }
         None => record.namespaces.push(namespace.clone()),
     }
