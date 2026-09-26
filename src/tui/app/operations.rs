@@ -607,19 +607,25 @@ impl App {
     /// Not once it has stopped, when the port it keeps serves nothing, nor
     /// while the process it points at is stopped and a sibling runs. A
     /// failed one's still copies: another of its processes may answer it,
-    /// as the detail pane says. The phase is asked first, as `o` asks it.
+    /// as the detail pane says. The phase is asked first, as `o` asks it,
+    /// and a worktree that holds no port is told so in its row's own word:
+    /// a failed one is not called running.
     pub(super) fn copy_selected_url(&mut self) {
         let Some(name) = self.selected_name() else {
             return;
         };
         let label = self.label_of(&name);
-        if self.phase_of(&name).is_none() {
+        let Some(phase) = self.phase_of(&name) else {
             self.set_error(format!("{label} is not running — s starts it"));
             return;
-        }
+        };
         let Some(url) = self.url_of(&name) else {
+            let state = match phase {
+                Aggregate::Failed { .. } => "has failed",
+                Aggregate::Starting { .. } | Aggregate::Running { .. } => "is running",
+            };
             self.set_error(format!(
-                "{label} is running and holds no port, so it has no URL to copy"
+                "{label} {state} and holds no port, so it has no URL to copy"
             ));
             return;
         };

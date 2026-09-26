@@ -1710,6 +1710,28 @@ fn o_and_c_on_a_running_worktree_that_holds_no_port_say_so() {
         "feat/one is running and holds no port, so it has no URL to copy"
     );
     assert!(is_error);
+
+    // A failed one is let past the phase check, since its URL may still
+    // answer; with no port, `c` said it was running beside a failed row.
+    app.state
+        .worktrees
+        .get_mut("feat+one")
+        .unwrap()
+        .processes
+        .get_mut("dev")
+        .unwrap()
+        .phase = Phase::Failed {
+        reason: "exit 1".into(),
+        at: Utc::now(),
+    };
+    press(&mut app, KeyCode::Char('c'));
+    assert_eq!(app.clipboard, None);
+    let (message, is_error) = app.active_status().unwrap();
+    assert_eq!(
+        message,
+        "feat/one has failed and holds no port, so it has no URL to copy"
+    );
+    assert!(is_error);
 }
 
 // A stop keeps the port assignment, so `o` and `c` handed out a URL that
