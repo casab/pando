@@ -7226,6 +7226,85 @@ fn a_stale_records_native_server_is_signalled_before_the_record_goes() {
     assert!(fx.state().worktrees[&name].services.is_empty());
 }
 
+// The same stale record, holding the things of pando's that outlive a
+// process: the containers and volumes of its compose project, and a
+// database it made in the main checkout's server. Both are named for the
+// worktree's name, so they are this worktree's — and the start that
+// dropped the record with them left the containers up on their old ports
+// and gave `rm` nothing to take down or drop.
+#[test]
+fn a_stale_records_containers_and_namespaces_pass_to_the_record_that_replaces_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut fx = fixture();
+    with_dev(&mut fx, dev("sleep 30"));
+    let name = worktree_named(&fx, "feat/one");
+    let calls = fx.paths.home.join("docker-calls");
+    let bin = fx.paths.home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(
+        bin.join("docker"),
+        format!("#!/bin/sh\necho \"$*\" >> '{}'\n", calls.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(bin.join("docker"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let namespace = state::NamespaceRecord {
+        service: "mariadb".into(),
+        recipe: "mariadb".into(),
+        kind: state::NamespaceKind::Database,
+        host: "127.0.0.1".into(),
+        port: 3306,
+        name: "app__feat_one".into(),
+        main: "app".into(),
+        keys: Vec::new(),
+        used_at: Utc::now(),
+    };
+    let mut store = fx.state();
+    let record = store.worktrees.get_mut(&name).unwrap();
+    record.path = fx.root.join("somewhere-else");
+    record.mode = Some(state::ServiceMode::Isolated);
+    record.services.push(state::ServiceRecord {
+        name: "postgres".to_string(),
+        kind: state::ServiceKind::Compose,
+        port: Some(17_999),
+        pid: None,
+        pgid: None,
+        compose_project: Some("pando-stale-feat_one".to_string()),
+    });
+    record.namespaces.push(namespace.clone());
+    state::save(&fx.paths.state_file(), &store).unwrap();
+
+    let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+    let _guard = guard(&outcome);
+    let record = fx.state().worktrees[&name].clone();
+    assert_ne!(record.path, fx.root.join("somewhere-else"), "{record:?}");
+    let postgres = record
+        .services
+        .iter()
+        .find(|s| s.name == "postgres")
+        .expect("the record `rm` takes the volumes down by");
+    assert_eq!(
+        postgres.compose_project.as_deref(),
+        Some("pando-stale-feat_one")
+    );
+    assert_eq!(
+        postgres.port, None,
+        "but it claims no port it does not have"
+    );
+    assert_eq!(
+        record.namespaces,
+        vec![namespace],
+        "and the record `rm` drops the database by"
+    );
+    let calls = std::fs::read_to_string(&calls).unwrap_or_default();
+    assert!(
+        calls
+            .lines()
+            .any(|line| line.contains("pando-stale-feat_one") && line.ends_with("stop")),
+        "a shared start left the stale record's containers running: {calls:?}"
+    );
+}
+
 // 0.2.0 could leave a compose record with a project and no port on a
 // worktree that is not isolated — a failed isolated start. `status` and
 // the TUI showed it as `postgres  no port` for ever. It is still what `rm`

@@ -290,6 +290,13 @@ fn start_checked(
         crate::paths::resolve_for_compare(&record.path)
             != crate::paths::resolve_for_compare(&canonical)
     });
+    // What a stale record knew about this worktree's name rather than its
+    // path outlives it: the compose project its containers and volumes are
+    // under, and the namespaces pando made in the main checkout's servers.
+    // Both are named for the project and the worktree's name, so they are
+    // this worktree's, and a record that no longer names them is one `rm`
+    // can never take down or drop.
+    let mut inherited: Option<WorktreeRecord> = None;
     if stale {
         let record = store.worktrees.get_mut(name).expect("just read");
         let groups: Vec<i32> = record
@@ -310,8 +317,9 @@ fn start_checked(
         if !failures.is_empty() {
             bail!("{name}: {}", failures.join("; "));
         }
-        store.worktrees.remove(name);
+        inherited = store.worktrees.remove(name);
     }
+    let inherited_projects = inherited.as_ref().map(compose_projects).unwrap_or_default();
 
     // What this worktree does about services now, against what it did
     // before. Decided here rather than with the ports below, because a
@@ -476,6 +484,19 @@ fn start_checked(
         .worktrees
         .entry(name.to_string())
         .or_insert_with(|| WorktreeRecord::new(canonical.clone(), false));
+    if let Some(stale) = inherited {
+        // Without a port: the window this start re-derives is its own.
+        record.services.extend(
+            stale
+                .services
+                .into_iter()
+                .filter(|s| s.kind == state::ServiceKind::Compose && s.compose_project.is_some())
+                .map(|s| state::ServiceRecord { port: None, ..s }),
+        );
+        for namespace in &stale.namespaces {
+            namespaced::keep(record, namespace);
+        }
+    }
     // A whole-worktree start replaces everything that was observed; a
     // `--only` start leaves the sibling's ports alone and lets the next
     // refresh say what is really listening.
@@ -581,9 +602,8 @@ fn start_checked(
             record.services = planned_services(config, &assignment.ports, record);
         }
         // Written into the record this start saves and spawns from, not
-        // left to what `prepare` wrote: a stale record replaced above took
-        // those with it, and a namespace nothing records is one `rm` can
-        // never drop.
+        // left to what `prepare` wrote: a namespace nothing records is one
+        // `rm` can never drop.
         for namespace in ready.iter().flat_map(|ready| &ready.namespaces) {
             namespaced::keep(record, namespace);
         }
@@ -619,6 +639,15 @@ fn start_checked(
             ),
         });
         stop_containers(paths, &going_shared, progress)?;
+    }
+    // And the containers a stale record replaced above left up, on a start
+    // that is not about to bring that compose project up again itself.
+    if !isolate && !inherited_projects.is_empty() {
+        progress(&format!(
+            "{} was last started at another path — stopping the private services it left running",
+            worktree.display_name()
+        ));
+        stop_containers(paths, &inherited_projects, progress)?;
     }
 
     // Every failure between here and the services being up leaves a
