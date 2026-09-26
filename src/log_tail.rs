@@ -415,7 +415,7 @@ fn rich_colorize(line: &str) -> Line<'static> {
     let mut pos = 0;
 
     while pos < line.len() {
-        if let Some(m) = find_pattern(&line[pos..]) {
+        if let Some(m) = next_pattern(&line[pos..]) {
             // Belt and braces. A pattern that reported a start or an end
             // inside a multi-byte character would panic the whole process
             // on the slices below — `pando logs` and the TUI with it — so
@@ -463,12 +463,44 @@ struct PatternMatch {
     style: Style,
 }
 
-fn find_pattern(s: &str) -> Option<PatternMatch> {
+/// How far into the rest of a line the search for its next pattern looks
+/// first.
+const FIRST_PATTERN_WINDOW: usize = 64;
+
+/// The earliest pattern in `s`, searched for in windows that double from
+/// [`FIRST_PATTERN_WINDOW`] until one holds a match or the whole of `s`.
+///
+/// A search costs about what lies before the match rather than the rest
+/// of the line: every token used to scan to the end, so colouring a long
+/// line dense with URLs or status codes cost the square of its length.
+fn next_pattern(s: &str) -> Option<PatternMatch> {
+    let mut limit = FIRST_PATTERN_WINDOW;
+    loop {
+        let found = find_pattern(s, limit);
+        if found.is_some() || limit >= s.len() {
+            return found;
+        }
+        limit = limit.saturating_mul(2);
+    }
+}
+
+/// Where `needle` first occurs in `s`, when that is before `limit`. Only
+/// the bytes an occurrence starting there could cover are searched.
+fn find_before(s: &str, needle: &str, limit: usize) -> Option<usize> {
+    let end = ceil_boundary(s, limit.saturating_add(needle.len()));
+    s[..end].find(needle).filter(|&idx| idx < limit)
+}
+
+/// The earliest pattern in `s`, when it starts before `limit`; none when
+/// it starts at or after it. What each pattern matches is decided on the
+/// whole of `s`, so a window that holds the match finds the one a search
+/// of the whole would.
+fn find_pattern(s: &str, limit: usize) -> Option<PatternMatch> {
     let mut best: Option<PatternMatch> = None;
 
     // HTTP methods
     for method in &["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"] {
-        if let Some(idx) = s.find(method) {
+        if let Some(idx) = find_before(s, method, limit) {
             let end = idx + method.len();
             let at_boundary = (idx == 0 || !s.as_bytes()[idx - 1].is_ascii_alphanumeric())
                 && (end >= s.len() || !s.as_bytes()[end].is_ascii_alphanumeric());
@@ -489,7 +521,7 @@ fn find_pattern(s: &str) -> Option<PatternMatch> {
     {
         let b = s.as_bytes();
         let mut i = 0;
-        while i < b.len() {
+        while i < b.len().min(limit) {
             if !b[i].is_ascii_digit()
                 || (i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'.'))
             {
@@ -548,7 +580,7 @@ fn find_pattern(s: &str) -> Option<PatternMatch> {
 
     // HTTP status codes (3-digit numbers at word boundary)
     let mut i = 0;
-    while i + 2 < s.len() {
+    while i + 2 < s.len() && i < limit {
         let b = s.as_bytes();
         if b[i].is_ascii_digit() && b[i + 1].is_ascii_digit() && b[i + 2].is_ascii_digit() {
             let at_start = i == 0 || !b[i - 1].is_ascii_alphanumeric();
@@ -564,14 +596,17 @@ fn find_pattern(s: &str) -> Option<PatternMatch> {
                     500..=599 => Some(Style::new().fg(red())),
                     _ => None,
                 };
-                if let Some(style) = style
-                    && best.as_ref().is_none_or(|b| i < b.start)
-                {
-                    best = Some(PatternMatch {
-                        start: i,
-                        end: i + 3,
-                        style,
-                    });
+                if let Some(style) = style {
+                    if best.as_ref().is_none_or(|b| i < b.start) {
+                        best = Some(PatternMatch {
+                            start: i,
+                            end: i + 3,
+                            style,
+                        });
+                    }
+                    // Scanned from the left, the first code is the
+                    // earliest one.
+                    break;
                 }
             }
         }
@@ -580,7 +615,7 @@ fn find_pattern(s: &str) -> Option<PatternMatch> {
 
     // URLs (http:// or https://)
     for prefix in &["https://", "http://"] {
-        if let Some(idx) = s.find(prefix) {
+        if let Some(idx) = find_before(s, prefix, limit) {
             let rest = &s[idx + prefix.len()..];
             let url_end = rest
                 .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '>' || c == ')')
@@ -597,7 +632,7 @@ fn find_pattern(s: &str) -> Option<PatternMatch> {
     }
 
     // File paths with line numbers (e.g., src/foo.ts:42)
-    if let Some(idx) = s.find("src/") {
+    if let Some(idx) = find_before(s, "src/", limit) {
         let rest = &s[idx..];
         let path_end = rest
             .find(|c: char| c.is_whitespace() || c == ')' || c == '"' || c == '\'')
@@ -614,7 +649,8 @@ fn find_pattern(s: &str) -> Option<PatternMatch> {
     // Timestamps (HH:MM:SS or ISO-ish prefix)
     if s.len() >= 8 {
         let b = s.as_bytes();
-        for t in 0..s.len().saturating_sub(7) {
+        // A stamp with its date starts eleven bytes before its time.
+        for t in 0..s.len().saturating_sub(7).min(limit.saturating_add(11)) {
             if b[t].is_ascii_digit()
                 && b[t + 1].is_ascii_digit()
                 && b[t + 2] == b':'
@@ -655,7 +691,7 @@ fn find_pattern(s: &str) -> Option<PatternMatch> {
                     if end < s.len() && b[end] == b'Z' {
                         end += 1;
                     }
-                    if best.as_ref().is_none_or(|b| ts_start < b.start) {
+                    if ts_start < limit && best.as_ref().is_none_or(|b| ts_start < b.start) {
                         best = Some(PatternMatch {
                             start: ts_start,
                             end,
@@ -669,7 +705,7 @@ fn find_pattern(s: &str) -> Option<PatternMatch> {
     }
 
     // Stack trace frames: "at " prefix
-    if let Some(idx) = s.find("    at ")
+    if let Some(idx) = find_before(s, "    at ", limit)
         && best.as_ref().is_none_or(|b| idx < b.start)
     {
         best = Some(PatternMatch {
@@ -1896,6 +1932,59 @@ mod tests {
 
         let slow = rich_colorize("ready in 2.1s");
         assert_eq!(span_style(&slow, "2.1s").unwrap().fg, Some(red()));
+    }
+
+    fn found(m: Option<PatternMatch>) -> Option<(usize, usize, Style)> {
+        m.map(|m| (m.start, m.end, m.style))
+    }
+
+    // Every token rescanned the rest of the line, so a long line dense
+    // with tokens cost the square of its length. The search now looks in
+    // a window first, and a window must find what the whole would.
+    #[test]
+    fn a_pattern_search_in_a_window_finds_what_a_search_of_the_whole_would() {
+        let lines = [
+            "GET /api/a 200 in 85ms",
+            "GETTING there GET /x 404",
+            "see src/ then src/app.ts:12 at 12:00:01",
+            "2024-01-02T10:20:30.123Z POST https://example.test/a) done",
+            "req 7 http://a.test/b 301 took 1.2s and 450 ms",
+            "Error: boom\n    at run (src/main.ts:4:2)",
+            "é21-09-26T10:00:00 ü 12:34:56Z OPTIONS",
+            "no tokens in this one at all",
+            "999 1234 600 250",
+        ];
+        for line in lines {
+            let whole = found(find_pattern(line, usize::MAX));
+            for limit in 0..line.len() + 12 {
+                let expected = whole.filter(|(start, _, _)| *start < limit);
+                assert_eq!(
+                    found(find_pattern(line, limit)),
+                    expected,
+                    "{line:?} within {limit}"
+                );
+            }
+            assert_eq!(found(next_pattern(line)), whole, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_long_line_dense_with_tokens_colours_every_one() {
+        let line = "GET /a 200 ".repeat(2000);
+        let styled = rich_colorize(&line);
+        let text: String = styled.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, line);
+        let methods = styled
+            .spans
+            .iter()
+            .filter(|s| s.content == "GET" && s.style.fg == Some(cyan()))
+            .count();
+        let codes = styled
+            .spans
+            .iter()
+            .filter(|s| s.content == "200" && s.style.fg == Some(green()))
+            .count();
+        assert_eq!((methods, codes), (2000, 2000));
     }
 
     #[test]
