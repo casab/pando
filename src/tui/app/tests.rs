@@ -4655,10 +4655,39 @@ fn base_choices_lead_with_the_default_and_name_each_branch_once() {
         },
     ];
     assert_eq!(
-        base_choices(Some("origin/main"), &branches),
+        base_choices(&["origin/main"], &branches),
         vec!["origin/main", "main"]
     );
-    assert_eq!(base_choices(None, &[]), Vec::<String>::new());
+    assert_eq!(
+        base_choices(&["develop", "origin/main"], &branches),
+        vec!["develop", "origin/main", "main"]
+    );
+    assert_eq!(base_choices(&[], &[]), Vec::<String>::new());
+}
+
+// With `[project] base` set, `new` forks from it, and so does the
+// dialog's untouched choice; the repository's default is one tab away
+// and, once chosen, is what the new branch forks from.
+#[test]
+fn tab_starts_from_the_configured_base_and_reaches_the_repository_default() {
+    let mut app = test_app(&["feat+one"]);
+    app.default_base = Some("origin/main".into());
+    app.config.project.base = Some("develop".into());
+    open_create_with(&mut app, &[("release", BranchSource::Local)]);
+    for c in "feat/x".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    let base = |app: &App| match &app.modal {
+        Some(Modal::Create { base, .. }) => base.clone(),
+        other => panic!("expected the create modal, got {other:?}"),
+    };
+    assert_eq!(app.implied_base("feat/x").as_deref(), Some("develop"));
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(base(&app).as_deref(), Some("origin/main"));
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(base(&app).as_deref(), Some("release"));
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(base(&app), None, "and back to the configured base");
 }
 
 // ---- the all tab -----------------------------------------------------

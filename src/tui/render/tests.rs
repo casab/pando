@@ -2620,6 +2620,33 @@ fn the_picker_marks_the_main_checkouts_branch_and_shows_the_base() {
     assert!(rendered.contains("tab"), "{rendered}");
 }
 
+// The base the dialog names is the one `new` would fork from: a branch
+// rule that matches the typed name, then `[project] base`, and only then
+// the repository's default.
+#[test]
+fn the_create_dialog_names_the_base_the_config_gives_the_typed_branch() {
+    let mut app = test_app(&["feat+one"]);
+    app.default_base = Some("origin/main".into());
+    app.config.project.base = Some("develop".into());
+    app.config.branches.rules.push(crate::config::BranchRule {
+        match_: "hotfix/*".into(),
+        base: "release".into(),
+    });
+    let mut dialog_for = |input: &str| {
+        app.modal = Some(Modal::Create {
+            input: input.into(),
+            branches: BranchLoadState::Ready(Vec::new()),
+            selected: 0,
+            base: None,
+        });
+        text_of(&draw(&mut app, 140, 30))
+    };
+    let rendered = dialog_for("feat/x");
+    assert!(rendered.contains("fork from develop"), "{rendered}");
+    let rendered = dialog_for("hotfix/y");
+    assert!(rendered.contains("fork from release"), "{rendered}");
+}
+
 // ---- the all tab -----------------------------------------------------
 
 #[test]

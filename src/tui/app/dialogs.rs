@@ -160,15 +160,19 @@ impl BranchLoadState {
     }
 }
 
-/// What `n` may fork a new branch from: the default base first, then every
-/// branch the picker read, each once.
-pub fn base_choices(default_base: Option<&str>, branches: &[BranchEntry]) -> Vec<String> {
-    let mut choices: Vec<String> = default_base.map(str::to_string).into_iter().collect();
-    for entry in branches {
-        let name = match entry.source {
+/// What `n` may fork a new branch from: `leading` first — the base it
+/// forks from when none is chosen, and the repository's default — then
+/// every branch the picker read, each once.
+pub fn base_choices(leading: &[&str], branches: &[BranchEntry]) -> Vec<String> {
+    let mut choices: Vec<String> = Vec::new();
+    let names = leading
+        .iter()
+        .map(|name| name.to_string())
+        .chain(branches.iter().map(|entry| match entry.source {
             crate::worktree::BranchSource::Local => entry.name.clone(),
             crate::worktree::BranchSource::Remote => format!("origin/{}", entry.name),
-        };
+        }));
+    for name in names {
         if !choices.contains(&name) {
             choices.push(name);
         }
@@ -304,14 +308,23 @@ impl App {
         let rows = create_rows(&input, branches.as_slice());
         match key.code {
             KeyCode::Esc => return,
-            // The base a new branch forks from, walked in place: the
-            // default first, then every branch the picker read.
+            // The base a new branch forks from, walked in place: the one
+            // it forks from untouched first, then the repository's
+            // default, then every branch the picker read. Only the first
+            // is no choice at all, so the config's base can be passed
+            // over for the repository's default, as `new --base` can.
             KeyCode::Tab | KeyCode::BackTab => {
-                let choices = base_choices(self.default_base.as_deref(), branches.as_slice());
+                let implied = self.implied_base(&input);
+                let leading: Vec<&str> = implied
+                    .iter()
+                    .chain(&self.default_base)
+                    .map(String::as_str)
+                    .collect();
+                let choices = base_choices(&leading, branches.as_slice());
                 if !choices.is_empty() {
                     let current = base
                         .as_ref()
-                        .or(self.default_base.as_ref())
+                        .or(implied.as_ref())
                         .and_then(|b| choices.iter().position(|c| c == b));
                     let forward = key.code == KeyCode::Tab;
                     // With no base yet — no default the repository could
@@ -326,7 +339,7 @@ impl App {
                         None => choices.len() - 1,
                     };
                     let chosen = choices[next].clone();
-                    base = (Some(&chosen) != self.default_base.as_ref()).then_some(chosen);
+                    base = (Some(&chosen) != implied.as_ref()).then_some(chosen);
                 }
             }
             KeyCode::Down => selected = (selected + 1).min(rows.len().saturating_sub(1)),
@@ -401,6 +414,16 @@ impl App {
             selected,
             base,
         });
+    }
+
+    /// The base a new branch called `branch` forks from when none is
+    /// chosen: the config's, read as `new` reads it, else the
+    /// repository's default.
+    pub fn implied_base(&self, branch: &str) -> Option<String> {
+        self.config
+            .base_for_branch(branch.trim())
+            .map(str::to_string)
+            .or_else(|| self.default_base.clone())
     }
 
     /// Whether `branch` is the one the main checkout has.

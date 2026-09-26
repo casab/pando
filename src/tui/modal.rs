@@ -430,12 +430,12 @@ fn render_create(
         prompt,
     );
 
-    // The base is shown, and tab walks it: the default first, then every
-    // branch the picker read.
+    // The base is shown, and tab walks it: the one the typed name forks
+    // from untouched — the config's, or the repository's default — then
+    // every branch the picker read.
     let chosen = base.is_some();
-    let base = base
-        .or(app.default_base.as_deref())
-        .unwrap_or("the default base");
+    let implied = app.implied_base(input);
+    let base = base.or(implied.as_deref()).unwrap_or("the default base");
     let base_line = Line::from(vec![
         Span::styled("new branches fork from ", Style::new().fg(text_muted())),
         Span::styled(
