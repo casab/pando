@@ -4,9 +4,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::catalog::package_managers;
-use crate::config::{Config, ServiceConfig};
+use crate::config::Config;
 use crate::paths::PandoPaths;
-use crate::{detect, ports, template};
+use crate::{actions, detect, ports, template};
 
 use super::report::{Finding, Section};
 
@@ -240,9 +240,9 @@ fn check_template(
 /// Every role this config declares, mapped to a number that is only there
 /// so a template can render.
 ///
-/// Both kinds: a process's own roles and a service's name, which is a role
-/// too — that is what lets a process be told the port of the database
-/// beside it.
+/// Both kinds: a process's own roles and a service's name, compose or
+/// native, which is a role too — that is what lets a process be told the
+/// port of the database beside it.
 fn declared_roles(config: &Config) -> BTreeMap<String, u16> {
     let mut out = BTreeMap::new();
     let mut next = ports::PORT_MIN;
@@ -257,12 +257,10 @@ fn declared_roles(config: &Config) -> BTreeMap<String, u16> {
             give(role, &mut out);
         }
     }
-    for service in &config.services {
-        if let ServiceConfig::Compose { include, .. } = service {
-            for name in include {
-                give(name.clone(), &mut out);
-            }
-        }
+    // The start's own list, so the two cannot disagree about what a
+    // service's role is.
+    for role in actions::service_roles(config) {
+        give(role, &mut out);
     }
     out
 }

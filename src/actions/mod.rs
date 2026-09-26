@@ -43,17 +43,14 @@ pub use questions::{
 pub use refresh::{FAILURE_SHOWN_LINES, Refreshed, failure_tail, inspect, refresh};
 pub use runtime::{Machine, runs_through_runner, runtime_shell, user_home, with_prelude};
 pub use services::{
-    ServiceStatus, export_lines, recorded_service_statuses, resolved_env, service_statuses,
-    shared_service_statuses, worktree_url,
+    ServiceStatus, export_lines, recorded_service_statuses, resolved_env, service_roles,
+    service_statuses, shared_service_statuses, worktree_url,
 };
 pub use share::{ENV_SHARE_PORT, ShareOutcome, SpawnProxy, share, share_with, unshare};
 pub use worktree::{
     CREATED_BUT_INSTALL_FAILED, Ownership, created_by_pando, guard_write_locations, ls, new,
     new_for_pr, ownership, path, rm, sanitize_branch_to_dir,
 };
-
-#[cfg(test)]
-use services::service_roles;
 
 #[cfg(test)]
 mod tests;

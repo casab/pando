@@ -705,6 +705,28 @@ fn a_placeholder_naming_a_service_resolves_because_a_service_is_a_role_too() {
     assert!(report.healthy(), "{:?}", report.findings);
 }
 
+// An isolated start gives a native service's name a port as it does a
+// compose one's; doctor's roles had only the compose names, so this was a
+// problem a start never hit.
+#[test]
+fn a_placeholder_naming_a_native_service_resolves_as_well() {
+    let fx = fixture();
+    write_project_config(
+        &fx,
+        "[processes.web]\ncmd = \"serve\"\nports = [\"web\"]\n\
+             env = { DB = \"postgres://localhost:{port:postgres}\" }\n\n\
+             [[services]]\nkind = \"native\"\nname = \"postgres\"\n\n\
+             [[hooks]]\nname = \"migrate\"\nafter = \"services\"\n\
+             cmd = \"migrate --port {port:postgres}\"\n",
+    );
+    let report = report(&fx);
+    assert!(
+        !mentions(&report, "cannot be resolved"),
+        "{:?}",
+        messages(&report)
+    );
+}
+
 #[test]
 fn the_project_section_reports_the_home_mode_and_the_port_window() {
     use std::os::unix::fs::PermissionsExt;

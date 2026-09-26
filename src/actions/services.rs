@@ -167,7 +167,10 @@ fn compose_entries(config: &Config) -> Vec<ComposeEntry<'_>> {
 /// Compose and native entries share one role space and are listed in the
 /// order the file writes them, so a project that has both hands out ports
 /// in a stable order whichever kind comes first.
-pub(super) fn service_roles(config: &Config) -> Vec<String> {
+///
+/// Public because `doctor` renders templates against the roles a start
+/// would have, and a second list of them left the native services out.
+pub fn service_roles(config: &Config) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for service in &config.services {
         match service {
