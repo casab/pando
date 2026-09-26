@@ -3020,6 +3020,33 @@ fn the_daemon_is_not_asked_about_when_no_compose_service_needs_it() {
     assert!(!mentions(&report, "Docker daemon"));
 }
 
+// `include = []` is the written-down "none of them", and an isolated start
+// never needs Docker for it. doctor counted it as a compose service, so a
+// stopped Docker failed doctor with a problem whose fix threw the answer
+// away, and a missing one said `--isolated` could not run.
+#[test]
+fn a_compose_entry_that_includes_nothing_needs_no_docker() {
+    let fx = fixture();
+    write_project_config(
+        &fx,
+        "[dev]\ncmd = \"true\"\n\n[[services]]\nkind = \"compose\"\n\
+         file = \"docker-compose.yml\"\ninclude = []\n",
+    );
+    write_compose(&fx, "services:\n  app:\n    build: .\n");
+    let down = report_of(
+        &fx,
+        &daemon_says(1, "Cannot connect to the Docker daemon at unix:///x.sock"),
+    );
+    assert!(!mentions(&down, "Docker daemon"), "{:?}", messages(&down));
+    assert!(down.healthy(), "{:?}", down.findings);
+    let missing = report_of(&fx, &no_tools);
+    assert!(
+        !mentions(&missing, "docker is not on the PATH"),
+        "{:?}",
+        messages(&missing)
+    );
+}
+
 // The probe script itself, run by a real bash against a fake docker: an
 // answer, a refusal, and the exit status behind the mark.
 #[test]

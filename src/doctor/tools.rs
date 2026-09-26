@@ -164,6 +164,17 @@ pub(super) enum Daemon {
     Unknown,
 }
 
+/// Whether an isolated start of this project runs anything in Docker: a
+/// compose entry that includes a service. One that includes none is the
+/// written-down answer "none of them", and a start brings nothing up for
+/// it, so it needs neither the client nor the daemon.
+fn runs_containers(config: &Config) -> bool {
+    config
+        .services
+        .iter()
+        .any(|s| matches!(s, ServiceConfig::Compose { .. }) && s.brings_anything_up())
+}
+
 /// Asks the Docker daemon whether it is up, when this project declares
 /// compose services and the client is there to ask.
 ///
@@ -179,14 +190,10 @@ fn daemon_check(
     tools: &mut [ToolReport],
     findings: &mut Vec<Finding>,
 ) {
-    let isolates = config
-        .services
-        .iter()
-        .any(|s| matches!(s, ServiceConfig::Compose { .. }));
     let Some(docker) = tools.iter_mut().find(|t| t.name == "docker" && t.found) else {
         return;
     };
-    if !isolates {
+    if !runs_containers(config) {
         return;
     }
     let program = services::docker_program(paths).display().to_string();
@@ -288,12 +295,8 @@ fn tool_probes(paths: &PandoPaths, config: &Config) -> Vec<ToolProbe> {
     // binary an isolated start would use — and looked for where that start
     // looks, since pando runs docker itself rather than through the shell.
     let docker = services::docker_program(paths).display().to_string();
-    let isolates = config
-        .services
-        .iter()
-        .any(|s| matches!(s, ServiceConfig::Compose { .. }));
     let needed = "`start --isolated`, which runs private copies of the project's services";
-    let missing_docker = isolates.then(|| {
+    let missing_docker = runs_containers(config).then(|| {
         (
             Severity::Note,
             "this project declares compose services, so `--isolated` cannot run; a plain \
