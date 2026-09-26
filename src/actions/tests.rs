@@ -56,7 +56,7 @@ fn stop_all(paths: &PandoPaths) -> Result<Vec<String>> {
 }
 
 fn stop_all_with(paths: &PandoPaths, stop: impl Fn(i32) -> Result<()>) -> Result<Vec<String>> {
-    super::stop_all_with(paths, None, stop, &noop)
+    super::stop_all_with(paths, None, stop, &noop).map(|report| report.stopped)
 }
 
 fn rm(paths: &PandoPaths, name: &str, yes: bool, force: bool) -> Result<()> {
@@ -2108,7 +2108,7 @@ fn a_stop_all_after_a_list_leaves_running_what_came_up_since() {
 
     let said = std::cell::RefCell::new(Vec::<String>::new());
     let signalled = std::cell::RefCell::new(Vec::<i32>::new());
-    let mut stopped = super::stop_all_with(
+    let report = super::stop_all_with(
         &fx.paths,
         Some(std::slice::from_ref(&listed)),
         |pgid| {
@@ -2118,9 +2118,12 @@ fn a_stop_all_after_a_list_leaves_running_what_came_up_since() {
         &|line| said.borrow_mut().push(line.to_string()),
     )
     .unwrap();
+    let mut stopped = report.stopped;
     stopped.sort();
     // Not up, so never listed: a crashed one goes as it always did.
     assert_eq!(stopped, vec![crashed.clone(), listed.clone()]);
+    // And the one kept is returned, for the TUI's header to name.
+    assert_eq!(report.kept, vec![since.clone()]);
     assert!(!signalled.borrow().contains(&4_000_202), "{signalled:?}");
     assert!(fx.state().worktrees[&since].processes.contains_key("dev"));
     assert!(

@@ -100,8 +100,9 @@ pub enum PendingOutcome {
     /// header in front of it.
     Shared(String, String, bool),
     Unshared(String),
-    /// Every worktree `X` stopped.
-    StoppedAll(Vec<String>),
+    /// Every worktree `X` stopped, and every one it left running because
+    /// it came up after the confirmation was shown.
+    StoppedAll(actions::StopAllReport),
 }
 
 impl PendingOutcome {
@@ -457,12 +458,29 @@ impl App {
                         ));
                         self.spawn_refresh();
                     }
-                    PendingOutcome::StoppedAll(names) => {
-                        match names.len() {
-                            0 => self.set_success("nothing was running"),
-                            1 => self.set_success(format!("stopped {}", self.label_of(&names[0]))),
-                            n => self.set_success(format!("stopped {n} worktrees")),
-                        }
+                    PendingOutcome::StoppedAll(report) => {
+                        // What came up after the confirmation was shown was
+                        // left running, and the header names it by branch:
+                        // said only to `m`, it left "nothing was running"
+                        // on the header beside a row that ran.
+                        let stopped = match report.stopped.as_slice() {
+                            [] if report.kept.is_empty() => "nothing was running".to_string(),
+                            [] => "nothing listed was still running".to_string(),
+                            [name] => format!("stopped {}", self.label_of(name)),
+                            names => format!("stopped {} worktrees", names.len()),
+                        };
+                        let kept: Vec<String> =
+                            report.kept.iter().map(|name| self.label_of(name)).collect();
+                        self.set_success(match kept.as_slice() {
+                            [] => stopped,
+                            [one] => {
+                                format!("{stopped} · {one} came up since and was left running")
+                            }
+                            many => format!(
+                                "{stopped} · {} came up since and were left running",
+                                many.join(", ")
+                            ),
+                        });
                         self.spawn_refresh();
                     }
                     PendingOutcome::Unshared(_) => {

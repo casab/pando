@@ -5225,6 +5225,38 @@ fn an_action_that_only_narrated_ends_on_its_outcome() {
     );
 }
 
+// `X` leaves running what came up after its list was shown, and said so
+// only to `m`, by directory: the header said "stopped feat/one", or
+// "nothing was running" beside a row that ran.
+#[test]
+fn a_stop_all_names_on_the_header_what_it_left_running() {
+    let came_up = "feat+two came up after the list of what stops was shown — left running";
+    for (stopped, said) in [
+        (
+            vec!["feat+one".to_string()],
+            "stopped feat/one · feat/two came up since and was left running",
+        ),
+        (
+            Vec::new(),
+            "nothing listed was still running · feat/two came up since and was left running",
+        ),
+    ] {
+        let mut app = test_app(&["feat+one", "feat+two"]);
+        pending_that_says(
+            &mut app,
+            "",
+            PendingKind::StopAll,
+            &[came_up],
+            Ok(PendingOutcome::StoppedAll(actions::StopAllReport {
+                stopped,
+                kept: vec!["feat+two".to_string()],
+            })),
+        );
+        wait_for_pending(&mut app);
+        assert_eq!(app.active_status(), Some((said, false)));
+    }
+}
+
 // ---- errors about one worktree ---------------------------------------
 
 // An error raised by feat/db's start does not follow the reader into

@@ -148,6 +148,16 @@ pub enum StopOutcome {
     NotRunning,
 }
 
+/// What a stop of every worktree did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StopAllReport {
+    /// The worktrees it stopped.
+    pub stopped: Vec<String>,
+    /// The worktrees up that the list it was given did not name: they came
+    /// up after it was shown, and were left running.
+    pub kept: Vec<String>,
+}
+
 /// Everything a start needs to know about one process before anything is
 /// spawned.
 ///
@@ -1248,18 +1258,20 @@ pub fn stop(
 /// Stops every worktree pando has a process for, returning their names.
 pub fn stop_all(paths: &PandoPaths, progress: &dyn Fn(&str)) -> Result<Vec<String>> {
     stop_all_with(paths, None, |pgid| proc::stop(pgid, STOP_GRACE), progress)
+        .map(|report| report.stopped)
 }
 
 /// [`stop_all`] once a confirmation has shown `listed` as what is up. A
 /// worktree up now that it did not name came up after it was shown — an
 /// agent started or shared it while the question was open — and is left
-/// running, and said to be. What is not up goes as it does for
-/// [`stop_all`]: a crashed dev server's containers were never listed.
+/// running, said to be, and reported as kept. What is not up goes as it
+/// does for [`stop_all`]: a crashed dev server's containers were never
+/// listed.
 pub fn stop_all_listed(
     paths: &PandoPaths,
     listed: &[String],
     progress: &dyn Fn(&str),
-) -> Result<Vec<String>> {
+) -> Result<StopAllReport> {
     stop_all_with(
         paths,
         Some(listed),
@@ -1276,7 +1288,7 @@ pub fn stop_all_with(
     listed: Option<&[String]>,
     stop: impl Fn(i32) -> Result<()>,
     progress: &dyn Fn(&str),
-) -> Result<Vec<String>> {
+) -> Result<StopAllReport> {
     paths.ensure_home()?;
     let _lock = state::lock(&paths.lock_file())?;
     let mut store = state::load(&paths.state_file())?;
@@ -1285,6 +1297,7 @@ pub fn stop_all_with(
     // sure nothing of pando's is left running. A share too: its tunnel
     // outlives the processes it pointed at.
     let mut names: Vec<String> = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
     for (name, record) in &store.worktrees {
         if record.processes.is_empty() && record.services.is_empty() && record.share.is_none() {
             continue;
@@ -1293,6 +1306,7 @@ pub fn stop_all_with(
             progress(&format!(
                 "{name} came up after the list of what stops was shown — left running"
             ));
+            kept.push(name.clone());
             continue;
         }
         names.push(name.clone());
@@ -1345,7 +1359,7 @@ pub fn stop_all_with(
         return Err(e);
     }
     stop_containers(paths, &projects, progress)?;
-    Ok(stopped)
+    Ok(StopAllReport { stopped, kept })
 }
 
 /// The public URL `name` is shared at, read before a stop so that one which
