@@ -156,6 +156,28 @@ pub(super) fn python_runner(signals: &Signals) -> &'static str {
     package_managers::run_prefix(lockfiles(signals), Ecosystem::Python).unwrap_or("")
 }
 
+/// The port a script fixes on its own command line: `next dev -p 3001`,
+/// `vite --port=5174`. A CLI takes its flag over the environment, so no
+/// port pando hands the process can move it.
+///
+/// Only a number counts. `-p $PORT` reads the port it is given, which is
+/// exactly the shape that should be given one.
+pub(super) fn fixed_port(script: &str) -> Option<u16> {
+    let mut words = script.split_whitespace();
+    while let Some(word) = words.next() {
+        let value = match word {
+            "--port" | "-p" => words.next(),
+            _ => word
+                .strip_prefix("--port=")
+                .or_else(|| word.strip_prefix("-p=")),
+        };
+        if let Some(port) = value.and_then(|v| v.trim_matches(['"', '\'']).parse().ok()) {
+            return Some(port);
+        }
+    }
+    None
+}
+
 pub(super) fn lockfiles(signals: &Signals) -> impl Iterator<Item = &str> {
     signals.lockfiles.iter().map(String::as_str)
 }
@@ -390,7 +412,12 @@ pub(super) fn port_proposal(
     signals: &Signals,
     rule: Option<&'static FrameworkRule>,
 ) -> Option<Proposal> {
-    let framework_env = rule.and_then(|r| match r.port {
+    // Not where the script that would run fixes its own port: the flag
+    // wins over the variable, and a role for it is a port nothing binds.
+    let fixed = ranked_scripts(signals)
+        .first()
+        .is_some_and(|(_, body)| fixed_port(body).is_some());
+    let framework_env = rule.filter(|_| !fixed).and_then(|r| match r.port {
         PortMechanism::Env(name) => Some((name, r.name)),
         _ => None,
     });

@@ -459,6 +459,27 @@ fn the_projects_own_port_variables_beat_the_framework_guess() {
     assert!(!proposal.decided);
 }
 
+// Next reads `-p` over `PORT`: given a role, the process would be waited
+// on for a port it never binds.
+#[test]
+fn a_dev_script_that_fixes_its_own_port_is_not_given_the_framework_one() {
+    let next = RULES.iter().find(|r| r.name == "Next.js").unwrap();
+    for body in [
+        "next dev -p 3001",
+        "next dev --port=3001",
+        "next dev --port '3001'",
+    ] {
+        let signals = scripts(&[("dev", body)]);
+        assert!(port_proposal(&signals, Some(next)).is_none(), "{body}");
+    }
+    // A port it reads from the environment is still one it is given.
+    let signals = scripts(&[("dev", "next dev -p $PORT")]);
+    assert_eq!(
+        values(&port_proposal(&signals, Some(next)).unwrap()),
+        vec!["PORT"]
+    );
+}
+
 // A project that writes `PORT` has said where its web server's port
 // comes from. The role reading is for a project that named its ports
 // instead, so this one keeps the question it always had.
@@ -945,6 +966,56 @@ fn a_port_flag_is_handed_on_the_way_the_package_manager_expects() {
         .unwrap();
     assert_eq!(processes["web"].cmd, "npm run dev -- --port {port:web}");
     assert_eq!(processes["api"].cmd, "npm run dev");
+}
+
+// The create-turbo layout: each app's own script names its port, and the
+// root only fans out with `turbo run dev`. Given `PORT` and a role, each
+// app would bind its own port anyway and fail its readiness wait.
+#[test]
+fn an_app_whose_dev_script_fixes_its_port_owns_no_role() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "workspaces": ["apps/*"], "scripts": { "dev": "turbo run dev" } }"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+    for (name, script) in [
+        ("web", "next dev --turbopack --port 3000"),
+        ("docs", "next dev --turbopack --port 3001"),
+        ("site", "vite --port 5174"),
+    ] {
+        std::fs::create_dir_all(root.join("apps").join(name)).unwrap();
+        std::fs::write(
+            root.join("apps").join(name).join("package.json"),
+            format!(r#"{{ "scripts": {{ "dev": "{script}" }} }}"#),
+        )
+        .unwrap();
+    }
+    std::fs::write(root.join("apps/site/vite.config.ts"), "export default {}\n").unwrap();
+    let proposal = proposed_processes(root);
+    let processes = proposal.candidates[0].processes.clone().unwrap();
+    for (name, process) in &processes {
+        assert_eq!(
+            process.cmd, "pnpm dev",
+            "{name}: the flag is not said twice"
+        );
+        assert!(process.roles().is_empty(), "{name}: {:?}", process.ports);
+        assert!(process.ready.is_none(), "{name}");
+        assert!(
+            !process.env.contains_key("PORT"),
+            "{name}: {:?}",
+            process.env
+        );
+    }
+    assert!(
+        proposal.candidates[0]
+            .why
+            .contains("web fixes its own port 3000 in its dev script"),
+        "{}",
+        proposal.candidates[0].why
+    );
 }
 
 /// Adds an app with a Node dev script to the `workspace` fixture.

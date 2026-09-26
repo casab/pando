@@ -8,7 +8,7 @@ use crate::catalog::frameworks::{FrameworkRule, PortMechanism};
 use crate::config::{PortsSpec, ProcessConfig, ReadySpec};
 
 use super::apply::DEV;
-use super::dev::{is_multiplexer, is_production, script_args, script_runner};
+use super::dev::{fixed_port, is_multiplexer, is_production, script_args, script_runner};
 use super::frameworks::framework;
 use super::proposal::{Candidate, Proposal, Slot};
 use super::signals::{Signals, parse_scripts, present};
@@ -28,6 +28,10 @@ pub struct WorkspaceApp {
     pub default_port: Option<u16>,
     /// How this app takes a port, from its own framework rule.
     pub port: PortMechanism,
+    /// The port its own dev script fixes on the command line, which no
+    /// port pando hands it can move: `next dev --port 3000` binds 3000
+    /// whatever `PORT` says. Such an app owns no role.
+    pub fixed_port: Option<u16>,
 }
 
 /// Fewer than this is not a workspace worth splitting up: one app with a
@@ -168,12 +172,15 @@ pub fn workspace_apps(root: &Path, signals: &Signals) -> Vec<WorkspaceApp> {
                 continue;
             };
             let rule = framework(&path, &app);
+            let fixed = fixed_port(script);
             let mut cmd = format!("{runner}dev");
             // A framework that takes its port on the command line gets the
             // flag appended to its own script: `pnpm dev --port 1234`, or
             // `npm run dev -- --port 1234`, runs what the app already runs,
-            // on the port pando chose.
+            // on the port pando chose. Not to a script that already says
+            // which port: that would be the flag twice.
             if let Some(rule) = rule
+                && fixed.is_none()
                 && rule.port == PortMechanism::InCommand
                 && let Some(flag) = rule.port_flag
             {
@@ -183,8 +190,9 @@ pub fn workspace_apps(root: &Path, signals: &Signals) -> Vec<WorkspaceApp> {
                 );
             }
             apps.push(WorkspaceApp {
-                default_port: app_default_port(signals, name, rule),
+                default_port: fixed.or_else(|| app_default_port(signals, name, rule)),
                 port: match rule {
+                    _ if fixed.is_some() => PortMechanism::Ask,
                     Some(rule)
                         if rule.port == PortMechanism::InCommand && rule.port_flag.is_none() =>
                     {
@@ -193,6 +201,7 @@ pub fn workspace_apps(root: &Path, signals: &Signals) -> Vec<WorkspaceApp> {
                     Some(rule) => rule.port,
                     None => PortMechanism::Ask,
                 },
+                fixed_port: fixed,
                 name: name.to_string(),
                 dir,
                 cmd,
@@ -309,6 +318,11 @@ fn app_port_env(signals: &Signals, app: &WorkspaceApp) -> Vec<String> {
     let wanted = app_port_var(&app.name);
     let declared = signals.env_keys().any(|key| key == wanted);
     let mut out: Vec<String> = Vec::new();
+    // A port the app's own script fixes beats any variable: a role for it
+    // would be a port reserved and waited on that nothing ever binds.
+    if app.fixed_port.is_some() {
+        return out;
+    }
     match app.port {
         // The command already carries the port. A second way of saying it
         // is a second thing that can disagree.
@@ -503,12 +517,23 @@ pub(super) fn processes_proposal(root: &Path, signals: &Signals) -> Option<Propo
     // question says where they came from.
     let declared: Vec<String> = apps
         .iter()
+        .filter(|app| app.fixed_port.is_none())
         .map(|app| app_port_var(&app.name))
         .filter(|key| signals.env_keys().any(|k| k == key))
         .collect();
     let mut why = format!("a dev script in each of {} workspace apps", apps.len());
     if !declared.is_empty() {
         why.push_str(&format!("; {} in the env example", declared.join(" and ")));
+    }
+    // Said, because such an app gets no port of its own in a worktree and
+    // two worktrees will both want the one its script names.
+    for app in &apps {
+        if let Some(port) = app.fixed_port {
+            why.push_str(&format!(
+                "; {} fixes its own port {port} in its dev script",
+                app.name
+            ));
+        }
     }
     let mut candidates = vec![Candidate {
         value: summary,
