@@ -485,7 +485,9 @@ impl App {
         self.spawn_remove(name, !created_by_pando, force);
     }
 
-    /// Everything the remove dialog states up front, most serious first.
+    /// Everything the remove dialog states up front, most serious first:
+    /// what refuses it, then the data that goes for good, then the rest.
+    /// A dialog too short for all of them loses the last.
     pub fn remove_blockers(&self, name: &str) -> Vec<RemoveBlocker> {
         let mut out = Vec::new();
         let Some(wt) = self.worktrees.iter().find(|w| w.name == name) else {
@@ -499,18 +501,18 @@ impl App {
             Some(false) => {}
             None => out.push(RemoveBlocker::DirtyUnknown),
         }
-        if self.phase_of(name).is_some() {
-            out.push(RemoveBlocker::Running);
-        }
-        if !self.created_by_pando.get(name).copied().unwrap_or(false) {
-            out.push(RemoveBlocker::NotOurs);
-        }
         let drops = self
             .record_for(name)
             .map(actions::namespaces_rm_drops)
             .unwrap_or_default();
         if !drops.is_empty() {
             out.push(RemoveBlocker::Drops(drops));
+        }
+        if self.phase_of(name).is_some() {
+            out.push(RemoveBlocker::Running);
+        }
+        if !self.created_by_pando.get(name).copied().unwrap_or(false) {
+            out.push(RemoveBlocker::NotOurs);
         }
         out
     }

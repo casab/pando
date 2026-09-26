@@ -2416,6 +2416,31 @@ fn the_stop_all_confirmation_lists_what_goes_down() {
     assert!(rendered.contains("feat/three"), "{rendered}");
 }
 
+// Twelve names were listed whatever the pane's height, so in a 12-row
+// split with ten worktrees up the warning and the key line fell off the
+// bottom, and `y` still stopped them all.
+#[test]
+fn a_short_stop_all_confirmation_counts_names_to_keep_its_keys() {
+    let names: Vec<String> = (0..10).map(|i| format!("feat+number-{i}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let mut app = test_app(&refs);
+    for name in &refs {
+        with_process(&mut app, name, running_phase());
+    }
+    app.modal = Some(Modal::StopAll {
+        names: names.clone(),
+    });
+    let rendered = text_of(&draw(&mut app, 60, 12));
+    assert!(rendered.contains("y stop all   esc cancel"), "{rendered}");
+    assert!(rendered.contains("go down too"), "{rendered}");
+    assert!(rendered.contains("… and 5 more"), "{rendered}");
+
+    // Where there is room, the twelve it always listed.
+    let rendered = text_of(&draw(&mut app, 120, 40));
+    assert!(rendered.contains("feat/number-9"), "{rendered}");
+    assert!(!rendered.contains("more"), "{rendered}");
+}
+
 // Removing a running worktree stops it first; the confirmation says so.
 #[test]
 fn removing_a_running_worktree_warns_that_it_stops_it() {
@@ -3376,12 +3401,54 @@ fn a_login_typed_into_the_question_shows_its_password_as_dots() {
 #[test]
 fn the_remove_dialog_says_which_database_and_slot_go_with_the_worktree() {
     let mut app = test_app(&["feat+one"]);
+    with_namespaces(&mut app, "feat+one");
+    app.modal = Some(Modal::Remove {
+        name: "feat+one".into(),
+        created_by_pando: true,
+    });
+    let rendered = text_of(&draw(&mut app, 140, 30));
+    assert!(
+        rendered.contains("drops database shop__feat_one, empties redis slot 3 with it"),
+        "{rendered}"
+    );
+}
+
+// A 40 by 10 tmux split: the key line went first, then the tail of what
+// removing drops, and the caption was cut at the border — while `y`
+// still removed the worktree and dropped its database.
+#[test]
+fn a_short_remove_dialog_keeps_its_keys_and_what_it_drops() {
+    let mut app = test_app(&["feat+one"]);
+    with_process(&mut app, "feat+one", running_phase());
+    with_namespaces(&mut app, "feat+one");
+    app.created_by_pando.insert("feat+one".into(), false);
+    app.modal = Some(Modal::Remove {
+        name: "feat+one".into(),
+        created_by_pando: false,
+    });
+    let rendered = text_of(&draw(&mut app, 40, 10));
+    assert!(rendered.contains("y remove   F force"), "{rendered}");
+    assert!(rendered.contains("esc cancel"), "{rendered}");
+    assert!(rendered.contains("drops database"), "{rendered}");
+    assert!(rendered.contains("redis slot 3 with it"), "{rendered}");
+
+    // Narrow but tall enough: nothing goes, and the caption wraps.
+    let rendered = text_of(&draw(&mut app, 50, 30));
+    assert!(rendered.contains("its logs and data"), "{rendered}");
+    assert!(rendered.contains("are deleted"), "{rendered}");
+    assert!(rendered.contains("removing stops it"), "{rendered}");
+    assert!(rendered.contains("pando did not create"), "{rendered}");
+    assert!(rendered.contains("esc cancel"), "{rendered}");
+}
+
+/// Gives `name` a database and a redis slot of its own, which `rm` drops.
+fn with_namespaces(app: &mut App, name: &str) {
     let record = app
         .state
         .worktrees
-        .entry("feat+one".into())
-        .or_insert_with(|| crate::state::WorktreeRecord::new("/abs/feat+one", true));
-    for (service, kind, name) in [
+        .entry(name.into())
+        .or_insert_with(|| crate::state::WorktreeRecord::new(format!("/abs/{name}"), true));
+    for (service, kind, namespace) in [
         (
             "mariadb",
             crate::state::NamespaceKind::Database,
@@ -3395,22 +3462,13 @@ fn the_remove_dialog_says_which_database_and_slot_go_with_the_worktree() {
             kind,
             host: "localhost".into(),
             port: 1,
-            name: name.into(),
+            name: namespace.into(),
             main: "0".into(),
             mains: Vec::new(),
             keys: Vec::new(),
             used_at: chrono::Utc::now(),
         });
     }
-    app.modal = Some(Modal::Remove {
-        name: "feat+one".into(),
-        created_by_pando: true,
-    });
-    let rendered = text_of(&draw(&mut app, 140, 30));
-    assert!(
-        rendered.contains("drops database shop__feat_one, empties redis slot 3 with it"),
-        "{rendered}"
-    );
 }
 
 // ---- namespaced in the TUI ------------------------------------------------------

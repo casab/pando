@@ -1006,12 +1006,67 @@ fn render_theme_picker(f: &mut Frame, area: Rect, app: &App, selected: usize) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+/// A dialog's keys, each with what it does, as many to a row as `width`
+/// takes: one line cut at the border lost the key that cancels.
+fn key_rows(keys: Vec<(Span<'static>, Span<'static>)>, width: usize) -> Vec<Line<'static>> {
+    let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut used = 0;
+    for (key, what) in keys {
+        let needs = text_width(&key.content) + text_width(&what.content);
+        match rows.last_mut() {
+            Some(row) if used + 3 + needs <= width => {
+                row.extend([hint_span("   "), key, what]);
+                used += 3 + needs;
+            }
+            _ => {
+                rows.push(vec![key, what]);
+                used = needs;
+            }
+        }
+    }
+    rows.into_iter()
+        .map(|row| super::render::truncate_line(Line::from(row), width))
+        .collect()
+}
+
+/// Paints `body` over `keys`, the keys on the box's last rows, with a
+/// blank row between them when there is room for one. A body taller
+/// than the box loses its last rows, and a `…` says so; the keys that
+/// answer it are never the ones to go.
+fn paint_over_keys(
+    f: &mut Frame,
+    inner: Rect,
+    mut body: Vec<Line<'static>>,
+    keys: Vec<Line<'static>>,
+) {
+    let keys_height = (keys.len() as u16).min(inner.height);
+    let room = inner.height - keys_height;
+    if body.len() < room as usize {
+        body.push(Line::raw(""));
+    } else if body.len() > room as usize && room > 0 {
+        body.truncate(room as usize - 1);
+        body.push(hint_span("…").into());
+    }
+    let body_area = Rect {
+        height: room,
+        ..inner
+    };
+    let keys_area = Rect {
+        y: inner.y + room,
+        height: keys_height,
+        ..inner
+    };
+    f.render_widget(Paragraph::new(body), body_area);
+    f.render_widget(Paragraph::new(keys), keys_area);
+}
+
 /// Confirming `X`: what is up, one row apiece, before any of it goes down.
 fn render_stop_all(f: &mut Frame, area: Rect, names: &[String], app: &App) {
     let cap = max_content_width(area);
-    // A tmux split has few rows; past this many the rest are counted.
+    // Past this many names the rest are counted, and sooner in a short
+    // tmux split: the names get only the rows the rest leave them.
     const MAX_ROWS: usize = 12;
-    let mut lines = vec![Line::styled(
+    let title = Line::styled(
         truncate(
             &match names.len() {
                 1 => "stop the one worktree that is up?".to_string(),
@@ -1020,8 +1075,26 @@ fn render_stop_all(f: &mut Frame, area: Rect, names: &[String], app: &App) {
             cap,
         ),
         Style::new().fg(text()).add_modifier(Modifier::BOLD),
-    )];
-    for name in names.iter().take(MAX_ROWS) {
+    );
+    let warning: Vec<Line> = wrap_text("their services and public URLs go down too", cap)
+        .into_iter()
+        .map(|row| Line::styled(row, Style::new().fg(yellow())))
+        .collect();
+    let keys = key_rows(
+        vec![
+            (key_span("y"), hint_span(" stop all")),
+            (key_span("esc"), hint_span(" cancel")),
+        ],
+        cap,
+    );
+    // The border, the title, the warning, the blank row and the keys.
+    let room = (area.height as usize).saturating_sub(2 + 1 + warning.len() + 1 + keys.len());
+    let shown = match names.len() <= room.min(MAX_ROWS) {
+        true => names.len(),
+        false => room.saturating_sub(1).min(MAX_ROWS),
+    };
+    let mut lines = vec![title];
+    for name in names.iter().take(shown) {
         let (glyph, color) = super::render::run_marker(app.phase_of(name).as_ref());
         lines.push(Line::from(vec![
             Span::styled(glyph, Style::new().fg(color)),
@@ -1031,98 +1104,113 @@ fn render_stop_all(f: &mut Frame, area: Rect, names: &[String], app: &App) {
             ),
         ]));
     }
-    if names.len() > MAX_ROWS {
-        lines.push(hint_span(&format!("… and {} more", names.len() - MAX_ROWS)).into());
+    if names.len() > shown {
+        lines.push(hint_span(&format!("… and {} more", names.len() - shown)).into());
     }
-    lines.push(Line::styled(
-        truncate("their services and public URLs go down too", cap),
-        Style::new().fg(yellow()),
-    ));
-    lines.push(Line::raw(""));
-    lines.push(Line::from(vec![
-        key_span("y"),
-        hint_span(" stop all   "),
-        key_span("esc"),
-        hint_span(" cancel"),
-    ]));
-    let width = widest(&lines).min(cap);
-    let Some(inner) = popup(f, area, "stop everything", None, width, lines.len()) else {
+    lines.extend(warning);
+    let width = widest(&lines).max(widest(&keys)).min(cap);
+    let height = lines.len() + 1 + keys.len();
+    let Some(inner) = popup(f, area, "stop everything", None, width, height) else {
         return;
     };
-    f.render_widget(Paragraph::new(lines), inner);
+    paint_over_keys(f, inner, lines, keys);
 }
 
 /// What removing takes with it and what would stop it, all of it before
 /// the key is pressed: running, uncommitted changes, not pando's, locked.
+/// A pane too short for all of it keeps what refuses the removal, what it
+/// destroys and the keys.
 fn render_remove(f: &mut Frame, area: Rect, label: &str, blockers: &[RemoveBlocker]) {
     let cap = max_content_width(area);
-    let mut lines = vec![
-        Line::styled(
-            truncate_middle(&format!("remove {label}?"), cap),
-            Style::new().fg(text()).add_modifier(Modifier::BOLD),
+    // Each block with how soon it goes in a pane too short for all of
+    // them, the highest first: the caption, then whether it runs, then
+    // whether pando made it. The title never goes.
+    let mut blocks: Vec<(u8, Vec<Line<'static>>)> = vec![
+        (
+            0,
+            vec![Line::styled(
+                truncate_middle(&format!("remove {label}?"), cap),
+                Style::new().fg(text()).add_modifier(Modifier::BOLD),
+            )],
         ),
-        Line::styled(
-            "the branch is kept; its logs and data are deleted",
-            Style::new().fg(text_muted()),
+        (
+            5,
+            wrap_text("the branch is kept; its logs and data are deleted", cap)
+                .into_iter()
+                .map(|row| Line::styled(row, Style::new().fg(text_muted())))
+                .collect(),
         ),
     ];
     // Said here rather than found out from the progress line afterwards,
     // or from git refusing after the dialog has gone.
     for blocker in blockers {
-        let (mark, color) = match blocker {
-            RemoveBlocker::Locked(_) => ("⚠", yellow()),
-            RemoveBlocker::Dirty => ("*", yellow()),
-            RemoveBlocker::DirtyUnknown => ("?", text_muted()),
-            RemoveBlocker::Running => ("●", yellow()),
-            RemoveBlocker::NotOurs => ("⚠", yellow()),
+        let (mark, color, sheds) = match blocker {
+            RemoveBlocker::Locked(_) => ("⚠", yellow(), 1),
+            RemoveBlocker::Dirty => ("*", yellow(), 2),
+            RemoveBlocker::DirtyUnknown => ("?", text_muted(), 2),
+            RemoveBlocker::Running => ("●", yellow(), 4),
+            RemoveBlocker::NotOurs => ("⚠", yellow(), 3),
             // Data that goes for good: the destructive colour.
-            RemoveBlocker::Drops(_) => ("✕", red()),
+            RemoveBlocker::Drops(_) => ("✕", red(), 1),
         };
-        for (i, row) in wrap_text(&blocker.line(), cap.saturating_sub(2))
+        let rows = wrap_text(&blocker.line(), cap.saturating_sub(2))
             .into_iter()
             .enumerate()
-        {
-            let lead = if i == 0 { mark } else { " " };
-            lines.push(Line::styled(
-                format!("{lead} {row}"),
-                Style::new().fg(color),
-            ));
-        }
+            .map(|(i, row)| {
+                let lead = if i == 0 { mark } else { " " };
+                Line::styled(format!("{lead} {row}"), Style::new().fg(color))
+            })
+            .collect();
+        blocks.push((sheds, rows));
     }
-    lines.push(Line::raw(""));
     let dirty = blockers.contains(&RemoveBlocker::Dirty);
-    lines.push(if blockers.iter().any(RemoveBlocker::is_fatal) {
-        Line::from(vec![
+    let keys = if blockers.iter().any(RemoveBlocker::is_fatal) {
+        vec![(
             key_span("esc"),
             Span::styled(
                 " close — this one cannot be removed",
                 Style::new().fg(red()),
             ),
-        ])
+        )]
     } else if dirty {
         // `y` would only be refused by git, so the key offered is the one
         // that works — and what it costs is on the line above.
-        Line::from(vec![
-            key_span("F"),
-            hint_span(" remove, discarding changes   "),
-            key_span("esc"),
-            hint_span(" cancel"),
-        ])
+        vec![
+            (key_span("F"), hint_span(" remove, discarding changes")),
+            (key_span("esc"), hint_span(" cancel")),
+        ]
     } else {
-        Line::from(vec![
-            key_span("y"),
-            hint_span(" remove   "),
-            key_span("F"),
-            hint_span(" force   "),
-            key_span("esc"),
-            hint_span(" cancel"),
-        ])
-    });
-    let width = widest(&lines).min(cap);
-    let Some(inner) = popup(f, area, "remove worktree", None, width, lines.len()) else {
+        vec![
+            (key_span("y"), hint_span(" remove")),
+            (key_span("F"), hint_span(" force")),
+            (key_span("esc"), hint_span(" cancel")),
+        ]
+    };
+    let keys = key_rows(keys, cap);
+    // The rows inside the border that the keys leave.
+    let room = (area.height as usize).saturating_sub(2 + keys.len());
+    let rows = |blocks: &[(u8, Vec<Line>)]| blocks.iter().map(|(_, b)| b.len()).sum::<usize>();
+    let shed = rows(&blocks) > room;
+    // Down to what fits with a `…` under it, which says something went.
+    while shed && rows(&blocks) + 1 > room {
+        let Some(at) = (0..blocks.len())
+            .filter(|&i| blocks[i].0 > 0)
+            .max_by_key(|&i| (blocks[i].0, i))
+        else {
+            break;
+        };
+        blocks.remove(at);
+    }
+    let mut lines: Vec<Line<'static>> = blocks.into_iter().flat_map(|(_, b)| b).collect();
+    if shed {
+        lines.push(hint_span("…").into());
+    }
+    let width = widest(&lines).max(widest(&keys)).min(cap);
+    let height = lines.len() + 1 + keys.len();
+    let Some(inner) = popup(f, area, "remove worktree", None, width, height) else {
         return;
     };
-    f.render_widget(Paragraph::new(lines), inner);
+    paint_over_keys(f, inner, lines, keys);
 }
 
 /// Every key of the view it was opened from, then what the marks mean.
