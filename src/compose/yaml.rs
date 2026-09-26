@@ -11,7 +11,7 @@ use anyhow::{Result, bail};
 // ---- parsing --------------------------------------------------------------
 
 pub fn parse(text: &str) -> Result<ComposeFile> {
-    let (node, more) = parse_document(text)?;
+    let (node, unplaced) = parse_document(text)?;
     let Node::Map(top) = node else {
         bail!("a compose file is a mapping at its top level");
     };
@@ -25,8 +25,10 @@ pub fn parse(text: &str) -> Result<ComposeFile> {
     };
     file.unresolved.aliases = read().any(refers_elsewhere);
     // Compose merges every document of a file into the first, so a second
-    // one can add anything to a service, a bind mount among it.
-    file.unresolved.unread = more
+    // one can add anything to a service, a bind mount among it, and a line
+    // at the top level with no key in it may be one compose reads as part
+    // of the value above it.
+    file.unresolved.unread = unplaced
         || top.iter().any(|(key, value)| match (key.as_str(), value) {
             ("services", Node::Map(services)) => {
                 services.iter().any(|(_, body)| service_unread(body))
@@ -374,15 +376,26 @@ struct Line {
     text: String,
 }
 
-/// The file's first YAML document, and whether another one follows it.
+/// The file's first YAML document, and whether the file holds text this
+/// reader does not place in it: another document after it, or a line at
+/// its top level with no key in it.
+///
+/// The top level is a mapping of every key read around such a line, not
+/// one this reader could not read: a compose file is a mapping there, and
+/// the parse failed saying it was none, where compose reads a flow value
+/// that goes on over a line at column 0 as part of it.
 fn parse_document(text: &str) -> Result<(Node, bool)> {
     let (lines, more) = significant_lines(text);
-    if lines.is_empty() {
+    let Some(first) = lines.first() else {
         return Ok((Node::Map(Vec::new()), more));
-    }
+    };
     let mut at = 0usize;
-    let node = parse_block(&lines, &mut at, lines[0].indent)?;
-    Ok((node, more))
+    let start = first.text.trim_start();
+    if start.starts_with('-') || opens_a_value(start) {
+        return Ok((parse_block(&lines, &mut at, first.indent)?, more));
+    }
+    let (entries, keyless) = map_entries(&lines, &mut at, first.indent)?;
+    Ok((Node::Map(entries), more || keyless))
 }
 
 /// The lines of the file's first YAML document, comments and blank lines
@@ -526,8 +539,34 @@ fn parse_seq(lines: &[Line], at: &mut usize, indent: usize) -> Result<Node> {
     Ok(Node::Seq(items))
 }
 
+/// The mapping at `indent`, or one this reader could not read when a line
+/// at its own column has no key in it (see [`map_entries`]).
 fn parse_map(lines: &[Line], at: &mut usize, indent: usize) -> Result<Node> {
+    let (entries, keyless) = map_entries(lines, at, indent)?;
+    Ok(if keyless {
+        Node::Unread
+    } else {
+        Node::Map(entries)
+    })
+}
+
+/// The entries of the mapping at `indent`, and whether a line at its own
+/// column had no key in it.
+///
+/// Such a line, other than one closing the brackets of the value above,
+/// is one this reader cannot place: a plain scalar written on the line
+/// under its key or `-`, an explicit `? key`, or a flow value going on
+/// over its key's column. It is skipped and the keys after it are read,
+/// but the mapping is not the one compose reads: `-` over
+/// `./pgdata:/var/lib/postgresql/data` read as a mapping of nothing, a
+/// mount with no source, where compose binds `./pgdata`.
+fn map_entries(
+    lines: &[Line],
+    at: &mut usize,
+    indent: usize,
+) -> Result<(Vec<(String, Node)>, bool)> {
     let mut entries: Vec<(String, Node)> = Vec::new();
+    let mut keyless = false;
     while let Some(line) = lines.get(*at) {
         if line.indent < indent {
             break;
@@ -542,26 +581,16 @@ fn parse_map(lines: &[Line], at: &mut usize, indent: usize) -> Result<Node> {
         if trimmed.starts_with('-') {
             break;
         }
-        let Some((key, value)) = split_key(trimmed) else {
-            // A line closing the brackets of the value above goes on with
-            // that value.
-            if closes_only(trimmed) {
-                *at += 1;
-                continue;
-            }
-            // Any other line at the mapping's own column with no key in it
-            // is one this reader cannot place: a plain scalar written on
-            // the line under its key or `-`, or an explicit `? key`.
-            // Skipped, `-` over `./pgdata:/var/lib/postgresql/data` read as
-            // a mapping of nothing, a mount with no source, where compose
-            // binds `./pgdata`.
-            return Ok(Node::Unread);
-        };
         *at += 1;
-        let node = inline_value(lines, at, value, indent)?;
-        entries.push((key, node));
+        match split_key(trimmed) {
+            Some((key, value)) => {
+                let node = inline_value(lines, at, value, indent)?;
+                entries.push((key, node));
+            }
+            None => keyless |= !closes_only(trimmed),
+        }
     }
-    Ok(Node::Map(entries))
+    Ok((entries, keyless))
 }
 
 /// What follows `key:` — on the same line, or the block indented under it.

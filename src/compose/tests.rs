@@ -351,6 +351,34 @@ fn a_second_document_is_never_approved_on_half_a_file() {
     assert!(err.contains("second document"), "{err}");
 }
 
+// Compose reads a flow value that goes on over a line at the top level's
+// own column as part of it, and an explicit `? key` sits there too. Such a
+// line made the whole top level one this reader could not read, and the
+// parse failed saying the file was no mapping at all, so `start` stopped
+// where it had asked compose before.
+#[test]
+fn a_line_at_the_top_level_with_no_key_leaves_the_file_unread_not_unparsed() {
+    let web = "services:\n  web:\n    image: nginx\n    volumes:\n      - ./src:/app\n";
+    for text in [
+        format!("x-ports: [\"80\",\n\"81\"]\n{web}"),
+        format!("{web}x-ports: [\"80\",\n\"81\"]\n"),
+        format!("? x-note\n: kept\n{web}"),
+    ] {
+        let file = parse(&text).unwrap();
+        assert!(file.unresolved.unread, "{text}");
+        assert_eq!(
+            file.services["web"].volumes,
+            vec![Mount::Bind("./src".to_string())],
+            "{text}"
+        );
+        let err = format!(
+            "{:#}",
+            resolve_included(&file, &["web".into()], &[]).unwrap_err()
+        );
+        assert!(err.contains("docker compose config"), "{err}");
+    }
+}
+
 #[test]
 fn find_prefers_composes_own_order() {
     let dir = tempfile::tempdir().unwrap();

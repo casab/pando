@@ -79,9 +79,10 @@ pub struct Unresolved {
     /// with a quote in it that neither opens nor closes a quoted scalar,
     /// or a mapping with a line or an entry it finds no key in — or a
     /// value anywhere goes on over lines this reader takes for keys, or the
-    /// file goes on past its first YAML document, which compose merges the
-    /// others into. A bind mount written in any of them is as invisible as
-    /// one behind an alias.
+    /// file has a line at its top level with no key in it, or goes on past
+    /// its first YAML document, which compose merges the others into. A
+    /// bind mount written in any of them is as invisible as one behind an
+    /// alias.
     pub unread: bool,
 }
 
