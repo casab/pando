@@ -1221,7 +1221,9 @@ fn a_workspace_apps_other_scripts_do_not_say_what_its_dev_script_runs() {
 
 // Handed `--port`, a library's `vite build --watch` exited on an option
 // Vite's build does not take, and without it the watcher would still
-// bind no port, so the readiness wait failed the whole worktree.
+// bind no port, so the readiness wait failed the whole worktree. The
+// `vite` of a config file's name, or of a cache the script clears, read
+// as Vite's server and brought the flag back.
 #[test]
 fn a_package_whose_dev_script_only_builds_is_given_no_server_port() {
     let dir = tempdir().unwrap();
@@ -1229,6 +1231,16 @@ fn a_package_whose_dev_script_only_builds_is_given_no_server_port() {
     for (app, marker, dev) in [
         ("ui", "vite.config.ts", "vite build --watch"),
         ("widgets", "angular.json", "ng build --watch"),
+        (
+            "lib",
+            "vite.config.ts",
+            "vite build --watch --config vite.lib.config.ts",
+        ),
+        (
+            "icons",
+            "vite.config.ts",
+            "rm -rf node_modules/.vite && vite build --watch",
+        ),
     ] {
         std::fs::create_dir_all(dir.path().join("apps").join(app)).unwrap();
         std::fs::write(dir.path().join("apps").join(app).join(marker), "{}\n").unwrap();
@@ -1242,7 +1254,7 @@ fn a_package_whose_dev_script_only_builds_is_given_no_server_port() {
         .processes
         .clone()
         .unwrap();
-    for app in ["ui", "widgets"] {
+    for app in ["ui", "widgets", "lib", "icons"] {
         let process = &processes[app];
         assert_eq!(process.cmd, "pnpm dev", "{app}");
         assert!(process.roles().is_empty(), "{app}: {:?}", process.ports);
@@ -1250,16 +1262,21 @@ fn a_package_whose_dev_script_only_builds_is_given_no_server_port() {
     }
     assert_eq!(processes["web"].cmd, "pnpm dev --port {port:web}");
 
-    let (dir, s) = marker_fixture(&[
-        ("vite.config.ts", "export default {}\n"),
-        (
-            "package.json",
-            r#"{ "scripts": { "dev": "vite build --watch" } }"#,
-        ),
-    ]);
-    let proposal = dev_in(dir.path(), &s);
-    assert_eq!(values(&proposal), vec!["npm run dev"]);
-    assert_eq!(proposal.candidates[0].ports, None);
+    for dev in [
+        "vite build --watch",
+        "vite build --watch --config vite.lib.config.ts",
+        "vite build --watch -c vite.config.lib.ts",
+        "rm -rf node_modules/.vite && vite build --watch",
+    ] {
+        let manifest = format!(r#"{{ "scripts": {{ "dev": "{dev}" }} }}"#);
+        let (dir, s) = marker_fixture(&[
+            ("vite.config.ts", "export default {}\n"),
+            ("package.json", &manifest),
+        ]);
+        let proposal = dev_in(dir.path(), &s);
+        assert_eq!(values(&proposal), vec!["npm run dev"], "{dev}");
+        assert_eq!(proposal.candidates[0].ports, None, "{dev}");
+    }
 }
 
 // Read as build-only, a `vite build && vite preview` lost the `--port`
@@ -1291,19 +1308,27 @@ fn a_package_whose_dev_script_builds_and_then_serves_is_given_its_port() {
         assert_eq!(process.roles(), vec![app.to_string()], "{app}");
     }
 
-    let (dir, s) = marker_fixture(&[
-        ("vite.config.ts", "export default {}\n"),
-        (
-            "package.json",
-            r#"{ "scripts": { "dev": "vite build && vite preview" } }"#,
-        ),
-    ]);
-    let proposal = dev_in(dir.path(), &s);
-    assert_eq!(values(&proposal), vec!["npm run dev -- --port {port:web}"]);
-    assert_eq!(
-        proposal.candidates[0].ports,
-        Some(PortsSpec::List(vec!["web".to_string()]))
-    );
+    for dev in [
+        "vite build && vite preview",
+        "vite build -c vite.lib.config.ts && ./node_modules/.bin/vite preview",
+    ] {
+        let manifest = format!(r#"{{ "scripts": {{ "dev": "{dev}" }} }}"#);
+        let (dir, s) = marker_fixture(&[
+            ("vite.config.ts", "export default {}\n"),
+            ("package.json", &manifest),
+        ]);
+        let proposal = dev_in(dir.path(), &s);
+        assert_eq!(
+            values(&proposal),
+            vec!["npm run dev -- --port {port:web}"],
+            "{dev}"
+        );
+        assert_eq!(
+            proposal.candidates[0].ports,
+            Some(PortsSpec::List(vec!["web".to_string()])),
+            "{dev}"
+        );
+    }
 }
 
 // ---- install ---------------------------------------------------------

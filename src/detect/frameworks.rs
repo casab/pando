@@ -45,7 +45,10 @@ pub(super) fn script_framework(
 /// Whether `body` runs one of the rule's build markers and, past them,
 /// nothing else of the rule's: the framework's build, which serves
 /// nothing. A build the server follows, `vite build && vite preview`, is
-/// that server's script, and the flag it is handed reaches the server.
+/// that server's script, and the flag it is handed reaches the server. A
+/// file the build is handed, `--config vite.lib.config.ts`, or a path it
+/// clears first, `node_modules/.vite`, names the framework and runs none
+/// of it.
 pub(super) fn only_builds(rule: &FrameworkRule, body: &str) -> bool {
     let builds = rule
         .build_markers
@@ -55,7 +58,11 @@ pub(super) fn only_builds(rule: &FrameworkRule, body: &str) -> bool {
         .build_markers
         .iter()
         .fold(body.to_string(), |rest, needle| without(&rest, needle));
-    builds && !runs(rule, &rest)
+    builds
+        && !rule
+            .script_markers
+            .iter()
+            .any(|needle| invokes(&rest, needle))
 }
 
 /// Whether one of the project's script bodies runs one of the rule's
@@ -104,6 +111,17 @@ fn mentioned_at<'a>(body: &'a str, needle: &'a str) -> impl Iterator<Item = usiz
         // A needle that ends in a space ("node ") has already said where
         // the word ends.
         (before && (after || needle.ends_with(' '))).then_some(at)
+    })
+}
+
+/// Whether `body` runs `needle` as [`mentions`] reads it, and not as part
+/// of a file's name or path: `vite.lib.config.ts` and `node_modules/.vite`
+/// name Vite and run none of it.
+fn invokes(body: &str, needle: &str) -> bool {
+    mentioned_at(body, needle).any(|at| {
+        let before = body[..at].chars().next_back();
+        let after = body[at + needle.len()..].chars().next();
+        before != Some('.') && (needle.ends_with(' ') || !matches!(after, Some('.' | '/')))
     })
 }
 
