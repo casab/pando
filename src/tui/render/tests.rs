@@ -3160,6 +3160,7 @@ fn the_detail_title_shows_the_action_in_flight_as_the_row_does() {
         spinner_frame: 0,
         progress_rx: None,
         stage: None,
+        said: Vec::new(),
         label: "feat/one".into(),
     });
     let buf = draw(&mut app, 140, 20);
