@@ -146,6 +146,59 @@ impl Env {
             .output()
             .expect("run pando")
     }
+
+    /// Runs pando with a `git` in front of the real one that logs each
+    /// call's arguments, and returns the calls it saw, one line apiece.
+    fn pando_counting_git(&self, args: &[&str]) -> (Output, Vec<String>) {
+        use std::os::unix::fs::PermissionsExt;
+        let found = Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .expect("look for git");
+        let real = String::from_utf8_lossy(&found.stdout).trim().to_string();
+        let dir = self.home.parent().unwrap();
+        let bin = dir.join("counting-git");
+        let log = dir.join("git-calls.log");
+        std::fs::create_dir_all(&bin).unwrap();
+        let _ = std::fs::remove_file(&log);
+        let shim = bin.join("git");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec '{real}' \"$@\"\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let out = Command::new(env!("CARGO_BIN_EXE_pando"))
+            .env("PANDO_HOME", &self.home)
+            .env("PATH", path)
+            .current_dir(&self.root)
+            .args(args)
+            .output()
+            .expect("run pando");
+        let calls = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        (out, calls)
+    }
+}
+
+/// The calls among `calls` whose arguments include `verb` as a word of
+/// its own, such as `status` in `-C <dir> --no-optional-locks status`.
+fn git_calls_to<'a>(calls: &'a [String], verb: &str) -> Vec<&'a String> {
+    calls
+        .iter()
+        .filter(|call| call.split_whitespace().any(|arg| arg == verb))
+        .collect()
 }
 
 /// A fixture with compose services, a fake docker in its home, and a dev
@@ -253,6 +306,33 @@ fn ls_json_parses_and_carries_the_documented_keys() {
         "pr",
     ] {
         assert!(w.get(key).is_some(), "missing key {key:?} in {w}");
+    }
+}
+
+// `status` prints no git field in either shape, so it pays for none: no
+// `git status` in any worktree, and none of the repository-wide reads
+// that fill `ls`'s commit and ahead/behind columns.
+#[test]
+fn status_reads_the_listing_and_asks_git_for_nothing_it_does_not_print() {
+    let e = env();
+    for branch in ["feat/one", "feat/two"] {
+        let out = e.pando(&["new", branch]);
+        assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    }
+    for args in [
+        &["status"][..],
+        &["status", "--json"],
+        &["status", "feat/one"],
+        &["status", "feat/one", "--json"],
+    ] {
+        let (out, calls) = e.pando_counting_git(args);
+        assert_eq!(code(&out), EXIT_OK, "{args:?}: {}", stderr(&out));
+        assert!(stdout(&out).contains("feat"), "{args:?}: {}", stdout(&out));
+        assert!(!calls.is_empty(), "{args:?}: the stand-in git saw nothing");
+        for verb in ["status", "log", "for-each-ref", "rev-list"] {
+            let asked = git_calls_to(&calls, verb);
+            assert!(asked.is_empty(), "{args:?} ran git {verb}: {asked:?}");
+        }
     }
 }
 

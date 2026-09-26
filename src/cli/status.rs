@@ -13,7 +13,6 @@ use crate::actions::worktree_url;
 use crate::paths::PandoPaths;
 use crate::state::{Phase, ProcessRecord, WorktreeRecord};
 use crate::term::{Paint, Style, ellipsize_distinct, ellipsize_end, text_width};
-use crate::worktree::Worktree;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -148,7 +147,9 @@ fn phase_reason(phase: &Phase) -> Option<String> {
 pub fn status_json<W: Write>(paths: &PandoPaths, only: Option<&str>, out: &mut W) -> Result<()> {
     let refreshed = actions::refresh(paths);
     report_refresh(&refreshed);
-    let mut worktrees = actions::ls(paths)?;
+    // The listing alone: the shape has no git fields, and enriching would
+    // be a `git status` in every worktree for nothing.
+    let mut worktrees = crate::worktree::discover(&paths.project)?;
     worktrees.retain(|w| only.is_none_or(|name| w.name == name));
     if let Some(name) = only
         && worktrees.is_empty()
@@ -327,15 +328,9 @@ fn status_lines<W: Write>(
     // For the services a namespaced worktree leaves shared, and why; a
     // config that does not load only costs those lines.
     let config = crate::config::load(paths).ok().map(|loaded| loaded.config);
-    // Only the worktrees that will be shown are enriched: a `git status`
-    // apiece, and `status <name>` shows one.
-    let mut worktrees = crate::worktree::discover(&paths.project)?;
-    worktrees.retain(|w| only.is_none_or(|name| w.name == name));
-    crate::worktree::enrich_from_git(&mut worktrees, paths.root()).ok();
-    let shown: Vec<&Worktree> = worktrees
-        .iter()
-        .filter(|w| only.is_none_or(|name| w.name == name))
-        .collect();
+    // The listing alone, as for the JSON: nothing here reads a git field.
+    let mut shown = crate::worktree::discover(&paths.project)?;
+    shown.retain(|w| only.is_none_or(|name| w.name == name));
     if shown.is_empty() {
         if let Some(name) = only {
             return Err(not_listed(name, refreshed.state.worktrees.get(name)));
@@ -346,7 +341,7 @@ fn status_lines<W: Write>(
     // Named as `ls` names them: by branch, where the directory is the
     // branch spelled for a filesystem. Measured in columns, and cut only as
     // far as leaves the phase word room, never below `ls`'s floor.
-    let all_names: Vec<String> = shown.iter().map(|w| display_name(w)).collect();
+    let all_names: Vec<String> = shown.iter().map(display_name).collect();
     let widest = all_names.iter().map(|n| text_width(n)).max().unwrap_or(0);
     let names = widest.min(width.saturating_sub(COL_GAP + PHASE_CELL).max(NAME_FLOOR));
     for (w, shown_name) in shown.iter().zip(&all_names) {
