@@ -816,7 +816,14 @@ fn render_mode_chooser(f: &mut Frame, area: Rect, app: &App, name: &str, selecte
     let cap = max_content_width(area);
     let record = app.record_for(name);
     let running = app.is_up(name);
-    let current = record.and_then(|r| r.mode);
+    // A running worktree always runs in one, shared when its record never
+    // said — a 0.3.0 start — as `choose_mode` reads it; a stopped one has
+    // a last-used mode only once one was written down.
+    let current = if running {
+        record.map(|r| r.mode())
+    } else {
+        record.and_then(|r| r.mode)
+    };
     let rows: Vec<(ServiceMode, &str, &str)> = ServiceMode::ALL
         .iter()
         .map(|mode| match mode {

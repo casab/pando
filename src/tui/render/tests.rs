@@ -3225,6 +3225,28 @@ fn the_mode_chooser_marks_what_it_last_ran_in_or_runs_in() {
     );
 }
 
+// A worktree 0.3.0 started shared wrote no mode down. Still running, it
+// runs shared, as ⏎ on that row treats it: marked `running`, and choosing
+// it keeps it as it is rather than promising a restart that never comes.
+#[test]
+fn a_running_worktree_with_no_mode_written_runs_shared_in_the_chooser() {
+    let mut app = test_app(&["feat+one"]);
+    with_process(&mut app, "feat+one", running_phase());
+    assert_eq!(app.state.worktrees["feat+one"].mode, None);
+    app.modal = Some(Modal::Mode {
+        name: "feat+one".into(),
+        selected: 0,
+    });
+    let rendered = text_of(&draw(&mut app, 140, 30));
+    let row = rendered
+        .lines()
+        .find(|l| l.contains("the main checkout's servers and its data"))
+        .unwrap();
+    assert!(row.contains("running"), "{row}");
+    assert!(rendered.contains("keeps it as it is"), "{rendered}");
+    assert!(!rendered.contains("every process restarts"), "{rendered}");
+}
+
 // Decision 11: namespaced has a colour of its own, wherever the word is.
 #[test]
 fn namespaced_is_painted_in_its_own_colour_in_the_list_and_the_chooser() {
