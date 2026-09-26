@@ -294,7 +294,18 @@ fn viewer_rows(
         }
     }
 
-    if view.follow || !cursor_fits || rows.len() < body_height {
+    // A cursor line taller than the body shows from its start, where the
+    // stamp and the level are: j/k move by whole lines, so a head cut off
+    // could never be scrolled into view.
+    let tall_cursor = (!view.follow && !cursor_fits)
+        .then(|| visible.get(cursor).map(|&at| build(cursor, at)))
+        .flatten()
+        .filter(|own| own.len() > body_height);
+    if let Some(own) = tall_cursor {
+        rows = own;
+        rows.truncate(body_height);
+        scroll_out = cursor;
+    } else if view.follow || !cursor_fits || rows.len() < body_height {
         // Anchor the bottom of the window: on the tail while following, on
         // the cursor when it fell below the forward window.
         let anchor = if !view.follow && !cursor_fits {

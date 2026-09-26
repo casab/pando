@@ -1469,6 +1469,25 @@ fn a_line_longer_than_the_viewer_wraps_and_truncates_with_w() {
     );
 }
 
+// A cursor line taller than the body was anchored at its bottom, so its
+// start — the stamp, the level, the first words — was never on screen.
+#[test]
+fn a_cursor_line_taller_than_the_viewer_shows_from_its_start() {
+    let (_dir, mut app) = app_with_logs(&["feat+one"]);
+    let long = format!("HEAD{}", "ab".repeat(400));
+    write_log(&app, "feat+one", "dev", &["a line".to_string(), long]);
+    app.open_log_viewer();
+    draw(&mut app, 40, 14);
+    app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    let wrapped = text_of(&draw(&mut app, 40, 14));
+    assert!(wrapped.contains("HEAD"), "{wrapped}");
+    // Wrap off, the cursor line still renders in full.
+    app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+    let unwrapped = text_of(&draw(&mut app, 40, 14));
+    assert!(unwrapped.contains("HEAD"), "{unwrapped}");
+}
+
 // ---- yank ------------------------------------------------------------
 
 #[test]
