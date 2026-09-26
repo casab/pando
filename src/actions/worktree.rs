@@ -718,6 +718,40 @@ pub(super) fn find_worktree(paths: &PandoPaths, name: &str) -> Result<Worktree> 
         .with_context(|| format!("no worktree named {name:?}"))
 }
 
+/// [`find_worktree`] for a start or restart, which runs things in the
+/// worktree: see [`refuse_a_gone_directory`].
+pub(super) fn find_live_worktree(paths: &PandoPaths, name: &str) -> Result<Worktree> {
+    let worktree = find_worktree(paths, name)?;
+    refuse_a_gone_directory(&worktree)?;
+    Ok(worktree)
+}
+
+/// Refuses a worktree git still lists but whose directory is gone, naming
+/// the `rm` that clears its entry.
+///
+/// Nothing else would say so. A start made its namespaces, assigned its
+/// ports and saved them, and then failed in the first hook or spawn with a
+/// bare "No such file or directory" that read as the install command or
+/// bash being missing. `rm` keeps the plain lookup: clearing such an entry
+/// is what it is for.
+pub(super) fn refuse_a_gone_directory(worktree: &Worktree) -> Result<()> {
+    if !worktree.prunable && worktree.path.is_dir() {
+        return Ok(());
+    }
+    let why = worktree
+        .prunable_reason
+        .as_deref()
+        .map(|reason| format!(" ({reason})"))
+        .unwrap_or_default();
+    bail!(
+        "the directory of {} is gone{why}: git still lists it at {}, but nothing can run there \
+         — `pando rm {}` clears that entry",
+        worktree.display_name(),
+        worktree.path.display(),
+        worktree.display_name()
+    )
+}
+
 /// Refuses, once per run and before anything is written, a pando home or a
 /// `worktrees_dir` that lies inside the repository or any worktree git knows
 /// about.

@@ -17,7 +17,7 @@ use super::runtime::{
     Machine, RuntimeOutcome, answer_prelude, resolve_runtime, runtime_shell, user_home,
 };
 use super::services::{backends_reachable, placeholder_ports, service_roles};
-use super::worktree::find_worktree;
+use super::worktree::{find_worktree, refuse_a_gone_directory};
 use crate::state::ServiceMode;
 
 /// Something pando needs to know and cannot work out on its own.
@@ -448,11 +448,19 @@ pub fn resolve_for_start(
     ask: Ask<'_>,
     progress: &dyn Fn(&str),
 ) -> Result<Config> {
+    // A worktree whose directory is gone is refused before anything is
+    // asked: a login given, or a slot freed, for a start that cannot run
+    // there is a cost with nothing for it. A name git does not list is
+    // `start`'s to refuse.
+    let worktree = find_worktree(paths, name).ok();
+    if let Some(worktree) = &worktree {
+        refuse_a_gone_directory(worktree)?;
+    }
     let target = target_of(paths, config, name, mode);
     let isolating = mode == Mode::Isolated || target == ServiceMode::Isolated;
     if isolating
         && !service_roles(config).is_empty()
-        && let Ok(worktree) = find_worktree(paths, name)
+        && let Some(worktree) = &worktree
     {
         let canonical =
             std::fs::canonicalize(&worktree.path).unwrap_or_else(|_| worktree.path.clone());

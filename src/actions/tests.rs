@@ -8129,6 +8129,63 @@ fn new_over_a_prunable_entry_names_the_rm_that_clears_it() {
     );
 }
 
+// A start of a worktree whose directory was deleted assigned its ports,
+// saved them, and failed in the install hook or the spawn with a bare "No
+// such file or directory" — read by the CLI as the install command being
+// wrong — having asked for a login and made a namespace first.
+#[test]
+fn a_start_of_a_worktree_whose_directory_is_gone_names_the_rm_that_clears_it() {
+    let mut fx = fixture();
+    with_dev(&mut fx, dev("sleep 30"));
+    let name = worktree_named(&fx, "feat/gone");
+    std::fs::remove_dir_all(fx.worktrees_dir().join(&name)).unwrap();
+
+    let asked = resolve_for_start(
+        &fx.paths,
+        &fx.config,
+        &name,
+        Mode::Namespaced,
+        &refuse,
+        &noop,
+    )
+    .map(|_| ())
+    .unwrap_err();
+    let started = start(&fx.paths, &fx.config, &name, None, &noop).unwrap_err();
+    for err in [asked, started] {
+        let msg = format!("{err:#}");
+        assert!(msg.contains("feat/gone is gone"), "{msg}");
+        assert!(msg.contains("`pando rm feat/gone`"), "{msg}");
+        assert!(!msg.contains("No such file"), "{msg}");
+    }
+    let state = fx.state();
+    let record = state.worktrees.get(&name);
+    assert!(
+        record.is_none_or(|r| r.ports.is_empty() && r.processes.is_empty()),
+        "{record:?}"
+    );
+}
+
+#[test]
+fn a_restart_of_a_worktree_whose_directory_is_gone_stops_nothing() {
+    let mut fx = fixture();
+    with_dev(&mut fx, dev("sleep 30"));
+    let name = worktree_named(&fx, "feat/gone");
+    let report = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+    let _guard = guard(&report);
+    std::fs::remove_dir_all(fx.worktrees_dir().join(&name)).unwrap();
+
+    let err = restart(&fx.paths, &fx.config, &name, None, &noop).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("`pando rm feat/gone`"),
+        "{err:#}"
+    );
+    assert!(
+        crate::process::group_alive(report.started[0].record.pgid),
+        "a restart that cannot start must not stop"
+    );
+    assert_eq!(live_processes(&fx, &name), vec!["dev"]);
+}
+
 #[test]
 fn rm_refuses_the_main_checkout_and_an_unknown_name() {
     let fx = fixture();

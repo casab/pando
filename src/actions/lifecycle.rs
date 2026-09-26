@@ -30,7 +30,7 @@ use super::share::{share_closed, share_target_is_up, sweep_dead_shares_with, tak
 // Only for the intra-doc link above `sweep_orphaned_groups`.
 #[cfg(doc)]
 use super::share::sweep_dead_shares;
-use super::worktree::find_worktree;
+use super::worktree::{find_live_worktree, find_worktree};
 
 /// How long a process group gets to exit on its own before SIGKILL.
 pub(super) const STOP_GRACE: Duration = Duration::from_secs(5);
@@ -221,7 +221,7 @@ fn start_checked(
         namespaces: mut ready,
         restarting,
     } = preflight;
-    let worktree = find_worktree(paths, name)?;
+    let worktree = find_live_worktree(paths, name)?;
     // Before anything is installed, signalled or spawned: a `--only` naming
     // a process that does not exist must have no side effects at all.
     let selection = selected_processes(config, only)?;
@@ -1583,6 +1583,9 @@ pub fn restart(
     // unrelated state, and never the one that lists the names config
     // declares.
     selected_processes(config, only)?;
+    // And a worktree whose directory is gone, which the start half would
+    // refuse only after the stop half had run and the namespaces were made.
+    let worktree = find_live_worktree(paths, name)?;
     let was = recorded_mode(paths, name);
     let target = target_of(paths, config, name, mode);
     // Before the stop below, not after it: a refusal that has already
@@ -1596,7 +1599,6 @@ pub fn restart(
     // mode change, because the stop takes the containers down too.
     let preflighted = target == ServiceMode::Isolated;
     if preflighted {
-        let worktree = find_worktree(paths, name)?;
         let canonical =
             std::fs::canonicalize(&worktree.path).unwrap_or_else(|_| worktree.path.clone());
         preflight_isolation(
