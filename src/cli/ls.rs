@@ -545,8 +545,13 @@ struct PrOut {
 }
 
 pub fn ls_json<W: Write>(paths: &PandoPaths, out: &mut W) -> Result<()> {
-    let worktrees = actions::ls(paths)?;
-    let refreshed = actions::refresh(paths);
+    // Side by side, as for the text.
+    let (worktrees, refreshed) = std::thread::scope(|scope| {
+        let refreshing = scope.spawn(|| actions::refresh(paths));
+        let worktrees = actions::ls(paths);
+        (worktrees, refreshing.join().unwrap_or_default())
+    });
+    let worktrees = worktrees?;
     // A share the refresh closed or a service it forgot is saved as gone,
     // so this is the one run that can say so.
     report_refresh(&refreshed);

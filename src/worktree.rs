@@ -101,6 +101,21 @@ impl Worktree {
             ahead_behind: None,
         }
     }
+
+    /// The porcelain entry this worktree was read from.
+    fn entry(&self) -> PorcelainEntry {
+        PorcelainEntry {
+            path: self.path.clone(),
+            head: self.head.clone(),
+            branch: self.branch.clone(),
+            detached: self.detached,
+            prunable: self.prunable,
+            prunable_reason: self.prunable_reason.clone(),
+            locked: self.locked,
+            lock_reason: self.lock_reason.clone(),
+            bare: self.bare,
+        }
+    }
 }
 
 /// The main checkout plus every worktree pando manages.
@@ -315,13 +330,23 @@ pub struct EnrichUpdate {
     pub ahead_behind: Option<(u32, u32)>,
 }
 
+/// Enriches worktrees from the listing they were read from: their own
+/// heads and branches feed the batched reads, so no second
+/// `git worktree list` runs.
 pub fn enrich_from_git(worktrees: &mut [Worktree], root: &Path) -> Result<()> {
+    if worktrees.is_empty() {
+        return Ok(());
+    }
     let items: Vec<(String, PathBuf)> = worktrees
         .iter()
         .map(|w| (w.name.clone(), w.path.clone()))
         .collect();
+    let listed: HashMap<PathBuf, PorcelainEntry> = worktrees
+        .iter()
+        .map(|w| (listed_key(&w.path), w.entry()))
+        .collect();
     let (tx, rx) = mpsc::channel();
-    enrich_stream(root, items, tx, 16);
+    enrich_listed(root, items, listed, resolve_base_branch(root), tx, 16);
 
     let mut updates: HashMap<String, EnrichUpdate> = HashMap::new();
     while let Ok(u) = rx.recv() {
@@ -345,12 +370,24 @@ pub fn enrich_stream(
     sender: mpsc::Sender<EnrichUpdate>,
     pool_cap: usize,
 ) {
-    let count = items.len();
-    if count == 0 {
+    if items.is_empty() {
         return;
     }
     let porcelain = porcelain_by_path(root);
     let base = resolve_base_branch(root);
+    enrich_listed(root, items, porcelain, base, sender, pool_cap);
+}
+
+/// [`enrich_stream`] with the listing and the base already in hand.
+fn enrich_listed(
+    root: &Path,
+    items: Vec<(String, PathBuf)>,
+    porcelain: HashMap<PathBuf, PorcelainEntry>,
+    base: Option<String>,
+    sender: mpsc::Sender<EnrichUpdate>,
+    pool_cap: usize,
+) {
+    let count = items.len();
 
     // Two repo-wide calls replace two forks per worktree: commit meta for
     // every worktree HEAD, and ahead/behind for every branch. Misses fall
@@ -409,11 +446,14 @@ fn porcelain_by_path(root: &Path) -> HashMap<PathBuf, PorcelainEntry> {
     };
     parse_porcelain(&text)
         .into_iter()
-        .map(|e| {
-            let key = std::fs::canonicalize(&e.path).unwrap_or_else(|_| e.path.clone());
-            (key, e)
-        })
+        .map(|e| (listed_key(&e.path), e))
         .collect()
+}
+
+/// How enrichment keys a listed path: canonical where the directory is
+/// there, as git printed it where it is gone.
+fn listed_key(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Short sha, subject, and relative age for every given commit from one
@@ -501,8 +541,7 @@ fn enrich_one(
     commit_meta: &HashMap<String, (String, String, String)>,
     branch_counts: &HashMap<String, (u32, u32)>,
 ) -> EnrichUpdate {
-    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let entry = porcelain.get(&canonical);
+    let entry = porcelain.get(&listed_key(path));
     let (branch, prunable) = match entry {
         Some(e) => (e.branch.clone(), e.prunable),
         None => (None, false),

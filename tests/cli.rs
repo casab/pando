@@ -309,6 +309,29 @@ fn ls_json_parses_and_carries_the_documented_keys() {
     }
 }
 
+// Every command lists the worktrees twice before it runs: once to find
+// the repository and once to guard the write locations. `ls` needs one
+// listing of its own, and enriches from it rather than asking again.
+#[test]
+fn ls_lists_the_worktrees_once_beyond_what_every_command_does() {
+    let e = env();
+    for branch in ["feat/one", "feat/two"] {
+        let out = e.pando(&["new", branch]);
+        assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    }
+    for args in [&["ls"][..], &["ls", "--json"]] {
+        let (out, calls) = e.pando_counting_git(args);
+        assert_eq!(code(&out), EXIT_OK, "{args:?}: {}", stderr(&out));
+        assert!(stdout(&out).contains("feat"), "{args:?}: {}", stdout(&out));
+        let listings: Vec<&String> = calls
+            .iter()
+            .filter(|call| call.contains("worktree list --porcelain"))
+            .collect();
+        assert_eq!(listings.len(), 3, "{args:?}: {listings:#?}");
+        assert_eq!(git_calls_to(&calls, "status").len(), 2, "{args:?}");
+    }
+}
+
 // `status` prints no git field in either shape, so it pays for none: no
 // `git status` in any worktree, and none of the repository-wide reads
 // that fill `ls`'s commit and ahead/behind columns.
