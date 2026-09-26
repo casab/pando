@@ -1956,6 +1956,97 @@ fn stop_shared_and_rm_all_work_with_docker_down() {
     assert!(!store.worktrees.contains_key(&name));
 }
 
+// A docker that cannot be run at all — uninstalled, or not on the PATH
+// pando inherits — failed every `stop` and `stop --all` of a worktree that
+// had ever run isolated, and `start --shared` with them, with a remedy
+// that named a start flag. `rm` was not refused up front, and even forced
+// it stopped everything and then kept the worktree for ever, because the
+// `down -v` it could not run held it in place.
+#[test]
+fn stop_shared_and_rm_all_work_with_a_docker_that_cannot_be_run() {
+    if skip_without_python() {
+        return;
+    }
+    let f = iso();
+    let name = new_worktree(&f, "feat/one");
+    start_isolated(&f, &name);
+    let project = f.project(&name);
+    // Docker goes, and its containers with it.
+    let docker = f.home.join("bin").join("docker");
+    let out = std::process::Command::new(&docker)
+        .args(["compose", "-p", &project, "down", "-v"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    std::fs::write(&docker, "#!/nonexistent/python3\n").unwrap();
+
+    let said = std::sync::Mutex::new(Vec::<String>::new());
+    let note = |m: &str| said.lock().unwrap().push(m.to_string());
+    let noted = |said: &std::sync::Mutex<Vec<String>>| {
+        let mut said = said.lock().unwrap();
+        let noted = said
+            .iter()
+            .any(|m| m.contains("docker cannot be run here") && m.contains(&project));
+        said.clear();
+        noted
+    };
+    actions::stop(&f.paths, &name, None, &note).unwrap();
+    assert!(noted(&said), "stop says so");
+    actions::stop_all(&f.paths, &note).unwrap();
+    assert!(noted(&said), "stop --all says so");
+    assert_eq!(
+        f.service(&name, "postgres").compose_project.as_deref(),
+        Some(project.as_str()),
+        "the record that names the project is kept"
+    );
+
+    let report = actions::start(
+        &f.paths,
+        &f.config,
+        &name,
+        None,
+        actions::Mode::Shared,
+        &note,
+    )
+    .unwrap();
+    assert!(noted(&said), "start --shared says so");
+    assert!(f.record(&name).mode() != pando::state::ServiceMode::Isolated);
+    let dev = report.started[0].record.pid;
+
+    let err = format!(
+        "{:#}",
+        actions::rm(&f.paths, &name, false, false, &note).unwrap_err()
+    );
+    assert!(err.contains("cannot be run here"), "{err}");
+    assert!(
+        err.contains(&format!("docker compose -p {project} down -v")),
+        "{err}"
+    );
+    assert!(
+        pando::remedy::for_cli(&err).contains("--force"),
+        "{}",
+        pando::remedy::for_cli(&err)
+    );
+    assert!(process::is_alive(dev), "nothing was stopped by a refusal");
+    assert!(
+        f.record(&name)
+            .services
+            .iter()
+            .any(|s| s.compose_project.is_some())
+    );
+
+    said.lock().unwrap().clear();
+    actions::rm(&f.paths, &name, false, true, &note).unwrap();
+    let said = said.into_inner().unwrap();
+    assert!(
+        said.iter()
+            .any(|m| m.contains("down -v") && m.contains(&project)),
+        "the command that removes the volumes later is written down: {said:?}"
+    );
+    let store = state::load(&f.paths.state_file()).unwrap();
+    assert!(!store.worktrees.contains_key(&name));
+}
+
 /// Waits until something accepts connections on `port`.
 fn wait_bound(port: u16) {
     for _ in 0..200 {

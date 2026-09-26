@@ -24,8 +24,11 @@ use super::worktree::find_worktree;
 /// A Docker daemon that is not running is a note, not a failure: its
 /// containers cannot be running either, so there is nothing left to stop,
 /// and a `stop` that errors because Docker is off is a worktree the
-/// developer cannot stop. The records that name the projects are kept by
-/// every caller, so a later `stop` or `rm` can still find them.
+/// developer cannot stop. A docker that cannot be run at all is a note
+/// too: nothing this `stop` does can reach those containers, and failing
+/// every `stop` for it says only what the next one will. The records that
+/// name the projects are kept by every caller, so a later `stop` or `rm`
+/// can still find them.
 pub(super) fn stop_containers(
     paths: &PandoPaths,
     projects: &[String],
@@ -35,11 +38,16 @@ pub(super) fn stop_containers(
         paths,
         projects,
         |compose| compose.stop(),
-        |project| {
-            format!(
+        |project, e| match () {
+            _ if services::is_daemon_down(e) => Some(format!(
                 "Docker is not running, so the services of {project} are not either — nothing \
                  to stop"
-            )
+            )),
+            _ if services::is_docker_missing(e) => Some(format!(
+                "docker cannot be run here, so the services of {project} cannot be asked to \
+                 stop — the record that names them is kept, for a stop that can"
+            )),
+            _ => None,
         },
         progress,
     )
@@ -158,12 +166,14 @@ pub(super) fn remove_containers(
         paths,
         projects,
         |compose| compose.down_with_volumes(),
-        |project| {
-            format!(
-                "Docker is not running, so the services of {project} could not be removed — their \
-                 data volumes survive; once Docker is up, `docker compose -p {project} down -v` \
-                 removes them"
-            )
+        |project, e| {
+            services::is_daemon_down(e).then(|| {
+                format!(
+                    "Docker is not running, so the services of {project} could not be removed — \
+                     their data volumes survive; once Docker is up, `docker compose -p {project} \
+                     down -v` removes them"
+                )
+            })
         },
         progress,
     )
@@ -171,12 +181,14 @@ pub(super) fn remove_containers(
 
 /// The first of these compose projects Docker cannot be asked about, if
 /// any, with how it failed: "is not running" for a daemon that is down,
-/// "is not answering" for one that did not reply in time. Any other
-/// failure is left to the command that follows to report, with its own
-/// words.
+/// "is not answering" for one that did not reply in time, "cannot be run
+/// here" for a docker that could not be run at all. Any other failure is
+/// left to the command that follows to report, with its own words.
 ///
 /// A hung daemon counts: the `down -v` that follows would hang the same
-/// way, under the state lock.
+/// way, under the state lock. So does a docker that cannot be run: the
+/// `down -v` would fail the same way, and `rm` could then never remove
+/// the worktree, forced or not.
 pub(super) fn docker_down_for(
     paths: &PandoPaths,
     projects: &[String],
@@ -192,6 +204,7 @@ pub(super) fn docker_down_for(
         let how = match () {
             _ if services::is_daemon_down(&e) => "is not running",
             _ if services::is_daemon_hung(&e) => "is not answering",
+            _ if services::is_docker_missing(&e) => "cannot be run here",
             _ => return None,
         };
         Some((project.clone(), how))
@@ -199,13 +212,13 @@ pub(super) fn docker_down_for(
 }
 
 /// Runs one compose verb against every project a worktree owns, reporting
-/// the failures together. A daemon that is down is reported through
-/// `daemon_down` and `progress` instead of failing.
+/// the failures together. A failure `note` has words for — a daemon that
+/// is down, say — is said through `progress` instead of failing.
 fn stop_compose_projects(
     paths: &PandoPaths,
     projects: &[String],
     run: impl Fn(&services::Compose) -> Result<()>,
-    daemon_down: impl Fn(&str) -> String,
+    note: impl Fn(&str, &anyhow::Error) -> Option<String>,
     progress: &dyn Fn(&str),
 ) -> Result<()> {
     if projects.is_empty() {
@@ -215,10 +228,11 @@ fn stop_compose_projects(
     let mut failures = Vec::new();
     for project in projects {
         let compose = services::Compose::by_project(&program, project.as_str());
-        match run(&compose) {
-            Ok(()) => {}
-            Err(e) if services::is_daemon_down(&e) => progress(&daemon_down(project)),
-            Err(e) => failures.push(format!("{project}: {e:#}")),
+        if let Err(e) = run(&compose) {
+            match note(project, &e) {
+                Some(note) => progress(&note),
+                None => failures.push(format!("{project}: {e:#}")),
+            }
         }
     }
     if failures.is_empty() {
