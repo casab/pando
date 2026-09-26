@@ -3,7 +3,6 @@
 use super::schema::Config;
 use super::schema::ISOLATION_KINDS;
 use super::schema::ServiceConfig;
-use super::schema::expand_tilde;
 use crate::project::ProjectRef;
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;
@@ -24,15 +23,10 @@ pub(super) fn normalize(mut config: Config) -> Result<Config> {
 }
 
 pub fn validate(config: &Config, project: &ProjectRef) -> Result<()> {
-    if let Some(dir) = &config.project.worktrees_dir {
+    if let Some(dir) = config.configured_worktrees_dir(&project.root) {
         // Against the repository root only: the fuller check, which also
         // knows about linked worktrees, needs git and runs once at startup.
-        crate::paths::ensure_outside_repository(
-            "worktrees_dir",
-            &expand_tilde(dir),
-            &project.root,
-            &[],
-        )?;
+        crate::paths::ensure_outside_repository("worktrees_dir", &dir, &project.root, &[])?;
     }
     validate_processes(config)?;
     validate_services(config)?;

@@ -753,6 +753,28 @@ fn a_worktrees_dir_outside_the_repository_is_accepted() {
     assert_eq!(loaded.config.worktrees_dir(&f.paths), outside);
 }
 
+// git takes a relative path from the repository root, whichever
+// directory pando was run from. Taken from pando's own directory
+// instead, `wt` passed the check wherever it did not exist yet, and git
+// then checked the worktree out inside the repository.
+#[test]
+fn a_relative_worktrees_dir_is_taken_from_the_repository_root() {
+    let f = fixture();
+    write_home(&f, "[project]\nworktrees_dir = \"wt\"\n");
+    let err = load(&f.paths).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("inside the repository"),
+        "unexpected error: {err:#}"
+    );
+
+    write_home(&f, "[project]\nworktrees_dir = \"../trees\"\n");
+    let loaded = load(&f.paths).unwrap();
+    assert_eq!(
+        loaded.config.worktrees_dir(&f.paths),
+        f.root.join("../trees")
+    );
+}
+
 #[test]
 fn unknown_keys_are_rejected() {
     let f = fixture();

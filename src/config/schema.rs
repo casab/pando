@@ -504,10 +504,23 @@ impl Config {
     /// pando's own. The single helper every caller uses, so a configured
     /// value is honoured by `actions` and the TUI watcher alike.
     pub fn worktrees_dir(&self, paths: &PandoPaths) -> PathBuf {
-        match &self.project.worktrees_dir {
-            Some(dir) => expand_tilde(dir),
-            None => paths.worktrees_dir(),
-        }
+        self.configured_worktrees_dir(paths.root())
+            .unwrap_or_else(|| paths.worktrees_dir())
+    }
+
+    /// The configured `worktrees_dir`, with `~` expanded and a relative
+    /// value taken from the repository root — where `git -C <root>
+    /// worktree add` puts it. Resolved against the directory pando was run
+    /// from instead, the checks and the checkout looked at two different
+    /// places, and a value that named a directory inside the repository
+    /// was let through wherever it did not exist yet.
+    pub(super) fn configured_worktrees_dir(&self, root: &Path) -> Option<PathBuf> {
+        let dir = expand_tilde(self.project.worktrees_dir.as_deref()?);
+        Some(if dir.is_relative() {
+            root.join(dir)
+        } else {
+            dir
+        })
     }
 
     /// The base branch `new` forks from for `branch`, if config decides it:
