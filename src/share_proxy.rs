@@ -212,7 +212,12 @@ fn handle_connection_with(
     header_timeout: Duration,
 ) -> Result<()> {
     client.set_read_timeout(Some(header_timeout)).ok();
-    let (head, leftover) = read_until_headers_end(&mut client)?;
+    // A connection that closes before sending a byte asked nothing, and
+    // nothing failed: it is a port probe, `await_listening`'s among them.
+    // Logged, it left a false error in every share's proxy log.
+    let Some((head, leftover)) = read_until_headers_end(&mut client)? else {
+        return Ok(());
+    };
     // The deadline was for the headers, and they are here. A request whose
     // body is already sent — which is every GET — then has nothing more to
     // say for as long as the response takes, and a deadline left on turns
@@ -258,12 +263,16 @@ fn handle_connection_with(
 }
 
 /// Reads until the end-of-headers marker, returning the header block and
-/// whatever body bytes arrived in the same packet.
-fn read_until_headers_end(client: &mut TcpStream) -> Result<(String, Vec<u8>)> {
+/// whatever body bytes arrived in the same packet — or `None` when the
+/// client closed without sending anything at all.
+fn read_until_headers_end(client: &mut TcpStream) -> Result<Option<(String, Vec<u8>)>> {
     let mut buf: Vec<u8> = Vec::with_capacity(2048);
     let mut chunk = [0u8; 1024];
     loop {
         let n = client.read(&mut chunk).context("read from the client")?;
+        if n == 0 && buf.is_empty() {
+            return Ok(None);
+        }
         if n == 0 {
             bail!("the client closed before finishing its headers");
         }
@@ -276,7 +285,7 @@ fn read_until_headers_end(client: &mut TcpStream) -> Result<(String, Vec<u8>)> {
         if let Some((end_head, start_body)) = find_headers_end(&buf) {
             let head = String::from_utf8(buf[..end_head].to_vec())
                 .context("the request headers were not valid UTF-8")?;
-            return Ok((head, buf[start_body..].to_vec()));
+            return Ok(Some((head, buf[start_body..].to_vec())));
         }
     }
 }
@@ -737,6 +746,41 @@ mod tests {
         assert!(
             response.contains("tick-11"),
             "the stream was cut short: {response}"
+        );
+    }
+
+    // `await_listening` connects and closes at once to see the proxy is
+    // up, and the proxy logged that probe as a failed connection: a false
+    // error in every share's log, and in a race of two shares the line
+    // `last_words` quoted for the other proxy's bind failure.
+    #[test]
+    fn a_connection_that_sends_nothing_is_not_a_failure() {
+        let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_port = proxy.local_addr().unwrap().port();
+        let (tx, rx) = mpsc::channel::<Result<(), String>>();
+        thread::spawn(move || {
+            for _ in 0..2 {
+                if let Ok((stream, _)) = proxy.accept() {
+                    // No upstream: neither connection gets as far as one.
+                    let handled = handle_connection(stream, 1, COOKIE);
+                    tx.send(handled.map_err(|e| format!("{e:#}"))).ok();
+                }
+            }
+        });
+
+        drop(TcpStream::connect(("127.0.0.1", proxy_port)).unwrap());
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), Ok(()));
+
+        let mut client = TcpStream::connect(("127.0.0.1", proxy_port)).unwrap();
+        client.write_all(b"GET / HTTP/1.1\r\nHost: h\r\n").unwrap();
+        drop(client);
+        let err = rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            err.contains("closed before finishing its headers"),
+            "a request cut off part-way is still one: {err}"
         );
     }
 
