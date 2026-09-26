@@ -181,7 +181,8 @@ fn a_real_quick_tunnel_answers_on_its_public_url_and_is_torn_down() {
     let server = serve();
     eprintln!("local server on 127.0.0.1:{}", server.port);
 
-    let spawn = match tunnel::start_tunnel(&paths, "feat+one", server.port) {
+    let spawn = match tunnel::start_tunnel(&paths, "feat+one", tunnel::DEV_SERVER_HOST, server.port)
+    {
         Ok(spawn) => spawn,
         Err(e) => {
             // Rate limited, offline, or Cloudflare having a bad day. None

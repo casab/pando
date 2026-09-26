@@ -40,6 +40,12 @@ const API_HOST: &str = "api.trycloudflare.com";
 /// The only value `[share].provider` takes in v1.
 pub const DEFAULT_PROVIDER: &str = "cloudflared";
 
+/// The host a tunnel straight onto a dev server is pointed at. A name, not
+/// `127.0.0.1`: a dev server told `localhost` is on `[::1]` alone on macOS
+/// — Vite's default — and cloudflared dials every address the name
+/// resolves to, so a server on either loopback answers.
+pub const DEV_SERVER_HOST: &str = "localhost";
+
 /// Without `--config <path>`, cloudflared reads `~/.cloudflared/config.yml`
 /// and applies its `ingress:` rules to every request — even to a quick
 /// tunnel created with `--url`. A developer who already runs a named tunnel
@@ -81,9 +87,10 @@ pub trait Provider {
     /// going to be shared does not get told to install anything.
     fn ensure_present(&self, paths: &PandoPaths) -> Result<()>;
 
-    /// Publishes `local_port` and returns once a public URL exists and
-    /// the provider's edge has a connection to serve it on — or, with the
-    /// URL, the reason it does not yet, once the deadline passes.
+    /// Publishes `local_port` on `host` and returns once a public URL
+    /// exists and the provider's edge has a connection to serve it on —
+    /// or, with the URL, the reason it does not yet, once the deadline
+    /// passes.
     ///
     /// `spawned` is told the tunnel's process group the moment there is
     /// one, before the wait, so the caller can write it down somewhere
@@ -92,6 +99,7 @@ pub trait Provider {
         &self,
         paths: &PandoPaths,
         name: &str,
+        host: &str,
         local_port: u16,
         spawned: &dyn Fn(i32),
     ) -> Result<TunnelSpawn>;
@@ -128,10 +136,11 @@ impl Provider for Cloudflared {
         &self,
         paths: &PandoPaths,
         name: &str,
+        host: &str,
         local_port: u16,
         spawned: &dyn Fn(i32),
     ) -> Result<TunnelSpawn> {
-        start_tunnel_with(paths, name, local_port, spawned)
+        start_tunnel_with(paths, name, host, local_port, spawned)
     }
 }
 
@@ -190,9 +199,15 @@ fn program_is_runnable(program: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Spawns a quick tunnel onto `local_port` and waits for its public URL.
-pub fn start_tunnel(paths: &PandoPaths, name: &str, local_port: u16) -> Result<TunnelSpawn> {
-    start_tunnel_with(paths, name, local_port, &|_| {})
+/// Spawns a quick tunnel onto `host:local_port` and waits for its public
+/// URL.
+pub fn start_tunnel(
+    paths: &PandoPaths,
+    name: &str,
+    host: &str,
+    local_port: u16,
+) -> Result<TunnelSpawn> {
+    start_tunnel_with(paths, name, host, local_port, &|_| {})
 }
 
 /// [`start_tunnel`], telling `spawned` the tunnel's process group before
@@ -200,6 +215,7 @@ pub fn start_tunnel(paths: &PandoPaths, name: &str, local_port: u16) -> Result<T
 fn start_tunnel_with(
     paths: &PandoPaths,
     name: &str,
+    host: &str,
     local_port: u16,
     spawned: &dyn Fn(i32),
 ) -> Result<TunnelSpawn> {
@@ -217,13 +233,10 @@ fn start_tunnel_with(
     // field rather than loose in a sentence — and pins it against a
     // `TUNNEL_LOG_OUTPUT` in the inherited environment; a cloudflared too
     // old to honour it falls back to the banner parser. `--config` shadows
-    // the user's own. `localhost`, not `127.0.0.1`: a dev server told
-    // `localhost` is on `[::1]` alone on macOS — Vite's default — and
-    // cloudflared dials every address the name resolves to, so a server on
-    // either loopback answers.
+    // the user's own.
     let shell_cmd = format!(
         "exec {program} tunnel --no-autoupdate --output json --config {config} \
-         --url http://localhost:{local_port}",
+         --url http://{host}:{local_port}",
         program = process::shell_quote(&cloudflared_program(paths).to_string_lossy()),
         config = process::shell_quote(&config_path.to_string_lossy()),
     );
@@ -685,7 +698,7 @@ mod tests {
         let fx = fixture();
         crate::testutil::fake_cloudflared_json_publishing(&fx.paths.home);
 
-        let spawn = start_tunnel(&fx.paths, "feat+one", 17000).unwrap();
+        let spawn = start_tunnel(&fx.paths, "feat+one", DEV_SERVER_HOST, 17000).unwrap();
         let _ = process::stop(spawn.pgid, STOP_GRACE);
         assert_eq!(spawn.public_url, FAKE_TUNNEL_URL);
     }
@@ -695,7 +708,7 @@ mod tests {
         let fx = fixture();
         crate::testutil::fake_cloudflared_api_error(&fx.paths.home);
 
-        let err = start_tunnel(&fx.paths, "feat+one", 17000).unwrap_err();
+        let err = start_tunnel(&fx.paths, "feat+one", DEV_SERVER_HOST, 17000).unwrap_err();
         let message = format!("{err:#}");
         assert!(
             message.contains("exited before publishing") || message.contains("no URL"),
@@ -751,7 +764,7 @@ mod tests {
         let fx = fixture();
         fake_cloudflared_publishing(&fx.paths.home);
 
-        let spawn = start_tunnel(&fx.paths, "feat+one", 17000).unwrap();
+        let spawn = start_tunnel(&fx.paths, "feat+one", DEV_SERVER_HOST, 17000).unwrap();
         assert_eq!(spawn.public_url, FAKE_TUNNEL_URL);
         assert_eq!(spawn.unconnected, None, "it registered a connection");
         assert_eq!(spawn.log_path, fx.paths.log_file("feat+one", TUNNEL_LOG));
@@ -767,7 +780,7 @@ mod tests {
     fn the_log_written_is_the_worktrees_own_tunnel_log() {
         let fx = fixture();
         fake_cloudflared_publishing(&fx.paths.home);
-        let spawn = start_tunnel(&fx.paths, "feat+one", 17000).unwrap();
+        let spawn = start_tunnel(&fx.paths, "feat+one", DEV_SERVER_HOST, 17000).unwrap();
         let _ = process::stop(spawn.pgid, STOP_GRACE);
 
         let log = std::fs::read_to_string(fx.paths.log_file("feat+one", TUNNEL_LOG)).unwrap();
@@ -832,7 +845,7 @@ mod tests {
     fn a_tunnel_that_publishes_and_never_reaches_the_edge_fails_with_the_log_tail() {
         let fx = fixture();
         fake_cloudflared_unreachable_edge(&fx.paths.home);
-        let err = start_tunnel(&fx.paths, "feat+one", 17000).unwrap_err();
+        let err = start_tunnel(&fx.paths, "feat+one", DEV_SERVER_HOST, 17000).unwrap_err();
         let message = format!("{err:#}");
         assert!(message.contains("never connected"), "{message}");
         assert!(
@@ -886,7 +899,7 @@ mod tests {
     fn a_provider_that_exits_before_publishing_fails_with_the_log_tail() {
         let fx = fixture();
         fake_cloudflared_failing(&fx.paths.home);
-        let err = start_tunnel(&fx.paths, "feat+one", 17000).unwrap_err();
+        let err = start_tunnel(&fx.paths, "feat+one", DEV_SERVER_HOST, 17000).unwrap_err();
         let message = format!("{err:#}");
         assert!(message.contains("exited before publishing"), "{message}");
         assert!(message.contains("Too Many Requests"), "{message}");
@@ -943,7 +956,7 @@ mod tests {
     fn the_tunnel_shadows_the_user_config_and_targets_the_port_it_was_given() {
         let fx = fixture();
         fake_cloudflared_publishing(&fx.paths.home);
-        let spawn = start_tunnel(&fx.paths, "feat+one", 17042).unwrap();
+        let spawn = start_tunnel(&fx.paths, "feat+one", DEV_SERVER_HOST, 17042).unwrap();
         let _ = process::stop(spawn.pgid, STOP_GRACE);
 
         let log = std::fs::read_to_string(&spawn.log_path).unwrap();

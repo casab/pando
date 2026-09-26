@@ -212,11 +212,16 @@ pub fn share_with(
         }
         _ => None,
     };
-    let upstream = proxy.as_ref().map_or(target_port, |p| p.listen_port);
+    // The proxy by the one address it binds; the dev server by the name
+    // either loopback answers to.
+    let (host, upstream) = match &proxy {
+        Some(proxy) => (share_proxy::LISTEN_HOST, proxy.listen_port),
+        None => (tunnel::DEV_SERVER_HOST, target_port),
+    };
 
     progress(&format!("opening a {} tunnel", provider.name()));
     let noted = |pgid| note_pending(paths, name, pgid);
-    let spawn = match provider.start(paths, name, upstream, &noted) {
+    let spawn = match provider.start(paths, name, host, upstream, &noted) {
         Ok(spawn) => spawn,
         Err(e) => {
             // Nothing has recorded the proxy yet, so this is the last

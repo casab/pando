@@ -32,6 +32,12 @@ pub const ENV_COOKIE: &str = "PANDO_SHARE_COOKIE";
 /// The hidden subcommand that runs the proxy in this same binary.
 pub const SUBCOMMAND: &str = "__share-proxy";
 
+/// The one address the proxy listens on, and so the one a tunnel onto it
+/// is pointed at. Not `localhost`: cloudflared tries `[::1]` first for
+/// that name, and whatever binds `[::1]` on the proxy's port — which `ps`
+/// shows — would be handed every visitor.
+pub const LISTEN_HOST: &str = "127.0.0.1";
+
 /// How long a spawned proxy has to start listening. Binding is the first
 /// thing it does, so this is one exec on a loaded machine.
 pub const LISTEN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -168,18 +174,18 @@ fn proxy_env(cookie: &str) -> Vec<(String, String)> {
     vec![(ENV_COOKIE.to_string(), cookie.to_string())]
 }
 
-/// The hidden subcommand's entry point. Binds `127.0.0.1:listen_port` and
-/// forwards every connection to `upstream_port`, on whichever loopback
+/// The hidden subcommand's entry point. Binds [`LISTEN_HOST`]`:listen_port`
+/// and forwards every connection to `upstream_port`, on whichever loopback
 /// answers, with the cookie injected.
 ///
 /// Loopback only. The proxy exists to be reached by a tunnel running on
 /// this machine, and a bind on `0.0.0.0` would publish an
 /// already-authenticated door onto the local network.
 pub fn run_in_process(listen_port: u16, upstream_port: u16, cookie: &str) -> Result<()> {
-    let listener = TcpListener::bind(("127.0.0.1", listen_port))
-        .with_context(|| format!("bind the share proxy on 127.0.0.1:{listen_port}"))?;
+    let listener = TcpListener::bind((LISTEN_HOST, listen_port))
+        .with_context(|| format!("bind the share proxy on {LISTEN_HOST}:{listen_port}"))?;
     // Ports, never the cookie: this goes into the proxy log.
-    eprintln!("pando share proxy: 127.0.0.1:{listen_port} -> localhost:{upstream_port}");
+    eprintln!("pando share proxy: {LISTEN_HOST}:{listen_port} -> localhost:{upstream_port}");
     let cookie = cookie.to_string();
     for conn in listener.incoming() {
         match conn {

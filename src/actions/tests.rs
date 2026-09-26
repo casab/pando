@@ -2633,6 +2633,7 @@ impl tunnel::Provider for MissingProvider {
         &self,
         _: &PandoPaths,
         _: &str,
+        _: &str,
         _: u16,
         _: &dyn Fn(i32),
     ) -> Result<tunnel::TunnelSpawn> {
@@ -2654,6 +2655,7 @@ impl tunnel::Provider for FailingProvider {
     fn start(
         &self,
         _: &PandoPaths,
+        _: &str,
         _: &str,
         _: u16,
         _: &dyn Fn(i32),
@@ -2802,9 +2804,12 @@ fn share_with_an_auth_command_runs_it_and_puts_a_proxy_in_front() {
         "the record still says what is being shared, not what is in front of it"
     );
 
+    // By the one address the proxy binds. Told `localhost`, cloudflared
+    // tries `[::1]` first, and anything that bound `[::1]` on the proxy's
+    // port — which `ps` shows — was handed every visitor.
     let log = std::fs::read_to_string(fx.paths.log_file(&name, "tunnel")).unwrap();
     assert!(
-        log.contains(&format!("--url http://localhost:{proxy_port}")),
+        log.contains(&format!("--url http://127.0.0.1:{proxy_port}")),
         "the tunnel must point at the proxy, not the application: {log}"
     );
 
@@ -3025,6 +3030,7 @@ impl tunnel::Provider for UnreachedProvider {
         &self,
         _: &PandoPaths,
         _: &str,
+        _: &str,
         _: u16,
         _: &dyn Fn(i32),
     ) -> Result<tunnel::TunnelSpawn> {
@@ -3124,6 +3130,7 @@ impl tunnel::Provider for DiallingProvider {
         &self,
         paths: &PandoPaths,
         name: &str,
+        _: &str,
         _: u16,
         spawned: &dyn Fn(i32),
     ) -> Result<tunnel::TunnelSpawn> {
@@ -3340,6 +3347,7 @@ impl tunnel::Provider for PendingWatcher<'_> {
         &self,
         paths: &PandoPaths,
         name: &str,
+        _: &str,
         _: u16,
         spawned: &dyn Fn(i32),
     ) -> Result<tunnel::TunnelSpawn> {
