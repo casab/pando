@@ -1719,6 +1719,27 @@ fn seed_fixture(files: &[(&str, &str)]) -> TempDir {
     dir
 }
 
+// An ignored dependency tree is named once and dropped, not walked: what
+// comes back is the root's own ignored files, and nothing from inside
+// `node_modules` or from a directory that is not ignored itself.
+#[test]
+fn only_root_level_ignored_files_are_present_ones() {
+    let dir = seed_fixture(&[
+        (".gitignore", "node_modules/\n.env\n*.log\n"),
+        (".env", "PORT=3000\n"),
+        ("debug.log", "\n"),
+    ]);
+    for rel in ["node_modules/pkg/lib", "sub"] {
+        std::fs::create_dir_all(dir.path().join(rel)).unwrap();
+    }
+    for i in 0..50 {
+        std::fs::write(dir.path().join(format!("node_modules/pkg/lib/{i}.js")), "").unwrap();
+    }
+    std::fs::write(dir.path().join("node_modules/.env"), "").unwrap();
+    std::fs::write(dir.path().join("sub/x.log"), "").unwrap();
+    assert_eq!(ignored_present(dir.path()), [".env", "debug.log"]);
+}
+
 // The fresh-clone case: `.env` is gitignored so it never arrives, and
 // the example beside it is the only thing that says what it looks like.
 #[test]

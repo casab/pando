@@ -3,7 +3,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::process::Command;
 
 use crate::catalog::frameworks;
 use crate::catalog::package_managers;
@@ -373,19 +372,22 @@ const PROVISION_DENYLIST: [&str; 6] = [
 /// fresh worktree would be missing.
 ///
 /// Only the root, and only files: an ignored directory is build output or a
-/// dependency tree, which a worktree builds for itself.
-fn ignored_present(root: &Path) -> Vec<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args([
+/// dependency tree, which a worktree builds for itself. `--directory` has
+/// git name such a directory once, as `name/`, rather than list every file
+/// under `node_modules` or `target` for the filter below to throw away.
+pub(super) fn ignored_present(root: &Path) -> Vec<String> {
+    let out = crate::project::git(
+        root,
+        [
             "ls-files",
             "--others",
             "--ignored",
             "--exclude-standard",
+            "--directory",
+            "--no-empty-directory",
             "-z",
-        ])
-        .output();
+        ],
+    );
     let Ok(out) = out else { return Vec::new() };
     if !out.status.success() {
         return Vec::new();
