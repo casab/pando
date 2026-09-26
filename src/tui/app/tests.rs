@@ -4381,6 +4381,42 @@ fn e_inside_tmux_puts_a_terminal_editor_in_its_own_window() {
     );
 }
 
+// tmux reads `-c` and `-n` as formats. A branch `fix/#Hx` opened its
+// shell in $HOME, in a window named for the host, while pando said it
+// opened in the worktree; a fork's branch holding `#(…)` had tmux run
+// what was in it.
+#[test]
+fn a_tmux_window_takes_a_hash_in_the_branch_as_it_is() {
+    for key in ['!', 'e'] {
+        let mut app = test_app(&["pr-12+x#(touch)#H"]);
+        app.launch_env = env(true, Some("/bin/zsh"), None, Some("vim"));
+        press(&mut app, KeyCode::Char(key));
+        let Some(Launch::Tmux { args }) = app.launch.clone().map(|r| r.launch) else {
+            panic!("{key} inside tmux opens a window: {:?}", app.launch);
+        };
+        assert_eq!(
+            args[..5],
+            [
+                "new-window",
+                "-c",
+                "/trees/pr-12+x##(touch)##H",
+                "-n",
+                "pr-12/x##(touch)##H"
+            ],
+            "{key}"
+        );
+        if key == 'e' {
+            // The editor's argument is not a format: tmux passes it on.
+            assert_eq!(args[5..], ["vim", "/trees/pr-12+x#(touch)#H"]);
+        }
+        let (message, _) = app.active_status().expect("it says what it did");
+        assert!(
+            message.contains("tmux window pr-12/x#(touch)#H"),
+            "{message}"
+        );
+    }
+}
+
 #[test]
 fn e_hands_a_gui_editor_off_with_its_arguments() {
     for tmux in [false, true] {

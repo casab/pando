@@ -129,6 +129,14 @@ pub fn window_name(label: &str) -> String {
     format!("{kept}…")
 }
 
+/// `s` as tmux reads it back, as it is. tmux expands `-c` and `-n` as
+/// formats, where `#H` is the host name and `#(…)` runs a command, and a
+/// branch can hold either — a fork's, picked by whoever opened the pull
+/// request. `##` is how a format says `#`.
+fn tmux_literal(s: &str) -> String {
+    s.replace('#', "##")
+}
+
 /// What to say once the event loop has carried `request` out, if anything.
 /// A suspend says it on the way back; a hand-off was already announced by
 /// the key that asked for it, so it says nothing more — or it is said
@@ -146,9 +154,9 @@ pub fn plan_shell(env: &LaunchEnv, path: &Path, label: &str) -> LaunchRequest {
                 args: vec![
                     "new-window".into(),
                     "-c".into(),
-                    where_,
+                    tmux_literal(&where_),
                     "-n".into(),
-                    window_name(label),
+                    tmux_literal(&window_name(label)),
                 ],
             },
             done: format!(
@@ -198,12 +206,14 @@ pub fn plan_editor(env: &LaunchEnv, path: &Path, label: &str) -> Result<LaunchRe
         });
     }
     if env.tmux {
+        // The program and its arguments are not formats: tmux runs them
+        // as they are, the path included.
         let mut tmux = vec![
             "new-window".to_string(),
             "-c".into(),
-            path.display().to_string(),
+            tmux_literal(&path.display().to_string()),
             "-n".into(),
-            window_name(label),
+            tmux_literal(&window_name(label)),
             program,
         ];
         tmux.extend(args);
