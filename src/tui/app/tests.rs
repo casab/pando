@@ -5060,7 +5060,54 @@ fn the_slow_tick_re_reads_the_selected_worktrees_git_quietly() {
     app.tick = GIT_SELECTED_EVERY - 1;
     app.handle_event(AppEvent::Tick);
     assert!(app.git_refreshing, "a re-read is in flight");
-    assert!(!app.enriching, "and the header does not announce it");
+    assert_eq!(app.enriching, 0, "and the header does not announce it");
+}
+
+// A worktree made while a quiet re-read runs is read at once, alongside
+// it. Whichever read finishes first ends only itself: the new worktree's
+// git row said its status could not be read while it was being read.
+#[test]
+fn a_read_of_git_that_finishes_leaves_the_one_still_under_way() {
+    let discovered = |names: &[&str]| {
+        let worktrees = names
+            .iter()
+            .map(|name| Worktree {
+                dirty: None,
+                ..wt(name)
+            })
+            .collect();
+        AppEvent::Discovered(Box::new(Ok(Snapshot {
+            main: wt("acme-shop"),
+            worktrees,
+            created_by_pando: BTreeMap::new(),
+            state: State::new(),
+            warning: None,
+            notices: Vec::new(),
+            default_base: Some("main".into()),
+        })))
+    };
+    let mut app = test_app(&["feat+one"]);
+    app.refresh_git(None);
+    assert!(app.git_refreshing);
+    app.handle_event(discovered(&["feat+one", "feat+two"]));
+    assert_eq!(app.enriching, 1, "the new worktree is being read");
+    app.handle_event(AppEvent::EnrichDone { quiet: true });
+    assert!(!app.git_refreshing);
+    assert_eq!(app.enriching, 1, "and still is once the re-read is over");
+
+    // Two announced reads at once are the same: the header says
+    // `reading git` until both are over.
+    app.handle_event(discovered(&["feat+one", "feat+two", "feat+three"]));
+    assert_eq!(app.enriching, 2);
+    app.handle_event(AppEvent::EnrichDone { quiet: false });
+    assert_eq!(app.enriching, 1);
+    app.refresh_git(None);
+    assert!(
+        !app.git_refreshing,
+        "no re-read starts while one is under way"
+    );
+    app.handle_event(AppEvent::EnrichDone { quiet: false });
+    assert_eq!(app.enriching, 0);
 }
 
 // A worktree that became dirty after the TUI opened shows its `*` once

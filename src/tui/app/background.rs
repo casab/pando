@@ -24,7 +24,10 @@ pub enum AppEvent {
     FsChange,
     Discovered(Box<Result<Snapshot, String>>),
     Enrich(EnrichUpdate),
-    EnrichDone,
+    /// One read of git state is over: a quiet re-read, or an announced one.
+    EnrichDone {
+        quiet: bool,
+    },
     BranchesReady(Vec<BranchEntry>),
     PrsReady(Result<Vec<PrInfo>, String>),
     /// Which GitHub account `gh` acts as for this project.
@@ -435,8 +438,9 @@ impl App {
         });
     }
 
-    /// Enriches `only` when given, every worktree otherwise.
-    pub(super) fn spawn_enrichment(&mut self, only: Option<Vec<String>>) {
+    /// Enriches `only` when given, every worktree otherwise. A `quiet` read
+    /// is not announced in the header.
+    pub(super) fn spawn_enrichment(&mut self, only: Option<Vec<String>>, quiet: bool) {
         let items: Vec<(String, std::path::PathBuf)> = self
             .worktrees
             .iter()
@@ -446,7 +450,11 @@ impl App {
         if items.is_empty() {
             return;
         }
-        self.enriching = true;
+        if quiet {
+            self.git_refreshing = true;
+        } else {
+            self.enriching += 1;
+        }
         let root = self.paths.root().to_path_buf();
         let tx = self.event_tx.clone();
         // A few rows are measured against the base the detail pane names,
@@ -466,7 +474,7 @@ impl App {
             // and startup enrichment must not starve the UI.
             worktree::enrich_stream(&root, items, known_base, etx, 4);
             let _ = pump.join();
-            let _ = tx.send(AppEvent::EnrichDone);
+            let _ = tx.send(AppEvent::EnrichDone { quiet });
         });
     }
 

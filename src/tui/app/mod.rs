@@ -261,9 +261,13 @@ pub struct App {
     /// until they are done so their keystrokes do not answer it.
     pub queued_question: Option<QueuedQuestion>,
     pub pending: Option<PendingAction>,
-    pub enriching: bool,
+    /// Announced reads of git state in flight: the first, and one for the
+    /// worktrees each discovery finds, which can overlap. The header says
+    /// `reading git` while there is one.
+    pub enriching: usize,
     /// A quiet re-read of git state is in flight: the periodic one, which
-    /// the header does not announce the way it does the first.
+    /// the header does not announce the way it does the first. There is at
+    /// most one, as none starts while any read is under way.
     pub git_refreshing: bool,
     /// What each worktree's commit age was when enrichment reported it, and
     /// when that was, so the age on screen keeps counting: git's `%cr` is a
@@ -352,7 +356,7 @@ impl App {
             select_on_arrival: None,
             queued_question: None,
             pending: None,
-            enriching: false,
+            enriching: 0,
             git_refreshing: false,
             commit_seen: HashMap::new(),
             nothing_to_run: false,
@@ -376,7 +380,7 @@ impl App {
         // disk cache so those rows already carry sha, age, and dirty state.
         app.apply_snapshot(snapshot(&app.paths, None, false)?);
         app.hydrate_from_cache();
-        app.spawn_enrichment(None);
+        app.spawn_enrichment(None, false);
         app.spawn_pr_fetch();
         app.spawn_gh_account_check();
         Ok(app)
@@ -429,7 +433,7 @@ impl App {
                         let fresh = self.apply_snapshot(snapshot);
                         if !fresh.is_empty() {
                             self.hydrate_from_cache();
-                            self.spawn_enrichment(Some(fresh));
+                            self.spawn_enrichment(Some(fresh), false);
                         }
                     }
                     Err(e) => self.set_error(format!("refresh failed: {e}")),
@@ -450,11 +454,16 @@ impl App {
                     None => false,
                 };
                 // A quiet re-read that found nothing new costs no paint.
-                changed || self.enriching
+                changed || self.enriching > 0
             }
-            AppEvent::EnrichDone => {
-                self.enriching = false;
-                self.git_refreshing = false;
+            // Reads overlap — discovery reads what it finds whatever else
+            // is under way — so the one that finished ends only itself.
+            AppEvent::EnrichDone { quiet } => {
+                if quiet {
+                    self.git_refreshing = false;
+                } else {
+                    self.enriching = self.enriching.saturating_sub(1);
+                }
                 self.save_enrich_cache();
                 true
             }
@@ -1158,16 +1167,10 @@ impl App {
     /// these. Quiet — the header's `reading git` is for the first read —
     /// and never two at once.
     pub fn refresh_git(&mut self, only: Option<Vec<String>>) {
-        if self.enriching || self.git_refreshing {
+        if self.enriching > 0 || self.git_refreshing {
             return;
         }
-        self.spawn_enrichment(only);
-        // `spawn_enrichment` announces itself; a re-read should not, so the
-        // flag it set moves to the quiet one.
-        if self.enriching {
-            self.enriching = false;
-            self.git_refreshing = true;
-        }
+        self.spawn_enrichment(only, true);
     }
 
     /// Remembers what enrichment said a commit's age was, and when.
@@ -1386,7 +1389,7 @@ impl App {
             select_on_arrival: None,
             queued_question: None,
             pending: None,
-            enriching: false,
+            enriching: 0,
             git_refreshing: false,
             commit_seen: HashMap::new(),
             nothing_to_run: false,

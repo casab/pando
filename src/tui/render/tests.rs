@@ -2494,9 +2494,9 @@ fn the_git_row_says_reading_only_while_git_is_being_read() {
     };
     let mut app = test_app(&["feat+tui"]);
     app.worktrees[0].dirty = None;
-    app.enriching = true;
+    app.enriching = 1;
     assert!(git_row(&mut app).contains("reading git…"));
-    app.enriching = false;
+    app.enriching = 0;
     app.git_refreshing = true;
     assert!(git_row(&mut app).contains("reading git…"));
     app.git_refreshing = false;

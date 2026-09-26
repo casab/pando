@@ -331,7 +331,7 @@ fn git_row(app: &App, wt: &crate::worktree::Worktree, width: usize) -> Line<'sta
             "no working tree to read".to_string(),
             Style::new().fg(signal_color(wt)),
         )),
-        None if app.enriching || app.git_refreshing => {
+        None if app.enriching > 0 || app.git_refreshing => {
             parts.push(("reading git…".to_string(), Style::new().fg(text_muted())))
         }
         None => parts.push((

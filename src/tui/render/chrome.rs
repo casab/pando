@@ -182,7 +182,7 @@ pub(super) fn render_header(f: &mut Frame, area: Rect, app: &App) {
             spans.push(Span::styled(word, Style::new().fg(color)));
         }
     }
-    if app.enriching {
+    if app.enriching > 0 {
         spans.push(Span::styled(
             " · reading git",
             Style::new().fg(text_muted()),
