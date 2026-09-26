@@ -91,6 +91,11 @@ pub fn carry_out(
             gate.pause();
             let _ = disable_raw_mode();
             let _ = execute!(stdout(), LeaveAlternateScreen);
+            // Every frame hides the cursor, and leaving the alternate
+            // screen does not bring it back; a shell does not either, so
+            // one opened by `!` would be typed into blind. The next frame
+            // hides it again.
+            let _ = terminal.show_cursor();
             let ran = Command::new(&program)
                 .args(&args)
                 .current_dir(&cwd)
