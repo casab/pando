@@ -81,8 +81,18 @@ pub fn resolve_included(
             )
         })?;
         // A mount this reader never saw is not one it can refuse, and an
-        // alias or a merge key can carry one in. Compose resolves them
-        // when it can; when it could not, half a file approves nothing.
+        // alias, a merge key or `extends:` can carry one in. Compose
+        // resolves them when it can; when it could not, half a file
+        // approves nothing.
+        if file.unresolved.extends.contains(name) {
+            bail!(
+                "service {name:?} is not isolated: it uses `extends:`, which pando's own reader \
+                 does not follow, and `docker compose config` could not resolve it here — a bind \
+                 mount the service it extends declares would be invisible to pando, and an \
+                 isolated copy could write its data into your repository. Make `docker compose \
+                 config` work for this file, or write out in {name:?} what it extends"
+            );
+        }
         if file.unresolved.aliases {
             bail!(
                 "service {name:?} is not isolated: the compose file uses YAML aliases or merge \

@@ -622,7 +622,6 @@ fn a_refusal_about_an_unfollowed_file_says_which_key_it_did_not_follow() {
         resolve_included(&file, &["db".into()], &[]).unwrap_err()
     );
     assert!(err.contains("extends"), "{err}");
-    assert!(err.contains("include"), "{err}");
     assert!(err.contains("docker compose config"), "{err}");
 
     // And a service only the `include:` declares is not flatly "not
@@ -659,6 +658,37 @@ fn a_bind_mount_brought_in_by_a_merge_key_is_never_approved_on_half_a_file() {
     );
     assert!(err.contains("\"postgres\""), "{err}");
     assert!(err.contains("docker compose config"), "{err}");
+}
+
+// Compose follows `extends:` when it runs `up`, so a bind mount the
+// extended service declares is there whether or not this reader saw it.
+// Approved on what was read, `up -d db` wrote a database cluster into the
+// worktree whenever `docker compose config` could not answer.
+#[test]
+fn a_service_that_extends_another_is_never_approved_on_half_a_file() {
+    let file = parse(
+        "services:\n  db:\n    extends:\n      file: base.yml\n      service: pg\n    \
+         image: postgres:16\n    ports: [\"5432:5432\"]\n  \
+         cache:\n    image: redis:7\n",
+    )
+    .unwrap();
+    assert_eq!(
+        file.services["db"].container_port(),
+        Some(5432),
+        "everything this reader saw of db would pass"
+    );
+    let err = format!(
+        "{:#}",
+        resolve_included(&file, &["db".into()], &[]).unwrap_err()
+    );
+    assert!(err.contains("\"db\""), "{err}");
+    assert!(err.contains("`extends:`"), "{err}");
+    assert!(err.contains("docker compose config"), "{err}");
+    assert_eq!(
+        resolve_included(&file, &["cache".into()], &[]).unwrap(),
+        vec![("cache".to_string(), 6379)],
+        "a service written out whole is read whole"
+    );
 }
 
 #[test]
