@@ -356,12 +356,20 @@ pub(super) fn run_probes(
 ///
 /// Empty when git cannot answer. A hook that ran is not failed because the
 /// check after it could not be made — the check is a warning, not a gate.
+///
+/// `--no-optional-locks`, so the check never takes `index.lock` from under
+/// a `git commit` the developer runs in the worktree while a hook does, and
+/// bounded like every other git question pando asks.
 pub(super) fn porcelain_status(worktree: &Path) -> Vec<String> {
-    let Ok(out) = std::process::Command::new("git")
-        .current_dir(worktree)
-        .args(["status", "--porcelain", "--untracked-files=all"])
-        .output()
-    else {
+    let Ok(out) = crate::project::git(
+        worktree,
+        [
+            "--no-optional-locks",
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+        ],
+    ) else {
         return Vec::new();
     };
     if !out.status.success() {

@@ -231,11 +231,19 @@ pub(super) fn uninitialised_submodules(worktree: &Path) -> Vec<String> {
 /// error, never "clean": `rm` acts on this answer by stopping processes
 /// and removing volumes, and only then finds out from `git worktree
 /// remove` that the tree was dirty after all.
+///
+/// `--no-optional-locks`, as `worktree::is_dirty` has: a plain status
+/// refreshes a stale index, which takes `index.lock` and rewrites the
+/// index inside `.git` — of a worktree `rm --yes` may not own, and one a
+/// refused `rm` leaves in place.
 fn dirty_entry(worktree: &Worktree) -> Result<Option<String>> {
     if worktree.prunable {
         return Ok(None);
     }
-    let out = crate::project::git(&worktree.path, ["status", "--porcelain"])?;
+    let out = crate::project::git(
+        &worktree.path,
+        ["--no-optional-locks", "status", "--porcelain"],
+    )?;
     if !out.status.success() {
         bail!(
             "git status failed: {}",

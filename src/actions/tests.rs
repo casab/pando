@@ -6934,6 +6934,43 @@ fn rm_refuses_a_dirty_worktree_without_force() {
     assert!(fx.names().is_empty());
 }
 
+// A plain `git status` refreshes a stale index: it takes `index.lock` and
+// rewrites the index inside `.git`, which a `git commit` in the worktree
+// can trip over and a refused `rm` left behind.
+#[test]
+fn rm_and_the_hook_check_leave_a_worktrees_index_alone() {
+    let fx = fixture();
+    let name = new(&fx.paths, &fx.config, "feat/one", None, &noop).unwrap();
+    let worktree = fx.worktrees_dir().join(&name);
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(&worktree)
+        .args(["rev-parse", "--absolute-git-dir"])
+        .output()
+        .unwrap();
+    let index = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()).join("index");
+    let before = std::fs::read(&index).unwrap();
+    // Stale stat data for a tracked file, with its content unchanged.
+    std::fs::File::options()
+        .write(true)
+        .open(worktree.join("README.md"))
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + Duration::from_secs(60))
+        .unwrap();
+    std::fs::write(worktree.join("scratch.txt"), "wip").unwrap();
+
+    let err = rm(&fx.paths, &name, false, false).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("modified or untracked"),
+        "{err:#}"
+    );
+    assert_eq!(porcelain_status(&worktree), vec!["?? scratch.txt"]);
+    assert!(
+        std::fs::read(&index).unwrap() == before,
+        "a status probe rewrote the worktree's index"
+    );
+}
+
 // A `git status` that cannot answer (a timeout, a broken gitfile) read as
 // "clean": `rm` stopped the dev server and took the volumes down, and only
 // then did `git worktree remove` refuse a dirty tree. Not knowing has to
