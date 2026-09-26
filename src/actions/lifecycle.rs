@@ -20,12 +20,12 @@ use super::namespaced::{self, Ready};
 use super::refresh::advance_before_reconcile;
 use super::runtime::with_prelude;
 use super::services::{
-    FRESH_DATA_DIR, Fresh, bring_up_services, clear_native_sockets, compose_projects,
-    forget_hooks_after_services, forget_unstarted_services, has_interrupted_compose,
-    has_live_services, leave_changed_kinds, planned_services, preflight_isolation,
-    replace_stopped_containers, resolve_service_env, service_roles, shared_service_env,
-    stop_containers, stop_service_containers, stop_service_pumps, undo_failed_isolation,
-    url_owner_not_running, worktree_url,
+    FRESH_DATA_DIR, Fresh, bring_up_services, changed_kinds, clear_native_sockets,
+    compose_projects, forget_hooks_after_services, forget_unstarted_services,
+    has_interrupted_compose, has_live_services, leave_changed_kinds, planned_services,
+    preflight_isolation, replace_stopped_containers, resolve_service_env, service_roles,
+    shared_service_env, stop_containers, stop_service_containers, stop_service_pumps,
+    undo_failed_isolation, url_owner_not_running, worktree_url,
 };
 use super::share::{share_closed, share_target_is_up, sweep_dead_shares_with, take_share_down};
 // Only for the intra-doc link above `sweep_orphaned_groups`.
@@ -267,7 +267,16 @@ fn start_checked(
     // *then* found Docker was off had destroyed an environment over a
     // request that could never succeed. Read without the lock, like
     // `mode_would_change`; the decision is made again under it below.
-    if !preflighted && would_switch_to_isolated(paths, config, name, mode) {
+    //
+    // The same for an isolated worktree one of whose services config now
+    // runs as another kind: the start stops the server it ran on before
+    // the new one is brought up, and an engine that is not installed, or a
+    // recipe that does not resolve, left its app with no database at all.
+    if !preflighted
+        && (would_switch_to_isolated(paths, config, name, mode)
+            || (would_isolate(paths, config, name, mode)
+                && would_change_kinds(paths, config, name)))
+    {
         preflight_isolation(
             paths,
             config,
@@ -393,9 +402,15 @@ fn start_checked(
         }
     }
     // The mode flipped under a concurrent command between the lock-free
-    // read above and this one. Rare, so checked here, under the lock,
-    // rather than not at all.
-    if mode_changed && isolate && !preflighted {
+    // read above and this one, or the kind of a service its record runs
+    // did. Rare, so checked here, under the lock, rather than not at all.
+    let kinds_change = isolate
+        && store
+            .worktrees
+            .get(name)
+            .or(inherited.as_ref())
+            .is_some_and(|record| !changed_kinds(config, record).is_empty());
+    if (mode_changed || kinds_change) && isolate && !preflighted {
         preflight_isolation(
             paths,
             config,
@@ -1857,6 +1872,16 @@ fn would_switch_to_isolated(paths: &PandoPaths, config: &Config, name: &str, mod
     mode == Mode::Isolated
         && would_isolate(paths, config, name, mode)
         && recorded_mode(paths, name) != ServiceMode::Isolated
+}
+
+/// Whether this worktree's record runs a service as another kind than
+/// config gives it now — the start that stops the old server before the
+/// new one comes up. Read without the lock.
+fn would_change_kinds(paths: &PandoPaths, config: &Config, name: &str) -> bool {
+    state::load(&paths.state_file())
+        .ok()
+        .and_then(|mut store| store.worktrees.remove(name))
+        .is_some_and(|record| !changed_kinds(config, &record).is_empty())
 }
 
 /// The processes a start, stop or restart acts on: every one config

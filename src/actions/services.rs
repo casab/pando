@@ -357,6 +357,30 @@ fn kind_of(native: &[String], service: &str) -> state::ServiceKind {
     }
 }
 
+/// Whether a service record is of another kind than the one config runs
+/// its service as now. A record of a service config no longer has is not:
+/// there is nothing it is changing to.
+fn changes_kind(native: &[String], roles: &[String], service: &state::ServiceRecord) -> bool {
+    roles.contains(&service.name) && service.kind != kind_of(native, &service.name)
+}
+
+/// The services of a worktree's record whose kind config has changed —
+/// the ones [`leave_changed_kinds`] stops — each with the kind it runs as
+/// now.
+pub(super) fn changed_kinds(
+    config: &Config,
+    record: &WorktreeRecord,
+) -> Vec<(String, state::ServiceKind)> {
+    let native = native_names(config);
+    let roles = service_roles(config);
+    record
+        .services
+        .iter()
+        .filter(|service| changes_kind(&native, &roles, service))
+        .map(|service| (service.name.clone(), kind_of(&native, &service.name)))
+        .collect()
+}
+
 /// Stops what the records of services whose kind config has changed ran:
 /// a compose `postgres` that is now a native one, or the other way round.
 ///
@@ -378,7 +402,7 @@ pub(super) fn leave_changed_kinds(
     let roles = service_roles(config);
     let mut containers: Vec<(String, Vec<String>)> = Vec::new();
     for service in record.services.iter_mut() {
-        if !roles.contains(&service.name) || service.kind == kind_of(&native, &service.name) {
+        if !changes_kind(&native, &roles, service) {
             continue;
         }
         if let Some(pgid) = service.pgid {

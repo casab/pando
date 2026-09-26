@@ -892,6 +892,57 @@ fn a_compose_record_docker_cannot_be_run_for_gives_way_to_the_native_server() {
     assert_eq!(f.service(&name, "postgres").pid, server);
 }
 
+// No preflight ran for a worktree that was isolated already, so a switch
+// to an engine this machine does not have stopped the container first and
+// found the missing engine only when the native server was to start: the
+// dev server, "already running", was left on a port nothing served.
+#[test]
+fn a_switch_to_an_engine_this_machine_does_not_have_leaves_the_container_running() {
+    let (f, name, before) = switched_from_compose();
+    let project = before.compose_project.clone().unwrap();
+    let _down = common::docker::down_on_drop(&f.home, &project);
+    let recipes = f.paths.recipes_dir();
+    std::fs::create_dir_all(&recipes).unwrap();
+    std::fs::write(
+        recipes.join("postgres.toml"),
+        "kind = \"service\"\nname = \"postgres\"\n\
+         binaries = [\"pando-no-such-engine\"]\n\
+         install = \"brew install pando-no-such-engine\"\n\n\
+         [service]\nport_env = \"DATABASE_URL\"\n\
+         init = \"pando-no-such-engine init {datadir}\"\n\
+         cmd = \"exec pando-no-such-engine -p {port}\"\n",
+    )
+    .unwrap();
+    let up = common::docker::services_up(&f.home, &project);
+    let dev = f.record(&name).processes["dev"].pgid;
+
+    for mode in [actions::Mode::Remembered, actions::Mode::Isolated] {
+        let e = format!(
+            "{:#}",
+            actions::start(&f.paths, &f.config, &name, None, mode, &|_| {}).unwrap_err()
+        );
+        assert!(e.contains("pando-no-such-engine"), "{mode:?}: {e}");
+    }
+    assert_eq!(
+        f.service(&name, "postgres"),
+        before,
+        "the compose record, pump and all"
+    );
+    assert!(
+        process::group_alive(before.pgid.unwrap()),
+        "its log pump runs"
+    );
+    assert_eq!(common::docker::services_up(&f.home, &project), up);
+    assert!(
+        !common::docker::invocations_for(&f.home, &project)
+            .iter()
+            .any(|call| call.ends_with("stop postgres")),
+        "{:?}",
+        common::docker::invocations_for(&f.home, &project)
+    );
+    assert!(process::group_alive(dev), "the dev server is as it was");
+}
+
 // ---- a data directory the fingerprint cannot see --------------------------
 
 // The other half of the hook-fingerprint bug, and the one only a native
