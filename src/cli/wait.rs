@@ -174,9 +174,24 @@ pub(super) fn wait_ready(
     let began = Instant::now();
     let mut announced: BTreeSet<String> = BTreeSet::new();
     let mut said_waiting = false;
+    let mut told: BTreeSet<String> = BTreeSet::new();
     loop {
         let refreshed = actions::refresh(paths);
+        // A service that died under the wait is forgotten by this refresh
+        // and saved as gone: the wait is the one command that sees it go,
+        // and a failure it causes comes next. Told once, even if a save
+        // that failed makes the next refresh find it again.
+        for line in &refreshed.notices {
+            if told.insert(line.clone()) {
+                notice(line);
+            }
+        }
         let Some(record) = refreshed.state.worktrees.get(name.as_str()) else {
+            // A state file pando could not use says nothing about whether
+            // anything stopped.
+            if let Some(warning) = &refreshed.warning {
+                bail!("{warning}");
+            }
             bail!("{shown} has nothing running — it stopped while pando waited");
         };
         let now = Utc::now();

@@ -3,7 +3,6 @@
 use super::JSON_VERSION;
 use super::report_refresh;
 use super::short_head;
-use super::warn_about;
 use crate::actions;
 use crate::actions::worktree_url;
 use crate::cache;
@@ -548,11 +547,10 @@ struct PrOut {
 pub fn ls_json<W: Write>(paths: &PandoPaths, out: &mut W) -> Result<()> {
     let worktrees = actions::ls(paths)?;
     let refreshed = actions::refresh(paths);
-    let owned = actions::Ownership {
-        by_name: actions::ownership(&refreshed.state, &worktrees),
-        warning: refreshed.warning.clone(),
-    };
-    warn_about(&owned);
+    // A share the refresh closed or a service it forgot is saved as gone,
+    // so this is the one run that can say so.
+    report_refresh(&refreshed);
+    let owned = actions::ownership(&refreshed.state, &worktrees);
     // Cache only: the CLI never spawns `gh`, so `ls --json` stays fast and
     // works offline. The TUI is what refreshes this.
     let prs = cache::load_prs(&paths.pr_cache_file());
@@ -584,7 +582,7 @@ pub fn ls_json<W: Write>(paths: &PandoPaths, out: &mut W) -> Result<()> {
                     .map(WorktreeRecord::mode)
                     .unwrap_or_default();
                 WorktreeOut {
-                    created_by_pando: owned.by_name.get(&w.name).copied().unwrap_or(false),
+                    created_by_pando: owned.get(&w.name).copied().unwrap_or(false),
                     mode,
                     name: w.name,
                     path: w.path.display().to_string(),

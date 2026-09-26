@@ -313,6 +313,43 @@ fn a_huge_ready_timeout_makes_a_long_wait_and_not_an_overflow() {
     }
 }
 
+// A database that crashed during `start --wait` was forgotten by the
+// wait's refresh and saved as gone, and the wait never said so: the
+// failure it caused came with no cause, and no later command had one.
+#[test]
+fn a_wait_tells_what_its_refresh_forgot() {
+    let fx = fixture();
+    let name = actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
+    let mut exited = std::process::Command::new("true").spawn().unwrap();
+    exited.wait().unwrap();
+    let mut store = crate::state::load(&fx.paths.state_file()).unwrap();
+    let record = store.worktrees.get_mut(&name).unwrap();
+    let mut dev = listening(std::process::id() as i32, &[]);
+    dev.started_at = Utc::now() - chrono::Duration::seconds(60);
+    record.processes.insert("dev".to_string(), dev);
+    record.services.push(crate::state::ServiceRecord {
+        name: "mariadb".into(),
+        kind: crate::state::ServiceKind::Native,
+        port: Some(17_004),
+        pid: Some(exited.id()),
+        pgid: None,
+        compose_project: None,
+    });
+    crate::state::save(&fx.paths.state_file(), &store).unwrap();
+
+    let said = std::cell::RefCell::new(Vec::new());
+    let named = super::names::Named::of(&fx.paths, Some("feat/one"), &name);
+    super::wait::wait_ready(&fx.paths, &named, None, &|line| {
+        said.borrow_mut().push(line.to_string())
+    })
+    .unwrap();
+    let said = said.into_inner();
+    assert!(
+        said.iter().any(|l| l.contains("its mariadb exited")),
+        "{said:?}"
+    );
+}
+
 fn fake_process(started_at: chrono::DateTime<Utc>) -> ProcessRecord {
     ProcessRecord {
         pid: 1,

@@ -925,14 +925,6 @@ fn report_refresh(refreshed: &actions::Refreshed) {
     }
 }
 
-/// Always stderr, never the listing: `ls --json`'s stdout has to stay
-/// parseable, and this is not part of the documented shape.
-fn warn_about(owned: &actions::Ownership) {
-    if let Some(warning) = &owned.warning {
-        eprintln!("pando: {warning}");
-    }
-}
-
 /// The sha `ls --json` publishes: seven characters, always. `head_sha` is
 /// enrichment's abbreviation and porcelain's `head` is the full forty, so a
 /// worktree whose enrichment failed would otherwise put a different shape

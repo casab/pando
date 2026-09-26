@@ -545,6 +545,54 @@ fn ls_warns_when_the_state_file_cannot_be_used() {
     let out = e.pando(&["rm", "feat+one", "--yes"]);
     assert_eq!(code(&out), EXIT_ERROR);
     assert!(stderr(&out).contains("version 3"), "{}", stderr(&out));
+
+    // `open` said "not running" about a worktree it could not read.
+    let out = e.pando(&["open", "feat/one"]);
+    assert_eq!(code(&out), EXIT_ERROR);
+    assert!(stderr(&out).contains("version 3"), "{}", stderr(&out));
+    assert!(!stderr(&out).contains("not running"), "{}", stderr(&out));
+}
+
+// A refresh that forgets a service which exited saves it as gone, so the
+// command that ran it is the only one that can say so. `ls --json` and
+// `open` said nothing, and the fact was lost.
+#[test]
+fn ls_json_and_open_say_what_their_refresh_forgot() {
+    let e = env();
+    e.pando(&["new", "feat/one"]);
+    let state = e.project_dir().join("state.json");
+    let mut exited = Command::new("true").spawn().unwrap();
+    exited.wait().unwrap();
+    let with_a_dead_service = || {
+        let mut store: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+        store["worktrees"]["feat+one"]["services"] = serde_json::json!([{
+            "name": "mariadb",
+            "kind": "native",
+            "port": 17_004,
+            "pid": exited.id(),
+        }]);
+        std::fs::write(&state, store.to_string()).unwrap();
+    };
+
+    with_a_dead_service();
+    let out = e.pando(&["ls", "--json"]);
+    assert_eq!(code(&out), EXIT_OK, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("its mariadb exited"),
+        "{}",
+        stderr(&out)
+    );
+    serde_json::from_str::<serde_json::Value>(&stdout(&out)).expect("stdout stays parseable");
+
+    with_a_dead_service();
+    let out = e.pando(&["open", "feat/one"]);
+    assert_eq!(code(&out), EXIT_ERROR);
+    assert!(
+        stderr(&out).contains("its mariadb exited"),
+        "{}",
+        stderr(&out)
+    );
 }
 
 // The committed file is the one a teammate can change under you, so the

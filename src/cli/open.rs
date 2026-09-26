@@ -22,6 +22,14 @@ pub(super) fn url_to_open(
     let Named { dir, shown, typed } = named;
     let refreshed = actions::refresh(paths);
     let record = refreshed.state.worktrees.get(dir.as_str());
+    // A state file pando could not use says nothing about this worktree,
+    // so its reason is the answer, not "not running".
+    if let (None, Some(warning)) = (record, &refreshed.warning) {
+        bail!("{warning}");
+    }
+    // Said before the answer: a tunnel that died is why there is no public
+    // URL to open, and the refresh has already saved it as gone.
+    super::report_refresh(&refreshed);
     if public {
         return match record.and_then(|r| r.share.as_ref()) {
             Some(share) => Ok(share.public_url.clone()),
