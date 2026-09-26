@@ -20,7 +20,7 @@ use crate::state::ShareRecord;
 pub const TUNNEL_LOG: &str = "tunnel";
 
 /// How long a provider may take to publish a URL before the share fails.
-const READY_TIMEOUT: Duration = Duration::from_secs(30);
+pub const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// Matches `actions`' own grace: a tunnel is not special enough to wait
 /// longer for.

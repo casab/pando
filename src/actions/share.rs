@@ -385,6 +385,7 @@ fn note_pending(paths: &PandoPaths, name: &str, pgid: i32) {
         Some(pending) => pending.pgids.push(pgid),
         None => record.pending_shares.push(PendingShare {
             owner_pid: me,
+            since: Utc::now(),
             pgids: vec![pgid],
         }),
     }
@@ -452,7 +453,9 @@ pub fn unshare(paths: &PandoPaths, name: &str) -> Result<()> {
 /// So is a share that never got as far as a record, because the pando
 /// waiting on its tunnel died first: see [`PendingShare`].
 pub(super) fn sweep_dead_shares(store: &mut state::State) -> Vec<String> {
-    sweep_dead_shares_with(store, proc::is_alive, |pgid| proc::stop(pgid, STOP_GRACE))
+    sweep_dead_shares_with(store, proc::is_alive, proc::group_alive, |pgid| {
+        proc::stop(pgid, STOP_GRACE)
+    })
 }
 
 /// [`sweep_dead_shares`] with liveness and the signal injected, so a test
@@ -460,11 +463,12 @@ pub(super) fn sweep_dead_shares(store: &mut state::State) -> Vec<String> {
 pub(super) fn sweep_dead_shares_with(
     store: &mut state::State,
     is_alive: impl Fn(u32) -> bool,
+    group_alive: impl Fn(i32) -> bool,
     stop: impl Fn(i32) -> Result<()>,
 ) -> Vec<String> {
     let mut notices = Vec::new();
     for (name, record) in store.worktrees.iter_mut() {
-        sweep_interrupted_shares(name, record, &is_alive, &stop, &mut notices);
+        sweep_interrupted_shares(name, record, &is_alive, &group_alive, &stop, &mut notices);
         let Some(share) = record.share.clone() else {
             continue;
         };
@@ -502,26 +506,53 @@ pub(super) fn sweep_dead_shares_with(
     notices
 }
 
+/// How long a share can be pending before the pando that wrote it down
+/// cannot still be waiting on it: the proxy's time to listen, the tunnel's
+/// time to publish, and a minute for the stops and locks either side.
+const PENDING_SHARE_DEADLINE: Duration = Duration::from_secs(
+    share_proxy::LISTEN_TIMEOUT.as_secs() + tunnel::READY_TIMEOUT.as_secs() + 60,
+);
+
 /// Stops what a share spawned when the pando waiting on it is gone, and
 /// drops the [`PendingShare`] that named it.
 ///
-/// Every group it names is signalled, and the entry is kept only when one
-/// would not stop: it holds the only pgids anything can use to try again.
+/// That pando is gone when its pid has exited, or when the share has been
+/// pending for longer than [`PENDING_SHARE_DEADLINE`]. A pid alone is no
+/// proof: once its pando exits the system can hand it to anything, and a
+/// long-lived process that got it kept an orphaned tunnel and its
+/// cookie-holding proxy up for good.
+///
+/// Every group it names that is still alive is signalled, and the entry is
+/// kept only when one would not stop: it holds the only pgids anything can
+/// use to try again. One none of whose groups is alive goes without a
+/// signal, whoever owns it: there is nothing left to stop, and its pgids
+/// may name somebody else's groups by now.
 fn sweep_interrupted_shares(
     name: &str,
     record: &mut WorktreeRecord,
     is_alive: &impl Fn(u32) -> bool,
+    group_alive: &impl Fn(i32) -> bool,
     stop: &impl Fn(i32) -> Result<()>,
     notices: &mut Vec<String>,
 ) {
+    let now = Utc::now();
     let mut kept = Vec::new();
     for pending in std::mem::take(&mut record.pending_shares) {
-        if is_alive(pending.owner_pid) {
+        let alive: Vec<i32> = pending
+            .pgids
+            .iter()
+            .copied()
+            .filter(|&pgid| group_alive(pgid))
+            .collect();
+        if alive.is_empty() {
+            continue;
+        }
+        let waited = now.signed_duration_since(pending.since).num_seconds();
+        if is_alive(pending.owner_pid) && waited <= PENDING_SHARE_DEADLINE.as_secs() as i64 {
             kept.push(pending);
             continue;
         }
-        let failures: Vec<String> = pending
-            .pgids
+        let failures: Vec<String> = alive
             .iter()
             .filter_map(|&pgid| stop(pgid).err().map(|e| format!("group {pgid}: {e:#}")))
             .collect();

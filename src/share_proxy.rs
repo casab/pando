@@ -34,7 +34,7 @@ pub const SUBCOMMAND: &str = "__share-proxy";
 
 /// How long a spawned proxy has to start listening. Binding is the first
 /// thing it does, so this is one exec on a loaded machine.
-const LISTEN_TIMEOUT: Duration = Duration::from_secs(5);
+pub const LISTEN_TIMEOUT: Duration = Duration::from_secs(5);
 const LISTEN_POLL: Duration = Duration::from_millis(50);
 
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);

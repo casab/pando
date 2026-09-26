@@ -388,6 +388,12 @@ pub struct ShareRecord {
 pub struct PendingShare {
     /// The pando process waiting on the share.
     pub owner_pid: u32,
+    /// When it was written down. A share pending for longer than any share
+    /// waits is not one `owner_pid` is still waiting on: that pid has been
+    /// handed to another process since. Read as now from a state file
+    /// without it, which only moves the deadline later.
+    #[serde(default = "Utc::now")]
+    pub since: DateTime<Utc>,
     /// Every process group spawned for it so far.
     pub pgids: Vec<i32>,
 }

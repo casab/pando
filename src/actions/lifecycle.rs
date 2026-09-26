@@ -1391,7 +1391,7 @@ pub(super) fn sweep_orphaned_groups_with(
     // First, because a share is the one record whose survivor is a public
     // door: a tunnel nobody can name again is worse than a dev server
     // nobody can name again.
-    let notices = sweep_dead_shares_with(store, proc::is_alive, &stop);
+    let notices = sweep_dead_shares_with(store, proc::is_alive, proc::group_alive, &stop);
     let mut failures = Vec::new();
     for (name, record) in &mut store.worktrees {
         for (process, p) in &mut record.processes {

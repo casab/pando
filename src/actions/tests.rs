@@ -3252,12 +3252,13 @@ fn a_share_names_what_it_has_spawned_while_its_tunnel_comes_up() {
         .clone()
         .unwrap()
         .tunnel_pgid;
+    let seen: Vec<(u32, Vec<i32>)> = seen.into_iter().map(|p| (p.owner_pid, p.pgids)).collect();
     assert_eq!(
         seen,
-        vec![PendingShare {
-            owner_pid: std::process::id(),
-            pgids: vec![proxies.into_inner().unwrap()[0], tunnel],
-        }],
+        vec![(
+            std::process::id(),
+            vec![proxies.into_inner().unwrap()[0], tunnel]
+        )],
         "the proxy and the tunnel, before the tunnel's wait"
     );
     assert!(
@@ -3334,6 +3335,7 @@ fn state_with_a_pending_share(owner: u32, pgids: Vec<i32>) -> state::State {
     let mut record = WorktreeRecord::new("/tmp/feat+one", true);
     record.pending_shares.push(PendingShare {
         owner_pid: owner,
+        since: Utc::now(),
         pgids,
     });
     store.worktrees.insert("feat+one".to_string(), record);
@@ -3347,6 +3349,7 @@ fn a_share_whose_pando_died_before_its_tunnel_was_up_is_stopped_by_the_sweep() {
     let notices = sweep_dead_shares_with(
         &mut store,
         |pid| pid != 4_000_001,
+        |_| true,
         |pgid| {
             signalled.lock().unwrap().push(pgid);
             Ok(())
@@ -3360,15 +3363,69 @@ fn a_share_whose_pando_died_before_its_tunnel_was_up_is_stopped_by_the_sweep() {
 #[test]
 fn a_share_still_coming_up_in_a_live_pando_is_left_to_it() {
     let mut store = state_with_a_pending_share(4_000_001, vec![4242]);
-    let notices = sweep_dead_shares_with(&mut store, |_| true, |_| bail!("must not signal"));
+    let notices =
+        sweep_dead_shares_with(&mut store, |_| true, |_| true, |_| bail!("must not signal"));
     assert!(notices.is_empty(), "{notices:?}");
     assert_eq!(store.worktrees["feat+one"].pending_shares.len(), 1);
+}
+
+// A pid alone is no proof its pando is still waiting: once that pando is
+// gone the system can hand the pid to anything, and a long-lived process
+// that got it kept an orphaned tunnel, and a proxy holding the auth
+// cookie, up for good.
+#[test]
+fn a_share_pending_for_longer_than_any_share_waits_is_stopped_whoever_has_its_pid() {
+    let mut store = state_with_a_pending_share(4_000_001, vec![4242, 8484]);
+    store.worktrees.get_mut("feat+one").unwrap().pending_shares[0].since =
+        Utc::now() - chrono::TimeDelta::minutes(10);
+    let signalled = std::sync::Mutex::new(Vec::new());
+    let notices = sweep_dead_shares_with(
+        &mut store,
+        |_| true,
+        |_| true,
+        |pgid| {
+            signalled.lock().unwrap().push(pgid);
+            Ok(())
+        },
+    );
+    assert_eq!(signalled.into_inner().unwrap(), vec![4242, 8484]);
+    assert!(store.worktrees["feat+one"].pending_shares.is_empty());
+    assert!(notices[0].contains("interrupted"), "{notices:?}");
+}
+
+// Nothing is left to stop, and the pgids may name somebody else's groups
+// by the time a sweep comes round.
+#[test]
+fn a_pending_share_whose_groups_have_all_exited_is_dropped_without_a_signal() {
+    let mut store = state_with_a_pending_share(4_000_001, vec![4242, 8484]);
+    let notices = sweep_dead_shares_with(
+        &mut store,
+        |pid| pid != 4_000_001,
+        |_| false,
+        |_| bail!("must not signal"),
+    );
+    assert!(store.worktrees["feat+one"].pending_shares.is_empty());
+    assert!(notices.is_empty(), "{notices:?}");
+
+    // And only the groups still alive are signalled.
+    let mut store = state_with_a_pending_share(4_000_001, vec![4242, 8484]);
+    let signalled = std::sync::Mutex::new(Vec::new());
+    sweep_dead_shares_with(
+        &mut store,
+        |pid| pid != 4_000_001,
+        |pgid| pgid == 8484,
+        |pgid| {
+            signalled.lock().unwrap().push(pgid);
+            Ok(())
+        },
+    );
+    assert_eq!(signalled.into_inner().unwrap(), vec![8484]);
 }
 
 #[test]
 fn an_interrupted_share_that_will_not_stop_keeps_its_groups_named() {
     let mut store = state_with_a_pending_share(4_000_001, vec![4242]);
-    let notices = sweep_dead_shares_with(&mut store, |_| false, |_| bail!("stuck"));
+    let notices = sweep_dead_shares_with(&mut store, |_| false, |_| true, |_| bail!("stuck"));
     assert_eq!(store.worktrees["feat+one"].pending_shares.len(), 1);
     assert!(notices[0].contains("would not stop"), "{notices:?}");
 }
@@ -3553,6 +3610,7 @@ fn a_dead_tunnel_closes_the_share_and_signals_the_proxy_that_is_left() {
         &mut store,
         // The tunnel died; the proxy is still up.
         |pid| pid == 8484,
+        |_| true,
         |pgid| {
             signalled.lock().unwrap().push(pgid);
             Ok(())
@@ -3580,6 +3638,7 @@ fn a_dead_proxy_takes_the_tunnel_in_front_of_it_down() {
         // The proxy died; the tunnel is still up, serving the login
         // screen the proxy existed to skip.
         |pid| pid == 4242,
+        |_| true,
         |pgid| {
             signalled.lock().unwrap().push(pgid);
             Ok(())
@@ -3601,6 +3660,7 @@ fn a_live_share_is_left_alone() {
     let notices = sweep_dead_shares_with(
         &mut store,
         |_| true,
+        |_| true,
         |pgid| {
             signalled.lock().unwrap().push(pgid);
             Ok(())
@@ -3616,8 +3676,12 @@ fn a_live_share_is_left_alone() {
 #[test]
 fn a_share_that_will_not_die_keeps_its_record_and_says_so() {
     let mut store = state_with_share(share_record_of(4242, Some(8484)));
-    let notices =
-        sweep_dead_shares_with(&mut store, |pid| pid == 8484, |_| bail!("would not stop"));
+    let notices = sweep_dead_shares_with(
+        &mut store,
+        |pid| pid == 8484,
+        |_| true,
+        |_| bail!("would not stop"),
+    );
 
     assert!(
         store.worktrees["feat+one"].share.is_some(),
@@ -3654,6 +3718,7 @@ fn a_share_whose_application_crashed_is_closed_and_both_halves_signalled() {
         &mut store,
         // Both halves of the share are up; the application is not.
         |pid| pid != 777,
+        |_| true,
         |pgid| {
             signalled.lock().unwrap().push(pgid);
             Ok(())
@@ -3677,7 +3742,7 @@ fn a_share_whose_application_crashed_is_closed_and_both_halves_signalled() {
 #[test]
 fn a_share_whose_application_is_still_up_is_left_alone() {
     let mut store = state_with_a_shared_application(Phase::Running { since: Utc::now() }, 777);
-    let notices = sweep_dead_shares_with(&mut store, |_| true, |_| Ok(()));
+    let notices = sweep_dead_shares_with(&mut store, |_| true, |_| true, |_| Ok(()));
     assert!(notices.is_empty(), "{notices:?}");
     assert!(store.worktrees["feat+one"].share.is_some());
 }
@@ -3687,7 +3752,7 @@ fn a_share_whose_application_is_still_up_is_left_alone() {
 #[test]
 fn a_share_of_something_still_starting_is_left_alone() {
     let mut store = state_with_a_shared_application(Phase::Starting { since: Utc::now() }, 777);
-    let notices = sweep_dead_shares_with(&mut store, |_| true, |_| Ok(()));
+    let notices = sweep_dead_shares_with(&mut store, |_| true, |_| true, |_| Ok(()));
     assert!(notices.is_empty(), "{notices:?}");
     assert!(store.worktrees["feat+one"].share.is_some());
 }
@@ -3772,6 +3837,7 @@ fn a_share_without_a_proxy_is_swept_on_its_tunnel_alone() {
     sweep_dead_shares_with(
         &mut store,
         |_| false,
+        |_| true,
         |pgid| {
             signalled.lock().unwrap().push(pgid);
             Ok(())
@@ -4118,7 +4184,7 @@ fn a_share_of_a_worktree_not_running_the_urls_owner_is_refused_by_name() {
 #[test]
 fn a_share_whose_urls_owner_was_stopped_on_its_own_is_closed() {
     let mut store = shared_web_and_api(&["api"]);
-    let notices = sweep_dead_shares_with(&mut store, |_| true, |_| Ok(()));
+    let notices = sweep_dead_shares_with(&mut store, |_| true, |_| true, |_| Ok(()));
     assert!(store.worktrees["feat+one"].share.is_none());
     assert!(
         notices[0].contains("nothing is serving"),
