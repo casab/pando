@@ -250,6 +250,13 @@ fn remove_if_there(path: &Path) -> Result<()> {
 
 /// A throwaway pando home, removed when it goes out of scope — including
 /// when the pass it was made for failed partway through.
+///
+/// It sees what the pass reads from the real home and never writes there:
+/// the developer's own recipes, and the shims in its `bin` that the
+/// machine probe puts first on PATH. Without them the preview proposed
+/// services from the built-in recipes alone, which is not what the real
+/// run proposes. They are links, not copies, and removing the scratch
+/// removes the links and leaves what they point at.
 struct Scratch {
     dir: PathBuf,
     /// The directories this preview had to create to hold the scratch
@@ -281,7 +288,22 @@ impl Scratch {
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
         std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-        Ok(Scratch { dir, created })
+        // Made before the links, so a link that fails still has the
+        // scratch removed behind it.
+        let scratch = Scratch { dir, created };
+        for real in [paths.recipes_dir(), paths.home.join("bin")] {
+            let (Ok(relative), Ok(target)) = (real.strip_prefix(&paths.home), real.canonicalize())
+            else {
+                continue;
+            };
+            if !target.is_dir() {
+                continue;
+            }
+            let link = scratch.dir.join(relative);
+            std::os::unix::fs::symlink(&target, &link)
+                .with_context(|| format!("link {} → {}", link.display(), target.display()))?;
+        }
+        Ok(scratch)
     }
 }
 

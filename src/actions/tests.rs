@@ -5327,6 +5327,78 @@ fn a_dry_run_leaves_no_directory_behind_in_pandos_home() {
     assert!(!fx.paths.config_file().exists());
 }
 
+// The preview ran in a scratch home with none of the real one's recipes
+// or shims, so it proposed services from the built-in recipes alone: a
+// developer whose recipe points an engine at a shim in pando's own `bin`
+// was shown one answer and then had `init` write another.
+#[test]
+fn a_dry_run_sees_the_developers_own_recipes_and_shims() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = detectable_fixture(
+        r#"{ "dev": "next dev" }"#,
+        "PORT=3000\nMONGODB_URL=mongodb://localhost:27017/app\n",
+    );
+    // An engine only pando's own `bin` has, so what either run finds does
+    // not depend on what this host has installed.
+    let recipes = fx.paths.recipes_dir();
+    std::fs::create_dir_all(&recipes).unwrap();
+    std::fs::write(
+        recipes.join("mongodb.toml"),
+        "kind = \"service\"\nname = \"mongodb\"\nbinaries = [\"pando-fake-mongod\"]\n\n\
+         [service]\ncmd = \"exec pando-fake-mongod --port {port}\"\n",
+    )
+    .unwrap();
+    let bin = fx.paths.home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("pando-fake-mongod"), "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(
+        bin.join("pando-fake-mongod"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+
+    let services = std::cell::RefCell::new(Vec::<Question>::new());
+    let take_the_rules = |q: &Question| -> Result<Answer> {
+        if q.slot == Slot::Services {
+            services.borrow_mut().push(q.clone());
+            return Ok(Answer::Many(q.checked.clone()));
+        }
+        match recommended(q) {
+            Some((answer, _)) => Ok(answer),
+            None => Err(NeedsAnswer {
+                question: q.clone(),
+            }
+            .into()),
+        }
+    };
+    let (_, preview) = init_dry_run(
+        &fx.paths,
+        &fx.config,
+        &Answering::asking(&take_the_rules),
+        &noop,
+    )
+    .unwrap();
+    init(
+        &fx.paths,
+        &fx.config,
+        &Answering::asking(&take_the_rules),
+        &noop,
+    )
+    .unwrap();
+
+    let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+    assert!(written.contains("mongodb"), "{written}");
+    let previewed = preview
+        .iter()
+        .find(|(path, _)| *path == fx.paths.config_file())
+        .map(|(_, body)| body.as_str());
+    assert_eq!(previewed, Some(written.as_str()), "{services:?}");
+    // And the links went with the scratch, leaving what they pointed at.
+    assert!(recipes.join("mongodb.toml").is_file());
+    assert!(bin.join("pando-fake-mongod").is_file());
+    assert!(!fx.paths.home.join("preview").exists());
+}
+
 #[test]
 fn init_takes_every_slot_a_rule_decided_and_asks_nothing() {
     let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");
