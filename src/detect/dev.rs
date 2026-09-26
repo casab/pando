@@ -149,8 +149,18 @@ const MULTIPLEXERS: [&str; 6] = [
     "npm:",
 ];
 
-pub(super) fn is_production(body: &str) -> bool {
+fn is_production(body: &str) -> bool {
     PRODUCTION_SHAPES.iter().any(|shape| body.contains(shape))
+}
+
+/// Whether a script serves the production build rather than develops.
+///
+/// Never one named `dev` or `dev:*`: a TypeScript dev loop compiles and
+/// then runs its output, `tsc-watch --onSuccess "node dist/index.js"`, and
+/// the name is the project saying which script it develops with.
+fn serves_production(name: &str, body: &str) -> bool {
+    let dev_by_name = name == "dev" || name.starts_with("dev:");
+    !dev_by_name && is_production(body)
 }
 
 pub(super) fn is_multiplexer(body: &str) -> bool {
@@ -209,7 +219,7 @@ fn ranked_scripts(signals: &Signals) -> Vec<(String, String)> {
     let mut named: Vec<(String, String)> = Vec::new();
     let mut rest: Vec<(String, String)> = Vec::new();
     for (name, body) in &signals.scripts {
-        if EXCLUDED_SCRIPTS.contains(&name.as_str()) || is_production(body) {
+        if EXCLUDED_SCRIPTS.contains(&name.as_str()) || serves_production(name, body) {
             continue;
         }
         let dev_shaped = name == "dev"
@@ -284,7 +294,7 @@ pub(super) fn dev_cmd_proposal(
     let sure_script = signals
         .scripts
         .get("dev")
-        .is_some_and(|body| !is_multiplexer(body) && !is_production(body));
+        .is_some_and(|body| !is_multiplexer(body));
     let decided =
         candidates.len() == 1 || (sure_script && candidates[0].value == format!("{runner}dev"));
     Some(Proposal::of(Slot::DevCmd, candidates, decided))

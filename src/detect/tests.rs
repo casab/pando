@@ -287,6 +287,37 @@ fn a_production_start_script_is_not_a_dev_server() {
     assert!(proposal.decided);
 }
 
+// A TypeScript dev loop compiles and then runs its output, so its body
+// reads like the production `start` beside it. The name says which one
+// the project develops with; without it there was nothing left to offer.
+#[test]
+fn a_dev_script_that_compiles_and_runs_its_output_is_still_the_dev_server() {
+    let signals = scripts(&[
+        ("dev", "tsc-watch --onSuccess \"node dist/index.js\""),
+        ("dev:api", "tsc && node build/api.js"),
+        ("start", "node dist/index.js"),
+    ]);
+    let proposal = dev_of(&signals, None);
+    assert_eq!(values(&proposal), vec!["npm run dev", "npm run dev:api"]);
+    assert!(proposal.decided);
+}
+
+#[test]
+fn a_workspace_app_whose_dev_runs_its_build_output_is_still_an_app() {
+    let dir = tempdir().unwrap();
+    workspace(dir.path());
+    std::fs::write(
+        dir.path().join("apps/api/package.json"),
+        r#"{ "scripts": { "dev": "nodemon --exec 'tsc && node dist/index.js'" } }"#,
+    )
+    .unwrap();
+    let apps = workspace_apps(dir.path(), &signals(dir.path()));
+    assert_eq!(
+        apps.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+        vec!["api", "web"]
+    );
+}
+
 // Several candidates with an unambiguous `dev` is still a decision: the
 // developer named it, and pando is only confirming.
 #[test]

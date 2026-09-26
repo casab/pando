@@ -8,7 +8,7 @@ use crate::catalog::frameworks::{FrameworkRule, PortMechanism};
 use crate::config::{PortsSpec, ProcessConfig, ReadySpec};
 
 use super::apply::DEV;
-use super::dev::{fixed_port, is_multiplexer, is_production, script_args, script_runner};
+use super::dev::{fixed_port, is_multiplexer, script_args, script_runner};
 use super::frameworks::framework;
 use super::proposal::{Candidate, Proposal, Slot};
 use super::signals::{Signals, parse_scripts, present};
@@ -165,7 +165,9 @@ pub fn workspace_apps(root: &Path, signals: &Signals) -> Vec<WorkspaceApp> {
             let Some(script) = app.scripts.get("dev") else {
                 continue;
             };
-            if is_production(script) || is_multiplexer(script) {
+            // Not the production check: a script named `dev` is the one the
+            // app develops with, even when it compiles and runs `dist/`.
+            if is_multiplexer(script) {
                 continue;
             }
             let Some(name) = Path::new(&dir).file_name().and_then(|n| n.to_str()) else {
