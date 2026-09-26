@@ -821,9 +821,9 @@ fn read_env_files(worktree: &Path) -> Vec<(String, std::collections::BTreeMap<St
 }
 
 /// `KEY=value` lines, with `export`, surrounding quotes and a trailing
-/// comment dropped. Not a dotenv implementation: it reads what a key looks
-/// like, and the only thing pando does with the answer is swap a number
-/// inside it.
+/// comment dropped, and references expanded. Not a full dotenv
+/// implementation: it reads what a key's value is, and pando swaps a
+/// number inside it or hands it to the app as it is.
 ///
 /// A value in quotes ends at its closing quote, and whatever follows is
 /// dropped. An unquoted one ends at a `#` that starts a word — at the
@@ -832,13 +832,51 @@ fn read_env_files(worktree: &Path) -> Vec<(String, std::collections::BTreeMap<St
 /// value goes into the app's environment, ahead of the app's own dotenv
 /// file, so a comment read into it breaks an app that connects fine
 /// without pando.
+///
+/// For the same reason, a value that is not in single quotes has its
+/// `$NAME` and `${NAME}` references expanded, the way dotenv loaders
+/// expand them: from the process environment first, then from a key
+/// earlier in the same file, which is the order a loader that does not
+/// override the environment resolves them in. `${NAME:-default}` and
+/// `${NAME-default}` take their default as a shell does, `\$` is a
+/// literal `$`, and a reference nothing defines is left as written. The
+/// app's own loader would have expanded `postgres://${POSTGRES_USER}@…`;
+/// handed it unexpanded, ahead of that loader, the app logged in as a
+/// user called `${POSTGRES_USER}`.
 pub fn parse_env(text: &str) -> std::collections::BTreeMap<String, String> {
-    text.lines().filter_map(parse_env_line).collect()
+    parse_env_in(text, &|name| std::env::var(name).ok())
 }
 
-/// One line of an env file as [`parse_env`] reads it: `None` for a blank
-/// line, a comment, or a line with no key.
+/// [`parse_env`], with the process environment as `environment` answers
+/// for it.
+fn parse_env_in(
+    text: &str,
+    environment: &dyn Fn(&str) -> Option<String>,
+) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for (key, value, quote) in text.lines().filter_map(env_entry) {
+        let value = match quote {
+            Some('\'') => value.to_string(),
+            _ => expand(value, &|name| {
+                environment(name).or_else(|| out.get(name).cloned())
+            }),
+        };
+        out.insert(key.to_string(), value);
+    }
+    out
+}
+
+/// One line of an env file as [`parse_env`] reads it, before any reference
+/// in it is expanded: `None` for a blank line, a comment, or a line with
+/// no key.
 pub fn parse_env_line(line: &str) -> Option<(String, String)> {
+    let (key, value, _) = env_entry(line)?;
+    Some((key.to_string(), value.to_string()))
+}
+
+/// A line's key, its value, and the quote the value was closed in, if it
+/// was.
+fn env_entry(line: &str) -> Option<(&str, &str, Option<char>)> {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') {
         return None;
@@ -850,15 +888,96 @@ pub fn parse_env_line(line: &str) -> Option<(String, String)> {
         return None;
     }
     let value = value.trim();
-    let value = match value.chars().next() {
+    Some(match value.chars().next() {
         // An unclosed quote is kept as written: there is no telling
         // where the value was meant to end.
-        Some(quote @ ('"' | '\'')) => {
-            closing_quote(&value[1..], quote).map_or(value, |end| &value[1..1 + end])
+        Some(quote @ ('"' | '\'')) => match closing_quote(&value[1..], quote) {
+            Some(end) => (key, &value[1..1 + end], Some(quote)),
+            None => (key, value, None),
+        },
+        _ => (key, without_comment(value), None),
+    })
+}
+
+/// A value with its `$NAME`, `${NAME}`, `${NAME:-default}` and
+/// `${NAME-default}` references replaced by what `lookup` says, as
+/// [`parse_env`] describes.
+fn expand(value: &str, lookup: &dyn Fn(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(at) = rest.find(['$', '\\']) {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at..];
+        if let Some(after) = tail.strip_prefix("\\$") {
+            out.push('$');
+            rest = after;
+            continue;
         }
-        _ => without_comment(value),
+        let Some(reference) = tail.strip_prefix('$').and_then(reference) else {
+            // A backslash before anything else, or a `$` that starts no
+            // name, is itself.
+            out.push_str(&tail[..1]);
+            rest = &tail[1..];
+            continue;
+        };
+        match (lookup(reference.name), reference.default) {
+            (Some(found), Some(default)) if found.is_empty() && reference.or_empty => {
+                out.push_str(default)
+            }
+            (Some(found), _) => out.push_str(&found),
+            (None, Some(default)) => out.push_str(default),
+            (None, None) => out.push_str(&tail[..1 + reference.len]),
+        }
+        rest = &tail[1 + reference.len..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A reference, as [`expand`] reads the text after its `$`.
+struct Reference<'a> {
+    /// How many bytes of that text it takes.
+    len: usize,
+    name: &'a str,
+    /// What stands in for the name when it is unset.
+    default: Option<&'a str>,
+    /// Whether the default stands in for an empty value too: `:-` rather
+    /// than `-`.
+    or_empty: bool,
+}
+
+/// The reference at the start of `text`, the text after a `$`, if one is
+/// there.
+fn reference(text: &str) -> Option<Reference<'_>> {
+    let name_len = |text: &str| {
+        let len = text
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(text.len());
+        (len > 0 && !text.starts_with(|c: char| c.is_ascii_digit())).then_some(len)
     };
-    Some((key.to_string(), value.to_string()))
+    let Some(braced) = text.strip_prefix('{') else {
+        let len = name_len(text)?;
+        return Some(Reference {
+            len,
+            name: &text[..len],
+            default: None,
+            or_empty: false,
+        });
+    };
+    let close = braced.find('}')?;
+    let inner = &braced[..close];
+    let (name, after) = inner.split_at(name_len(inner)?);
+    let (default, or_empty) = match after.strip_prefix(":-") {
+        Some(default) => (Some(default), true),
+        None if after.is_empty() => (None, false),
+        None => (Some(after.strip_prefix('-')?), false),
+    };
+    Some(Reference {
+        len: close + 2,
+        name,
+        default,
+        or_empty,
+    })
 }
 
 /// Where the quote that opened a value closes, in the text after it. A
@@ -1668,6 +1787,76 @@ mod tests {
         assert_eq!(
             parsed["K"], "\"open",
             "an unclosed quote is kept as written"
+        );
+    }
+
+    // A URL built from the file's own keys is what the app's loader
+    // would have made of it; unexpanded, the app logged in as a user
+    // called `${POSTGRES_USER}`.
+    #[test]
+    fn a_reference_is_expanded_from_the_environment_then_from_the_file() {
+        let environment = |name: &str| (name == "FROM_SHELL").then(|| "shell".to_string());
+        let parsed = parse_env_in(
+            "POSTGRES_USER=app\nPOSTGRES_PASSWORD=\"s3cret\"\nPOSTGRES_DB=shop\n\
+             DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@localhost:5432/${POSTGRES_DB}\n\
+             QUOTED=\"$POSTGRES_USER-${FROM_SHELL}\"\n\
+             FROM_SHELL=file\nSHADOWED=${FROM_SHELL}\n",
+            &environment,
+        );
+        assert_eq!(
+            parsed["DATABASE_URL"],
+            "postgres://app:s3cret@localhost:5432/shop"
+        );
+        assert_eq!(parsed["QUOTED"], "app-shell");
+        assert_eq!(
+            parsed["SHADOWED"], "shell",
+            "the environment wins, as a loader that does not override it reads it"
+        );
+        // And the environment is the process's own.
+        let path = std::env::var("PATH").unwrap();
+        assert_eq!(parse_env("P=${PATH}")["P"], path);
+    }
+
+    #[test]
+    fn a_default_is_taken_and_a_literal_or_an_unknown_reference_is_left_as_written() {
+        let parsed = parse_env_in(
+            "EMPTY=\nDB_PORT=${PG_PORT:-5432}\nA=${EMPTY:-x}\nB=${EMPTY-x}\nC=${UNSET-x}\n\
+             LITERAL='${DB_PORT}'\nESCAPED=\"a\\$DB_PORT\"\nUNKNOWN=${NOPE}/$NOPE\n\
+             DOLLARS=pa$$word$ $1\nBROKEN=${DB_PORT\nLATER=${AFTER}\nAFTER=1\n",
+            &|_| None,
+        );
+        assert_eq!(parsed["DB_PORT"], "5432");
+        assert_eq!(parsed["A"], "x", "`:-` stands in for an empty value");
+        assert_eq!(parsed["B"], "", "`-` only for an unset one");
+        assert_eq!(parsed["C"], "x");
+        assert_eq!(parsed["LITERAL"], "${DB_PORT}", "single quotes are literal");
+        assert_eq!(parsed["ESCAPED"], "a$DB_PORT");
+        assert_eq!(parsed["UNKNOWN"], "${NOPE}/$NOPE");
+        assert_eq!(parsed["DOLLARS"], "pa$$word$ $1");
+        assert_eq!(parsed["BROKEN"], "${DB_PORT");
+        assert_eq!(parsed["LATER"], "${AFTER}", "only a key read before it");
+    }
+
+    #[test]
+    fn an_isolated_app_env_is_built_from_the_expanded_value() {
+        let dir = worktree_with(&[(
+            ".env",
+            "PANDO_TEST_PG_USER=app\nPANDO_TEST_PG_DB=shop\n\
+             DATABASE_URL=postgres://${PANDO_TEST_PG_USER}@localhost:5432/${PANDO_TEST_PG_DB}\n\
+             DB_PORT=${PANDO_TEST_PG_PORT:-5432}\n",
+        )]);
+        let env = app_env(
+            dir.path(),
+            &map(&[("DATABASE_URL", "postgres"), ("DB_PORT", "postgres")]),
+            &ports(&[("postgres", 17_004)]),
+        )
+        .unwrap();
+        assert_eq!(env["DATABASE_URL"], "postgres://app@localhost:17004/shop");
+        assert_eq!(env["DB_PORT"], "17004");
+        assert_eq!(
+            value_in_env(dir.path(), "DATABASE_URL").as_deref(),
+            Some("postgres://app@localhost:5432/shop"),
+            "and a shared or namespaced start reads it expanded"
         );
     }
 

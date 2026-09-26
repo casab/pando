@@ -632,6 +632,30 @@ fn a_shared_start_tells_the_app_the_main_checkouts_service_ports() {
     );
 }
 
+// A URL the main checkout's `.env` builds from its own keys reaches the
+// app as the app's loader would have read it. A loader that does not
+// override keeps what pando set, so a literal `${…}` there was the login.
+#[test]
+fn a_shared_start_hands_the_app_its_env_files_references_expanded() {
+    let mut fx = fixture();
+    std::fs::write(
+        fx.root.join(".env"),
+        "PANDO_TEST_DB_USER=app\nPANDO_TEST_DB_NAME=shop\n\
+         DATABASE_URL=mysql://${PANDO_TEST_DB_USER}@localhost:3306/${PANDO_TEST_DB_NAME}\n",
+    )
+    .unwrap();
+    let services: Config = toml::from_str(
+        "[[services]]\nkind = \"native\"\nname = \"mariadb\"\nenv = { DATABASE_URL = \"mariadb\" }\n",
+    )
+    .unwrap();
+    fx.config.services = services.services;
+    let env = super::services::shared_service_env(&fx.paths, &fx.config);
+    assert_eq!(
+        env.get("DATABASE_URL").map(String::as_str),
+        Some("mysql://app@localhost:3306/shop")
+    );
+}
+
 #[test]
 fn a_process_that_owns_no_ports_starts_and_reaches_running() {
     let mut fx = fixture();
