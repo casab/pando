@@ -157,9 +157,9 @@ pub fn fake_cloudflared(home: &Path, body: &str) {
         .expect("make the fake cloudflared executable");
 }
 
-/// A fake that publishes a URL in cloudflared's own bordered format and
-/// then stays up, as a tunnel does. `exec` so the pid pando records is the
-/// one that has to be killed.
+/// A fake that publishes a URL in cloudflared's own bordered format,
+/// registers a connection with the edge, and then stays up, as a tunnel
+/// does. `exec` so the pid pando records is the one that has to be killed.
 pub fn fake_cloudflared_publishing(home: &Path) {
     fake_cloudflared(
         home,
@@ -168,6 +168,42 @@ pub fn fake_cloudflared_publishing(home: &Path) {
              echo 'INF +----------------------------------------------------+'\n\
              echo 'INF |  {FAKE_TUNNEL_URL}  |'\n\
              echo 'INF +----------------------------------------------------+'\n\
+             echo '{FAKE_REGISTERED}'\n\
+             exec sleep 300\n"
+        ),
+    );
+}
+
+/// The line cloudflared logs once the edge has a connection for its
+/// tunnel, as 2025.11.1 prints it.
+pub const FAKE_REGISTERED: &str = "INF Registered tunnel connection connIndex=0 \
+     connection=00000000-0000-0000-0000-000000000000 event=0 ip=198.41.200.13 location=tst01 \
+     protocol=quic";
+
+/// A fake that publishes its URL and then never reaches the edge, the way
+/// cloudflared does on a network that blocks it: dial errors, and then an
+/// exit.
+pub fn fake_cloudflared_unreachable_edge(home: &Path) {
+    fake_cloudflared(
+        home,
+        &format!(
+            "echo 'INF |  {FAKE_TUNNEL_URL}  |'\n\
+             echo 'ERR Failed to dial a quic connection error=\"timeout: no recent network \
+             activity\"' >&2\n\
+             sleep 0.3\n\
+             echo 'ERR no more connections active and exiting' >&2\n\
+             exit 1\n"
+        ),
+    );
+}
+
+/// A fake that publishes its URL and then neither connects nor exits.
+pub fn fake_cloudflared_still_dialling(home: &Path) {
+    fake_cloudflared(
+        home,
+        &format!(
+            "echo 'INF |  {FAKE_TUNNEL_URL}  |'\n\
+             echo 'INF Retrying connection in up to 2s' >&2\n\
              exec sleep 300\n"
         ),
     );
@@ -185,6 +221,8 @@ pub fn fake_cloudflared_json_publishing(home: &Path) {
              echo '{{\"level\":\"info\",\"message\":\"+---------------------+\"}}'\n\
              echo '{{\"level\":\"info\",\"message\":\"|  {FAKE_TUNNEL_URL}  |\"}}'\n\
              echo '{{\"level\":\"info\",\"message\":\"+---------------------+\"}}'\n\
+             echo '{{\"level\":\"info\",\"connIndex\":0,\"event\":0,\"location\":\"tst01\",\
+             \"protocol\":\"quic\",\"message\":\"Registered tunnel connection\"}}'\n\
              exec sleep 300\n"
         ),
     );

@@ -2842,7 +2842,10 @@ fn a_share_whose_proxy_died_while_its_tunnel_opened_is_never_recorded() {
     };
     crate::testutil::fake_cloudflared(
         &fx.paths.home,
-        &format!("sleep 2\necho 'INF |  {FAKE_TUNNEL_URL}  |'\nexec sleep 300\n"),
+        &format!(
+            "sleep 2\necho 'INF |  {FAKE_TUNNEL_URL}  |'\necho '{}'\nexec sleep 300\n",
+            crate::testutil::FAKE_REGISTERED
+        ),
     );
     let mut config = fx.config.clone();
     config.share.auth_cmd = Some("printf 'session=abc'".to_string());
@@ -2865,6 +2868,62 @@ fn a_share_whose_proxy_died_while_its_tunnel_opened_is_never_recorded() {
     assert!(
         fx.state().worktrees[&name].share.is_none(),
         "a share whose proxy is dead is a public URL onto nothing"
+    );
+}
+
+/// A provider whose tunnel published its URL and was still dialling its
+/// edge when the deadline passed.
+struct DiallingProvider;
+
+impl tunnel::Provider for DiallingProvider {
+    fn name(&self) -> &'static str {
+        "cloudflared"
+    }
+    fn ensure_present(&self, _: &PandoPaths) -> Result<()> {
+        Ok(())
+    }
+    fn start(&self, paths: &PandoPaths, name: &str, _: u16) -> Result<tunnel::TunnelSpawn> {
+        let log_path = paths.log_file(name, tunnel::TUNNEL_LOG);
+        let spawn = proc::spawn_detached(SpawnOptions {
+            shell_cmd: "exec sleep 300",
+            cwd: &std::env::temp_dir(),
+            log_file: &log_path,
+            env: &[],
+            status_file: None,
+        })?;
+        Ok(tunnel::TunnelSpawn {
+            pid: spawn.pid,
+            pgid: spawn.pgid,
+            public_url: FAKE_TUNNEL_URL.to_string(),
+            log_path,
+            unconnected: Some("ERR Failed to dial a quic connection".to_string()),
+        })
+    }
+}
+
+#[test]
+fn a_share_whose_tunnel_has_not_reached_its_edge_says_so() {
+    let Some((fx, name, _guards, _)) = shared_fixture() else {
+        return;
+    };
+    let said = std::sync::Mutex::new(Vec::<String>::new());
+    let outcome = share_with(
+        &fx.paths,
+        &fx.config,
+        &name,
+        &DiallingProvider,
+        &stub_proxy,
+        &|m| said.lock().unwrap().push(m.to_string()),
+    )
+    .unwrap();
+    let _share = share_guard(&fx, &name);
+
+    assert_eq!(outcome.public_url, FAKE_TUNNEL_URL);
+    let said = said.into_inner().unwrap();
+    assert!(
+        said.iter()
+            .any(|m| m.contains("has not connected") && m.contains("Failed to dial")),
+        "a URL that may not answer is handed out with the reason: {said:?}"
     );
 }
 

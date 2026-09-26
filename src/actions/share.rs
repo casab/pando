@@ -273,6 +273,15 @@ pub fn share_with(
         let _ = tunnel::stop_share(&record);
         return Err(e);
     }
+    // Shared, and said so, rather than refused: a slow edge is not a dead
+    // one. But a URL that may not answer yet is not one to hand out
+    // without the reason.
+    if let Some(tail) = &spawn.unconnected {
+        progress(&format!(
+            "{} has not connected to its edge yet, so the URL may not answer — tail: {tail}",
+            provider.name()
+        ));
+    }
     Ok(ShareOutcome {
         name: name.to_string(),
         public_url: record.public_url,

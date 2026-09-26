@@ -1182,7 +1182,8 @@ pub const FAKE_TUNNEL_URL: &str = "https://fake-tunnel-for-tests.trycloudflare.c
 /// developer would use for a real shim. No test touches PATH.
 ///
 /// It echoes its own arguments, publishes a URL in cloudflared's bordered
-/// format, and then stays up as a tunnel does.
+/// format, registers a connection with the edge, and then stays up as a
+/// tunnel does.
 pub fn fake_cloudflared(home: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let bin = home.join("bin");
@@ -1197,6 +1198,7 @@ pub fn fake_cloudflared(home: &Path) {
              echo 'INF +---------------------------------------------------+'\n\
              echo 'INF |  {FAKE_TUNNEL_URL}  |'\n\
              echo 'INF +---------------------------------------------------+'\n\
+             echo 'INF Registered tunnel connection connIndex=0 location=tst01 protocol=quic'\n\
              exec sleep 300\n"
         ),
     )

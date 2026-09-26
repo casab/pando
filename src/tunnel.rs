@@ -62,6 +62,10 @@ pub struct TunnelSpawn {
     pub pgid: i32,
     pub public_url: String,
     pub log_path: PathBuf,
+    /// The tail of its log when the deadline passed before the tunnel had
+    /// connected to the provider's edge: the URL may not answer yet, and
+    /// this is what it was doing instead. `None` once it has connected.
+    pub unconnected: Option<String>,
 }
 
 /// One way of publishing a local port.
@@ -77,7 +81,9 @@ pub trait Provider {
     /// going to be shared does not get told to install anything.
     fn ensure_present(&self, paths: &PandoPaths) -> Result<()>;
 
-    /// Publishes `local_port` and returns once a public URL exists.
+    /// Publishes `local_port` and returns once a public URL exists and
+    /// the provider's edge has a connection to serve it on — or, with the
+    /// URL, the reason it does not yet, once the deadline passes.
     fn start(&self, paths: &PandoPaths, name: &str, local_port: u16) -> Result<TunnelSpawn>;
 }
 
@@ -207,11 +213,12 @@ pub fn start_tunnel(paths: &PandoPaths, name: &str, local_port: u16) -> Result<T
     .context("spawn cloudflared")?;
 
     match await_url(spawn.pid, &log_path) {
-        Ok(public_url) => Ok(TunnelSpawn {
+        Ok(published) => Ok(TunnelSpawn {
             pid: spawn.pid,
             pgid: spawn.pgid,
-            public_url,
+            public_url: published.url,
             log_path,
+            unconnected: published.unconnected,
         }),
         Err(e) => {
             // Never leave the child behind on the way out: nothing has
@@ -223,16 +230,24 @@ pub fn start_tunnel(paths: &PandoPaths, name: &str, local_port: u16) -> Result<T
     }
 }
 
-/// Polls the log until a URL appears, the process dies, or the timeout
-/// passes.
-fn await_url(pid: u32, log_path: &Path) -> Result<String> {
+/// What the wait for a tunnel found.
+#[derive(Debug)]
+struct Published {
+    url: String,
+    /// The log's tail, when the deadline passed with no edge connection.
+    unconnected: Option<String>,
+}
+
+/// Polls the log until a URL appears and the edge has a connection for
+/// it, the process dies, or the timeout passes.
+fn await_url(pid: u32, log_path: &Path) -> Result<Published> {
     await_url_until(pid, log_path, Instant::now() + READY_TIMEOUT)
 }
 
 /// [`await_url`] with the deadline given, so a test can drive the timeout
 /// branch without sitting through it.
-fn await_url_until(pid: u32, log_path: &Path, deadline: Instant) -> Result<String> {
-    loop {
+fn await_url_until(pid: u32, log_path: &Path, deadline: Instant) -> Result<Published> {
+    let url = loop {
         // Read the log before testing liveness, not after: a provider that
         // published a URL and exited in the same breath has still told us
         // what we asked, and checking liveness first would throw it away.
@@ -245,7 +260,7 @@ fn await_url_until(pid: u32, log_path: &Path, deadline: Instant) -> Result<Strin
                     tail_log(log_path)
                 );
             }
-            return Ok(url);
+            break url;
         }
         if !alive {
             bail!(
@@ -261,7 +276,71 @@ fn await_url_until(pid: u32, log_path: &Path, deadline: Instant) -> Result<Strin
             );
         }
         std::thread::sleep(POLL_INTERVAL);
+    };
+    await_edge_until(pid, log_path, url, deadline)
+}
+
+/// Waits, on the same deadline, for the tunnel that published `url` to
+/// connect to Cloudflare's edge.
+///
+/// cloudflared prints its URL as soon as the quick-tunnel API answers,
+/// before it has a single connection to the edge that serves it. On a
+/// network that blocks the edge the URL never answers, and cloudflared
+/// retries for a minute or two before it exits — so a tunnel that exits
+/// first fails the share, with the tail that says why.
+///
+/// A deadline passed with the tunnel still trying is not a failure, since
+/// a slow edge is not a dead one: the URL comes back with the tail, for
+/// the caller to pass on.
+fn await_edge_until(
+    pid: u32,
+    log_path: &Path,
+    url: String,
+    deadline: Instant,
+) -> Result<Published> {
+    loop {
+        let connected = log_says_connected(log_path);
+        let alive = process::is_alive(pid);
+        if !alive {
+            if connected {
+                bail!(
+                    "cloudflared published {url} and then exited — tail: {}",
+                    tail_log(log_path)
+                );
+            }
+            bail!(
+                "cloudflared published {url} but never connected to Cloudflare's edge — tail: {}",
+                tail_log(log_path)
+            );
+        }
+        if connected {
+            return Ok(Published {
+                url,
+                unconnected: None,
+            });
+        }
+        if Instant::now() >= deadline {
+            return Ok(Published {
+                url,
+                unconnected: Some(tail_log(log_path)),
+            });
+        }
+        std::thread::sleep(POLL_INTERVAL);
     }
+}
+
+fn log_says_connected(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .map(|content| content.lines().any(connection_registered))
+        .unwrap_or(false)
+}
+
+/// Whether one log line says cloudflared registered a connection with the
+/// edge: `Registered tunnel connection` in 2025.11.1, in either log
+/// format, and `Connection <id> registered` in older releases.
+fn connection_registered(line: &str) -> bool {
+    line.contains("Registered tunnel connection")
+        || (line.contains("Connection ") && line.contains(" registered"))
 }
 
 /// Takes both halves of a share down: the tunnel first, so no new request
@@ -413,8 +492,9 @@ mod tests {
     use super::*;
     use crate::project::ProjectRef;
     use crate::testutil::{
-        FAKE_TUNNEL_URL, fake_cloudflared_failing, fake_cloudflared_publishing,
-        fake_cloudflared_silent, wait_until,
+        FAKE_REGISTERED, FAKE_TUNNEL_URL, fake_cloudflared_failing, fake_cloudflared_publishing,
+        fake_cloudflared_silent, fake_cloudflared_still_dialling,
+        fake_cloudflared_unreachable_edge, wait_until,
     };
     use chrono::Utc;
     use std::sync::Mutex;
@@ -645,6 +725,7 @@ mod tests {
 
         let spawn = start_tunnel(&fx.paths, "feat+one", 17000).unwrap();
         assert_eq!(spawn.public_url, FAKE_TUNNEL_URL);
+        assert_eq!(spawn.unconnected, None, "it registered a connection");
         assert_eq!(spawn.log_path, fx.paths.log_file("feat+one", TUNNEL_LOG));
         assert!(process::is_alive(spawn.pid), "the tunnel must still be up");
 
@@ -671,15 +752,12 @@ mod tests {
         );
     }
 
-    // The timeout is 30s, which is far too long for a test to sit through,
-    // so the wait is driven directly with a child that never publishes.
-    #[test]
-    fn a_provider_that_never_publishes_fails_with_the_log_tail() {
-        let fx = fixture();
-        fake_cloudflared_silent(&fx.paths.home);
+    /// The fake in the home, spawned as `start_tunnel` spawns it but not
+    /// waited on, once its log says `said`: the timeout is 30s, far too
+    /// long for a test to sit through, so the test drives the wait.
+    fn spawn_unwaited(fx: &Fx, said: &str) -> (process::SpawnResult, PathBuf) {
         let log = fx.paths.log_file("feat+one", TUNNEL_LOG);
         truncate_log(&log).unwrap();
-
         let spawn = process::spawn_detached(SpawnOptions {
             shell_cmd: &format!(
                 "exec {}",
@@ -693,9 +771,18 @@ mod tests {
         .unwrap();
         assert!(wait_until(Duration::from_secs(5), || {
             std::fs::read_to_string(&log)
-                .map(|s| s.contains("Requesting"))
+                .map(|s| s.contains(said))
                 .unwrap_or(false)
         }));
+        (spawn, log)
+    }
+
+    // The wait is driven directly with a child that never publishes.
+    #[test]
+    fn a_provider_that_never_publishes_fails_with_the_log_tail() {
+        let fx = fixture();
+        fake_cloudflared_silent(&fx.paths.home);
+        let (spawn, log) = spawn_unwaited(&fx, "Requesting");
 
         // A deadline in the past, so the loop reports the timeout it would
         // report thirty seconds from now.
@@ -708,6 +795,63 @@ mod tests {
             message.contains("Requesting new quick Tunnel"),
             "the tail of the log is the whole diagnosis: {message}"
         );
+    }
+
+    // cloudflared prints its URL before it has one connection to the edge
+    // that serves it. On a network that blocks the edge the URL never
+    // answers, and the share was reported as a success all the same.
+    #[test]
+    fn a_tunnel_that_publishes_and_never_reaches_the_edge_fails_with_the_log_tail() {
+        let fx = fixture();
+        fake_cloudflared_unreachable_edge(&fx.paths.home);
+        let err = start_tunnel(&fx.paths, "feat+one", 17000).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("never connected"), "{message}");
+        assert!(
+            message.contains("Failed to dial"),
+            "the dial error is the diagnosis: {message}"
+        );
+    }
+
+    // A slow edge is not a dead one: the URL comes back, with the reason
+    // it may not answer yet.
+    #[test]
+    fn a_tunnel_still_dialling_at_the_deadline_publishes_with_the_reason() {
+        let fx = fixture();
+        fake_cloudflared_still_dialling(&fx.paths.home);
+        let (spawn, log) = spawn_unwaited(&fx, "Retrying");
+
+        let published = await_url_until(spawn.pid, &log, Instant::now());
+        let _ = process::stop(spawn.pgid, STOP_GRACE);
+
+        let published = published.unwrap();
+        assert_eq!(published.url, FAKE_TUNNEL_URL);
+        let tail = published.unconnected.expect("it never connected");
+        assert!(tail.contains("Retrying connection"), "{tail}");
+    }
+
+    #[test]
+    fn a_connection_is_registered_in_every_form_cloudflared_logs_it() {
+        assert!(connection_registered(FAKE_REGISTERED));
+        assert!(connection_registered(
+            "{\"level\":\"info\",\"connIndex\":0,\"message\":\"Registered tunnel connection\"}"
+        ));
+        assert!(
+            connection_registered(
+                "INF Connection 25e2ee72-4f2c-4e5b-9b3c-0c0b1b7b3f1e registered connIndex=0 \
+                 location=LHR"
+            ),
+            "an older release"
+        );
+        for line in [
+            "INF Retrying connection in up to 2s",
+            "ERR Failed to dial a quic connection",
+            "ERR Unable to establish connection.",
+            "ERR Register tunnel error from server side",
+            "INF |  https://x.trycloudflare.com  |",
+        ] {
+            assert!(!connection_registered(line), "{line}");
+        }
     }
 
     #[test]
