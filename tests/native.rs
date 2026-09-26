@@ -989,6 +989,76 @@ fn a_data_directory_built_from_nothing_runs_the_migration_again() {
     let _ = std::fs::remove_file(&sink);
 }
 
+// A service that changes kind is on other data just as a new data
+// directory is, and nothing reopened the gate for it: native to compose
+// brought up an empty volume under a live dev server with no migration,
+// and compose back to native found the old data directory, so no init
+// said anything either.
+#[test]
+fn a_service_that_changes_kind_runs_the_migration_again_each_way() {
+    let dir = TempDir::new().unwrap();
+    let sink = dir.path().join("ran.txt");
+    let config_with = |service: &str| {
+        format!(
+            "[project]\ninstall = \"true\"\n\n\
+             [dev]\ncmd = \"sleep 30\"\nports = []\n\n{service}\n\n\
+             [[hooks]]\nname = \"migrate\"\nafter = \"services\"\n\
+             fingerprint = [\"package.json\"]\ncmd = \"echo migrated >> '{}'\"\n",
+            sink.display()
+        )
+    };
+    let native = "[[services]]\nkind = \"native\"\nname = \"postgres\"\n\
+                  env = { DATABASE_URL = \"postgres\" }";
+    let compose = "[[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
+                   include = [\"postgres\"]\nenv = { DATABASE_URL = \"postgres\" }";
+    let mut f = nat_with(&config_with(native));
+    common::docker::install(&f.home);
+    let ran = || {
+        std::fs::read_to_string(&sink)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let name = new_worktree(&f, "feat/one");
+    start_isolated(&f, &name);
+    assert_eq!(ran(), 1, "the first start migrates");
+
+    let switch = |f: &mut Nat, service: &str| {
+        std::fs::write(f.paths.config_file(), config_with(service)).unwrap();
+        f.config = config::load(&f.paths).unwrap().config;
+        let said = std::cell::RefCell::new(Vec::<String>::new());
+        let report = actions::start(
+            &f.paths,
+            &f.config,
+            &name,
+            None,
+            actions::Mode::Remembered,
+            &|m| said.borrow_mut().push(m.to_string()),
+        )
+        .unwrap();
+        assert!(report.started_nothing(), "the dev server stays up");
+        said.into_inner()
+    };
+    let said = switch(&mut f, compose);
+    let project = f.service(&name, "postgres").compose_project.unwrap();
+    let _down = common::docker::down_on_drop(&f.home, &project);
+    assert_eq!(ran(), 2, "an empty volume is a changed input: {said:?}");
+    assert!(
+        said.iter()
+            .any(|m| m.contains("postgres runs in a container now") && m.contains("migrate")),
+        "{said:?}"
+    );
+
+    let said = switch(&mut f, native);
+    assert_eq!(f.service(&name, "postgres").kind, ServiceKind::Native);
+    assert_eq!(
+        postgres::initdb_runs(&f.datadir(&name, "postgres")),
+        1,
+        "the data directory it had before"
+    );
+    assert_eq!(ran(), 3, "and so is the old one: {said:?}");
+}
+
 // The same empty database, reached through a start that failed after the
 // init. The marker was written before the server was waited on, so the
 // retry saw a data directory it had made before — and nothing else said

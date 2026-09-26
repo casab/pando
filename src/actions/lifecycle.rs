@@ -661,9 +661,13 @@ fn start_checked(
     // `rm` cannot take the data of after that, so the start says how.
     let mut changed_kind: Vec<(String, Vec<String>)> = Vec::new();
     let mut unnamed: Vec<String> = Vec::new();
+    // Every service that changed kind, in either direction: each is on a
+    // server of the other kind now, with other data.
+    let mut moved_kinds: Vec<(String, state::ServiceKind)> = Vec::new();
     if let Some(record) = store.worktrees.get_mut(name) {
         record.roles = owners;
         if isolate {
+            moved_kinds = changed_kinds(config, record);
             changed_kind = leave_changed_kinds(paths, config, name, record)?;
             record.services = planned_services(config, &assignment.ports, record);
             unnamed = changed_kind
@@ -704,6 +708,16 @@ fn start_checked(
         }
         e
     };
+
+    // A service on a server of another kind is on other data, which a
+    // hook's fingerprint cannot see any more than it sees a mode change —
+    // see `forget_hooks_after_services`. Forgotten now, before anything
+    // that can fail: the record already says the new kind, so the start
+    // that retries a failure below would not see the change again.
+    let moved_why = moved_kinds_why(&moved_kinds);
+    if let Some(why) = &moved_why {
+        forget_hooks_after_services(paths, config, name, why, progress).map_err(undo)?;
+    }
 
     // Outside the lock, like every other compose call: `docker compose
     // stop` takes seconds, and holding the state lock through it would
@@ -838,6 +852,11 @@ fn start_checked(
     };
     if let Some(why) = why {
         forget_hooks_after_services(paths, config, name, why, progress).map_err(undo)?;
+        everything_up = false;
+    }
+    // A service that changed kind had its hooks forgotten above, and its
+    // new server gets them and the probes even under live processes.
+    if moved_why.is_some() {
         everything_up = false;
     }
 
@@ -1872,6 +1891,27 @@ fn would_switch_to_isolated(paths: &PandoPaths, config: &Config, name: &str, mod
     mode == Mode::Isolated
         && would_isolate(paths, config, name, mode)
         && recorded_mode(paths, name) != ServiceMode::Isolated
+}
+
+/// Why the hooks after the services run again when services changed
+/// kind, each said with how it runs now; `None` when none did.
+fn moved_kinds_why(moved: &[(String, state::ServiceKind)]) -> Option<String> {
+    let said: Vec<String> = [
+        (state::ServiceKind::Native, "natively"),
+        (state::ServiceKind::Compose, "in a container"),
+    ]
+    .into_iter()
+    .filter_map(|(kind, how)| {
+        let names: Vec<&str> = moved
+            .iter()
+            .filter(|(_, to)| *to == kind)
+            .map(|(service, _)| service.as_str())
+            .collect();
+        let verb = if names.len() == 1 { "runs" } else { "run" };
+        (!names.is_empty()).then(|| format!("{} {verb} {how} now", names.join(", ")))
+    })
+    .collect();
+    (!said.is_empty()).then(|| format!("{}, on other data", said.join(" and ")))
 }
 
 /// Whether this worktree's record runs a service as another kind than
