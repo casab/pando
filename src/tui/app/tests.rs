@@ -4355,6 +4355,7 @@ fn a_start_that_returns_before_ready_waits_to_say_so() {
         Ok(PendingOutcome::Started(
             "feat+one".into(),
             Some("http://localhost:17342".into()),
+            vec![("dev".into(), 4242)],
         ))
     });
     wait_for_pending(&mut app);
@@ -4379,6 +4380,59 @@ fn a_start_that_returns_before_ready_waits_to_say_so() {
     let status = app.flash().unwrap();
     assert_eq!(status.kind, StatusKind::Success);
     assert_eq!(status.message, "feat/one is ready — http://localhost:17342");
+    assert!(app.awaiting_ready.is_none());
+}
+
+// A restart came back while the state on hand was still the run it
+// replaced, every process running — or, for `P`, only the siblings it left
+// alone — and said "ready" at once of a process still coming up. Ready is
+// what it spawned running, by pid.
+#[test]
+fn a_restart_is_not_ready_on_a_read_from_before_it() {
+    let mut app = test_app(&["feat+one"]);
+    with_process(&mut app, "feat+one", running_phase());
+    with_second_process(&mut app, "feat+one", "api", running_phase());
+    app.spawn_pending("feat+one".into(), PendingKind::Restart, || {
+        Ok(PendingOutcome::Started(
+            "feat+one".into(),
+            None,
+            vec![("api".into(), 9191)],
+        ))
+    });
+    wait_for_pending(&mut app);
+    let status = app.flash().unwrap();
+    assert_ne!(status.kind, StatusKind::Success, "{}", status.message);
+    assert!(app.awaiting_ready.is_some());
+
+    let old_api = app.state.worktrees["feat+one"].processes["api"].clone();
+    let refreshed = |app: &mut App, api: Option<Phase>| {
+        let mut state = app.state.clone();
+        let processes = &mut state.worktrees.get_mut("feat+one").unwrap().processes;
+        processes.remove("api");
+        if let Some(phase) = api {
+            let new_api = ProcessRecord {
+                pid: 9191,
+                phase,
+                ..old_api.clone()
+            };
+            processes.insert("api".into(), new_api);
+        }
+        app.handle_event(AppEvent::Refreshed(Box::new(Ok(state))));
+    };
+    // Between the stop and the start: only the sibling, running.
+    refreshed(&mut app, None);
+    assert!(
+        app.awaiting_ready.is_some(),
+        "the sibling says nothing of api"
+    );
+    refreshed(&mut app, Some(Phase::Starting { since: Utc::now() }));
+    assert!(app.awaiting_ready.is_some());
+    assert_ne!(app.flash().unwrap().kind, StatusKind::Success);
+
+    refreshed(&mut app, Some(running_phase()));
+    let status = app.flash().unwrap();
+    assert_eq!(status.kind, StatusKind::Success);
+    assert_eq!(status.message, "feat/one is ready");
     assert!(app.awaiting_ready.is_none());
 }
 
@@ -5071,7 +5125,11 @@ fn a_death_that_a_discovery_finds_is_said_too() {
 fn a_death_during_a_start_is_said_once_by_name() {
     let mut app = test_app(&["feat+m"]);
     with_process(&mut app, "feat+m", Phase::Starting { since: Utc::now() });
-    app.awaiting_ready = Some(("feat+m".into(), None));
+    app.awaiting_ready = Some(AwaitingReady {
+        name: "feat+m".into(),
+        url: None,
+        spawned: vec![("dev".into(), 4242)],
+    });
     let mut state = app.state.clone();
     fail_process(&mut state, "feat+m", "dev", "boom");
     let before = app.messages.len();

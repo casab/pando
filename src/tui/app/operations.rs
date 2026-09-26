@@ -262,7 +262,7 @@ impl App {
             // one the next keypress asks all over again.
             let _ = tx.send(AppEvent::ConfigResolved(Box::new(config.clone())));
             actions::start(&paths, &config, &worker_name, None, mode, &progress)
-                .map(|report| PendingOutcome::Started(worker_name.clone(), report.url.clone()))
+                .map(|report| PendingOutcome::started(worker_name.clone(), &report))
                 .map_err(|e| format!("{e:#}"))
         });
         if started && let Some(p) = self.pending.as_mut() {
@@ -433,7 +433,7 @@ impl App {
                 mode,
                 &progress,
             )
-            .map(|report| PendingOutcome::Started(worker_name.clone(), report.url.clone()))
+            .map(|report| PendingOutcome::started(worker_name.clone(), &report))
             .map_err(|e| format!("{e:#}"))
         });
         if started && let Some(p) = self.pending.as_mut() {

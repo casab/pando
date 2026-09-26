@@ -37,7 +37,7 @@ pub use launch::{
 };
 pub use log_view::{LOG_VIEWER_CAPACITY, LineInspect, LogFilter, LogView, SearchMode, SearchState};
 pub use merged::{ALL_SOURCE, MergedTail, SOURCE_SEPARATOR, ViewTail, strip_source};
-pub use pending::{PendingAction, PendingKind, PendingOutcome};
+pub use pending::{AwaitingReady, PendingAction, PendingKind, PendingOutcome};
 pub use remedies::as_tui_remedy;
 pub use tails::LogTails;
 pub use themes::ThemeState;
@@ -55,6 +55,7 @@ use crate::config::Config;
 use crate::paths::PandoPaths;
 use crate::state::{self, Aggregate, ProcessRecord, State, WorktreeRecord};
 use crate::worktree::{self, GhAccount, PrInfo, Worktree};
+use pending::Readiness;
 
 /// How long a status message stays on the header before the counts return.
 /// An error stays longer than a confirmation: it is the one that has to be
@@ -270,9 +271,10 @@ pub struct App {
     /// is what asks for one. `⏎` then says where to add one instead of
     /// pretending to start.
     pub nothing_to_run: bool,
-    /// A worktree whose start returned before it was ready, and the URL
-    /// the start reported: the refresh that finds it running says so.
-    pub awaiting_ready: Option<(String, Option<String>)>,
+    /// A worktree whose start returned before it was ready, the URL the
+    /// start reported, and what it spawned: the refresh that finds those
+    /// processes running says so.
+    pub awaiting_ready: Option<AwaitingReady>,
     /// The failure last announced for each worktree's process, by when it
     /// failed, so the same death is never announced twice.
     pub deaths_told: HashMap<(String, String), chrono::DateTime<chrono::Utc>>,
@@ -1254,31 +1256,33 @@ impl App {
     }
 
     /// A start that returned before its worktree was ready says so once
-    /// the refresh finds it running — or stops waiting when it failed or
-    /// went away. A failure that `died` already names is left to it.
+    /// the refresh finds what it spawned running — or stops waiting when
+    /// that failed or the worktree went away. A failure that `died`
+    /// already names is left to it.
     fn announce_ready(&mut self, died: &[Death]) {
-        let Some((name, url)) = self.awaiting_ready.clone() else {
+        let Some(awaited) = self.awaiting_ready.clone() else {
             return;
         };
-        match self.phase_of(&name) {
-            Some(Aggregate::Running { .. }) => {
+        let name = awaited.name.as_str();
+        match awaited.readiness(self.record_for(name)) {
+            Readiness::Ready => {
                 self.awaiting_ready = None;
-                let label = self.label_of(&name);
-                match url {
+                let label = self.label_of(name);
+                match awaited.url {
                     Some(url) => self.set_success(format!("{label} is ready — {url}")),
                     None => self.set_success(format!("{label} is ready")),
                 }
             }
-            Some(Aggregate::Starting { .. }) => {}
-            Some(Aggregate::Failed { .. }) => {
+            Readiness::Waiting => {}
+            Readiness::Failed => {
                 self.awaiting_ready = None;
-                if died.iter().any(|(n, ..)| *n == name) {
+                if died.iter().any(|(n, ..)| n == name) {
                     return;
                 }
-                let label = self.label_of(&name);
-                self.set_error_about(&name, format!("{label} failed — l shows the log"));
+                let label = self.label_of(name);
+                self.set_error_about(name, format!("{label} failed — l shows the log"));
             }
-            None => self.awaiting_ready = None,
+            Readiness::Gone => self.awaiting_ready = None,
         }
     }
 

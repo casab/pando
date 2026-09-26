@@ -8,6 +8,7 @@ use std::time::Instant;
 use crate::actions;
 use crate::config::Config;
 use crate::paths::PandoPaths;
+use crate::state::{self, Aggregate, Phase, WorktreeRecord};
 use crate::worktree::PrInfo;
 
 use super::App;
@@ -66,7 +67,9 @@ impl PendingKind {
 pub enum PendingOutcome {
     Created(String),
     Removed(String),
-    Started(String, Option<String>),
+    /// The worktree, its URL, and each process the call spawned with its
+    /// pid.
+    Started(String, Option<String>, Vec<(String, u32)>),
     Stopped(String),
     /// The worktree, its public URL, and whether a proxy is injecting a
     /// header in front of it.
@@ -74,6 +77,82 @@ pub enum PendingOutcome {
     Unshared(String),
     /// Every worktree `X` stopped.
     StoppedAll(Vec<String>),
+}
+
+impl PendingOutcome {
+    /// What a start or a restart of `name` reports.
+    pub(super) fn started(name: String, report: &actions::StartReport) -> Self {
+        let spawned = report
+            .started
+            .iter()
+            .map(|p| (p.process.clone(), p.record.pid))
+            .collect();
+        PendingOutcome::Started(name, report.url.clone(), spawned)
+    }
+}
+
+/// A start that returned before what it spawned was ready.
+#[derive(Debug, Clone)]
+pub struct AwaitingReady {
+    pub name: String,
+    /// The URL the start reported, for the line that says it is ready.
+    pub url: Option<String>,
+    /// Each process the start spawned, and its pid.
+    pub spawned: Vec<(String, u32)>,
+}
+
+/// Where a start's processes are, as one read of the state has them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Readiness {
+    /// Still starting, or not in the read at all.
+    Waiting,
+    Ready,
+    Failed,
+    /// Nothing of the worktree is recorded any more.
+    Gone,
+}
+
+impl AwaitingReady {
+    /// What `record` says about the processes the start spawned.
+    ///
+    /// By pid, and only those: a read taken before the start still shows
+    /// the run it replaced, every process running, and one taken between
+    /// a restart's stop and its start shows only the siblings it left
+    /// alone. Neither says anything about the new processes, so both are
+    /// waited through. A start that spawned nothing, all of it already
+    /// up, has the whole record's phase.
+    pub(super) fn readiness(&self, record: Option<&WorktreeRecord>) -> Readiness {
+        if self.spawned.is_empty() {
+            return match record.and_then(state::aggregate_phase) {
+                Some(Aggregate::Running { .. }) => Readiness::Ready,
+                Some(Aggregate::Starting { .. }) => Readiness::Waiting,
+                Some(Aggregate::Failed { .. }) => Readiness::Failed,
+                None => Readiness::Gone,
+            };
+        }
+        let ours: Vec<&Phase> = self
+            .spawned
+            .iter()
+            .filter_map(|(process, pid)| {
+                let p = record?.processes.get(process)?;
+                (p.pid == *pid).then_some(&p.phase)
+            })
+            .collect();
+        if ours
+            .iter()
+            .any(|phase| matches!(phase, Phase::Failed { .. }))
+        {
+            Readiness::Failed
+        } else if ours.len() == self.spawned.len()
+            && ours
+                .iter()
+                .all(|phase| matches!(phase, Phase::Running { .. }))
+        {
+            Readiness::Ready
+        } else {
+            Readiness::Waiting
+        }
+    }
 }
 
 pub struct PendingAction {
@@ -241,27 +320,28 @@ impl App {
                         self.set_success(format!("removed {label}"));
                         self.spawn_discovery();
                     }
-                    PendingOutcome::Started(name, url) => {
+                    PendingOutcome::Started(name, url, spawned) => {
                         // A start returns once the processes are spawned,
                         // which is not the same as ready: a `✓ started`
                         // beside a row that still says `starting` is a
                         // claim the row contradicts. Ready is announced by
-                        // the refresh that sees it.
-                        let ready = matches!(
-                            self.phase_of(&name),
-                            Some(crate::state::Aggregate::Running { .. })
-                        );
+                        // the refresh that sees what it spawned running.
                         let at = url
                             .as_ref()
                             .map(|url| format!(" — {url}"))
                             .unwrap_or_default();
-                        if ready {
+                        let awaited = AwaitingReady {
+                            name: name.clone(),
+                            url,
+                            spawned,
+                        };
+                        if awaited.readiness(self.record_for(&name)) == Readiness::Ready {
                             self.set_success(format!("{label} is ready{at}"));
                         } else {
                             self.set_status(format!(
                                 "started {label}, waiting for it to be ready{at}"
                             ));
-                            self.awaiting_ready = Some((name.clone(), url));
+                            self.awaiting_ready = Some(awaited);
                         }
                         // The log is new, so whatever was tailed for this
                         // worktree is about the run that just ended.
