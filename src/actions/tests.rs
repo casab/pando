@@ -10385,7 +10385,8 @@ fn a_slot_another_project_records_is_never_given_out_or_emptied() {
     assert!(
         said.iter()
             .any(|l| l.contains("redis slot 1 is left as it is")
-                && l.contains("feat+theirs of project other-1a2b3c4d")),
+                && l.contains("feat+theirs of project other-1a2b3c4d")
+                && !l.contains("will not mention it again")),
         "{said:?}"
     );
     assert!(
@@ -10486,6 +10487,12 @@ fn rm_empties_no_slot_while_another_projects_state_cannot_be_read() {
         said.iter()
             .any(|l| l.contains("redis slot 1 is left as it is")
                 && l.contains("project other-1a2b3c4d as well, whose state could not be read")),
+        "{said:?}"
+    );
+    // That project may go on naming it, so this is not the last of it.
+    assert!(
+        said.iter()
+            .all(|l| !l.contains("will not mention it again")),
         "{said:?}"
     );
     assert!(!redis.join("flushed").exists());
@@ -11329,6 +11336,28 @@ fn rm_leaves_what_the_guard_refuses_and_says_why() {
     );
     assert_eq!(ns.fake("dropped"), "", "nothing was dropped");
     assert!(!redis.join("flushed").exists(), "nothing was emptied");
+}
+
+// A slot `rm` leaves because another record names it too is still that
+// one's, and pando goes on showing it: its line does not say this is the
+// last pando says of it.
+#[test]
+fn a_slot_rm_leaves_to_another_record_is_not_said_to_be_the_last_of_it() {
+    let (ns, redis) = stopped_namespaced();
+    hold(&ns, [(1, false)]);
+    let (said, progress) = collecting();
+    super::rm(&ns.fx.paths, "w1", false, false, &progress).unwrap();
+    let said = said.borrow().clone();
+    let line = said
+        .iter()
+        .find(|l| l.contains("redis slot 1 is left as it is"))
+        .unwrap_or_else(|| panic!("{said:?}"));
+    assert!(
+        line.contains(&format!("recorded for {} as well", ns.name)),
+        "{line}"
+    );
+    assert!(!line.contains("will not mention it again"), "{line}");
+    assert!(!redis.join("flushed").exists());
 }
 
 // A database the server will not let the login drop is said, with the

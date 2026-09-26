@@ -1586,7 +1586,8 @@ pub fn namespaces_rm_drops(record: &crate::state::WorktreeRecord) -> Vec<String>
 /// goes with the worktree's. After that `doctor` can find a database
 /// again by its name, when its recipe can list them; nothing finds a slot
 /// again, a number with nothing of the project in it, so its line says
-/// this is the last pando says of it.
+/// this is the last pando says of it — unless another record still names
+/// it, and pando goes on showing it as that one's.
 pub(super) fn drop_namespaces(
     paths: &PandoPaths,
     store: &crate::state::State,
@@ -1623,9 +1624,11 @@ pub(super) fn drop_namespaces(
             .ok()
             .and_then(|loaded| loaded.recipe.namespace.clone());
         // What a line about one left behind ends with, when nothing will
-        // find it again once its record is gone.
-        let last = match ns.kind == NamespaceKind::Database
-            && recipe.as_ref().is_some_and(|recipe| recipe.list.is_some())
+        // find it again once its record is gone: no recipe lists it, and
+        // no other record names it — nor may, from a state unread.
+        let last = match (ns.kind == NamespaceKind::Database
+            && recipe.as_ref().is_some_and(|recipe| recipe.list.is_some()))
+            || named_elsewhere(store, name, ns, &others)
         {
             true => "",
             false => " — nothing records it after this, so pando will not mention it again",
@@ -1684,6 +1687,33 @@ pub(super) fn drop_namespaces(
             )),
         }
     }
+}
+
+/// Whether a record other than `name`'s names this namespace: another
+/// worktree's here, or another project's, as a worktree's or as its main
+/// checkout's. A project whose state cannot be read may.
+fn named_elsewhere(
+    store: &crate::state::State,
+    name: &str,
+    namespace: &crate::state::NamespaceRecord,
+    others: &[(String, std::result::Result<crate::state::State, String>)],
+) -> bool {
+    recorded_elsewhere(store, name, namespace).is_some()
+        || others.iter().any(|(_, other)| match other {
+            Err(_) => true,
+            Ok(other) => other
+                .worktrees
+                .values()
+                .flat_map(|record| &record.namespaces)
+                .any(|ns| {
+                    let main = crate::state::NamespaceRecord {
+                        name: ns.main.clone(),
+                        ..ns.clone()
+                    };
+                    namespace::same_namespace(ns, namespace)
+                        || namespace::same_namespace(&main, namespace)
+                }),
+        })
 }
 
 /// A database named like a worktree's of this project that no pando
