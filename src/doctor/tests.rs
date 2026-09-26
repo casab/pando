@@ -1021,6 +1021,49 @@ fn a_prelude_that_fails_in_front_of_the_probe_is_a_problem_naming_its_file() {
     );
 }
 
+// docker and cloudflared are asked before the prelude, so they answer
+// whether it works or not: their lines are no sign it got through.
+#[test]
+fn a_prelude_that_fails_after_the_tools_pando_runs_itself_answered_is_a_problem() {
+    let fx = fixture();
+    let prelude = "source ~/.nvm/nvm.sh";
+    write_project_config(&fx, &format!("[runtime]\nprelude = \"{prelude}\"\n"));
+    let error = "bash: /Users/someone/.nvm/nvm.sh: No such file or directory\n";
+    let shell = |script: &str| {
+        let Some((direct, _)) = script.split_once(&format!("{prelude} && {{")) else {
+            return Some(error.to_string());
+        };
+        let mut out = String::new();
+        for index in direct
+            .lines()
+            .filter_map(|l| l.split(TOOL_PATH_MARK).nth(1))
+            .filter_map(|rest| rest.split(' ').next())
+        {
+            let _ = writeln!(out, "{TOOL_PATH_MARK}{index} /usr/local/bin/thing{index}");
+            let _ = writeln!(out, "{TOOL_VERSION_MARK}{index} 1.2.3");
+        }
+        assert!(
+            !out.is_empty(),
+            "no tool is asked before the prelude: {script}"
+        );
+        Some(out + error)
+    };
+    let report = report_of(&fx, &shell);
+    assert!(!report.healthy(), "{:?}", messages(&report));
+    assert!(
+        report.findings.iter().any(|f| f.section == Section::Tools
+            && f.severity == Severity::Problem
+            && f.message.contains("No such file or directory")),
+        "{:?}",
+        messages(&report)
+    );
+    assert!(
+        !mentions(&report, "could not ask this shell what it has"),
+        "{:?}",
+        messages(&report)
+    );
+}
+
 #[test]
 fn the_tool_script_runs_behind_the_prelude_a_real_spawn_would_use() {
     let probes = vec![ToolProbe {

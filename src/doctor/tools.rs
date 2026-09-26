@@ -514,7 +514,9 @@ fn probe_tools(
     }
     // The body never ran. With a prelude set that is the prelude's
     // failure, and it is the same one every spawn would hit. A body that
-    // printed a mark did run, so the prelude in front of it got through.
+    // printed a mark did run, so the prelude in front of it got through;
+    // a tool pando runs itself is asked before the prelude, so its marks
+    // say nothing about it.
     let last = text
         .lines()
         .map(str::trim)
@@ -522,7 +524,10 @@ fn probe_tools(
         .find(|line| !line.is_empty())
         .unwrap_or("no output")
         .to_string();
-    let failure = match prelude.is_empty() || !found.is_empty() {
+    let behind_prelude = found
+        .keys()
+        .any(|index| probes.get(*index).is_some_and(|probe| !probe.direct));
+    let failure = match prelude.is_empty() || behind_prelude {
         true => ProbeFailure::Unanswered(format!("the probe did not finish — {last}")),
         false => ProbeFailure::Prelude(last),
     };
