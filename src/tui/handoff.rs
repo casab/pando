@@ -79,8 +79,8 @@ pub fn carry_out(
 ) -> Result<Option<String>, String> {
     let said = said_after(&request);
     match request.launch {
-        Launch::Tmux { args } => {
-            hand_off("tmux".to_string(), args, None, tx.clone());
+        Launch::Tmux { args, cwd } => {
+            hand_off("tmux".to_string(), args, Some(cwd), tx.clone());
             Ok(said)
         }
         Launch::Detached { program, args, cwd } => {
@@ -115,6 +115,11 @@ pub fn carry_out(
 /// Starts `program` off the UI thread with its streams redirected, and
 /// reports a failure — including a non-zero exit, which is how tmux says a
 /// window could not be made — back as an event.
+///
+/// A `cwd` that is not there is said before anything runs: tmux given it
+/// as `-c` opens the window in $HOME and exits 0, and any program run in
+/// it fails with "No such file or directory", as if the program were
+/// what is missing.
 fn hand_off(
     program: String,
     args: Vec<String>,
@@ -122,6 +127,15 @@ fn hand_off(
     tx: Sender<AppEvent>,
 ) {
     thread::spawn(move || {
+        if let Some(cwd) = &cwd
+            && !cwd.is_dir()
+        {
+            let _ = tx.send(AppEvent::LaunchFailed(format!(
+                "could not run {program}: {} is missing — git worktree prune removes the entry",
+                cwd.display()
+            )));
+            return;
+        }
         let mut command = Command::new(&program);
         command
             .args(&args)
@@ -176,6 +190,32 @@ mod tests {
         assert!(polls.load(Ordering::SeqCst) > held, "it never came back");
         stop.store(true, Ordering::SeqCst);
         reader.join().unwrap();
+    }
+
+    // Inside tmux, `!` on a worktree whose directory had gone opened a
+    // shell in $HOME: tmux exits 0 for a `-c` it cannot enter, so nothing
+    // took back the "opened a shell in …" the key had said.
+    #[test]
+    fn a_hand_off_into_a_missing_directory_says_so_and_runs_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("feat+gone");
+        let ran = dir.path().join("ran");
+        let (tx, rx) = std::sync::mpsc::channel();
+        hand_off(
+            "/usr/bin/touch".to_string(),
+            vec![ran.display().to_string()],
+            Some(gone.clone()),
+            tx,
+        );
+        let Ok(AppEvent::LaunchFailed(message)) = rx.recv_timeout(Duration::from_secs(10)) else {
+            panic!("no failure came back");
+        };
+        assert!(
+            message.contains(&format!("{} is missing", gone.display())),
+            "{message}"
+        );
+        assert!(message.contains("git worktree prune"), "{message}");
+        assert!(!ran.exists(), "it ran anyway");
     }
 
     #[test]

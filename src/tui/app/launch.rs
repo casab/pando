@@ -42,8 +42,10 @@ impl LaunchEnv {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Launch {
     /// `tmux <args>`, detached from pando's terminal: tmux opens the
-    /// window and pando keeps running beside it.
-    Tmux { args: Vec<String> },
+    /// window and pando keeps running beside it. Run in `cwd`, the
+    /// directory the window opens in, because tmux opens a window whose
+    /// `-c` is not there in $HOME and says nothing.
+    Tmux { args: Vec<String>, cwd: PathBuf },
     /// Give the terminal to `program` until it exits, then take it back.
     Suspend {
         program: String,
@@ -158,6 +160,7 @@ pub fn plan_shell(env: &LaunchEnv, path: &Path, label: &str) -> LaunchRequest {
                     "-n".into(),
                     tmux_literal(&window_name(label)),
                 ],
+                cwd: path.to_path_buf(),
             },
             done: format!(
                 "opened a shell in {label} — tmux window {}",
@@ -218,7 +221,10 @@ pub fn plan_editor(env: &LaunchEnv, path: &Path, label: &str) -> Result<LaunchRe
         ];
         tmux.extend(args);
         return Ok(LaunchRequest {
-            launch: Launch::Tmux { args: tmux },
+            launch: Launch::Tmux {
+                args: tmux,
+                cwd: path.to_path_buf(),
+            },
             done: format!(
                 "editing {label} in {shown} — tmux window {}",
                 window_name(label)
@@ -239,7 +245,8 @@ impl App {
     fn selected_path_and_label(&mut self) -> Option<(PathBuf, String)> {
         let name = self.selected_name()?;
         // Not checked for existence here: a missing directory is reported
-        // by whatever runs in it, off this thread.
+        // by whatever runs in it, off this thread — tmux included, which
+        // is run in it for that reason.
         let path = self.selected_worktree()?.path.clone();
         Some((path, self.label_of(&name)))
     }

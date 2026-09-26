@@ -4294,7 +4294,10 @@ fn bang_inside_tmux_opens_a_window_named_for_the_branch() {
                 "/trees/feat+one".into(),
                 "-n".into(),
                 "feat/one".into(),
-            ]
+            ],
+            // Run in the worktree, so that one whose directory has gone
+            // is said to be gone rather than opened in $HOME.
+            cwd: PathBuf::from("/trees/feat+one"),
         })
     );
     let (message, error) = app.active_status().expect("it says what it did");
@@ -4376,7 +4379,8 @@ fn e_inside_tmux_puts_a_terminal_editor_in_its_own_window() {
                 "feat/one".into(),
                 "/usr/local/bin/hx".into(),
                 "/trees/feat+one".into(),
-            ]
+            ],
+            cwd: PathBuf::from("/trees/feat+one"),
         })
     );
 }
@@ -4391,7 +4395,7 @@ fn a_tmux_window_takes_a_hash_in_the_branch_as_it_is() {
         let mut app = test_app(&["pr-12+x#(touch)#H"]);
         app.launch_env = env(true, Some("/bin/zsh"), None, Some("vim"));
         press(&mut app, KeyCode::Char(key));
-        let Some(Launch::Tmux { args }) = app.launch.clone().map(|r| r.launch) else {
+        let Some(Launch::Tmux { args, .. }) = app.launch.clone().map(|r| r.launch) else {
             panic!("{key} inside tmux opens a window: {:?}", app.launch);
         };
         assert_eq!(
