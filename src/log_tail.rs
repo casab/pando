@@ -688,6 +688,64 @@ fn find_pattern(s: &str) -> Option<PatternMatch> {
 /// dev logs grow to hundreds of MB and the first poll runs on the UI thread.
 const MAX_INITIAL_BYTES_PER_LINE: u64 = 512;
 
+/// The most a first read grows its window to while it holds too few whole
+/// lines: room for a final line a dev server dumps whole — a large JSON
+/// response, a state object — and small enough that a log which is one
+/// giant line cannot stall the UI thread's first poll.
+const MAX_INITIAL_WINDOW: u64 = 8 * 1024 * 1024;
+
+/// Where the first read of a file of `size` bytes starts, and whether that
+/// is partway through a line.
+///
+/// The window starts `capacity` × [`MAX_INITIAL_BYTES_PER_LINE`] bytes
+/// before the end and doubles while it holds fewer than `capacity` whole
+/// lines, up to [`MAX_INITIAL_WINDOW`]: `logs -n 50` of a log whose lines
+/// are longer than the budget still prints fifty, and a log that ends in
+/// a line longer than the window still shows that line. Newlines are
+/// counted, never parsed, and each byte is counted once.
+fn initial_start(file: &mut File, size: u64, capacity: usize) -> std::io::Result<(u64, bool)> {
+    let first = (capacity as u64).saturating_mul(MAX_INITIAL_BYTES_PER_LINE);
+    if size <= first {
+        return Ok((0, false));
+    }
+    let ceiling = first.max(MAX_INITIAL_WINDOW);
+    // `capacity` whole lines take one newline more: the first one ends the
+    // line the window starts partway through.
+    let wanted = (capacity as u64).saturating_add(1);
+    let mut start = size - first;
+    let mut newlines = count_newlines(file, start, size)?;
+    while newlines < wanted && start > 0 && size - start < ceiling {
+        let next = size - (2 * (size - start)).min(ceiling).min(size);
+        newlines += count_newlines(file, next, start)?;
+        start = next;
+    }
+    if start == 0 {
+        return Ok((0, false));
+    }
+    // A newline just before the window means it starts on a line, and that
+    // line is whole. One that cannot be read is taken as a partial line:
+    // dropping a whole line is safer than showing a fragment.
+    let mut before = [0u8; 1];
+    file.seek(SeekFrom::Start(start - 1))?;
+    let partial = file.read_exact(&mut before).is_err() || before[0] != b'\n';
+    Ok((start, partial))
+}
+
+/// How many newlines `file` holds in `from..to`.
+fn count_newlines(file: &mut File, from: u64, to: u64) -> std::io::Result<u64> {
+    file.seek(SeekFrom::Start(from))?;
+    let mut range = Read::by_ref(file).take(to - from);
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut count = 0;
+    loop {
+        let read = range.read(&mut buf)?;
+        if read == 0 {
+            return Ok(count);
+        }
+        count += buf[..read].iter().filter(|&&b| b == b'\n').count() as u64;
+    }
+}
+
 /// The most lines a new tail reserves room for before it has read any:
 /// past this the buffer grows as lines arrive, up to its capacity.
 const PREALLOCATE_LINES: usize = 4096;
@@ -880,11 +938,11 @@ impl LogTail {
         }
         let mut skip_partial_first_line = false;
         if self.offset == 0 {
-            let max_initial = (self.capacity as u64).saturating_mul(MAX_INITIAL_BYTES_PER_LINE);
-            if size > max_initial {
-                self.offset = size - max_initial;
-                skip_partial_first_line = true;
-            }
+            let (start, partial) = initial_start(&mut file, size, self.capacity)
+                .with_context(|| format!("read log {}", self.path.display()))?;
+            self.offset = start;
+            self.line_start_offset = start;
+            skip_partial_first_line = partial;
         }
         if size == self.offset {
             return Ok(false);
@@ -1188,6 +1246,52 @@ mod tests {
         let mut expected = lines[97..].to_vec();
         expected.push("after".to_string());
         assert_eq!(plain_lines(&tail), expected);
+    }
+
+    // The first read was a fixed `capacity * 512` bytes, so `logs -n 50`
+    // of a log with 1 KB lines printed about 25.
+    #[test]
+    fn the_first_poll_reads_as_many_long_lines_as_it_has_room_for() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("json.log");
+        let lines: Vec<String> = (0..200).map(|i| format!("{i:0>1000}")).collect();
+        write_all(&path, &(lines.join("\n") + "\n"));
+
+        let mut tail = LogTail::new(path, 50);
+        assert!(tail.poll().unwrap());
+        assert_eq!(plain_lines(&tail), lines[150..].to_vec());
+    }
+
+    // A last line longer than the whole window left nothing after the
+    // partial first line was dropped, and `logs` said a log of many lines
+    // held "not one complete line yet".
+    #[test]
+    fn the_first_poll_reads_a_last_line_longer_than_its_window() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("dump.log");
+        let dump = "{".to_string() + &"x".repeat(30_000) + "}";
+        write_all(&path, &format!("{}{dump}\n", "short\n".repeat(1000)));
+
+        let mut tail = LogTail::new(path, 50);
+        assert!(tail.poll().unwrap());
+        assert_eq!(plain_lines(&tail).last(), Some(&dump));
+        assert_eq!(tail.lines().len(), 50);
+    }
+
+    // A window that starts right after a newline starts on a whole line.
+    // It was dropped as if it were a fragment, and a log of two lines
+    // showed neither.
+    #[test]
+    fn a_first_window_that_starts_on_a_line_keeps_that_line() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("exact.log");
+        // Two lines, the second exactly the window for a capacity of one.
+        let second = "y".repeat(MAX_INITIAL_BYTES_PER_LINE as usize - 1);
+        write_all(&path, &format!("first\n{second}\n"));
+
+        let mut tail = LogTail::new(path, 1);
+        assert!(tail.poll().unwrap());
+        assert_eq!(plain_lines(&tail), vec![second]);
     }
 
     #[test]
