@@ -73,11 +73,11 @@ pub struct Unresolved {
     /// Whether a value this reader takes anything from, in a service or a
     /// top-level volume, is one it could not read — one behind a YAML tag
     /// (`!override`, `!reset`), a block scalar (`|`, `>-`) or a plain
-    /// scalar folded onto the lines under it, a flow collection or quoted
-    /// scalar closed only on a later line, or a mapping with a line or an
-    /// entry it finds no key in — or a value anywhere goes on over lines
-    /// this reader takes for keys, or the file goes on past its first YAML
-    /// document, which compose merges the others into.
+    /// scalar folded onto the lines under it, a quoted scalar that goes on
+    /// over a line break, alone or inside a flow collection, or a mapping
+    /// with a line or an entry it finds no key in — or a value anywhere
+    /// goes on over lines this reader takes for keys, or the file goes on
+    /// past its first YAML document, which compose merges the others into.
     /// A bind mount written in any of them is as invisible as one behind
     /// an alias.
     pub unread: bool,

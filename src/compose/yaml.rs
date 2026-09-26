@@ -102,25 +102,29 @@ fn holds_spilled(node: &Node) -> bool {
 /// Whether what [`service`] reads of a service body is a value this reader
 /// could not read: the body itself, anything under `ports:`, `volumes:`
 /// and `depends_on:`, or the `image:`, `build:` (and its `context:`),
-/// `container_name:` or `healthcheck:` value.
+/// `container_name:` or `healthcheck:` (and its `disable:`) value.
 ///
 /// Nothing else counts, unless it spilled over the keys after it. A
-/// `command:`, an `environment:` or a healthcheck's `test:` list that
-/// Prettier wrapped onto the lines under it holds no port and no mount,
-/// and counting one doubted a file read whole.
+/// `command:` script written as a block scalar holds no port and no mount,
+/// and a healthcheck's `test:` written as text is a check whatever the
+/// text says; counting either doubted a file read whole.
 fn service_unread(body: &Node) -> bool {
     let Node::Map(fields) = body else {
         return holds_unread(body);
     };
     let unread = |node: &Node| *node == Node::Unread;
+    let unread_under = |fields: &[(String, Node)], want: &str| {
+        fields
+            .iter()
+            .any(|(key, value)| key == want && unread(value))
+    };
     holds_spilled(body)
         || fields
             .iter()
             .any(|(key, value)| match (key.as_str(), value) {
                 ("ports" | "volumes" | "depends_on", value) => holds_unread(value),
-                ("build", Node::Map(build)) => build
-                    .iter()
-                    .any(|(key, value)| key == "context" && unread(value)),
+                ("build", Node::Map(build)) => unread_under(build, "context"),
+                ("healthcheck", Node::Map(check)) => unread_under(check, "disable"),
                 ("image" | "build" | "container_name" | "healthcheck", value) => unread(value),
                 _ => false,
             })
@@ -618,13 +622,21 @@ fn one_line(text: &str) -> Node {
 /// The value `text` on the line just read, the one before `at`, whose key
 /// or `-` sits at `indent`.
 ///
-/// A flow collection or quoted scalar still open at the end of its line is
-/// not read. Every block here skips the lines deeper than its own column
-/// and a line of closing brackets at it, so when the value goes on only
-/// over such lines, what follows it is read as compose reads it and the
-/// value is [`Node::Unread`]. Compose also takes one that goes on over a
-/// line no deeper than its key, which this reader would read as a key of
-/// its own; that one is [`Node::Spilled`].
+/// A flow collection still open at the end of its line goes on over the
+/// lines under it and is read as the one line they make, since a line
+/// break between its entries is only a space: Prettier wraps a flow list
+/// too long for its line this way, and a healthcheck's `test:` wrapped
+/// over `"NONE"` is one the file turns off. Every block here skips the
+/// lines deeper than its own column and a line of closing brackets at it,
+/// so what follows the value is read as compose reads it.
+///
+/// A quoted scalar that goes on over a line break, alone or inside a flow
+/// collection, is not read: the break folds by rules of its own, and a `#`
+/// on the line after it was taken for a comment. Going on only over such
+/// lines, it is [`Node::Unread`]. Compose also takes a flow collection or
+/// a quoted scalar that goes on over a line no deeper than its key, which
+/// this reader would read as a key of its own; that one is
+/// [`Node::Spilled`].
 ///
 /// Any other value that goes on over the lines under it — a plain scalar
 /// folded onto them, a block scalar's text — is [`Node::Unread`] too. Read
@@ -643,14 +655,23 @@ fn value_on(lines: &[Line], at: usize, text: &str, indent: usize) -> Node {
     if !flow.open() {
         return one_line(text);
     }
+    let mut quote_broken = flow.quote.is_some();
+    let mut whole = text.trim().to_string();
     for line in &lines[at..] {
         if line.indent < indent || (line.indent == indent && !closes_only(&line.text)) {
             return Node::Spilled;
         }
         flow.read(&line.text);
+        whole.push(' ');
+        whole.push_str(line.text.trim());
         if !flow.open() {
-            return Node::Unread;
+            return if quote_broken {
+                Node::Unread
+            } else {
+                one_line(&whole)
+            };
         }
+        quote_broken |= flow.quote.is_some();
     }
     // Never closed, which compose does not read either.
     Node::Spilled

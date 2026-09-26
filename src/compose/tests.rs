@@ -208,11 +208,30 @@ services:
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       disable: false
+  wrapped:
+    image: redis:7
+    healthcheck:
+      test: [
+        "NONE"
+      ]
 "#;
     let file = parse(text).unwrap();
+    assert!(!file.unresolved.any(), "{:?}", file.unresolved);
     assert!(!file.services["disabled"].healthcheck);
     assert!(!file.services["none"].healthcheck);
     assert!(file.services["tuned"].healthcheck);
+    assert!(
+        !file.services["wrapped"].healthcheck,
+        "a `test:` list wrapped onto the lines under it is read whole"
+    );
+
+    // A `disable:` this reader cannot read may turn the check off, so
+    // compose is asked.
+    let file = parse(
+        "services:\n  cache:\n    image: redis:7\n    healthcheck:\n      disable: !!bool true\n",
+    )
+    .unwrap();
+    assert!(file.unresolved.unread);
 
     // Compose keeps both opt-outs as written.
     let file = parse_config_json(
@@ -880,15 +899,11 @@ fn an_alias_outside_services_and_a_quoted_star_leave_the_file_whole() {
 
 /// A bind mount into the worktree, in each shape this reader cannot take
 /// from one line or place in the mapping it sits in. Compose reads every
-/// one of them, and Prettier writes the first when a flow list grows too
-/// long for its line.
-const UNREADABLE: [&str; 14] = [
-    "    volumes: [\n      \"./pgdata:/var/lib/postgresql/data\"\n    ]\n",
-    "    volumes:\n      - {\n        type: bind,\n        source: ./pgdata,\n        \
-     target: /var/lib/postgresql/data\n      }\n",
+/// one of them.
+const UNREADABLE: [&str; 12] = [
+    "    volumes: [\n      \"./pgdata:\n      /var/lib/postgresql/data\"\n    ]\n",
     "    volumes: !override\n      - ./pgdata:/var/lib/postgresql/data\n",
     "    volumes:\n      - \"./pgdata\\\n        :/var/lib/postgresql/data\"\n",
-    "    volumes:\n      [\n        \"./pgdata:/var/lib/postgresql/data\"\n      ]\n",
     "    volumes:\n      - >-\n        ./pgdata:/var/lib/postgresql/data\n",
     "    volumes:\n      - type: bind\n        source: |-\n          ./pgdata\n        \
      target: /var/lib/postgresql/data\n",
@@ -927,6 +942,52 @@ fn a_value_this_reader_cannot_read_is_never_approved_on_half_a_file() {
         assert!(
             err.contains("`!override`"),
             "it names what it could not read: {err}"
+        );
+    }
+}
+
+// Prettier wraps a flow collection too long for its line onto the lines
+// under it, and compose reads it as the one line they make. Read that way
+// here too, what is in it is known without asking compose, and the keys
+// after one in a `- target:` entry are read with the entry.
+#[test]
+fn a_flow_collection_closed_on_a_later_line_is_read_whole() {
+    for volumes in [
+        "    volumes: [\n      \"./pgdata:/var/lib/postgresql/data\"\n    ]\n",
+        "    volumes:\n      - {\n        type: bind,\n        source: ./pgdata,\n        \
+         target: /var/lib/postgresql/data\n      }\n",
+        "    volumes:\n      [\n        \"./pgdata:/var/lib/postgresql/data\"\n      ]\n",
+        "    volumes:\n      - target: /var/lib/postgresql/data\n        bind: {\n          \
+         create_host_path: true\n        }\n        type: bind\n        source: ./pgdata\n",
+    ] {
+        let text = format!("services:\n  db:\n    image: postgres:16\n{volumes}");
+        let file = parse(&text).unwrap();
+        assert!(!file.unresolved.any(), "{text}");
+        assert_eq!(
+            file.services["db"].volumes,
+            vec![Mount::Bind("./pgdata".to_string())],
+            "{text}"
+        );
+        let err = format!(
+            "{:#}",
+            resolve_included(&file, &["db".into()], &[]).unwrap_err()
+        );
+        assert!(
+            err.contains("./pgdata"),
+            "refused for the mount it has: {err}"
+        );
+    }
+    // A service body, and the services map itself, written as one.
+    for text in [
+        "services:\n  db: {\n    image: postgres:16,\n    volumes: [\"./pgdata:/data\"]\n  }\n",
+        "services: {\n  db: {image: postgres:16, volumes: [\"./pgdata:/data\"]}\n}\n",
+    ] {
+        let file = parse(text).unwrap();
+        assert!(!file.unresolved.any(), "{text}");
+        assert_eq!(
+            file.services["db"].volumes,
+            vec![Mount::Bind("./pgdata".to_string())],
+            "{text}"
         );
     }
 }
@@ -981,15 +1042,18 @@ fn a_block_scalar_where_nothing_is_read_leaves_the_file_whole() {
 }
 
 // What the reader does read still counts wherever it sits: a service body,
-// its `ports:`, or a top-level volume's body spread over several lines.
+// its `ports:`, or a top-level volume's body spread over several lines with
+// a quote in it that goes on over a line break.
 #[test]
 fn a_value_spread_over_several_lines_where_something_is_read_still_counts() {
     for text in [
-        "services:\n  db: {\n    image: postgres:16,\n    volumes: [\"./pgdata:/data\"]\n  }\n",
-        "services:\n  db:\n    image: postgres:16\n    ports: [\n      \"5432:5432\"\n    ]\n",
+        "services:\n  db: {\n    image: postgres:16,\n    volumes: [\"./pgdata:\n      \
+         /data\"]\n  }\n",
+        "services:\n  db:\n    image: postgres:16\n    ports: [\n      \"5432:\n      \
+         5432\"\n    ]\n",
         "services:\n  db:\n    image: postgres:16\n    volumes:\n      - pgdata:/data\n\
-         volumes:\n  pgdata: {\n    driver_opts: {o: bind, device: /srv/pg}\n  }\n",
-        "services: {\n  db: {image: postgres:16}\n}\n",
+         volumes:\n  pgdata: {\n    driver_opts: {o: bind, device: \"/srv\n      /pg\"}\n  }\n",
+        "services: {\n  db: {image: \"postgres\n    :16\"}\n}\n",
     ] {
         let file = parse(text).unwrap();
         assert!(file.unresolved.unread, "{text}");
