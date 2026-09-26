@@ -898,9 +898,6 @@ pub fn run_share_proxy(listen: u16, upstream: u16) -> Result<()> {
 /// What `actions` says when a config names no process to start.
 const NO_PROCESSES: &str = "no processes configured";
 
-/// What a failed install step's error carries, from `actions`.
-const INSTALL_FAILED: &str = "the install hook failed";
-
 /// An error from `new`, `start` or `restart`, with the way past it when
 /// `actions` could only say what went wrong: the file to edit, by its
 /// absolute path, and what to write there.
@@ -915,12 +912,8 @@ fn with_a_way_past(paths: &PandoPaths, e: anyhow::Error) -> anyhow::Error {
             crate::doctor::nothing_to_run_fix(&paths.config_file())
         );
     }
-    if text.contains(INSTALL_FAILED) {
-        return anyhow::anyhow!(
-            "{text} — `project.install` in {} is the command; fix it there, or set it to \"\" \
-             to skip installing",
-            crate::config::install_origin(paths).display()
-        );
+    if let Some(fixed) = actions::install_remedy(paths, &text) {
+        return anyhow::anyhow!(fixed);
     }
     e
 }

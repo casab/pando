@@ -392,6 +392,25 @@ fn newly_dirty(before: &[String], after: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// The first words of a hook's failure, which name the hook.
+fn failed(hook: &str) -> String {
+    format!("the {hook} hook failed")
+}
+
+/// A failed install step's error with the way past it: the file that
+/// sets `project.install`, and that `""` there skips installing. `None`
+/// for any other error. The CLI says it after `new`, `start` and
+/// `restart`, and the TUI after `n`.
+pub fn install_remedy(paths: &PandoPaths, error: &str) -> Option<String> {
+    error.contains(&failed(INSTALL_HOOK)).then(|| {
+        format!(
+            "{error} — `project.install` in {} is the command; fix it there, or set it to \"\" \
+             to skip installing",
+            config::install_origin(paths).display()
+        )
+    })
+}
+
 /// The context a failing hook carries: which entry it is, and where the one
 /// edit that removes it lives.
 ///
@@ -400,7 +419,7 @@ fn newly_dirty(before: &[String], after: &[String]) -> Vec<String> {
 /// — it is the difference between "a wrong guess costs one edit" and a
 /// mysterious failure at start time.
 fn hook_failed(paths: &PandoPaths, config: &Config, hook: &config::HookConfig) -> String {
-    let base = format!("the {} hook failed", hook.name);
+    let base = failed(&hook.name);
     // The install step is synthesised from `[project].install`; there is no
     // `[[hooks]]` entry to point at.
     if hook.name == INSTALL_HOOK || !config.hooks.iter().any(|h| h.name == hook.name) {

@@ -4202,6 +4202,12 @@ fn a_failed_install_keeps_the_worktree_and_names_its_log() {
     let msg = format!("{err:#}");
     assert!(msg.contains("install"), "{msg}");
     assert!(msg.contains("could-not-resolve"), "{msg}");
+    // What the TUI reads it by, and what gets the way past it appended.
+    assert!(
+        msg.starts_with(&format!("feat/one {CREATED_BUT_INSTALL_FAILED}")),
+        "{msg}"
+    );
+    assert!(install_remedy(&fx.paths, &msg).is_some(), "{msg}");
     assert!(
         msg.contains("install.log"),
         "the log path is in the message: {msg}"

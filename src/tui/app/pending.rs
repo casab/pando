@@ -216,7 +216,11 @@ impl App {
             let _ = tx.send(AppEvent::ConfigResolved(Box::new(config.clone())));
             create(&paths, &config, &progress)
                 .map(PendingOutcome::Created)
-                .map_err(|e| format!("{e:#}"))
+                .map_err(|e| {
+                    // With where to fix it, as `pando new` says it.
+                    let text = format!("{e:#}");
+                    actions::install_remedy(&paths, &text).unwrap_or(text)
+                })
         });
         if started && let Some(p) = self.pending.as_mut() {
             p.progress_rx = Some(prx);
@@ -397,6 +401,16 @@ impl App {
                 {
                     self.nothing_to_run = true;
                     self.set_error_about(&name, self.nothing_to_run_line());
+                    return;
+                }
+                // A create whose install step failed kept its worktree, and
+                // says so itself: "could not create" in front of it
+                // contradicted it, and the cursor goes to it as to any
+                // worktree `n` made.
+                if kind == PendingKind::Create && e.contains(actions::CREATED_BUT_INSTALL_FAILED) {
+                    self.set_error_about(&name, e);
+                    self.select_on_arrival = Some(name);
+                    self.spawn_discovery();
                     return;
                 }
                 self.set_error_about(&name, format!("could not {} {label}: {e}", kind.noun()));

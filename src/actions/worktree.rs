@@ -19,6 +19,11 @@ use super::refresh::refresh;
 use super::services::{clear_native_sockets, compose_projects, docker_down_for, remove_containers};
 use crate::remedy;
 
+/// What `new` says after the branch when the worktree was made and only
+/// its install step failed. The worktree is kept, so a caller may treat
+/// it as made.
+pub const CREATED_BUT_INSTALL_FAILED: &str = "was created, but its install step failed";
+
 pub use crate::worktree::sanitize_branch_to_dir;
 
 /// Which of the three shapes `new` is in. Mirrors the decision git itself
@@ -215,7 +220,7 @@ pub fn new(
         not_own: None,
     };
     run_hooks(paths, config, config::HookPoint::Create, &ctx, progress)
-        .with_context(|| format!("{branch} was created, but its install step failed"))?;
+        .with_context(|| format!("{branch} {CREATED_BUT_INSTALL_FAILED}"))?;
     Ok(dir_name)
 }
 

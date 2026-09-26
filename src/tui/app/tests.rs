@@ -4511,6 +4511,36 @@ fn x_on_a_worktree_that_is_not_running_says_so() {
     assert_eq!(status.kind, StatusKind::Info);
 }
 
+// The checkout worked and the install after it did not: the worktree is
+// kept, and "could not create feat/x: feat/x was created, but …" said
+// both at once.
+#[test]
+fn a_create_whose_install_failed_says_it_was_created_and_goes_to_it() {
+    let mut app = test_app(&["feat+one"]);
+    let error = format!(
+        "feat/x {}: the install hook failed: exited 1",
+        actions::CREATED_BUT_INSTALL_FAILED
+    );
+    let reported = error.clone();
+    app.spawn_pending("feat+x".into(), PendingKind::Create, move || Err(reported));
+    app.pending.as_mut().unwrap().label = "feat/x".into();
+    wait_for_pending(&mut app);
+    let (message, is_error) = app.active_status().unwrap();
+    assert_eq!(message, error);
+    assert!(is_error, "the install still failed");
+    assert_eq!(app.select_on_arrival.as_deref(), Some("feat+x"));
+
+    // Any other failure is still one to create it.
+    let mut app = test_app(&["feat+one"]);
+    app.spawn_pending("feat+y".into(), PendingKind::Create, || {
+        Err("branch feat/y already exists".into())
+    });
+    wait_for_pending(&mut app);
+    let (message, _) = app.active_status().unwrap();
+    assert!(message.starts_with("could not create "), "{message}");
+    assert_eq!(app.select_on_arrival, None);
+}
+
 // ---- errors about one worktree ---------------------------------------
 
 // An error raised by feat/db's start does not follow the reader into

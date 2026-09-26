@@ -20,7 +20,7 @@ mod services;
 mod share;
 mod worktree;
 
-pub use hooks::{HookContext, INSTALL_HOOK, matched_nothing, run_hooks};
+pub use hooks::{HookContext, INSTALL_HOOK, install_remedy, matched_nothing, run_hooks};
 pub use init::{
     ALL_SLOTS, InitReport, SlotSummary, init, init_dry_run, machine_evidence,
     machine_evidence_from, machine_evidence_script,
@@ -46,8 +46,8 @@ pub use services::{
 };
 pub use share::{ENV_SHARE_PORT, ShareOutcome, SpawnProxy, share, share_with, unshare};
 pub use worktree::{
-    Ownership, created_by_pando, guard_write_locations, ls, new, new_for_pr, ownership, path, rm,
-    sanitize_branch_to_dir,
+    CREATED_BUT_INSTALL_FAILED, Ownership, created_by_pando, guard_write_locations, ls, new,
+    new_for_pr, ownership, path, rm, sanitize_branch_to_dir,
 };
 
 #[cfg(test)]
