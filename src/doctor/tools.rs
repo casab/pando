@@ -185,9 +185,14 @@ fn daemon_check(
                 "the Docker daemon is not running (`docker info`: {reason}) — this project \
                  declares compose services, so `start --isolated` cannot bring them up"
             ),
+            // `prefer` alone changes nothing here: it only settles the
+            // services question, and the compose entries have answered it.
             format!(
-                "start Docker; or run the services without it: set `[isolation] prefer = \
-                 \"native\"` in {} where pando has a recipe for them; or {}",
+                "start Docker; or run the services without it: remove the `[[services]] kind = \
+                 \"compose\"` entries from {} and set `[isolation] prefer = \"native\"` in {}, \
+                 so the next `start --isolated` settles them again on pando's recipes where it \
+                 has them; or {}",
+                crate::config::services_origin(paths).display(),
                 super::config::user_config_shown(paths),
                 crate::remedy::SHARED.cli
             ),

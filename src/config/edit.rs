@@ -294,7 +294,7 @@ fn other_layer_declares_processes(paths: &PandoPaths, layer: Layer) -> bool {
     ]
     .iter()
     .filter(|path| **path != layer.file(paths))
-    .any(|path| declares_processes(path))
+    .any(|path| declares_top_level(path, "processes"))
 }
 
 /// Which layer's file sets `[runtime].prelude`, highest precedence first.
@@ -331,6 +331,21 @@ pub fn install_origin(paths: &PandoPaths) -> PathBuf {
     .unwrap_or_else(|| Layer::Project.file(paths))
 }
 
+/// Which layer's file declares `[[services]]`, highest precedence first:
+/// a higher layer replaces the whole list, so the entries in force are
+/// that one file's. pando's own when none of them does, since that is
+/// where an answer would be written.
+pub fn services_origin(paths: &PandoPaths) -> PathBuf {
+    [
+        Layer::Project.file(paths),
+        Layer::User.file(paths),
+        paths.root().join("pando.toml"),
+    ]
+    .into_iter()
+    .find(|path| declares_top_level(path, "services"))
+    .unwrap_or_else(|| Layer::Project.file(paths))
+}
+
 fn declares(path: &Path, table: &str, key: &str) -> bool {
     std::fs::read_to_string(path)
         .ok()
@@ -339,12 +354,12 @@ fn declares(path: &Path, table: &str, key: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn declares_processes(path: &Path) -> bool {
+fn declares_top_level(path: &Path, key: &str) -> bool {
     let Ok(text) = std::fs::read_to_string(path) else {
         return false;
     };
     toml::from_str::<Table>(&text)
-        .map(|table| table.contains_key("processes"))
+        .map(|table| table.contains_key(key))
         .unwrap_or(false)
 }
 

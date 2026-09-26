@@ -2291,6 +2291,17 @@ fn a_docker_daemon_that_is_down_is_a_problem_naming_the_way_around_it() {
     let fix = problem.fix.as_deref().unwrap();
     assert!(fix.contains("start Docker"), "{fix}");
     assert!(fix.contains("prefer = \"native\""), "{fix}");
+    // `prefer` only settles the services question, and the compose
+    // entries have answered it: setting it alone changes nothing, so the
+    // way around names the entries to take out, and the file they are in.
+    assert!(
+        fix.contains("remove the `[[services]] kind = \"compose\"` entries"),
+        "{fix}"
+    );
+    assert!(
+        fix.contains(&fx.paths.config_file().display().to_string()),
+        "{fix}"
+    );
     // The file this run reads, under PANDO_HOME — not `~/.pando`.
     assert!(
         fix.contains(&fx.paths.user_config_file().display().to_string()),
