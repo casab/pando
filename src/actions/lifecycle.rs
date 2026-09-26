@@ -200,6 +200,9 @@ struct Preflight {
     isolation: bool,
     /// The namespaces a namespaced start needs are made and recorded.
     namespaces: Option<Ready>,
+    /// This start is a `restart --only`: the process it names is replaced
+    /// even while it runs, rather than reported as already up.
+    restarting: bool,
 }
 
 fn start_checked(
@@ -214,6 +217,7 @@ fn start_checked(
     let Preflight {
         isolation: mut preflighted,
         namespaces: mut ready,
+        restarting,
     } = preflight;
     let worktree = find_worktree(paths, name)?;
     // Before anything is installed, signalled or spawned: a `--only` naming
@@ -248,7 +252,8 @@ fn start_checked(
     // not that case — it is about to run code. Read without the lock, like
     // the hook's own fingerprint: the decision it guards is "can this step
     // be skipped", and the authoritative one is made under the lock below.
-    let mut everything_up = every_process_running(paths, name, &selection);
+    // A restart is never that case: what it names is about to be replaced.
+    let mut everything_up = !restarting && every_process_running(paths, name, &selection);
 
     // A start that switches this worktree to its own services replaces
     // every process it is running. So everything that switch needs —
@@ -407,6 +412,13 @@ fn start_checked(
     // still the one they have. Nothing fights over a port meanwhile,
     // because the services get roles of their own after the processes'
     // and the processes keep the ports they hold.
+    //
+    // A live process a `restart --only` names is left as it is too, and
+    // replaced under the lock its successor is spawned under. Stopped
+    // here, it would be out of the record until then, and a share it
+    // serves would have nothing behind it: the next sweep, this start's
+    // own among them, closes a URL whose process is coming back on the
+    // same port.
     let mut already: Vec<String> = Vec::new();
     let mut clear: Vec<(String, i32, bool)> = Vec::new();
     let mut kept_serving: Vec<String> = Vec::new();
@@ -417,7 +429,9 @@ fn start_checked(
                 existing.phase,
                 Phase::Starting { .. } | Phase::Running { .. }
             ) && existing.alive(proc::is_alive, proc::group_alive);
-            if selected && live && !mode_changed {
+            if selected && live && restarting {
+                // Replaced below, under the second lock.
+            } else if selected && live && !mode_changed {
                 already.push(process.clone());
             } else if selected && live && keeps_serving {
                 kept_serving.push(process.clone());
@@ -802,6 +816,9 @@ fn start_checked(
     // had just been stopped. Nothing is undone: the start that took them
     // down left a consistent shared worktree — its own ports, its own
     // processes — and an undo would write this start's older picture over it.
+    //
+    // A `restart --only` keeps nothing it names, whatever mode it runs in:
+    // replacing it is what the restart is for.
     if isolate {
         let lost: Vec<String> = service_roles(config)
             .into_iter()
@@ -840,7 +857,7 @@ fn start_checked(
         if !live {
             continue;
         }
-        if running == target {
+        if running == target && !restarting {
             progress(&format!("{process_name} is already running"));
             already.push(process_name.clone());
         } else {
@@ -868,7 +885,7 @@ fn start_checked(
         }
     };
 
-    if !replace.is_empty() {
+    if !replace.is_empty() && running != target {
         progress(match target {
             ServiceMode::Isolated => {
                 "its own services are ready, so its processes restart against them"
@@ -1060,20 +1077,6 @@ fn every_process_running(
     })
 }
 
-/// What an `--only` that names nothing the worktree is running means.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum MissingOnly {
-    /// An error naming what the worktree *is* running. `stop` cannot see
-    /// config — it has to work when `pando.toml` is broken — so the record
-    /// is the only thing it can check a name against, and "not running"
-    /// would read as "nothing to do" for a typo.
-    IsAnError,
-    /// Nothing to do. `restart` has already checked the name against
-    /// config, and bringing a process that is down back up is exactly what
-    /// `restart --only` is for.
-    IsNothingToDo,
-}
-
 /// Stops a worktree's processes — every one it is running, or the one
 /// `only` names. The worktree, its ports, and its logs survive.
 pub fn stop(
@@ -1082,22 +1085,12 @@ pub fn stop(
     only: Option<&str>,
     progress: &dyn Fn(&str),
 ) -> Result<StopOutcome> {
-    stop_missing(paths, name, only, MissingOnly::IsAnError, progress)
-}
-
-fn stop_missing(
-    paths: &PandoPaths,
-    name: &str,
-    only: Option<&str>,
-    missing: MissingOnly,
-    progress: &dyn Fn(&str),
-) -> Result<StopOutcome> {
     paths.ensure_home()?;
     let mut projects: Vec<String> = Vec::new();
     let outcome = {
         let _lock = state::lock(&paths.lock_file())?;
         let mut store = state::load(&paths.state_file())?;
-        let outcome = stop_recorded(&mut store, name, only, missing, &mut projects)?;
+        let outcome = stop_recorded(&mut store, name, only, &mut projects)?;
         // `reconcile` drops dead-leader records for every worktree in the
         // project, not only this one, so every one is signalled first — and
         // a sibling's half-dead share along with them.
@@ -1152,14 +1145,7 @@ pub fn stop_all_with(
         // One worktree that will not die must not leave the rest running —
         // and must not lose its record either. The failures are collected
         // and reported once every other group has been signalled.
-        match stop_recorded_with(
-            &mut store,
-            &name,
-            None,
-            MissingOnly::IsAnError,
-            &stop,
-            &mut projects,
-        ) {
+        match stop_recorded_with(&mut store, &name, None, &stop, &mut projects) {
             Ok(StopOutcome::Stopped(_)) => stopped.push(name),
             Ok(StopOutcome::NotRunning) => {}
             Err(e) => failures.push(format!("stopping {name}: {e:#}")),
@@ -1216,14 +1202,12 @@ pub(super) fn stop_recorded(
     store: &mut state::State,
     name: &str,
     only: Option<&str>,
-    missing: MissingOnly,
     services_to_stop: &mut Vec<String>,
 ) -> Result<StopOutcome> {
     stop_recorded_with(
         store,
         name,
         only,
-        missing,
         |pgid| proc::stop(pgid, STOP_GRACE),
         services_to_stop,
     )
@@ -1232,15 +1216,10 @@ pub(super) fn stop_recorded(
 /// What `--only <name>` gets when the worktree is not running that
 /// process: an error naming what it *is* running, because "not running"
 /// would read as "nothing to do" for a typo — and a typo must never be
-/// answered by taking the database down.
-fn missing_only(
-    only: Option<&str>,
-    missing: MissingOnly,
-    record: &WorktreeRecord,
-) -> Result<StopOutcome> {
-    if missing == MissingOnly::IsNothingToDo {
-        return Ok(StopOutcome::NotRunning);
-    }
+/// answered by taking the database down. `stop` cannot see config — it
+/// has to work when `pando.toml` is broken — so the record is the only
+/// thing it can check a name against.
+fn missing_only(only: Option<&str>, record: &WorktreeRecord) -> Result<StopOutcome> {
     let running: Vec<&str> = record.processes.keys().map(String::as_str).collect();
     bail!(
         "this worktree is not running a process named {:?} — it is running: {}",
@@ -1257,7 +1236,6 @@ pub(super) fn stop_recorded_with(
     store: &mut state::State,
     name: &str,
     only: Option<&str>,
-    missing: MissingOnly,
     stop: impl Fn(i32) -> Result<()>,
     services_to_stop: &mut Vec<String>,
 ) -> Result<StopOutcome> {
@@ -1273,7 +1251,7 @@ pub(super) fn stop_recorded_with(
     // something *is* running, not a silent whole-worktree stop.
     if record.processes.is_empty() {
         if only.is_some() {
-            return missing_only(only, missing, record);
+            return missing_only(only, record);
         }
         // Read before anything is signalled: a native service *is* its
         // process, so a worktree whose only service is a database has
@@ -1308,7 +1286,7 @@ pub(super) fn stop_recorded_with(
         .map(|(process, p)| (process.clone(), p.pgid, p.swept))
         .collect();
     if groups.is_empty() {
-        return missing_only(only, missing, record);
+        return missing_only(only, record);
     }
     let mut stopped = Vec::new();
     let mut failures = Vec::new();
@@ -1450,7 +1428,8 @@ pub(super) fn sweep_orphaned_groups_with(
 
 /// Stop, then start. The ports come back from the record `stop` left
 /// behind, so a restart keeps the URL — and `--only` restarts one process
-/// while the rest keep serving on the ports they already have.
+/// while the rest keep serving on the ports they already have, as a start
+/// that replaces it: its public URL, if it has one, stays up.
 pub fn restart(
     paths: &PandoPaths,
     config: &Config,
@@ -1489,14 +1468,16 @@ pub fn restart(
             &worktree_roles(config, true),
         )?;
     }
-    // And a name config does know, whose process is simply not up, is a
-    // no-op to stop rather than a refusal. Bringing a stopped process back
-    // is the one thing `restart --only` exists for, and it used to be the
-    // one thing it could not do — but only while a sibling was still
-    // running, which made the failure look random.
+    // A `--only` restart has no stop half: its start replaces the process
+    // it names, under the lock the successor is spawned under, so a share
+    // of it never has nothing behind it. And a name config does know,
+    // whose process is simply not up, is just started. Bringing a stopped
+    // process back is the one thing `restart --only` exists for, and it
+    // used to be the one thing it could not do — but only while a sibling
+    // was still running, which made the failure look random.
     //
-    // Except on the way onto data of its own: that start replaces every
-    // process anyway, and only once the worktree's own services or
+    // Nor does one on the way onto data of its own: that start replaces
+    // every process anyway, and only once the worktree's own services or
     // namespaces are ready. A stop first would throw that away — a restart
     // whose services then failed to come up would have cost the developer
     // the dev server it could not replace.
@@ -1507,8 +1488,10 @@ pub fn restart(
         ServiceMode::Namespaced => Some(namespaced::prepare(paths, config, name, progress)?),
         _ => None,
     };
-    if !(target != was && target != ServiceMode::Shared && was != ServiceMode::Isolated) {
-        stop_missing(paths, name, only, MissingOnly::IsNothingToDo, progress)?;
+    let onto_own_data =
+        target != was && target != ServiceMode::Shared && was != ServiceMode::Isolated;
+    if only.is_none() && !onto_own_data {
+        stop(paths, name, None, progress)?;
     }
     start_checked(
         paths,
@@ -1519,6 +1502,7 @@ pub fn restart(
         Preflight {
             isolation: preflighted,
             namespaces,
+            restarting: only.is_some(),
         },
         progress,
     )

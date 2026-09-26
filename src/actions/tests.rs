@@ -1313,6 +1313,57 @@ fn restart_only_brings_back_a_process_that_is_not_running() {
     );
 }
 
+/// Shares a started worktree through a stand-in tunnel that really runs,
+/// so a sweep reads it as alive and a stop has a group to signal.
+fn share_through_a_live_tunnel(fx: &Fx, name: &str) -> Detached {
+    let tunnel = crate::testutil::spawn_guarded(
+        "exec sleep 300",
+        &std::env::temp_dir(),
+        &fx.paths.log_file(name, "tunnel"),
+    );
+    let mut store = fx.state();
+    store.worktrees.get_mut(name).expect("started").share = Some(ShareRecord {
+        tunnel_pid: tunnel.pid,
+        tunnel_pgid: tunnel.pgid,
+        ..share_record_of(tunnel.pid, None)
+    });
+    state::save(&fx.paths.state_file(), &store).unwrap();
+    tunnel
+}
+
+// A `--only` stop of the process a share points at takes the share down,
+// and `restart --only` was that stop and then a start. The URL a
+// developer had handed out closed for a process that came back on the
+// same port a moment later — and a stop that kept it would not have
+// helped, because the start's own sweep found the share with nothing
+// behind it and closed it anyway.
+#[test]
+fn restart_only_of_the_process_a_share_points_at_keeps_the_share() {
+    let mut fx = fixture();
+    with_web_and_api(&mut fx);
+    let name = workspace_worktree(&fx, "feat/one");
+    let first = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+    let _guard = guard(&first);
+    let tunnel = share_through_a_live_tunnel(&fx, &name);
+    let web_pid = fx.state().worktrees[&name].processes["web"].pid;
+
+    let report = restart(&fx.paths, &fx.config, &name, Some("web"), &noop).unwrap();
+    let _g2 = guard(&report);
+    assert_eq!(names_of(&report.started), vec!["web"]);
+    assert_eq!(report.ports, first.ports, "web comes back on its own port");
+    assert!(
+        !crate::process::is_alive(web_pid),
+        "the old web process was replaced"
+    );
+    let share = fx.state().worktrees[&name].share.clone();
+    assert_eq!(
+        share.map(|s| s.tunnel_pid),
+        Some(tunnel.pid),
+        "the public URL is the one the developer handed out"
+    );
+    assert!(crate::process::is_alive(tunnel.pid), "and its tunnel is up");
+}
+
 // The name is checked against config, not against what happens to be
 // running: the same typo used to produce two different messages
 // depending on unrelated state, and only one of them listed the names
@@ -3878,7 +3929,6 @@ fn stopping_one_process_of_several_leaves_the_share_up() {
         &mut store,
         "feat+one",
         Some("api"),
-        MissingOnly::IsAnError,
         |_| Ok(()),
         &mut projects,
     )
@@ -3906,7 +3956,6 @@ fn stopping_the_last_process_takes_the_share_down_even_with_only() {
         &mut store,
         "feat+one",
         Some("web"),
-        MissingOnly::IsAnError,
         |pgid| {
             signalled.lock().unwrap().push(pgid);
             Ok(())
@@ -3954,7 +4003,6 @@ fn stopping_the_process_the_url_points_at_takes_the_share_down_even_with_only() 
         &mut store,
         "feat+one",
         Some("web"),
-        MissingOnly::IsAnError,
         |_| Ok(()),
         &mut projects,
     )
@@ -3969,7 +4017,6 @@ fn stopping_the_process_the_url_points_at_takes_the_share_down_even_with_only() 
         &mut store,
         "feat+one",
         Some("api"),
-        MissingOnly::IsAnError,
         |_| Ok(()),
         &mut projects,
     )
@@ -4035,7 +4082,6 @@ fn stopping_a_worktree_with_nothing_running_still_closes_its_share() {
         &mut store,
         "feat+one",
         None,
-        MissingOnly::IsAnError,
         |pgid| {
             signalled.lock().unwrap().push(pgid);
             Ok(())
@@ -4061,7 +4107,6 @@ fn a_share_that_will_not_stop_fails_the_stop_and_keeps_its_record() {
         &mut store,
         "feat+one",
         None,
-        MissingOnly::IsAnError,
         |_| bail!("would not stop"),
         &mut projects,
     )

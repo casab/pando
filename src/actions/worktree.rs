@@ -13,7 +13,7 @@ use crate::state::{self, WorktreeRecord};
 use crate::worktree::{self, PrInfo, Worktree};
 
 use super::hooks::{HookContext, run_hooks};
-use super::lifecycle::{MissingOnly, StopOutcome, stop_recorded, sweep_orphaned_groups};
+use super::lifecycle::{StopOutcome, stop_recorded, sweep_orphaned_groups};
 use super::namespaced::drop_namespaces;
 use super::refresh::refresh;
 use super::services::{clear_native_sockets, compose_projects, docker_down_for, remove_containers};
@@ -507,13 +507,7 @@ pub fn rm(
     if !running.is_empty() {
         progress(&format!("stopping {}", running.join(", ")));
     }
-    let stopped = stop_recorded(
-        &mut store,
-        name,
-        None,
-        MissingOnly::IsAnError,
-        &mut projects,
-    )?;
+    let stopped = stop_recorded(&mut store, name, None, &mut projects)?;
 
     // The containers, the network, and the volumes, before git is asked to
     // remove anything: the record that names the compose project is about
