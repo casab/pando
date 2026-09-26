@@ -21,9 +21,10 @@ use super::refresh::advance_before_reconcile;
 use super::runtime::with_prelude;
 use super::services::{
     FRESH_DATA_DIR, Fresh, bring_up_services, clear_native_sockets, compose_projects,
-    forget_hooks_after_services, forget_unstarted_services, has_live_services, planned_services,
-    preflight_isolation, resolve_service_env, service_roles, shared_service_env, stop_containers,
-    stop_service_pumps, undo_failed_isolation, worktree_url,
+    forget_hooks_after_services, forget_unstarted_services, has_live_services, leave_changed_kinds,
+    planned_services, preflight_isolation, resolve_service_env, service_roles, shared_service_env,
+    stop_containers, stop_service_containers, stop_service_pumps, undo_failed_isolation,
+    worktree_url,
 };
 use super::share::{share_closed, share_target_is_up, sweep_dead_shares_with, take_share_down};
 // Only for the intra-doc link above `sweep_orphaned_groups`.
@@ -610,10 +611,23 @@ fn start_checked(
         .map(|(process, config)| (process.clone(), config.roles()))
         .filter(|(_, roles)| !roles.is_empty())
         .collect();
+    // The containers of services that were compose and are native now,
+    // stopped once the lock is let go: the port the native server is about
+    // to be given is the one they publish. A project no record names any
+    // more is one `rm` cannot take the data of, so the start says how.
+    let mut changed_kind: Vec<(String, Vec<String>)> = Vec::new();
+    let mut unnamed: Vec<String> = Vec::new();
     if let Some(record) = store.worktrees.get_mut(name) {
         record.roles = owners;
         if isolate {
+            changed_kind = leave_changed_kinds(paths, config, name, record)?;
             record.services = planned_services(config, &assignment.ports, record);
+            let named = compose_projects(record);
+            unnamed = changed_kind
+                .iter()
+                .map(|(project, _)| project.clone())
+                .filter(|project| !named.contains(project))
+                .collect();
         }
         // Written into the record this start saves and spawns from, not
         // left to what `prepare` wrote: a namespace nothing records is one
@@ -654,6 +668,25 @@ fn start_checked(
         });
         stop_containers(paths, &going_shared, progress)?;
     }
+    for (project, services) in &changed_kind {
+        let (verb, whose) = match services.len() {
+            1 => ("runs", "its compose container"),
+            _ => ("run", "their compose containers"),
+        };
+        let mut line = format!(
+            "{}: {} {verb} natively now — stopping {whose}",
+            worktree.display_name(),
+            services.join(", ")
+        );
+        if unnamed.contains(project) {
+            line.push_str(&format!(
+                "; nothing else of it is in {project}, so the data stays until `docker compose \
+                 -p {project} down -v` removes it"
+            ));
+        }
+        progress(&line);
+    }
+    stop_service_containers(paths, &changed_kind, progress)?;
     // And the containers a stale record replaced above left up, on a start
     // that is not about to bring that compose project up again itself.
     if !isolate && !inherited_projects.is_empty() {

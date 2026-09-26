@@ -581,6 +581,108 @@ fn a_compose_service_and_a_native_one_share_a_role_space_and_come_up_together() 
     );
 }
 
+// `native_instead` tells a developer to swap a compose service for a
+// native one of the same name. The next start wrote the native record
+// over the compose one and kept the log pump's pid, which then passed for
+// a running server: no native postgres started, the app stayed on the
+// container, and nothing in pando could find the container again.
+#[test]
+fn a_compose_service_that_becomes_native_is_stopped_before_the_server_starts() {
+    let dir = TempDir::new().unwrap();
+    let root = build(Kind::NextPnpmCompose, dir.path()).root;
+    let home = dir.path().join("pando-home");
+    common::docker::install(&home);
+    postgres::install(&home);
+    let paths = paths_for(&home, &root);
+    std::fs::create_dir_all(paths.project_dir()).unwrap();
+    let config_with = |services: &str| {
+        format!(
+            "[project]\nprovision = [\".env\"]\ninstall = \"true\"\n\n\
+             [dev]\ncmd = '''{}'''\nports = {{ PORT = \"web\" }}\n\n{services}",
+            listener_printing("DATABASE_URL")
+        )
+    };
+    std::fs::write(
+        paths.config_file(),
+        config_with(
+            "[[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
+             include = [\"postgres\", \"redis\"]\n\
+             env = { DATABASE_URL = \"postgres\", REDIS_URL = \"redis\" }\n",
+        ),
+    )
+    .unwrap();
+    let config = config::load(&paths).unwrap().config;
+    let mut f = Nat {
+        _dir: dir,
+        root,
+        home,
+        paths,
+        config,
+    };
+    let name = new_worktree(&f, "feat/one");
+    start_isolated(&f, &name);
+    let before = f.service(&name, "postgres");
+    let project = before.compose_project.clone().unwrap();
+    let pump = before.pgid.unwrap();
+    let redis = common::docker::service_pids(&f.home, &project);
+
+    std::fs::write(
+        f.paths.config_file(),
+        config_with(
+            "[[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
+             include = [\"redis\"]\nenv = { REDIS_URL = \"redis\" }\n\n\
+             [[services]]\nkind = \"native\"\nname = \"postgres\"\n\
+             env = { DATABASE_URL = \"postgres\" }\n",
+        ),
+    )
+    .unwrap();
+    f.config = config::load(&f.paths).unwrap().config;
+    let said = std::cell::RefCell::new(Vec::<String>::new());
+    actions::start(
+        &f.paths,
+        &f.config,
+        &name,
+        None,
+        actions::Mode::Isolated,
+        &|m| said.borrow_mut().push(m.to_string()),
+    )
+    .unwrap();
+
+    let native = f.service(&name, "postgres");
+    assert_eq!(native.kind, ServiceKind::Native);
+    assert_eq!(native.compose_project, None);
+    assert_ne!(native.pgid, Some(pump), "the log pump is not the server");
+    assert!(!process::group_alive(pump), "the log pump was stopped");
+    assert!(
+        process::is_alive(native.pid.unwrap()),
+        "a native server runs"
+    );
+    assert_eq!(native.port, before.port, "on the port the container had");
+    assert!(
+        common::docker::invocations_for(&f.home, &project)
+            .contains(&format!("compose -p {project} stop postgres")),
+        "{:?}",
+        common::docker::invocations_for(&f.home, &project)
+    );
+    assert_eq!(
+        common::docker::service_pids(&f.home, &project)
+            .into_iter()
+            .filter(|(service, _)| service == "redis")
+            .collect::<Vec<_>>(),
+        redis
+            .into_iter()
+            .filter(|(service, _)| service == "redis")
+            .collect::<Vec<_>>(),
+        "the compose service that stayed was left alone"
+    );
+    let said = said.into_inner();
+    assert!(
+        said.iter()
+            .any(|m| m.contains("postgres runs natively now") && !m.contains("down -v")),
+        "redis still names the project, so `rm` takes its data: {said:?}"
+    );
+}
+
 // ---- a data directory the fingerprint cannot see --------------------------
 
 // The other half of the hook-fingerprint bug, and the one only a native

@@ -8607,6 +8607,47 @@ fn a_stopped_isolated_worktree_is_not_running_to_a_second_stop() {
     assert!(!crate::process::group_alive(pump.pgid));
 }
 
+// A service record whose kind config has changed is written fresh, so
+// nothing would stop what the old one ran. A native server whose name is
+// now a compose service's was left running with no record of it, on the
+// port its container was about to be published on.
+#[test]
+fn a_native_server_whose_service_is_now_compose_is_stopped_and_forgotten() {
+    let mut fx = fixture();
+    let compose: Config = toml::from_str(
+        "[[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
+         include = [\"postgres\"]\nenv = { DATABASE_URL = \"postgres\" }\n",
+    )
+    .unwrap();
+    fx.config.services = compose.services;
+    let server = crate::testutil::spawn_guarded(
+        "exec sleep 300",
+        &std::env::temp_dir(),
+        &fx.paths.log_file("feat+one", "postgres"),
+    );
+    let mut record = WorktreeRecord::new(fx.root.clone(), false);
+    record.services = vec![state::ServiceRecord {
+        name: "postgres".to_string(),
+        kind: state::ServiceKind::Native,
+        port: Some(15432),
+        pid: Some(server.pid),
+        pgid: Some(server.pgid),
+        compose_project: None,
+    }];
+
+    let containers =
+        super::services::leave_changed_kinds(&fx.paths, &fx.config, "feat+one", &mut record)
+            .unwrap();
+    assert!(containers.is_empty(), "a native server has no container");
+    assert!(!crate::process::group_alive(server.pgid));
+
+    let ports = BTreeMap::from([("postgres".to_string(), 15432)]);
+    let planned = super::services::planned_services(&fx.config, &ports, &record);
+    assert_eq!(planned.len(), 1, "{planned:?}");
+    assert_eq!(planned[0].kind, state::ServiceKind::Compose);
+    assert_eq!(planned[0].pid, None, "the server's pid is not a log pump");
+}
+
 // 0.2.0 could leave a compose record with a project and no port on a
 // worktree that is not isolated — a failed isolated start. `status` and
 // the TUI showed it as `postgres  no port` for ever. It is still what `rm`

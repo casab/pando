@@ -45,6 +45,30 @@ pub(super) fn stop_containers(
     )
 }
 
+/// Stops only the named services' containers of each compose project,
+/// leaving the rest of the project running and every volume in place.
+pub(super) fn stop_service_containers(
+    paths: &PandoPaths,
+    containers: &[(String, Vec<String>)],
+    progress: &dyn Fn(&str),
+) -> Result<()> {
+    for (project, services) in containers {
+        stop_compose_projects(
+            paths,
+            std::slice::from_ref(project),
+            |compose| compose.stop_services(services),
+            |project| {
+                format!(
+                    "Docker is not running, so the services of {project} are not either — \
+                     nothing to stop"
+                )
+            },
+            progress,
+        )?;
+    }
+    Ok(())
+}
+
 /// Removes the containers, network and volumes of every compose project
 /// named — what `rm` does.
 ///
@@ -200,16 +224,70 @@ fn native_names(config: &Config) -> Vec<String> {
         .collect()
 }
 
+/// The kind of record a service config runs gets, given its native names.
+fn kind_of(native: &[String], service: &str) -> state::ServiceKind {
+    match native.iter().any(|name| name == service) {
+        true => state::ServiceKind::Native,
+        false => state::ServiceKind::Compose,
+    }
+}
+
+/// Stops what the records of services whose kind config has changed ran:
+/// a compose `postgres` that is now a native one, or the other way round.
+///
+/// [`planned_services`] writes the new kind's record fresh, so nothing
+/// would stop the old one's process or find its container again. Its
+/// process — a log pump, or the native server itself — is stopped here,
+/// under the lock, as a switch to the shared services stops it. Its
+/// containers are returned, by compose project, for
+/// [`stop_service_containers`] once the lock is let go.
+pub(super) fn leave_changed_kinds(
+    paths: &PandoPaths,
+    config: &Config,
+    name: &str,
+    record: &mut WorktreeRecord,
+) -> Result<Vec<(String, Vec<String>)>> {
+    let native = native_names(config);
+    let roles = service_roles(config);
+    let mut containers: Vec<(String, Vec<String>)> = Vec::new();
+    for service in record.services.iter_mut() {
+        if !roles.contains(&service.name) || service.kind == kind_of(&native, &service.name) {
+            continue;
+        }
+        if let Some(pgid) = service.pgid {
+            proc::stop(pgid, STOP_GRACE)
+                .with_context(|| format!("stop the process group {pgid} of {}", service.name))?;
+            service.pid = None;
+            service.pgid = None;
+        }
+        match (service.kind, &service.compose_project) {
+            (state::ServiceKind::Compose, Some(project)) => {
+                match containers.iter_mut().find(|(p, _)| p == project) {
+                    Some((_, services)) => services.push(service.name.clone()),
+                    None => containers.push((project.clone(), vec![service.name.clone()])),
+                }
+            }
+            (state::ServiceKind::Native, _) => {
+                let _ = std::fs::remove_dir_all(paths.service_socket_dir(name, &service.name));
+            }
+            _ => {}
+        }
+    }
+    Ok(containers)
+}
+
 /// The service records an isolated start writes, before anything is up.
 ///
 /// A record that already exists keeps its log pump, so a plain `start`
-/// beside live services does not lose the pid that stops it. A record for
-/// a service config no longer includes is kept too: it still names the
-/// compose project, and dropping it would leave a container and its volume
-/// with nothing in pando able to take them down — but its *port* is
-/// blanked, because the window has moved on and another service has that
-/// number now. `status` would otherwise show two services on one port, and
-/// only one of them would be telling the truth.
+/// beside live services does not lose the pid that stops it — but only a
+/// record of the same kind: one whose service config now runs the other
+/// way is written fresh, once [`leave_changed_kinds`] has stopped what it
+/// ran. A record for a service config no longer includes is kept too: it
+/// still names the compose project, and dropping it would leave a
+/// container and its volume with nothing in pando able to take them down
+/// — but its *port* is blanked, because the window has moved on and
+/// another service has that number now. `status` would otherwise show two
+/// services on one port, and only one of them would be telling the truth.
 pub(super) fn planned_services(
     config: &Config,
     ports: &BTreeMap<String, u16>,
@@ -218,20 +296,20 @@ pub(super) fn planned_services(
     let native = native_names(config);
     let mut out: Vec<state::ServiceRecord> = Vec::new();
     for service in service_roles(config) {
-        let existing = record.services.iter().find(|s| s.name == service);
         // A native record's pid *is* the server, and `reconcile` drops the
         // record when it dies; a compose record's pid is only the log
         // pump in front of a container. Same field, and the two must not
         // be confused — a record written with the wrong kind would either
         // lose a container pando can never find again, or keep a database
         // record for a process that exited.
-        let is_native = native.contains(&service);
+        let kind = kind_of(&native, &service);
+        let existing = record
+            .services
+            .iter()
+            .find(|s| s.name == service && s.kind == kind);
         out.push(state::ServiceRecord {
             name: service.clone(),
-            kind: match is_native {
-                true => state::ServiceKind::Native,
-                false => state::ServiceKind::Compose,
-            },
+            kind,
             port: ports.get(&service).copied(),
             pid: existing.and_then(|s| s.pid),
             pgid: existing.and_then(|s| s.pgid),
@@ -240,9 +318,9 @@ pub(super) fn planned_services(
             // project is one whose containers were never brought up, so
             // `stop` and `rm` have nothing to ask Docker about, and a
             // failed start can drop it.
-            compose_project: match is_native {
-                true => None,
-                false => existing.and_then(|s| s.compose_project.clone()),
+            compose_project: match kind {
+                state::ServiceKind::Native => None,
+                state::ServiceKind::Compose => existing.and_then(|s| s.compose_project.clone()),
             },
         });
     }
