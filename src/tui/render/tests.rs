@@ -2348,6 +2348,36 @@ fn the_detail_pane_has_a_git_row() {
     assert!(row.contains("clean · even with main"), "{rendered}");
 }
 
+// Git state nobody knows is `reading` only while it is being read: a
+// worktree whose directory is gone, or whose `git status` failed, would
+// otherwise say it for ever, under a header that stopped saying it.
+#[test]
+fn the_git_row_says_reading_only_while_git_is_being_read() {
+    let git_row = |app: &mut App| {
+        let rendered = text_of(&draw(app, 140, 30));
+        rendered
+            .lines()
+            .find(|line| line.contains("││ git "))
+            .unwrap_or_else(|| panic!("no git row:\n{rendered}"))
+            .to_string()
+    };
+    let mut app = test_app(&["feat+tui"]);
+    app.worktrees[0].dirty = None;
+    app.enriching = true;
+    assert!(git_row(&mut app).contains("reading git…"));
+    app.enriching = false;
+    app.git_refreshing = true;
+    assert!(git_row(&mut app).contains("reading git…"));
+    app.git_refreshing = false;
+    let row = git_row(&mut app);
+    assert!(row.contains("status could not be read"), "{row}");
+
+    app.worktrees[0].prunable = true;
+    let row = git_row(&mut app);
+    assert!(row.contains("no working tree to read"), "{row}");
+    assert!(!row.contains("reading"), "{row}");
+}
+
 // One duration style in the pane: the commit's age reads like the uptime.
 #[test]
 fn the_commit_age_is_compact() {

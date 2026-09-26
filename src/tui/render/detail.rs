@@ -324,7 +324,20 @@ fn git_row(app: &App, wt: &crate::worktree::Worktree, width: usize) -> Line<'sta
             Style::new().fg(yellow()).add_modifier(Modifier::BOLD),
         )),
         Some(false) => parts.push(("clean".to_string(), Style::new().fg(text_dim()))),
-        None => parts.push(("reading git…".to_string(), Style::new().fg(text_muted()))),
+        // Unknown is only `reading` while a read is under way. A worktree
+        // whose directory is gone has nothing to read, and a `git status`
+        // that failed or ran out of time is not going to answer by itself.
+        None if wt.prunable => parts.push((
+            "no working tree to read".to_string(),
+            Style::new().fg(signal_color(wt)),
+        )),
+        None if app.enriching || app.git_refreshing => {
+            parts.push(("reading git…".to_string(), Style::new().fg(text_muted())))
+        }
+        None => parts.push((
+            "status could not be read".to_string(),
+            Style::new().fg(text_muted()),
+        )),
     }
     if let Some((ahead, behind)) = wt.ahead_behind {
         let base = app
