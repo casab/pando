@@ -1238,23 +1238,28 @@ fn bring_up_native_services(
     // worktree would otherwise do.
     let live = live_native_services(paths, name)?;
 
-    let mut started: Vec<native::Native> = Vec::new();
+    let mut started: Vec<Brought> = Vec::new();
     let mut fresh = Fresh(false);
     for service in planned {
         if live.contains(&service.service) {
             continue;
         }
-        match start_one_native(paths, config, name, &service, progress) {
-            Ok(native::Init::Ran) => fresh = Fresh(true),
-            Ok(_) => {}
+        let spawned = match start_one_native(paths, config, name, &service, progress) {
+            Ok(Some((init, pgid))) => {
+                if matches!(init, native::Init::Ran) {
+                    fresh = Fresh(true);
+                }
+                Some(pgid)
+            }
+            Ok(None) => None,
             Err(e) => {
                 stop_native_services(paths, name, &started);
                 return Err(e);
             }
-        }
-        started.push(service);
+        };
+        started.push(Brought { service, spawned });
     }
-    for service in &started {
+    for Brought { service, .. } in &started {
         let Some(pid) = recorded_native_pid(paths, name, &service.service)? else {
             continue;
         };
@@ -1267,6 +1272,14 @@ fn bring_up_native_services(
         }
     }
     Ok(fresh)
+}
+
+/// A native service one bring-up waits on, with the process group it
+/// spawned for it: `None` for a server another start of this worktree
+/// spawned first, which this one waits on and never stops.
+struct Brought {
+    service: native::Native,
+    spawned: Option<i32>,
 }
 
 /// Whether a start built a data directory that was not there before, and
@@ -1291,13 +1304,26 @@ pub(super) const FRESH_DATA_DIR: &str = "a service here was given a new, empty d
 /// forgotten now, before anything that can fail: a start that dies waiting
 /// for the server would otherwise leave their fingerprints in place, and
 /// the retry would skip the migration against an empty database.
+///
+/// Returns the init and the process group it spawned, or `None` when the
+/// record names a server that is alive. Two starts of one worktree at once
+/// — the TUI and an agent — both found no server and spawned one on the
+/// same data directory, and the second pid written over the first left a
+/// live server no record named. So each service's starts take turns on a
+/// lock beside its data directory, from the look at the record to the pid
+/// written into it, with the init inside: a second start that found a
+/// directory the first one's init was still filling adopted it half made.
 fn start_one_native(
     paths: &PandoPaths,
     config: &Config,
     name: &str,
     service: &native::Native,
     progress: &dyn Fn(&str),
-) -> Result<native::Init> {
+) -> Result<Option<(native::Init, i32)>> {
+    let _turn = state::lock(&service_lock_file(&service.datadir))?;
+    if recorded_native_pid(paths, name, &service.service)?.is_some_and(proc::is_alive) {
+        return Ok(None);
+    }
     let init = service.ensure_init(progress)?;
     if matches!(init, native::Init::Ran) {
         forget_hooks_after_services(paths, config, name, FRESH_DATA_DIR, progress)?;
@@ -1316,7 +1342,15 @@ fn start_one_native(
         record.pgid = Some(spawned.pgid);
     }
     state::save(&paths.state_file(), &store)?;
-    Ok(init)
+    Ok(Some((init, spawned.pgid)))
+}
+
+/// The lock one native service's starts take turns on: beside its data
+/// directory, never in it, where adoption would take it for data.
+fn service_lock_file(datadir: &Path) -> PathBuf {
+    let mut path = datadir.as_os_str().to_owned();
+    path.push(".lock");
+    PathBuf::from(path)
 }
 
 /// The native services of this worktree whose server is still alive.
@@ -1363,11 +1397,15 @@ fn native_record<'a>(
         .find(|s| s.name == service && s.kind == state::ServiceKind::Native)
 }
 
-/// Signals every native service this call started and forgets its pid, so
+/// Signals every native server this call spawned and forgets its pid, so
 /// a failed start leaves no server holding a port and no record claiming
 /// one is there.
-fn stop_native_services(paths: &PandoPaths, name: &str, started: &[native::Native]) {
-    if started.is_empty() {
+///
+/// Only what it spawned. A server another start of this worktree spawned
+/// is that start's to stop, and a record that names another process
+/// group now — or a socket directory that goes with it — is left to it.
+fn stop_native_services(paths: &PandoPaths, name: &str, started: &[Brought]) {
+    if started.iter().all(|brought| brought.spawned.is_none()) {
         return;
     }
     let Ok(_lock) = state::lock(&paths.lock_file()) else {
@@ -1376,17 +1414,17 @@ fn stop_native_services(paths: &PandoPaths, name: &str, started: &[native::Nativ
     let Ok(mut store) = state::load(&paths.state_file()) else {
         return;
     };
-    for service in started {
+    for Brought { service, spawned } in started {
+        let Some(pgid) = *spawned else { continue };
+        let _ = proc::stop(pgid, STOP_GRACE);
         let Some(record) = store
             .worktrees
             .get_mut(name)
             .and_then(|r| native_record(&mut r.services, &service.service))
+            .filter(|record| record.pgid == Some(pgid))
         else {
             continue;
         };
-        if let Some(pgid) = record.pgid {
-            let _ = proc::stop(pgid, STOP_GRACE);
-        }
         record.pid = None;
         record.pgid = None;
         let _ = std::fs::remove_dir_all(&service.socket_dir);

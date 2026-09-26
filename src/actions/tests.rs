@@ -8986,6 +8986,107 @@ fn a_compose_record_docker_could_not_be_asked_about_is_kept_beside_the_native_on
     assert_eq!(services[0].pid, Some(4242));
 }
 
+// Two starts of one worktree at once — the TUI and an agent — both found
+// no native server running and both spawned one on the same data
+// directory, and the second pid was written over the first: a live server
+// no record named, holding the port and the data directory from every
+// start after it. A data directory neither had made yet, both initialised.
+#[test]
+fn two_starts_at_once_spawn_and_record_one_native_server() {
+    use std::os::unix::fs::PermissionsExt;
+    if !python3_available() {
+        eprintln!("skipping: python3 is not installed");
+        return;
+    }
+    let mut fx = fixture();
+    fx.paths.ensure_home().unwrap();
+    let inits = fx.paths.home.join("slowdb-inits");
+    let spawns = fx.paths.home.join("slowdb-spawns");
+    let recipes = fx.paths.recipes_dir();
+    std::fs::create_dir_all(&recipes).unwrap();
+    // An init slow enough that both starts are inside it at once.
+    std::fs::write(
+        recipes.join("slowdb.toml"),
+        format!(
+            "kind = \"service\"\nname = \"slowdb\"\nbinaries = [\"pando-fake-slowdb\"]\n\n\
+             [service]\ninit = \"echo ran >> '{}' && sleep 1 && mkdir -p {{datadir}}\"\n\
+             cmd = \"exec pando-fake-slowdb {{port}}\"\n",
+            inits.display()
+        ),
+    )
+    .unwrap();
+    let bin = fx.paths.home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(
+        bin.join("pando-fake-slowdb"),
+        format!(
+            "#!/bin/sh\necho spawned >> '{}'\n\
+             exec python3 -c \"import socket,sys,time;s=socket.socket();\
+             s.bind(('127.0.0.1',int(sys.argv[1])));s.listen(5);time.sleep(60)\" \"$1\"\n",
+            spawns.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        bin.join("pando-fake-slowdb"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let native: Config =
+        toml::from_str("[[services]]\nkind = \"native\"\nname = \"slowdb\"\n").unwrap();
+    fx.config.services = native.services;
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut record = WorktreeRecord::new(fx.root.clone(), false);
+    record.services = vec![state::ServiceRecord {
+        name: "slowdb".to_string(),
+        kind: state::ServiceKind::Native,
+        port: Some(port),
+        pid: None,
+        pgid: None,
+        compose_project: None,
+    }];
+    let mut store = state::State::default();
+    store.worktrees.insert("feat+one".to_string(), record);
+    state::save(&fx.paths.state_file(), &store).unwrap();
+    let ports = BTreeMap::from([("slowdb".to_string(), port)]);
+
+    let bring_up = || {
+        super::services::bring_up_services(
+            &fx.paths, &fx.config, "feat+one", &fx.root, &ports, &noop,
+        )
+        .map(|_| ())
+    };
+    let (a, b) = std::thread::scope(|scope| {
+        let a = scope.spawn(bring_up);
+        let b = scope.spawn(bring_up);
+        (a.join().unwrap(), b.join().unwrap())
+    });
+
+    let record = fx.state().worktrees["feat+one"].services[0].clone();
+    let _server = record.pgid.map(|pgid| crate::testutil::Detached {
+        pid: record.pid.unwrap_or_default(),
+        pgid,
+    });
+    let count = |path: &Path| {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    assert_eq!(count(&spawns), 1, "one server for one data directory");
+    assert_eq!(count(&inits), 1, "one init for one data directory");
+    a.unwrap();
+    b.unwrap();
+    assert!(
+        record.pid.is_some_and(proc::is_alive),
+        "the server that runs is the one recorded: {record:?}"
+    );
+}
+
 // 0.2.0 could leave a compose record with a project and no port on a
 // worktree that is not isolated — a failed isolated start. `status` and
 // the TUI showed it as `postgres  no port` for ever. It is still what `rm`
