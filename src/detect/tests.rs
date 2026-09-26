@@ -1331,6 +1331,46 @@ fn a_package_whose_dev_script_builds_and_then_serves_is_given_its_port() {
     }
 }
 
+// pnpm hands `--port` to a script's last command. In `vite & vite build
+// --watch` that is the build, which refused it, while the backgrounded
+// Vite bound a port of its own and the wait on the reserved one failed
+// the start.
+#[test]
+fn a_workspace_app_is_given_its_flag_only_where_its_last_command_is_the_server() {
+    let dir = tempdir().unwrap();
+    workspace(dir.path());
+    for (app, dev) in [
+        ("docs", "vite & vite build --watch"),
+        ("site", "vite; vite build --watch"),
+        ("shop", "vite & node api.js"),
+        ("blog", "tsc -b && vite"),
+    ] {
+        std::fs::create_dir_all(dir.path().join("apps").join(app)).unwrap();
+        std::fs::write(
+            dir.path().join("apps").join(app).join("vite.config.ts"),
+            "export default {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("apps").join(app).join("package.json"),
+            format!(r#"{{ "scripts": {{ "dev": "{dev}" }} }}"#),
+        )
+        .unwrap();
+    }
+    let processes = proposed_processes(dir.path()).candidates[0]
+        .processes
+        .clone()
+        .unwrap();
+    for app in ["docs", "site", "shop"] {
+        let process = &processes[app];
+        assert_eq!(process.cmd, "pnpm dev", "{app}");
+        assert!(process.roles().is_empty(), "{app}: {:?}", process.ports);
+        assert!(process.ready.is_none(), "{app}");
+    }
+    assert_eq!(processes["blog"].cmd, "pnpm dev --port {port:blog}");
+    assert_eq!(processes["blog"].roles(), vec!["blog".to_string()]);
+}
+
 // ---- install ---------------------------------------------------------
 
 // Invariant 1: a lockfile can never change because pando ran an

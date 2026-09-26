@@ -442,12 +442,10 @@ fn script_candidate(
 ) -> Candidate {
     let value = format!("{}{name}", script_runner(signals));
     let why = format!("package.json scripts.{name}");
-    let last = last_command(body);
     let flagged = rule.filter(|rule| {
         rule.port == PortMechanism::InCommand
             && !rule.scripts_build_assets
-            && runs(rule, last)
-            && !only_builds(rule, last)
+            && flag_reaches_server(rule, body)
             && !is_multiplexer(body)
             && fixed_port(body).is_none()
     });
@@ -469,6 +467,14 @@ fn script_candidate(
         ports: Some(PortsSpec::List(vec![role.to_string()])),
         ..Candidate::default()
     }
+}
+
+/// Whether a port flag appended to a script reaches the rule's server:
+/// the script's last command, the one npm and pnpm hand it to, runs the
+/// framework's server and not only its build.
+pub(super) fn flag_reaches_server(rule: &FrameworkRule, body: &str) -> bool {
+    let last = last_command(body);
+    runs(rule, last) && !only_builds(rule, last)
 }
 
 /// The last command of a script body, after its final `&`, `&&`, `;`, `|`

@@ -8,7 +8,7 @@ use crate::catalog::frameworks::{FrameworkRule, PortMechanism};
 use crate::config::{PortsSpec, ProcessConfig, ReadySpec};
 
 use super::apply::DEV;
-use super::dev::{is_multiplexer, own_port, script_args, script_runner};
+use super::dev::{flag_reaches_server, is_multiplexer, own_port, script_args, script_runner};
 use super::frameworks::script_framework;
 use super::proposal::{Candidate, Proposal, Slot};
 use super::signals::{Signals, parse_scripts, present};
@@ -215,12 +215,18 @@ pub fn workspace_apps(root: &Path, signals: &Signals) -> Vec<WorkspaceApp> {
             // flag appended to its own script: `pnpm dev --port 1234`, or
             // `npm run dev -- --port 1234`, runs what the app already runs,
             // on the port pando chose. Not to a script that already says
-            // which port: that would be the flag twice.
-            if let Some(rule) = rule
-                && fixed.is_none()
-                && rule.port == PortMechanism::InCommand
-                && let Some(flag) = rule.port_flag
-            {
+            // which port: that would be the flag twice. Nor to one whose
+            // last command, the one the flag is handed to, is not the
+            // framework's server: `vite & vite build --watch` hands it to
+            // the build, which refuses it.
+            let flag = rule
+                .filter(|rule| {
+                    fixed.is_none()
+                        && rule.port == PortMechanism::InCommand
+                        && flag_reaches_server(rule, script)
+                })
+                .and_then(|rule| rule.port_flag);
+            if let Some(flag) = flag {
                 cmd = format!(
                     "{cmd} {args}{}",
                     flag.replace("{port}", &format!("{{port:{name}}}"))
@@ -230,9 +236,7 @@ pub fn workspace_apps(root: &Path, signals: &Signals) -> Vec<WorkspaceApp> {
                 default_port: fixed.or_else(|| app_default_port(signals, name, rule)),
                 port: match rule {
                     _ if fixed.is_some() => PortMechanism::Ask,
-                    Some(rule)
-                        if rule.port == PortMechanism::InCommand && rule.port_flag.is_none() =>
-                    {
+                    Some(rule) if rule.port == PortMechanism::InCommand && flag.is_none() => {
                         PortMechanism::Ask
                     }
                     Some(rule) => rule.port,
