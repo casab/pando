@@ -12841,6 +12841,19 @@ fn doctor_never_lists_a_database_another_projects_record_holds() {
     );
 }
 
+// Anyone who may make a database under the prefix can put a statement in
+// its name. It is still listed, with no command: the one printed for it
+// dropped the main database as well.
+#[test]
+fn doctor_prints_no_drop_for_a_leftover_whose_name_is_not_plain() {
+    let (ns, _redis) = stopped_namespaced();
+    std::fs::write(ns.fake.join("dbs/shop__a`; DROP DATABASE `shop"), "").unwrap();
+    let leftovers = namespace_leftovers(&ns.fx.paths, &ns.fx.config, &ns.fx.state());
+    assert_eq!(leftovers.len(), 1, "{leftovers:?}");
+    assert_eq!(leftovers[0].name, "shop__a`; DROP DATABASE `shop");
+    assert_eq!(leftovers[0].by_hand, None);
+}
+
 #[test]
 fn doctor_reports_a_leftover_database_as_a_note_with_its_fix() {
     let (ns, _redis) = stopped_namespaced();

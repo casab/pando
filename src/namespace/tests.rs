@@ -805,6 +805,52 @@ fn the_engine_refuses_to_drop_anything_that_is_not_a_namespace() {
     );
 }
 
+// The main database's name comes from an env file, and the listing put it
+// in a command unchecked: `$(…)` in it ran in the shell before the client
+// was ever started. It is refused like any name that is not plain, and
+// nothing runs.
+#[test]
+fn a_main_name_that_is_not_plain_is_never_put_in_a_listing() {
+    let fake = FakeClient::new("mariadb", "MYSQL_PWD", FAKE_MARIADB);
+    let recipe = recipe_namespace("mariadb");
+    let db = server(&recipe, &fake, "mariadb");
+    let ran = fake.dir.path().join("ran");
+    let main = format!("shop$(touch {})", ran.display());
+    let e = format!("{:#}", db.list(&main).unwrap_err());
+    assert!(e.contains("not a plain name"), "{e}");
+    assert!(!ran.exists(), "the shell ran what the env file said");
+    assert_eq!(fake.read("argv"), "", "the client was run");
+    assert!(db.grant(&main).is_none(), "and no grant is printed for it");
+    assert!(db.grant("shop").is_some());
+}
+
+// A name the server lists can be anything its owner typed. Only one the
+// engine would drop itself is printed as a drop: the command printed for
+// `shop__a`; DROP DATABASE `shop` dropped the main database with it.
+#[test]
+fn a_drop_by_hand_is_printed_only_for_a_name_the_engine_would_drop() {
+    let fake = FakeClient::new("mariadb", "MYSQL_PWD", FAKE_MARIADB);
+    let recipe = recipe_namespace("mariadb");
+    let db = server(&recipe, &fake, "mariadb");
+    assert!(
+        db.by_hand("shop__feat_x")
+            .is_some_and(|c| c.contains("DROP DATABASE IF EXISTS `shop__feat_x`")),
+        "{:?}",
+        db.by_hand("shop__feat_x")
+    );
+    for name in ["shop__a`; DROP DATABASE `shop", "shop__a'b", "shop", ""] {
+        assert_eq!(db.by_hand(name), None, "{name:?}");
+    }
+
+    let fake = FakeClient::new("redis-cli", "REDISCLI_AUTH", FAKE_REDIS);
+    let recipe = recipe_namespace("redis");
+    let cache = server(&recipe, &fake, "redis");
+    assert!(cache.by_hand("3").is_some());
+    for name in ["0", "3; FLUSHALL", "x"] {
+        assert_eq!(cache.by_hand(name), None, "{name:?}");
+    }
+}
+
 const FAKE_REDIS: &str = r#"case "$*" in
   *" ping") echo PONG ;;
   *DBSIZE*)

@@ -158,11 +158,7 @@ impl Server<'_> {
     /// Only ever called past [`super::may_drop`]; the name is checked again
     /// here anyway, because this is the line that runs the statement.
     pub fn drop(&self, name: &str, main: &str) -> Result<()> {
-        let fits = match self.recipe.kind {
-            NamespaceKind::Database => is_plain(name) && name.contains(MARKER),
-            NamespaceKind::Slot => name.parse::<u32>().is_ok_and(|slot| slot > 0),
-        };
-        if !fits {
+        if !self.could_have_made(name) {
             bail!("pando will not drop {name:?}: it is not a namespace it could have made");
         }
         let out = self.run(&self.recipe.drop, Some(name))?;
@@ -182,11 +178,15 @@ impl Server<'_> {
 
     /// Every database on the server named for a worktree of `main` —
     /// `<main>__…` — as far as this login can see. Empty when the recipe
-    /// has no way to ask.
+    /// has no way to ask. A `main` that is not a plain name is refused
+    /// before anything runs, as [`Server::script`] refuses a namespace.
     pub fn list(&self, main: &str) -> Result<Vec<String>> {
         let Some(command) = self.recipe.list.as_deref() else {
             return Ok(Vec::new());
         };
+        if !is_plain(main) {
+            bail!("{main:?} is not a plain name, so pando will not put it in a command");
+        }
         let vars = Vars {
             prefix_like: Some(prefix_like(main)),
             ..self.vars(None)
@@ -212,8 +212,13 @@ impl Server<'_> {
 
     /// The command that drops `name` — the recipe's own, as pando would
     /// run it — for a person to run when pando could not: printed, never
-    /// run, and never with the password in it.
+    /// run, and never with the password in it. `None` for a name
+    /// [`Server::drop`] would refuse: a printed command is run as it is
+    /// printed.
     pub fn by_hand(&self, name: &str) -> Option<String> {
+        if !self.could_have_made(name) {
+            return None;
+        }
         let rendered = template::render_with(&self.recipe.drop, &self.vars(Some(name))).ok()?;
         Some(match &self.recipe.password_env {
             Some(var) if self.login.has_password() => {
@@ -249,9 +254,12 @@ impl Server<'_> {
 
     /// What an administrator runs, once, so this login may make and drop
     /// `<main>__…` on this server and nothing else — when the recipe
-    /// knows how to say it.
+    /// knows how to say it, and `main` is a plain name.
     pub fn grant(&self, main: &str) -> Option<String> {
         let grant = self.recipe.grant.as_deref()?;
+        if !is_plain(main) {
+            return None;
+        }
         let account = self
             .recipe
             .account
@@ -313,6 +321,16 @@ impl Server<'_> {
             (None, _) => {
                 format!("{head} — give it the right to {scope} on that server. Nothing was {done}.")
             }
+        }
+    }
+
+    /// Whether `name` is a namespace pando could have made on this server:
+    /// a plain database name with the marker in it, or a slot other than
+    /// 0. Nothing else is dropped, or printed as a drop.
+    fn could_have_made(&self, name: &str) -> bool {
+        match self.recipe.kind {
+            NamespaceKind::Database => is_plain(name) && name.contains(MARKER),
+            NamespaceKind::Slot => name.parse::<u32>().is_ok_and(|slot| slot > 0),
         }
     }
 
