@@ -485,7 +485,6 @@ impl App {
         out
     }
 
-    // ---- background work -------------------------------------------------
     pub(super) fn handle_question_key(
         &mut self,
         key: KeyEvent,
