@@ -3391,6 +3391,125 @@ fn a_share_that_fails_leaves_nothing_pending() {
     assert!(fx.state().worktrees[&name].pending_shares.is_empty());
 }
 
+/// A provider whose tunnels publish only once the test opens the gate,
+/// each at a URL of its own, and which counts how many it was asked for.
+struct GatedProvider {
+    started: std::sync::atomic::AtomicUsize,
+    open: std::sync::Mutex<bool>,
+    opened: std::sync::Condvar,
+}
+
+impl tunnel::Provider for GatedProvider {
+    fn name(&self) -> &'static str {
+        "cloudflared"
+    }
+    fn ensure_present(&self, _: &PandoPaths) -> Result<()> {
+        Ok(())
+    }
+    fn start(
+        &self,
+        paths: &PandoPaths,
+        name: &str,
+        _: &str,
+        _: u16,
+        spawned: &dyn Fn(i32),
+    ) -> Result<tunnel::TunnelSpawn> {
+        let n = self
+            .started
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let open = self.open.lock().unwrap();
+        drop(self.opened.wait_while(open, |open| !*open).unwrap());
+        let log_path = paths.log_file(name, tunnel::TUNNEL_LOG);
+        let spawn = proc::spawn_detached(SpawnOptions {
+            shell_cmd: "exec sleep 300",
+            cwd: &std::env::temp_dir(),
+            log_file: &log_path,
+            env: &[],
+            status_file: None,
+        })?;
+        spawned(spawn.pgid);
+        Ok(tunnel::TunnelSpawn {
+            pid: spawn.pid,
+            pgid: spawn.pgid,
+            public_url: format!("https://tunnel-{n}.trycloudflare.com"),
+            log_path,
+            unconnected: None,
+        })
+    }
+}
+
+// Every tunnel of a worktree writes one log, and each wait takes the
+// first URL in it: two shares at once could both read one tunnel's URL,
+// and the one that recorded second closed the tunnel serving it. The
+// TUI's `t` and an agent's `pando share` of one worktree is all it takes.
+#[test]
+fn a_share_while_another_of_the_worktree_is_opening_waits_and_answers_with_its_url() {
+    let Some((fx, name, _guards, _)) = shared_fixture() else {
+        return;
+    };
+    let provider = GatedProvider {
+        started: std::sync::atomic::AtomicUsize::new(0),
+        open: std::sync::Mutex::new(false),
+        opened: std::sync::Condvar::new(),
+    };
+    let said = std::sync::Mutex::new(Vec::<String>::new());
+    let share_of = |progress: &(dyn Fn(&str) + Sync)| {
+        share_with(
+            &fx.paths,
+            &fx.config,
+            &name,
+            &provider,
+            &stub_proxy,
+            progress,
+        )
+    };
+    let started = || provider.started.load(std::sync::atomic::Ordering::SeqCst);
+    // The gate opens whatever was seen, so a failed wait is a failed
+    // assertion rather than two threads blocked for good.
+    let (asked, reached, first, second) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| share_of(&noop));
+        let asked = wait_until(Duration::from_secs(20), || started() == 1);
+        let second = scope.spawn(|| share_of(&|m: &str| said.lock().unwrap().push(m.to_string())));
+        // Until the second share is either waiting or has asked for a
+        // tunnel of its own, whichever this code does.
+        let reached = asked
+            && wait_until(Duration::from_secs(20), || {
+                started() > 1 || said.lock().unwrap().iter().any(|m| m.contains("waiting"))
+            });
+        *provider.open.lock().unwrap() = true;
+        provider.opened.notify_all();
+        (
+            asked,
+            reached,
+            first.join().unwrap(),
+            second.join().unwrap(),
+        )
+    });
+    let _share = share_guard(&fx, &name);
+    assert!(asked, "the first share never asked for its tunnel");
+    assert!(
+        reached,
+        "the second share neither waited nor opened a tunnel"
+    );
+
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_eq!(
+        provider.started.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one tunnel for one worktree"
+    );
+    assert!(!first.already);
+    assert!(second.already, "{second:?}");
+    assert_eq!(second.public_url, first.public_url);
+    let record = fx.state().worktrees[&name].share.clone().unwrap();
+    assert_eq!(record.public_url, first.public_url);
+    assert!(
+        crate::process::is_alive(record.tunnel_pid),
+        "the recorded tunnel is the one still serving its URL"
+    );
+}
+
 /// A worktree with a share of `owner`'s still coming up, which has
 /// spawned the groups `pgids`.
 fn state_with_a_pending_share(owner: u32, pgids: Vec<i32>) -> state::State {

@@ -120,6 +120,13 @@ impl PandoPaths {
         self.logs_dir(name).join(format!("{source}.log"))
     }
 
+    /// Held for the whole of one share of a worktree. Beside the tunnel's
+    /// log, which is what two shares at once would both write, and gone
+    /// with it when the worktree is removed.
+    pub fn share_lock_file(&self, name: &str) -> PathBuf {
+        self.logs_dir(name).join("share.lock")
+    }
+
     pub fn data_dir(&self, name: &str) -> PathBuf {
         self.project_dir().join("data").join(name)
     }
@@ -438,6 +445,10 @@ mod tests {
             p.log_file("feat+x", "dev"),
             base.join("logs/feat+x/dev.log")
         );
+        assert_eq!(
+            p.share_lock_file("feat+x"),
+            base.join("logs/feat+x/share.lock")
+        );
         assert_eq!(p.data_dir("feat+x"), base.join("data/feat+x"));
         assert_eq!(p.compose_dir(), base.join("compose"));
         assert_eq!(
@@ -471,6 +482,7 @@ mod tests {
             p.worktree_path("feat+x"),
             p.logs_dir("feat+x"),
             p.log_file("feat+x", "dev"),
+            p.share_lock_file("feat+x"),
             p.data_dir("feat+x"),
             p.compose_dir(),
             p.compose_override_file("feat+x"),

@@ -90,6 +90,9 @@ pub struct ShareOutcome {
 /// and a tunnel that takes up to thirty seconds to publish. That window is
 /// why the second half re-checks: a `stop` in the meantime must not leave a
 /// tunnel open onto nothing with no record of it.
+///
+/// A second share of the same worktree waits for the first to finish, and
+/// then answers with its URL.
 pub fn share(
     paths: &PandoPaths,
     config: &Config,
@@ -129,11 +132,25 @@ pub fn share_with(
     paths.ensure_home()?;
     let worktree = find_worktree(paths, name)?;
     let canonical = std::fs::canonicalize(&worktree.path).unwrap_or_else(|_| worktree.path.clone());
-
-    // Outside the lock, because `refresh` takes it: a worktree `start`
-    // returned from a moment ago is still `Starting`, and refusing it is
-    // refusing the first thing anyone types.
     let shown = worktree.display_name();
+
+    // One share of a worktree at a time, for the whole of it. Each tunnel
+    // of a worktree writes the same log, and two opening at once both read
+    // the URL printed first: one recorded the other's, and the other,
+    // giving way, closed the tunnel that served it. A second share waits
+    // here, and then finds the first one's record.
+    let lock_path = paths.share_lock_file(name);
+    let _one_share = match state::try_lock(&lock_path)? {
+        Some(held) => held,
+        None => {
+            progress(&format!("waiting for another share of {shown} to finish"));
+            state::lock(&lock_path)?
+        }
+    };
+
+    // Outside the state lock, because `refresh` takes it: a worktree
+    // `start` returned from a moment ago is still `Starting`, and refusing
+    // it is refusing the first thing anyone types.
     await_share_target(paths, name, &shown, progress);
 
     // Every refusal first, and the proxy's port, under the lock.
