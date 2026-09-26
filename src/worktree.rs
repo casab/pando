@@ -364,9 +364,13 @@ pub fn enrich_from_git(worktrees: &mut [Worktree], root: &Path) -> Result<()> {
 /// a full working tree, so a wide pool saturates the disk for the whole run.
 /// Callers that block on the result want it wide; the TUI keeps it narrow so
 /// startup enrichment does not starve the UI.
+///
+/// `known_base` is a base the caller resolved already, which saves the
+/// one to five git calls of resolving it again; `None` resolves it here.
 pub fn enrich_stream(
     root: &Path,
     items: Vec<(String, PathBuf)>,
+    known_base: Option<String>,
     sender: mpsc::Sender<EnrichUpdate>,
     pool_cap: usize,
 ) {
@@ -374,7 +378,7 @@ pub fn enrich_stream(
         return;
     }
     let porcelain = porcelain_by_path(root);
-    let base = resolve_base_branch(root);
+    let base = known_base.or_else(|| resolve_base_branch(root));
     enrich_listed(root, items, porcelain, base, sender, pool_cap);
 }
 
@@ -389,15 +393,18 @@ fn enrich_listed(
 ) {
     let count = items.len();
 
-    // Two repo-wide calls replace two forks per worktree: commit meta for
-    // every worktree HEAD, and ahead/behind for every branch. Misses fall
-    // back to a per-worktree fork.
-    let shas: Vec<&str> = porcelain
-        .values()
-        .filter_map(|e| e.head.as_deref())
+    // Two batched calls replace two forks per worktree: commit meta for
+    // each enriched worktree's HEAD, and ahead/behind for each one's
+    // branch — only theirs, so re-reading one row walks one branch, not
+    // every local one. Misses fall back to a per-worktree fork.
+    let listed: Vec<&PorcelainEntry> = items
+        .iter()
+        .filter_map(|(_, path)| porcelain.get(&listed_key(path)))
         .collect();
+    let shas: Vec<&str> = listed.iter().filter_map(|e| e.head.as_deref()).collect();
+    let branches: Vec<&str> = listed.iter().filter_map(|e| e.branch.as_deref()).collect();
     let commit_meta = batch_commit_meta(root, &shas);
-    let branch_counts = batch_ahead_behind(root, base.as_deref());
+    let branch_counts = batch_ahead_behind(root, base.as_deref(), &branches);
 
     let pool_size = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -494,18 +501,27 @@ fn batch_commit_meta(root: &Path, shas: &[&str]) -> HashMap<String, (String, Str
     map
 }
 
-/// Per-branch ahead/behind against the base, from one `git for-each-ref`.
-/// Requires git >= 2.41 for `%(ahead-behind:...)`; on failure the empty map
-/// routes callers to the per-worktree fallback.
-fn batch_ahead_behind(root: &Path, base: Option<&str>) -> HashMap<String, (u32, u32)> {
+/// Ahead/behind against the base for each of `branches`, from one
+/// `git for-each-ref`. Requires git >= 2.41 for `%(ahead-behind:...)`; on
+/// failure the empty map routes callers to the per-worktree fallback.
+///
+/// A branch name is matched as a literal ref: git refuses the glob
+/// characters in one, and `a` and `a/b` cannot both be branches.
+fn batch_ahead_behind(
+    root: &Path,
+    base: Option<&str>,
+    branches: &[&str],
+) -> HashMap<String, (u32, u32)> {
     let Some(base) = base else {
         return HashMap::new();
     };
-    let format = format!("%(refname:short)\x1f%(ahead-behind:{base})");
-    let out = crate::project::git(
-        root,
-        ["for-each-ref", "refs/heads", &format!("--format={format}")],
-    );
+    if branches.is_empty() {
+        return HashMap::new();
+    }
+    let format = format!("--format=%(refname:short)\x1f%(ahead-behind:{base})");
+    let refs = branches.iter().map(|b| format!("refs/heads/{b}"));
+    let args = ["for-each-ref".to_string(), format].into_iter().chain(refs);
+    let out = crate::project::git(root, args);
     let out = match out {
         Ok(o) if o.status.success() => o,
         _ => return HashMap::new(),
@@ -1325,10 +1341,95 @@ bare
             .collect();
 
         let (tx, rx) = mpsc::channel();
-        enrich_stream(&repo, items, tx, 16);
+        enrich_stream(&repo, items, None, tx, 16);
         let mut names: Vec<String> = rx.iter().map(|u| u.name).collect();
         names.sort();
         assert_eq!(names, vec!["alpha", "bravo", "charlie", "delta"]);
+    }
+
+    fn stream_updates(
+        repo: &Path,
+        wts: &[Worktree],
+        names: &[&str],
+        known_base: Option<&str>,
+    ) -> HashMap<String, EnrichUpdate> {
+        let items: Vec<(String, PathBuf)> = wts
+            .iter()
+            .filter(|w| names.contains(&w.name.as_str()))
+            .map(|w| (w.name.clone(), w.path.clone()))
+            .collect();
+        let (tx, rx) = mpsc::channel();
+        enrich_stream(repo, items, known_base.map(str::to_string), tx, 4);
+        rx.iter().map(|u| (u.name.clone(), u)).collect()
+    }
+
+    // The TUI re-reads the selected row on its own, with the base it
+    // already holds: the batched reads then cover that row only, and must
+    // give it exactly what the pass over every row does.
+    #[test]
+    fn enriching_one_worktree_gives_what_enriching_all_of_them_gives() {
+        let (_dir, repo) = repo_with_worktrees(&[("feat+a", "feat/a"), ("feat+b", "feat/b")]);
+        let trees = repo.parent().unwrap().join("trees");
+        git(
+            &trees.join("feat+a"),
+            &["commit", "--allow-empty", "-m", "a 1"],
+        );
+        git(
+            &trees.join("feat+a"),
+            &["commit", "--allow-empty", "-m", "a 2"],
+        );
+        git(
+            &trees.join("feat+b"),
+            &["commit", "--allow-empty", "-m", "b 1"],
+        );
+        git(&repo, &["commit", "--allow-empty", "-m", "main 1"]);
+        let wts = discover(&project_at(&repo)).unwrap();
+
+        let all = stream_updates(&repo, &wts, &["feat+a", "feat+b"], None);
+        let one = stream_updates(&repo, &wts, &["feat+a"], Some("main"));
+        assert_eq!(one.len(), 1);
+        assert_eq!(one["feat+a"], all["feat+a"]);
+        assert_eq!(one["feat+a"].ahead_behind, Some((2, 1)));
+        assert_eq!(one["feat+a"].head_subject.as_deref(), Some("a 2"));
+    }
+
+    #[test]
+    fn a_known_base_is_what_ahead_and_behind_are_counted_against() {
+        let (_dir, repo) = repo_with_worktrees(&[("feat+a", "feat/a"), ("feat+b", "feat/b")]);
+        let trees = repo.parent().unwrap().join("trees");
+        git(
+            &trees.join("feat+a"),
+            &["commit", "--allow-empty", "-m", "a 1"],
+        );
+        git(
+            &trees.join("feat+b"),
+            &["commit", "--allow-empty", "-m", "b 1"],
+        );
+        git(
+            &trees.join("feat+b"),
+            &["commit", "--allow-empty", "-m", "b 2"],
+        );
+        let wts = discover(&project_at(&repo)).unwrap();
+
+        let resolved = stream_updates(&repo, &wts, &["feat+a"], None);
+        assert_eq!(
+            resolved["feat+a"].ahead_behind,
+            Some((1, 0)),
+            "against main"
+        );
+        let known = stream_updates(&repo, &wts, &["feat+a"], Some("feat/b"));
+        assert_eq!(known["feat+a"].ahead_behind, Some((1, 2)), "against feat/b");
+    }
+
+    #[test]
+    fn the_batched_ahead_behind_walks_only_the_branches_asked_about() {
+        let (_dir, repo) = repo_with_worktrees(&[("feat+a", "feat/a"), ("feat+b", "feat/b")]);
+        git(&repo, &["branch", "feat/idle"]);
+        git(&repo, &["branch", "feat/a-sibling"]);
+
+        let counts = batch_ahead_behind(&repo, Some("main"), &["feat/a"]);
+        assert_eq!(counts.keys().collect::<Vec<_>>(), vec!["feat/a"]);
+        assert!(batch_ahead_behind(&repo, Some("main"), &[]).is_empty());
     }
 
     #[test]

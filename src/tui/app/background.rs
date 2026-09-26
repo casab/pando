@@ -424,6 +424,9 @@ impl App {
         self.enriching = true;
         let root = self.paths.root().to_path_buf();
         let tx = self.event_tx.clone();
+        // A few rows are measured against the base the detail pane names,
+        // which discovery keeps current; the full pass resolves its own.
+        let known_base = only.and(self.default_base.clone());
         thread::spawn(move || {
             let (etx, erx) = mpsc::channel();
             let forward = tx.clone();
@@ -436,7 +439,7 @@ impl App {
             });
             // Narrow pool: every job forks `git status` against a full tree,
             // and startup enrichment must not starve the UI.
-            worktree::enrich_stream(&root, items, etx, 4);
+            worktree::enrich_stream(&root, items, known_base, etx, 4);
             let _ = pump.join();
             let _ = tx.send(AppEvent::EnrichDone);
         });
