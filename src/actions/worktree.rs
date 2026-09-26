@@ -753,7 +753,12 @@ pub fn ls(paths: &PandoPaths) -> Result<Vec<Worktree>> {
 
 /// The absolute, canonical path of a worktree.
 pub fn path(paths: &PandoPaths, name: &str) -> Result<PathBuf> {
-    let discovery = worktree::discover_all(&paths.project)?;
+    path_in(worktree::discover_all(&paths.project)?, name)
+}
+
+/// [`path`], from a listing already made: the one the name was resolved
+/// against, so `pando path` lists the worktrees once for both.
+pub fn path_in(discovery: worktree::Discovery, name: &str) -> Result<PathBuf> {
     if discovery.main.name == name {
         return Ok(discovery.main.path);
     }

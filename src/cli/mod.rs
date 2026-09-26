@@ -580,8 +580,7 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             Ok(())
         }
         Command::Path { name } => {
-            let name = names::resolve_or_main(paths, &name)?;
-            writeln!(out, "{}", actions::path(paths, &name)?.display())?;
+            writeln!(out, "{}", names::path(paths, &name)?.display())?;
             Ok(())
         }
         Command::Start {
@@ -597,8 +596,8 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             // Before any question: a misspelt name is worth knowing about
             // before being asked which dev command to run.
             let typed = name;
-            let name = names::target(paths, typed.as_deref(), "start")?;
-            let named = names::Named::of(paths, typed.as_deref(), &name);
+            let named = names::target_named(paths, typed.as_deref(), "start")?;
+            let name = named.dir.clone();
             let mode = actions::Mode::of(isolated, namespaced, shared);
             // Before any question too: a login asked for, or a slot freed,
             // for a start that is refused is a cost with nothing for it.
@@ -738,8 +737,8 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             no_wait,
         } => {
             let typed = name;
-            let name = names::target(paths, typed.as_deref(), "restart")?;
-            let named = names::Named::of(paths, typed.as_deref(), &name);
+            let named = names::target_named(paths, typed.as_deref(), "restart")?;
+            let name = named.dir.clone();
             // Resolved exactly as `start` resolves it: a project whose
             // process question has never been answered gets the question,
             // not a refusal.
@@ -783,8 +782,8 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             }
         }
         Command::Share { name: typed } => {
-            let name = names::target(paths, typed.as_deref(), "share")?;
-            let named = names::Named::of(paths, typed.as_deref(), &name);
+            let named = names::target_named(paths, typed.as_deref(), "share")?;
+            let name = named.dir.clone();
             let outcome =
                 actions::share(paths, config, &name, &notice).map_err(|e| named.reword(e))?;
             if outcome.already {
@@ -798,8 +797,8 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             Ok(())
         }
         Command::Unshare { name: typed } => {
-            let name = names::target(paths, typed.as_deref(), "unshare")?;
-            let named = names::Named::of(paths, typed.as_deref(), &name);
+            let named = names::target_named(paths, typed.as_deref(), "unshare")?;
+            let name = named.dir.clone();
             actions::unshare(paths, &name).map_err(|e| named.reword(e))?;
             writeln!(out, "unshared {name}")?;
             Ok(())
@@ -808,8 +807,7 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             name: typed,
             public,
         } => {
-            let name = names::target(paths, typed.as_deref(), "open")?;
-            let named = names::Named::of(paths, typed.as_deref(), &name);
+            let named = names::target_named(paths, typed.as_deref(), "open")?;
             let url = open::url_to_open(paths, config, &named, public)?;
             // Printed first, so the URL is there to copy even when there is
             // no browser to hand it to.

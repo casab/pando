@@ -338,7 +338,7 @@ fn a_wait_tells_what_its_refresh_forgot() {
     crate::state::save(&fx.paths.state_file(), &store).unwrap();
 
     let said = std::cell::RefCell::new(Vec::new());
-    let named = super::names::Named::of(&fx.paths, Some("feat/one"), &name);
+    let named = super::names::target_named(&fx.paths, Some("feat/one"), "start").unwrap();
     super::wait::wait_ready(&fx.paths, &named, None, &|line| {
         said.borrow_mut().push(line.to_string())
     })
@@ -383,7 +383,7 @@ fn a_refresh_that_only_failed_to_save_still_answers_about_the_worktree() {
     let refreshed = actions::refresh(&fx.paths);
     assert!(refreshed.warning.is_some() && !refreshed.unreadable);
 
-    let named = super::names::Named::of(&fx.paths, Some("feat/two"), &two);
+    let named = super::names::target_named(&fx.paths, Some("feat/two"), "open").unwrap();
     let err =
         super::open::url_to_open(&fx.paths, &with_dev(&fx.config), &named, false).unwrap_err();
     assert_eq!(
@@ -447,8 +447,8 @@ fn the_main_checkout_resolves_for_path_only_and_an_empty_name_is_a_usage_error()
             "{typed}: {err:#}"
         );
         assert_eq!(
-            super::names::resolve_or_main(&fx.paths, typed).unwrap(),
-            "acme-shop",
+            super::names::path(&fx.paths, typed).unwrap().file_name(),
+            Some(std::ffi::OsStr::new("acme-shop")),
             "{typed}"
         );
     }
@@ -628,7 +628,7 @@ fn open_wants_something_up_or_a_share() {
     let fx = fixture();
     let name = actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
     let config = with_dev(&fx.config);
-    let named = super::names::Named::of(&fx.paths, Some("feat/one"), &name);
+    let named = super::names::target_named(&fx.paths, Some("feat/one"), "open").unwrap();
     let open =
         |config: &Config, public| super::open::url_to_open(&fx.paths, config, &named, public);
     let err = open(&config, false).unwrap_err();
@@ -668,8 +668,8 @@ fn with_dev(config: &Config) -> Config {
 #[test]
 fn open_on_a_project_with_nothing_to_run_says_so_and_how_to_add_one() {
     let fx = fixture();
-    let name = actions::new(&fx.paths, &fx.config, "feat/r", None, &|_| {}).unwrap();
-    let named = super::names::Named::of(&fx.paths, Some("feat/r"), &name);
+    actions::new(&fx.paths, &fx.config, "feat/r", None, &|_| {}).unwrap();
+    let named = super::names::target_named(&fx.paths, Some("feat/r"), "open").unwrap();
     let err = super::open::url_to_open(&fx.paths, &fx.config, &named, false).unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.starts_with("feat/r is not running, and this project has nothing to run"));
@@ -874,7 +874,7 @@ fn ls_names_lists_what_a_worktree_argument_accepts() {
     // The main checkout is offered for `path`, the one verb it is a place
     // for; every worktree resolves for all of them.
     for name in &names {
-        super::names::resolve_or_main(&fx.paths, name).unwrap();
+        super::names::path(&fx.paths, name).unwrap();
     }
     super::names::resolve(&fx.paths, names[1]).unwrap();
 }

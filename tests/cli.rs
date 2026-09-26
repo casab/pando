@@ -332,6 +332,35 @@ fn ls_lists_the_worktrees_once_beyond_what_every_command_does() {
     }
 }
 
+// A verb that takes a name finds the worktree and names it for its
+// messages from one listing: resolving, naming and `path`'s own lookup
+// each listed the worktrees again, for answers the first one had.
+#[test]
+fn a_verb_that_takes_a_name_lists_the_worktrees_once_to_find_it() {
+    let e = env();
+    e.write_config(SLEEPER);
+    let out = e.pando(&["new", "feat/one"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    // `open` of a worktree that is not running is refused, after the name
+    // was found: the refusal names it as a person knows it.
+    for (args, beyond) in [(&["path", "feat/one"][..], 1), (&["open", "feat/one"], 1)] {
+        let (out, calls) = e.pando_counting_git(args);
+        match args[0] {
+            "path" => assert_eq!(code(&out), EXIT_OK, "{}", stderr(&out)),
+            _ => assert!(
+                stderr(&out).contains("feat/one is not running"),
+                "{}",
+                stderr(&out)
+            ),
+        }
+        let listings = calls
+            .iter()
+            .filter(|call| call.contains("worktree list --porcelain"))
+            .count();
+        assert_eq!(listings, 2 + beyond, "{args:?}: {calls:#?}");
+    }
+}
+
 // `status` prints no git field in either shape, so it pays for none: no
 // `git status` in any worktree, and none of the repository-wide reads
 // that fill `ls`'s commit and ahead/behind columns.
