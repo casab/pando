@@ -2969,7 +2969,8 @@ fn serde_word<T: serde::Serialize>(value: T) -> String {
 
 /// agent/json.md quotes every enum-valued field by hand, and one of those
 /// strings was once wrong for as long as it shipped. This holds each list
-/// to the type that prints it. The matches are exhaustive on purpose: a new
+/// to the type that prints it or, where the words are spelled by hand, to
+/// what the binary prints. The matches are exhaustive on purpose: a new
 /// variant does not compile here until somebody decides what the document
 /// says about it.
 #[test]
@@ -3031,7 +3032,37 @@ fn every_enum_value_agent_json_documents_is_one_the_binary_prints() {
             ServiceKind::Compose | ServiceKind::Native => {}
         }
     }
-    check("kind", kinds.map(serde_word).to_vec());
+    // `status --json` spells the kind with a match of its own, not through
+    // the enum's serde, so the words are read back from what it prints for
+    // one service of each kind.
+    let fx = fixture();
+    let name = actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
+    let mut store = crate::state::load(&fx.paths.state_file()).unwrap();
+    store.worktrees.get_mut(&name).unwrap().services = kinds
+        .map(|kind| crate::state::ServiceRecord {
+            name: serde_word(kind),
+            kind,
+            port: None,
+            pid: None,
+            pgid: None,
+            compose_project: None,
+        })
+        .to_vec();
+    crate::state::save(&fx.paths.state_file(), &store).unwrap();
+    let status: serde_json::Value =
+        serde_json::from_str(&capture(|b| status_json(&fx.paths, None, b))).unwrap();
+    let printed = kinds.map(|kind| {
+        status["worktrees"][0]["services"][serde_word(kind)]["kind"]
+            .as_str()
+            .unwrap_or_else(|| panic!("status --json prints no kind for a {kind:?} service"))
+            .to_string()
+    });
+    assert_eq!(
+        printed,
+        kinds.map(serde_word),
+        "status --json names a kind by another word"
+    );
+    check("kind", printed.to_vec());
 
     // Every mode, and the published words for them: `status --json`,
     // `ls --json` and `doctor --json` print these, and a program reading
@@ -3096,12 +3127,26 @@ fn every_enum_value_agent_json_documents_is_one_the_binary_prints() {
         phases.iter().map(|p| phase_word(p).to_string()).collect(),
     );
 
-    // Plain strings in the report rather than an enum; doctor's own tests
-    // pin the order it prints them in.
-    check(
-        "layer",
-        ["committed", "user", "project"].map(String::from).to_vec(),
+    // Plain strings in the report rather than an enum, so they are read
+    // from a report doctor makes, as `doctor --json` prints it; doctor's
+    // own tests pin the order. The shell finds nothing, so no login shell
+    // runs.
+    let finds_nothing = |_: &str| None;
+    let report = crate::doctor::run_on(
+        &fx.paths,
+        &crate::actions::Machine {
+            shell: &finds_nothing,
+            home: fx.root.join("no-such-home"),
+        },
     );
+    let report = serde_json::to_value(&report).unwrap();
+    let layers = report["config"]["layers"]
+        .as_array()
+        .expect("doctor --json lists the config layers")
+        .iter()
+        .map(|layer| layer["layer"].as_str().expect("a layer's name").to_string())
+        .collect();
+    check("layer", layers);
 }
 
 // "answer it in pando.toml" named no key and no real path. Exit 3 now
