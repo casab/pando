@@ -233,7 +233,10 @@ fn go_main(root: &Path) -> bool {
 }
 
 /// The package a Go file declares: the first `package` clause, past the
-/// comments and build constraints before it.
+/// comments and build constraints before it. None for a file its build
+/// constraint keeps out of every build, as a library's `gen.go` generator
+/// is: `package main` there is what `go run gen.go` runs, and no part of
+/// the package `go run .` would.
 fn go_package(text: &str) -> Option<&str> {
     let mut in_block = false;
     for line in text.lines() {
@@ -254,6 +257,9 @@ fn go_package(text: &str) -> Option<&str> {
                 }
             }
         }
+        if ignored(line) {
+            return None;
+        }
         if line.is_empty() || line.starts_with("//") {
             continue;
         }
@@ -267,6 +273,17 @@ fn go_package(text: &str) -> Option<&str> {
             .map(|name| name.trim_end_matches(';'));
     }
     None
+}
+
+/// Whether a line is the build constraint that keeps its file out of
+/// every build: `//go:build ignore`, or the older `// +build ignore`.
+fn ignored(line: &str) -> bool {
+    let constraint = line.strip_prefix("//go:build").or_else(|| {
+        line.strip_prefix("//")
+            .map(str::trim_start)
+            .and_then(|rest| rest.strip_prefix("+build"))
+    });
+    constraint.is_some_and(|expr| expr.starts_with(char::is_whitespace) && expr.trim() == "ignore")
 }
 
 #[cfg(test)]

@@ -820,6 +820,13 @@ fn a_go_module_whose_root_is_not_a_main_package_matches_no_framework() {
             ("go.mod", "module x\n"),
             ("x.go", "// package main\npackage x\n"),
         ],
+        // A generator `go run gen.go` runs by name is in no package.
+        &[
+            ("go.mod", "module x\n"),
+            ("lib.go", "package lib\n"),
+            ("gen.go", "//go:build ignore\n\npackage main\n"),
+            ("mkerrors.go", "// +build ignore\n\npackage main\n"),
+        ],
     ] {
         let (dir, s) = marker_fixture(files);
         assert!(framework(dir.path(), &s).is_none(), "{files:?}");
@@ -837,6 +844,13 @@ fn a_go_module_whose_root_is_not_a_main_package_matches_no_framework() {
     let rule = framework(dir.path(), &s);
     assert_eq!(rule.unwrap().name, "Go");
     assert_eq!(values(&dev_in(dir.path(), &s)), vec!["go run ."]);
+
+    // A constraint that some builds pass keeps the file in the package.
+    let (dir, s) = marker_fixture(&[
+        ("go.mod", "module x\n"),
+        ("main.go", "//go:build !ignore\n\npackage main\n"),
+    ]);
+    assert_eq!(framework(dir.path(), &s).unwrap().name, "Go");
 }
 
 // `config.ru` is every Rack app's and `bin/dev` is a helper in any
