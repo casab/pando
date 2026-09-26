@@ -2263,6 +2263,35 @@ fn moving_the_cursor_returns_the_tail_to_the_end() {
     assert_eq!(app.tail_scroll, 0);
 }
 
+// The list moves while a start runs, and the start's return sent the tail
+// on screen to its end even when that tail was another worktree's, which
+// the start had not touched.
+#[test]
+fn a_start_finishing_keeps_the_scroll_of_another_worktrees_tail() {
+    let mut app = test_app(&["feat+one", "feat+two"]);
+    let start_one = |app: &mut App| {
+        app.spawn_pending("feat+one".into(), PendingKind::Start, || {
+            Ok(PendingOutcome::Started(
+                "feat+one".into(),
+                None,
+                vec![("dev".into(), 4242)],
+            ))
+        });
+    };
+    start_one(&mut app);
+    press(&mut app, KeyCode::Char('j'));
+    assert_eq!(app.selected_worktree().unwrap().name, "feat+two");
+    app.tail_scroll = 3;
+    wait_for_pending(&mut app);
+    assert_eq!(app.tail_scroll, 3, "feat/two's tail is where it was read");
+
+    press(&mut app, KeyCode::Char('k'));
+    app.tail_scroll = 3;
+    start_one(&mut app);
+    wait_for_pending(&mut app);
+    assert_eq!(app.tail_scroll, 0, "feat/one's own log is new");
+}
+
 // ---- the log viewer --------------------------------------------------
 
 /// An app whose home is a real (temporary) directory, so the log files

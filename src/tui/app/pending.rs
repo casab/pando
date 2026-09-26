@@ -430,9 +430,13 @@ impl App {
                             self.awaiting_ready = Some(awaited);
                         }
                         // The log is new, so whatever was tailed for this
-                        // worktree is about the run that just ended.
+                        // worktree is about the run that just ended. The
+                        // scroll belongs to the selected row's tail, which
+                        // is another worktree's once the cursor moved on.
                         self.log_tails.forget_worktree(&name);
-                        self.tail_scroll = 0;
+                        if self.selected_worktree().is_some_and(|w| w.name == name) {
+                            self.tail_scroll = 0;
+                        }
                         self.spawn_refresh();
                     }
                     PendingOutcome::Stopped(_) => {
