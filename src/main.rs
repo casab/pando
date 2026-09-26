@@ -48,6 +48,9 @@ fn main() -> ExitCode {
         Err(e) if e.downcast_ref::<pando::doctor::Unhealthy>().is_some() => {
             ExitCode::from(EXIT_ERROR)
         }
+        // Whoever read stdout stopped, having read what they wanted —
+        // `pando logs | head`. Nothing failed, so nothing is said.
+        Err(e) if pando::cli::stdout_closed(&e) => ExitCode::SUCCESS,
         Err(e) => {
             // `{:#}` flattens the context chain onto one line: a CLI failure
             // is one sentence, not a stack.
@@ -67,7 +70,7 @@ fn run(cli: Cli) -> Result<()> {
     // A completion script is about pando, not about any repository, and
     // it is typically generated from a dotfiles setup that is in none.
     if let Some(pando::cli::Command::Completions { shell }) = cli.command {
-        return pando::cli::completions(shell, &mut std::io::stdout());
+        return pando::cli::completions(shell, &mut pando::cli::Stdout);
     }
     let cwd = std::env::current_dir().context(
         "cannot read the current directory — it may have been deleted; cd somewhere that exists",

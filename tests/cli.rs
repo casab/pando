@@ -1676,6 +1676,39 @@ impl Drop for Follower {
     }
 }
 
+// `pando logs | head` printed "pando: Broken pipe (os error 32)" and exited
+// 1 once head had its lines, which a script reads as pando failing.
+#[test]
+fn a_reader_that_stops_early_ends_logs_quietly_with_success() {
+    use std::io::{BufRead, BufReader};
+
+    let e = env();
+    let log = e.log_file("feat+one", "dev");
+    std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+    // Far more than a pipe holds, so pando is still writing when the
+    // reader goes.
+    let lines: String = (0..5000).map(|i| format!("{i:0>100}\n")).collect();
+    std::fs::write(&log, lines).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pando"))
+        .env("PANDO_HOME", &e.home)
+        .current_dir(&e.root)
+        .args(["logs", "feat+one", "-n", "5000"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run pando logs");
+    let mut first = String::new();
+    BufReader::new(child.stdout.take().expect("piped stdout"))
+        .read_line(&mut first)
+        .unwrap();
+    assert!(first.ends_with("0\n"), "{first:?}");
+
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(code(&out), EXIT_OK, "{}", stderr(&out));
+    assert_eq!(stderr(&out), "");
+}
+
 // `logs -f` read everything written since its last poll at once and kept
 // the newest 4096 lines of it, so a burst of more — or the backlog after
 // a pager stopped reading — lost its middle with no marker.

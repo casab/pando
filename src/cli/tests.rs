@@ -2396,6 +2396,20 @@ fn ls_json_fills_the_pr_field_from_the_cache() {
     );
 }
 
+// Only stdout's own broken pipe is a reader that stopped. One to a
+// process pando runs is a failure, and still has to say so.
+#[test]
+fn only_a_broken_stdout_ends_quietly() {
+    use std::io::{Error, ErrorKind};
+    let closed = anyhow::Error::from(super::stdout_error(Error::from(ErrorKind::BrokenPipe)))
+        .context("print a line");
+    assert!(stdout_closed(&closed));
+    let child = anyhow::Error::from(Error::from(ErrorKind::BrokenPipe)).context("feed a client");
+    assert!(!stdout_closed(&child));
+    let other = anyhow::Error::from(super::stdout_error(Error::from(ErrorKind::Other)));
+    assert!(!stdout_closed(&other));
+}
+
 // `head` is documented as "abc1234". Porcelain's sha is all forty, and
 // enrichment's is git's own abbreviation, which is longer in a large
 // repository or under `core.abbrev`: one listing used to publish both

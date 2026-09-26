@@ -496,8 +496,58 @@ const WORKTREE: &str = completion::WORKTREE;
 /// The log `logs` reads when no `--source` is given.
 const DEFAULT_SOURCE: &str = "dev";
 
+/// The reader of pando's stdout went away: `pando logs | head` once `head`
+/// has its lines, `logs -f | grep -m1` once grep has its match. Not a
+/// failure — what was read was what was wanted — so `main` ends quietly
+/// with success on it.
+#[derive(Debug)]
+pub struct StdoutClosed;
+
+impl std::fmt::Display for StdoutClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("nothing is reading stdout any more")
+    }
+}
+
+impl std::error::Error for StdoutClosed {}
+
+/// stdout, with a write to a reader that went away told apart from every
+/// other broken pipe: one to a process pando runs is a real failure.
+#[derive(Debug, Default)]
+pub struct Stdout;
+
+impl Write for Stdout {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        std::io::stdout().write(buf).map_err(stdout_error)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::stdout().flush().map_err(stdout_error)
+    }
+}
+
+fn stdout_error(e: std::io::Error) -> std::io::Error {
+    match e.kind() {
+        std::io::ErrorKind::BrokenPipe => {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, StdoutClosed)
+        }
+        _ => e,
+    }
+}
+
+/// Whether `e` is [`StdoutClosed`], however much context it gathered on
+/// the way up.
+pub fn stdout_closed(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+            .is_some_and(|inner| inner.is::<StdoutClosed>())
+    })
+}
+
 pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result<()> {
-    let mut out = std::io::stdout();
+    let mut out = Stdout;
     match command {
         Command::New { branch, base, yes } => {
             let config = &actions::resolve_for_new(paths, config, &everyday_asker(yes), &notice)?;
