@@ -5,6 +5,7 @@ use chrono::Utc;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use crate::catalog;
 use crate::config::Config;
 use crate::paths::PandoPaths;
 use crate::ports;
@@ -229,7 +230,7 @@ pub fn share_with(
     // The worktree may have been stopped, removed, or shared by somebody
     // else while the tunnel was coming up. Anything that was spawned goes
     // down here rather than becoming a process with no record.
-    let _lock = state::lock(&paths.lock_file())?;
+    let lock = state::lock(&paths.lock_file())?;
     let mut store = state::load(&paths.state_file())?;
     let Some(existing_record) = store.worktrees.get(name) else {
         let _ = tunnel::stop_share(&record);
@@ -273,6 +274,7 @@ pub fn share_with(
         let _ = tunnel::stop_share(&record);
         return Err(e);
     }
+    drop(lock);
     // Shared, and said so, rather than refused: a slow edge is not a dead
     // one. But a URL that may not answer yet is not one to hand out
     // without the reason.
@@ -282,12 +284,67 @@ pub fn share_with(
             provider.name()
         ));
     }
+    if let Some(refusal) = host_refusal(target_port, &record.public_url) {
+        progress(&format!("{shown}: {refusal}"));
+    }
     Ok(ShareOutcome {
         name: name.to_string(),
         public_url: record.public_url,
         pre_authed: proxy.is_some(),
         already: false,
     })
+}
+
+/// How long the host probe waits on the dev server. A host check is the
+/// first thing such a server does with a request, so one that has not
+/// answered by now let the host through and is building the page.
+const HOST_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How much of the answer the probe reads. A refusal says what it is in
+/// its first few kilobytes.
+const HOST_PROBE_BYTES: u64 = 16 * 1024;
+
+/// What the dev server says to a visitor, asked as the tunnel will ask
+/// it: with the public URL's own `Host`.
+///
+/// Several frameworks' dev servers refuse every host that is not
+/// `localhost` or an address, so a share of one hands every visitor its
+/// blocked-host page. The share still stands — it is the project's
+/// setting to change, not pando's — so this names the change, from
+/// [`catalog::host_checks`]. It asks the dev server's own port rather than
+/// a proxy in front of it, so no cookie goes with it; an error, a timeout,
+/// or any answer that is not a known refusal says nothing.
+pub(super) fn host_refusal(target_port: u16, public_url: &str) -> Option<String> {
+    use std::io::{Read, Write};
+    let host = public_url
+        .split_once("://")
+        .map_or(public_url, |(_, rest)| rest);
+    let mut stream = ports::connect_loopback(target_port, HOST_PROBE_TIMEOUT).ok()?;
+    stream.set_read_timeout(Some(HOST_PROBE_TIMEOUT)).ok()?;
+    stream.set_write_timeout(Some(HOST_PROBE_TIMEOUT)).ok()?;
+    let request =
+        format!("GET / HTTP/1.1\r\nHost: {host}\r\nAccept: text/html\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).ok()?;
+    let mut answer = Vec::new();
+    // A timeout part-way through keeps what arrived before it.
+    let _ = stream.take(HOST_PROBE_BYTES).read_to_end(&mut answer);
+    let answer = String::from_utf8_lossy(&answer);
+    let status = answer
+        .strip_prefix("HTTP/")?
+        .split_whitespace()
+        .nth(1)?
+        .parse::<u16>()
+        .ok()?;
+    let check = catalog::host_checks::refused_by(status, &answer)?;
+    // Every host the provider hands out, not just this one: the next share
+    // is given another.
+    let suffix = host.find('.').map_or(host, |dot| &host[dot..]);
+    Some(format!(
+        "its dev server refuses the public URL's host, so visitors get {}'s blocked-host page — \
+         to let shares in, {}",
+        check.server,
+        check.remedy.replace("{suffix}", suffix)
+    ))
 }
 
 /// Takes a worktree's public URL down.

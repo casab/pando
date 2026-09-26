@@ -2307,6 +2307,11 @@ fn share_guard(fx: &Fx, name: &str) -> ShareGuard {
 /// A worktree running a real listener on its `web` port, with a fake
 /// provider installed — the state every share test starts from.
 fn shared_fixture() -> Option<(Fx, String, Vec<Detached>, StartReport)> {
+    shared_fixture_running(python_listener_template())
+}
+
+/// [`shared_fixture`], with `cmd` as the process on the `web` port.
+fn shared_fixture_running(cmd: String) -> Option<(Fx, String, Vec<Detached>, StartReport)> {
     if !python3_available() {
         eprintln!("skipping: python3 is needed for a process that really holds a port");
         return None;
@@ -2315,7 +2320,7 @@ fn shared_fixture() -> Option<(Fx, String, Vec<Detached>, StartReport)> {
     with_dev(
         &mut fx,
         ProcessConfig {
-            cmd: python_listener_template(),
+            cmd,
             ports: Some(PortsSpec::List(vec!["web".to_string()])),
             ready: Some(ReadySpec {
                 role: Some("web".to_string()),
@@ -2924,6 +2929,109 @@ fn a_share_whose_tunnel_has_not_reached_its_edge_says_so() {
         said.iter()
             .any(|m| m.contains("has not connected") && m.contains("Failed to dial")),
         "a URL that may not answer is handed out with the reason: {said:?}"
+    );
+}
+
+/// A dev server on the `web` port that answers every request the way
+/// Vite refuses a host it does not know.
+fn vite_refusing_hosts_template() -> String {
+    "python3 -u -c \"import socket;s=socket.socket();\
+     s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);\
+     s.bind(('127.0.0.1',{port:web}));s.listen(5)\nwhile True:\n c,_=s.accept()\n try:\n  \
+     c.recv(65536);c.sendall(b'HTTP/1.1 403 Forbidden\\r\\nContent-Length: 51\\r\\n\
+     Connection: close\\r\\n\\r\\nBlocked request. Add it to server.allowedHosts now.')\n \
+     except Exception:\n  pass\n c.close()\""
+        .to_string()
+}
+
+/// A server that reads one request, hands its head to the test, and
+/// answers with `response`.
+fn answering_once(response: &'static [u8]) -> (u16, std::sync::mpsc::Receiver<String>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let Ok((mut socket, _)) = listener.accept() else {
+            return;
+        };
+        let mut head = Vec::new();
+        let mut chunk = [0u8; 4096];
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            match socket.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => head.extend_from_slice(&chunk[..n]),
+            }
+        }
+        tx.send(String::from_utf8_lossy(&head).into_owned()).ok();
+        let _ = socket.write_all(response);
+    });
+    (port, rx)
+}
+
+// A stock Vite 6, Rails or Django dev server refuses every host that is
+// not localhost or an address, and the tunnel hands it the public one:
+// the share "worked", and every visitor got the framework's blocked-host
+// page with nothing in pando pointing at the one-line fix.
+#[test]
+fn a_dev_server_that_refuses_the_public_host_is_named_with_its_fix() {
+    let (port, seen) = answering_once(
+        b"HTTP/1.1 403 Forbidden\r\nContent-Length: 56\r\nConnection: close\r\n\r\n\
+          Blocked request. This host is not allowed. allowedHosts.",
+    );
+    let refusal = host_refusal(port, "https://abc-def.trycloudflare.com").expect("a refusal");
+    assert!(refusal.contains("Vite"), "{refusal}");
+    assert!(
+        refusal.contains("'.trycloudflare.com'") && refusal.contains("server.allowedHosts"),
+        "every host the provider hands out, and where it goes: {refusal}"
+    );
+    let head = seen.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(
+        head.contains("Host: abc-def.trycloudflare.com\r\n"),
+        "asked as the tunnel will ask it: {head}"
+    );
+}
+
+#[test]
+fn a_dev_server_that_lets_the_public_host_in_says_nothing() {
+    let (port, _) = answering_once(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK");
+    assert_eq!(host_refusal(port, "https://abc.trycloudflare.com"), None);
+
+    // One that never answers is building the page, which means it let
+    // the host in.
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = silent.local_addr().unwrap().port();
+    assert_eq!(host_refusal(port, "https://abc.trycloudflare.com"), None);
+}
+
+#[test]
+fn a_share_of_a_dev_server_that_refuses_its_host_says_how_to_let_it_in() {
+    let Some((fx, name, _guards, _)) = shared_fixture_running(vite_refusing_hosts_template())
+    else {
+        return;
+    };
+    let said = std::sync::Mutex::new(Vec::<String>::new());
+    let provider = tunnel::provider_for(None).unwrap();
+    let outcome = share_with(
+        &fx.paths,
+        &fx.config,
+        &name,
+        provider.as_ref(),
+        &stub_proxy,
+        &|m| said.lock().unwrap().push(m.to_string()),
+    )
+    .unwrap();
+    let _share = share_guard(&fx, &name);
+
+    assert_eq!(
+        outcome.public_url, FAKE_TUNNEL_URL,
+        "the share still stands"
+    );
+    let said = said.into_inner().unwrap();
+    assert!(
+        said.iter()
+            .any(|m| m.contains("refuses the public URL's host") && m.contains("allowedHosts")),
+        "{said:?}"
     );
 }
 
