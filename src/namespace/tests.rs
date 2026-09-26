@@ -852,6 +852,57 @@ fn a_slot_is_sized_and_emptied_by_its_own_number_and_never_by_a_fallback() {
     }
 }
 
+// A slot has no grant to print and no `<main>__` to scope one to: its
+// refusal names the slot, says whose connection, and ends each sentence.
+#[test]
+fn a_slot_the_server_will_not_let_pando_empty_is_refused_in_sentences_about_the_slot() {
+    let fake = FakeClient::new(
+        "redis-cli",
+        "REDISCLI_AUTH",
+        "echo \"(error) NOPERM this user has no permissions to run the 'flushdb' command\"; \
+         exit 1\n",
+    );
+    let recipe = recipe_namespace("redis");
+    let mut cache = server(&recipe, &fake, "redis");
+    cache.port = 6379;
+    cache.login = Login::none();
+    let e = format!("{:#}", cache.drop("3", "0").unwrap_err());
+    assert_eq!(
+        e,
+        "redis on localhost:6379 does not let a connection with no login empty slot 3 — give \
+         it the right to empty slot 3 on that server. Nothing was dropped."
+    );
+
+    cache.login = Login::new(Some("app".into()), Some(PASSWORD.into()), "the test's env");
+    let e = format!("{:#}", cache.drop("3", "0").unwrap_err());
+    assert!(
+        e.starts_with("redis on localhost:6379 does not let the login from the test's env"),
+        "{e}"
+    );
+    assert!(
+        !e.contains("databases named") && !e.contains("hunter2"),
+        "{e}"
+    );
+}
+
+// A database recipe with no grant to print still ends its sentences, and
+// still says the right is to `<main>__…` alone.
+#[test]
+fn a_database_refusal_with_no_grant_to_print_says_the_right_it_needs() {
+    let fake = FakeClient::new("mariadb", "MYSQL_PWD", FAKE_MARIADB);
+    fake.touch("deny");
+    let mut recipe = recipe_namespace("mariadb");
+    recipe.grant = None;
+    let db = server(&recipe, &fake, "mariadb");
+    let e = format!("{:#}", db.create("shop__feat_x", "shop").unwrap_err());
+    assert_eq!(
+        e,
+        "mariadb on localhost:3306 does not let the login from the test's env make or drop \
+         shop__feat_x — give it the right to make and drop databases named shop__… on that \
+         server. Nothing was made."
+    );
+}
+
 #[test]
 fn a_missing_client_is_named_before_anything_is_asked() {
     let fake = FakeClient::new("not-mariadb", "MYSQL_PWD", "exit 0\n");

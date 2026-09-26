@@ -140,7 +140,7 @@ impl Server<'_> {
             return Ok(Created::Made);
         }
         if self.is_denied(&out) {
-            bail!("{} Nothing was made.", self.denied(name, main));
+            bail!("{}", self.denied(name, main, "made"));
         }
         if self.exists(name)? {
             return Ok(Created::AlreadyThere);
@@ -170,7 +170,7 @@ impl Server<'_> {
             return Ok(());
         }
         if self.is_denied(&out) {
-            bail!("{} Nothing was dropped.", self.denied(name, main));
+            bail!("{}", self.denied(name, main, "dropped"));
         }
         bail!(
             "{} on {} could not drop {name}: {}",
@@ -279,21 +279,41 @@ impl Server<'_> {
     }
 
     /// The refusal a login that may not make or drop namespaces earns: who
-    /// it is, and the one statement that fixes it.
-    fn denied(&self, name: &str, main: &str) -> String {
-        let fix = match self.grant(main) {
-            Some(grant) => {
-                format!(" — run this once as an administrator of that server:\n\n    {grant}\n\n")
-            }
-            None => " — give it the right to, on that server".to_string(),
+    /// it is, what it may not do, the one statement that fixes it when the
+    /// recipe knows it, and that nothing was `done`.
+    ///
+    /// A database's refusal says the right it needs is to `<main>__…`; a
+    /// slot is a number, and its refusal names the slot alone.
+    fn denied(&self, name: &str, main: &str, done: &str) -> String {
+        let who = match (&self.login.user, self.login.has_password()) {
+            (None, false) => "a connection with no login".to_string(),
+            _ => format!("the login from {}", self.login.from),
         };
-        format!(
-            "{} on {} does not let the login from {} make or drop {name}{fix}It lets that login \
-             make and drop databases named {main}{MARKER}… and nothing else.",
+        let (what, scope) = match self.recipe.kind {
+            NamespaceKind::Database => (
+                format!("make or drop {name}"),
+                format!("make and drop databases named {main}{MARKER}…"),
+            ),
+            NamespaceKind::Slot => (format!("empty slot {name}"), format!("empty slot {name}")),
+        };
+        let head = format!(
+            "{} on {} does not let {who} {what}",
             self.service,
-            self.address(),
-            self.login.from,
-        )
+            self.address()
+        );
+        match (self.grant(main), self.recipe.kind) {
+            (Some(grant), NamespaceKind::Database) => format!(
+                "{head} — run this once as an administrator of that server:\n\n    {grant}\n\nIt \
+                 lets that login {scope} and nothing else. Nothing was {done}."
+            ),
+            (Some(grant), NamespaceKind::Slot) => format!(
+                "{head} — run this once as an administrator of that server:\n\n    {grant}\n\n\
+                 Nothing was {done}."
+            ),
+            (None, _) => {
+                format!("{head} — give it the right to {scope} on that server. Nothing was {done}.")
+            }
+        }
     }
 
     fn is_denied(&self, out: &proc::Captured) -> bool {
