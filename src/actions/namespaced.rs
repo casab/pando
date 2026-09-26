@@ -496,7 +496,7 @@ pub(super) fn prepare(
     for (target, server) in &servers {
         let (namespace, made) = match target.namespace.kind {
             NamespaceKind::Database => ensure_database(paths, name, target, server, progress)?,
-            NamespaceKind::Slot => ensure_slot(paths, name, target, server)?,
+            NamespaceKind::Slot => ensure_slot(paths, name, target, server, progress)?,
         };
         // A slot given out is empty and needs no schema; only a database
         // made just now does.
@@ -688,11 +688,17 @@ fn ensure_database(
 /// not written yet holds an empty slot too. When every slot is held the
 /// start stops and says by whom; a start that can ask has already been
 /// asked which one to free.
+///
+/// The one state records is kept only while it is this worktree's alone
+/// and not the main checkout's: one the main checkout's env files name, or
+/// one another worktree's record names too, is let go — never emptied —
+/// and a new one given, with a line saying why.
 fn ensure_slot(
     paths: &PandoPaths,
     name: &str,
     target: &Target,
     server: &namespace::Server<'_>,
+    progress: &dyn Fn(&str),
 ) -> Result<(crate::state::NamespaceRecord, bool)> {
     let slot = |n: &str| crate::state::NamespaceRecord {
         service: target.service.clone(),
@@ -716,20 +722,15 @@ fn ensure_slot(
             .map(|ns| ns.name.clone())
     });
     if let Some(recorded) = recorded {
-        // Still this worktree's under the lock: a start that freed it
-        // since has emptied it and may be giving it out, and writing it
-        // back would hand one slot to two worktrees. Then it gets a new
-        // one, like a worktree that never had one.
         let kept = slot(&recorded);
-        if record_if(paths, name, &kept, |store| {
-            store.worktrees.get(name).is_some_and(|record| {
-                record
-                    .namespaces
-                    .iter()
-                    .any(|ns| ns.service == kept.service && namespace::same_namespace(ns, &kept))
-            })
-        })? {
-            return Ok((kept, false));
+        match hold_on(paths, name, target, &kept)? {
+            Held::Kept => return Ok((kept, false)),
+            Held::LetGo(why) => progress(&format!(
+                "{}: slot {recorded} is let go, not emptied — {why} — and this worktree gets one \
+                 of its own",
+                target.service
+            )),
+            Held::Gone => {}
         }
         store = crate::state::load(&paths.state_file())?;
     }
@@ -782,6 +783,65 @@ fn ensure_slot(
             .collect::<Vec<_>>()
             .join(", ")
     )
+}
+
+/// What became of the slot a worktree's record names, as [`hold_on`]
+/// found it under the lock.
+enum Held {
+    /// Still this worktree's alone, and marked as used now.
+    Kept,
+    /// Taken out of this worktree's record, unemptied, and why.
+    LetGo(String),
+    /// No longer in its record: a start that freed it since has emptied
+    /// it, and may be giving it out.
+    Gone,
+}
+
+/// Whether a worktree goes on with the slot its record names, decided
+/// under the lock against state as it is by then.
+///
+/// Kept only while the record still names it, the main checkout's env
+/// files do not, and no other worktree's record does. Writing back one a
+/// start has freed since would hand one slot to two worktrees. One the
+/// main checkout names is main's data. And one two records name — a state
+/// written before slots were taken under the lock, or edited by hand — is
+/// shared by two apps already: this worktree lets it go as the other's,
+/// rather than go on sharing it or stop every start of both.
+fn hold_on(
+    paths: &PandoPaths,
+    name: &str,
+    target: &Target,
+    kept: &crate::state::NamespaceRecord,
+) -> Result<Held> {
+    let _lock = crate::state::lock(&paths.lock_file())?;
+    let mut store = crate::state::load(&paths.state_file())?;
+    let own = |ns: &crate::state::NamespaceRecord| {
+        ns.service == kept.service && namespace::same_namespace(ns, kept)
+    };
+    let recorded = store
+        .worktrees
+        .get(name)
+        .is_some_and(|record| record.namespaces.iter().any(own));
+    if !recorded {
+        return Ok(Held::Gone);
+    }
+    let slot = kept.name.trim().parse::<u32>().ok();
+    let mains = target
+        .mains
+        .iter()
+        .any(|main| slot.is_some() && main.trim().parse::<u32>().ok() == slot);
+    let why = match (mains, recorded_elsewhere(&store, name, kept)) {
+        (true, _) => Some("the main checkout's env files name it".to_string()),
+        (false, Some(other)) => Some(format!("{other}'s record names it too")),
+        (false, None) => None,
+    };
+    let record = store.worktrees.get_mut(name).expect("just read");
+    match &why {
+        Some(_) => record.namespaces.retain(|ns| !own(ns)),
+        None => keep(record, kept),
+    }
+    crate::state::save(&paths.state_file(), &store)?;
+    Ok(why.map_or(Held::Kept, Held::LetGo))
 }
 
 /// The slots pando may give a worktree on a target's server: every one it

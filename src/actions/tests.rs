@@ -9755,6 +9755,80 @@ fn a_slot_given_to_another_worktree_while_this_one_started_is_not_written_back()
     assert!(!redis.join("flushed").exists());
 }
 
+// Two records naming one slot — a state written before slots were taken
+// under the lock, or edited by hand — stop neither worktree for good: the
+// one starting lets it go, unemptied, as the other's, and gets its own.
+#[test]
+fn a_slot_two_records_name_is_let_go_by_the_one_starting_and_emptied_by_neither() {
+    let (ns, redis) = slots_fixture(MAIN_ENV_WITH_REDIS);
+    let (report, _) = ns.start(Mode::Namespaced).unwrap();
+    drop(guard(&report));
+    stop(&ns.fx.paths, &ns.name, None).unwrap();
+    hold(&ns, [(1, false)]);
+
+    let (report, said) = ns.start(Mode::Remembered).unwrap();
+    let _guard = guard(&report);
+    assert!(
+        said.iter().any(|l| l
+            == "redis: slot 1 is let go, not emptied — w1's record names it too — and this \
+                worktree gets one of its own"),
+        "{said:?}"
+    );
+    assert_eq!(ns.env_line("REDIS_DB").as_deref(), Some("2"));
+    let store = ns.fx.state();
+    assert_eq!(store.worktrees["w1"].namespaces[0].name, "1");
+    let ours: Vec<&str> = store.worktrees[&ns.name]
+        .namespaces
+        .iter()
+        .filter(|n| n.service == "redis")
+        .map(|n| n.name.as_str())
+        .collect();
+    assert_eq!(ours, vec!["2"]);
+    assert!(!redis.join("flushed").exists());
+}
+
+// A worktree given main's second slot before main's every slot was known
+// keeps it no longer: the next start lets it go, unemptied, and gives the
+// worktree one of its own.
+#[test]
+fn a_recorded_slot_the_main_checkout_names_is_let_go_and_never_emptied() {
+    let (ns, redis) = slots_fixture_keyed(
+        "DATABASE_PORT=3306\nDATABASE_NAME=shop\nDATABASE_USER=app\n\
+         REDIS_URL=redis://localhost:6379/0\nSIDEKIQ_REDIS_URL=redis://localhost:6379/1\n",
+        &["REDIS_URL", "SIDEKIQ_REDIS_URL"],
+    );
+    let (report, _) = ns.start(Mode::Namespaced).unwrap();
+    drop(guard(&report));
+    stop(&ns.fx.paths, &ns.name, None).unwrap();
+    let mut store = ns.fx.state();
+    for slot in store
+        .worktrees
+        .get_mut(&ns.name)
+        .unwrap()
+        .namespaces
+        .iter_mut()
+        .filter(|n| n.service == "redis")
+    {
+        slot.name = "1".into();
+    }
+    state::save(&ns.fx.paths.state_file(), &store).unwrap();
+    let _ = std::fs::remove_file(&ns.seen);
+
+    let (report, said) = ns.start(Mode::Remembered).unwrap();
+    let _guard = guard(&report);
+    assert!(
+        said.iter()
+            .any(|l| l.starts_with("redis: slot 1 is let go, not emptied")
+                && l.contains("the main checkout's env files name it")),
+        "{said:?}"
+    );
+    assert_eq!(
+        ns.env_line("SIDEKIQ_REDIS_URL").as_deref(),
+        Some("redis://localhost:6379/2")
+    );
+    assert!(!redis.join("flushed").exists(), "main's queue was emptied");
+}
+
 // Decision 3: an app that reads no slot setting has nowhere to be told
 // another slot, so its Redis stays shared — said in one line — and the
 // database is still its own.
