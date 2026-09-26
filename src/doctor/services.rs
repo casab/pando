@@ -163,7 +163,10 @@ fn isolation_report(
     let (mechanism, lines) = match configured_isolation(config) {
         Some((mechanism, mut lines)) => {
             if let Some(detected) = choice.mechanism
-                && !config.services.iter().any(|s| service_kind(s) == detected)
+                && !config
+                    .services
+                    .iter()
+                    .any(|s| s.brings_anything_up() && service_kind(s) == detected)
             {
                 lines.push(format!(
                     "detection alone would choose {detected} now: {}",
@@ -186,8 +189,10 @@ fn isolation_report(
 }
 
 /// What config already says about isolation: the mechanism a start runs,
-/// named after the first `[[services]]` entry, and one line per entry that
-/// says it. `None` while config says nothing.
+/// named after the first `[[services]]` entry that brings anything up, and
+/// one line per entry that says it. An entry that includes none of a
+/// compose file's services is an answer that runs nothing, so a config of
+/// only those has nothing to isolate. `None` while config says nothing.
 fn configured_isolation(config: &Config) -> Option<(Option<&'static str>, Vec<String>)> {
     if config.isolation.none {
         return Some((
@@ -195,13 +200,17 @@ fn configured_isolation(config: &Config) -> Option<(Option<&'static str>, Vec<St
             vec!["`[isolation] none` says this project has nothing to isolate".to_string()],
         ));
     }
-    let first = config.services.first()?;
+    if config.services.is_empty() {
+        return None;
+    }
     let lines = config
         .services
         .iter()
         .map(|service| match service {
             ServiceConfig::Compose { file, include, .. } => match include.is_empty() {
-                true => format!("`[[services]]` names the compose file {file}"),
+                true => format!(
+                    "`[[services]]` names the compose file {file}, for none of its services"
+                ),
                 false => format!(
                     "`[[services]]` names the compose file {file}, for {}",
                     include.join(", ")
@@ -212,7 +221,12 @@ fn configured_isolation(config: &Config) -> Option<(Option<&'static str>, Vec<St
             }
         })
         .collect();
-    Some((Some(service_kind(first)), lines))
+    let mechanism = config
+        .services
+        .iter()
+        .find(|service| service.brings_anything_up())
+        .map(service_kind);
+    Some((mechanism, lines))
 }
 
 /// A `[[services]]` entry's `kind`, spelled the way the file spells it.

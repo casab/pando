@@ -327,6 +327,18 @@ pub enum ServiceConfig {
     },
 }
 
+impl ServiceConfig {
+    /// Whether a start brings anything up for this entry. A native entry
+    /// is its one service; a compose entry is the services its `include`
+    /// names, and an empty one is the written-down answer "none of them".
+    pub fn brings_anything_up(&self) -> bool {
+        match self {
+            ServiceConfig::Compose { include, .. } => !include.is_empty(),
+            ServiceConfig::Native { .. } => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HookConfig {

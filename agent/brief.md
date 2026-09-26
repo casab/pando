@@ -512,8 +512,8 @@ Afterwards, `doctor` says so in its own words, which is what you report:
 ```
 services
   isolation     nothing here to run a private copy of
-                docker-compose.yml declares nothing this project depends on
-                nothing in its env example names an engine pando has a recipe for
+                `[[services]]` names the compose file docker-compose.yml, for none of its services
+  compose       docker-compose.yml
 ```
 
 ## D. Services with no manifest — where the machine decides

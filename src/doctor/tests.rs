@@ -1704,6 +1704,72 @@ fn an_answered_project_is_reported_as_its_config_says_and_not_as_detection_would
     );
 }
 
+// `include = []` is the written-down "none of them", and a start brings
+// nothing up for it. doctor named the mechanism after the entry's kind,
+// so a compose file that only packages the app — the brief's own scenario
+// — read as "compose, as this project's config already says".
+#[test]
+fn a_compose_entry_that_includes_nothing_is_reported_as_nothing_to_isolate() {
+    let fx = fixture();
+    write_compose(&fx, "services:\n  app:\n    build: .\n");
+    let none_of_them = "[[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
+                        include = []\n";
+    write_project_config(&fx, none_of_them);
+    let report = report_of(&fx, &shell_with(&["docker"]));
+    let isolation = &report.services.isolation;
+    assert!(isolation.answered);
+    assert_eq!(isolation.mechanism, None);
+    let said = isolation.evidence.join(" | ");
+    assert!(
+        said.contains(
+            "`[[services]]` names the compose file docker-compose.yml, for none of its services"
+        ),
+        "{said}"
+    );
+    let text = report.render();
+    assert!(
+        text.contains("nothing here to run a private copy of"),
+        "{text}"
+    );
+    // The brief quotes this render as what an agent reports for it.
+    let brief =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("agent/brief.md"))
+            .expect("read agent/brief.md");
+    let quoted = brief
+        .split("## C. ")
+        .nth(1)
+        .and_then(|scenario| scenario.split("Afterwards, `doctor`").nth(1))
+        .and_then(|rest| rest.split("```").nth(1))
+        .expect("scenario C's doctor block");
+    for line in quoted.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        assert!(
+            text.lines().any(|printed| printed.trim() == line),
+            "agent/brief.md quotes {line:?}, which doctor does not print:\n{text}"
+        );
+    }
+
+    // What detection would choose is still said where it differs, as it is
+    // for `[isolation] none`.
+    write_compose(&fx, "services:\n  postgres:\n    image: postgres:16\n");
+    let report = report_of(&fx, &shell_with(&["docker"]));
+    let said = report.services.isolation.evidence.join(" | ");
+    assert!(
+        said.contains("detection alone would choose compose now"),
+        "{said}"
+    );
+
+    // Before a native entry, it is not the entry a start runs.
+    write_project_config(
+        &fx,
+        &format!("{none_of_them}\n[[services]]\nkind = \"native\"\nname = \"postgres\"\n"),
+    );
+    let report = report_of(&fx, &shell_with(&["docker", "postgres"]));
+    assert_eq!(
+        report.services.isolation.mechanism.as_deref(),
+        Some("native")
+    );
+}
+
 #[test]
 fn a_project_with_nothing_to_isolate_says_that_rather_than_guessing() {
     let fx = fixture();
