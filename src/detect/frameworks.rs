@@ -42,12 +42,20 @@ pub(super) fn script_framework(
     (!only_builds(rule, dev)).then_some(rule)
 }
 
-/// Whether `body` runs one of the rule's build markers: the framework's
-/// build, which serves nothing.
+/// Whether `body` runs one of the rule's build markers and, past them,
+/// nothing else of the rule's: the framework's build, which serves
+/// nothing. A build the server follows, `vite build && vite preview`, is
+/// that server's script, and the flag it is handed reaches the server.
 pub(super) fn only_builds(rule: &FrameworkRule, body: &str) -> bool {
-    rule.build_markers
+    let builds = rule
+        .build_markers
         .iter()
-        .any(|needle| mentions(body, needle))
+        .any(|needle| mentions(body, needle));
+    let rest = rule
+        .build_markers
+        .iter()
+        .fold(body.to_string(), |rest, needle| without(&rest, needle));
+    builds && !runs(rule, &rest)
 }
 
 /// Whether one of the project's script bodies runs one of the rule's
@@ -80,8 +88,14 @@ fn passes(root: &Path, guard: Guard) -> bool {
 /// whose test runner happens to share a prefix with a dev server would be
 /// started as that dev server.
 fn mentions(body: &str, needle: &str) -> bool {
+    mentioned_at(body, needle).next().is_some()
+}
+
+/// Where `body` runs `needle` as a word of its own, as [`mentions`] reads
+/// it.
+fn mentioned_at<'a>(body: &'a str, needle: &'a str) -> impl Iterator<Item = usize> + 'a {
     let word = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
-    body.match_indices(needle).any(|(at, _)| {
+    body.match_indices(needle).filter_map(move |(at, _)| {
         let before = body[..at].chars().next_back().is_none_or(|c| !word(c));
         let after = body[at + needle.len()..]
             .chars()
@@ -89,8 +103,22 @@ fn mentions(body: &str, needle: &str) -> bool {
             .is_none_or(|c| !word(c));
         // A needle that ends in a space ("node ") has already said where
         // the word ends.
-        before && (after || needle.ends_with(' '))
+        (before && (after || needle.ends_with(' '))).then_some(at)
     })
+}
+
+/// `body` with each place it runs `needle` cut out, a space left in its
+/// stead so the words either side stay apart.
+fn without(body: &str, needle: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut from = 0;
+    for at in mentioned_at(body, needle) {
+        out.push_str(&body[from..at]);
+        out.push(' ');
+        from = at + needle.len();
+    }
+    out.push_str(&body[from..]);
+    out
 }
 
 /// Whether a Cargo project builds something runnable. A `[lib]`-only crate

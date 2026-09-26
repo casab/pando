@@ -1128,6 +1128,50 @@ fn a_package_whose_dev_script_only_builds_is_given_no_server_port() {
     assert_eq!(proposal.candidates[0].ports, None);
 }
 
+// Read as build-only, a `vite build && vite preview` lost the `--port`
+// its preview server takes, bound Vite's own port in every worktree, and
+// two worktrees clashed on it.
+#[test]
+fn a_package_whose_dev_script_builds_and_then_serves_is_given_its_port() {
+    let dir = tempdir().unwrap();
+    workspace(dir.path());
+    for (app, marker, dev) in [
+        ("docs", "vite.config.ts", "vite build && vite preview"),
+        ("admin", "angular.json", "ng build shared && ng serve"),
+    ] {
+        std::fs::create_dir_all(dir.path().join("apps").join(app)).unwrap();
+        std::fs::write(dir.path().join("apps").join(app).join(marker), "{}\n").unwrap();
+        std::fs::write(
+            dir.path().join("apps").join(app).join("package.json"),
+            format!(r#"{{ "scripts": {{ "dev": "{dev}" }} }}"#),
+        )
+        .unwrap();
+    }
+    let processes = proposed_processes(dir.path()).candidates[0]
+        .processes
+        .clone()
+        .unwrap();
+    for app in ["docs", "admin"] {
+        let process = &processes[app];
+        assert_eq!(process.cmd, format!("pnpm dev --port {{port:{app}}}"));
+        assert_eq!(process.roles(), vec![app.to_string()], "{app}");
+    }
+
+    let (dir, s) = marker_fixture(&[
+        ("vite.config.ts", "export default {}\n"),
+        (
+            "package.json",
+            r#"{ "scripts": { "dev": "vite build && vite preview" } }"#,
+        ),
+    ]);
+    let proposal = dev_in(dir.path(), &s);
+    assert_eq!(values(&proposal), vec!["npm run dev -- --port {port:web}"]);
+    assert_eq!(
+        proposal.candidates[0].ports,
+        Some(PortsSpec::List(vec!["web".to_string()]))
+    );
+}
+
 // ---- install ---------------------------------------------------------
 
 // Invariant 1: a lockfile can never change because pando ran an
