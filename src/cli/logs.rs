@@ -277,8 +277,11 @@ pub(super) fn default_sources(paths: &PandoPaths, name: &str, preferred: &str) -
 
 /// Every process the record names for this worktree, once, sorted.
 fn process_names(paths: &PandoPaths, name: &str) -> Vec<String> {
-    // `inspect`, not `refresh`: choosing a log may not write state.
-    let state = actions::inspect(paths).state;
+    // The state as saved, not `inspect`'s: choosing a log may not write
+    // state, and it reads only which processes and roles the record names,
+    // which no phase advance changes. `inspect` scans every live group's
+    // sockets first, a `ps` and an `lsof` before a line is printed.
+    let state = crate::state::load(&paths.state_file()).unwrap_or_default();
     let mut out: Vec<String> = state
         .worktrees
         .get(name)
