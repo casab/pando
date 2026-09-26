@@ -212,6 +212,7 @@ impl App {
 
     pub fn poll_pending(&mut self) {
         let asking = self.awaiting_answer();
+        let may_spin = self.spinner_may_take_header();
         let Some(pending) = self.pending.as_mut() else {
             return;
         };
@@ -314,7 +315,9 @@ impl App {
             // a spinner could stand for, and its clock is the reader's.
             Err(mpsc::TryRecvError::Empty) if asking => {
                 let message = format!("? {} is waiting for your answer", pending.label);
-                self.set_progress(message);
+                if may_spin {
+                    self.set_progress(message);
+                }
             }
             Err(mpsc::TryRecvError::Empty) => {
                 pending.spinner_frame = pending.spinner_frame.wrapping_add(1);
@@ -330,7 +333,9 @@ impl App {
                     Some(stage) => format!("{glyph} {label} · {stage}{suffix}"),
                     None => format!("{glyph} {label}…{suffix}"),
                 };
-                self.set_progress(message);
+                if may_spin {
+                    self.set_progress(message);
+                }
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 let kind = pending.kind;

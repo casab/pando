@@ -3684,6 +3684,34 @@ fn a_start_waiting_on_a_question_says_so() {
     assert!(app.awaiting_answer());
 }
 
+// The spinner rewrote the header on every tick, so what was said while an
+// action ran — a crash, the refusal of a second action — was gone within a
+// quarter of a second. It waits until that has had its time.
+#[test]
+fn a_message_said_while_an_action_runs_is_not_spun_over() {
+    let mut app = test_app(&["feat+one", "feat+two"]);
+    let (hold, held) = mpsc::channel::<()>();
+    app.spawn_pending("feat+one".into(), PendingKind::Start, move || {
+        let _ = held.recv();
+        Err("let go".to_string())
+    });
+    press(&mut app, KeyCode::Char('j'));
+    press(&mut app, KeyCode::Char('s'));
+    for _ in 0..3 {
+        app.poll_pending();
+    }
+    assert_eq!(
+        app.active_status(),
+        Some(("already busy with feat+one", true))
+    );
+
+    app.status.as_mut().unwrap().at = Instant::now() - ERROR_TTL - Duration::from_secs(1);
+    app.poll_pending();
+    let status = app.flash().expect("the spinner is back");
+    assert_eq!(status.kind, StatusKind::Progress, "{}", status.message);
+    drop(hold);
+}
+
 // ---- new -------------------------------------------------------------
 
 // `n` settles what `pando new` settles before it creates anything. It did

@@ -1039,6 +1039,16 @@ impl App {
         });
     }
 
+    /// Whether the spinner may have the header: nothing else is on it, or
+    /// what is on it has had its time. An error, a confirmation or a prompt
+    /// posted while an action is in flight stays for as long as any other;
+    /// the row and the detail pane still say what is in flight.
+    pub(super) fn spinner_may_take_header(&self) -> bool {
+        self.status
+            .as_ref()
+            .is_none_or(|s| s.kind == StatusKind::Progress || !s.fresh())
+    }
+
     /// What a second press would do, for as long as it would. Not kept
     /// in the history: once it has expired it is no longer true.
     pub fn set_prompt(&mut self, message: impl Into<String>) {
