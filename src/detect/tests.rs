@@ -2862,6 +2862,36 @@ fn a_projects_own_schema_script_is_offered_after_the_known_tools() {
     );
 }
 
+// Keyed on `*/migrations/*.py`, a migration added to an app one level
+// down left the fingerprint as it was: migrate was skipped, and the
+// worktree's own database kept the schema it had.
+#[test]
+fn djangos_migrate_is_keyed_on_every_apps_migrations_at_any_depth() {
+    let dir = tempdir().unwrap();
+    for path in [
+        "manage.py",
+        "core/migrations/0001_initial.py",
+        "apps/billing/migrations/0001_initial.py",
+    ] {
+        let path = dir.path().join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "").unwrap();
+    }
+    let proposal = schema_hook_proposal(dir.path(), &signals(dir.path())).unwrap();
+    let hook = proposal.candidates[0].hook.clone().unwrap();
+    assert_eq!(hook.cmd, "python manage.py migrate");
+    let before = crate::hooks::fingerprint(dir.path(), &hook.fingerprint, &hook.cmd);
+    assert!(before.is_some());
+    std::fs::write(
+        dir.path()
+            .join("apps/billing/migrations/0002_add_invoice_total.py"),
+        "",
+    )
+    .unwrap();
+    let after = crate::hooks::fingerprint(dir.path(), &hook.fingerprint, &hook.cmd);
+    assert_ne!(before, after, "{:?}", hook.fingerprint);
+}
+
 #[test]
 fn a_schema_script_with_no_migrations_directory_is_keyed_on_the_manifest() {
     let dir = tempdir().unwrap();

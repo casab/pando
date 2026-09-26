@@ -231,7 +231,7 @@ impl Kind {
                     &[("DB_PORT", "db"), ("REDIS_URL", "redis")],
                 ));
                 config.hooks.push(migrate_hook(
-                    &["*/migrations/*.py"],
+                    &["**/migrations/*.py"],
                     "uv run python manage.py migrate",
                 ));
             }

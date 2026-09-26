@@ -256,7 +256,7 @@ fn a_schema_hook_carries_the_files_it_is_keyed_on() {
         (
             Kind::DjangoUvPostgres,
             "uv run python manage.py migrate",
-            "*/migrations/*.py",
+            "**/migrations/*.py",
         ),
     ] {
         let (_dir, root) = fixture(kind);

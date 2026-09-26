@@ -696,10 +696,12 @@ fn schema_candidates(root: &Path, signals: &Signals) -> Vec<Candidate> {
     }
     if root.join("manage.py").is_file() {
         // `python_runner` carries its own trailing space, or is empty for
-        // a project whose interpreter is simply on PATH.
+        // a project whose interpreter is simply on PATH. Every app's
+        // migrations, at any depth: `core/` beside `apps/billing/`, or a
+        // project's apps all one level down.
         push(
             format!("{}python manage.py migrate", python_runner(signals)),
-            &["*/migrations/*.py"],
+            &["**/migrations/*.py"],
             "manage.py",
         );
     }
