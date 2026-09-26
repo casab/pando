@@ -2118,6 +2118,7 @@ fn a_hook_a_namespaced_start_skips_beside_a_shared_database_is_not_one_it_runs_a
         port: 3306,
         name: "shop__feat_one".to_string(),
         main: "shop".to_string(),
+        mains: Vec::new(),
         keys: vec!["DATABASE_PORT".to_string()],
         used_at: chrono::Utc::now(),
     });

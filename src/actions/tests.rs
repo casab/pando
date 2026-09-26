@@ -8579,6 +8579,7 @@ fn a_stale_records_containers_and_namespaces_pass_to_the_record_that_replaces_it
         port: 3306,
         name: "app__feat_one".into(),
         main: "app".into(),
+        mains: Vec::new(),
         keys: Vec::new(),
         used_at: Utc::now(),
     };
@@ -10261,6 +10262,7 @@ fn slot_holder(n: u32, running: bool, hours: i64) -> WorktreeRecord {
         port: 6379,
         name: n.to_string(),
         main: "0".into(),
+        mains: Vec::new(),
         keys: Vec::new(),
         used_at: Utc::now() - chrono::Duration::hours(hours),
     });
@@ -10354,6 +10356,14 @@ fn a_second_slot_the_main_checkout_names_is_never_given_out_or_emptied() {
         Some("redis://localhost:6379/2"),
         "slot 1 is main's queue, empty or not"
     );
+    // Recorded, for another project on the same server to know them by.
+    let slot = ns
+        .record()
+        .namespaces
+        .into_iter()
+        .find(|n| n.service == "redis")
+        .unwrap();
+    assert_eq!(slot.mains, vec!["0".to_string(), "1".to_string()]);
     drop(running);
     stop(&ns.fx.paths, &ns.name, None).unwrap();
 
@@ -10519,6 +10529,51 @@ fn a_slot_another_project_records_is_never_given_out_or_emptied() {
     assert!(
         !redis.join("flushed").exists(),
         "another project's slot was emptied"
+    );
+}
+
+// Every slot another project's main checkout names is its own, not only
+// the first: its records carry them all. Only the first was read, so its
+// queue's slot beside its cache's was given out here while it was empty,
+// and emptied by the `rm` of the worktree it was given to.
+#[test]
+fn a_second_slot_another_projects_main_checkout_names_is_never_given_out_or_emptied() {
+    let (ns, redis) = slots_fixture(MAIN_ENV_WITH_REDIS);
+    let mut theirs = slot_holder(3, false, 1);
+    theirs.namespaces[0].main = "1".into();
+    theirs.namespaces[0].mains = vec!["1".into(), "2".into()];
+    hold_elsewhere(&ns, theirs);
+    let (report, _) = ns.start(Mode::Namespaced).unwrap();
+    let running = guard(&report);
+    assert_eq!(ns.env_line("REDIS_DB").as_deref(), Some("4"));
+    drop(running);
+    stop(&ns.fx.paths, &ns.name, None).unwrap();
+
+    let mut store = ns.fx.state();
+    for slot in store
+        .worktrees
+        .get_mut(&ns.name)
+        .unwrap()
+        .namespaces
+        .iter_mut()
+        .filter(|n| n.service == "redis")
+    {
+        slot.name = "2".into();
+    }
+    state::save(&ns.fx.paths.state_file(), &store).unwrap();
+    let (said, progress) = collecting();
+    super::rm(&ns.fx.paths, &ns.name, false, false, &progress).unwrap();
+    let said = said.borrow().clone();
+    assert!(
+        said.iter()
+            .any(|l| l.contains("redis slot 2 is left as it is")
+                && l.contains("main checkout's own in project other-1a2b3c4d")
+                && !l.contains("will not mention it again")),
+        "{said:?}"
+    );
+    assert!(
+        !redis.join("flushed").exists(),
+        "another project's main slot was emptied"
     );
 }
 
@@ -11898,6 +11953,7 @@ fn doctor_never_lists_a_database_another_projects_record_holds() {
         port: 3306,
         name: "SHOP__FEAT_THEIRS".into(),
         main: "shop".into(),
+        mains: Vec::new(),
         keys: Vec::new(),
         used_at: Utc::now(),
     });

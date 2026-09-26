@@ -19,7 +19,7 @@ use super::name::{MARKER, MAX_NAME, is_plain};
 ///   is pando's word that pando created it. A database that was already
 ///   there is never recorded, and never dropped.
 /// - **It is never the main checkout's own**, whatever the record says: not
-///   the name recorded beside it, and not any name the main checkout's env
+///   a name recorded beside it, and not any name the main checkout's env
 ///   files give today (`main_now`) — a queue's slot beside a cache's is
 ///   main's as much as the first. Compared without case, because MariaDB
 ///   on macOS does. For a slot, never slot 0 either, which is where every
@@ -31,7 +31,7 @@ use super::name::{MARKER, MAX_NAME, is_plain};
 /// - **No other worktree's record names the same one** on the same server,
 ///   in this project or in any other pando keeps state for on this machine
 ///   (`others`, each by its id) — and no other project's record names it
-///   as that project's main checkout's own. Two records claiming one
+///   among that project's main checkout's own. Two records claiming one
 ///   database are a state file that is wrong about something, and the
 ///   drop that would empty the other worktree's data is not the way to
 ///   find out which. A project whose state cannot be read (`Err`, with
@@ -56,7 +56,7 @@ pub fn may_drop(
             "{what} is not recorded as {worktree}'s, so pando did not make it and will not drop it"
         );
     }
-    let mains = std::iter::once(namespace.main.as_str()).chain(main_now.iter().copied());
+    let mains = namespace.every_main().chain(main_now.iter().copied());
     match namespace.kind {
         NamespaceKind::Database => {
             for main in mains {
@@ -150,11 +150,13 @@ pub fn may_drop(
             .values()
             .flat_map(|record| &record.namespaces)
             .any(|ns| {
-                let main = NamespaceRecord {
-                    name: ns.main.clone(),
-                    ..ns.clone()
-                };
-                same_namespace(&main, namespace)
+                ns.every_main().any(|main| {
+                    let main = NamespaceRecord {
+                        name: main.to_string(),
+                        ..ns.clone()
+                    };
+                    same_namespace(&main, namespace)
+                })
             })
     });
     if let Some((project, _)) = theirs {

@@ -657,6 +657,7 @@ fn ensure_database(
         port: target.port,
         name: candidate.to_string(),
         main: target.main.clone(),
+        mains: target.mains.clone(),
         keys: target.keys.clone(),
         used_at: chrono::Utc::now(),
     };
@@ -744,6 +745,7 @@ fn ensure_slot(
         port: target.port,
         name: n.to_string(),
         main: target.main.clone(),
+        mains: target.mains.clone(),
         keys: target.keys.clone(),
         used_at: chrono::Utc::now(),
     };
@@ -1259,13 +1261,15 @@ fn slots_elsewhere(
                         gone: repository_gone || !record.path.exists(),
                     });
                 }
-                if let Ok(slot) = ns.main.trim().parse::<u32>() {
-                    out.push(Elsewhere {
-                        slot,
-                        whose: format!("the main checkout of project {project}"),
-                        project: project.clone(),
-                        gone: repository_gone,
-                    });
+                for main in ns.every_main() {
+                    if let Ok(slot) = main.trim().parse::<u32>() {
+                        out.push(Elsewhere {
+                            slot,
+                            whose: format!("the main checkout of project {project}"),
+                            project: project.clone(),
+                            gone: repository_gone,
+                        });
+                    }
                 }
             }
         }
@@ -1564,7 +1568,8 @@ pub(super) fn recorded_elsewhere<'a>(
 }
 
 /// Puts a namespace into a worktree's record, or marks the one already
-/// there as used now. The caller holds the lock.
+/// there as used now, with every name the main checkout's own has there
+/// today. The caller holds the lock.
 pub(super) fn keep(
     record: &mut crate::state::WorktreeRecord,
     namespace: &crate::state::NamespaceRecord,
@@ -1574,7 +1579,12 @@ pub(super) fn keep(
         .iter_mut()
         .find(|ns| ns.service == namespace.service && namespace::same_namespace(ns, namespace))
     {
-        Some(existing) => existing.used_at = namespace.used_at,
+        Some(existing) => {
+            existing.used_at = namespace.used_at;
+            if !namespace.mains.is_empty() {
+                existing.mains = namespace.mains.clone();
+            }
+        }
         None => record.namespaces.push(namespace.clone()),
     }
 }
@@ -1790,12 +1800,14 @@ fn named_elsewhere(
                 .values()
                 .flat_map(|record| &record.namespaces)
                 .any(|ns| {
-                    let main = crate::state::NamespaceRecord {
-                        name: ns.main.clone(),
-                        ..ns.clone()
-                    };
                     namespace::same_namespace(ns, namespace)
-                        || namespace::same_namespace(&main, namespace)
+                        || ns.every_main().any(|main| {
+                            let main = crate::state::NamespaceRecord {
+                                name: main.to_string(),
+                                ..ns.clone()
+                            };
+                            namespace::same_namespace(&main, namespace)
+                        })
                 }),
         })
 }
@@ -1859,6 +1871,7 @@ pub fn namespace_leftovers(
                 port: target.port,
                 name: name.clone(),
                 main: target.main.clone(),
+                mains: target.mains.clone(),
                 keys: Vec::new(),
                 used_at: chrono::Utc::now(),
             };

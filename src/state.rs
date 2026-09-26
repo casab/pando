@@ -328,6 +328,14 @@ pub struct NamespaceRecord {
     /// The main checkout's own database, or slot, on that server: what the
     /// name was derived from, and what it must never be.
     pub main: String,
+    /// Every one the main checkout's env files named on that server when a
+    /// start last used this, `main` first: a queue's slot beside a
+    /// cache's. What another project on the same server knows of this
+    /// project's main checkout is these, so none of them is ever given out
+    /// or emptied there. Empty in a record written before they were kept,
+    /// which [`NamespaceRecord::every_main`] reads as `main` alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mains: Vec<String>,
     /// The env keys the app found the service by when this was made,
     /// which is where its login is read from: `rm` reads it there to drop
     /// this without loading config.
@@ -335,6 +343,20 @@ pub struct NamespaceRecord {
     pub keys: Vec<String>,
     /// When a start of this worktree last used it.
     pub used_at: DateTime<Utc>,
+}
+
+impl NamespaceRecord {
+    /// Every name the main checkout's own has on that server, as this
+    /// record knows them: `main`, then the rest of
+    /// [`NamespaceRecord::mains`].
+    pub fn every_main(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.main.as_str()).chain(
+            self.mains
+                .iter()
+                .map(String::as_str)
+                .filter(|main| *main != self.main),
+        )
+    }
 }
 
 /// What a namespace is on its server.
@@ -1282,6 +1304,7 @@ mod tests {
             port: 3306,
             name: "shop__feat_x".into(),
             main: "shop".into(),
+            mains: vec!["shop".into(), "shop_jobs".into()],
             keys: vec!["DATABASE_PORT".into()],
             used_at: at(10),
         }];
@@ -1303,6 +1326,25 @@ mod tests {
         assert!(json.contains("\"version\":2"));
         let back: State = serde_json::from_str(&json).unwrap();
         assert_eq!(state, back);
+    }
+
+    // A namespace recorded before every name of the main checkout's own was
+    // kept names only `main`, and reads as that alone.
+    #[test]
+    fn a_namespace_recorded_with_its_main_alone_reads_as_that_main() {
+        let mut state = full_state();
+        let namespace = &mut state.worktrees.get_mut("feat+x").unwrap().namespaces[0];
+        namespace.mains.clear();
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(!json.contains("\"mains\""), "{json}");
+        let back: State = serde_json::from_str(&json).unwrap();
+        let namespace = &back.worktrees["feat+x"].namespaces[0];
+        assert_eq!(namespace.every_main().collect::<Vec<_>>(), vec!["shop"]);
+        let kept = &full_state().worktrees["feat+x"].namespaces[0];
+        assert_eq!(
+            kept.every_main().collect::<Vec<_>>(),
+            vec!["shop", "shop_jobs"]
+        );
     }
 
     // Every 0.3.0 state file says `isolated` and never `mode`. Read wrong,

@@ -3301,6 +3301,7 @@ fn with_namespaces(fx: &Fx, name: &str, mode: crate::state::ServiceMode) {
             port,
             name: ns.into(),
             main: "shop".into(),
+            mains: Vec::new(),
             keys: Vec::new(),
             used_at: Utc::now(),
         });

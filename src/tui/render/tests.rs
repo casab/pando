@@ -3397,6 +3397,7 @@ fn the_remove_dialog_says_which_database_and_slot_go_with_the_worktree() {
             port: 1,
             name: name.into(),
             main: "0".into(),
+            mains: Vec::new(),
             keys: Vec::new(),
             used_at: chrono::Utc::now(),
         });
@@ -3662,6 +3663,7 @@ fn the_detail_pane_says_what_each_service_holds_for_the_worktree() {
             port: 1,
             name: name.into(),
             main: "0".into(),
+            mains: Vec::new(),
             keys: Vec::new(),
             used_at: chrono::Utc::now(),
         });
