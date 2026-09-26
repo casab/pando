@@ -96,18 +96,28 @@ pub fn new(
     paths.ensure_home()?;
     // State is locked and read *before* git creates anything: a state file
     // pando cannot use has to refuse while there is still nothing to undo.
-    let _lock = state::lock(&paths.lock_file())?;
-    let mut store = state::load(&paths.state_file())?;
-    // Under the lock, so the porcelain read cannot race a concurrent `new`
-    // whose record is already saved but whose worktree this process has not
-    // seen yet. The sweep signals only groups whose leader is dead: a
-    // record of a worktree removed outside pando while its processes still
-    // run is dropped with them unsignalled. A known gap, left because a
-    // path comparison that went wrong here would kill a healthy server.
-    for notice in sweep_orphaned_groups(&mut store)? {
-        progress(&notice);
+    // Not held through the checkout, which runs the repository's filters
+    // and hooks — an LFS download takes minutes, and every `ls` and every
+    // TUI worker would wait on it.
+    {
+        let _lock = state::lock(&paths.lock_file())?;
+        let mut store = state::load(&paths.state_file())?;
+        let loaded = store.clone();
+        // Under the lock, so the porcelain read cannot race a concurrent
+        // `new` whose record is already saved but whose worktree this
+        // process has not seen yet. The sweep signals only groups whose
+        // leader is dead: a record of a worktree removed outside pando while
+        // its processes still run is dropped with them unsignalled. A known
+        // gap, left because a path comparison that went wrong here would
+        // kill a healthy server.
+        for notice in sweep_orphaned_groups(&mut store)? {
+            progress(&notice);
+        }
+        drop_stale_worktree_records(&mut store, &root);
+        if store != loaded {
+            state::save(&paths.state_file(), &store)?;
+        }
     }
-    drop_stale_worktree_records(&mut store, &root);
 
     std::fs::create_dir_all(&worktrees_dir)
         .with_context(|| format!("create {}", worktrees_dir.display()))?;
@@ -136,15 +146,25 @@ pub fn new(
     }
     progress(&format!("checking out {branch}"));
     // Captured, not inherited: `git worktree add` narrates on stdout and
-    // stderr, which would paint over the TUI's alternate screen.
+    // stderr, which would paint over the TUI's alternate screen. And never
+    // prompting, like the fetches: the checkout runs the LFS filter, whose
+    // download can ask for a password — over the TUI, whose keys then went
+    // nowhere, and for ever.
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
     let out = cmd.output().context("spawn git worktree add")?;
     if !out.status.success() {
         bail!("git worktree add failed: {}", git_failure_reason(&out));
     }
 
     // Past this point the worktree exists, so every failure has something to
-    // undo before it is reported.
+    // undo before it is reported. The state is read again under the lock:
+    // other commands have saved theirs while git checked out. The lock goes
+    // with this closure, before the install runs: `npm ci` takes minutes,
+    // and holding the state lock through it would stall every `ls` and
+    // freeze the TUI's tick.
     let finish = (|| -> Result<()> {
+        let _lock = state::lock(&paths.lock_file())?;
+        let mut store = state::load(&paths.state_file())?;
         if !config.project.provision_paths().is_empty() {
             progress("provisioning");
         }
@@ -158,10 +178,6 @@ pub fn new(
     if let Err(e) = finish {
         return Err(unwind_new(&root, &target, branch, &source, e));
     }
-    // The lock goes before the install runs: `npm ci` takes minutes, and
-    // holding the state lock through it would stall every `ls` and freeze
-    // the TUI's tick.
-    drop(_lock);
 
     // A failed install keeps the worktree. The branch is checked out, the
     // files are provisioned, and the next `start` tries the install again —

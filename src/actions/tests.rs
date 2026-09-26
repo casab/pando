@@ -7104,6 +7104,51 @@ fn rm_clears_one_prunable_entry_and_leaves_the_others_alone() {
     );
 }
 
+// The checkout runs the repository's filters and hooks, an LFS download
+// among them. Held through it, the state lock stalled every `ls` and TUI
+// worker for as long as it took; and a download that wanted a password
+// asked for it on the terminal, over the TUI.
+#[test]
+fn new_holds_no_state_lock_through_the_checkout_and_lets_it_prompt_for_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = fixture();
+    let marks = tempdir().unwrap();
+    let hooks = marks.path().join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("post-checkout");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nprintf '%s' \"$GIT_TERMINAL_PROMPT\" > '{m}/prompt'\ntouch '{m}/started'\n\
+             i=0\nwhile [ ! -e '{m}/release' ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done\n",
+            m = marks.path().display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    git(
+        &fx.root,
+        &["config", "core.hooksPath", hooks.to_str().unwrap()],
+    );
+
+    std::thread::scope(|scope| {
+        let creating = scope.spawn(|| new(&fx.paths, &fx.config, "feat/slow", None, &noop));
+        let started = wait_until(Duration::from_secs(20), || {
+            marks.path().join("started").exists()
+        });
+        let free = started && state::try_lock(&fx.paths.lock_file()).unwrap().is_some();
+        std::fs::write(marks.path().join("release"), "").unwrap();
+        let name = creating.join().unwrap().unwrap();
+        assert!(started, "the checkout's hook never ran");
+        assert!(free, "the state lock was held through the checkout");
+        assert!(fx.state().worktrees[&name].created_by_pando);
+    });
+    assert_eq!(
+        std::fs::read_to_string(marks.path().join("prompt")).unwrap(),
+        "0"
+    );
+}
+
 // git still lists a worktree whose directory was deleted, and `new` said
 // it "already exists at" a path that was not there, with nothing about
 // the `rm` that clears the entry.
