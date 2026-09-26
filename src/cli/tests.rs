@@ -1709,6 +1709,57 @@ fn status_text_sheds_the_url_and_then_the_ports_as_the_terminal_narrows() {
     assert!(narrow.contains("running"), "{narrow}");
 }
 
+// `status` measured in characters, as `ls` once did: a name with wide
+// characters pushed its phase word right of its neighbours', and a
+// failure reason in Japanese, cut to the width in characters, still ran
+// past the terminal and wrapped.
+#[test]
+fn status_text_lines_up_and_fits_wide_characters_by_the_columns_they_take() {
+    let fx = fixture();
+    let wide = actions::new(&fx.paths, &fx.config, "feat/日本語ログイン", None, &|_| {}).unwrap();
+    actions::new(&fx.paths, &fx.config, "feat/api", None, &|_| {}).unwrap();
+    with_two_processes(
+        &fx,
+        &wide,
+        Phase::Failed {
+            at: Utc::now(),
+            reason: "ポートはすでに別のプロセスが使っています".repeat(4),
+        },
+    );
+
+    let text = capture(|b| status_text_at(&fx.paths, None, b, 80));
+    let phase_columns: Vec<usize> = text
+        .lines()
+        .filter(|line| line.starts_with("feat/"))
+        .map(|line| {
+            let at = line.find("failed").or(line.find("stopped")).unwrap();
+            crate::term::text_width(&line[..at])
+        })
+        .collect();
+    assert_eq!(phase_columns.len(), 2, "{text}");
+    assert_eq!(phase_columns[0], phase_columns[1], "{text}");
+    for line in text.lines() {
+        assert!(
+            crate::term::text_width(line) <= 80,
+            "{line:?} is wider than 80 columns:\n{text}"
+        );
+    }
+}
+
+// A name as wide as the terminal was printed whole, leaving the rest of
+// its line no room at all, so every line of it wrapped.
+#[test]
+fn status_text_cuts_a_name_too_long_for_the_terminal() {
+    let fx = fixture();
+    let branch = format!("feat/{}", "long-".repeat(20));
+    actions::new(&fx.paths, &fx.config, &branch, None, &|_| {}).unwrap();
+
+    let text = capture(|b| status_text_at(&fx.paths, None, b, 80));
+    let line = text.lines().next().unwrap();
+    assert!(crate::term::text_width(line) <= 80, "{line:?}");
+    assert!(line.contains("stopped"), "{line:?}");
+}
+
 #[test]
 fn status_text_says_which_process_failed() {
     let fx = fixture();
@@ -2343,12 +2394,6 @@ fn ls_json_fills_the_pr_field_from_the_cache() {
         v["worktrees"][0]["pr"]["url"],
         "https://example.test/pull/42"
     );
-}
-
-#[test]
-fn ellipsize_keeps_short_strings_and_truncates_long_ones() {
-    assert_eq!(ellipsize("short", 10), "short");
-    assert_eq!(ellipsize("abcdefghij", 5), "abcd…");
 }
 
 // `head` is documented as "abc1234". Porcelain's sha is all forty, and

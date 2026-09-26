@@ -939,16 +939,5 @@ fn short_head(w: &Worktree) -> Option<String> {
         .map(|sha| sha.chars().take(SHORT_SHA_LEN).collect())
 }
 
-/// Truncate to at most `max` chars with a trailing ellipsis, so a long name
-/// never overflows its column.
-fn ellipsize(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let head: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{head}…")
-    }
-}
-
 #[cfg(test)]
 mod tests;

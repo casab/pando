@@ -135,8 +135,8 @@ const NAME_READABLE: usize = 24;
 /// How far a name is cut to keep the URL.
 const NAME_SHORT: usize = 16;
 
-/// The narrowest a name is ever cut to.
-const NAME_FLOOR: usize = 12;
+/// The narrowest a name is ever cut to, here and in `status`.
+pub(super) const NAME_FLOOR: usize = 12;
 
 /// Which columns fit in `width`, given each column's width. Dropping is
 /// all-or-nothing per column, so every column keeps one straight edge.

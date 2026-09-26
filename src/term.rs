@@ -154,6 +154,27 @@ pub fn text_width(text: &str) -> usize {
     text.chars().map(char_width).sum()
 }
 
+/// `text` cut to at most `max` columns at its end, behind a `…`, so a row
+/// with wide characters in it still fits the terminal it was cut for.
+pub fn ellipsize_end(text: &str, max: usize) -> String {
+    if text_width(text) <= max {
+        return text.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut kept = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        if used + char_width(c) > max - 1 {
+            break;
+        }
+        used += char_width(c);
+        kept.push(c);
+    }
+    format!("{kept}…")
+}
+
 /// `text` cut to at most `max` columns by taking out its middle, so both
 /// the start and the end survive: two long branch names that share a
 /// prefix still read as two different names.
@@ -257,8 +278,18 @@ mod tests {
             ];
             let cut = ellipsize_distinct(&names[0], &names, max);
             assert!(text_width(&cut) <= max, "{cut:?} at {max}");
+            let cut = ellipsize_end("  api  failed    ポートが使われています", max);
+            assert!(text_width(&cut) <= max, "{cut:?} at {max}");
         }
         assert_eq!(visible_width("\x1b[31m日本\x1b[0m"), 4);
+    }
+
+    #[test]
+    fn ellipsize_end_keeps_short_strings_and_truncates_long_ones() {
+        assert_eq!(ellipsize_end("short", 10), "short");
+        assert_eq!(ellipsize_end("abcdefghij", 5), "abcd…");
+        assert_eq!(ellipsize_end("日本語", 4), "日…");
+        assert_eq!(ellipsize_end("abc", 0), "");
     }
 
     #[test]

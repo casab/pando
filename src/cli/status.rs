@@ -2,8 +2,8 @@
 //! or JSON.
 
 use super::JSON_VERSION;
-use super::ellipsize;
 use super::ls::COL_GAP;
+use super::ls::NAME_FLOOR;
 use super::ls::ProjectOut;
 use super::ls::display_name;
 use super::ls::terminal_width;
@@ -12,7 +12,7 @@ use crate::actions;
 use crate::actions::worktree_url;
 use crate::paths::PandoPaths;
 use crate::state::{Phase, ProcessRecord, WorktreeRecord};
-use crate::term::{Paint, Style};
+use crate::term::{Paint, Style, ellipsize_distinct, ellipsize_end, text_width};
 use crate::worktree::Worktree;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -344,18 +344,17 @@ fn status_lines<W: Write>(
         return Ok(());
     }
     // Named as `ls` names them: by branch, where the directory is the
-    // branch spelled for a filesystem.
-    let names = shown
-        .iter()
-        .map(|w| display_name(w).chars().count())
-        .max()
-        .unwrap_or(4);
-    for w in shown {
+    // branch spelled for a filesystem. Measured in columns, and cut only as
+    // far as leaves the phase word room, never below `ls`'s floor.
+    let all_names: Vec<String> = shown.iter().map(|w| display_name(w)).collect();
+    let widest = all_names.iter().map(|n| text_width(n)).max().unwrap_or(0);
+    let names = widest.min(width.saturating_sub(COL_GAP + PHASE_CELL).max(NAME_FLOOR));
+    for (w, shown_name) in shown.iter().zip(&all_names) {
         let record = refreshed.state.worktrees.get(&w.name);
         writeln!(
             out,
-            "{:<names$}  {}",
-            display_name(w),
+            "{}  {}",
+            pad(&ellipsize_distinct(shown_name, &all_names, names), names),
             worktree_line(record, width.saturating_sub(names + COL_GAP))
         )?;
         // One line per process under it, so a worktree that is `failed`
@@ -364,29 +363,25 @@ fn status_lines<W: Write>(
         let process_width = record
             .processes
             .keys()
-            .map(|name| name.chars().count())
+            .map(|name| text_width(name))
             .max()
             .unwrap_or(0);
         for (name, p) in &record.processes {
             // The same shape as the worktree line above, and the same
             // degradation: a reason or an uptime is truncated rather than
             // allowed to wrap the row under it.
-            let row = format!(
-                "  {:<process_width$}  {}",
-                name,
-                process_line(p),
-                process_width = process_width
-            );
-            writeln!(out, "{}", ellipsize(&row, width))?;
+            let row = format!("  {}  {}", pad(name, process_width), process_line(p));
+            writeln!(out, "{}", ellipsize_end(&row, width))?;
         }
         // A port the worktree's processes were given and nothing listens
         // on: the api half of a root script whose web half is up.
         for (role, port) in crate::state::silent_ports(record, Utc::now()) {
             let row = format!(
-                "  {:<process_width$}  {:<PHASE_CELL$}  nothing listens on {port} — the log says why",
-                role, "silent",
+                "  {}  {:<PHASE_CELL$}  nothing listens on {port} — the log says why",
+                pad(&role, process_width),
+                "silent",
             );
-            writeln!(out, "{}", ellipsize(&row, width))?;
+            writeln!(out, "{}", ellipsize_end(&row, width))?;
         }
         // And one per private service, so a worktree whose database is
         // down says which one rather than only that its app failed.
@@ -394,12 +389,8 @@ fn status_lines<W: Write>(
         let namespaces = actions::namespace_lines(paths, config.as_ref(), record);
         let service_width = services
             .iter()
-            .map(|s| s.name.chars().count())
-            .chain(
-                namespaces
-                    .iter()
-                    .map(|(service, _, _)| service.chars().count()),
-            )
+            .map(|s| text_width(&s.name))
+            .chain(namespaces.iter().map(|(service, _, _)| text_width(service)))
             .max()
             .unwrap_or(0)
             .max(process_width);
@@ -418,18 +409,21 @@ fn status_lines<W: Write>(
                 false => "",
             };
             let row = format!(
-                "  {:<service_width$}  {:<PHASE_CELL$}  service on {port}{pump}",
-                service.name,
+                "  {}  {:<PHASE_CELL$}  service on {port}{pump}",
+                pad(&service.name, service_width),
                 if service.up { "up" } else { "down" },
             );
-            writeln!(out, "{}", ellipsize(&row, width))?;
+            writeln!(out, "{}", ellipsize_end(&row, width))?;
         }
         // And what it holds in the main checkout's own servers: its own
         // database and slot, ones kept for the way back from another mode,
         // and the services a namespaced worktree leaves on main's data.
         for (service, word, what) in &namespaces {
-            let row = format!("  {service:<service_width$}  {word:<PHASE_CELL$}  {what}");
-            writeln!(out, "{}", ellipsize(&row, width))?;
+            let row = format!(
+                "  {}  {word:<PHASE_CELL$}  {what}",
+                pad(service, service_width)
+            );
+            writeln!(out, "{}", ellipsize_end(&row, width))?;
         }
         // And the public URL, last, because it is the line somebody is
         // most often here to copy.
@@ -439,13 +433,24 @@ fn status_lines<W: Write>(
                 None => String::new(),
             };
             let row = format!(
-                "  {:<service_width$}  {:<PHASE_CELL$}  {}{through}",
-                "share", "public", share.public_url,
+                "  {}  {:<PHASE_CELL$}  {}{through}",
+                pad("share", service_width),
+                "public",
+                share.public_url,
             );
-            writeln!(out, "{}", ellipsize(&row, width))?;
+            writeln!(out, "{}", ellipsize_end(&row, width))?;
         }
     }
     Ok(())
+}
+
+/// `text` padded with spaces to `width` columns. `{:<width$}` counts
+/// characters, and a wide one takes two columns.
+fn pad(text: &str, width: usize) -> String {
+    format!(
+        "{text}{}",
+        " ".repeat(width.saturating_sub(text_width(text)))
+    )
 }
 
 /// The error for a name `status` was given that git does not list.
@@ -525,19 +530,19 @@ fn fit_line(word: &str, ports: &str, url: Option<&str>, tail: Option<&str>, room
         parts.join(&" ".repeat(COL_GAP))
     };
     let full = assemble(ports, url);
-    if full.chars().count() <= room {
+    if text_width(&full) <= room {
         return full;
     }
     let without_url = assemble(ports, None);
-    if without_url.chars().count() <= room {
+    if text_width(&without_url) <= room {
         return without_url;
     }
-    let over = without_url.chars().count() - room;
-    let keep = ports.chars().count().saturating_sub(over);
+    let over = text_width(&without_url) - room;
+    let keep = text_width(ports).saturating_sub(over);
     // And if even an empty ports cell will not fit — a split narrow enough
     // that the phase word and the age are already too much — the line is
     // truncated rather than left to wrap onto the process rows below it.
-    ellipsize(&assemble(&ellipsize(ports, keep), None), room)
+    ellipsize_end(&assemble(&ellipsize_end(ports, keep), None), room)
 }
 
 fn process_line(p: &ProcessRecord) -> String {
