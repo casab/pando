@@ -7459,6 +7459,37 @@ fn rm_clears_one_prunable_entry_and_leaves_the_others_alone() {
     );
 }
 
+// Once `git worktree prune` has run over a deleted worktree, git no longer
+// lists it, and `rm` looked the name up in git's list alone: "no worktree
+// named", while doctor named that very command as the way to forget it.
+// The record stayed, and so did the process, logs and data it named.
+#[test]
+fn rm_of_a_worktree_git_has_pruned_takes_down_what_its_record_names() {
+    let mut fx = fixture();
+    with_dev(&mut fx, dev("sleep 30"));
+    let name = worktree_named(&fx, "feat/one");
+    let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+    let _guard = guard(&outcome);
+    let pgid = outcome.started[0].record.pgid;
+    std::fs::create_dir_all(fx.paths.data_dir(&name)).unwrap();
+    std::fs::remove_dir_all(fx.worktrees_dir().join(&name)).unwrap();
+    git(&fx.root, &["worktree", "prune"]);
+    assert!(fx.names().is_empty(), "git has forgotten it");
+
+    rm(&fx.paths, &name, false, false).unwrap();
+    assert!(
+        !crate::process::group_alive(pgid),
+        "rm must not leave a process behind with no record of it"
+    );
+    assert!(!fx.state().worktrees.contains_key(&name));
+    assert!(!fx.paths.logs_dir(&name).exists());
+    assert!(!fx.paths.data_dir(&name).exists());
+
+    // And a name with no record either is still nothing to remove.
+    let err = rm(&fx.paths, &name, false, false).unwrap_err();
+    assert!(format!("{err:#}").contains("no worktree named"), "{err:#}");
+}
+
 // The checkout runs the repository's filters and hooks, an LFS download
 // among them. Held through it, the state lock stalled every `ls` and TUI
 // worker for as long as it took; and a download that wanted a password

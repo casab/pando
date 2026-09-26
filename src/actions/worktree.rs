@@ -383,6 +383,12 @@ fn git_succeeds(root: &Path, args: &[&str]) -> bool {
 
 /// Removes a worktree, its logs, and its data directory. The branch is kept;
 /// deleting it is a separate decision.
+///
+/// A worktree git no longer lists — its directory deleted and `git
+/// worktree prune` run — that pando still has a record for is removed the
+/// same way, less the git removal: what the record names is taken down
+/// and the record forgotten. Otherwise the record would wait for an
+/// unrelated `new` to drop it, and nothing would take down what it named.
 pub fn rm(
     paths: &PandoPaths,
     name: &str,
@@ -394,15 +400,21 @@ pub fn rm(
     if discovery.main.name == name {
         bail!("{name:?} is the main checkout — pando never removes it");
     }
-    let target = discovery
-        .worktrees
-        .iter()
-        .find(|w| w.name == name)
-        .with_context(|| format!("no worktree named {name:?}"))?;
+    let target = discovery.worktrees.iter().find(|w| w.name == name);
+    // Read without the lock, and before the home is made: this only asks
+    // whether there is anything to remove at all.
+    if target.is_none()
+        && !state::load(&paths.state_file())
+            .is_ok_and(|store| forgotten_record(&discovery, &store, name).is_some())
+    {
+        bail!("no worktree named {name:?}");
+    }
 
     // Locked worktrees are always refused. pando never unlocks, and never
     // passes --force twice to talk git out of it.
-    if target.locked {
+    if let Some(target) = target
+        && target.locked
+    {
         let reason = target
             .lock_reason
             .as_deref()
@@ -426,16 +438,29 @@ pub fn rm(
     // group it signalled, and a refused `rm` that forgot that signalled
     // them all again on the next mutation.
     state::save(&paths.state_file(), &store)?;
-    drop_stale_worktree_records(&mut store, paths.root());
-    let created_by_pando = store
-        .worktrees
-        .get(name)
-        .is_some_and(|r| r.created_by_pando && record_is_for(r, target));
-    let shown = target.display_name();
+    let (shown, recorded_at) = match target {
+        Some(target) => {
+            drop_stale_worktree_records(&mut store, paths.root());
+            (target.display_name(), target.path.clone())
+        }
+        // Not dropped as stale: that record is the one this removes.
+        None => match forgotten_record(&discovery, &store, name) {
+            Some(record) => {
+                progress(&format!(
+                    "git no longer lists {name} — taking down what pando still has for it"
+                ));
+                (name.to_string(), record.path.clone())
+            }
+            None => bail!("no worktree named {name:?}"),
+        },
+    };
+    let created_by_pando = store.worktrees.get(name).is_some_and(|r| {
+        r.created_by_pando && target.is_none_or(|target| record_is_for(r, target))
+    });
     if !created_by_pando && !yes {
         bail!(
             "pando did not create {shown} ({}) — {}",
-            target.path.display(),
+            recorded_at.display(),
             remedy::REMOVE_ANYWAY
         );
     }
@@ -446,7 +471,7 @@ pub fn rm(
     // process for pando's kill. The questions are the two git asks without
     // `--force`, in its order; ignored files never block a removal and do
     // not show here.
-    if !force {
+    if !force && let Some(target) = target {
         match submodule_in(target) {
             Ok(None) => {}
             Ok(Some(what)) => bail!(
@@ -545,28 +570,31 @@ pub fn rm(
     //
     // Always run, even when the directory is already gone: the same command
     // clears a prunable entry, and only that one. `git worktree prune` is
-    // global and would sweep entries pando has no business touching.
-    let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(paths.root()).args(["worktree", "remove"]);
-    if force {
-        cmd.arg("--force");
-    }
-    cmd.arg(target.path.to_str().context("worktree path is not utf-8")?);
-    let out = cmd.output().context("spawn git worktree remove")?;
-    if !out.status.success() {
-        // Anything that was running has already been stopped by now and
-        // that cannot be taken back, so the cleared record is saved rather
-        // than left behind to resurface as a phantom failure — and the
-        // message says what actually happened.
-        state::save(&paths.state_file(), &store)?;
-        let reason = git_failure_reason(&out);
-        if matches!(stopped, StopOutcome::Stopped(_)) {
-            bail!(
-                "git worktree remove failed: {reason} — what was running was stopped, and any \
-                 public URL closed; the worktree was kept"
-            );
+    // global and would sweep entries pando has no business touching. A
+    // worktree git no longer lists has nothing left for it to remove.
+    if let Some(target) = target {
+        let mut cmd = Command::new("git");
+        cmd.arg("-C").arg(paths.root()).args(["worktree", "remove"]);
+        if force {
+            cmd.arg("--force");
         }
-        bail!("git worktree remove failed: {reason}");
+        cmd.arg(target.path.to_str().context("worktree path is not utf-8")?);
+        let out = cmd.output().context("spawn git worktree remove")?;
+        if !out.status.success() {
+            // Anything that was running has already been stopped by now
+            // and that cannot be taken back, so the cleared record is saved
+            // rather than left behind to resurface as a phantom failure —
+            // and the message says what actually happened.
+            state::save(&paths.state_file(), &store)?;
+            let reason = git_failure_reason(&out);
+            if matches!(stopped, StopOutcome::Stopped(_)) {
+                bail!(
+                    "git worktree remove failed: {reason} — what was running was stopped, and \
+                     any public URL closed; the worktree was kept"
+                );
+            }
+            bail!("git worktree remove failed: {reason}");
+        }
     }
 
     let _ = std::fs::remove_dir_all(paths.logs_dir(name));
@@ -790,6 +818,22 @@ fn record_is_for(record: &WorktreeRecord, wt: &Worktree) -> bool {
     wt.prunable
         || crate::paths::resolve_for_compare(&record.path)
             == crate::paths::resolve_for_compare(&wt.path)
+}
+
+/// The record called `name` when it is for a worktree git no longer lists
+/// at all, under that name or any other: the one thing `rm` of a name git
+/// does not know removes.
+fn forgotten_record<'a>(
+    discovery: &worktree::Discovery,
+    store: &'a state::State,
+    name: &str,
+) -> Option<&'a WorktreeRecord> {
+    let record = store.worktrees.get(name)?;
+    let path = crate::paths::resolve_for_compare(&record.path);
+    let listed = std::iter::once(&discovery.main)
+        .chain(&discovery.worktrees)
+        .any(|w| crate::paths::resolve_for_compare(&w.path) == path);
+    (!listed).then_some(record)
 }
 
 /// Drops records for worktrees git no longer lists. Callers hold the flock;
