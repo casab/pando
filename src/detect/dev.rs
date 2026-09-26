@@ -431,11 +431,15 @@ pub(super) fn port_proposal(
     rule: Option<&'static FrameworkRule>,
 ) -> Option<Proposal> {
     // Not where the script that would run fixes its own port: the flag
-    // wins over the variable, and a role for it is a port nothing binds.
-    let fixed = ranked_scripts(signals)
+    // wins over every variable, the framework's and the env example's
+    // alike, and a role for it is a port nothing binds.
+    if ranked_scripts(signals)
         .first()
-        .is_some_and(|(_, body)| fixed_port(body).is_some());
-    let framework_env = rule.filter(|_| !fixed).and_then(|r| match r.port {
+        .is_some_and(|(_, body)| fixed_port(body).is_some())
+    {
+        return None;
+    }
+    let framework_env = rule.and_then(|r| match r.port {
         PortMechanism::Env(name) => Some((name, r.name)),
         _ => None,
     });

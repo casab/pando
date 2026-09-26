@@ -480,6 +480,22 @@ fn a_dev_script_that_fixes_its_own_port_is_not_given_the_framework_one() {
     );
 }
 
+// The env example's own `PORT` moves the fixed port no more than the
+// framework's does: decided, it was a role waited on for a port Next
+// never binds.
+#[test]
+fn a_dev_script_that_fixes_its_own_port_is_not_given_the_env_examples_one() {
+    let next = RULES.iter().find(|r| r.name == "Next.js").unwrap();
+    for keys in [&["PORT"][..], &["WEB_PORT", "API_PORT"]] {
+        let signals = Signals {
+            env_example: env_pairs(keys),
+            ..scripts(&[("dev", "next dev -p 3001")])
+        };
+        assert!(port_proposal(&signals, Some(next)).is_none(), "{keys:?}");
+        assert!(port_proposal(&signals, None).is_none(), "{keys:?}");
+    }
+}
+
 // A project that writes `PORT` has said where its web server's port
 // comes from. The role reading is for a project that named its ports
 // instead, so this one keeps the question it always had.
