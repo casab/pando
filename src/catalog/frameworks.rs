@@ -35,10 +35,23 @@ pub struct FrameworkRule {
     /// for a framework that takes its port some other way — Django's
     /// positional `host:port` cannot be appended to somebody's script.
     pub port_flag: Option<&'static str>,
-    /// Only for a project that builds something runnable: a Cargo.toml
-    /// with no binary is a library, and detection checks the crate before
-    /// it lets this rule match.
-    pub binary_only: bool,
+    /// What a project with one of the markers must also be before this
+    /// rule claims it.
+    pub guard: Guard,
+}
+
+/// What a marker match must also pass, for a marker file that more than
+/// one kind of project has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Guard {
+    /// The marker file is enough.
+    Marker,
+    /// A crate that builds something runnable: a Cargo.toml with no binary
+    /// is a library, and there is nothing to serve.
+    BinaryCrate,
+    /// One of these files contains this text: every Mix project has a
+    /// `mix.exs`, and only one that depends on `:phoenix` is Phoenix.
+    Mentions(&'static [&'static str], &'static str),
 }
 
 /// The rules pando ships with. Order matters: the first match wins, so the
@@ -57,7 +70,7 @@ pub const RULES: [FrameworkRule; 12] = [
         default_port: 3000,
         command: Some("npx next dev"),
         port_flag: Some("--port {port}"),
-        binary_only: false,
+        guard: Guard::Marker,
     },
     FrameworkRule {
         name: "Nuxt",
@@ -67,7 +80,7 @@ pub const RULES: [FrameworkRule; 12] = [
         default_port: 3000,
         command: Some("npx nuxt dev"),
         port_flag: Some("--port {port}"),
-        binary_only: false,
+        guard: Guard::Marker,
     },
     // Astro sits on Vite but has its own CLI, its own default port and its
     // own command, so it comes before the Vite row that would claim it.
@@ -79,7 +92,7 @@ pub const RULES: [FrameworkRule; 12] = [
         default_port: 4321,
         command: Some("npx astro dev --port {port:web}"),
         port_flag: Some("--port {port}"),
-        binary_only: false,
+        guard: Guard::Marker,
     },
     FrameworkRule {
         name: "Angular",
@@ -89,7 +102,7 @@ pub const RULES: [FrameworkRule; 12] = [
         default_port: 4200,
         command: Some("npx ng serve --port {port:web}"),
         port_flag: Some("--port {port}"),
-        binary_only: false,
+        guard: Guard::Marker,
     },
     FrameworkRule {
         name: "Vite",
@@ -114,7 +127,7 @@ pub const RULES: [FrameworkRule; 12] = [
         default_port: 5173,
         command: Some("npx vite --port {port:web}"),
         port_flag: Some("--port {port}"),
-        binary_only: false,
+        guard: Guard::Marker,
     },
     FrameworkRule {
         name: "Django",
@@ -124,17 +137,19 @@ pub const RULES: [FrameworkRule; 12] = [
         default_port: 8000,
         command: Some("{runner}python manage.py runserver 127.0.0.1:{port:web}"),
         port_flag: None,
-        binary_only: false,
+        guard: Guard::Marker,
     },
     FrameworkRule {
         name: "Rails",
-        markers: &["config.ru", "bin/dev"],
+        // Rails' own files. `config.ru` is every Rack app's and `bin/dev`
+        // is a helper script in any language.
+        markers: &["bin/rails", "config/application.rb"],
         script_markers: &[],
         port: PortMechanism::InCommand,
         default_port: 3000,
         command: Some("bin/rails server -p {port:web}"),
         port_flag: Some("-p {port}"),
-        binary_only: false,
+        guard: Guard::Marker,
     },
     FrameworkRule {
         name: "Phoenix",
@@ -144,7 +159,9 @@ pub const RULES: [FrameworkRule; 12] = [
         default_port: 4000,
         command: Some("mix phx.server"),
         port_flag: None,
-        binary_only: false,
+        // `{:phoenix, …}` in the deps, or `:phoenix,` in the lockfile an
+        // umbrella keeps at its root beside a `mix.exs` that has none.
+        guard: Guard::Mentions(&["mix.exs", "mix.lock"], ":phoenix,"),
     },
     FrameworkRule {
         name: "Laravel",
@@ -154,7 +171,7 @@ pub const RULES: [FrameworkRule; 12] = [
         default_port: 8000,
         command: Some("php artisan serve --port {port:web}"),
         port_flag: Some("--port {port}"),
-        binary_only: false,
+        guard: Guard::Marker,
     },
     FrameworkRule {
         name: "Go",
@@ -164,7 +181,7 @@ pub const RULES: [FrameworkRule; 12] = [
         default_port: 8080,
         command: Some("go run ."),
         port_flag: None,
-        binary_only: false,
+        guard: Guard::Marker,
     },
     FrameworkRule {
         name: "Rust",
@@ -176,7 +193,7 @@ pub const RULES: [FrameworkRule; 12] = [
         // run, which `binary_crate` decides.
         command: Some("cargo run"),
         port_flag: None,
-        binary_only: true,
+        guard: Guard::BinaryCrate,
     },
     FrameworkRule {
         name: "Node",
@@ -186,7 +203,7 @@ pub const RULES: [FrameworkRule; 12] = [
         default_port: 3000,
         command: None,
         port_flag: None,
-        binary_only: false,
+        guard: Guard::Marker,
     },
 ];
 

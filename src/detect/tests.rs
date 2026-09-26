@@ -730,6 +730,49 @@ fn a_library_crate_matches_no_framework() {
     assert_eq!(framework(dir.path(), &s).unwrap().name, "Rust");
 }
 
+// `config.ru` is every Rack app's and `bin/dev` is a helper in any
+// language: read as Rails, a Sinatra app and a Go repo were both given
+// `bin/rails server`, which is not there to run.
+#[test]
+fn a_file_other_projects_have_too_does_not_make_one_rails() {
+    let (dir, s) = marker_fixture(&[("Gemfile", ""), ("config.ru", "run App\n")]);
+    assert!(framework(dir.path(), &s).is_none());
+    let (dir, s) = marker_fixture(&[("go.mod", "module x\n"), ("bin/dev", "#!/bin/sh\n")]);
+    assert_eq!(framework(dir.path(), &s).unwrap().name, "Go");
+    let (dir, s) = marker_fixture(&[
+        ("config.ru", ""),
+        ("bin/dev", ""),
+        ("bin/rails", ""),
+        ("config/application.rb", ""),
+    ]);
+    assert_eq!(framework(dir.path(), &s).unwrap().name, "Rails");
+}
+
+// Every Mix project has a mix.exs, and `mix phx.server` is a task only
+// Phoenix defines.
+#[test]
+fn a_mix_project_is_phoenix_only_when_it_depends_on_phoenix() {
+    let (dir, s) = marker_fixture(&[(
+        "mix.exs",
+        "defp deps do\n  [{:jason, \"~> 1.4\"}, {:phoenix_pubsub, \"~> 2.1\"}]\nend\n",
+    )]);
+    assert!(framework(dir.path(), &s).is_none());
+    let (dir, s) = marker_fixture(&[(
+        "mix.exs",
+        "defp deps do\n  [{:phoenix, \"~> 1.7.14\"}, {:jason, \"~> 1.4\"}]\nend\n",
+    )]);
+    assert_eq!(framework(dir.path(), &s).unwrap().name, "Phoenix");
+    // An umbrella's root mix.exs names no dependency; its lockfile does.
+    let (dir, s) = marker_fixture(&[
+        ("mix.exs", "def project do\n  [apps_path: \"apps\"]\nend\n"),
+        (
+            "mix.lock",
+            "%{\n  \"phoenix\": {:hex, :phoenix, \"1.7.14\", \"abc\", [:mix], [], \"hexpm\"},\n}\n",
+        ),
+    ]);
+    assert_eq!(framework(dir.path(), &s).unwrap().name, "Phoenix");
+}
+
 // ---- install ---------------------------------------------------------
 
 // Invariant 1: a lockfile can never change because pando ran an

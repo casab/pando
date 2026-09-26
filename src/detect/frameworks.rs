@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use crate::catalog::frameworks::{FrameworkRule, RULES};
+use crate::catalog::frameworks::{FrameworkRule, Guard, RULES};
 
 use super::signals::Signals;
 
@@ -17,12 +17,24 @@ pub fn framework(root: &Path, signals: &Signals) -> Option<&'static FrameworkRul
             .script_markers
             .iter()
             .any(|needle| signals.scripts.values().any(|body| mentions(body, needle)));
-        // A Cargo.toml with no binary is a library: nothing to serve.
-        if rule.binary_only && by_marker && !binary_crate(root) {
+        // A Cargo.toml with no binary is a library, and a mix.exs with no
+        // Phoenix in it is some other Mix project: nothing this rule serves.
+        if by_marker && !passes(root, rule.guard) {
             return false;
         }
         by_marker || by_script
     })
+}
+
+/// Whether the project at `root` is what a rule's guard asks for.
+fn passes(root: &Path, guard: Guard) -> bool {
+    match guard {
+        Guard::Marker => true,
+        Guard::BinaryCrate => binary_crate(root),
+        Guard::Mentions(files, needle) => files.iter().any(|file| {
+            std::fs::read_to_string(root.join(file)).is_ok_and(|text| text.contains(needle))
+        }),
+    }
 }
 
 /// Whether `body` runs `needle` as a word of its own. A plain substring
