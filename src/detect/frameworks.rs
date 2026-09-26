@@ -214,10 +214,36 @@ pub(super) fn several_binaries(root: &Path) -> Vec<String> {
     binaries.into_iter().map(|(name, _)| name).collect()
 }
 
+/// The names a command under `cmd/` has when it is the service's server.
+const GO_SERVER_COMMANDS: [&str; 7] = ["server", "api", "web", "app", "http", "serve", "www"];
+
+/// The names a command under `cmd/` has when it is a tool beside the
+/// server, which a start would run as the dev server and see exit.
+const GO_TOOL_COMMANDS: [&str; 13] = [
+    "migrate",
+    "migration",
+    "seed",
+    "cli",
+    "admin",
+    "gen",
+    "generate",
+    "tool",
+    "tools",
+    "worker",
+    "job",
+    "cron",
+    "script",
+];
+
 /// The commands of a Go module whose root is not a main package, which
-/// `go run .` refuses: each directory under `cmd/` that is one, in
-/// directory order. Empty for a module whose root is a main package, and
-/// for a library, which is level zero as a library crate is.
+/// `go run .` refuses: each directory under `cmd/` that is one. The first
+/// is the one a start takes, so a server leads: a command with a server's
+/// name, or with the module's own, `cmd/shop` in `example.com/shop`, then
+/// the rest in directory order. Where there are several and none has a
+/// server's name, none: `cmd/migrate` and `cmd/seed` are tools, and taken
+/// as the dev server one would run against the database and exit. Empty
+/// for a module whose root is a main package, and for a library, which
+/// is level zero as a library crate is.
 pub(super) fn go_commands(root: &Path) -> Vec<String> {
     if go_main(root) {
         return Vec::new();
@@ -230,7 +256,41 @@ pub(super) fn go_commands(root: &Path) -> Vec<String> {
         .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
         .collect();
     names.sort();
+    if names.len() < 2 {
+        return names;
+    }
+    let module = go_module_name(root);
+    let serves = |name: &str| {
+        !GO_TOOL_COMMANDS.contains(&name)
+            && (GO_SERVER_COMMANDS.contains(&name) || module.as_deref() == Some(name))
+    };
+    if !names.iter().any(|name| serves(name)) {
+        return Vec::new();
+    }
+    names.sort_by_key(|name| !serves(name));
     names
+}
+
+/// The last element of a Go module's path, past a major version suffix:
+/// `shop` for `example.com/shop/v2`.
+fn go_module_name(root: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(root.join("go.mod")).ok()?;
+    let path = text.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("module")?;
+        rest.starts_with(char::is_whitespace)
+            .then(|| rest.split("//").next().unwrap_or(rest).trim())
+    })?;
+    let mut elements = path.trim_matches('"').rsplit('/');
+    let last = elements.next()?;
+    let major = last
+        .strip_prefix('v')
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    match major {
+        true => elements.next(),
+        false => Some(last),
+    }
+    .filter(|name| !name.is_empty())
+    .map(str::to_string)
 }
 
 /// Whether the Go package in `dir` is a main package: one of its `.go`

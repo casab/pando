@@ -873,7 +873,7 @@ fn a_go_module_whose_commands_live_under_cmd_is_offered_each_by_path() {
     assert_eq!(
         values(&proposal),
         vec!["go run ./cmd/api", "go run ./cmd/worker"],
-        "in directory order"
+        "the server first"
     );
     assert!(!proposal.decided);
     assert_eq!(values(&port_proposal(&s, rule).unwrap()), vec!["PORT"]);
@@ -897,6 +897,67 @@ fn a_go_module_whose_commands_live_under_cmd_is_offered_each_by_path() {
     let proposal = dev_in(dir.path(), &s);
     assert_eq!(values(&proposal), vec!["go run ."]);
     assert!(proposal.decided);
+}
+
+// The first command is the one a start takes. In directory order a
+// `cmd/migrate` beside a `cmd/server` came first, and a first start ran
+// the migration tool against the env's database as the dev server.
+#[test]
+fn a_go_modules_server_under_cmd_is_offered_before_its_tools() {
+    let first = |files: &[(&str, &str)]| {
+        let (dir, s) = marker_fixture(files);
+        dev_cmd_proposal(dir.path(), &s, framework(dir.path(), &s))
+            .map(|proposal| values(&proposal).join(", "))
+    };
+    assert_eq!(
+        first(&[
+            ("go.mod", "module x\n"),
+            ("cmd/migrate/main.go", "package main\n"),
+            ("cmd/server/main.go", "package main\n"),
+        ])
+        .as_deref(),
+        Some("go run ./cmd/server, go run ./cmd/migrate")
+    );
+    assert_eq!(
+        first(&[
+            ("go.mod", "module x\n"),
+            ("cmd/admin/main.go", "package main\n"),
+            ("cmd/api/main.go", "package main\n"),
+            ("cmd/cli/main.go", "package main\n"),
+            ("cmd/seed/main.go", "package main\n"),
+        ])
+        .as_deref(),
+        Some("go run ./cmd/api, go run ./cmd/admin, go run ./cmd/cli, go run ./cmd/seed")
+    );
+    // The command named after the module is its own.
+    assert_eq!(
+        first(&[
+            ("go.mod", "module example.com/acme/shop/v2 // the shop\n"),
+            ("cmd/gen/main.go", "package main\n"),
+            ("cmd/shop/main.go", "package main\n"),
+        ])
+        .as_deref(),
+        Some("go run ./cmd/shop, go run ./cmd/gen")
+    );
+
+    // Several commands and none a server: there is nothing pando can tell
+    // is the one to run, and a tool is no guess at it.
+    for files in [
+        &[
+            ("go.mod", "module x\n"),
+            ("cmd/migrate/main.go", "package main\n"),
+            ("cmd/seed/main.go", "package main\n"),
+        ][..],
+        &[
+            ("go.mod", "module example.com/acme/migrate\n"),
+            ("cmd/migrate/main.go", "package main\n"),
+            ("cmd/lint/main.go", "package main\n"),
+        ],
+    ] {
+        let (dir, s) = marker_fixture(files);
+        assert!(framework(dir.path(), &s).is_none(), "{files:?}");
+        assert_eq!(first(files), None, "{files:?}");
+    }
 }
 
 // `config.ru` is every Rack app's and `bin/dev` is a helper in any

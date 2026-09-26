@@ -60,7 +60,9 @@ pub enum Guard {
     /// is a library, and there is nothing to serve.
     BinaryCrate,
     /// A Go module with a `package main` to run: its root, or a command
-    /// under `cmd/`. A library has nothing for `go run` to run.
+    /// under `cmd/` that may be its server. A library has nothing for `go
+    /// run` to run, and among several commands none named as a server
+    /// there is no telling which one serves.
     GoMain,
     /// One of these files contains this text: every Mix project has a
     /// `mix.exs`, and only one that depends on `:phoenix` is Phoenix.
