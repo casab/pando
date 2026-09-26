@@ -64,10 +64,24 @@ pub fn refreshed(state: State) -> AppEvent {
 }
 
 pub fn refreshed_with(state: State, warning: Option<&str>, notices: Vec<String>) -> AppEvent {
-    AppEvent::Refreshed(Box::new(actions::Refreshed {
-        state,
-        warning: warning.map(str::to_string),
-        notices,
+    AppEvent::Refreshed(Box::new(background::QuickRefresh {
+        refreshed: actions::Refreshed {
+            state,
+            warning: warning.map(str::to_string),
+            notices,
+        },
+        ran: true,
+    }))
+}
+
+/// A quick refresh that found nothing could change, and only read `state`.
+pub fn reread(state: State) -> AppEvent {
+    AppEvent::Refreshed(Box::new(background::QuickRefresh {
+        refreshed: actions::Refreshed {
+            state,
+            ..Default::default()
+        },
+        ran: false,
     }))
 }
 
@@ -1745,6 +1759,29 @@ fn a_standing_warning_from_the_quick_refresh_is_said_once() {
         .filter(|m| m.message.contains("version 3"))
         .count();
     assert_eq!(said, 2, "{:?}", app.messages);
+}
+
+// A save that keeps failing — a home made read-only while a running
+// server has a port the file lacks — is said by each discovery's full
+// refresh. The quick refreshes between them only read the file, saved
+// nothing, and cleared it all the same, so every discovery said it again.
+#[test]
+fn a_standing_warning_is_not_cleared_by_a_refresh_that_only_read() {
+    let mut app = test_app(&["feat+one"]);
+    let discovery = |app: &App| Snapshot {
+        warning: Some("could not save /s: read-only file system".into()),
+        ..listing(app, &["feat+one"])
+    };
+    app.apply_snapshot(discovery(&app));
+    app.handle_event(reread(State::new()));
+    app.handle_event(reread(State::new()));
+    app.apply_snapshot(discovery(&app));
+    let said = app
+        .messages
+        .iter()
+        .filter(|m| m.message.contains("could not save"))
+        .count();
+    assert_eq!(said, 1, "{:?}", app.messages);
 }
 
 // The quick refresh is four refreshes in five, and the one that sweeps a
@@ -5955,15 +5992,17 @@ fn the_gated_refresh_reads_a_quiet_state_as_is_and_advances_a_death() {
     std::fs::create_dir_all(app.paths.state_file().parent().unwrap()).unwrap();
     crate::state::save(&app.paths.state_file(), &app.state).unwrap();
     let quiet = background::refresh_if_needed(&app.paths);
-    assert_eq!(quiet.state, app.state);
-    assert!(quiet.warning.is_none());
+    assert!(!quiet.ran);
+    assert_eq!(quiet.refreshed.state, app.state);
+    assert!(quiet.refreshed.warning.is_none());
 
     let record = app.state.worktrees.get_mut("feat+a").unwrap();
     record.processes.get_mut("dev").unwrap().pid = dead;
     crate::state::save(&app.paths.state_file(), &app.state).unwrap();
     let advanced = background::refresh_if_needed(&app.paths);
+    assert!(advanced.ran);
     assert!(matches!(
-        advanced.state.worktrees["feat+a"].processes["dev"].phase,
+        advanced.refreshed.state.worktrees["feat+a"].processes["dev"].phase,
         Phase::Failed { .. }
     ));
 }

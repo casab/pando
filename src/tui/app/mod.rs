@@ -483,16 +483,29 @@ impl App {
                 self.gh_account = Some(account);
                 changed
             }
-            AppEvent::Refreshed(refreshed) => {
+            AppEvent::Refreshed(quick) => {
                 self.refreshing = false;
-                let actions::Refreshed {
-                    state,
-                    warning,
-                    notices,
-                } = *refreshed;
+                let background::QuickRefresh {
+                    refreshed:
+                        actions::Refreshed {
+                            state,
+                            warning,
+                            notices,
+                        },
+                    ran,
+                } = *quick;
                 // Adopted with a warning too, as a discovery adopts it: a
                 // save that failed still has the phases right in memory.
                 let changed = self.adopt_state(state);
+                // Only a refresh that ran has a say about the warning. The
+                // read taken instead when nothing can change saves nothing,
+                // and its clearing a save that keeps failing had every
+                // discovery say that again.
+                let warning = if ran {
+                    warning
+                } else {
+                    self.state_warning.clone()
+                };
                 self.report_refresh(warning, notices) || changed
             }
             AppEvent::ServiceHealth(health) => {

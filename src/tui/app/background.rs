@@ -32,7 +32,7 @@ pub enum AppEvent {
     /// Process state, advanced and saved off the UI thread, with what the
     /// refresh had to say beside it: why the state file could not be used,
     /// and each share or service it found dead.
-    Refreshed(Box<actions::Refreshed>),
+    Refreshed(Box<QuickRefresh>),
     /// Whether the project's services are answering — the shared ones for
     /// the header chips, each worktree's private ones for its detail rows.
     /// Probed on the refresh worker: it is a TCP connect apiece.
@@ -72,6 +72,15 @@ pub struct Snapshot {
     /// often. Shown once, as a status line.
     pub notices: Vec<String>,
     pub default_base: Option<String>,
+}
+
+/// What the one-second refresh found.
+pub struct QuickRefresh {
+    pub refreshed: actions::Refreshed,
+    /// Whether [`actions::refresh`] ran. The read [`refresh_if_needed`]
+    /// takes instead when it cannot matter takes no lock and saves
+    /// nothing, so a warning it did not give is not one it cleared.
+    pub ran: bool,
 }
 
 /// Sends a question to the UI thread and waits for the answer.
@@ -141,7 +150,7 @@ pub fn snapshot(paths: &PandoPaths, known_base: Option<String>, scan: bool) -> R
         let refreshed = if scan {
             actions::refresh(paths)
         } else {
-            refresh_if_needed(paths)
+            refresh_if_needed(paths).refreshed
         };
         let default_base =
             known_base.or_else(|| resolving.and_then(|handle| handle.join().ok().flatten()));
@@ -168,13 +177,19 @@ pub fn snapshot(paths: &PandoPaths, known_base: Option<String>, scan: bool) -> R
 /// the state file is read as it stands. The full refresh still runs with
 /// every discovery, so ports a running server opens later are captured
 /// within one slow tick.
-pub(super) fn refresh_if_needed(paths: &PandoPaths) -> actions::Refreshed {
+pub(super) fn refresh_if_needed(paths: &PandoPaths) -> QuickRefresh {
     match state::load(&paths.state_file()) {
-        Ok(store) if !needs_advance(&store, crate::process::is_alive) => actions::Refreshed {
-            state: store,
-            ..Default::default()
+        Ok(store) if !needs_advance(&store, crate::process::is_alive) => QuickRefresh {
+            refreshed: actions::Refreshed {
+                state: store,
+                ..Default::default()
+            },
+            ran: false,
         },
-        _ => actions::refresh(paths),
+        _ => QuickRefresh {
+            refreshed: actions::refresh(paths),
+            ran: true,
+        },
     }
 }
 
@@ -371,13 +386,14 @@ impl App {
         let config = self.config.clone();
         let tx = self.event_tx.clone();
         thread::spawn(move || {
-            let refreshed = refresh_if_needed(&paths);
+            let quick = refresh_if_needed(&paths);
             // Before the state is handed over: probing is a TCP connect
             // per service, and it has no business on the UI thread or in
             // a paint.
             let health = ServiceHealth {
                 shared: actions::shared_service_statuses(&paths, &config),
-                worktrees: refreshed
+                worktrees: quick
+                    .refreshed
                     .state
                     .worktrees
                     .iter()
@@ -385,7 +401,7 @@ impl App {
                     .map(|(name, record)| (name.clone(), actions::service_statuses(record)))
                     .collect(),
             };
-            let _ = tx.send(AppEvent::Refreshed(Box::new(refreshed)));
+            let _ = tx.send(AppEvent::Refreshed(Box::new(quick)));
             // Sent when empty too: a worktree whose private services were
             // just taken down must lose their rows, and an answer that is
             // the same as the last one costs no repaint.
