@@ -29,8 +29,10 @@ pub enum AppEvent {
     PrsReady(Result<Vec<PrInfo>, String>),
     /// Which GitHub account `gh` acts as for this project.
     GhAccountReady(GhAccount),
-    /// Process state, advanced and saved off the UI thread.
-    Refreshed(Box<Result<State, String>>),
+    /// Process state, advanced and saved off the UI thread, with what the
+    /// refresh had to say beside it: why the state file could not be used,
+    /// and each share or service it found dead.
+    Refreshed(Box<actions::Refreshed>),
     /// Whether the project's services are answering — the shared ones for
     /// the header chips, each worktree's private ones for its detail rows.
     /// Probed on the refresh worker: it is a TCP connect apiece.
@@ -223,20 +225,7 @@ impl App {
         // discovery runs is as likely as the quick one to be the read
         // that first finds a process dead.
         self.adopt_state(snapshot.state);
-        if snapshot.warning != self.state_warning {
-            if let Some(message) = snapshot.warning.clone() {
-                self.set_error(message);
-            }
-            self.state_warning = snapshot.warning;
-        }
-        // Shares that died since the last tick. Every one of them, once:
-        // the records are already gone, so the next tick has nothing to
-        // repeat, and showing only the first means the second worktree's
-        // public URL closed in silence. The status line truncates rather
-        // than wraps, like every other row.
-        if !snapshot.notices.is_empty() {
-            self.set_error(snapshot.notices.join(" · "));
-        }
+        self.report_refresh(snapshot.warning, snapshot.notices);
         let keep = self.take_arrival().or(keep);
         self.refilter_keeping(keep.clone(), row);
         // The worktree under the cursor went away, and the cursor is on
@@ -248,6 +237,34 @@ impl App {
             self.tail_scroll = 0;
         }
         fresh
+    }
+
+    /// What a refresh said beside the state, from either door: the quick
+    /// refresh or the full one a discovery runs. Returns whether it said
+    /// anything.
+    ///
+    /// A warning is said when it appears or changes. A state file pando
+    /// cannot read stays that way, and saying so on every quick refresh
+    /// fills `m` with that one line within a minute.
+    pub(super) fn report_refresh(&mut self, warning: Option<String>, notices: Vec<String>) -> bool {
+        let mut said = false;
+        if warning != self.state_warning {
+            if let Some(message) = warning.clone() {
+                self.set_error(message);
+                said = true;
+            }
+            self.state_warning = warning;
+        }
+        // Shares and services that died since the last refresh. Every one
+        // of them, once: the records are already gone, so the next refresh
+        // has nothing to repeat, and showing only the first means the
+        // second worktree's public URL closed in silence. The status line
+        // truncates rather than wraps, like every other row.
+        if !notices.is_empty() {
+            self.set_error(notices.join(" · "));
+            said = true;
+        }
+        said
     }
 
     /// The worktree `n` just made, once a discovery has listed it: it takes
@@ -347,11 +364,7 @@ impl App {
                     .map(|(name, record)| (name.clone(), actions::service_statuses(record)))
                     .collect(),
             };
-            let result = match refreshed.warning {
-                Some(warning) => Err(warning),
-                None => Ok(refreshed.state),
-            };
-            let _ = tx.send(AppEvent::Refreshed(Box::new(result)));
+            let _ = tx.send(AppEvent::Refreshed(Box::new(refreshed)));
             // Sent when empty too: a worktree whose private services were
             // just taken down must lose their rows, and an answer that is
             // the same as the last one costs no repaint.

@@ -58,6 +58,19 @@ pub fn test_app(names: &[&str]) -> App {
 use crate::state::{ProcessRecord, WorktreeRecord};
 use chrono::Utc;
 
+/// A quick refresh that read `state` and had nothing else to say.
+pub fn refreshed(state: State) -> AppEvent {
+    refreshed_with(state, None, Vec::new())
+}
+
+pub fn refreshed_with(state: State, warning: Option<&str>, notices: Vec<String>) -> AppEvent {
+    AppEvent::Refreshed(Box::new(actions::Refreshed {
+        state,
+        warning: warning.map(str::to_string),
+        notices,
+    }))
+}
+
 /// Gives a worktree a process in `phase`, as a refresh would have.
 pub fn with_process(app: &mut App, name: &str, phase: Phase) {
     let mut record = WorktreeRecord::new(format!("/trees/{name}"), true);
@@ -1470,7 +1483,7 @@ fn open_uses_the_same_url_rule_as_status() {
     );
     record.observed_ports = vec![3000];
     state.worktrees.insert("feat+url2".to_string(), record);
-    app.handle_event(AppEvent::Refreshed(Box::new(Ok(state.clone()))));
+    app.handle_event(refreshed(state.clone()));
 
     assert_eq!(
         app.url_of("feat+url2"),
@@ -1488,7 +1501,7 @@ fn a_refresh_replaces_the_process_state() {
     let mut record = WorktreeRecord::new("/trees/feat+one", true);
     record.ports.insert("web".to_string(), 17_342);
     state.worktrees.insert("feat+one".to_string(), record);
-    assert!(app.handle_event(AppEvent::Refreshed(Box::new(Ok(state)))));
+    assert!(app.handle_event(refreshed(state)));
     assert_eq!(
         app.url_of("feat+one").as_deref(),
         Some("http://localhost:17342")
@@ -1499,10 +1512,79 @@ fn a_refresh_replaces_the_process_state() {
 #[test]
 fn a_refresh_that_failed_reaches_the_status_line() {
     let mut app = test_app(&["feat+one"]);
-    app.handle_event(AppEvent::Refreshed(Box::new(Err("state is v3".into()))));
+    app.handle_event(refreshed_with(
+        State::new(),
+        Some("state is v3"),
+        Vec::new(),
+    ));
     let (message, is_error) = app.active_status().unwrap();
     assert!(message.contains("state is v3"), "{message}");
     assert!(is_error);
+}
+
+// Four quick refreshes in five seconds, each finding the same state file
+// it cannot read: said on every one, `m` held nothing else within a
+// minute.
+#[test]
+fn a_standing_warning_from_the_quick_refresh_is_said_once() {
+    let mut app = test_app(&["feat+one"]);
+    let warning = Some("state file /s is version 3");
+    app.handle_event(refreshed_with(State::new(), warning, Vec::new()));
+    app.handle_event(refreshed_with(State::new(), warning, Vec::new()));
+    // Nor again by the discovery that reads the same file.
+    app.apply_snapshot(Snapshot {
+        main: wt("acme-shop"),
+        worktrees: vec![wt("feat+one")],
+        created_by_pando: BTreeMap::new(),
+        state: State::new(),
+        warning: warning.map(str::to_string),
+        notices: Vec::new(),
+        default_base: None,
+    });
+    let said = app
+        .messages
+        .iter()
+        .filter(|m| m.message.contains("version 3"))
+        .count();
+    assert_eq!(said, 1, "{:?}", app.messages);
+
+    // Read again after a good refresh, it is news again.
+    app.handle_event(refreshed(State::new()));
+    app.handle_event(refreshed_with(State::new(), warning, Vec::new()));
+    let said = app
+        .messages
+        .iter()
+        .filter(|m| m.message.contains("version 3"))
+        .count();
+    assert_eq!(said, 2, "{:?}", app.messages);
+}
+
+// The quick refresh is four refreshes in five, and the one that sweeps a
+// dead share saves it away: a notice it dropped, no later refresh had.
+#[test]
+fn a_notice_from_the_quick_refresh_reaches_the_status_line() {
+    let mut app = test_app(&["feat+one"]);
+    app.handle_event(refreshed_with(
+        State::new(),
+        None,
+        vec!["feat+one: the share's tunnel exited, so the public URL is closed".into()],
+    ));
+    let (message, is_error) = app.active_status().expect("a notice");
+    assert!(message.contains("public URL is closed"), "{message}");
+    assert!(is_error);
+}
+
+// A save that failed has the phases right in memory; the quick refresh
+// dropped them and kept the older read.
+#[test]
+fn a_quick_refresh_with_a_warning_still_adopts_its_state() {
+    let mut app = test_app(&["feat+one"]);
+    let mut state = State::new();
+    let mut record = WorktreeRecord::new("/trees/feat+one", true);
+    record.ports.insert("web".to_string(), 17_342);
+    state.worktrees.insert("feat+one".to_string(), record);
+    app.handle_event(refreshed_with(state, Some("could not save"), Vec::new()));
+    assert!(app.record_for("feat+one").is_some());
 }
 
 // ---- the question modal ----------------------------------------------
@@ -3637,7 +3719,7 @@ fn the_list_keeps_discovery_order_when_a_worktree_starts() {
     let mut probe = test_app(&["feat+three"]);
     with_process(&mut probe, "feat+three", running_phase());
     state.worktrees.extend(probe.state.worktrees);
-    app.handle_event(AppEvent::Refreshed(Box::new(Ok(state))));
+    app.handle_event(refreshed(state));
 
     let order: Vec<&str> = app
         .filtered_indices
@@ -4376,7 +4458,7 @@ fn a_start_that_returns_before_ready_waits_to_say_so() {
         .get_mut("dev")
         .unwrap()
         .phase = running_phase();
-    app.handle_event(AppEvent::Refreshed(Box::new(Ok(state))));
+    app.handle_event(refreshed(state));
     let status = app.flash().unwrap();
     assert_eq!(status.kind, StatusKind::Success);
     assert_eq!(status.message, "feat/one is ready — http://localhost:17342");
@@ -4417,7 +4499,7 @@ fn a_restart_is_not_ready_on_a_read_from_before_it() {
             };
             processes.insert("api".into(), new_api);
         }
-        app.handle_event(AppEvent::Refreshed(Box::new(Ok(state))));
+        app.handle_event(refreshed(state));
     };
     // Between the stop and the start: only the sibling, running.
     refreshed(&mut app, None);
@@ -5090,7 +5172,7 @@ fn a_process_that_dies_after_ready_says_so() {
     app.set_success("feat/m is ready");
     let mut state = app.state.clone();
     fail_process(&mut state, "feat+m", "api", "exited with status 1");
-    app.handle_event(AppEvent::Refreshed(Box::new(Ok(state.clone()))));
+    app.handle_event(refreshed(state.clone()));
     let status = app.flash().expect("a flash");
     assert!(status.is_error());
     assert_eq!(
@@ -5101,7 +5183,7 @@ fn a_process_that_dies_after_ready_says_so() {
 
     // Said once: the next refresh finds it already failed.
     let before = app.messages.len();
-    app.handle_event(AppEvent::Refreshed(Box::new(Ok(state))));
+    app.handle_event(refreshed(state));
     assert_eq!(app.messages.len(), before);
 }
 
@@ -5133,7 +5215,7 @@ fn a_death_that_a_discovery_finds_is_said_too() {
     // And once: neither the refresh after it, nor an older discovery that
     // lands late with the process still up, says it again.
     let before = app.messages.len();
-    app.handle_event(AppEvent::Refreshed(Box::new(Ok(state.clone()))));
+    app.handle_event(refreshed(state.clone()));
     let mut stale = state.clone();
     stale
         .worktrees
@@ -5144,7 +5226,7 @@ fn a_death_that_a_discovery_finds_is_said_too() {
         .unwrap()
         .phase = running_phase();
     app.handle_event(AppEvent::Discovered(Box::new(Ok(snapshot(stale)))));
-    app.handle_event(AppEvent::Refreshed(Box::new(Ok(state))));
+    app.handle_event(refreshed(state));
     assert_eq!(app.messages.len(), before, "{:?}", app.messages);
 }
 
@@ -5162,7 +5244,7 @@ fn a_death_during_a_start_is_said_once_by_name() {
     let mut state = app.state.clone();
     fail_process(&mut state, "feat+m", "dev", "boom");
     let before = app.messages.len();
-    app.handle_event(AppEvent::Refreshed(Box::new(Ok(state))));
+    app.handle_event(refreshed(state));
     assert_eq!(app.messages.len(), before + 1);
     assert_eq!(app.flash().unwrap().message, "dev of feat/m exited — boom");
     assert!(app.awaiting_ready.is_none());

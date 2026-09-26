@@ -483,15 +483,17 @@ impl App {
                 self.gh_account = Some(account);
                 changed
             }
-            AppEvent::Refreshed(result) => {
+            AppEvent::Refreshed(refreshed) => {
                 self.refreshing = false;
-                match *result {
-                    Ok(state) => self.adopt_state(state),
-                    Err(e) => {
-                        self.set_error(format!("refresh failed: {e}"));
-                        true
-                    }
-                }
+                let actions::Refreshed {
+                    state,
+                    warning,
+                    notices,
+                } = *refreshed;
+                // Adopted with a warning too, as a discovery adopts it: a
+                // save that failed still has the phases right in memory.
+                let changed = self.adopt_state(state);
+                self.report_refresh(warning, notices) || changed
             }
             AppEvent::ServiceHealth(health) => {
                 let changed = *health != self.service_health;
