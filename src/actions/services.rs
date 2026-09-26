@@ -380,9 +380,10 @@ pub(super) fn identity_url(resolved: &BTreeMap<String, String>) -> Option<String
 /// for them.
 ///
 /// Compose first, then native, and a native service that fails takes the
-/// containers down with it — "a service that never comes up leaves
-/// nothing running" is the rule the compose half already follows, and a
-/// worktree half in one mode and half in another is worse than either.
+/// containers this start brought up down with it — "a service that never
+/// comes up leaves nothing running" is the rule the compose half already
+/// follows, and a worktree half in one mode and half in another is worse
+/// than either.
 pub(super) fn bring_up_services(
     paths: &PandoPaths,
     config: &Config,
@@ -391,17 +392,40 @@ pub(super) fn bring_up_services(
     ports: &BTreeMap<String, u16>,
     progress: &dyn Fn(&str),
 ) -> Result<Fresh> {
-    bring_up_compose_services(paths, config, name, worktree, ports, progress)?;
+    let started = bring_up_compose_services(paths, config, name, worktree, ports, progress)?;
     let e = match bring_up_native_services(paths, config, name, worktree, ports, progress) {
         Ok(fresh) => return Ok(fresh),
         Err(e) => e,
     };
-    if !compose_entries(config).is_empty() {
-        let project = crate::compose::project_name(paths.project_id(), name);
-        let program = services::docker_program(paths);
-        let _ = services::Compose::by_project(&program, &project).stop();
+    if let Some(started) = started {
+        started.stop();
     }
     Err(e)
+}
+
+/// The containers one compose bring-up is answerable for: the ones a
+/// start that fails after it stops again.
+struct Started {
+    program: PathBuf,
+    project: String,
+    /// `None` when none of the included services was running before: every
+    /// container of the project is then this start's, and all of them are
+    /// stopped by project, profiled ones included. Otherwise the included
+    /// services that were not running, because the ones that were belong
+    /// to processes that are still live.
+    only: Option<Vec<String>>,
+}
+
+impl Started {
+    /// Best effort: the error being reported is the start's, not this one.
+    fn stop(&self) {
+        let compose = services::Compose::by_project(&self.program, &self.project);
+        let _ = match &self.only {
+            None => compose.stop(),
+            Some(services) if services.is_empty() => Ok(()),
+            Some(services) => compose.stop_services(services),
+        };
+    }
 }
 
 /// Everything a compose bring-up needs, decided before anything runs.
@@ -509,7 +533,8 @@ fn plan_compose(
 }
 
 /// Brings this worktree's private *containers* up, waits for them, and
-/// starts a log pump in front of each one.
+/// starts a log pump in front of each one. `None` when this project has no
+/// compose services.
 ///
 /// The override that remaps the ports is regenerated every time: the
 /// ports can move, the compose file can change under a rebase, and a
@@ -521,7 +546,7 @@ fn bring_up_compose_services(
     worktree: &Path,
     ports: &BTreeMap<String, u16>,
     progress: &dyn Fn(&str),
-) -> Result<()> {
+) -> Result<Option<Started>> {
     let Some(ComposePlan {
         project,
         program,
@@ -533,7 +558,7 @@ fn bring_up_compose_services(
         ..
     }) = plan_compose(paths, config, name, worktree, ports)?
     else {
-        return Ok(());
+        return Ok(None);
     };
 
     let override_file = paths.compose_override_file(name);
@@ -552,6 +577,28 @@ fn bring_up_compose_services(
     // may be a container and a volume under this project, and the record
     // is the only thing `rm` can find them by.
     name_compose_project(paths, name, &project, &include)?;
+
+    // What is already running is left running whatever happens next. A
+    // start of an isolated worktree that is up has live processes talking
+    // to those containers, and failing to bring one crashed service back
+    // must not take the healthy ones down with it.
+    let running: Vec<String> = services::Compose::by_project(&program, &project)
+        .ps()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(services::Status::running)
+        .map(|status| status.service)
+        .collect();
+    let not_running: Vec<String> = include
+        .iter()
+        .filter(|service| !running.contains(service))
+        .cloned()
+        .collect();
+    let started = Started {
+        only: (not_running.len() < include.len()).then_some(not_running),
+        program,
+        project,
+    };
     progress(&format!("starting services: {}", include.join(", ")));
 
     // A service that never comes up leaves nothing running: the ones that
@@ -573,10 +620,10 @@ fn bring_up_compose_services(
         })
         .and_then(|()| pump_service_logs(paths, name, &compose, &include, worktree));
     if let Err(e) = brought_up {
-        let _ = services::Compose::by_project(&program, &project).stop();
+        started.stop();
         return Err(e);
     }
-    Ok(())
+    Ok(Some(started))
 }
 
 /// Records the compose project on the service records it is about to

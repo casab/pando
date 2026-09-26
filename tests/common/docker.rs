@@ -64,6 +64,14 @@ pub fn with_healthcheck(home: &Path, project: &str, services: &[&str]) {
     std::fs::write(dir.join("healthcheck"), services.join(",")).unwrap();
 }
 
+/// Tells the shim that these services exit as soon as `up` starts them,
+/// which is what a container that crashes on boot looks like to `ps`.
+pub fn exits_on_up(home: &Path, project: &str, services: &[&str]) {
+    let dir = state_dir(home).join(project);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("exits-on-up"), services.join(",")).unwrap();
+}
+
 /// Tells the shim to bring the project up but never let it become ready:
 /// no listener is bound and health stays `starting`.
 pub fn never_ready(home: &Path, project: &str) {
@@ -241,12 +249,16 @@ def write_state(state):
         json.dump(state, handle)
 
 
-def healthchecked():
+def listed(marker):
     try:
-        with open(os.path.join(PROJ, "healthcheck")) as handle:
+        with open(os.path.join(PROJ, marker)) as handle:
             return [s for s in handle.read().strip().split(",") if s]
     except Exception:
         return []
+
+
+def healthchecked():
+    return listed("healthcheck")
 
 
 def published():
@@ -325,8 +337,10 @@ def alive(pid):
         return False
 
 
-def kill_all(state):
-    for entry in state.values():
+def kill_all(state, only=None):
+    for name, entry in state.items():
+        if only and name not in only:
+            continue
         pid = entry.get("pid") or 0
         if alive(pid):
             try:
@@ -344,6 +358,7 @@ def do_up():
     stuck = os.path.exists(os.path.join(PROJ, "never-ready"))
     proxy = os.path.exists(os.path.join(PROJ, "proxy-only"))
     checks = healthchecked()
+    dies = listed("exits-on-up")
     state = read_state()
     wanted = REST or list(published().keys())
     for name, (host, container) in published().items():
@@ -355,7 +370,10 @@ def do_up():
         entry["port"] = host
         entry["container"] = container
         entry["stopped"] = False
-        entry["pid"] = 0 if stuck else (hang_up(host) if proxy else listen(host))
+        if stuck or name in dies:
+            entry["pid"] = 0
+        else:
+            entry["pid"] = hang_up(host) if proxy else listen(host)
         entry["health"] = ("starting" if stuck else "healthy") if name in checks else ""
         state[name] = entry
     write_state(state)
@@ -392,7 +410,7 @@ def do_logs():
 
 def do_stop():
     state = read_state()
-    kill_all(state)
+    kill_all(state, REST)
     write_state(state)
 
 

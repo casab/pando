@@ -299,6 +299,63 @@ fn a_second_isolated_start_of_a_running_worktree_keeps_every_port() {
     );
 }
 
+// Bringing back one crashed container of a running isolated worktree is
+// what a second start is for. When it crashed again, the cleanup stopped
+// every container of the project, and the healthy database the live app
+// was using went with it.
+#[test]
+fn a_failed_start_of_a_running_worktree_stops_only_what_it_brought_up() {
+    if skip_without_python() {
+        return;
+    }
+    let f = iso_with(&config_toml(&listener_printing("DATABASE_URL")).replace(
+        "env = { DATABASE_URL = \"postgres\", REDIS_URL = \"redis\" }",
+        "env = { DATABASE_URL = \"postgres\", REDIS_URL = \"redis\" }\nready_timeout_s = 3",
+    ));
+    let name = new_worktree(&f, "feat/one");
+    let project = f.project(&name);
+    start_isolated(&f, &name);
+    let pids = |f: &Iso| -> BTreeMap<String, u64> {
+        docker::service_pids(&f.home, &project)
+            .into_iter()
+            .collect()
+    };
+    let before = pids(&f);
+
+    // redis dies, and dies again as soon as it is brought back.
+    process::stop(before["redis"] as i32, Duration::from_secs(2)).unwrap();
+    docker::exits_on_up(&f.home, &project, &["redis"]);
+    let err = format!(
+        "{:#}",
+        actions::start(
+            &f.paths,
+            &f.config,
+            &name,
+            None,
+            actions::Mode::Isolated,
+            &|_| {}
+        )
+        .unwrap_err()
+    );
+    assert!(
+        err.contains("\"redis\" exited before it was ready"),
+        "{err}"
+    );
+
+    let up: Vec<String> = docker::services_up(&f.home, &project)
+        .into_iter()
+        .map(|(service, _)| service)
+        .collect();
+    assert_eq!(up, vec!["postgres"], "the live app's database was stopped");
+    assert_eq!(pids(&f)["postgres"], before["postgres"], "and left alone");
+    let seen = docker::invocations_for(&f.home, &project);
+    assert!(
+        seen.contains(&format!("compose -p {project} stop redis")),
+        "what this start brought up is stopped again: {seen:?}"
+    );
+    assert!(f.record(&name).mode() == pando::state::ServiceMode::Isolated);
+}
+
 #[test]
 fn stop_takes_the_processes_and_the_services_down_together() {
     if skip_without_python() {

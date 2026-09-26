@@ -321,6 +321,15 @@ impl Compose {
         Ok(())
     }
 
+    /// Stops only these services' containers, and leaves the rest of the
+    /// project running and every volume where it is.
+    pub fn stop_services(&self, services: &[String]) -> Result<()> {
+        let mut rest = vec!["stop"];
+        rest.extend(services.iter().map(String::as_str));
+        self.run(&rest, Some(TEARDOWN_TIMEOUT))?;
+        Ok(())
+    }
+
     /// Removes the containers, the network, and the named volumes. What
     /// `rm` does: the worktree is going, and its database goes with it.
     pub fn down_with_volumes(&self) -> Result<()> {
