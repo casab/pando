@@ -124,10 +124,17 @@ pub(super) fn ask_through_ui(
 /// pick over the other writer's answer, and started on the old command.
 /// A file that does not load is one somebody is editing, so it stops the
 /// worker rather than falling back to the copy it would have overwritten.
+///
+/// And guarded as `main` guards the copy it loads. `config::load` checks
+/// `worktrees_dir` against the repository root and nothing else, so one
+/// moved into a linked worktree since the TUI opened is where `n` would
+/// make the next worktree: inside another checkout.
 pub(super) fn config_now(paths: &PandoPaths) -> Result<Config, String> {
-    crate::config::load(paths)
+    let config = crate::config::load(paths)
         .map(|loaded| loaded.config)
-        .map_err(|e| format!("{e:#}"))
+        .map_err(|e| format!("{e:#}"))?;
+    actions::guard_write_locations(paths, &config).map_err(|e| format!("{e:#}"))?;
+    Ok(config)
 }
 
 /// One consistent read of the repository: the worktrees, who owns them, and

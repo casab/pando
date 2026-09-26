@@ -1473,6 +1473,51 @@ fn a_start_resolves_the_config_on_disk_not_the_one_the_tui_opened_with() {
     );
 }
 
+// `main` guards the config it loads, once; the workers read the file
+// again, and `config::load` knows only the repository root. A
+// `worktrees_dir` moved into a linked worktree after the TUI opened is
+// where `n` made the next worktree: inside another checkout.
+#[test]
+fn n_refuses_a_worktrees_dir_moved_into_a_linked_worktree_since_the_tui_opened() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("acme-shop");
+    crate::testutil::init_repo(&root);
+    let linked = dir.path().join("linked");
+    crate::testutil::git(
+        &root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "linked",
+            linked.to_str().unwrap(),
+        ],
+    );
+    let paths = PandoPaths::new(
+        dir.path().join("pando-home"),
+        crate::project::ProjectRef::from_root(&root).unwrap(),
+    );
+    let mut app = App::new_for_test(paths.clone(), Config::default(), Vec::new());
+
+    // Written after this session opened.
+    let nested = linked.join("nested");
+    let file = paths.config_file();
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(
+        &file,
+        format!("[project]\nworktrees_dir = \"{}\"\n", nested.display()),
+    )
+    .unwrap();
+
+    assert!(app.spawn_create("feat/x".into(), None));
+    wait_for_pending(&mut app);
+    let (message, is_error) = app.active_status().expect("an error");
+    assert!(is_error, "{message}");
+    assert!(message.contains("inside the worktree"), "{message}");
+    assert!(!nested.exists(), "nothing is made inside another checkout");
+}
+
 #[test]
 fn enter_twice_starts_the_selected_worktree() {
     let mut app = test_app(&["feat+one"]);
