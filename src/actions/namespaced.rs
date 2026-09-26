@@ -1475,8 +1475,11 @@ pub fn namespaces_rm_drops(record: &crate::state::WorktreeRecord) -> Vec<String>
 ///
 /// Called by `rm` once the worktree itself is gone, so a removal git
 /// refused never costs a worktree its data. One pando may not or cannot
-/// drop is said, with the command that drops it by hand; its record goes
-/// with the worktree's, and `doctor` lists it after that.
+/// drop is said, with the command that drops it by hand, and its record
+/// goes with the worktree's. After that `doctor` can find a database
+/// again by its name, when its recipe can list them; nothing finds a slot
+/// again, a number with nothing of the project in it, so its line says
+/// this is the last pando says of it.
 pub(super) fn drop_namespaces(
     paths: &PandoPaths,
     store: &crate::state::State,
@@ -1508,17 +1511,28 @@ pub(super) fn drop_namespaces(
             .flat_map(|t| t.mains.iter().map(String::as_str))
             .collect();
         let what = namespace::describe(ns);
-        if let Err(e) = namespace::may_drop(store, name, ns, &main_now, &others) {
-            progress(&format!("{}: {what} is left as it is — {e:#}", ns.service));
-            continue;
-        }
-        let Some(recipe) = recipes
+        let recipe = recipes
             .get(&ns.recipe)
             .ok()
-            .and_then(|loaded| loaded.recipe.namespace.clone())
-        else {
+            .and_then(|loaded| loaded.recipe.namespace.clone());
+        // What a line about one left behind ends with, when nothing will
+        // find it again once its record is gone.
+        let last = match ns.kind == NamespaceKind::Database
+            && recipe.as_ref().is_some_and(|recipe| recipe.list.is_some())
+        {
+            true => "",
+            false => " — nothing records it after this, so pando will not mention it again",
+        };
+        if let Err(e) = namespace::may_drop(store, name, ns, &main_now, &others) {
             progress(&format!(
-                "{}: {what} is left as it is — the recipe {:?} no longer says how to drop it",
+                "{}: {what} is left as it is — {e:#}{last}",
+                ns.service
+            ));
+            continue;
+        }
+        let Some(recipe) = recipe else {
+            progress(&format!(
+                "{}: {what} is left as it is — the recipe {:?} no longer says how to drop it{last}",
                 ns.service, ns.recipe
             ));
             continue;
@@ -1554,7 +1568,7 @@ pub(super) fn drop_namespaces(
                 }
             )),
             Err(e) => progress(&format!(
-                "{}: {what} could not be dropped — {e:#}{}",
+                "{}: {what} could not be dropped — {e:#}{}{last}",
                 ns.service,
                 server
                     .by_hand(&ns.name)

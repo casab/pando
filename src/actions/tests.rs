@@ -10363,6 +10363,20 @@ fn rm_leaves_what_the_guard_refuses_and_says_why() {
         "{said:?}"
     );
     assert!(said.iter().any(|l| l.contains("slot 0")), "{said:?}");
+    // Nothing finds a slot again once its record is gone, and its line
+    // says so; a database a recipe can list, doctor finds by its name.
+    let forgotten = |l: &String| l.ends_with("so pando will not mention it again");
+    assert!(
+        said.iter()
+            .any(|l| l.contains("redis slot 0 is left") && forgotten(l)),
+        "{said:?}"
+    );
+    assert!(
+        !said
+            .iter()
+            .any(|l| l.contains("database shop is left") && forgotten(l)),
+        "{said:?}"
+    );
     assert_eq!(ns.fake("dropped"), "", "nothing was dropped");
     assert!(!redis.join("flushed").exists(), "nothing was emptied");
 }
