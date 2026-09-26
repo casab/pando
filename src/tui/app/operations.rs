@@ -6,7 +6,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use crate::actions;
-use crate::state::ServiceMode;
+use crate::state::{Aggregate, ServiceMode};
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
 use super::background::{AppEvent, ask_through_ui};
@@ -504,16 +504,29 @@ impl App {
         }
     }
 
+    /// `o`: only while the worktree runs. A stop keeps its port
+    /// assignment, and nothing serves it then; the row and the detail pane
+    /// stop showing the URL, and `pando open` refuses it, failed or not
+    /// running alike.
     pub(super) fn open_selected_url(&mut self) {
         let Some(name) = self.selected_name() else {
             return;
         };
+        let label = self.label_of(&name);
         let Some(url) = self.url_of(&name) else {
-            self.set_error(format!("{name} has no port yet — start it first"));
+            self.set_error(format!("{label} has no port yet — start it first"));
             return;
         };
-        self.open_url(&url);
-        self.set_success(format!("opened {url}"));
+        match self.phase_of(&name) {
+            None => self.set_error(format!("{label} is not running — s starts it")),
+            Some(Aggregate::Failed { .. }) => self.set_error(format!(
+                "{label} has failed — l shows the log, r restarts it"
+            )),
+            Some(_) => {
+                self.open_url(&url);
+                self.set_success(format!("opened {url}"));
+            }
+        }
     }
 
     /// Hands a URL to the browser — `$BROWSER` when it is set, as
@@ -567,15 +580,23 @@ impl App {
     /// `c`: the local URL, shared or not. One key that copied the public
     /// URL whenever there was one pasted a tunnel address where a
     /// localhost one was wanted; each URL has its own key instead.
+    ///
+    /// Not once it has stopped, when the port it keeps serves nothing. A
+    /// failed one's still copies: another of its processes may answer it,
+    /// as the detail pane says.
     pub(super) fn copy_selected_url(&mut self) {
         let Some(name) = self.selected_name() else {
             return;
         };
+        let label = self.label_of(&name);
         let Some(url) = self.url_of(&name) else {
-            let label = self.label_of(&name);
             self.set_error(format!("{label} has no URL yet — start it first"));
             return;
         };
+        if self.phase_of(&name).is_none() {
+            self.set_error(format!("{label} is not running — s starts it"));
+            return;
+        }
         self.copy_to_clipboard(&url);
         self.set_success(format!("copied {url}"));
     }

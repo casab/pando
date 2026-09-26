@@ -1317,6 +1317,54 @@ fn open_needs_a_port_before_it_has_a_url() {
     assert_eq!(app.opened.as_deref(), Some("http://localhost:17342"));
 }
 
+// A stop keeps the port assignment, so `o` and `c` handed out a URL that
+// nothing served, and said so with a tick.
+#[test]
+fn o_and_c_refuse_a_stopped_worktrees_leftover_url() {
+    let mut app = test_app(&["feat+one"]);
+    with_process(&mut app, "feat+one", running_phase());
+    app.state
+        .worktrees
+        .get_mut("feat+one")
+        .unwrap()
+        .processes
+        .clear();
+    assert!(app.url_of("feat+one").is_some(), "the ports outlive a stop");
+
+    press(&mut app, KeyCode::Char('o'));
+    assert_eq!(app.opened, None);
+    let (message, is_error) = app.active_status().unwrap();
+    assert_eq!(message, "feat/one is not running — s starts it");
+    assert!(is_error);
+
+    press(&mut app, KeyCode::Char('c'));
+    assert_eq!(app.clipboard, None);
+    let (message, is_error) = app.active_status().unwrap();
+    assert_eq!(message, "feat/one is not running — s starts it");
+    assert!(is_error);
+}
+
+// `pando open` refuses a failed worktree; its URL may still answer from
+// another process, so `c` still copies it.
+#[test]
+fn o_refuses_a_failed_worktree_and_c_still_copies_its_url() {
+    let mut app = test_app(&["feat+one"]);
+    let failed = Phase::Failed {
+        reason: "exit 1".into(),
+        at: Utc::now(),
+    };
+    with_process(&mut app, "feat+one", failed);
+
+    press(&mut app, KeyCode::Char('o'));
+    assert_eq!(app.opened, None);
+    let (message, is_error) = app.active_status().unwrap();
+    assert!(message.starts_with("feat/one has failed"), "{message}");
+    assert!(is_error);
+
+    press(&mut app, KeyCode::Char('c'));
+    assert_eq!(app.clipboard.as_deref(), Some("http://localhost:17342"));
+}
+
 // ---- share -----------------------------------------------------------
 
 // Sharing puts the dev server on the internet, and a link once given
