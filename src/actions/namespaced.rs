@@ -1002,12 +1002,29 @@ fn not_alone(
     }
 }
 
-/// Whether anything of a worktree runs, as state says: a process whose
-/// leader is alive and whose start did not fail.
+/// Whether anything of a worktree runs, as a start decides what it leaves
+/// up: a process starting or running, and alive by the rule `status`
+/// reads it with — a portless one whose leader backgrounded it and
+/// returned among them. A failed one is replaced by the next start.
 fn runs(record: &crate::state::WorktreeRecord) -> bool {
     record.processes.values().any(|p| {
-        !matches!(p.phase, crate::state::Phase::Failed { .. }) && crate::process::is_alive(p.pid)
+        matches!(
+            p.phase,
+            crate::state::Phase::Starting { .. } | crate::state::Phase::Running { .. }
+        ) && p.alive(crate::process::is_alive, crate::process::group_alive)
     })
+}
+
+/// Whether anything of a worktree may still be on the slots its record
+/// names: a process alive by the rule `status` reads it with, whatever its
+/// phase. A start that failed its readiness wait kills nothing, and its
+/// app can go on serving. One the sweep has signalled is gone, whatever
+/// its pid says now.
+fn in_use(record: &crate::state::WorktreeRecord) -> bool {
+    record
+        .processes
+        .values()
+        .any(|p| !p.swept && p.alive(crate::process::is_alive, crate::process::group_alive))
 }
 
 /// Whether a worktree's app is on the slots its record names, for a
@@ -1039,6 +1056,8 @@ struct Holder {
     worktree: String,
     slot: u32,
     namespace: crate::state::NamespaceRecord,
+    /// Something of it may be on the slot: [`in_use`]. Never offered to
+    /// free, and never emptied.
     running: bool,
 }
 
@@ -1061,7 +1080,7 @@ impl Holder {
 fn slot_holders(store: &crate::state::State, target: &Target) -> Vec<Holder> {
     let mut out = Vec::new();
     for (worktree, record) in &store.worktrees {
-        let running = runs(record);
+        let running = in_use(record);
         for ns in &record.namespaces {
             let here = crate::state::NamespaceRecord {
                 host: target.host.clone(),

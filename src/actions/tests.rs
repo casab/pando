@@ -10850,6 +10850,46 @@ fn a_running_worktree_keeps_a_slot_another_record_names_and_rm_of_the_other_empt
     );
 }
 
+// The same for an app whose only process owns no port and outlived the
+// shell that started it: the start leaves it running, as `status` calls
+// it, so its slot is kept too. Its leader alone said it had stopped, and
+// the record moved to a new slot while the app went on using the old one.
+#[test]
+fn a_portless_app_that_outlived_its_shell_keeps_a_slot_another_record_names() {
+    let (mut ns, _redis) = slots_fixture(MAIN_ENV_WITH_REDIS);
+    with_dev(
+        &mut ns.fx,
+        ProcessConfig {
+            cmd: format!("env > {}; sleep 30 & exit 0", ns.seen.display()),
+            ports: Some(crate::config::PortsSpec::List(Vec::new())),
+            ..Default::default()
+        },
+    );
+    let (report, _) = ns.start(Mode::Namespaced).unwrap();
+    let _running = guard(&report);
+    let leader = report.started[0].record.pid;
+    assert!(wait_until(Duration::from_secs(5), || {
+        !crate::process::is_alive(leader)
+    }));
+    hold(&ns, [(1, false)]);
+
+    let (report, said) = ns.start(Mode::Remembered).unwrap();
+    assert!(report.started.is_empty(), "{said:?}");
+    assert!(
+        said.iter()
+            .any(|l| l.starts_with("redis: slot 1 is kept while this worktree runs")),
+        "{said:?}"
+    );
+    let ours: Vec<String> = ns
+        .record()
+        .namespaces
+        .into_iter()
+        .filter(|n| n.service == "redis")
+        .map(|n| n.name)
+        .collect();
+    assert_eq!(ours, vec!["1".to_string()]);
+}
+
 // A worktree running shared is on the main checkout's data, not on the
 // slot its record still names from a namespaced run, and the start that
 // makes it namespaced replaces every process: a slot another record names
@@ -11200,6 +11240,80 @@ fn every_slot_held_by_a_running_worktree_stops_the_start_naming_them() {
     assert!(e.contains("held by a running worktree"), "{e}");
     assert!(e.contains("w15 (slot 15, running)"), "{e}");
     assert!(!redis.join("flushed").exists());
+}
+
+// A worktree whose app is still up is never offered to free: not one
+// whose only process owns no port and outlived the shell that started it,
+// which `status` calls running, nor one whose start failed its readiness
+// wait while its app went on serving. Its leader alone said stopped, and
+// the slot was emptied under the app.
+#[test]
+fn a_worktree_whose_app_is_still_up_is_never_offered_to_free_its_slot() {
+    let (ns, redis) = slots_fixture(MAIN_ENV_WITH_REDIS);
+    hold(&ns, (1..=15).map(|n| (n, false)));
+    let log = ns.fx.paths.log_file("w2", "dev");
+    let backgrounded = crate::testutil::spawn_guarded("sleep 30 & exit 0", &ns.fx.root, &log);
+    assert!(wait_until(Duration::from_secs(5), || {
+        !crate::process::is_alive(backgrounded.pid)
+    }));
+    assert!(crate::process::group_alive(backgrounded.pgid));
+    let mut store = ns.fx.state();
+    let mut portless = slot_holder(2, true, 2).processes.remove("dev").unwrap();
+    portless.pid = backgrounded.pid;
+    portless.pgid = backgrounded.pgid;
+    store
+        .worktrees
+        .get_mut("w2")
+        .unwrap()
+        .processes
+        .insert("dev".into(), portless);
+    let mut failed = slot_holder(3, true, 3);
+    failed.processes.get_mut("dev").unwrap().phase = Phase::Failed {
+        at: Utc::now(),
+        reason: "timeout: nothing bound port 3000 in 30s".into(),
+    };
+    store.worktrees.insert("w3".into(), failed);
+    state::save(&ns.fx.paths.state_file(), &store).unwrap();
+
+    let asked = std::cell::RefCell::new(None::<Question>);
+    let ask = |q: &Question| -> Result<Answer> {
+        asked.replace(Some(q.clone()));
+        let index = q.options.iter().position(|(value, _)| value == "w4");
+        Ok(Answer::Choice(index.expect("w4 is offered")))
+    };
+    resolve_for_start(
+        &ns.fx.paths,
+        &ns.fx.config,
+        &ns.name,
+        Mode::Namespaced,
+        &ask,
+        &noop,
+    )
+    .unwrap();
+    let question = asked.into_inner().expect("asked which one to free");
+    assert!(
+        question
+            .options
+            .iter()
+            .all(|(value, _)| value != "w2" && value != "w3"),
+        "{:?}",
+        question.options
+    );
+    assert_eq!(question.options.len(), 13);
+    assert!(
+        question
+            .details
+            .iter()
+            .any(|d| d.starts_with("running, so not offered:")
+                && d.contains("w2 (slot 2, running)")
+                && d.contains("w3 (slot 3, running)")),
+        "{:?}",
+        question.details
+    );
+    assert_eq!(
+        std::fs::read_to_string(redis.join("flushed")).unwrap(),
+        "4\n"
+    );
 }
 
 /// Asks which slot to free, answering `w2`; the question it put.
