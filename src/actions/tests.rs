@@ -5219,6 +5219,47 @@ fn init_takes_every_slot_a_rule_decided_and_asks_nothing() {
     assert!(written.contains("provision = [\".env\"]"), "{written}");
 }
 
+// `null` at `schema_hook` is an answers file's documented "no", and on a
+// project where the rules found no schema step it has nothing to switch
+// off. It used to reach the writer for `ports = []` and `provision = []`,
+// which has no key for a hook, and panic with the slots after it unasked.
+#[test]
+fn a_program_saying_no_to_a_schema_step_nobody_found_writes_nothing_and_carries_on() {
+    let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");
+    let offered = std::cell::RefCell::new(Vec::<Slot>::new());
+    let program = |q: &Question| -> Option<Result<Answer>> {
+        offered.borrow_mut().push(q.slot);
+        (q.slot == Slot::SchemaHook).then(|| Ok(Answer::Program(Box::new(Answer::None))))
+    };
+    let said = std::cell::RefCell::new(Vec::<String>::new());
+    let progress = |line: &str| said.borrow_mut().push(line.to_string());
+    init(
+        &fx.paths,
+        &fx.config,
+        &Answering::by_program(&refuse, &program),
+        &progress,
+    )
+    .unwrap();
+
+    assert!(
+        offered.borrow().contains(&Slot::SchemaHook),
+        "the program was offered the slot the rules were silent about"
+    );
+    let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+    assert!(!written.contains("[[hooks]]"), "{written}");
+    assert!(
+        written.contains("provision = [\".env\"]"),
+        "the slot after it was still reached: {written}"
+    );
+    assert!(
+        said.borrow()
+            .iter()
+            .any(|line| line.contains("no schema step") && line.contains("nothing was written")),
+        "{:?}",
+        said.borrow()
+    );
+}
+
 // Ask just in time, once: the second pass has nothing left to ask,
 // which is what writing the first one down was for.
 #[test]

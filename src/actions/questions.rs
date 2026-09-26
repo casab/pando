@@ -1078,6 +1078,10 @@ fn write_empty_answer(
     pending: Option<Pending>,
     progress: &dyn Fn(&str),
 ) -> Result<()> {
+    // Only these two have an empty form: one list, under one key.
+    let (Slot::PortEnv | Slot::Provision, Some((table, key))) = (slot, slot.key()) else {
+        bail!("{} has no \"none\" answer to write", slot_label(slot));
+    };
     // Through the same gate every other answer goes through. Nothing
     // `validate` knows about refuses an empty list today; the guarantee
     // is that no answer is written without being read back, and an
@@ -1085,7 +1089,6 @@ fn write_empty_answer(
     let mut proposed = config.clone();
     apply_empty(slot, &mut proposed);
     refuse_unloadable(paths, slot, "none of them", &proposed)?;
-    let (table, key) = slot.key().expect("both of these write one key");
     config::set_detected(
         paths,
         slot.layer(),
@@ -1151,7 +1154,7 @@ fn volunteer(
             let note = by.note(config::Note::Answered);
             write_answer(paths, config, slot, &candidate, note, pending, progress)?;
         }
-        Answer::None if slot.allows_none() => {
+        Answer::None if matches!(slot, Slot::PortEnv | Slot::Provision) => {
             write_empty_answer(
                 paths,
                 config,
@@ -1160,6 +1163,17 @@ fn volunteer(
                 pending,
                 progress,
             )?;
+        }
+        // "No" to a schema step the rules never found is already true:
+        // there is no command to write down as switched off, and an
+        // answers file that says so has said nothing wrong.
+        Answer::None if slot == Slot::SchemaHook => {
+            progress(&format!(
+                "{}: the rules found no schema step, so there is nothing to switch off — \
+                 nothing was written",
+                slot_label(slot)
+            ));
+            return Ok(false);
         }
         // Nothing was on offer, so there was nothing to choose: only a
         // typed answer, or the empty one where the slot has it.
@@ -1278,7 +1292,10 @@ fn apply_empty(slot: Slot, config: &mut Config) {
                 .or_default()
                 .ports = Some(config::PortsSpec::List(Vec::new()));
         }
-        _ => config.project.provision = Some(Vec::new()),
+        Slot::Provision => config.project.provision = Some(Vec::new()),
+        // Nothing else has an empty form; `write_empty_answer` refuses
+        // every other slot before it gets here.
+        _ => {}
     }
 }
 
