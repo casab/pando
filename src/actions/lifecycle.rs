@@ -1194,13 +1194,33 @@ pub fn stop(
 
 /// Stops every worktree pando has a process for, returning their names.
 pub fn stop_all(paths: &PandoPaths, progress: &dyn Fn(&str)) -> Result<Vec<String>> {
-    stop_all_with(paths, |pgid| proc::stop(pgid, STOP_GRACE), progress)
+    stop_all_with(paths, None, |pgid| proc::stop(pgid, STOP_GRACE), progress)
 }
 
-/// [`stop_all`] with the signal injected, so a test can drive the path
-/// where a group refuses to die without needing one that really does.
+/// [`stop_all`] once a confirmation has shown `listed` as what is up. A
+/// worktree up now that it did not name came up after it was shown — an
+/// agent started or shared it while the question was open — and is left
+/// running, and said to be. What is not up goes as it does for
+/// [`stop_all`]: a crashed dev server's containers were never listed.
+pub fn stop_all_listed(
+    paths: &PandoPaths,
+    listed: &[String],
+    progress: &dyn Fn(&str),
+) -> Result<Vec<String>> {
+    stop_all_with(
+        paths,
+        Some(listed),
+        |pgid| proc::stop(pgid, STOP_GRACE),
+        progress,
+    )
+}
+
+/// [`stop_all`] or [`stop_all_listed`] with the signal injected, so a
+/// test can drive the path where a group refuses to die without needing
+/// one that really does.
 pub fn stop_all_with(
     paths: &PandoPaths,
+    listed: Option<&[String]>,
     stop: impl Fn(i32) -> Result<()>,
     progress: &dyn Fn(&str),
 ) -> Result<Vec<String>> {
@@ -1211,12 +1231,19 @@ pub fn stop_all_with(
     // still has a database up, and `stop` with no name is how you make
     // sure nothing of pando's is left running. A share too: its tunnel
     // outlives the processes it pointed at.
-    let names: Vec<String> = store
-        .worktrees
-        .iter()
-        .filter(|(_, r)| !r.processes.is_empty() || !r.services.is_empty() || r.share.is_some())
-        .map(|(name, _)| name.clone())
-        .collect();
+    let mut names: Vec<String> = Vec::new();
+    for (name, record) in &store.worktrees {
+        if record.processes.is_empty() && record.services.is_empty() && record.share.is_none() {
+            continue;
+        }
+        if listed.is_some_and(|listed| !listed.contains(name)) && record.is_live() {
+            progress(&format!(
+                "{name} came up after the list of what stops was shown — left running"
+            ));
+            continue;
+        }
+        names.push(name.clone());
+    }
     let mut stopped = Vec::new();
     let mut failures = Vec::new();
     let mut projects: Vec<String> = Vec::new();

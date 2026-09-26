@@ -454,20 +454,12 @@ impl App {
         }
     }
 
-    /// Whether anything of a worktree's is up: a process that has not
-    /// failed, a service with a process behind it, or a tunnel. A crashed
-    /// dev server's database counts; a record left behind by a stop, one
-    /// whose only process has exited, or the compose records a stopped
-    /// isolated worktree keeps for `rm` do not.
+    /// Whether anything of a worktree's is up, as
+    /// [`WorktreeRecord::is_live`](crate::state::WorktreeRecord::is_live)
+    /// says. `X` lists these, and stops no other one that is up.
     pub fn is_live(&self, name: &str) -> bool {
-        self.record_for(name).is_some_and(|record| {
-            record
-                .processes
-                .values()
-                .any(|p| !matches!(p.phase, crate::state::Phase::Failed { .. }))
-                || record.services.iter().any(|s| s.pid.is_some())
-                || record.share.is_some()
-        })
+        self.record_for(name)
+            .is_some_and(crate::state::WorktreeRecord::is_live)
     }
 
     /// The worktrees `X` would stop: every one with something up.
@@ -491,7 +483,9 @@ impl App {
         self.modal = Some(Modal::StopAll { names });
     }
 
-    pub(super) fn stop_everything(&mut self) {
+    /// The confirmation's `y`: stops what it showed, `listed`, and leaves
+    /// up anything that came up after it was shown.
+    pub(super) fn stop_everything(&mut self, listed: Vec<String>) {
         let paths = self.paths.clone();
         let (ptx, prx) = mpsc::channel::<String>();
         // No worktree's name: the rows it covers are found through
@@ -500,7 +494,7 @@ impl App {
             let progress = |msg: &str| {
                 let _ = ptx.send(msg.to_string());
             };
-            actions::stop_all(&paths, &progress)
+            actions::stop_all_listed(&paths, &listed, &progress)
                 .map(PendingOutcome::StoppedAll)
                 .map_err(|e| format!("{e:#}"))
         });

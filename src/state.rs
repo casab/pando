@@ -178,6 +178,19 @@ impl WorktreeRecord {
     pub fn mode(&self) -> ServiceMode {
         self.mode.unwrap_or_default()
     }
+
+    /// Whether anything of this worktree's is up: a process that has not
+    /// failed, a service with a process behind it, or a tunnel. A crashed
+    /// dev server's database counts; a record left behind by a stop, one
+    /// whose only process has exited, or the compose records a stopped
+    /// isolated worktree keeps for `rm` do not.
+    pub fn is_live(&self) -> bool {
+        self.processes
+            .values()
+            .any(|p| !matches!(p.phase, Phase::Failed { .. }))
+            || self.services.iter().any(|s| s.pid.is_some())
+            || self.share.is_some()
+    }
 }
 
 /// How a worktree's processes reach the project's stateful services.

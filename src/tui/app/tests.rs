@@ -4131,7 +4131,7 @@ fn a_second_action_is_refused_with_what_the_first_is_called() {
     // Nothing is polled, so the first action is still in flight however
     // soon its worker gives up on paths that do not exist.
     let mut app = test_app(&["feat+one"]);
-    app.stop_everything();
+    app.stop_everything(Vec::new());
     press(&mut app, KeyCode::Char('s'));
     let (message, _) = app.active_status().unwrap();
     assert_eq!(message, "already busy stopping everything");

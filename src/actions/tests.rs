@@ -56,7 +56,7 @@ fn stop_all(paths: &PandoPaths) -> Result<Vec<String>> {
 }
 
 fn stop_all_with(paths: &PandoPaths, stop: impl Fn(i32) -> Result<()>) -> Result<Vec<String>> {
-    super::stop_all_with(paths, stop, &noop)
+    super::stop_all_with(paths, None, stop, &noop)
 }
 
 fn rm(paths: &PandoPaths, name: &str, yes: bool, force: bool) -> Result<()> {
@@ -1408,7 +1408,7 @@ fn stopping_everything_says_which_public_url_it_closed() {
     state::save(&fx.paths.state_file(), &store).unwrap();
 
     let said = std::cell::RefCell::new(Vec::<String>::new());
-    super::stop_all_with(&fx.paths, |_| Ok(()), &|line| {
+    super::stop_all_with(&fx.paths, None, |_| Ok(()), &|line| {
         said.borrow_mut().push(line.to_string())
     })
     .unwrap();
@@ -2019,6 +2019,61 @@ fn stop_all_takes_down_a_share_whose_processes_are_all_gone() {
     assert_eq!(stopped, vec![name.clone()]);
     assert!(signalled.borrow().contains(&tunnel.pgid), "{signalled:?}");
     assert!(fx.state().worktrees[&name].share.is_none());
+}
+
+// The TUI's `X` lists what is up and stops on `y`, which can come long
+// after: a worktree an agent started or shared in between was stopped,
+// and its public URL closed, though the list never named it.
+#[test]
+fn a_stop_all_after_a_list_leaves_running_what_came_up_since() {
+    let fx = fixture();
+    let listed = worktree_named(&fx, "feat/listed");
+    let since = worktree_named(&fx, "feat/since");
+    let crashed = worktree_named(&fx, "feat/crashed");
+    let mut store = fx.state();
+    // Live leaders are this test's own pid, so no sweep signals them.
+    let mut up = fake_record(4_000_201);
+    up.pid = std::process::id();
+    let mut came_up = fake_record(4_000_202);
+    came_up.pid = std::process::id();
+    for (name, record) in [
+        (&listed, up),
+        (&since, came_up),
+        (&crashed, failed_record(4_000_203)),
+    ] {
+        store
+            .worktrees
+            .get_mut(name)
+            .expect("new wrote a record")
+            .processes
+            .insert("dev".to_string(), record);
+    }
+    state::save(&fx.paths.state_file(), &store).unwrap();
+
+    let said = std::cell::RefCell::new(Vec::<String>::new());
+    let signalled = std::cell::RefCell::new(Vec::<i32>::new());
+    let mut stopped = super::stop_all_with(
+        &fx.paths,
+        Some(std::slice::from_ref(&listed)),
+        |pgid| {
+            signalled.borrow_mut().push(pgid);
+            Ok(())
+        },
+        &|line| said.borrow_mut().push(line.to_string()),
+    )
+    .unwrap();
+    stopped.sort();
+    // Not up, so never listed: a crashed one goes as it always did.
+    assert_eq!(stopped, vec![crashed.clone(), listed.clone()]);
+    assert!(!signalled.borrow().contains(&4_000_202), "{signalled:?}");
+    assert!(fx.state().worktrees[&since].processes.contains_key("dev"));
+    assert!(
+        said.borrow()
+            .iter()
+            .any(|line| line.contains(&since) && line.contains("left running")),
+        "{:?}",
+        said.borrow()
+    );
 }
 
 // Phase 2c review, finding 2. A `Failed` record survives `reconcile`
