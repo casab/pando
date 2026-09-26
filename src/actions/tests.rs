@@ -8869,6 +8869,51 @@ fn a_dry_run_with_an_open_question_renders_it_unanswered() {
     assert!(!fx.paths.config_file().exists(), "and nothing is written");
 }
 
+// The pass a preview runs again, after a question nobody here could
+// answer, used to run over the copies the pass before had already
+// written. A `[[services]]` entry is appended, not replaced, so the
+// services the rules decided went in twice — and the preview failed on
+// its own copy: two entries both running postgres.
+#[test]
+fn a_dry_run_run_again_after_an_open_question_writes_each_entry_once() {
+    let fx = compose_fixture(
+        "services:\n  postgres:\n    image: postgres:16\n    ports: [\"5432:5432\"]\n",
+        "PORT=3000\nDATABASE_URL=postgres://acme:acme@localhost:5432/acme\n",
+    );
+    // A schema step, so there is an open question after the services.
+    std::fs::create_dir_all(fx.root.join("prisma")).unwrap();
+    std::fs::write(fx.root.join("prisma/schema.prisma"), "// schema\n").unwrap();
+    git(&fx.root, &["add", "."]);
+    git(&fx.root, &["commit", "--quiet", "-m", "prisma"]);
+
+    let (report, preview) = init_dry_run(
+        &fx.paths,
+        &fx.config,
+        &Answering::asking(&asks_nothing_answerable),
+        &noop,
+    )
+    .unwrap();
+    let schema = report
+        .slots
+        .iter()
+        .find(|s| s.slot == Slot::SchemaHook)
+        .unwrap();
+    assert!(
+        schema
+            .value
+            .as_deref()
+            .is_some_and(|v| v.starts_with("(unanswered)")),
+        "the pass really was run again: {schema:?}"
+    );
+    let (_, body) = preview
+        .iter()
+        .find(|(path, _)| *path == fx.paths.config_file())
+        .expect("the project's file is previewed");
+    assert_eq!(body.matches("[[services]]").count(), 1, "{body}");
+    assert!(body.contains("\"postgres\""), "{body}");
+    assert!(!fx.paths.config_file().exists(), "and nothing is written");
+}
+
 // "provisioning" alone hid that `.env` in the worktree is a link to the
 // main checkout's: an edit there edits main. Each file is named, with
 // where it points and that it is a link.

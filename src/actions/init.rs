@@ -140,16 +140,6 @@ pub fn init_dry_run(
         (paths.config_file(), previewed.config_file()),
         (paths.user_config_file(), previewed.user_config_file()),
     ];
-    for (from, to) in &files {
-        let Ok(text) = std::fs::read_to_string(from) else {
-            continue;
-        };
-        if let Some(parent) = to.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create {}", parent.display()))?;
-        }
-        std::fs::write(to, text).with_context(|| format!("write {}", to.display()))?;
-    }
     // A question nobody here can answer — no terminal, no `--yes` that
     // may take it — is not a reason for a preview to fail. It is part of
     // the answer to "what would you write": that slot, unanswered. So the
@@ -166,6 +156,11 @@ pub fn init_dry_run(
     };
     let progress: &dyn Fn(&str) = &progress;
     let mut report = loop {
+        // Every pass from the files as they really are. The pass before
+        // this one wrote into the copies, and `config` does not know it:
+        // run again over them, it wrote every answer a second time, and a
+        // `[[services]]` or `[[hooks]]` entry is appended, not replaced.
+        seed_scratch(&files, &previewed)?;
         match init_slots(&previewed, config, &slots, answers, progress) {
             Ok(report) => break report,
             Err(e) => {
@@ -224,6 +219,33 @@ pub fn init_dry_run(
         },
         rendered,
     ))
+}
+
+/// Puts the scratch copies back to what the real files say: each one
+/// copied over, or removed where the real one does not exist, and the
+/// decisions log a pass recorded into removed.
+fn seed_scratch(files: &[(PathBuf, PathBuf)], previewed: &PandoPaths) -> Result<()> {
+    for (from, to) in files {
+        let Ok(text) = std::fs::read_to_string(from) else {
+            remove_if_there(to)?;
+            continue;
+        };
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+        std::fs::write(to, text).with_context(|| format!("write {}", to.display()))?;
+    }
+    remove_if_there(&previewed.decisions_file())
+}
+
+fn remove_if_there(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(e).with_context(|| format!("remove {}", path.display()))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// A throwaway pando home, removed when it goes out of scope — including
