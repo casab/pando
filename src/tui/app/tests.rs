@@ -416,6 +416,77 @@ fn service_health_reaches_the_app_off_the_ui_thread() {
     );
 }
 
+/// A worktree record carrying one private service with no port and no
+/// pid, so a probe of it answers without a connect or a signal.
+fn with_portless_service(state: &mut State, name: &str) {
+    let mut record = WorktreeRecord::new(format!("/trees/{name}"), true);
+    record.services.push(crate::state::ServiceRecord {
+        name: "postgres".into(),
+        kind: crate::state::ServiceKind::Compose,
+        port: None,
+        pid: None,
+        pgid: None,
+        compose_project: Some(format!("pando-{name}")),
+    });
+    state.worktrees.insert(name.to_string(), record);
+}
+
+// Every refresh probed every worktree's private services, a connect per
+// service a second, though only the selected worktree's are ever drawn.
+#[test]
+fn a_refresh_probes_only_the_selected_worktrees_services() {
+    let (_dir, mut app) = app_with_logs(&["feat+a", "feat+b"]);
+    let rx = app.event_rx.take().expect("the app owns its receiver");
+    let mut state = State::new();
+    with_portless_service(&mut state, "feat+a");
+    with_portless_service(&mut state, "feat+b");
+    std::fs::create_dir_all(app.paths.state_file().parent().unwrap()).unwrap();
+    crate::state::save(&app.paths.state_file(), &state).unwrap();
+    app.handle_event(refreshed(state));
+    app.select_index(1);
+
+    app.spawn_refresh();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let health = loop {
+        let left = deadline
+            .checked_duration_since(Instant::now())
+            .expect("the probe lands");
+        if let Ok(AppEvent::ServiceHealth(health)) = rx.recv_timeout(left) {
+            break health;
+        }
+    };
+    assert_eq!(
+        health.worktrees.keys().collect::<Vec<_>>(),
+        ["feat+b"],
+        "the selected worktree's, and no other"
+    );
+}
+
+// With only the selected worktree probed, a move onto another left its
+// service rows out until the next refresh came round.
+#[test]
+fn a_move_onto_a_worktree_with_services_probes_it_on_the_next_tick() {
+    let mut app = test_app(&["feat+a", "feat+b", "feat+c"]);
+    with_portless_service(&mut app.state, "feat+a");
+    with_portless_service(&mut app.state, "feat+b");
+    app.service_health
+        .worktrees
+        .insert("feat+a".to_string(), Vec::new());
+    // Ticks that are no refresh's own.
+    app.tick = 0;
+    app.handle_event(AppEvent::Tick);
+    assert!(!app.refreshing, "the selected worktree was probed");
+
+    app.select_index(1);
+    app.handle_event(AppEvent::Tick);
+    assert!(app.refreshing, "the one moved onto was not");
+
+    app.refreshing = false;
+    app.select_index(2);
+    app.handle_event(AppEvent::Tick);
+    assert!(!app.refreshing, "one with no services has nothing to probe");
+}
+
 // Every request for a discovery started one, so a backlog of ticks — or a
 // state lock held a long time — stacked up workers queued on the lock. One
 // asked for while one runs is still run, once, after it.

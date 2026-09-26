@@ -120,7 +120,8 @@ pub enum View {
 }
 
 /// What the last probe said about the project's services: the shared ones
-/// the header chips show, and each worktree's private ones.
+/// the header chips show, and the private ones of the worktree that was
+/// selected, the only ones on screen.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ServiceHealth {
     pub shared: Vec<actions::ServiceStatus>,
@@ -407,7 +408,7 @@ impl App {
                 let grew = self.poll_logs();
                 if self.tick.is_multiple_of(SLOW_TICK_EVERY) {
                     self.spawn_discovery();
-                } else if self.tick.is_multiple_of(REFRESH_EVERY) {
+                } else if self.tick.is_multiple_of(REFRESH_EVERY) || self.selection_unprobed() {
                     self.spawn_refresh();
                 }
                 if self.tick.is_multiple_of(GIT_ALL_EVERY) {
@@ -938,6 +939,19 @@ impl App {
                 _ => None,
             })
             .min()
+    }
+
+    /// Whether the selected worktree has private services the last probe
+    /// did not ask about, because the cursor moved onto it since. Only the
+    /// selected worktree's are probed, so a move asks on the next tick
+    /// rather than leaving its rows out until the next refresh.
+    fn selection_unprobed(&self) -> bool {
+        self.selected_worktree().is_some_and(|w| {
+            !self.service_health.worktrees.contains_key(&w.name)
+                && self
+                    .record_for(&w.name)
+                    .is_some_and(|r| !r.services.is_empty())
+        })
     }
 
     /// One worktree's private services as the last probe found them.

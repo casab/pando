@@ -413,6 +413,11 @@ impl App {
         let paths = self.paths.clone();
         let config = self.config.clone();
         let tx = self.event_tx.clone();
+        // Only the selected worktree's private services are probed: its
+        // detail pane is the one place they are shown, and probing every
+        // worktree's was a connect per service a second, nearly all of it
+        // thrown away.
+        let selected = self.selected_worktree().map(|w| w.name.clone());
         thread::spawn(move || {
             let quick = refresh_if_needed(&paths);
             // Before the state is handed over: probing is a TCP connect
@@ -420,13 +425,13 @@ impl App {
             // a paint.
             let health = ServiceHealth {
                 shared: actions::shared_service_statuses(&paths, &config),
-                worktrees: quick
-                    .refreshed
-                    .state
-                    .worktrees
-                    .iter()
-                    .filter(|(_, record)| !record.services.is_empty())
-                    .map(|(name, record)| (name.clone(), actions::service_statuses(record)))
+                worktrees: selected
+                    .and_then(|name| {
+                        let record = quick.refreshed.state.worktrees.get(&name)?;
+                        (!record.services.is_empty())
+                            .then(|| (name, actions::service_statuses(record)))
+                    })
+                    .into_iter()
                     .collect(),
             };
             let _ = tx.send(AppEvent::Refreshed(Box::new(quick)));
