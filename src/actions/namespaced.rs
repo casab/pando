@@ -938,16 +938,7 @@ fn hold_on(
     if !recorded {
         return Ok(Held::Gone);
     }
-    let slot = kept.name.trim().parse::<u32>().ok();
-    let mains = target
-        .mains
-        .iter()
-        .any(|main| slot.is_some() && main.trim().parse::<u32>().ok() == slot);
-    let why = match (mains, recorded_elsewhere(&store, name, kept)) {
-        (true, _) => Some("the main checkout's env files name it".to_string()),
-        (false, Some(other)) => Some(format!("{other}'s record names it too")),
-        (false, None) => None,
-    };
+    let why = not_alone(&store, name, target, kept);
     let record = store.worktrees.get_mut(name).expect("just read");
     let held = match why {
         None => Held::Kept,
@@ -960,6 +951,27 @@ fn hold_on(
     }
     crate::state::save(&paths.state_file(), &store)?;
     Ok(held)
+}
+
+/// Why the slot a worktree's record names is not its alone, when it is
+/// not: the main checkout's env files name it, or another worktree's
+/// record does too.
+fn not_alone(
+    store: &crate::state::State,
+    name: &str,
+    target: &Target,
+    slot: &crate::state::NamespaceRecord,
+) -> Option<String> {
+    let n = slot.name.trim().parse::<u32>().ok();
+    let mains = target
+        .mains
+        .iter()
+        .any(|main| n.is_some() && main.trim().parse::<u32>().ok() == n);
+    match (mains, recorded_elsewhere(store, name, slot)) {
+        (true, _) => Some("the main checkout's env files name it".to_string()),
+        (false, Some(other)) => Some(format!("{other}'s record names it too")),
+        (false, None) => None,
+    }
 }
 
 /// Whether anything of a worktree runs, as state says: a process whose
@@ -1218,9 +1230,19 @@ pub(super) fn free_slots_if_full(
         }
         let store = crate::state::load(&paths.state_file())?;
         let holders = slot_holders(&store, &target);
-        if holders.iter().any(|holder| holder.worktree == name) {
+        // A slot this worktree's record names is one its start goes on
+        // with, unless [`hold_on`] will let it go: then the start needs a
+        // new one, and is asked now, not only on its next attempt.
+        if holders.iter().any(|holder| {
+            holder.worktree == name
+                && (holder.running || not_alone(&store, name, &target, &holder.namespace).is_none())
+        }) {
             continue;
         }
+        let holders: Vec<Holder> = holders
+            .into_iter()
+            .filter(|holder| holder.worktree != name)
+            .collect();
         let others = slots_elsewhere(&other_projects(paths), &target);
         let elsewhere: Vec<String> = others.iter().map(Elsewhere::describe).collect();
         let stopped: Vec<&Holder> = holders.iter().filter(|holder| !holder.running).collect();

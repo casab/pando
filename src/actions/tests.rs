@@ -11004,6 +11004,50 @@ fn a_redis_with_fewer_slots_than_the_recipe_asks_which_stopped_worktree_frees_on
     );
 }
 
+// A recorded slot the start will let go is no slot of its own: with every
+// other one held by a stopped worktree, a terminal start asks which one
+// frees its slot the first time, rather than failing to say that it asks.
+// While the worktree runs it keeps the slot, so nothing is asked then.
+#[test]
+fn a_start_that_will_let_its_slot_go_asks_which_stopped_worktree_frees_one() {
+    let (ns, redis) = slots_fixture(MAIN_ENV_WITH_REDIS);
+    let (report, _) = ns.start(Mode::Namespaced).unwrap();
+    let running = guard(&report);
+    hold(&ns, (1..=15).map(|n| (n, false)));
+    let ask = |q: &Question| -> Result<Answer> { panic!("asked {:?}", q.slot) };
+    resolve_for_start(
+        &ns.fx.paths,
+        &ns.fx.config,
+        &ns.name,
+        Mode::Remembered,
+        &ask,
+        &noop,
+    )
+    .unwrap();
+    drop(running);
+    stop(&ns.fx.paths, &ns.name, None).unwrap();
+
+    let question = free_w2(&ns);
+    assert!(
+        question.options.iter().all(|(value, _)| *value != ns.name),
+        "{:?}",
+        question.options
+    );
+    assert_eq!(
+        std::fs::read_to_string(redis.join("flushed")).unwrap(),
+        "2\n"
+    );
+
+    let (report, said) = ns.start(Mode::Remembered).unwrap();
+    let _guard = guard(&report);
+    assert!(
+        said.iter()
+            .any(|l| l.starts_with("redis: slot 1 is let go, not emptied")),
+        "{said:?}"
+    );
+    assert_eq!(ns.env_line("REDIS_DB").as_deref(), Some("2"));
+}
+
 // Slots nobody holds but full of somebody else's keys are no free slot
 // either: the stopped worktrees holding the rest are offered.
 #[test]
