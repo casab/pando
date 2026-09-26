@@ -419,6 +419,10 @@ fn porcelain_by_path(root: &Path) -> HashMap<PathBuf, PorcelainEntry> {
 /// Short sha, subject, and relative age for every given commit from one
 /// `git log --no-walk`, keyed by full sha. An empty map on failure just
 /// routes callers to the per-worktree fallback.
+///
+/// A sha that names no commit — the null sha git lists for a worktree on
+/// an unborn branch, or a HEAD whose object is gone — is left out of the
+/// answer rather than failing it for every other worktree.
 fn batch_commit_meta(root: &Path, shas: &[&str]) -> HashMap<String, (String, String, String)> {
     if shas.is_empty() {
         return HashMap::new();
@@ -426,6 +430,7 @@ fn batch_commit_meta(root: &Path, shas: &[&str]) -> HashMap<String, (String, Str
     let args = [
         "log",
         "--no-walk=unsorted",
+        "--ignore-missing",
         "--format=%H%x1f%h%x1f%s%x1f%cr",
     ]
     .into_iter()
@@ -1234,6 +1239,36 @@ bare
         assert_eq!(w.head_subject.as_deref(), Some("on branch"));
         assert_eq!(w.ahead_behind, Some((1, 0)));
         assert_eq!(w.dirty, Some(false));
+    }
+
+    // A worktree on an unborn branch lists the null sha as its HEAD, and a
+    // HEAD whose object is gone lists a sha git cannot read: neither may
+    // send every other worktree to a `git log` of its own.
+    #[test]
+    fn the_batched_commit_read_answers_past_a_head_that_names_no_commit() {
+        let (_dir, repo) = repo_with_worktrees(&[("feat+x", "feat/x")]);
+        let unborn = repo.parent().unwrap().join("trees").join("pages");
+        git(
+            &repo,
+            &["worktree", "add", "--detach", unborn.to_str().unwrap()],
+        );
+        git(&unborn, &["checkout", "--quiet", "--orphan", "pages"]);
+
+        let wts = discover(&project_at(&repo)).unwrap();
+        let head_of = |name: &str| {
+            wts.iter()
+                .find(|w| w.name == name)
+                .and_then(|w| w.head.clone())
+                .unwrap()
+        };
+        let null = head_of("pages");
+        assert!(null.bytes().all(|b| b == b'0'), "unborn HEAD is {null}");
+        let feature = head_of("feat+x");
+        let gone = "1".repeat(40);
+
+        let meta = batch_commit_meta(&repo, &[&null, &gone, &feature]);
+        assert!(meta.contains_key(&feature), "{meta:?}");
+        assert_eq!(meta.len(), 1, "{meta:?}");
     }
 
     #[test]
