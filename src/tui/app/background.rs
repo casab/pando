@@ -102,6 +102,22 @@ pub(super) fn ask_through_ui(
     }
 }
 
+/// The config as it is on disk now, for a worker about to resolve and act
+/// on it.
+///
+/// Read again rather than taken from the session. Another pando — an
+/// agent running `init --answers`, or the developer's own edit — may have
+/// written `pando.toml` since the TUI opened, and resolving the copy from
+/// before that recorded an override nobody made, wrote this session's
+/// pick over the other writer's answer, and started on the old command.
+/// A file that does not load is one somebody is editing, so it stops the
+/// worker rather than falling back to the copy it would have overwritten.
+pub(super) fn config_now(paths: &PandoPaths) -> Result<Config, String> {
+    crate::config::load(paths)
+        .map(|loaded| loaded.config)
+        .map_err(|e| format!("{e:#}"))
+}
+
 /// One consistent read of the repository: the worktrees, who owns them, and
 /// the base a new branch would fork from. Runs off the UI thread, except
 /// once before the first frame.

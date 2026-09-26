@@ -12,7 +12,7 @@ use crate::state::{self, Aggregate, Phase, WorktreeRecord};
 use crate::worktree::PrInfo;
 
 use super::App;
-use super::background::{AppEvent, ask_through_ui};
+use super::background::{AppEvent, ask_through_ui, config_now};
 use super::dialogs::Modal;
 
 const SPINNER_FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
@@ -229,7 +229,6 @@ impl App {
         F: FnOnce(&PandoPaths, &Config, &dyn Fn(&str)) -> Result<String> + Send + 'static,
     {
         let paths = self.paths.clone();
-        let config = self.config.clone();
         let tx = self.event_tx.clone();
         let (ptx, prx) = mpsc::channel::<String>();
         let started = self.spawn_pending(dir_name, PendingKind::Create, move || {
@@ -242,6 +241,7 @@ impl App {
             // detection cannot decide. Without it a worktree made with `n`
             // has no dependencies installed and its first start fails.
             let ask = |question: &actions::Question| ask_through_ui(&tx, question);
+            let config = config_now(&paths)?;
             let config = actions::resolve_for_new(&paths, &config, &ask, &progress)
                 .map_err(|e| format!("{e:#}"))?;
             let _ = tx.send(AppEvent::ConfigResolved(Box::new(config.clone())));

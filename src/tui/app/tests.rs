@@ -1330,6 +1330,64 @@ fn what_a_start_resolves_is_applied_to_this_session_in_memory() {
     assert_eq!(app.config.processes["dev"].roles(), vec!["web"]);
 }
 
+// The session's copy is from when the TUI opened. Something else — an
+// agent's `init --answers`, a hand edit — may have written `pando.toml`
+// since, and a start that resolved the old copy saw the dev command
+// still open, took the rule's first choice and wrote it over the answer
+// already in the file.
+#[test]
+fn a_start_resolves_the_config_on_disk_not_the_one_the_tui_opened_with() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("acme-shop");
+    crate::testutil::init_repo(&root);
+    std::fs::write(
+        root.join("package.json"),
+        "{\n  \"name\": \"x\",\n  \"scripts\": { \"dev\": \"next dev\", \"dev:web\": \"next dev\" }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+    std::fs::write(root.join(".env.example"), "PORT=3000\n").unwrap();
+    let paths = PandoPaths::new(
+        dir.path().join("pando-home"),
+        crate::project::ProjectRef::from_root(&root).unwrap(),
+    );
+    let mut app = App::new_for_test(paths.clone(), Config::default(), vec![wt("feat+one")]);
+
+    // Written by another pando after this session opened.
+    let file = paths.config_file();
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(
+        &file,
+        "[dev]\ncmd = \"pnpm dev:web\"\nports = { PORT = \"web\" }\n",
+    )
+    .unwrap();
+
+    press(&mut app, KeyCode::Char('s'));
+    let rx = app.event_rx.take().expect("the app owns its receiver");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut applied = false;
+    while Instant::now() < deadline && !applied {
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(event) => {
+                let is_config = matches!(event, AppEvent::ConfigResolved(_));
+                app.handle_event(event);
+                applied = is_config;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    app.event_rx = Some(rx);
+
+    assert!(applied, "the worker never sent what it resolved");
+    assert_eq!(app.config.processes["dev"].cmd, "pnpm dev:web");
+    let written = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        written.contains("cmd = \"pnpm dev:web\"") && !written.contains("cmd = \"pnpm dev\""),
+        "the answer already in the file stays: {written}"
+    );
+}
+
 #[test]
 fn enter_twice_starts_the_selected_worktree() {
     let mut app = test_app(&["feat+one"]);

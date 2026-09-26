@@ -9,7 +9,7 @@ use crate::actions;
 use crate::state::{Aggregate, ServiceMode};
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
-use super::background::{AppEvent, ask_through_ui};
+use super::background::{AppEvent, ask_through_ui, config_now};
 use super::dialogs::Modal;
 use super::pending::{PendingKind, PendingOutcome};
 use super::{ARM_TTL, App, Armed};
@@ -247,7 +247,6 @@ impl App {
             return;
         }
         let paths = self.paths.clone();
-        let config = self.config.clone();
         let worker_name = name.clone();
         let tx = self.event_tx.clone();
         let (ptx, prx) = mpsc::channel::<String>();
@@ -258,6 +257,7 @@ impl App {
             // Detection may have a question; it goes back to the UI thread
             // and this worker waits for the answer.
             let ask = |question: &actions::Question| ask_through_ui(&tx, question);
+            let config = config_now(&paths)?;
             let config =
                 actions::resolve_for_start(&paths, &config, &worker_name, mode, &ask, &progress)
                     .map_err(|e| format!("{e:#}"))?;
@@ -419,7 +419,6 @@ impl App {
             .as_ref()
             .map(|process| format!("{process} of {}", self.label_of(&name)));
         let paths = self.paths.clone();
-        let config = self.config.clone();
         let worker_name = name.clone();
         let tx = self.event_tx.clone();
         let (ptx, prx) = mpsc::channel::<String>();
@@ -428,6 +427,7 @@ impl App {
                 let _ = ptx.send(msg.to_string());
             };
             let ask = |question: &actions::Question| ask_through_ui(&tx, question);
+            let config = config_now(&paths)?;
             let config =
                 actions::resolve_for_start(&paths, &config, &worker_name, mode, &ask, &progress)
                     .map_err(|e| format!("{e:#}"))?;
