@@ -5093,6 +5093,51 @@ fn a_typed_answer_is_taken_as_written_and_dated() {
     assert!(written.contains("ports = [\"web\"]"), "{written}");
 }
 
+// A lone `[dev]` holding the developer's own `ports` is the shape pando
+// fills a command into. A typed command carrying `{port:web}` kept their
+// map for the start that answered it, then wrote `ports = ["web"]` over
+// it in the file: `HMR_PORT` and its role were gone from the next load,
+// and a `ready.role` naming it made the file refuse to load at all.
+#[test]
+fn a_typed_command_carrying_a_port_keeps_the_ports_the_developer_wrote() {
+    let fx = detectable_fixture(
+        r#"{ "dev": "concurrently \"npm:dev:*\"", "dev:web": "next dev" }"#,
+        "PORT=3000\n",
+    );
+    let file = fx.paths.config_file();
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(
+        &file,
+        "[dev]\nports = { PORT = \"web\", HMR_PORT = \"hmr\" }\nready = { role = \"hmr\" }\n",
+    )
+    .unwrap();
+    let loaded = crate::config::load(&fx.paths).unwrap().config;
+
+    let (ask, asked) = scripted(vec![Answer::Custom(
+        "npm run dev -- --port {port:web}".to_string(),
+    )]);
+    let config = resolve_process(&fx.paths, &loaded, &ask, &noop).unwrap();
+    assert_eq!(
+        asked.borrow().iter().map(|q| q.slot).collect::<Vec<_>>(),
+        vec![Slot::DevCmd]
+    );
+    assert_eq!(config.processes["dev"].roles(), vec!["hmr", "web"]);
+
+    let written = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        written.contains("ports = { PORT = \"web\", HMR_PORT = \"hmr\" }"),
+        "{written}"
+    );
+    let reloaded = crate::config::load(&fx.paths)
+        .unwrap_or_else(|e| panic!("the file still loads: {e:#}\n{written}"))
+        .config;
+    assert_eq!(
+        reloaded.processes["dev"].cmd,
+        "npm run dev -- --port {port:web}"
+    );
+    assert_eq!(reloaded.processes["dev"].roles(), vec!["hmr", "web"]);
+}
+
 // "no ports" and "not answered yet" used to be the same state, so a
 // process that really has none — a worker, a watcher, a queue consumer
 // — was asked again on every start, and given a port it would never

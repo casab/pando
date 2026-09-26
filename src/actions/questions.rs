@@ -1040,7 +1040,19 @@ fn write_answer(
         record_decision(paths, pending, progress);
         return Ok(());
     }
-    let edits = detect::edits(slot, candidate);
+    let mut edits = detect::edits(slot, candidate);
+    // A `ports` the developer wrote is an answer, and `apply` keeps it: a
+    // command carrying `{port:web}` fills in `cmd` beside their map. The
+    // edits are what every rule would write, so the same guard goes here,
+    // or the file said `ports = ["web"]` from the next load on.
+    if slot == Slot::DevCmd
+        && config
+            .processes
+            .get(detect::DEV)
+            .is_some_and(|process| process.ports.is_some())
+    {
+        edits.retain(|edit| edit.key != "ports");
+    }
     if slot == Slot::Processes {
         // A whole process table is one answer to one question, so the
         // note goes on the table's header rather than on each of its
