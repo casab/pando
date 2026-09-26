@@ -163,8 +163,9 @@ pub enum Mount {
     Anonymous,
 }
 
-/// A top-level volume declaration. Both of these defeat the project-name
-/// prefix, so a service using one is refused for isolation.
+/// A top-level volume declaration: the keys that can defeat the
+/// project-name prefix, so that a service using the volume is refused for
+/// isolation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TopVolume {
     /// An explicit `name:`, which compose uses verbatim rather than
@@ -173,6 +174,12 @@ pub struct TopVolume {
     /// `external: true`: the volume is expected to exist already, and
     /// every worktree would share the one volume.
     pub external: bool,
+    /// `driver:`, when the file names one. None is compose's own `local`.
+    pub driver: Option<String>,
+    /// `driver_opts:`, each value as written. The project name prefixes
+    /// the volume's name, not where its data lives, and these can put it
+    /// elsewhere: `o: bind` with a `device:` binds a host directory.
+    pub driver_opts: BTreeMap<String, String>,
 }
 
 impl Service {

@@ -118,8 +118,28 @@ fn top_volume_from_json(project: &str, key: &str, value: &serde_json::Value) -> 
     // exactly what isolates the data per worktree. Anything else is a name
     // the project pinned, and every worktree would share it.
     let pinned = name.filter(|name| *name != format!("{project}_{key}"));
+    let driver_opts = value
+        .get("driver_opts")
+        .and_then(|v| v.as_object())
+        .map(|opts| {
+            opts.iter()
+                .map(|(key, value)| {
+                    let value = match value.as_str() {
+                        Some(text) => text.to_string(),
+                        None => value.to_string(),
+                    };
+                    (key.clone(), value)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     TopVolume {
         name: pinned.map(str::to_string),
         external,
+        driver: value
+            .get("driver")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        driver_opts,
     }
 }

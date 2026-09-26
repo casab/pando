@@ -162,6 +162,14 @@ fn top_volume(node: &Node) -> TopVolume {
             // `external: { name: x }` is the older spelling and is just as
             // shared as `external: true`.
             "external" => out.external = matches!(value.scalar(), Some("true") | None),
+            "driver" => out.driver = value.scalar().map(str::to_string),
+            "driver_opts" => {
+                let Node::Map(opts) = value else { continue };
+                out.driver_opts = opts
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.scalar().unwrap_or("").to_string()))
+                    .collect();
+            }
             _ => {}
         }
     }

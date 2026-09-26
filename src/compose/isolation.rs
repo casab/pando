@@ -4,8 +4,9 @@
 use super::ComposeFile;
 use super::Mount;
 use super::Service;
+use super::TopVolume;
 use super::UNREAD;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use std::path::PathBuf;
 
 // ---- the per-worktree override -------------------------------------------
@@ -147,8 +148,9 @@ fn caveat(file: &ComposeFile) -> String {
 }
 
 /// A bind mount relative to the compose file lands inside the worktree,
-/// and a named volume the project pins by name or borrows from outside is
-/// one every worktree would share.
+/// and a named volume the project pins by name, borrows from outside, or
+/// keeps somewhere else through `driver_opts` is one every worktree would
+/// share.
 fn check_mounts(
     name: &str,
     service: &Service,
@@ -157,41 +159,15 @@ fn check_mounts(
 ) -> Result<()> {
     for mount in &service.volumes {
         match mount {
-            Mount::Bind(source) if source.starts_with('$') => bail!(
-                "service {name:?} mounts {source:?}, and pando cannot tell whether that is \
-                 inside the repository — isolating it could write into your worktree. Use a \
-                 named volume for it, or drop {name:?} from `include`"
-            ),
-            Mount::Bind(source) if source.starts_with('/') || source.starts_with('~') => {
-                // A path pando *can* test is tested. An absolute source
-                // does not move with the worktree, so it is one of two
-                // things, and neither of them is isolation.
-                let resolved = crate::paths::resolve_for_compare(&expand_home(source));
-                if let Some(inside) = repository
-                    .iter()
-                    .find(|dir| resolved.starts_with(crate::paths::resolve_for_compare(dir)))
-                {
-                    bail!(
-                        "service {name:?} mounts {source:?}, which is inside {} — an isolated \
-                         copy would write its data into your repository, which pando never \
-                         does. Change it to a named volume in the compose file, or drop \
-                         {name:?} from `include`",
-                        inside.display()
-                    );
-                }
-                bail!(
-                    "service {name:?} mounts {source:?}, an absolute path that does not move \
-                     with the worktree — every worktree would bind that one directory and \
-                     share the data in it, which is not an isolated copy. Change it to a \
-                     named volume in the compose file, or drop {name:?} from `include`"
-                );
+            Mount::Bind(source) => {
+                return Err(refuse_bind(
+                    name,
+                    &format!("mounts {source:?}"),
+                    source,
+                    "Change it to a named volume in the compose file",
+                    repository,
+                ));
             }
-            Mount::Bind(source) => bail!(
-                "service {name:?} mounts {source:?}, which is inside the repository — an \
-                 isolated copy would write its data into your worktree, which pando never \
-                 does. Change it to a named volume in the compose file, or drop {name:?} \
-                 from `include`"
-            ),
             Mount::Named(volume) => {
                 let Some(declared) = file.volumes.get(volume) else {
                     continue;
@@ -210,11 +186,111 @@ fn check_mounts(
                          name, so every worktree would share one copy of that data"
                     );
                 }
+                check_driver_opts(name, volume, declared, repository)?;
             }
             Mount::Anonymous => {}
         }
     }
     Ok(())
+}
+
+/// Why a bind of the host path `source` is not isolation, which no bind
+/// is. `mounts` is how the refusal names the bind and `change` how to undo
+/// it, because a service's mount and a volume's `driver_opts` both write
+/// one.
+fn refuse_bind(
+    name: &str,
+    mounts: &str,
+    source: &str,
+    change: &str,
+    repository: &[PathBuf],
+) -> anyhow::Error {
+    if source.starts_with('$') {
+        return anyhow!(
+            "service {name:?} {mounts}, and pando cannot tell whether that is inside the \
+             repository — isolating it could write into your worktree. {change}, or drop \
+             {name:?} from `include`"
+        );
+    }
+    if !source.starts_with('/') && !source.starts_with('~') {
+        return anyhow!(
+            "service {name:?} {mounts}, which is inside the repository — an isolated copy \
+             would write its data into your worktree, which pando never does. {change}, or \
+             drop {name:?} from `include`"
+        );
+    }
+    // A path pando *can* test is tested. An absolute source does not move
+    // with the worktree, so it is one of two things, and neither of them
+    // is isolation.
+    let resolved = crate::paths::resolve_for_compare(&expand_home(source));
+    if let Some(inside) = repository
+        .iter()
+        .find(|dir| resolved.starts_with(crate::paths::resolve_for_compare(dir)))
+    {
+        return anyhow!(
+            "service {name:?} {mounts}, which is inside {} — an isolated copy would write its \
+             data into your repository, which pando never does. {change}, or drop {name:?} \
+             from `include`",
+            inside.display()
+        );
+    }
+    anyhow!(
+        "service {name:?} {mounts}, an absolute path that does not move with the worktree — \
+         every worktree would bind that one directory and share the data in it, which is not \
+         an isolated copy. {change}, or drop {name:?} from `include`"
+    )
+}
+
+/// The project name prefixes a volume's name, not where its data lives,
+/// and `driver_opts` can put that anywhere: the local driver mounts
+/// whatever `device:` names under the volume. With `o: bind` that is a
+/// host directory, judged as the bind mount it is; any other device but a
+/// tmpfs, such as an NFS or CIFS share or a disk, is one every worktree
+/// would mount. Options for any other driver say nothing pando can judge,
+/// so they are refused too.
+fn check_driver_opts(
+    name: &str,
+    volume: &str,
+    declared: &TopVolume,
+    repository: &[PathBuf],
+) -> Result<()> {
+    const DROP: &str = "Drop the volume's `driver_opts` in the compose file";
+    let opts = &declared.driver_opts;
+    if opts.is_empty() {
+        return Ok(());
+    }
+    if let Some(driver) = declared.driver.as_deref().filter(|d| *d != "local") {
+        bail!(
+            "service {name:?} uses the volume {volume:?}, which passes `driver_opts` to the \
+             driver {driver:?} — pando cannot tell where that driver keeps the data, and \
+             compose prefixes only the volume's name, so every worktree could share one copy \
+             of it. {DROP}, or drop {name:?} from `include`"
+        );
+    }
+    let opt = |key: &str| opts.get(key).map(String::as_str);
+    let Some(device) = opt("device") else {
+        return Ok(());
+    };
+    let binds = opt("type") == Some("bind")
+        || opt("o").is_some_and(|o| o.split(',').any(|o| matches!(o.trim(), "bind" | "rbind")));
+    if binds {
+        return Err(refuse_bind(
+            name,
+            &format!("uses the volume {volume:?}, whose `driver_opts` bind {device:?}"),
+            device,
+            DROP,
+            repository,
+        ));
+    }
+    if opt("type") == Some("tmpfs") {
+        return Ok(());
+    }
+    bail!(
+        "service {name:?} uses the volume {volume:?}, whose `driver_opts` keep its data on \
+         {device:?} — compose prefixes the volume's name with the project name, not where its \
+         data lives, so every worktree would share one copy of that data. {DROP}, or drop \
+         {name:?} from `include`"
+    )
 }
 
 /// `~` and `~/…` replaced with the home directory, which is what docker

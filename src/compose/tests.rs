@@ -569,6 +569,90 @@ fn a_plain_named_volume_is_isolated_by_the_project_name_and_allowed() {
     );
 }
 
+/// A compose file whose one service mounts `dbdata`, declared with `body`.
+fn with_volume(body: &str) -> ComposeFile {
+    parse(&format!(
+        "services:\n  db:\n    image: postgres:16\n    volumes:\n      \
+         - dbdata:/var/lib/postgresql/data\nvolumes:\n  dbdata:\n{body}"
+    ))
+    .unwrap()
+}
+
+// Compose prefixes the volume's name, and the local driver binds `device`
+// under it whatever the name is, so every worktree and the main checkout
+// ran on one data directory. With it inside the repository, an isolated
+// copy wrote its database files into the main checkout.
+#[test]
+fn a_volume_whose_driver_opts_bind_a_host_directory_is_judged_as_the_bind_it_is() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().join("acme-shop");
+    std::fs::create_dir_all(&root).unwrap();
+    let inside = root.join(".data").join("pg");
+    for (device, needle) in [
+        (inside.display().to_string(), root.display().to_string()),
+        (
+            "./.data/pg".to_string(),
+            "inside the repository".to_string(),
+        ),
+        ("/srv/acme/pg".to_string(), "every worktree".to_string()),
+        ("${PWD}/.data/pg".to_string(), "cannot tell".to_string()),
+    ] {
+        let file = with_volume(&format!(
+            "    driver: local\n    driver_opts:\n      type: none\n      o: bind\n      \
+             device: {device}\n"
+        ));
+        assert_eq!(file.volumes["dbdata"].driver.as_deref(), Some("local"));
+        assert_eq!(file.volumes["dbdata"].driver_opts["device"], device);
+        let err = format!(
+            "{:#}",
+            resolve_included(&file, &["db".into()], std::slice::from_ref(&root)).unwrap_err()
+        );
+        assert!(err.contains("dbdata"), "{err}");
+        assert!(err.contains(&device), "{err}");
+        assert!(err.contains(&needle), "{err}");
+        assert!(
+            err.contains("`driver_opts`"),
+            "it says what to change: {err}"
+        );
+    }
+}
+
+#[test]
+fn a_volume_kept_on_a_share_or_by_a_driver_pando_cannot_judge_is_refused() {
+    for (body, needle) in [
+        (
+            "    driver_opts: {type: nfs, o: \"addr=10.0.0.5,rw\", device: \":/export/pg\"}\n",
+            "every worktree would share",
+        ),
+        (
+            "    driver: acme/persist\n    driver_opts:\n      mountpoint: /srv/pg\n",
+            "cannot tell where",
+        ),
+    ] {
+        let err = format!(
+            "{:#}",
+            resolve_included(&with_volume(body), &["db".into()], &[]).unwrap_err()
+        );
+        assert!(err.contains("dbdata"), "{err}");
+        assert!(err.contains(needle), "{err}");
+    }
+}
+
+#[test]
+fn a_tmpfs_volume_or_a_driver_given_no_options_is_isolated_and_allowed() {
+    for body in [
+        "    driver_opts:\n      type: tmpfs\n      device: tmpfs\n      o: size=100m\n",
+        "    driver: local\n",
+        "    driver: acme/blocks\n",
+    ] {
+        assert_eq!(
+            resolve_included(&with_volume(body), &["db".into()], &[]).unwrap(),
+            vec![("db".to_string(), 5432)],
+            "{body}"
+        );
+    }
+}
+
 #[test]
 fn a_dependency_left_out_of_include_is_refused_naming_both() {
     let text = "services:\n  api:\n    image: node\n    ports: [\"3000:3000\"]\n    depends_on:\n      - db\n  db:\n    image: postgres:16\n";
@@ -977,6 +1061,44 @@ fn a_pinned_or_external_volume_survives_composes_normalisation() {
         resolve_included(&file, &["a".into()], &[]).unwrap_err()
     );
     assert!(err.contains("literally-this"), "{err}");
+}
+
+/// The shape `docker compose config --format json` gave on Compose 5.0.1
+/// for a local bind volume declared with `device: ./rel`: the device made
+/// absolute against the compose file's directory, and the name prefixed
+/// as for any plain volume.
+#[test]
+fn a_volume_bound_through_driver_opts_survives_composes_normalisation() {
+    let json = r#"{
+          "name": "pando-probe-opts",
+          "services": { "db": {
+            "image": "postgres:16",
+            "volumes": [ { "type": "volume", "source": "dbdata", "target": "/x", "volume": {} } ]
+          } },
+          "volumes": {
+            "dbdata": {
+              "name": "pando-probe-opts_dbdata",
+              "driver": "local",
+              "driver_opts": { "device": "/Users/me/code/acme/rel", "o": "bind", "type": "none" }
+            }
+          }
+        }"#;
+    let file = parse_config_json(json).unwrap();
+    let dbdata = &file.volumes["dbdata"];
+    assert_eq!(dbdata.name, None, "the prefix compose applies itself");
+    assert_eq!(dbdata.driver.as_deref(), Some("local"));
+    assert_eq!(dbdata.driver_opts["o"], "bind");
+    let err = format!(
+        "{:#}",
+        resolve_included(
+            &file,
+            &["db".into()],
+            &[PathBuf::from("/Users/me/code/acme")]
+        )
+        .unwrap_err()
+    );
+    assert!(err.contains("/Users/me/code/acme/rel"), "{err}");
+    assert!(err.contains("inside /Users/me/code/acme"), "{err}");
 }
 
 #[test]
