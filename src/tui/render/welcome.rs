@@ -68,11 +68,8 @@ pub(super) fn render_welcome(f: &mut Frame, area: Rect, app: &App) {
     if let Some(services) = services_summary(app) {
         lines.push(fact("services", services, width));
     }
-    lines.push(fact(
-        "worktrees",
-        home_relative(&app.config.worktrees_dir(&app.paths)),
-        width,
-    ));
+    let worktrees_dir = app.config.worktrees_dir(&app.paths);
+    lines.push(fact("worktrees", home_relative(&worktrees_dir), width));
     lines.push(Line::raw(""));
 
     for (key, what) in [
@@ -97,9 +94,18 @@ pub(super) fn render_welcome(f: &mut Frame, area: Rect, app: &App) {
     lines.push(Line::raw(""));
     // The real home, not `~/.pando`: `PANDO_HOME` moves it, and a
     // welcome that names the wrong directory sends somebody looking there.
+    // So does `[project] worktrees_dir`, for the worktrees alone.
     let home = home_relative(&app.paths.home);
+    let where_they_live = if worktrees_dir.starts_with(&app.paths.home) {
+        format!("worktrees, logs and config live under {home}")
+    } else {
+        format!(
+            "worktrees live in {}, logs and config under {home}",
+            home_relative(&worktrees_dir)
+        )
+    };
     for row in wrap_text(
-        &format!("Your checkout is never touched: worktrees, logs and config live under {home}."),
+        &format!("Your checkout is never touched: {where_they_live}."),
         width,
     ) {
         lines.push(Line::styled(row, Style::new().fg(text_muted())));

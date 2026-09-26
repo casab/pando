@@ -2214,6 +2214,28 @@ fn the_welcome_names_the_real_pando_home() {
     assert!(!rendered.contains("~/.pando"), "{rendered}");
 }
 
+// `[project] worktrees_dir` moves the worktrees out of pando home; the
+// welcome's last line says where they went rather than contradicting the
+// fact above it.
+#[test]
+fn the_welcome_names_a_worktrees_dir_outside_pando_home() {
+    let mut app = test_app(&[]);
+    app.config.project.worktrees_dir = Some("/pando-test-does-not-exist/code/wt".into());
+    let rendered = text_of(&draw(&mut app, 200, 30));
+    assert!(
+        rendered.contains("worktrees live in /pando-test-does-not-exist/code/wt"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("logs and config under /pando-test-does-not-exist/home"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("worktrees, logs and config"),
+        "{rendered}"
+    );
+}
+
 #[test]
 fn the_share_confirmation_names_the_address_that_goes_public() {
     let mut app = test_app(&["feat+one"]);
