@@ -1553,6 +1553,52 @@ fn an_env_example_is_read_without_its_quotes_and_export() {
     assert_eq!(processes["api"].env["WEB_PORT"], "{port:web}");
 }
 
+// A Node api and a Next web app both default to 3000. Pointed at the
+// first in directory order, the web app's own NEXTAUTH_URL was rewritten
+// to the api's port, and sign-in in the worktree broke.
+#[test]
+fn a_url_at_a_port_two_apps_default_to_points_at_neither() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "workspaces": ["apps/*"], "scripts": { "dev": "turbo run dev" } }"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+    for (name, script) in [("api", "tsx watch src/index.ts"), ("web", "next dev")] {
+        std::fs::create_dir_all(root.join("apps").join(name)).unwrap();
+        std::fs::write(
+            root.join("apps").join(name).join("package.json"),
+            format!(r#"{{ "scripts": {{ "dev": "{script}" }} }}"#),
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        root.join("apps/web/next.config.js"),
+        "module.exports = {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join(".env.example"),
+        "NEXTAUTH_URL=http://localhost:3000\n",
+    )
+    .unwrap();
+    let processes = proposed_processes(root).candidates[0]
+        .processes
+        .clone()
+        .unwrap();
+    assert_eq!(processes["api"].roles(), vec!["api"]);
+    assert_eq!(processes["web"].roles(), vec!["web"]);
+    for (name, process) in &processes {
+        assert!(
+            !process.env.contains_key("NEXTAUTH_URL"),
+            "{name}: {:?}",
+            process.env
+        );
+    }
+}
+
 // The create-turbo layout: each app's own script names its port, and the
 // root only fans out with `turbo run dev`. Given `PORT` and a role, each
 // app would bind its own port anyway and fail its readiness wait.

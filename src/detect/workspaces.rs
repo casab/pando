@@ -347,11 +347,11 @@ fn app_port_env(signals: &Signals, app: &WorkspaceApp) -> Vec<String> {
 /// Cross-references between apps, read out of the root env example.
 ///
 /// A value like `http://localhost:4000` is one app being told where
-/// another one listens. When that port is another app's default, the value
-/// becomes a template pointing at that app's role — so every worktree gets
-/// its own pair of ports and the two halves still find each other. It is
-/// given to every process *except* the one it points at, which is the only
-/// one that does not need to be told.
+/// another one listens. When that port is one app's default and no other
+/// app's, the value becomes a template pointing at that app's role — so
+/// every worktree gets its own pair of ports and the two halves still
+/// find each other. It is given to every process *except* the one it
+/// points at, which is the only one that does not need to be told.
 ///
 /// Only an app that owns a role can be pointed at: `{port:<role>}` for a
 /// role nobody owns does not render, and an environment that cannot be
@@ -366,12 +366,15 @@ fn cross_references(
         let Some(port) = localhost_url_port(value) else {
             continue;
         };
-        let Some(target) = apps
+        // Only a port that is one app's: two apps whose frameworks both
+        // default to 3000 leave no telling which one the URL names, and
+        // the wrong guess points a web app's own URL at the api.
+        let mut listening = apps
             .iter()
             .zip(owns_role)
-            .find(|(app, owns)| **owns && app.default_port == Some(port))
-            .map(|(app, _)| app)
-        else {
+            .filter(|(app, owns)| **owns && app.default_port == Some(port))
+            .map(|(app, _)| app);
+        let (Some(target), None) = (listening.next(), listening.next()) else {
             continue;
         };
         let template = value.replacen(
