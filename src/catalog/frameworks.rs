@@ -59,8 +59,8 @@ pub enum Guard {
     /// A crate that builds something runnable: a Cargo.toml with no binary
     /// is a library, and there is nothing to serve.
     BinaryCrate,
-    /// A Go module whose root is a `package main`: `go run .` has nothing
-    /// to run in a library, or where the commands live under `cmd/`.
+    /// A Go module with a `package main` to run: its root, or a command
+    /// under `cmd/`. A library has nothing for `go run` to run.
     GoMain,
     /// One of these files contains this text: every Mix project has a
     /// `mix.exs`, and only one that depends on `:phoenix` is Phoenix.
@@ -217,8 +217,9 @@ pub const RULES: [FrameworkRule; 12] = [
         script_markers: &[],
         port: PortMechanism::Env("PORT"),
         default_port: 8080,
-        // Only for a module whose root is a main package, which `go_main`
-        // decides.
+        // For a module whose root is a main package, which `go_main`
+        // decides. One whose commands live under `cmd/` runs each by its
+        // path, `go run ./cmd/<name>`, which `go_commands` lists.
         command: Some("go run ."),
         port_flag: None,
         guard: Guard::GoMain,

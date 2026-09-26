@@ -799,16 +799,15 @@ fn a_crate_with_several_binaries_is_offered_each_by_name() {
     }
 }
 
-// `go run .` in a module whose root is not a main package fails on every
-// start: "no Go files" where the commands live under `cmd/`, "is not a
-// main package" in a library.
+// `go run .` in a library fails on every start: "is not a main package".
 #[test]
 fn a_go_module_whose_root_is_not_a_main_package_matches_no_framework() {
     for files in [
         &[("go.mod", "module x\n"), ("lib.go", "package lib\n")][..],
         &[
             ("go.mod", "module x\n"),
-            ("cmd/api/main.go", "package main\n"),
+            ("cmd/README.md", "The commands.\n"),
+            ("cmd/shared/flags.go", "package shared\n"),
             ("internal/db/db.go", "package db\n"),
         ],
         &[
@@ -851,6 +850,53 @@ fn a_go_module_whose_root_is_not_a_main_package_matches_no_framework() {
         ("main.go", "//go:build !ignore\n\npackage main\n"),
     ]);
     assert_eq!(framework(dir.path(), &s).unwrap().name, "Go");
+}
+
+// The standard layout keeps a service's commands under `cmd/` and
+// nothing at the root for `go run .` to run: "no Go files". With no
+// command at all, such a service was given nothing to run.
+#[test]
+fn a_go_module_whose_commands_live_under_cmd_is_offered_each_by_path() {
+    let (dir, s) = marker_fixture(&[
+        ("go.mod", "module x\n"),
+        ("cmd/worker/main.go", "package main\n"),
+        ("cmd/api/main.go", "package main\n"),
+        ("cmd/api/routes.go", "package main\n"),
+        ("cmd/gen/gen.go", "//go:build ignore\n\npackage main\n"),
+        ("cmd/shared/flags.go", "package shared\n"),
+        ("cmd/check/main_test.go", "package main\n"),
+        ("internal/db/db.go", "package db\n"),
+    ]);
+    let rule = framework(dir.path(), &s);
+    assert_eq!(rule.unwrap().name, "Go");
+    let proposal = dev_in(dir.path(), &s);
+    assert_eq!(
+        values(&proposal),
+        vec!["go run ./cmd/api", "go run ./cmd/worker"],
+        "in directory order"
+    );
+    assert!(!proposal.decided);
+    assert_eq!(values(&port_proposal(&s, rule).unwrap()), vec!["PORT"]);
+
+    // One command is still a guess at what serves: `cmd/` holds tools as
+    // often as servers.
+    let (dir, s) = marker_fixture(&[
+        ("go.mod", "module x\n"),
+        ("cmd/api/main.go", "package main\n"),
+    ]);
+    let proposal = dev_in(dir.path(), &s);
+    assert_eq!(values(&proposal), vec!["go run ./cmd/api"]);
+    assert!(!proposal.decided);
+
+    // A root main package is what `go run .` runs, whatever `cmd/` holds.
+    let (dir, s) = marker_fixture(&[
+        ("go.mod", "module x\n"),
+        ("main.go", "package main\n"),
+        ("cmd/migrate/main.go", "package main\n"),
+    ]);
+    let proposal = dev_in(dir.path(), &s);
+    assert_eq!(values(&proposal), vec!["go run ."]);
+    assert!(proposal.decided);
 }
 
 // `config.ru` is every Rack app's and `bin/dev` is a helper in any

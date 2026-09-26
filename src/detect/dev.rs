@@ -9,7 +9,7 @@ use crate::catalog::package_managers::{self, Ecosystem};
 use crate::config::PortsSpec;
 
 use super::apply::dedup_by_value;
-use super::frameworks::{only_builds, runs, several_binaries};
+use super::frameworks::{go_commands, only_builds, runs, several_binaries};
 use super::proposal::{Candidate, Proposal, Slot};
 use super::signals::Signals;
 
@@ -338,6 +338,8 @@ pub(super) fn dev_cmd_proposal(
         false => scripts.into_iter().chain(targets).collect(),
     };
 
+    // Whether the candidates are a Go module's commands under `cmd/`.
+    let mut go_commands_offered = false;
     // A framework's own command, for a project with nothing else to run it.
     if own_command
         && let Some(rule) = rule
@@ -349,23 +351,42 @@ pub(super) fn dev_cmd_proposal(
             .then(|| PortsSpec::List(vec![crate::config::WEB_ROLE.to_string()]));
         let why = format!("the {} rule", rule.name);
         // A crate with several binaries and none run by default: cargo
-        // refuses the bare command, so each binary is offered by name.
-        let binaries = match rule.guard {
-            Guard::BinaryCrate => several_binaries(root),
+        // refuses the bare command, so each binary is offered by name. A
+        // Go module whose root is not a main package has nothing for
+        // `go run .` to run, so each command under `cmd/` is offered by
+        // its path: the rule's `.`, the root, becomes `./cmd/<name>`.
+        let named: Vec<(String, String)> = match rule.guard {
+            Guard::BinaryCrate => several_binaries(root)
+                .into_iter()
+                .map(|name| {
+                    let why = format!("{why}, for the {name} binary");
+                    (format!("{value} --bin {name}"), why)
+                })
+                .collect(),
+            Guard::GoMain => go_commands(root)
+                .into_iter()
+                .map(|name| {
+                    (
+                        format!("{value}/cmd/{name}"),
+                        format!("{why}, for cmd/{name}"),
+                    )
+                })
+                .collect(),
             _ => Vec::new(),
         };
-        let own: Vec<Candidate> = match binaries.is_empty() {
+        go_commands_offered = rule.guard == Guard::GoMain && !named.is_empty();
+        let own: Vec<Candidate> = match named.is_empty() {
             true => vec![Candidate {
                 value,
                 why,
                 ports,
                 ..Candidate::default()
             }],
-            false => binaries
-                .iter()
-                .map(|name| Candidate {
-                    value: format!("{value} --bin {name}"),
-                    why: format!("{why}, for the {name} binary"),
+            false => named
+                .into_iter()
+                .map(|(value, why)| Candidate {
+                    value,
+                    why,
                     ports: ports.clone(),
                     ..Candidate::default()
                 })
@@ -387,14 +408,17 @@ pub(super) fn dev_cmd_proposal(
     }
     // One candidate is certain. So is a script named exactly `dev` that is
     // really one dev server: a body that runs several at once is the
-    // multi-process shape, which is a question, not an assumption.
+    // multi-process shape, which is a question, not an assumption. A Go
+    // module's commands never are: `cmd/` holds tools as often as
+    // servers, so which one serves is the developer's to say even where
+    // there is one.
     let sure_script = signals
         .scripts
         .get("dev")
         .filter(|body| !is_multiplexer(body))
         .map(|body| script_candidate(signals, rule, "dev", body).value);
-    let decided =
-        candidates.len() == 1 || sure_script.is_some_and(|dev| candidates[0].value == dev);
+    let decided = !go_commands_offered
+        && (candidates.len() == 1 || sure_script.is_some_and(|dev| candidates[0].value == dev));
     Some(Proposal::of(Slot::DevCmd, candidates, decided))
 }
 

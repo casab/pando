@@ -76,7 +76,7 @@ fn passes(root: &Path, guard: Guard) -> bool {
     match guard {
         Guard::Marker => true,
         Guard::BinaryCrate => binary_crate(root),
-        Guard::GoMain => go_main(root),
+        Guard::GoMain => go_main(root) || !go_commands(root).is_empty(),
         Guard::Mentions(files, needle) => files.iter().any(|file| {
             std::fs::read_to_string(root.join(file)).is_ok_and(|text| text.contains(needle))
         }),
@@ -214,12 +214,29 @@ pub(super) fn several_binaries(root: &Path) -> Vec<String> {
     binaries.into_iter().map(|(name, _)| name).collect()
 }
 
-/// Whether a Go module's root is a main package: one of its `.go` files,
-/// tests aside, declares `package main`. A library, and a module whose
-/// commands live under `cmd/`, are level zero as a library crate is:
-/// `go run .` there fails on every start.
-fn go_main(root: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(root) else {
+/// The commands of a Go module whose root is not a main package, which
+/// `go run .` refuses: each directory under `cmd/` that is one, in
+/// directory order. Empty for a module whose root is a main package, and
+/// for a library, which is level zero as a library crate is.
+pub(super) fn go_commands(root: &Path) -> Vec<String> {
+    if go_main(root) {
+        return Vec::new();
+    }
+    let mut names: Vec<String> = std::fs::read_dir(root.join("cmd"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().is_dir() && go_main(&entry.path()))
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+        .collect();
+    names.sort();
+    names
+}
+
+/// Whether the Go package in `dir` is a main package: one of its `.go`
+/// files, tests aside, declares `package main`.
+fn go_main(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
     };
     entries.flatten().any(|entry| {
