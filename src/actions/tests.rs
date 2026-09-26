@@ -8759,6 +8759,58 @@ fn a_stopped_isolated_worktree_is_not_running_to_a_second_stop() {
     assert!(!crate::process::group_alive(pump.pgid));
 }
 
+// A start asks compose what is already running first, so a failure after
+// it stops only what the start brought up. A `ps` that failed — a Docker
+// too loaded to answer in time — read as "nothing is running", and the
+// failure after it stopped the whole project, containers the worktree's
+// live processes were using among them.
+#[test]
+fn a_compose_ps_that_fails_starts_nothing_and_stops_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = compose_fixture(
+        "services:\n  postgres:\n    image: postgres:16\n    ports: [\"5432:5432\"]\n",
+        "PORT=3000\nDATABASE_URL=postgres://acme:acme@localhost:5432/acme\n",
+    );
+    let config: Config = toml::from_str(
+        "[[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
+         include = [\"postgres\"]\nenv = { DATABASE_URL = \"postgres\" }\n",
+    )
+    .unwrap();
+    fx.paths.ensure_home().unwrap();
+    let calls = fx.paths.home.join("docker-calls");
+    let bin = fx.paths.home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(
+        bin.join("docker"),
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\n\
+             case \" $* \" in *\" ps \"*) echo 'context deadline exceeded' >&2; exit 1;; esac\n",
+            calls.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(bin.join("docker"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let ports = BTreeMap::from([("postgres".to_string(), 17010)]);
+
+    let err =
+        super::services::bring_up_services(&fx.paths, &config, "feat+one", &fx.root, &ports, &noop)
+            .unwrap_err();
+
+    assert!(
+        format!("{err:#}").contains("context deadline exceeded"),
+        "{err:#}"
+    );
+    let calls = std::fs::read_to_string(&calls).unwrap_or_default();
+    assert!(
+        !calls.lines().any(|line| line.contains(" up ")),
+        "nothing was brought up: {calls}"
+    );
+    assert!(
+        !calls.lines().any(|line| line.ends_with("stop")),
+        "nothing was stopped: {calls}"
+    );
+}
+
 // A service record whose kind config has changed is written fresh, so
 // nothing would stop what the old one ran. A native server whose name is
 // now a compose service's was left running with no record of it, on the

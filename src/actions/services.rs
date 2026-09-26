@@ -818,9 +818,18 @@ fn bring_up_compose_services(
     // start of an isolated worktree that is up has live processes talking
     // to those containers, and failing to bring one crashed service back
     // must not take the healthy ones down with it.
+    //
+    // So a `ps` that could not answer is not "nothing is running": read
+    // that way, the failure after it stopped the whole project, the healthy
+    // containers among them. Nothing is up yet, so the start ends here.
     let running: Vec<String> = services::Compose::by_project(&program, &project)
         .ps()
-        .unwrap_or_default()
+        .with_context(|| {
+            format!(
+                "could not ask Docker which services of {project} are already running, so none \
+                 were started"
+            )
+        })?
         .into_iter()
         .filter(services::Status::running)
         .map(|status| status.service)
