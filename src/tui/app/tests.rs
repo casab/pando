@@ -5041,6 +5041,61 @@ fn a_restart_is_not_ready_on_a_read_from_before_it() {
     assert!(app.awaiting_ready.is_none());
 }
 
+// A start that returned while dev was still starting waited on dev's pid,
+// and a stop — `x`, or `pando stop` in another pane — never ended the
+// wait: every later read, missing dev, said "waiting". Missing is only
+// news once a read has shown it, though, since a read from before the
+// start is missing it too.
+#[test]
+fn a_stop_while_a_start_waits_to_be_ready_ends_the_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let dev =
+        crate::testutil::spawn_guarded("exec sleep 30", dir.path(), &dir.path().join("dev.log"));
+    let pid = dev.pid;
+    let mut app = test_app(&["feat+one"]);
+    with_process(&mut app, "feat+one", Phase::Starting { since: Utc::now() });
+    let record = app.state.worktrees.get_mut("feat+one").unwrap();
+    record.processes.get_mut("dev").unwrap().pid = pid;
+    let starting = app.state.clone();
+    // What a read from before the start and one after a stop both show:
+    // the record, its ports, and no dev.
+    let mut without_dev = starting.clone();
+    let record = without_dev.worktrees.get_mut("feat+one").unwrap();
+    record.processes.clear();
+
+    app.state = without_dev.clone();
+    app.spawn_pending("feat+one".into(), PendingKind::Start, move || {
+        Ok(PendingOutcome::Started(
+            "feat+one".into(),
+            None,
+            vec![("dev".into(), pid)],
+        ))
+    });
+    wait_for_pending(&mut app);
+    app.handle_event(refreshed(without_dev.clone()));
+    assert!(
+        app.awaiting_ready.is_some(),
+        "a read from before the start says nothing of dev"
+    );
+    app.handle_event(refreshed(starting));
+    assert!(app.awaiting_ready.is_some(), "dev is still starting");
+
+    drop(dev);
+    app.handle_event(refreshed(without_dev.clone()));
+    assert!(app.awaiting_ready.is_none(), "dev was stopped");
+
+    // Not on a read nothing before it has shown dev in, dead or not: one
+    // that died by itself is in the reads after this, failed.
+    app.awaiting_ready = Some(AwaitingReady {
+        name: "feat+one".into(),
+        url: None,
+        spawned: vec![("dev".into(), pid)],
+        seen: false,
+    });
+    app.handle_event(refreshed(without_dev));
+    assert!(app.awaiting_ready.is_some());
+}
+
 // ---- commit age ------------------------------------------------------
 
 #[test]
@@ -5936,6 +5991,7 @@ fn a_death_during_a_start_is_said_once_by_name() {
         name: "feat+m".into(),
         url: None,
         spawned: vec![("dev".into(), 4242)],
+        seen: false,
     });
     let mut state = app.state.clone();
     fail_process(&mut state, "feat+m", "dev", "boom");

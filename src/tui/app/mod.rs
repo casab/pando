@@ -1309,29 +1309,28 @@ impl App {
     /// that failed or the worktree went away. A failure that `died`
     /// already names is left to it.
     fn announce_ready(&mut self, died: &[Death]) {
-        let Some(awaited) = self.awaiting_ready.clone() else {
+        let Some(mut awaited) = self.awaiting_ready.take() else {
             return;
         };
-        let name = awaited.name.as_str();
-        match awaited.readiness(self.record_for(name)) {
+        let name = awaited.name.clone();
+        match awaited.readiness(self.record_for(&name), crate::process::is_alive) {
             Readiness::Ready => {
-                self.awaiting_ready = None;
-                let label = self.label_of(name);
+                let label = self.label_of(&name);
                 match awaited.url {
                     Some(url) => self.set_success(format!("{label} is ready — {url}")),
                     None => self.set_success(format!("{label} is ready")),
                 }
             }
-            Readiness::Waiting => {}
+            // Kept, with what this read has shown.
+            Readiness::Waiting => self.awaiting_ready = Some(awaited),
             Readiness::Failed => {
-                self.awaiting_ready = None;
-                if died.iter().any(|(n, ..)| n == name) {
+                if died.iter().any(|(n, ..)| *n == name) {
                     return;
                 }
-                let label = self.label_of(name);
-                self.set_error_about(name, format!("{label} failed — l shows the log"));
+                let label = self.label_of(&name);
+                self.set_error_about(&name, format!("{label} failed — l shows the log"));
             }
-            Readiness::Gone => self.awaiting_ready = None,
+            Readiness::Gone => {}
         }
     }
 

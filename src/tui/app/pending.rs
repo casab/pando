@@ -108,29 +108,43 @@ pub struct AwaitingReady {
     pub url: Option<String>,
     /// Each process the start spawned, and its pid.
     pub spawned: Vec<(String, u32)>,
+    /// A read has shown one of them under its pid. That read was taken
+    /// after the start, so one a later read is missing, its pid dead, is
+    /// not still to come.
+    pub seen: bool,
 }
 
 /// Where a start's processes are, as one read of the state has them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Readiness {
-    /// Still starting, or not in the read at all.
+    /// Still starting, or not in a read that may be from before the start.
     Waiting,
     Ready,
     Failed,
-    /// Nothing of the worktree is recorded any more.
+    /// Nothing is left to wait for: the worktree was stopped, or what the
+    /// start spawned was replaced.
     Gone,
 }
 
 impl AwaitingReady {
-    /// What `record` says about the processes the start spawned.
+    /// What `record` says about the processes the start spawned, and
+    /// `alive` about the pid of one it no longer shows.
     ///
     /// By pid, and only those: a read taken before the start still shows
     /// the run it replaced, every process running, and one taken between
     /// a restart's stop and its start shows only the siblings it left
-    /// alone. Neither says anything about the new processes, so both are
-    /// waited through. A start that spawned nothing, all of it already
-    /// up, has the whole record's phase.
-    pub(super) fn readiness(&self, record: Option<&WorktreeRecord>) -> Readiness {
+    /// alone, or nothing. Neither says anything about the new processes,
+    /// so both are waited through. Once a read has shown one of them, a
+    /// process missing from a later read whose pid is not alive was
+    /// stopped or replaced since — by `x`, or a `pando stop` or `pando
+    /// restart` in another pane — and is never coming. One that died by
+    /// itself is still in the read, failed. A start that spawned nothing,
+    /// all of it already up, has the whole record's phase.
+    pub(super) fn readiness(
+        &mut self,
+        record: Option<&WorktreeRecord>,
+        alive: impl Fn(u32) -> bool,
+    ) -> Readiness {
         if self.spawned.is_empty() {
             return match record.and_then(state::aggregate_phase) {
                 Some(Aggregate::Running { .. }) => Readiness::Ready,
@@ -139,23 +153,32 @@ impl AwaitingReady {
                 None => Readiness::Gone,
             };
         }
-        let ours: Vec<&Phase> = self
+        let ours: Vec<Option<&Phase>> = self
             .spawned
             .iter()
-            .filter_map(|(process, pid)| {
+            .map(|(process, pid)| {
                 let p = record?.processes.get(process)?;
                 (p.pid == *pid).then_some(&p.phase)
             })
             .collect();
+        self.seen |= ours.iter().any(Option::is_some);
+        let gone = || {
+            self.spawned
+                .iter()
+                .zip(&ours)
+                .any(|((_, pid), phase)| phase.is_none() && !alive(*pid))
+        };
         if ours
             .iter()
+            .flatten()
             .any(|phase| matches!(phase, Phase::Failed { .. }))
         {
             Readiness::Failed
-        } else if ours.len() == self.spawned.len()
-            && ours
-                .iter()
-                .all(|phase| matches!(phase, Phase::Running { .. }))
+        } else if self.seen && gone() {
+            Readiness::Gone
+        } else if ours
+            .iter()
+            .all(|phase| matches!(phase, Some(Phase::Running { .. })))
         {
             Readiness::Ready
         } else {
@@ -374,12 +397,15 @@ impl App {
                             .as_ref()
                             .map(|url| format!(" — {url}"))
                             .unwrap_or_default();
-                        let awaited = AwaitingReady {
+                        let mut awaited = AwaitingReady {
                             name: name.clone(),
                             url,
                             spawned,
+                            seen: false,
                         };
-                        if awaited.readiness(self.record_for(&name)) == Readiness::Ready {
+                        let now =
+                            awaited.readiness(self.record_for(&name), crate::process::is_alive);
+                        if now == Readiness::Ready {
                             self.set_success(format!("{label} is ready{at}"));
                         } else {
                             self.set_status(format!(
