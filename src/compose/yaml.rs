@@ -632,10 +632,13 @@ fn one_line(text: &str) -> Node {
 ///
 /// A quoted scalar that goes on over a line break, alone or inside a flow
 /// collection, is not read: the break folds by rules of its own, and a `#`
-/// on the line after it was taken for a comment. Going on only over such
-/// lines, it is [`Node::Unread`]. Compose also takes a flow collection or
-/// a quoted scalar that goes on over a line no deeper than its key, which
-/// this reader would read as a key of its own; that one is
+/// on the line after it was taken for a comment. Nor is a flow collection
+/// on several lines with a quote character in it that neither opens nor
+/// closes a quoted scalar (see [`Flow::stray_quote`]): a comment kept after
+/// `it's` was read as the start of the key under it. Going on only over
+/// such lines, either is [`Node::Unread`]. Compose also takes a flow
+/// collection or a quoted scalar that goes on over a line no deeper than
+/// its key, which this reader would read as a key of its own; that one is
 /// [`Node::Spilled`].
 ///
 /// Any other value that goes on over the lines under it — a plain scalar
@@ -665,7 +668,7 @@ fn value_on(lines: &[Line], at: usize, text: &str, indent: usize) -> Node {
         whole.push(' ');
         whole.push_str(line.text.trim());
         if !flow.open() {
-            return if quote_broken {
+            return if quote_broken || flow.stray_quote {
                 Node::Unread
             } else {
                 one_line(&whole)
@@ -684,6 +687,14 @@ struct Flow {
     depth: usize,
     /// The quote a scalar is still open in.
     quote: Option<char>,
+    /// Whether a `]` or `}` closed one that was never opened.
+    overclosed: bool,
+    /// Whether a quote character was read that neither opens nor closes a
+    /// quoted scalar: the `'` in `it's`, an escaped `\"`, a doubled `''`,
+    /// or one kind inside a scalar quoted with the other. The comment
+    /// stripper takes some of these for quotes, so a `#` after one on the
+    /// same line may be text this reader kept.
+    stray_quote: bool,
 }
 
 impl Flow {
@@ -691,32 +702,41 @@ impl Flow {
         self.depth > 0 || self.quote.is_some()
     }
 
-    /// Reads on through one more line of it. A quote starts a scalar only
-    /// where a token does, so the `'` in `[it's]` opens nothing.
-    fn read(&mut self, text: &str) {
-        let mut chars = text.chars().peekable();
+    /// Reads on through one more line of it, and returns where in the line
+    /// a `,` sits outside every bracket and quote. A quote starts a scalar
+    /// only where a token does, so the `'` in `[it's]` opens nothing, and
+    /// neither `\"` in a double-quoted scalar nor `''` in a single-quoted
+    /// one closes it.
+    fn read(&mut self, text: &str) -> Vec<usize> {
+        let mut commas = Vec::new();
+        let mut chars = text.char_indices().peekable();
         let mut previous = ' ';
-        while let Some(c) = chars.next() {
+        while let Some((at, c)) = chars.next() {
             match self.quote {
                 Some('"') if c == '\\' => {
-                    chars.next();
+                    self.stray_quote |= chars.next().is_some_and(|(_, c)| matches!(c, '"' | '\''));
                 }
-                Some('\'') if c == '\'' && chars.peek() == Some(&'\'') => {
+                Some('\'') if c == '\'' && chars.peek().is_some_and(|&(_, c)| c == '\'') => {
                     chars.next();
+                    self.stray_quote = true;
                 }
                 Some(quote) if c == quote => self.quote = None,
-                Some(_) => {}
+                Some(_) => self.stray_quote |= matches!(c, '"' | '\''),
                 None => match c {
                     '"' | '\'' if previous.is_whitespace() || "[{,:".contains(previous) => {
                         self.quote = Some(c)
                     }
+                    '"' | '\'' => self.stray_quote = true,
                     '[' | '{' => self.depth += 1,
-                    ']' | '}' => self.depth = self.depth.saturating_sub(1),
+                    ']' | '}' if self.depth == 0 => self.overclosed = true,
+                    ']' | '}' => self.depth -= 1,
+                    ',' if self.depth == 0 => commas.push(at),
                     _ => {}
                 },
             }
             previous = c;
         }
+        commas
     }
 }
 
@@ -788,24 +808,26 @@ fn alias(text: &str) -> Option<Node> {
         .map(|name| Node::Alias(name.to_string()))
 }
 
-/// `[a, b]` and `{a: b}` on one line.
+/// `[a, b]` and `{a: b}` on one line, or one this reader could not read
+/// when its brackets and quotes do not close where it does.
 fn flow(text: &str) -> Option<Node> {
     let text = text.trim();
     if let Some(inner) = text.strip_prefix('[').and_then(|t| t.strip_suffix(']')) {
-        return Some(Node::Seq(
-            split_flow(inner)
-                .into_iter()
-                .map(|item| one_line(&item))
-                .collect(),
-        ));
+        let Some(items) = split_flow(inner) else {
+            return Some(Node::Unread);
+        };
+        return Some(Node::Seq(items.into_iter().map(one_line).collect()));
     }
     if let Some(inner) = text.strip_prefix('{').and_then(|t| t.strip_suffix('}')) {
+        let Some(items) = split_flow(inner) else {
+            return Some(Node::Unread);
+        };
         let mut entries = Vec::new();
-        for item in split_flow(inner) {
+        for item in items {
             // `{"type":"bind"}` has keys compose reads and this reader
             // does not split, and a mapping read without them lost the
             // bind mount they made.
-            let Some((key, value)) = split_key(&item) else {
+            let Some((key, value)) = split_key(item) else {
                 return Some(Node::Unread);
             };
             entries.push((key, one_line(&value)));
@@ -815,45 +837,29 @@ fn flow(text: &str) -> Option<Node> {
     None
 }
 
-/// Commas at nesting depth zero, outside quotes.
-fn split_flow(text: &str) -> Vec<String> {
+/// The entries inside a flow collection's brackets, split at the commas
+/// [`Flow`] finds between them, or `None` when that reading leaves a
+/// bracket or a quote open, or closes a bracket the text never opened: the
+/// brackets around it do not close where the collection does.
+///
+/// A scanner of its own took the `'` in `it's` for a quote, and every
+/// entry after it went into the one before, `volumes:` among them.
+fn split_flow(text: &str) -> Option<Vec<&str>> {
+    let mut flow = Flow::default();
+    let commas = flow.read(text);
+    if flow.open() || flow.overclosed {
+        return None;
+    }
+    let mut start = 0;
     let mut out = Vec::new();
-    let mut depth = 0i32;
-    let mut quote: Option<char> = None;
-    let mut current = String::new();
-    for c in text.chars() {
-        match quote {
-            Some(q) if c == q => {
-                quote = None;
-                current.push(c);
-            }
-            Some(_) => current.push(c),
-            None => match c {
-                '"' | '\'' => {
-                    quote = Some(c);
-                    current.push(c);
-                }
-                '[' | '{' => {
-                    depth += 1;
-                    current.push(c);
-                }
-                ']' | '}' => {
-                    depth -= 1;
-                    current.push(c);
-                }
-                ',' if depth == 0 => {
-                    out.push(current.trim().to_string());
-                    current = String::new();
-                }
-                _ => current.push(c),
-            },
+    for end in commas.into_iter().chain([text.len()]) {
+        let item = text[start..end].trim();
+        if !item.is_empty() {
+            out.push(item);
         }
+        start = end + 1;
     }
-    if !current.trim().is_empty() {
-        out.push(current.trim().to_string());
-    }
-    out.retain(|item| !item.is_empty());
-    out
+    Some(out)
 }
 
 fn unquote(text: &str) -> String {

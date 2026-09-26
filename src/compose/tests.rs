@@ -992,6 +992,60 @@ fn a_flow_collection_closed_on_a_later_line_is_read_whole() {
     }
 }
 
+// A flow collection was split at its commas by a quote scanner of its own,
+// which took the `'` in `it's` and the escaped `"` in `\"` for quotes that
+// open: every entry after one went into it, and `volumes:` was lost with
+// nothing said. Wrapped over lines, a comment after `it's` was kept by the
+// comment stripper, whose quotes are that scanner's, and read as the start
+// of the key after it. Each of these is now split where the scan that
+// closed it says, or, wrapped, is a value this reader could not read.
+#[test]
+fn a_quote_inside_a_flow_collection_never_hides_the_entries_after_it() {
+    let quoted = ["[sh, -c, echo it's up]", r#""say \"hi""#, "'it''s up'"];
+    for command in quoted {
+        let text = format!(
+            "services:\n  web: {{image: node:20, command: {command}, volumes: [\"./src:/app\"]}}\n"
+        );
+        let file = parse(&text).unwrap();
+        assert!(!file.unresolved.any(), "{text}");
+        assert_eq!(
+            file.services["web"].volumes,
+            vec![Mount::Bind("./src".to_string())],
+            "{text}"
+        );
+    }
+    let wrapped = quoted.map(|command| {
+        format!(
+            "services:\n  web: {{\n    image: node:20,\n    command: {command},\n    \
+             volumes: [\"./src:/app\"]\n  }}\n"
+        )
+    });
+    for text in wrapped.iter().map(String::as_str).chain([
+        "services:\n  web: {\n    command: [sh, -c, echo it's up],  # start it\n    \
+         volumes: [\"./src:/app\"]\n  }\n",
+        "services:\n  web:\n    image: node:20\n    volumes: [\n      \"./it's:/app\",\n      \
+         \"./src:/app\"\n    ]\n",
+    ]) {
+        let file = parse(text).unwrap();
+        assert!(file.unresolved.unread, "{text}");
+        let err = format!(
+            "{:#}",
+            resolve_included(&file, &["web".into()], &[]).unwrap_err()
+        );
+        assert!(err.contains("docker compose config"), "{err}");
+    }
+    // A comment kept after one leaves brackets that do not pair up, and a
+    // collection whose brackets do not pair up is not split at all.
+    for text in [
+        "services:\n  web: {image: node:20, command: echo it's up, volumes: [\"./src:/app\"]} \
+         # see {x}\n",
+        "services:\n  web:\n    image: node:20\n    volumes: [\"./src:/app\"]], [x]\n",
+    ] {
+        let file = parse(text).unwrap();
+        assert!(file.unresolved.unread, "{text}");
+    }
+}
+
 // Prettier wraps a flow list too long for its line onto the lines under
 // it. Under a key this reader never reads it hides no port and no mount,
 // but it marked the file half read, so `doctor` and `signals` doubted a
