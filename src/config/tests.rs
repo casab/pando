@@ -479,6 +479,94 @@ fn a_key_whose_table_is_a_scalar_is_refused_by_name() {
     assert_eq!(home_text(&f), "dev = 3\n");
 }
 
+// `dev = { cwd = "apps/web" }` is the shape detection fills in, written
+// inline. It was refused as "not a table", and since nothing was written
+// every start stopped on the same refusal.
+#[test]
+fn a_process_written_as_an_inline_table_is_filled_in_like_any_other() {
+    for (written, header) in [
+        (
+            "[processes]\ndev = { cwd = \"apps/web\" }\n",
+            "[processes.dev]",
+        ),
+        (
+            "processes = { dev = { cwd = \"apps/web\" } }\n",
+            "[processes.dev]",
+        ),
+        (
+            "processes.dev = { cwd = \"apps/web\" }\n",
+            "[processes.dev]",
+        ),
+        ("dev = { cwd = \"apps/web\" }\n", "[dev]"),
+    ] {
+        let f = fixture();
+        write_home(&f, written);
+        set_detected(
+            &f.paths,
+            Layer::Project,
+            &["dev"],
+            "cmd",
+            "pnpm dev",
+            Note::Detected("package.json scripts.dev".into()),
+        )
+        .unwrap();
+
+        let text = home_text(&f);
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("cmd = \"pnpm dev\"") && l.contains("# detected:")),
+            "{text}"
+        );
+        assert!(text.contains(header), "{text}");
+        let loaded = load(&f.paths).expect("the file pando wrote must load");
+        assert_eq!(loaded.config.processes["dev"].cmd, "pnpm dev", "{text}");
+        assert_eq!(
+            loaded.config.processes["dev"].cwd.as_deref(),
+            Some("apps/web"),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn an_inline_table_that_only_held_the_next_leaves_no_bare_header() {
+    let f = fixture();
+    write_home(&f, "processes = { dev = { cwd = \"apps/web\" } }\n");
+    set_detected(
+        &f.paths,
+        Layer::Project,
+        &["dev"],
+        "cmd",
+        "pnpm dev",
+        Note::Answered,
+    )
+    .unwrap();
+    let text = home_text(&f);
+    assert!(!text.lines().any(|l| l.trim() == "[processes]"), "{text}");
+}
+
+#[test]
+fn an_empty_inline_array_of_tables_takes_an_entry_like_any_other() {
+    let f = fixture();
+    write_home(&f, "hooks = []\n");
+    set_detected_array_entry(
+        &f.paths,
+        Layer::Project,
+        "hooks",
+        vec![
+            ("name".to_string(), "migrate".into()),
+            ("after".to_string(), "services".into()),
+            ("cmd".to_string(), "true".into()),
+        ],
+        Note::Answered,
+    )
+    .unwrap();
+    let text = home_text(&f);
+    assert!(text.contains("[[hooks]]"), "{text}");
+    let loaded = load(&f.paths).expect("the file pando wrote must load");
+    assert_eq!(loaded.config.hooks[0].name, "migrate", "{text}");
+}
+
 #[test]
 fn a_patch_that_changes_nothing_leaves_the_file_alone() {
     let f = fixture();

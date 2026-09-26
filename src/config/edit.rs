@@ -257,6 +257,18 @@ pub fn set_detected_array_entry(
     let comment = note.comment();
     let array = array.to_string();
     patch(paths, layer, move |doc| {
+        // `hooks = []`, or a list of inline tables, is an array of tables
+        // written inline, and becomes one written out.
+        if doc.get(&array).is_some_and(Item::is_array) {
+            written_out(doc.as_table_mut(), &array, |item| match item {
+                Item::Value(toml_edit::Value::Array(inline)) if inline.is_empty() => {
+                    Item::ArrayOfTables(toml_edit::ArrayOfTables::new())
+                }
+                item => item
+                    .into_array_of_tables()
+                    .map_or_else(|item| item, Item::ArrayOfTables),
+            });
+        }
         let item = doc
             .entry(&array)
             .or_insert_with(|| Item::ArrayOfTables(toml_edit::ArrayOfTables::new()));
@@ -390,11 +402,22 @@ fn write_target<'a>(
 /// gets `[processes.web]` and not a bare `[processes]` line above it — a
 /// line that is valid TOML and that no human would have written. A level
 /// that was already there keeps whatever the developer made it.
+///
+/// A table written inline, `dev = { cwd = "apps/web" }`, is a table: it is
+/// rewritten as one with a header of its own, the only form with room for
+/// the note beside each key pando adds. A level that was inline only to
+/// hold the next is implicit, for the same reason a created one is.
 fn ensure_table<'a>(doc: &'a mut DocumentMut, path: &[&str]) -> Result<&'a mut EditTable> {
     let mut table = doc.as_table_mut();
     let leaf = path.len().saturating_sub(1);
     for (depth, part) in path.iter().enumerate() {
         let existed = table.contains_key(part);
+        let inline = table.get(part).is_some_and(Item::is_inline_table);
+        if inline {
+            written_out(table, part, |item| {
+                item.into_table().map_or_else(|item| item, Item::Table)
+            });
+        }
         let entry = table
             .entry(part)
             .or_insert_with(|| Item::Table(EditTable::new()));
@@ -404,11 +427,25 @@ fn ensure_table<'a>(doc: &'a mut DocumentMut, path: &[&str]) -> Result<&'a mut E
                 path[..=depth].join(".")
             )
         })?;
-        if !existed && depth < leaf {
+        if (!existed || inline) && depth < leaf {
             table.set_implicit(true);
         }
     }
     Ok(table)
+}
+
+/// Replaces the value under `key` with its written-out form, a table or an
+/// array of tables with a header of its own.
+///
+/// The key's spacing goes with it: it was the `dev = ` of an inline value,
+/// and kept on a header it reads `[dev ]`.
+fn written_out(table: &mut EditTable, key: &str, convert: impl FnOnce(Item) -> Item) {
+    if let Some(mut key) = table.key_mut(key) {
+        key.leaf_decor_mut().clear();
+    }
+    if let Some(item) = table.get_mut(key) {
+        *item = convert(std::mem::take(item));
+    }
 }
 
 /// Atomic, and 0600: the temp file is locked down before the rename, so there
