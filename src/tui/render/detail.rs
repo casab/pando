@@ -209,6 +209,9 @@ pub(super) fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
     if let Some(ports) = ports_row(app, &name, width) {
         rows.push((KEEP_URL, ports));
     }
+    for line in silent_port_rows(app, &name, width) {
+        rows.push((KEEP_URL, line));
+    }
     if let Some(mode) = mode_row(app, &name, width) {
         rows.push((KEEP_MODE, mode));
     }
@@ -756,19 +759,37 @@ fn ports_row<'a>(app: &App, name: &str, width: usize) -> Option<Line<'a>> {
             Style::new().fg(text_muted()),
         ));
     }
-    // A port nothing listens on while the worktree reads as running: the
-    // half of a two-server script that died behind the half that is up.
+    Some(truncate_line(detail_row("ports", spans), width))
+}
+
+/// A port nothing listens on while the worktree reads as running: the
+/// half of a two-server script that died behind the half that is up.
+/// Under the ports, wrapped rather than cut: nothing else on the pane
+/// says it.
+fn silent_port_rows<'a>(app: &App, name: &str, width: usize) -> Vec<Line<'a>> {
+    let Some(record) = app.record_for(name) else {
+        return Vec::new();
+    };
     let silent: Vec<String> = crate::state::silent_ports(record, chrono::Utc::now())
         .into_iter()
         .map(|(role, port)| format!("{role} {port}"))
         .collect();
-    if !silent.is_empty() {
-        spans.push(Span::styled(
-            format!("  nothing on {} — l shows why", silent.join(", ")),
-            Style::new().fg(yellow()),
-        ));
+    if silent.is_empty() {
+        return Vec::new();
     }
-    Some(detail_row("ports", spans))
+    let room = width.saturating_sub(LABEL_WIDTH).max(1);
+    super::wrap_text(
+        &format!("nothing on {} — l shows why", silent.join(", ")),
+        room,
+    )
+    .into_iter()
+    .map(|row| {
+        Line::from(vec![
+            Span::raw(" ".repeat(LABEL_WIDTH)),
+            Span::styled(row, Style::new().fg(yellow())),
+        ])
+    })
+    .collect()
 }
 
 fn tail_header<'a>(app: &App, name: &str, width: usize) -> Line<'a> {

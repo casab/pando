@@ -974,6 +974,50 @@ fn the_detail_pane_shows_the_url_ports_and_uptime_of_a_running_worktree() {
     assert!(rendered.contains("pid 4242"), "{rendered}");
 }
 
+// The api of a root script that runs web and api died behind the web
+// server: the only line on the pane that says so is never cut at its
+// edge, however many ports come before it.
+#[test]
+fn a_port_nothing_listens_on_is_said_whole_under_the_ports() {
+    let mut app = test_app(&["feat+one"]);
+    with_process(
+        &mut app,
+        "feat+one",
+        crate::state::Phase::Running {
+            since: chrono::Utc::now() - chrono::Duration::minutes(2),
+        },
+    );
+    let record = app.state.worktrees.get_mut("feat+one").unwrap();
+    record.ports.insert("api".into(), 17_343);
+    record
+        .roles
+        .insert("dev".into(), vec!["api".into(), "web".into()]);
+    record.observed_ports = vec![17_342, 45_678, 45_679];
+    // Side by side, the detail pane's inside is 46 cells at 120 and 38 at
+    // 100; the warning fits on a row of its own at the first, and wraps
+    // at the second.
+    let rendered = text_of(&draw(&mut app, 120, 30));
+    assert!(rendered.contains("api 17343  web 17342"), "{rendered}");
+    assert!(
+        rendered.contains("nothing on api 17343 — l shows why"),
+        "{rendered}"
+    );
+    let rendered = text_of(&draw(&mut app, 100, 30));
+    assert!(rendered.contains("nothing on api 17343"), "{rendered}");
+    // The ports pando did not ask for are what gives way, and say so.
+    let ports = rendered.lines().find(|l| l.contains("││ ports ")).unwrap();
+    assert!(
+        ports.trim_end_matches('│').trim_end().ends_with('…'),
+        "{ports}"
+    );
+    assert!(
+        rendered
+            .lines()
+            .any(|l| l.trim_end_matches('│').trim_end().ends_with("why")),
+        "{rendered}"
+    );
+}
+
 #[test]
 fn a_stopped_worktree_is_told_how_to_start() {
     let mut app = test_app(&["feat+one"]);
