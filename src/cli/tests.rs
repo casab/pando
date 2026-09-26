@@ -3271,17 +3271,29 @@ fn the_login_question_at_exit_3_names_the_table_to_write_and_not_an_answers_file
 
 // A namespace login lives in pando's own config; nothing `status` prints
 // reads it, and nothing it prints may carry it.
+//
+// The worktree runs namespaced and its config declares a service pando
+// cannot reach, so the one path in `status` that reads the config — the
+// namespace lines, and the shared service's reason among them — runs.
 #[test]
 fn status_never_prints_a_namespace_login() {
+    use crate::state::ServiceMode;
     let fx = fixture();
-    actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
+    let name = actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
     std::fs::write(
         fx.paths.config_file(),
-        "[namespaced.mariadb]\nuser = \"root\"\npassword = \"hunter2\"\n",
+        "[[services]]\nkind = \"native\"\nname = \"mariadb\"\n\n\
+         [namespaced.mariadb]\nuser = \"root\"\npassword = \"hunter2\"\n",
     )
     .unwrap();
+    with_namespaces(&fx, &name, ServiceMode::Namespaced);
     let json = capture(|b| status_json(&fx.paths, None, b));
-    let text = capture(|b| status_text(&fx.paths, None, b));
+    let text = capture(|b| status_text_at(&fx.paths, None, b, usize::MAX));
+    assert!(
+        text.lines()
+            .any(|l| l.contains("mariadb") && l.contains("shared")),
+        "the namespace lines ran with the config: {text}"
+    );
     for shown in [&json, &text] {
         assert!(!shown.contains("hunter2"), "{shown}");
     }
