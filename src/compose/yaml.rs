@@ -16,6 +16,11 @@ pub fn parse(text: &str) -> Result<ComposeFile> {
         bail!("a compose file is a mapping at its top level");
     };
     let mut file = ComposeFile::default();
+    // Only under the two keys this reader takes anything from: an alias in
+    // an `x-` block that nothing here reads changes nothing pando decides.
+    file.unresolved.aliases = top.iter().any(|(key, value)| {
+        matches!(key.as_str(), "services" | "volumes") && refers_elsewhere(value)
+    });
     for (key, value) in &top {
         match key.as_str() {
             "services" => {
@@ -45,6 +50,19 @@ pub fn parse(text: &str) -> Result<ComposeFile> {
 
 fn has_key(node: &Node, want: &str) -> bool {
     matches!(node, Node::Map(fields) if fields.iter().any(|(key, _)| key == want))
+}
+
+/// Whether anything under `node` is an alias or a merge key: text written
+/// somewhere else in the file, which this reader does not copy in.
+fn refers_elsewhere(node: &Node) -> bool {
+    match node {
+        Node::Alias(_) => true,
+        Node::Scalar(_) => false,
+        Node::Seq(items) => items.iter().any(refers_elsewhere),
+        Node::Map(fields) => fields
+            .iter()
+            .any(|(key, value)| key == "<<" || refers_elsewhere(value)),
+    }
 }
 
 fn service(node: &Node) -> Service {
@@ -125,7 +143,7 @@ fn port(node: &Node) -> Option<Port> {
                 host: get("host_ip").map(str::to_string),
             })
         }
-        Node::Seq(_) => None,
+        Node::Seq(_) | Node::Alias(_) => None,
     }
 }
 
@@ -192,7 +210,7 @@ fn mount(node: &Node) -> Option<Mount> {
                 Some(_) => None,
             }
         }
-        Node::Seq(_) => None,
+        Node::Seq(_) | Node::Alias(_) => None,
     }
 }
 
@@ -215,6 +233,10 @@ enum Node {
     Scalar(String),
     Map(Vec<(String, Node)>),
     Seq(Vec<Node>),
+    /// `*name`: whatever the anchor `&name` marks elsewhere in the file.
+    /// Kept as a node of its own rather than read as the text `*name`, so
+    /// the file can say it was not read whole.
+    Alias(String),
 }
 
 impl Node {
@@ -316,10 +338,11 @@ fn parse_seq(lines: &[Line], at: &mut usize, indent: usize) -> Result<Node> {
         if line.indent > indent || !trimmed.starts_with('-') {
             break;
         }
-        let rest = trimmed[1..].trim_start().to_string();
+        let rest = without_anchor(trimmed[1..].trim_start());
         // The column the entry's own content starts at, so `- target: 80`
         // followed by `  published: 8080` reads as one mapping.
-        let inner = line.indent + (trimmed.len() - trimmed[1..].trim_start().len());
+        let inner = line.indent + (trimmed.len() - rest.len());
+        let rest = rest.to_string();
         *at += 1;
         if rest.is_empty() {
             let child_indent = lines.get(*at).map(|l| l.indent).unwrap_or(indent);
@@ -330,7 +353,7 @@ fn parse_seq(lines: &[Line], at: &mut usize, indent: usize) -> Result<Node> {
             }
             continue;
         }
-        if let Some(node) = flow(&rest) {
+        if let Some(node) = alias(&rest).or_else(|| flow(&rest)) {
             items.push(node);
             continue;
         }
@@ -389,12 +412,13 @@ fn parse_map(lines: &[Line], at: &mut usize, indent: usize) -> Result<Node> {
 }
 
 /// What follows `key:` — on the same line, or the block indented under it.
+///
+/// `volumes: &data` with the list under it is that list: an anchor is only
+/// a label, and reading it as the text `&data` would lose the block.
 fn inline_value(lines: &[Line], at: &mut usize, value: String, indent: usize) -> Result<Node> {
+    let value = without_anchor(&value);
     if !value.is_empty() {
-        if let Some(node) = flow(&value) {
-            return Ok(node);
-        }
-        return Ok(Node::Scalar(unquote(&value)));
+        return Ok(one_line(value));
     }
     let Some(next) = lines.get(*at) else {
         return Ok(Node::Scalar(String::new()));
@@ -432,6 +456,35 @@ fn split_key(text: &str) -> Option<(String, String)> {
     None
 }
 
+/// A value written on one line: an alias, a flow collection, or a scalar.
+fn one_line(text: &str) -> Node {
+    let text = without_anchor(text);
+    alias(text)
+        .or_else(|| flow(text))
+        .unwrap_or_else(|| Node::Scalar(unquote(text)))
+}
+
+/// `&name` at the front of a value, dropped. What follows it — on the line,
+/// or in the block under it — is the value.
+fn without_anchor(text: &str) -> &str {
+    let text = text.trim_start();
+    if !text.starts_with('&') {
+        return text;
+    }
+    match text.find(char::is_whitespace) {
+        Some(end) => text[end..].trim_start(),
+        None => "",
+    }
+}
+
+/// `*name`, unquoted. A plain YAML scalar cannot start with `*`, so this
+/// is never an image or a path.
+fn alias(text: &str) -> Option<Node> {
+    text.trim()
+        .strip_prefix('*')
+        .map(|name| Node::Alias(name.to_string()))
+}
+
 /// `[a, b]` and `{a: b}` on one line.
 fn flow(text: &str) -> Option<Node> {
     let text = text.trim();
@@ -439,7 +492,7 @@ fn flow(text: &str) -> Option<Node> {
         return Some(Node::Seq(
             split_flow(inner)
                 .into_iter()
-                .map(|item| flow(&item).unwrap_or_else(|| Node::Scalar(unquote(&item))))
+                .map(|item| one_line(&item))
                 .collect(),
         ));
     }
@@ -447,10 +500,7 @@ fn flow(text: &str) -> Option<Node> {
         let mut entries = Vec::new();
         for item in split_flow(inner) {
             if let Some((key, value)) = split_key(&item) {
-                entries.push((
-                    key,
-                    flow(&value).unwrap_or_else(|| Node::Scalar(unquote(&value))),
-                ));
+                entries.push((key, one_line(&value)));
             }
         }
         return Some(Node::Map(entries));

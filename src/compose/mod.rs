@@ -51,35 +51,47 @@ pub struct ComposeFile {
 
 /// Keys this reader does not follow, recorded rather than ignored.
 ///
-/// `extends:` pulls a service's real definition out of another file, and a
-/// top-level `include:` adds whole services this file never names. Either
-/// one means the ports and volumes pando is reading are not the ones
-/// compose would use — so every refusal has to say so rather than tell the
-/// developer to add a `ports:` entry their file already has.
+/// `extends:` pulls a service's real definition out of another file, a
+/// top-level `include:` adds whole services this file never names, and a
+/// YAML alias or merge key stands for text written somewhere else in the
+/// file. Any one of them means the ports and volumes pando is reading are
+/// not the ones compose would use — so every refusal has to say so rather
+/// than tell the developer to add a `ports:` entry their file already has.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Unresolved {
     /// Services that carry an `extends:` key, in file order.
     pub extends: Vec<String>,
     /// Whether the file has a top-level `include:`.
     pub include: bool,
+    /// Whether a service or a top-level volume uses a YAML alias
+    /// (`*name`) or a merge key (`<<:`). What either one brings in — a
+    /// bind mount among it — is invisible to this reader, so a file with
+    /// one is never approved for isolation on this reader's word.
+    pub aliases: bool,
 }
 
 impl Unresolved {
     pub fn any(&self) -> bool {
-        !self.extends.is_empty() || self.include
+        !self.extends.is_empty() || self.include || self.aliases
     }
 
     /// The keys, named the way the compose specification names them, for a
     /// message. `None` when there is nothing to say.
     pub fn describe(&self) -> Option<String> {
-        match (self.extends.is_empty(), self.include) {
-            (true, false) => None,
-            (false, false) => Some(format!("`extends:` (on {})", self.extends.join(", "))),
-            (true, true) => Some("a top-level `include:`".to_string()),
-            (false, true) => Some(format!(
-                "`extends:` (on {}) and a top-level `include:`",
-                self.extends.join(", ")
-            )),
+        let mut keys = Vec::new();
+        if !self.extends.is_empty() {
+            keys.push(format!("`extends:` (on {})", self.extends.join(", ")));
+        }
+        if self.include {
+            keys.push("a top-level `include:`".to_string());
+        }
+        if self.aliases {
+            keys.push("YAML aliases or merge keys (`*`, `<<:`)".to_string());
+        }
+        match keys.as_slice() {
+            [] => None,
+            [one] => Some(one.clone()),
+            [rest @ .., last] => Some(format!("{} and {last}", rest.join(", "))),
         }
     }
 }

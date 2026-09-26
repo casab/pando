@@ -927,6 +927,47 @@ fn a_bind_mount_inside_the_repository_is_refused_by_name() {
     );
 }
 
+// The same bind mount, carried in by a merge key. Compose expands it on
+// `up`; pando's reader does not, and the fake docker's `config` answers
+// nothing, so what pando read is half the file — which approves nothing.
+#[test]
+fn a_bind_mount_behind_a_merge_key_is_refused_when_compose_cannot_resolve_it() {
+    if skip_without_python() {
+        return;
+    }
+    let f = iso_with(&config_toml("sleep 30"));
+    std::fs::write(
+        f.root.join("docker-compose.yml"),
+        "x-pg: &pg\n  volumes:\n    - ./pgdata:/var/lib/postgresql/data\n\
+         services:\n  postgres:\n    <<: *pg\n    image: postgres:16\n    ports: [\"5432:5432\"]\n  \
+         redis:\n    image: redis:7\n    ports: [\"6379:6379\"]\n",
+    )
+    .unwrap();
+    common::git(&f.root, &["add", "."]);
+    common::git(&f.root, &["commit", "--quiet", "-m", "merge key"]);
+    let name = new_worktree(&f, "feat/one");
+
+    let err = format!(
+        "{:#}",
+        actions::start(
+            &f.paths,
+            &f.config,
+            &name,
+            None,
+            actions::Mode::Isolated,
+            &|_| {}
+        )
+        .unwrap_err()
+    );
+    assert!(err.contains("postgres"), "{err}");
+    assert!(err.contains("merge"), "{err}");
+    let invocations = docker::invocations(&f.home);
+    assert!(
+        !invocations.iter().any(|line| line.contains(" up ")),
+        "nothing was brought up: {invocations:?}"
+    );
+}
+
 // A compose file with a service called `web` is the common case, and a
 // role is one port: two things claiming it would be handed one number and
 // the second would die on `EADDRINUSE` for a reason nothing could explain.

@@ -259,8 +259,8 @@ impl Compose {
 
     /// The fully resolved file, as compose itself reads it.
     ///
-    /// `extends:` and a top-level `include:` are followed and every default
-    /// is filled in — none of which pando's own reader does. Nothing is
+    /// `extends:`, a top-level `include:` and YAML aliases are followed and
+    /// every default is filled in — none of which pando's own reader does. Nothing is
     /// created or started: `config` only prints.
     pub fn config(&self) -> Result<crate::compose::ComposeFile> {
         let text = self.run(&["config", "--format", "json"], Some(PROBE_TIMEOUT))?;

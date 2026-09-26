@@ -592,6 +592,101 @@ fn a_refusal_about_an_unfollowed_file_says_which_key_it_did_not_follow() {
     assert!(err.contains("include"), "{err}");
 }
 
+/// A merge key carrying a bind mount into the worktree, which is the shape
+/// a file that shares one block between its services arrives in.
+const MERGING: &str = "x-pg: &pg\n  volumes:\n    - ./pgdata:/var/lib/postgresql/data\n\
+         services:\n  postgres:\n    <<: *pg\n    image: postgres:16\n";
+
+// Compose expands `<<: *pg` when it runs `up`, so the bind mount is there
+// whether or not this reader saw it. Approving the service on what was
+// read would put a database cluster inside the worktree.
+#[test]
+fn a_bind_mount_brought_in_by_a_merge_key_is_never_approved_on_half_a_file() {
+    let file = parse(MERGING).unwrap();
+    assert!(file.unresolved.aliases);
+    assert!(file.unresolved.any(), "so compose is asked to resolve it");
+    assert!(
+        file.unresolved.describe().unwrap().contains("`<<:`"),
+        "{:?}",
+        file.unresolved.describe()
+    );
+    let err = format!(
+        "{:#}",
+        resolve_included(&file, &["postgres".into()], &[]).unwrap_err()
+    );
+    assert!(err.contains("\"postgres\""), "{err}");
+    assert!(err.contains("docker compose config"), "{err}");
+}
+
+#[test]
+fn an_alias_is_recorded_rather_than_read_as_an_anonymous_volume() {
+    let file = parse(
+        "x-data: &data\n  - /srv/pg:/var/lib/postgresql/data\n\
+         services:\n  db:\n    image: postgres:16\n    volumes: *data\n",
+    )
+    .unwrap();
+    assert!(file.unresolved.aliases);
+    assert_eq!(
+        file.services["db"].volumes,
+        Vec::new(),
+        "`*data` is not a mount with no source"
+    );
+    assert!(resolve_included(&file, &["db".into()], &[]).is_err());
+}
+
+// An anchor is only a label. Reading `volumes: &v` as the text `&v` lost
+// the list under it, and the bind mount in it with the list.
+#[test]
+fn an_anchor_is_only_a_label_and_what_it_marks_is_read() {
+    let file = parse(
+        "services:\n  db:\n    image: &img postgres:16\n    volumes: &v\n      \
+         - ./data:/var/lib/postgresql/data\n    ports: [&p \"5432:5432\"]\n",
+    )
+    .unwrap();
+    assert!(!file.unresolved.any(), "nothing here refers elsewhere");
+    let db = &file.services["db"];
+    assert_eq!(db.image.as_deref(), Some("postgres:16"));
+    assert_eq!(db.volumes, vec![Mount::Bind("./data".to_string())]);
+    assert_eq!(db.container_port(), Some(5432));
+    let err = format!(
+        "{:#}",
+        resolve_included(&file, &["db".into()], &[]).unwrap_err()
+    );
+    assert!(
+        err.contains("./data"),
+        "refused for the mount it has: {err}"
+    );
+}
+
+// Only what pando reads counts: an alias inside an `x-` block nothing here
+// uses changes no port and no mount, and a quoted `*` is a string.
+#[test]
+fn an_alias_outside_services_and_a_quoted_star_leave_the_file_whole() {
+    let file = parse(
+        "x-one: &one {a: b}\nx-two: *one\n\
+         services:\n  cache:\n    image: redis:7\n    command: [\"redis-server\", \"*\"]\n",
+    )
+    .unwrap();
+    assert!(!file.unresolved.any(), "{:?}", file.unresolved);
+    assert_eq!(
+        resolve_included(&file, &["cache".into()], &[]).unwrap(),
+        vec![("cache".to_string(), 6379)]
+    );
+}
+
+#[test]
+fn every_key_not_followed_is_named_in_one_sentence() {
+    let unresolved = Unresolved {
+        extends: vec!["db".to_string()],
+        include: true,
+        aliases: true,
+    };
+    assert_eq!(
+        unresolved.describe().unwrap(),
+        "`extends:` (on db), a top-level `include:` and YAML aliases or merge keys (`*`, `<<:`)"
+    );
+}
+
 /// Captured verbatim from `docker compose config --format json` on
 /// Compose 5.0.1, against a file using `extends` and a top-level
 /// `include:`. Every shape here is one the hand-rolled parser does not

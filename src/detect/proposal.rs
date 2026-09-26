@@ -334,8 +334,8 @@ impl Proposal {
 
 /// Reads a compose file this crate's own parser could not follow whole.
 ///
-/// `extends:` and a top-level `include:` are the two, and only compose
-/// itself resolves them. Detection is handed one of these so it can ask
+/// `extends:`, a top-level `include:` and YAML aliases or merge keys are
+/// the ones, and only compose itself resolves them. Detection is handed one of these so it can ask
 /// when Docker is there; [`propose`] passes none and falls back to what the
 /// parser could read, which is why a refusal says so.
 pub type ComposeResolver<'a> = &'a dyn Fn(&Path) -> Option<crate::compose::ComposeFile>;

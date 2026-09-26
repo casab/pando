@@ -436,8 +436,8 @@ pub(super) fn compose_services_proposal(
     let file = crate::compose::find(root)?;
     let path = root.join(&file);
     let mut parsed = crate::compose::read(&path).ok()?;
-    // Half a file read is not a proposal. Compose resolves `extends:` and a
-    // top-level `include:`; ask it when it is available.
+    // Half a file read is not a proposal. Compose resolves `extends:`, a
+    // top-level `include:` and YAML aliases; ask it when it is available.
     if parsed.unresolved.any()
         && let Some(resolve) = resolve
         && let Some(resolved) = resolve(&path)

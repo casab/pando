@@ -634,8 +634,9 @@ pub fn resolve_on(
     }
     let signals = detect::signals(paths.root());
     // Only ever called for a compose file pando's own reader could not
-    // follow — `extends:` or a top-level `include:` — so a plain project
-    // costs no process spawn. `config` prints; it creates nothing.
+    // follow — `extends:`, a top-level `include:`, a YAML alias — so a
+    // plain project costs no process spawn. `config` prints; it creates
+    // nothing.
     let program = services::docker_program(paths);
     let resolve = |file: &Path| -> Option<crate::compose::ComposeFile> {
         let dir = file.parent()?;

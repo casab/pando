@@ -80,6 +80,19 @@ pub fn resolve_included(
                 caveat(file)
             )
         })?;
+        // A mount this reader never saw is not one it can refuse, and an
+        // alias or a merge key can carry one in. Compose resolves them
+        // when it can; when it could not, half a file approves nothing.
+        if file.unresolved.aliases {
+            bail!(
+                "service {name:?} is not isolated: the compose file uses YAML aliases or merge \
+                 keys (`*`, `<<:`), which pando's own reader does not follow, and `docker \
+                 compose config` could not resolve them here — a bind mount brought in through \
+                 one would be invisible to pando, and an isolated copy could write its data into \
+                 your repository. Make `docker compose config` work for this file, or write out \
+                 in {name:?} what the alias brings in"
+            );
+        }
         check_mounts(name, service, file, repository)?;
         check_depends_on(name, service, include)?;
         let port = service.container_port().with_context(|| {

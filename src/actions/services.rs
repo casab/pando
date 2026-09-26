@@ -450,10 +450,10 @@ fn plan_compose(
     for entry in &entries {
         let file = crate::compose::file_in(worktree, entry.file)?;
         let mut parsed = crate::compose::read(&file)?;
-        // `extends:` and a top-level `include:` put the real definition in
-        // a file this reader does not follow, so what it read is not what
-        // compose would run. Compose can say; it is already the thing
-        // about to bring the services up.
+        // `extends:`, a top-level `include:` and a YAML alias put the real
+        // definition somewhere this reader does not follow, so what it read
+        // is not what compose would run. Compose can say; it is already the
+        // thing about to bring the services up.
         if parsed.unresolved.any()
             && let Ok(resolved) =
                 services::Compose::new(&program, &project, vec![file.clone()], worktree).config()
