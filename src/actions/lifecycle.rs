@@ -21,10 +21,11 @@ use super::refresh::advance_before_reconcile;
 use super::runtime::with_prelude;
 use super::services::{
     FRESH_DATA_DIR, Fresh, bring_up_services, clear_native_sockets, compose_projects,
-    forget_hooks_after_services, forget_unstarted_services, has_live_services, leave_changed_kinds,
-    planned_services, preflight_isolation, replace_stopped_containers, resolve_service_env,
-    service_roles, shared_service_env, stop_containers, stop_service_containers,
-    stop_service_pumps, undo_failed_isolation, url_owner_not_running, worktree_url,
+    forget_hooks_after_services, forget_unstarted_services, has_interrupted_compose,
+    has_live_services, leave_changed_kinds, planned_services, preflight_isolation,
+    replace_stopped_containers, resolve_service_env, service_roles, shared_service_env,
+    stop_containers, stop_service_containers, stop_service_pumps, undo_failed_isolation,
+    url_owner_not_running, worktree_url,
 };
 use super::share::{share_closed, share_target_is_up, sweep_dead_shares_with, take_share_down};
 // Only for the intra-doc link above `sweep_orphaned_groups`.
@@ -551,6 +552,10 @@ fn start_checked(
     // with no edit to `pando.toml`. Turned off here and now, because a
     // worktree pando can no longer isolate is one whose next start is a
     // shared one, and there is no container to contradict that.
+    //
+    // Asked before the ports go: a compose record with one is the only
+    // trace of a switch interrupted before any pump was recorded.
+    let interrupted = has_interrupted_compose(record);
     if !isolate {
         if record.mode == Some(ServiceMode::Isolated) {
             record.mode = Some(ServiceMode::Shared);
@@ -578,8 +583,10 @@ fn start_checked(
     // whose undo never ran. Its containers and servers are orphans, and
     // this start, which is a shared one, is the one that has to take them
     // down; dropping their ports while they run leaves them unfindable.
+    // So is one interrupted earlier, during `up` or the wait for the
+    // containers to be ready, before any pump was recorded.
     let mut going_shared: Vec<String> = Vec::new();
-    if !isolate && (was_isolated || has_live_services(record)) {
+    if !isolate && (was_isolated || has_live_services(record) || interrupted) {
         let failures = stop_service_pumps(record, &|pgid| proc::stop(pgid, STOP_GRACE));
         if !failures.is_empty() {
             bail!("{name}: {}", failures.join("; "));

@@ -10179,6 +10179,65 @@ fn a_plain_start_takes_down_the_services_an_interrupted_switch_left_running() {
     assert!(fx.state().worktrees[&name].services.is_empty());
 }
 
+// The same switch interrupted earlier — during `up`, or while its
+// containers were getting ready — has no pump recorded yet, only a compose
+// record with its project and its port. The next shared start took the
+// port away and left the containers running, holding theirs, where no
+// status could show them.
+#[test]
+fn a_plain_start_takes_down_the_containers_a_switch_interrupted_before_its_pumps_left() {
+    let mut fx = fixture();
+    with_dev(&mut fx, dev("sleep 30"));
+    let calls = docker_that_records(&fx.paths);
+    let name = worktree_named(&fx, "feat/one");
+    let mut store = fx.state();
+    let record = store.worktrees.get_mut(&name).expect("new wrote a record");
+    assert!(record.mode() != crate::state::ServiceMode::Isolated);
+    record.services.push(state::ServiceRecord {
+        name: "postgres".to_string(),
+        kind: state::ServiceKind::Compose,
+        port: Some(17_001),
+        pid: None,
+        pgid: None,
+        compose_project: Some("pando-acme-feat_one".to_string()),
+    });
+    state::save(&fx.paths.state_file(), &store).unwrap();
+
+    let (said, progress) = collecting();
+    let outcome = super::start(
+        &fx.paths,
+        &fx.config,
+        &name,
+        None,
+        Mode::Remembered,
+        &progress,
+    )
+    .unwrap();
+    let _guard = guard(&outcome);
+    assert_eq!(compose_stops(&calls, "pando-acme-feat_one"), 1);
+    assert!(
+        said.borrow()
+            .iter()
+            .any(|l| l.contains("the private ones an interrupted start left running")),
+        "{:?}",
+        said.borrow()
+    );
+    let record = fx.state().worktrees[&name].clone();
+    assert_eq!(
+        record.services[0].compose_project.as_deref(),
+        Some("pando-acme-feat_one"),
+        "the record `rm` takes the volumes down by stays"
+    );
+    assert_eq!(record.services[0].port, None);
+
+    // Once taken down, a shared start does not take it down again.
+    stop(&fx.paths, &name, None).unwrap();
+    let stopped = compose_stops(&calls, "pando-acme-feat_one");
+    let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+    let _guard = guard(&outcome);
+    assert_eq!(compose_stops(&calls, "pando-acme-feat_one"), stopped);
+}
+
 // `new` of a branch it cannot find locally asks origin for it. That fetch
 // had no deadline: a remote that accepts the connection and never answers
 // held `new` — and the TUI worker running it — for ever.

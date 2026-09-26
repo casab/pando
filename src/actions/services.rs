@@ -1588,6 +1588,21 @@ pub(super) fn has_live_services(record: &WorktreeRecord) -> bool {
         .any(|service| service.pid.is_some_and(proc::is_alive))
 }
 
+/// Whether any of a worktree's compose records has both a project and a
+/// port. On a worktree that is not isolated, that is what a switch to
+/// isolated leaves when it is interrupted after naming the project and
+/// before recording a log pump — all through `up` and the wait for
+/// readiness — so that its containers run with nothing live in the
+/// record. Every start that finishes on other services, and every undo of
+/// a failed switch, leaves a compose record without a port.
+pub(super) fn has_interrupted_compose(record: &WorktreeRecord) -> bool {
+    record.services.iter().any(|service| {
+        service.kind == state::ServiceKind::Compose
+            && service.compose_project.is_some()
+            && service.port.is_some()
+    })
+}
+
 /// The compose projects a worktree's records name, each once.
 pub(super) fn compose_projects(record: &WorktreeRecord) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
