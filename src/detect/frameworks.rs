@@ -13,17 +13,35 @@ pub fn framework(root: &Path, signals: &Signals) -> Option<&'static FrameworkRul
             .markers
             .iter()
             .any(|m| signals.markers.iter().any(|f| f == m));
-        let by_script = rule
-            .script_markers
-            .iter()
-            .any(|needle| signals.scripts.values().any(|body| mentions(body, needle)));
         // A Cargo.toml with no binary is a library, and a mix.exs with no
         // Phoenix in it is some other Mix project: nothing this rule serves.
         if by_marker && !passes(root, rule.guard) {
             return false;
         }
-        by_marker || by_script
+        by_marker || names_a_script(rule, signals)
     })
+}
+
+/// The rule for what a project's own `dev` script runs. For a framework
+/// whose scripts only build its assets, that is the rule a script names
+/// when one does: a Laravel app's `dev: vite` is Vite.
+pub(super) fn script_framework(root: &Path, signals: &Signals) -> Option<&'static FrameworkRule> {
+    let rule = framework(root, signals)?;
+    if !rule.scripts_build_assets {
+        return Some(rule);
+    }
+    RULES
+        .iter()
+        .find(|other| names_a_script(other, signals))
+        .or(Some(rule))
+}
+
+/// Whether one of the project's script bodies runs one of the rule's
+/// script markers.
+fn names_a_script(rule: &FrameworkRule, signals: &Signals) -> bool {
+    rule.script_markers
+        .iter()
+        .any(|needle| signals.scripts.values().any(|body| mentions(body, needle)))
 }
 
 /// Whether the project at `root` is what a rule's guard asks for.

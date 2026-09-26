@@ -26,8 +26,9 @@ pub struct FrameworkRule {
     pub script_markers: &'static [&'static str],
     pub port: PortMechanism,
     pub default_port: u16,
-    /// The command to propose when the project has no script to run.
-    /// `{runner}` is replaced with the project's package or venv runner.
+    /// The command to propose when the project has no script to run, or
+    /// when its scripts only build assets. `{runner}` is replaced with the
+    /// project's package or venv runner.
     pub command: Option<&'static str>,
     /// The flag that tells this framework its port, for an app whose own
     /// script pando runs rather than the command above: `pnpm dev --port
@@ -38,6 +39,11 @@ pub struct FrameworkRule {
     /// What a project with one of the markers must also be before this
     /// rule claims it.
     pub guard: Guard,
+    /// Whether the framework's own server is the app and a `package.json`
+    /// beside it only builds the assets: Laravel's `vite`, a Rails app on
+    /// vite_ruby. Its command then leads the scripts, which run the asset
+    /// server, not the app.
+    pub scripts_build_assets: bool,
 }
 
 /// What a marker match must also pass, for a marker file that more than
@@ -55,7 +61,8 @@ pub enum Guard {
 }
 
 /// The rules pando ships with. Order matters: the first match wins, so the
-/// specific frameworks come before the conventions they are built on.
+/// specific frameworks come before the conventions they are built on, and
+/// an app server before the asset pipeline it builds with.
 pub const RULES: [FrameworkRule; 12] = [
     FrameworkRule {
         name: "Next.js",
@@ -71,6 +78,7 @@ pub const RULES: [FrameworkRule; 12] = [
         command: Some("npx next dev"),
         port_flag: Some("--port {port}"),
         guard: Guard::Marker,
+        scripts_build_assets: false,
     },
     FrameworkRule {
         name: "Nuxt",
@@ -81,6 +89,7 @@ pub const RULES: [FrameworkRule; 12] = [
         command: Some("npx nuxt dev"),
         port_flag: Some("--port {port}"),
         guard: Guard::Marker,
+        scripts_build_assets: false,
     },
     // Astro sits on Vite but has its own CLI, its own default port and its
     // own command, so it comes before the Vite row that would claim it.
@@ -93,6 +102,7 @@ pub const RULES: [FrameworkRule; 12] = [
         command: Some("npx astro dev --port {port:web}"),
         port_flag: Some("--port {port}"),
         guard: Guard::Marker,
+        scripts_build_assets: false,
     },
     FrameworkRule {
         name: "Angular",
@@ -103,6 +113,58 @@ pub const RULES: [FrameworkRule; 12] = [
         command: Some("npx ng serve --port {port:web}"),
         port_flag: Some("--port {port}"),
         guard: Guard::Marker,
+        scripts_build_assets: false,
+    },
+    // The app servers come before the Vite row: a Laravel app has a
+    // vite.config.js and a `dev: vite` script, and so do Django and Rails
+    // apps that build their assets with Vite.
+    FrameworkRule {
+        name: "Django",
+        markers: &["manage.py"],
+        script_markers: &[],
+        port: PortMechanism::InCommand,
+        default_port: 8000,
+        command: Some("{runner}python manage.py runserver 127.0.0.1:{port:web}"),
+        port_flag: None,
+        guard: Guard::Marker,
+        scripts_build_assets: true,
+    },
+    FrameworkRule {
+        name: "Rails",
+        // Rails' own files. `config.ru` is every Rack app's and `bin/dev`
+        // is a helper script in any language.
+        markers: &["bin/rails", "config/application.rb"],
+        script_markers: &[],
+        port: PortMechanism::InCommand,
+        default_port: 3000,
+        command: Some("bin/rails server -p {port:web}"),
+        port_flag: Some("-p {port}"),
+        guard: Guard::Marker,
+        scripts_build_assets: true,
+    },
+    FrameworkRule {
+        name: "Phoenix",
+        markers: &["mix.exs"],
+        script_markers: &[],
+        port: PortMechanism::Env("PORT"),
+        default_port: 4000,
+        command: Some("mix phx.server"),
+        port_flag: None,
+        // `{:phoenix, …}` in the deps, or `:phoenix,` in the lockfile an
+        // umbrella keeps at its root beside a `mix.exs` that has none.
+        guard: Guard::Mentions(&["mix.exs", "mix.lock"], ":phoenix,"),
+        scripts_build_assets: true,
+    },
+    FrameworkRule {
+        name: "Laravel",
+        markers: &["artisan"],
+        script_markers: &[],
+        port: PortMechanism::InCommand,
+        default_port: 8000,
+        command: Some("php artisan serve --port {port:web}"),
+        port_flag: Some("--port {port}"),
+        guard: Guard::Marker,
+        scripts_build_assets: true,
     },
     FrameworkRule {
         name: "Vite",
@@ -128,50 +190,7 @@ pub const RULES: [FrameworkRule; 12] = [
         command: Some("npx vite --port {port:web}"),
         port_flag: Some("--port {port}"),
         guard: Guard::Marker,
-    },
-    FrameworkRule {
-        name: "Django",
-        markers: &["manage.py"],
-        script_markers: &[],
-        port: PortMechanism::InCommand,
-        default_port: 8000,
-        command: Some("{runner}python manage.py runserver 127.0.0.1:{port:web}"),
-        port_flag: None,
-        guard: Guard::Marker,
-    },
-    FrameworkRule {
-        name: "Rails",
-        // Rails' own files. `config.ru` is every Rack app's and `bin/dev`
-        // is a helper script in any language.
-        markers: &["bin/rails", "config/application.rb"],
-        script_markers: &[],
-        port: PortMechanism::InCommand,
-        default_port: 3000,
-        command: Some("bin/rails server -p {port:web}"),
-        port_flag: Some("-p {port}"),
-        guard: Guard::Marker,
-    },
-    FrameworkRule {
-        name: "Phoenix",
-        markers: &["mix.exs"],
-        script_markers: &[],
-        port: PortMechanism::Env("PORT"),
-        default_port: 4000,
-        command: Some("mix phx.server"),
-        port_flag: None,
-        // `{:phoenix, …}` in the deps, or `:phoenix,` in the lockfile an
-        // umbrella keeps at its root beside a `mix.exs` that has none.
-        guard: Guard::Mentions(&["mix.exs", "mix.lock"], ":phoenix,"),
-    },
-    FrameworkRule {
-        name: "Laravel",
-        markers: &["artisan"],
-        script_markers: &[],
-        port: PortMechanism::InCommand,
-        default_port: 8000,
-        command: Some("php artisan serve --port {port:web}"),
-        port_flag: Some("--port {port}"),
-        guard: Guard::Marker,
+        scripts_build_assets: false,
     },
     FrameworkRule {
         name: "Go",
@@ -182,6 +201,7 @@ pub const RULES: [FrameworkRule; 12] = [
         command: Some("go run ."),
         port_flag: None,
         guard: Guard::Marker,
+        scripts_build_assets: false,
     },
     FrameworkRule {
         name: "Rust",
@@ -194,6 +214,7 @@ pub const RULES: [FrameworkRule; 12] = [
         command: Some("cargo run"),
         port_flag: None,
         guard: Guard::BinaryCrate,
+        scripts_build_assets: false,
     },
     FrameworkRule {
         name: "Node",
@@ -204,6 +225,7 @@ pub const RULES: [FrameworkRule; 12] = [
         command: None,
         port_flag: None,
         guard: Guard::Marker,
+        scripts_build_assets: false,
     },
 ];
 

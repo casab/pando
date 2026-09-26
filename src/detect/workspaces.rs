@@ -9,7 +9,7 @@ use crate::config::{PortsSpec, ProcessConfig, ReadySpec};
 
 use super::apply::DEV;
 use super::dev::{fixed_port, is_multiplexer, script_args, script_runner};
-use super::frameworks::framework;
+use super::frameworks::script_framework;
 use super::proposal::{Candidate, Proposal, Slot};
 use super::signals::{Signals, parse_scripts, present};
 
@@ -173,7 +173,7 @@ pub fn workspace_apps(root: &Path, signals: &Signals) -> Vec<WorkspaceApp> {
             let Some(name) = Path::new(&dir).file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            let rule = framework(&path, &app);
+            let rule = script_framework(&path, &app);
             let fixed = fixed_port(script);
             let mut cmd = format!("{runner}dev");
             // A framework that takes its port on the command line gets the

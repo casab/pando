@@ -250,18 +250,27 @@ pub(super) fn dev_cmd_proposal(
     rule: Option<&'static FrameworkRule>,
 ) -> Option<Proposal> {
     let runner = script_runner(signals);
-    let mut candidates: Vec<Candidate> = ranked_scripts(signals)
+    let scripts: Vec<Candidate> = ranked_scripts(signals)
         .into_iter()
         .map(|(name, _body)| Candidate {
             value: format!("{runner}{name}"),
             why: format!("package.json scripts.{name}"),
             ..Candidate::default()
         })
-        .chain(target_candidates(signals))
         .collect();
+    let targets = target_candidates(signals);
+    // Where the scripts only build a backend's assets, they start the asset
+    // server and not the app: the project's own targets lead, then the
+    // framework's command, and the scripts come last.
+    let assets_only = rule.is_some_and(|rule| rule.scripts_build_assets);
+    let own_command = targets.is_empty() && (scripts.is_empty() || assets_only);
+    let mut candidates: Vec<Candidate> = match assets_only {
+        true => targets.into_iter().chain(scripts).collect(),
+        false => scripts.into_iter().chain(targets).collect(),
+    };
 
-    // A framework's own command, for a project with no script to run it.
-    if candidates.is_empty()
+    // A framework's own command, for a project with nothing else to run it.
+    if own_command
         && let Some(rule) = rule
         && let Some(command) = rule.command
     {
@@ -269,12 +278,15 @@ pub(super) fn dev_cmd_proposal(
         let ports = command
             .contains("{port:")
             .then(|| PortsSpec::List(vec![crate::config::WEB_ROLE.to_string()]));
-        candidates.push(Candidate {
-            value,
-            why: format!("the {} rule", rule.name),
-            ports,
-            ..Candidate::default()
-        });
+        candidates.insert(
+            0,
+            Candidate {
+                value,
+                why: format!("the {} rule", rule.name),
+                ports,
+                ..Candidate::default()
+            },
+        );
     }
 
     dedup_by_value(&mut candidates);
@@ -446,10 +458,13 @@ pub(super) fn port_proposal(
 ) -> Option<Proposal> {
     // Not where the script that would run fixes its own port: the flag
     // wins over every variable, the framework's and the env example's
-    // alike, and a role for it is a port nothing binds.
-    if ranked_scripts(signals)
-        .first()
-        .is_some_and(|(_, body)| fixed_port(body).is_some())
+    // alike, and a role for it is a port nothing binds. A backend whose
+    // scripts only build its assets is not run by them, so their port is
+    // the asset server's.
+    if !rule.is_some_and(|rule| rule.scripts_build_assets)
+        && ranked_scripts(signals)
+            .first()
+            .is_some_and(|(_, body)| fixed_port(body).is_some())
     {
         return None;
     }

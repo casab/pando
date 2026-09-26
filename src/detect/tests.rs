@@ -773,6 +773,88 @@ fn a_mix_project_is_phoenix_only_when_it_depends_on_phoenix() {
     assert_eq!(framework(dir.path(), &s).unwrap().name, "Phoenix");
 }
 
+/// A stock Laravel app: `artisan`, and Vite building its assets.
+const LARAVEL: [(&str, &str); 3] = [
+    ("artisan", "#!/usr/bin/env php\n"),
+    ("vite.config.js", "export default {}\n"),
+    (
+        "package.json",
+        r#"{ "private": true, "scripts": { "build": "vite build", "dev": "vite" } }"#,
+    ),
+];
+
+// Read as Vite, a Laravel app was started as its asset server alone,
+// which serves a placeholder page, and the PHP app never ran.
+#[test]
+fn a_backend_building_its_assets_with_vite_is_run_by_its_own_server() {
+    let (dir, s) = marker_fixture(&LARAVEL);
+    let rule = framework(dir.path(), &s);
+    assert_eq!(rule.unwrap().name, "Laravel");
+    let proposal = dev_of(&s, rule);
+    assert_eq!(
+        values(&proposal),
+        vec!["php artisan serve --port {port:web}", "npm run dev"],
+        "the asset server stays on offer, behind the app"
+    );
+    assert_eq!(
+        proposal.candidates[0].ports,
+        Some(PortsSpec::List(vec!["web".to_string()]))
+    );
+    assert!(
+        !proposal.decided,
+        "the app alone or with its asset server is the developer's call"
+    );
+
+    let (dir, s) = marker_fixture(&[
+        ("config.ru", ""),
+        ("bin/rails", ""),
+        ("config/application.rb", ""),
+        ("vite.config.ts", "export default {}\n"),
+    ]);
+    let rule = framework(dir.path(), &s);
+    assert_eq!(
+        values(&dev_of(&s, rule)),
+        vec!["bin/rails server -p {port:web}"]
+    );
+
+    let (dir, s) = marker_fixture(&[
+        ("manage.py", ""),
+        ("package.json", r#"{ "scripts": { "dev": "vite" } }"#),
+    ]);
+    let rule = framework(dir.path(), &s);
+    assert_eq!(
+        dev_of(&s, rule).candidates[0].value,
+        "python manage.py runserver 127.0.0.1:{port:web}"
+    );
+}
+
+// The port a `dev: vite --port 5173` fixes is the asset server's. The
+// app is Phoenix's own server, and PORT is still how it is told one.
+#[test]
+fn an_asset_script_that_fixes_its_port_leaves_the_apps_port_alone() {
+    let (dir, s) = marker_fixture(&[
+        ("mix.exs", "defp deps do\n  [{:phoenix, \"~> 1.7\"}]\nend\n"),
+        (
+            "package.json",
+            r#"{ "scripts": { "dev": "vite --port 5173" } }"#,
+        ),
+    ]);
+    let rule = framework(dir.path(), &s);
+    assert_eq!(values(&port_proposal(&s, rule).unwrap()), vec!["PORT"]);
+}
+
+// In a workspace pando runs the app's own `dev` script, so the rule
+// that tells it the port is the one the script names.
+#[test]
+fn a_workspace_app_with_a_backend_marker_is_given_its_scripts_port_flag() {
+    let dir = tempdir().unwrap();
+    workspace(dir.path());
+    std::fs::write(dir.path().join("apps/web/manage.py"), "").unwrap();
+    let apps = workspace_apps(dir.path(), &signals(dir.path()));
+    let web = apps.iter().find(|app| app.name == "web").unwrap();
+    assert_eq!(web.cmd, "pnpm dev --port {port:web}");
+}
+
 // ---- install ---------------------------------------------------------
 
 // Invariant 1: a lockfile can never change because pando ran an
