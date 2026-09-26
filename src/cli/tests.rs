@@ -2324,9 +2324,10 @@ fn ellipsize_keeps_short_strings_and_truncates_long_ones() {
     assert_eq!(ellipsize("abcdefghij", 5), "abcd…");
 }
 
-// `head` is documented as "abc1234". Enrichment supplies the seven
-// characters, but porcelain's sha is all forty, so a worktree whose
-// enrichment failed used to publish a different shape in the same field.
+// `head` is documented as "abc1234". Porcelain's sha is all forty, and
+// enrichment's is git's own abbreviation, which is longer in a large
+// repository or under `core.abbrev`: one listing used to publish both
+// shapes in the same field.
 #[test]
 fn the_json_head_is_always_the_short_sha() {
     let mut w = crate::tui::app::tests::wt("feat+one");
@@ -2334,10 +2335,12 @@ fn the_json_head_is_always_the_short_sha() {
     w.head_sha = None;
     assert_eq!(short_head(&w).as_deref(), Some("0123456"));
 
-    w.head_sha = Some("abc1234".into());
-    assert_eq!(short_head(&w).as_deref(), Some("abc1234"));
+    w.head_sha = Some("0123456789ab".into());
+    assert_eq!(short_head(&w).as_deref(), Some("0123456"));
 
     w.head = None;
+    assert_eq!(short_head(&w).as_deref(), Some("0123456"));
+
     w.head_sha = None;
     assert_eq!(short_head(&w), None);
 }

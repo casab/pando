@@ -38,7 +38,9 @@ pub use status::{status_json, status_text, status_text_at};
 /// crate version so agents can pin what they parse.
 pub const JSON_VERSION: u32 = 2;
 
-/// What `git log --format=%h` abbreviates to, and what the JSON documents.
+/// How long the sha `ls --json` publishes is, as the JSON documents it.
+/// Not what `%h` gives: git lengthens that in a large repository, and
+/// `core.abbrev` sets it to anything.
 const SHORT_SHA_LEN: usize = 7;
 
 /// Documented on `--help` because an agent driving pando needs to know that
@@ -925,16 +927,16 @@ fn report_refresh(refreshed: &actions::Refreshed) {
     }
 }
 
-/// The sha `ls --json` publishes: seven characters, always. `head_sha` is
-/// enrichment's abbreviation and porcelain's `head` is the full forty, so a
-/// worktree whose enrichment failed would otherwise put a different shape
-/// into a field documented as `"abc1234"`.
+/// The sha `ls --json` publishes: seven characters, always. Porcelain's
+/// `head` is the full forty, and enrichment's `head_sha` is git's own
+/// abbreviation, as long as the repository or `core.abbrev` makes it, so
+/// either is cut: one listing never holds two shapes of a field documented
+/// as `"abc1234"`.
 fn short_head(w: &Worktree) -> Option<String> {
-    w.head_sha.clone().or_else(|| {
-        w.head
-            .as_ref()
-            .map(|sha| sha.chars().take(SHORT_SHA_LEN).collect())
-    })
+    w.head
+        .as_deref()
+        .or(w.head_sha.as_deref())
+        .map(|sha| sha.chars().take(SHORT_SHA_LEN).collect())
 }
 
 /// Truncate to at most `max` chars with a trailing ellipsis, so a long name
