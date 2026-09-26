@@ -3095,6 +3095,30 @@ fn the_detail_title_leads_with_the_rows_glyph() {
     assert_eq!(style_at(&buf, "╭ ● feat/one", "●").fg, Some(green()));
 }
 
+// A stop in flight is not `running` in the title either: the title's
+// glyph is the row's, action and all.
+#[test]
+fn the_detail_title_shows_the_action_in_flight_as_the_row_does() {
+    let mut app = test_app(&["feat+one"]);
+    with_process(&mut app, "feat+one", running_phase());
+    let (_done, rx) = std::sync::mpsc::channel();
+    app.pending = Some(crate::tui::app::PendingAction {
+        name: "feat+one".into(),
+        kind: crate::tui::app::PendingKind::Stop,
+        rx,
+        started_at: std::time::Instant::now(),
+        spinner_frame: 0,
+        progress_rx: None,
+        stage: None,
+        label: "feat/one".into(),
+    });
+    let buf = draw(&mut app, 140, 20);
+    let rendered = text_of(&buf);
+    assert!(rendered.contains("╭ ◌ feat/one"), "{rendered}");
+    assert_eq!(style_at(&buf, "╭ ◌ feat/one", "◌").fg, Some(yellow()));
+    assert_eq!(style_at(&buf, "stopping", "◌").fg, Some(yellow()));
+}
+
 // Magenta means isolated, or a merged pull request, and nothing else: a
 // shared worktree's branch is painted as a branch is everywhere, and a
 // lock is something to look at.

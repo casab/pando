@@ -195,22 +195,17 @@ fn row_cells(app: &App, wt: &Worktree) -> RowCells {
 
     let phase = app.phase_of(&wt.name);
     let pending = app.pending_on(&wt.name);
-    let (glyph, word, color) = match pending {
-        // What is being done to it outranks what it was doing: a stop in
-        // flight is not `running`.
-        Some(_) if app.awaiting_answer() => ("? ", Some("waiting"), orange()),
-        Some(pending) => ("◌ ", Some(pending.kind.verb()), yellow()),
-        None => {
-            let (glyph, color) = run_marker(phase.as_ref());
-            // Running and stopped are the glyph's to say; the rest have
-            // something worth reading.
-            let word = match &phase {
-                Some(Aggregate::Starting { .. }) => Some("starting"),
-                Some(Aggregate::Failed { .. }) => Some("failed"),
-                _ => None,
-            };
-            (glyph, word, color)
-        }
+    let (glyph, color) = row_marker(app, &wt.name);
+    let word = match pending {
+        Some(_) if app.awaiting_answer() => Some("waiting"),
+        Some(pending) => Some(pending.kind.verb()),
+        // Running and stopped are the glyph's to say; the rest have
+        // something worth reading.
+        None => match &phase {
+            Some(Aggregate::Starting { .. }) => Some("starting"),
+            Some(Aggregate::Failed { .. }) => Some("failed"),
+            _ => None,
+        },
     };
     if let Some(word) = word {
         let mut style = Style::new().fg(color);
@@ -528,6 +523,17 @@ pub(super) fn port_of(url: &str) -> Option<String> {
     let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
     let (_, port) = host.rsplit_once(':')?;
     (!port.is_empty() && port.chars().all(|c| c.is_ascii_digit())).then(|| port.to_string())
+}
+
+/// A worktree's row glyph, in its colour. What is being done to it
+/// outranks what it was doing: a stop in flight is not `running`, and a
+/// start waiting on a question is not `stopped`.
+pub(super) fn row_marker(app: &App, name: &str) -> (&'static str, Color) {
+    match app.pending_on(name) {
+        Some(_) if app.awaiting_answer() => ("? ", orange()),
+        Some(_) => ("◌ ", yellow()),
+        None => run_marker(app.phase_of(name).as_ref()),
+    }
 }
 
 /// What a worktree is doing, in one cell.

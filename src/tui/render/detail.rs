@@ -14,7 +14,7 @@ use crate::theme::{
 };
 use crate::tui::app::{App, compact_age};
 
-use super::list::{pr_color, run_marker, signal_color, signal_text};
+use super::list::{pr_color, row_marker, run_marker, signal_color, signal_text};
 use super::{chunk_cells, home_relative, text_width, truncate, truncate_line, truncate_middle};
 
 // Detail rows, by how much they are worth keeping when the pane is short.
@@ -109,7 +109,7 @@ pub(super) fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
     // The title leads with the row's own glyph, in its colour, so the pane
     // says which state it describes before a word of it is read.
     let (glyph, glyph_color) = match &selected {
-        Some(name) => run_marker(app.phase_of(name).as_ref()),
+        Some(name) => row_marker(app, name),
         None => ("", text_muted()),
     };
     let title = match &selected {
