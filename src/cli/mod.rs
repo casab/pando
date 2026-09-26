@@ -548,6 +548,10 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             let name = names::target(paths, typed.as_deref(), "start")?;
             let named = names::Named::of(paths, typed.as_deref(), &name);
             let mode = actions::Mode::of(isolated, namespaced, shared);
+            // Before any question too: a login asked for, or a slot freed,
+            // for a start that is refused is a cost with nothing for it.
+            actions::refuse_only_on_a_mode_change(paths, config, &name, only.as_deref(), mode)
+                .map_err(|e| with_a_way_past(paths, named.reword(e)))?;
             let config = &actions::resolve_for_start(
                 paths,
                 config,
@@ -691,6 +695,8 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             // `start --shared` already is, since changing the mode
             // restarts the processes anyway.
             let mode = actions::Mode::of(isolated, namespaced, false);
+            actions::refuse_only_on_a_mode_change(paths, config, &name, only.as_deref(), mode)
+                .map_err(|e| with_a_way_past(paths, named.reword(e)))?;
             let config = &actions::resolve_for_start(
                 paths,
                 config,

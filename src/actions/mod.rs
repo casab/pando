@@ -26,8 +26,8 @@ pub use init::{
     machine_evidence_from, machine_evidence_script,
 };
 pub use lifecycle::{
-    Mode, StartReport, StartedProcess, StopOutcome, process_names, restart, start, stop, stop_all,
-    stop_all_with,
+    Mode, StartReport, StartedProcess, StopOutcome, process_names, refuse_only_on_a_mode_change,
+    restart, start, stop, stop_all, stop_all_with,
 };
 pub use namespaced::{
     Leftover, login_question, namespace_leftovers, namespace_lines, namespace_login,

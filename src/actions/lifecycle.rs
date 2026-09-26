@@ -219,6 +219,10 @@ fn start_checked(
     // Before anything is installed, signalled or spawned: a `--only` naming
     // a process that does not exist must have no side effects at all.
     let selection = selected_processes(config, only)?;
+    // And before a namespace is made or a container checked: a `--only`
+    // through a mode change is refused under the lock below whatever
+    // happens, and a database made first would outlive the refusal.
+    refuse_only_on_a_mode_change(paths, config, name, only, mode)?;
     let canonical = std::fs::canonicalize(&worktree.path).unwrap_or_else(|_| worktree.path.clone());
 
     // A project with nothing to isolate is not an error: `--isolated` on a
@@ -1488,6 +1492,22 @@ fn refuse_only_across_a_mode_change(only: Option<&str>, going: ServiceMode) -> R
             ServiceMode::Shared => "the project's shared",
         }
     )
+}
+
+/// [`refuse_only_across_a_mode_change`] for a start or restart in `mode`,
+/// read without the lock: what the CLI asks before any question, so that
+/// a refusal has asked for no login, freed no slot and made nothing.
+pub fn refuse_only_on_a_mode_change(
+    paths: &PandoPaths,
+    config: &Config,
+    name: &str,
+    only: Option<&str>,
+    mode: Mode,
+) -> Result<()> {
+    if only.is_some() && mode_would_change(paths, config, name, mode) {
+        refuse_only_across_a_mode_change(only, target_of(paths, config, name, mode))?;
+    }
+    Ok(())
 }
 
 /// Whether a start in this mode would change what the worktree's

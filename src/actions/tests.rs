@@ -8320,6 +8320,31 @@ fn only_one_process_cannot_be_moved_onto_namespaces() {
     assert_eq!(ns.fake("created"), "", "refused before anything was made");
 }
 
+// `start --only` is refused the same way, and as early: before a database
+// is made in the developer's server for a start that will not happen.
+#[test]
+fn only_one_process_cannot_be_started_onto_namespaces_and_nothing_is_made() {
+    let ns = namespaced_fixture(MAIN_ENV);
+    let (report, _) = ns.start(Mode::Shared).unwrap();
+    let _guard = guard(&report);
+    let e = format!(
+        "{:#}",
+        super::start(
+            &ns.fx.paths,
+            &ns.fx.config,
+            &ns.name,
+            Some("dev"),
+            Mode::Namespaced,
+            &noop
+        )
+        .unwrap_err()
+    );
+    assert!(e.contains("namespaces of its own"), "{e}");
+    assert!(e.contains("--only dev"), "{e}");
+    assert_eq!(ns.fake("created"), "", "refused before anything was made");
+    assert!(ns.record().namespaces.is_empty(), "and nothing recorded");
+}
+
 // ---- redis slots -----------------------------------------------------------------
 
 /// A fake `redis-cli` beside the fake `mariadb`: slot `n` holds as many

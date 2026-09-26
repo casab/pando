@@ -3567,6 +3567,49 @@ fn a_namespaced_worktree_through_the_cli_from_start_to_rm() {
     assert!(!printed.contains("cli-secret-pw"), "{printed}");
 }
 
+// `--only` through a switch onto namespaces is refused before anything
+// else: no login is asked for, and no database is made, for a start that
+// will not happen.
+#[test]
+fn start_only_onto_namespaces_is_refused_before_any_question() {
+    let e = env();
+    let fake = common::fake_mariadb(&e.home);
+    std::fs::write(
+        e.root.join(".env"),
+        "DATABASE_HOST=localhost\nDATABASE_PORT=3306\nDATABASE_NAME=shop\n",
+    )
+    .unwrap();
+    e.write_config(
+        "[dev]\ncmd = \"sleep 30\"\nports = []\n\n\
+         [[services]]\nkind = \"native\"\nname = \"mariadb\"\n\
+         env = { DATABASE_PORT = \"mariadb\" }\n",
+    );
+    let out = e.pando(&["new", "feat/one"]);
+    assert_eq!(code(&out), EXIT_OK, "{}", stderr(&out));
+    for verb in ["start", "restart"] {
+        let out = e.pando(&[
+            verb,
+            "feat/one",
+            "--only",
+            "dev",
+            "--namespaced",
+            "--no-wait",
+        ]);
+        assert_eq!(code(&out), EXIT_ERROR, "{verb}: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("--only dev"),
+            "{verb}: {}",
+            stderr(&out)
+        );
+        assert!(
+            !stderr(&out).contains("[namespaced.mariadb]"),
+            "{verb} asked for a login first: {}",
+            stderr(&out)
+        );
+    }
+    assert!(!fake.join("created").exists(), "nothing was made");
+}
+
 // Decision 7: visible from the start, and labelled experimental in help.
 #[test]
 fn namespaced_is_in_start_help_and_says_it_is_experimental() {
