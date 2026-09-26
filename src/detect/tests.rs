@@ -804,6 +804,35 @@ fn a_tracked_bun_lock_beside_an_ignored_bun_lockb_gets_the_frozen_install() {
     crate::testutil::git(dir.path(), &["add", "bun.lock"]);
     let proposal = install_proposal(dir.path(), &signals(dir.path())).unwrap();
     assert_eq!(values(&proposal), vec!["bun install --frozen-lockfile"]);
+
+    // The ignored `bun.lockb` present beside it changes nothing: the plain
+    // install would still rewrite the tracked `bun.lock`.
+    std::fs::write(dir.path().join("bun.lockb"), "\0").unwrap();
+    let proposal = install_proposal(dir.path(), &signals(dir.path())).unwrap();
+    assert_eq!(values(&proposal), vec!["bun install --frozen-lockfile"]);
+    assert!(proposal.decided);
+}
+
+// The old bun habit: only the binary lockfile is gitignored, and it is the
+// one present. The frozen install would fail in every new worktree, which
+// is checked out without it.
+#[test]
+fn an_ignored_bun_lockb_present_gets_the_plain_install() {
+    let dir = seed_fixture(&[
+        ("package.json", r#"{ "scripts": { "dev": "vite" } }"#),
+        (".gitignore", "bun.lockb\n"),
+        ("bun.lockb", "\0"),
+    ]);
+    let proposal = install_proposal(dir.path(), &signals(dir.path())).unwrap();
+    assert_eq!(values(&proposal), vec!["bun install"]);
+    assert!(proposal.decided);
+    assert!(
+        proposal.candidates[0]
+            .why
+            .contains("bun.lockb is gitignored"),
+        "{}",
+        proposal.candidates[0].why
+    );
 }
 
 // With no lockfile a bun of 1.2 or later writes `bun.lock`, which this

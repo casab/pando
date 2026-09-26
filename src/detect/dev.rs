@@ -17,9 +17,9 @@ use super::signals::Signals;
 /// A lockfile the project gitignores is not frozen against anything: a new
 /// worktree is checked out without it, so the frozen install fails there.
 /// Such a project, and a JavaScript one with no lockfile, gets its
-/// manager's plain install instead where every lockfile name that manager
-/// writes is gitignored — the file it writes is one git ignores, so it
-/// cannot change the repository.
+/// manager's plain install instead where the lockfiles it would write are
+/// gitignored, as [`lockfiles_ignored`] asks — the file it writes is one
+/// git ignores, so it cannot change the repository.
 pub(super) fn install_proposal(root: &Path, signals: &Signals) -> Option<Proposal> {
     let mut candidates: Vec<Candidate> = Vec::new();
     for lock in &signals.lockfiles {
@@ -61,7 +61,8 @@ fn unlocked_install(
     if !lockfiles_ignored(root, manager) {
         return None;
     }
-    let verb = match manager.lockfiles.len() {
+    let names = lockfiles_written(root, manager);
+    let verb = match names.len() {
         1 => "is",
         _ => "are",
     };
@@ -69,24 +70,41 @@ fn unlocked_install(
         value: cmd.to_string(),
         why: format!(
             "{} {verb} gitignored, so {cmd} cannot change the repository",
-            listed(manager.lockfiles)
+            listed(&names)
         ),
         ..Candidate::default()
     })
 }
 
-/// Whether every lockfile `manager` writes is one the project gitignores,
-/// which is when its plain install cannot change the repository.
+/// Whether the lockfiles `manager`'s plain install would write are ones
+/// the project gitignores, which is when it cannot change the repository.
 ///
-/// Every name, not the first: bun writes `bun.lock` or `bun.lockb`
-/// depending on its version, and a tracked `bun.lock` beside a `bun.lockb`
-/// left in the gitignore is a lockfile the plain install would rewrite.
+/// The ones present are what it rewrites, so those are asked of: a
+/// gitignored `bun.lockb` is enough where only `bun.lockb` is in the
+/// gitignore, and a tracked `bun.lock` beside it is not. With none
+/// present every name is, not the first: bun writes `bun.lock` or
+/// `bun.lockb` depending on its version.
 pub fn lockfiles_ignored(root: &Path, manager: &package_managers::PackageManager) -> bool {
-    !manager.lockfiles.is_empty()
-        && manager
-            .lockfiles
+    let names = lockfiles_written(root, manager);
+    !names.is_empty()
+        && names
             .iter()
             .all(|lockfile| super::signals::is_gitignored(root, lockfile))
+}
+
+/// The lockfiles of `manager` present at the root, else every name it
+/// writes.
+fn lockfiles_written(root: &Path, manager: &package_managers::PackageManager) -> Vec<&'static str> {
+    let present: Vec<&'static str> = manager
+        .lockfiles
+        .iter()
+        .copied()
+        .filter(|lockfile| root.join(lockfile).exists())
+        .collect();
+    if present.is_empty() {
+        return manager.lockfiles.to_vec();
+    }
+    present
 }
 
 pub(super) fn version_files_proposal(signals: &Signals) -> Option<Proposal> {

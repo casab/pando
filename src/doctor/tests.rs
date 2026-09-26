@@ -595,6 +595,22 @@ fn the_plain_install_is_a_problem_where_only_another_lockfile_name_is_ignored() 
     );
 }
 
+// The old bun habit: only the binary lockfile is gitignored, and it is the
+// one present, so `bun install` rewrites nothing git tracks.
+#[test]
+fn the_plain_install_is_fine_where_the_lockfile_present_is_the_one_ignored() {
+    let fx = fixture();
+    std::fs::write(fx.root.join(".gitignore"), "bun.lockb\n").unwrap();
+    std::fs::write(fx.root.join("bun.lockb"), "\0").unwrap();
+    write_project_config(&fx, "[project]\ninstall = \"bun install\"\n");
+    let report = report(&fx);
+    assert!(
+        !mentions(&report, "non-frozen install"),
+        "{:?}",
+        report.findings
+    );
+}
+
 #[test]
 fn a_frozen_install_and_a_command_pando_has_no_opinion_about_are_both_fine() {
     for install in [
