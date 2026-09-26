@@ -22,26 +22,34 @@ pub fn framework(root: &Path, signals: &Signals) -> Option<&'static FrameworkRul
     })
 }
 
-/// The rule for what a project's own `dev` script runs. For a framework
-/// whose scripts only build its assets, that is the rule a script names
-/// when one does: a Laravel app's `dev: vite` is Vite.
-pub(super) fn script_framework(root: &Path, signals: &Signals) -> Option<&'static FrameworkRule> {
+/// The rule for what `dev`, a project's own `dev` script, runs. For a
+/// framework whose scripts only build its assets, that is the rule the
+/// script names when it names one: a Laravel app's `dev: vite` is Vite.
+/// Only that script: a `css: node build-css.js` beside a Django app's
+/// `dev: python manage.py runserver` says nothing about what `dev` runs.
+pub(super) fn script_framework(
+    root: &Path,
+    signals: &Signals,
+    dev: &str,
+) -> Option<&'static FrameworkRule> {
     let rule = framework(root, signals)?;
     if !rule.scripts_build_assets {
         return Some(rule);
     }
-    RULES
-        .iter()
-        .find(|other| names_a_script(other, signals))
-        .or(Some(rule))
+    RULES.iter().find(|other| runs(other, dev)).or(Some(rule))
 }
 
 /// Whether one of the project's script bodies runs one of the rule's
 /// script markers.
 fn names_a_script(rule: &FrameworkRule, signals: &Signals) -> bool {
+    signals.scripts.values().any(|body| runs(rule, body))
+}
+
+/// Whether `body` runs one of the rule's script markers.
+fn runs(rule: &FrameworkRule, body: &str) -> bool {
     rule.script_markers
         .iter()
-        .any(|needle| signals.scripts.values().any(|body| mentions(body, needle)))
+        .any(|needle| mentions(body, needle))
 }
 
 /// Whether the project at `root` is what a rule's guard asks for.

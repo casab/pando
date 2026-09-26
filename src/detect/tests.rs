@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use tempfile::{TempDir, tempdir};
 
+use crate::catalog::frameworks::PortMechanism;
 use crate::catalog::package_managers;
 use crate::config::{Config, PortsSpec, ProcessConfig};
 
@@ -853,6 +854,26 @@ fn a_workspace_app_with_a_backend_marker_is_given_its_scripts_port_flag() {
     let apps = workspace_apps(dir.path(), &signals(dir.path()));
     let web = apps.iter().find(|app| app.name == "web").unwrap();
     assert_eq!(web.cmd, "pnpm dev --port {port:web}");
+}
+
+// Only the `dev` script says what it runs. Read from every script, the
+// `css` one's `node` made a Django app Node, handed PORT, which
+// runserver ignores, and waited on a port it never bound.
+#[test]
+fn a_workspace_apps_other_scripts_do_not_say_what_its_dev_script_runs() {
+    let dir = tempdir().unwrap();
+    workspace(dir.path());
+    std::fs::create_dir_all(dir.path().join("apps/admin")).unwrap();
+    std::fs::write(dir.path().join("apps/admin/manage.py"), "").unwrap();
+    std::fs::write(
+        dir.path().join("apps/admin/package.json"),
+        r#"{ "scripts": { "dev": "python manage.py runserver", "css": "node build-css.js" } }"#,
+    )
+    .unwrap();
+    let apps = workspace_apps(dir.path(), &signals(dir.path()));
+    let admin = apps.iter().find(|app| app.name == "admin").unwrap();
+    assert_eq!(admin.port, PortMechanism::Ask);
+    assert_eq!(admin.default_port, Some(8000));
 }
 
 // ---- install ---------------------------------------------------------

@@ -173,7 +173,7 @@ pub fn workspace_apps(root: &Path, signals: &Signals) -> Vec<WorkspaceApp> {
             let Some(name) = Path::new(&dir).file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            let rule = script_framework(&path, &app);
+            let rule = script_framework(&path, &app, script);
             let fixed = fixed_port(script);
             let mut cmd = format!("{runner}dev");
             // A framework that takes its port on the command line gets the
