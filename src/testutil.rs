@@ -38,6 +38,19 @@ pub fn git(cwd: &Path, args: &[&str]) {
     );
 }
 
+/// The HOME every login shell pando starts under test is given: empty, and
+/// the same one for the whole run. See `process::login_shell`.
+pub fn shell_home() -> &'static Path {
+    static HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        tempfile::Builder::new()
+            .prefix("pando-test-home")
+            .tempdir()
+            .expect("a HOME for the shells under test")
+    })
+    .path()
+}
+
 /// A repository with one commit on `main`, for tests that need a real repo
 /// but no particular contents.
 pub fn init_repo(path: &Path) {

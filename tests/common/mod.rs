@@ -45,6 +45,7 @@ pub fn git(cwd: &Path, args: &[&str]) {
 }
 
 pub fn git_raw(cwd: &Path, args: &[&str]) -> std::process::Output {
+    hermetic_home();
     Command::new("git")
         .args(FIXTURE_IDENTITY)
         .current_dir(cwd)
@@ -53,6 +54,79 @@ pub fn git_raw(cwd: &Path, args: &[&str]) -> std::process::Output {
         .stderr(Stdio::piped())
         .output()
         .unwrap_or_else(|e| panic!("spawn git {args:?}: {e}"))
+}
+
+/// Gives this test binary an empty HOME of its own, once, before its first
+/// fixture: every fixture is made through [`git_raw`], which calls this.
+///
+/// pando runs every command through `bash -lc`, and a login shell reads
+/// `~/.bash_profile`. With nvm or conda in it that is most of a second per
+/// shell, and whatever it puts on PATH becomes what the test tested: the
+/// tests that ran a real `pnpm install` passed only on a machine with nvm
+/// and the fixture's Node version. The library's own unit tests get the
+/// same through `process::login_shell`.
+pub fn hermetic_home() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let home = std::env::temp_dir().join("pando-test-home");
+        std::fs::create_dir_all(&home).unwrap();
+        // SAFETY: std's own environment lock orders this with every other
+        // std::env read and with Command's spawn, and nothing in these
+        // tests reads the environment through libc behind std's back.
+        unsafe { std::env::set_var("HOME", &home) };
+    });
+}
+
+/// Installs a stand-in `pnpm` at `<home>/bin/pnpm`, which pando puts in
+/// front of PATH, so a fixture's install and scripts need neither Node nor
+/// the network. The fixtures lock nothing, so `install` has nothing to do,
+/// as the real one would find; any other word runs that `package.json`
+/// script with `sh`, the way pnpm does. Every call is appended to
+/// `<home>/bin/pnpm.calls`.
+pub fn fake_pnpm(home: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let path = bin.join("pnpm");
+    std::fs::write(
+        &path,
+        r#"#!/bin/sh
+echo "$*" >> "$0.calls"
+case "$1" in
+  install|i|ci) exit 0 ;;
+  run) shift ;;
+esac
+script=$1
+shift
+body=$(python3 -c 'import json, sys; print(json.load(open("package.json"))["scripts"][sys.argv[1]])' "$script" 2>/dev/null) || {
+  echo "pnpm: no script named $script in package.json" >&2
+  exit 1
+}
+exec sh -c "$body \"\$@\"" pnpm "$@"
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Installs a stand-in `node` at `<home>/bin/node` that answers `-v` with
+/// `v<version>`, for fixtures that pin a Node version pando then checks.
+pub fn fake_node(home: &Path, version: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let path = bin.join("node");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\n\
+             case \"$1\" in -v|--version) echo v{version}; exit 0 ;; esac\n\
+             echo \"node: a stand-in under test runs nothing\" >&2\n\
+             exit 1\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 /// `git status --porcelain` output for a checkout. Empty means clean.

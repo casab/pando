@@ -223,12 +223,8 @@ pub fn detach_from_terminal() {
 /// `bash -lc` running `shell_cmd` in `cwd` with `env` added and nothing on
 /// stdin, in a session of its own when `detached`.
 fn shell(shell_cmd: &str, cwd: &Path, env: &[(String, String)], detached: bool) -> Command {
-    let mut command = Command::new("bash");
-    command
-        .arg("-lc")
-        .arg(shell_cmd)
-        .current_dir(cwd)
-        .stdin(Stdio::null());
+    let mut command = crate::process::login_shell(shell_cmd);
+    command.current_dir(cwd).stdin(Stdio::null());
     for (key, value) in env {
         command.env(key, value);
     }

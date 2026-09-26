@@ -51,7 +51,25 @@ fn env_built(kind: Kind, local_files: bool) -> Env {
     // — and the commands these tests actually run are `sleep` and a python
     // listener, so nothing has to be initialised in front of them. The
     // answer goes where that kind of answer lives: the user layer.
-    env.write_user_config("[runtime]\nprelude = \"\"\n");
+    //
+    // The pnpm fixtures do run their install and scripts, so they get a
+    // stand-in pnpm and node in the test's own `bin`, put first on PATH by
+    // the prelude the way a developer's `nvm use` would. Before, they ran
+    // the real pnpm, and passed only on a machine with nvm and Node 22.
+    match matches!(
+        kind,
+        Kind::NextPnpmCompose | Kind::NextMessy | Kind::MonoWebApi
+    ) {
+        true => {
+            common::fake_pnpm(&env.home);
+            common::fake_node(&env.home, "22.11.0");
+            env.write_user_config(&format!(
+                "[runtime]\nprelude = 'export PATH=\"{}:$PATH\"'\n",
+                env.home.join("bin").display()
+            ));
+        }
+        false => env.write_user_config("[runtime]\nprelude = \"\"\n"),
+    }
     env
 }
 

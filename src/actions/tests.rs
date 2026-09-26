@@ -2754,7 +2754,9 @@ fn share_waits_for_a_worktree_that_start_has_only_just_returned_from() {
     with_dev(
         &mut fx,
         ProcessConfig {
-            cmd: python_listener_template(),
+            // A server that takes a moment to bind, so `share` meets it
+            // still starting however quickly the shell itself comes up.
+            cmd: format!("sleep 1 && {}", python_listener_template()),
             ports: Some(PortsSpec::List(vec!["web".to_string()])),
             ready: Some(ReadySpec {
                 role: Some("web".to_string()),
@@ -10502,6 +10504,9 @@ const MAIN_ENV: &str = "DATABASE_HOST=localhost\nDATABASE_PORT=3306\nDATABASE_NA
 
 impl Namespaced {
     fn start(&self, mode: Mode) -> Result<(StartReport, Vec<String>)> {
+        // What `env_line` reads is this start's environment, never the one
+        // an earlier start in the same test wrote before it was stopped.
+        let _ = std::fs::remove_file(&self.seen);
         let (said, progress) = collecting();
         let report = super::start(
             &self.fx.paths,
