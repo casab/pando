@@ -430,7 +430,7 @@ impl Kind {
                     ProcessConfig {
                         // Vite takes its port on the command line, so the
                         // flag is appended to the app's own dev script.
-                        cmd: "pnpm dev -- --port {port:web}".to_string(),
+                        cmd: "pnpm dev --port {port:web}".to_string(),
                         cwd: Some("apps/web".to_string()),
                         ports: Some(PortsSpec::List(strings(&["web"]))),
                         // The reason `{port:<role>}` exists: the web app

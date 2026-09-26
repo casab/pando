@@ -850,7 +850,7 @@ fn a_workspace_proposes_one_process_per_app() {
     let web = &processes["web"];
     assert_eq!(web.cwd.as_deref(), Some("apps/web"));
     assert_eq!(
-        web.cmd, "pnpm dev -- --port {port:web}",
+        web.cmd, "pnpm dev --port {port:web}",
         "Vite takes its port on the command line, so the flag goes on its own script"
     );
     assert_eq!(web.roles(), vec!["web"]);
@@ -892,6 +892,23 @@ fn a_workspace_proposes_one_process_per_app() {
     for needle in ["api", "web", "apps/api", "apps/web", "pnpm dev"] {
         assert!(summary.contains(needle), "{summary}");
     }
+}
+
+// pnpm hands a `--` on to the script, where Vite reads it as the end of
+// its options and never sees the port; npm needs one, or the flag is its
+// own.
+#[test]
+fn a_port_flag_is_handed_on_the_way_the_package_manager_expects() {
+    let dir = tempdir().unwrap();
+    workspace(dir.path());
+    std::fs::remove_file(dir.path().join("pnpm-lock.yaml")).unwrap();
+    std::fs::write(dir.path().join("package-lock.json"), "{}\n").unwrap();
+    let processes = proposed_processes(dir.path()).candidates[0]
+        .processes
+        .clone()
+        .unwrap();
+    assert_eq!(processes["web"].cmd, "npm run dev -- --port {port:web}");
+    assert_eq!(processes["api"].cmd, "npm run dev");
 }
 
 /// Adds an app with a Node dev script to the `workspace` fixture.
@@ -1104,7 +1121,7 @@ fn the_processes_slot_writes_a_table_per_app() {
     assert_eq!(
         web,
         vec![
-            ("cmd", "\"pnpm dev -- --port {port:web}\"".to_string()),
+            ("cmd", "\"pnpm dev --port {port:web}\"".to_string()),
             ("cwd", "\"apps/web\"".to_string()),
             ("ports", "[\"web\"]".to_string()),
             (

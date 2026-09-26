@@ -123,6 +123,13 @@ pub(super) fn script_runner(signals: &Signals) -> &'static str {
     package_managers::run_prefix(lockfiles(signals), Ecosystem::JavaScript).unwrap_or("npm run ")
 }
 
+/// What goes between a `package.json` script and the arguments handed on
+/// to it, for the runner [`script_runner`] names: npm's `-- ` where that
+/// is npm.
+pub(super) fn script_args(signals: &Signals) -> &'static str {
+    package_managers::script_args(lockfiles(signals), Ecosystem::JavaScript).unwrap_or("-- ")
+}
+
 /// How this project runs a Python command.
 pub(super) fn python_runner(signals: &Signals) -> &'static str {
     package_managers::run_prefix(lockfiles(signals), Ecosystem::Python).unwrap_or("")

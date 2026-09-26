@@ -56,6 +56,12 @@ pub struct PackageManager {
     /// How this manager runs a project command, as a prefix: a
     /// `package.json` script for JavaScript, any command for Python.
     pub run_prefix: Option<&'static str>,
+    /// What goes between a command run with `run_prefix` and the arguments
+    /// handed on to it. npm needs `-- `, or it reads a flag as its own.
+    /// Empty for every other manager: pnpm hands a `--` on to the script
+    /// as a literal argument, and a CLI that meets one stops reading its
+    /// options there, so `vite -- --port 1234` never sees the port.
+    pub script_args: &'static str,
     /// How it runs a binary from the project's dependencies. `pnpm foo` and
     /// `bunx foo` run it; `npm foo` does not, which is what `npx` is for.
     pub exec: Option<&'static str>,
@@ -83,6 +89,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         lockfiles: &["pnpm-lock.yaml"],
         ecosystem: Ecosystem::JavaScript,
         run_prefix: Some("pnpm "),
+        script_args: "",
         exec: Some("pnpm"),
         install: Some(FrozenInstall {
             cmd: "pnpm install --frozen-lockfile",
@@ -100,6 +107,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         lockfiles: &["package-lock.json"],
         ecosystem: Ecosystem::JavaScript,
         run_prefix: Some("npm run "),
+        script_args: "-- ",
         exec: Some("npx"),
         install: Some(FrozenInstall {
             cmd: "npm ci",
@@ -117,6 +125,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         lockfiles: &["yarn.lock"],
         ecosystem: Ecosystem::JavaScript,
         run_prefix: Some("yarn "),
+        script_args: "",
         exec: Some("yarn"),
         // `--frozen-lockfile`, not `--immutable`: Yarn 1 does not know
         // `--immutable`, ignores it, and rewrites `yarn.lock`. Yarn 2 and
@@ -138,6 +147,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         lockfiles: &["bun.lockb", "bun.lock"],
         ecosystem: Ecosystem::JavaScript,
         run_prefix: Some("bun run "),
+        script_args: "",
         exec: Some("bunx"),
         install: Some(FrozenInstall {
             cmd: "bun install --frozen-lockfile",
@@ -155,6 +165,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         lockfiles: &["uv.lock"],
         ecosystem: Ecosystem::Python,
         run_prefix: Some("uv run "),
+        script_args: "",
         exec: None,
         install: Some(FrozenInstall {
             cmd: "uv sync --frozen",
@@ -172,6 +183,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         lockfiles: &["poetry.lock"],
         ecosystem: Ecosystem::Python,
         run_prefix: Some("poetry run "),
+        script_args: "",
         exec: None,
         // Poetry has no `--frozen`, and needs none: `install` refuses a
         // lockfile that no longer matches `pyproject.toml` rather than
@@ -188,6 +200,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         lockfiles: &["Pipfile.lock"],
         ecosystem: Ecosystem::Python,
         run_prefix: Some("pipenv run "),
+        script_args: "",
         exec: None,
         // `sync` installs exactly what the lockfile says and never writes
         // it; `install` resolves again and can rewrite it.
@@ -207,6 +220,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         lockfiles: &["Gemfile.lock"],
         ecosystem: Ecosystem::Ruby,
         run_prefix: None,
+        script_args: "",
         exec: None,
         // The environment variable rather than `bundle config`, which would
         // write `.bundle/config` into the repository.
@@ -226,6 +240,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         lockfiles: &["composer.lock"],
         ecosystem: Ecosystem::Php,
         run_prefix: None,
+        script_args: "",
         exec: None,
         // With a lockfile present `install` installs exactly what it pins
         // and never rewrites it; `update` is the verb that resolves again.
@@ -245,6 +260,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         lockfiles: &["mix.lock"],
         ecosystem: Ecosystem::Elixir,
         run_prefix: None,
+        script_args: "",
         exec: None,
         // Deliberately nothing: `mix deps.get` writes the lockfile for a
         // dependency that is not in it yet, and an install that can rewrite
@@ -259,6 +275,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         lockfiles: &["go.sum"],
         ecosystem: Ecosystem::Go,
         run_prefix: None,
+        script_args: "",
         exec: None,
         // `go run` resolves its own modules, and proposing a warm-up step
         // for it is noise.
@@ -271,6 +288,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         lockfiles: &["Cargo.lock"],
         ecosystem: Ecosystem::Rust,
         run_prefix: None,
+        script_args: "",
         exec: None,
         // `cargo run` resolves its own crates, so nothing is proposed; but a
         // developer who does write a fetch step is held to `--locked`.
@@ -331,17 +349,35 @@ pub fn declared_javascript(manifest: &str) -> &'static PackageManager {
     declared.unwrap_or_else(|| for_program("npm").expect("npm is a row"))
 }
 
+/// The manager of the first present lockfile that belongs to `ecosystem`
+/// and runs project commands: the one whose run prefix a proposal uses.
+fn runner<'a>(
+    lockfiles: impl IntoIterator<Item = &'a str>,
+    ecosystem: Ecosystem,
+) -> Option<&'static PackageManager> {
+    lockfiles
+        .into_iter()
+        .filter_map(for_lockfile)
+        .filter(|manager| manager.ecosystem == ecosystem)
+        .find(|manager| manager.run_prefix.is_some())
+}
+
 /// The run prefix of the first present lockfile whose manager belongs to
 /// `ecosystem`.
 pub fn run_prefix<'a>(
     lockfiles: impl IntoIterator<Item = &'a str>,
     ecosystem: Ecosystem,
 ) -> Option<&'static str> {
-    lockfiles
-        .into_iter()
-        .filter_map(for_lockfile)
-        .filter(|manager| manager.ecosystem == ecosystem)
-        .find_map(|manager| manager.run_prefix)
+    runner(lockfiles, ecosystem)?.run_prefix
+}
+
+/// What goes between a command and the arguments handed on to it, for the
+/// manager whose [`run_prefix`] runs it.
+pub fn script_args<'a>(
+    lockfiles: impl IntoIterator<Item = &'a str>,
+    ecosystem: Ecosystem,
+) -> Option<&'static str> {
+    Some(runner(lockfiles, ecosystem)?.script_args)
 }
 
 #[cfg(test)]

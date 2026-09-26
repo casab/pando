@@ -8,7 +8,7 @@ use crate::catalog::frameworks::{FrameworkRule, PortMechanism};
 use crate::config::{PortsSpec, ProcessConfig, ReadySpec};
 
 use super::apply::DEV;
-use super::dev::{is_multiplexer, is_production, script_runner};
+use super::dev::{is_multiplexer, is_production, script_args, script_runner};
 use super::frameworks::framework;
 use super::proposal::{Candidate, Proposal, Slot};
 use super::signals::{Signals, parse_scripts, present};
@@ -152,6 +152,7 @@ fn app_signals(dir: &Path) -> Signals {
 /// written. That is a workspace pando says nothing about.
 pub fn workspace_apps(root: &Path, signals: &Signals) -> Vec<WorkspaceApp> {
     let runner = script_runner(signals);
+    let args = script_args(signals);
     let mut apps: Vec<WorkspaceApp> = Vec::new();
     for glob in workspace_globs(root) {
         for dir in expand_glob(root, &glob) {
@@ -169,14 +170,15 @@ pub fn workspace_apps(root: &Path, signals: &Signals) -> Vec<WorkspaceApp> {
             let rule = framework(&path, &app);
             let mut cmd = format!("{runner}dev");
             // A framework that takes its port on the command line gets the
-            // flag appended to its own script: `pnpm dev -- --port 1234`
-            // runs what the app already runs, on the port pando chose.
+            // flag appended to its own script: `pnpm dev --port 1234`, or
+            // `npm run dev -- --port 1234`, runs what the app already runs,
+            // on the port pando chose.
             if let Some(rule) = rule
                 && rule.port == PortMechanism::InCommand
                 && let Some(flag) = rule.port_flag
             {
                 cmd = format!(
-                    "{cmd} -- {}",
+                    "{cmd} {args}{}",
                     flag.replace("{port}", &format!("{{port:{name}}}"))
                 );
             }

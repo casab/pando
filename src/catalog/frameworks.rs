@@ -30,8 +30,8 @@ pub struct FrameworkRule {
     /// `{runner}` is replaced with the project's package or venv runner.
     pub command: Option<&'static str>,
     /// The flag that tells this framework its port, for an app whose own
-    /// script pando runs rather than the command above: `pnpm dev --
-    /// --port 1234`. `{port}` is replaced with the role template. `None`
+    /// script pando runs rather than the command above: `pnpm dev --port
+    /// 1234`. `{port}` is replaced with the role template. `None`
     /// for a framework that takes its port some other way — Django's
     /// positional `host:port` cannot be appended to somebody's script.
     pub port_flag: Option<&'static str>,
