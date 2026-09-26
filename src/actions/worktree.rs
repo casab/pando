@@ -44,7 +44,9 @@ enum CreateSource {
 /// Most refusals happen before git is asked to do anything; the ones that
 /// cannot — the worktree's own gitignore has the last word on provisioning,
 /// and it can only be read once the worktree exists — unwind what was
-/// created and say so in the error.
+/// created and say so in the error. The one refusal that keeps the
+/// worktree is over a record of it another command wrote while git
+/// checked it out: that command may be running something in it.
 pub fn new(
     paths: &PandoPaths,
     config: &Config,
@@ -104,7 +106,7 @@ pub fn new(
     // Not held through the checkout, which runs the repository's filters
     // and hooks — an LFS download takes minutes, and every `ls` and every
     // TUI worker would wait on it.
-    {
+    let left = {
         let _lock = state::lock(&paths.lock_file())?;
         let mut store = state::load(&paths.state_file())?;
         let loaded = store.clone();
@@ -122,7 +124,10 @@ pub fn new(
         if store != loaded {
             state::save(&paths.state_file(), &store)?;
         }
-    }
+        // What the record under this name is as the lock goes: none, unless
+        // a porcelain that could not be read kept a stale one.
+        store.worktrees.get(&dir_name).cloned()
+    };
 
     std::fs::create_dir_all(&worktrees_dir)
         .with_context(|| format!("create {}", worktrees_dir.display()))?;
@@ -163,26 +168,39 @@ pub fn new(
 
     // Past this point the worktree exists, so every failure has something to
     // undo before it is reported. The state is read again under the lock:
-    // other commands have saved theirs while git checked out. The lock goes
-    // with this closure, before the install runs: `npm ci` takes minutes,
-    // and holding the state lock through it would stall every `ls` and
-    // freeze the TUI's tick.
-    let finish = (|| -> Result<()> {
-        let _lock = state::lock(&paths.lock_file())?;
-        let mut store = state::load(&paths.state_file())?;
-        if !config.project.provision_paths().is_empty() {
-            progress("provisioning");
-        }
-        provision_worktree_files(paths, config, &target, progress)?;
-        let canonical = std::fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
-        store
-            .worktrees
-            .insert(dir_name.clone(), WorktreeRecord::new(canonical, true));
-        state::save(&paths.state_file(), &store)
-    })();
-    if let Err(e) = finish {
-        return Err(unwind_new(&root, &target, branch, &source, e));
+    // other commands have saved theirs while git checked out. And the undo
+    // runs with the lock still held: let go first, a `start` waiting on it
+    // could record a dev server in the worktree the undo then removes, and
+    // the next sweep drops that record as stale with the server running.
+    let undo = |e| unwind_new(&root, &target, branch, &source, e);
+    let lock = state::lock(&paths.lock_file()).map_err(undo)?;
+    let mut store = state::load(&paths.state_file()).map_err(undo)?;
+    // A `start` from another terminal can find the worktree while git is
+    // still checking it out, and record its dev server and ports under
+    // this name. Written over, they drop out of pando's state while they
+    // run; unwound, the worktree goes from under them. So neither: the
+    // record and the worktree are kept as that command left them.
+    if store.worktrees.get(&dir_name) != left.as_ref() {
+        bail!(
+            "{branch} was checked out at {}, but another pando command recorded {dir_name:?} \
+             while git was checking it out — the worktree and that record are kept, and nothing \
+             was provisioned or installed into it",
+            target.display()
+        );
     }
+    if !config.project.provision_paths().is_empty() {
+        progress("provisioning");
+    }
+    provision_worktree_files(paths, config, &target, progress).map_err(undo)?;
+    let canonical = std::fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
+    store
+        .worktrees
+        .insert(dir_name.clone(), WorktreeRecord::new(canonical, true));
+    state::save(&paths.state_file(), &store).map_err(undo)?;
+    // The lock goes before the install runs: `npm ci` takes minutes, and
+    // holding the state lock through it would stall every `ls` and freeze
+    // the TUI's tick.
+    drop(lock);
 
     // A failed install keeps the worktree. The branch is checked out, the
     // files are provisioned, and the next `start` tries the install again —

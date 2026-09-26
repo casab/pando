@@ -7685,6 +7685,79 @@ fn new_holds_no_state_lock_through_the_checkout_and_lets_it_prompt_for_nothing()
     );
 }
 
+// With the lock let go through the checkout, a `start` in another
+// terminal can find the worktree while git is still checking it out, and
+// record its dev server and ports. `new` then wrote its own record over
+// that one, and the running server dropped out of pando's state: nothing
+// could stop it, and its ports went to the next worktree.
+#[test]
+fn new_keeps_a_record_another_command_wrote_while_git_checked_out() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = fixture();
+    let marks = tempdir().unwrap();
+    let hooks = marks.path().join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("post-checkout");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\ntouch '{m}/started'\n\
+             i=0\nwhile [ ! -e '{m}/release' ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done\n",
+            m = marks.path().display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    git(
+        &fx.root,
+        &["config", "core.hooksPath", hooks.to_str().unwrap()],
+    );
+    let name = sanitize_branch_to_dir("feat/slow");
+    let target = fx.worktrees_dir().join(&name);
+
+    let err = std::thread::scope(|scope| {
+        let creating = scope.spawn(|| new(&fx.paths, &fx.config, "feat/slow", None, &noop));
+        let started = wait_until(Duration::from_secs(20), || {
+            marks.path().join("started").exists()
+        });
+        if started {
+            // What a start's record is: adopted, with a live process and
+            // its port. The pid is this test's, so no sweep signals it.
+            let _lock = state::lock(&fx.paths.lock_file()).unwrap();
+            let mut store = state::load(&fx.paths.state_file()).unwrap();
+            let mut record = WorktreeRecord::new(std::fs::canonicalize(&target).unwrap(), false);
+            let mut live = fake_record(4_000_003);
+            live.pid = std::process::id();
+            record.processes.insert("dev".to_string(), live);
+            record.ports.insert("web".to_string(), 17_000);
+            store.worktrees.insert(name.clone(), record);
+            state::save(&fx.paths.state_file(), &store).unwrap();
+        }
+        std::fs::write(marks.path().join("release"), "").unwrap();
+        let made = creating.join().unwrap();
+        assert!(started, "the checkout's hook never ran");
+        made.unwrap_err()
+    });
+    let msg = format!("{err:#}");
+    assert!(msg.contains("another pando command recorded"), "{msg}");
+
+    let record = &fx.state().worktrees[&name];
+    assert!(
+        record.processes.contains_key("dev"),
+        "new wrote over the start's record"
+    );
+    assert_eq!(record.ports.get("web"), Some(&17_000));
+    assert!(!record.created_by_pando, "new claimed an adopted worktree");
+    assert!(
+        fx.names().contains(&name),
+        "the worktree went from under the start's dev server"
+    );
+
+    // Still listed, so the next mutation's sweep keeps its record.
+    worktree_named(&fx, "feat/after");
+    assert!(fx.state().worktrees[&name].processes.contains_key("dev"));
+}
+
 // git still lists a worktree whose directory was deleted, and `new` said
 // it "already exists at" a path that was not there, with nothing about
 // the `rm` that clears the entry.
