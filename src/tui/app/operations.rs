@@ -289,7 +289,10 @@ impl App {
                 let _ = ptx.send(msg.to_string());
             };
             actions::stop(&paths, &worker_name, None, &progress)
-                .map(|_| PendingOutcome::Stopped(worker_name))
+                .map(|outcome| match outcome {
+                    actions::StopOutcome::Stopped(_) => PendingOutcome::Stopped(worker_name),
+                    actions::StopOutcome::NotRunning => PendingOutcome::NotRunning(worker_name),
+                })
                 .map_err(|e| format!("{e:#}"))
         });
         if started && let Some(p) = self.pending.as_mut() {

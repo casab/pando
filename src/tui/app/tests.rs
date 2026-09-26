@@ -4402,6 +4402,18 @@ fn wait_for_pending(app: &mut App) {
     }
 }
 
+// `x` skips its confirmation on a row with nothing up, and the stop that
+// found nothing to stop said `✓ stopped` all the same.
+#[test]
+fn x_on_a_worktree_that_is_not_running_says_so() {
+    let (_dir, mut app) = app_with_logs(&["feat+one"]);
+    press(&mut app, KeyCode::Char('x'));
+    wait_for_pending(&mut app);
+    let status = app.flash().expect("a status");
+    assert_eq!(status.message, "feat/one was not running");
+    assert_eq!(status.kind, StatusKind::Info);
+}
+
 // ---- errors about one worktree ---------------------------------------
 
 // An error raised by feat/db's start does not follow the reader into

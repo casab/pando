@@ -71,6 +71,8 @@ pub enum PendingOutcome {
     /// pid.
     Started(String, Option<String>, Vec<(String, u32)>),
     Stopped(String),
+    /// A stop that found nothing of the worktree up.
+    NotRunning(String),
     /// The worktree, its public URL, and whether a proxy is injecting a
     /// header in front of it.
     Shared(String, String, bool),
@@ -353,6 +355,12 @@ impl App {
                     }
                     PendingOutcome::Stopped(_) => {
                         self.set_success(format!("stopped {label}"));
+                        self.spawn_refresh();
+                    }
+                    // Not a tick: nothing was stopped, and `pando stop`
+                    // says the same.
+                    PendingOutcome::NotRunning(_) => {
+                        self.set_status(format!("{label} was not running"));
                         self.spawn_refresh();
                     }
                     PendingOutcome::Shared(_, url, pre_authed) => {
