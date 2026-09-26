@@ -4778,11 +4778,20 @@ fn x_leaves_out_worktrees_with_nothing_up() {
             at: Utc::now(),
         },
     );
-    // A record left behind by a stop.
-    app.state.worktrees.insert(
-        "feat+second".to_string(),
-        WorktreeRecord::new("/trees/feat+second", true),
-    );
+    // A record left behind by a stop — of an isolated worktree, which
+    // keeps the record naming its compose project until `rm`.
+    let mut stopped = WorktreeRecord::new("/trees/feat+second", true);
+    stopped.services.push(crate::state::ServiceRecord {
+        name: "postgres".into(),
+        kind: crate::state::ServiceKind::Compose,
+        port: None,
+        pid: None,
+        pgid: None,
+        compose_project: Some("pando-x-feat_second".into()),
+    });
+    app.state
+        .worktrees
+        .insert("feat+second".to_string(), stopped);
     press(&mut app, KeyCode::Char('X'));
     assert!(app.modal.is_none(), "nothing to confirm");
     assert_eq!(app.active_status(), Some(("nothing is running", false)));

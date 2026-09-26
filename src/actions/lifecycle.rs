@@ -1278,11 +1278,11 @@ pub(super) fn stop_recorded_with(
         // Read before anything is signalled: a native service *is* its
         // process, so a worktree whose only service is a database has
         // something to stop even though it has no compose project and no
-        // process record at all.
-        let had_native = record
-            .services
-            .iter()
-            .any(|s| s.kind == state::ServiceKind::Native && s.pgid.is_some());
+        // process record at all. A compose service is up while its log
+        // pump is; a record that only names the project is what every
+        // stopped isolated worktree keeps for `rm`, until `rm`, and is not
+        // something running.
+        let had_service = record.services.iter().any(|s| s.pgid.is_some());
         let mut failures = stop_service_pumps(record, &stop);
         // A worktree whose every process crashed can still be shared: the
         // tunnel outlives them, and a public URL onto nothing is the worst
@@ -1292,10 +1292,13 @@ pub(super) fn stop_recorded_with(
         if !failures.is_empty() {
             bail!("{name}: {}", failures.join("; "));
         }
-        if projects.is_empty() && !was_shared && !had_native {
+        // Asked of Docker either way, because a container can outlive the
+        // pump in front of it; but saying "stopped" of a worktree that was
+        // stopped last week is a report of something that did not happen.
+        services_to_stop.extend(projects);
+        if !was_shared && !had_service {
             return Ok(StopOutcome::NotRunning);
         }
-        services_to_stop.extend(projects);
         return Ok(StopOutcome::Stopped(Vec::new()));
     }
     let groups: Vec<(String, i32, bool)> = record

@@ -7234,19 +7234,10 @@ fn a_stale_records_native_server_is_signalled_before_the_record_goes() {
 // and gave `rm` nothing to take down or drop.
 #[test]
 fn a_stale_records_containers_and_namespaces_pass_to_the_record_that_replaces_it() {
-    use std::os::unix::fs::PermissionsExt;
     let mut fx = fixture();
     with_dev(&mut fx, dev("sleep 30"));
     let name = worktree_named(&fx, "feat/one");
-    let calls = fx.paths.home.join("docker-calls");
-    let bin = fx.paths.home.join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    std::fs::write(
-        bin.join("docker"),
-        format!("#!/bin/sh\necho \"$*\" >> '{}'\n", calls.display()),
-    )
-    .unwrap();
-    std::fs::set_permissions(bin.join("docker"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let calls = docker_that_records(&fx.paths);
 
     let namespace = state::NamespaceRecord {
         service: "mariadb".into(),
@@ -7296,13 +7287,86 @@ fn a_stale_records_containers_and_namespaces_pass_to_the_record_that_replaces_it
         vec![namespace],
         "and the record `rm` drops the database by"
     );
-    let calls = std::fs::read_to_string(&calls).unwrap_or_default();
-    assert!(
-        calls
-            .lines()
-            .any(|line| line.contains("pando-stale-feat_one") && line.ends_with("stop")),
-        "a shared start left the stale record's containers running: {calls:?}"
+    assert_eq!(
+        compose_stops(&calls, "pando-stale-feat_one"),
+        1,
+        "a shared start left the stale record's containers running"
     );
+}
+
+/// A docker that does nothing and writes down every command line it was
+/// given, one per line, in the file this returns. Installed where
+/// `services::docker_program` looks first, so nothing reaches this
+/// machine's Docker.
+fn docker_that_records(paths: &PandoPaths) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let calls = paths.home.join("docker-calls");
+    let bin = paths.home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(
+        bin.join("docker"),
+        format!("#!/bin/sh\necho \"$*\" >> '{}'\n", calls.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(bin.join("docker"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    calls
+}
+
+/// The compose `stop`s a recording docker was asked for, of one project.
+fn compose_stops(calls: &Path, project: &str) -> usize {
+    std::fs::read_to_string(calls)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains(project) && line.ends_with("stop"))
+        .count()
+}
+
+// A stopped isolated worktree keeps its compose records, with no pump,
+// until `rm` takes the volumes down by them. Every later `stop` of it
+// said "stopped", and `stop` with no name listed every worktree that had
+// ever run isolated among the ones it had just stopped.
+#[test]
+fn a_stopped_isolated_worktree_is_not_running_to_a_second_stop() {
+    let fx = fixture();
+    let calls = docker_that_records(&fx.paths);
+    let name = worktree_named(&fx, "feat/one");
+    let with_postgres = |pump: Option<&Detached>| {
+        let mut store = fx.state();
+        store.worktrees.get_mut(&name).unwrap().services = vec![state::ServiceRecord {
+            name: "postgres".to_string(),
+            kind: state::ServiceKind::Compose,
+            port: None,
+            pid: pump.map(|p| p.pid),
+            pgid: pump.map(|p| p.pgid),
+            compose_project: Some("pando-x-feat_one".to_string()),
+        }];
+        state::save(&fx.paths.state_file(), &store).unwrap();
+    };
+
+    with_postgres(None);
+    assert_eq!(
+        stop(&fx.paths, &name, None).unwrap(),
+        StopOutcome::NotRunning
+    );
+    assert!(stop_all(&fx.paths).unwrap().is_empty());
+    assert_eq!(
+        compose_stops(&calls, "pando-x-feat_one"),
+        2,
+        "Docker is still asked, since a container can outlive its pump"
+    );
+
+    // A pump that is up is a service that is up.
+    let pump = crate::testutil::spawn_guarded(
+        "exec sleep 300",
+        &std::env::temp_dir(),
+        &fx.paths.log_file(&name, "postgres"),
+    );
+    with_postgres(Some(&pump));
+    assert_eq!(
+        stop(&fx.paths, &name, None).unwrap(),
+        StopOutcome::Stopped(Vec::new())
+    );
+    assert!(!crate::process::group_alive(pump.pgid));
 }
 
 // 0.2.0 could leave a compose record with a project and no port on a

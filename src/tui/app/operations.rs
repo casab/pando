@@ -433,16 +433,17 @@ impl App {
     }
 
     /// Whether anything of a worktree's is up: a process that has not
-    /// failed, a service, or a tunnel. A crashed dev server's database
-    /// counts; a record left behind by a stop, or one whose only process
-    /// has exited, does not.
+    /// failed, a service with a process behind it, or a tunnel. A crashed
+    /// dev server's database counts; a record left behind by a stop, one
+    /// whose only process has exited, or the compose records a stopped
+    /// isolated worktree keeps for `rm` do not.
     pub fn is_live(&self, name: &str) -> bool {
         self.record_for(name).is_some_and(|record| {
             record
                 .processes
                 .values()
                 .any(|p| !matches!(p.phase, crate::state::Phase::Failed { .. }))
-                || !record.services.is_empty()
+                || record.services.iter().any(|s| s.pid.is_some())
                 || record.share.is_some()
         })
     }
