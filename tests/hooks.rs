@@ -802,6 +802,86 @@ fn doctor_agrees_with_what_the_next_start_will_do() {
     );
 }
 
+/// What doctor says about one hook in one worktree: whether the next
+/// start runs it again.
+fn will_run_again(f: &Hx, name: &str, hook: &str) -> bool {
+    let report = pando::doctor::run(&f.paths);
+    report
+        .hooks
+        .iter()
+        .find(|h| h.name == hook)
+        .expect("a report for the hook")
+        .runs
+        .iter()
+        .find(|r| r.worktree == name)
+        .expect("a report for the worktree")
+        .will_run_again
+}
+
+// A start fingerprints the command it renders; doctor fingerprinted the
+// one the config writes. Any placeholder, or a `{{` escape, made those
+// two differ, so doctor said every templated hook would run again while
+// the start skipped it.
+#[test]
+fn doctor_renders_a_hooks_command_the_way_the_start_does() {
+    let f = hx(Kind::NextPnpmCompose, |sink| {
+        gated_with_services(sink).replace(
+            "echo migrated >>",
+            "echo migrated {name} {branch} {worktree} {port:postgres} {{x}} >>",
+        )
+    });
+    std::fs::write(f.root.join("seed.sql"), "one\n").unwrap();
+    common::git(&f.root, &["add", "."]);
+    common::git(&f.root, &["commit", "--quiet", "-m", "seed"]);
+    let name = new_worktree(&f, "feat/one");
+    start_in(&f, &name, actions::Mode::Isolated);
+    assert_eq!(f.ran().len(), 1, "the first start runs it: {:?}", f.ran());
+    actions::stop(&f.paths, &name, None, &|_| {}).unwrap();
+
+    assert!(
+        !will_run_again(&f, &name, "migrate"),
+        "nothing has changed, so the next start skips it"
+    );
+    f.clear();
+    start_in(&f, &name, actions::Mode::Remembered);
+    assert!(f.ran().is_empty(), "and it does: {:?}", f.ran());
+}
+
+// A hook the next start does not run is not one it runs again, whatever
+// its files say: doctor read the fingerprint alone.
+#[test]
+fn doctor_does_not_say_a_hook_the_next_start_skips_will_run_again() {
+    let mut f = hx(Kind::NextPnpmCompose, gated_with_services);
+    std::fs::write(f.root.join("seed.sql"), "one\n").unwrap();
+    common::git(&f.root, &["add", "."]);
+    common::git(&f.root, &["commit", "--quiet", "-m", "seed"]);
+    let name = new_worktree(&f, "feat/one");
+    start_in(&f, &name, actions::Mode::Shared);
+    assert_eq!(f.ran(), vec!["migrated"]);
+    actions::stop(&f.paths, &name, None, &|_| {}).unwrap();
+
+    let worktree = state::load(&f.paths.state_file()).unwrap().worktrees[&name]
+        .path
+        .clone();
+    std::fs::write(worktree.join("seed.sql"), "two\n").unwrap();
+    assert!(
+        will_run_again(&f, &name, "migrate"),
+        "its input changed, so the next start runs it"
+    );
+
+    let text = std::fs::read_to_string(f.paths.config_file())
+        .unwrap()
+        .replace("on = \"always\"", "on = \"never\"");
+    f.rewrite_config(&text);
+    assert!(
+        !will_run_again(&f, &name, "migrate"),
+        "switched off, it runs on no start at all"
+    );
+    f.clear();
+    start_in(&f, &name, actions::Mode::Remembered);
+    assert!(f.ran().is_empty(), "and it does not: {:?}", f.ran());
+}
+
 // ---- which starts a hook runs on ------------------------------------------
 
 /// The same compose project, with the migration hook as detection writes

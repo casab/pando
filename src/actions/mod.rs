@@ -20,7 +20,9 @@ mod services;
 mod share;
 mod worktree;
 
-pub use hooks::{HookContext, INSTALL_HOOK, install_remedy, matched_nothing, run_hooks};
+pub use hooks::{
+    HookContext, INSTALL_HOOK, install_remedy, matched_nothing, run_hooks, runs_again,
+};
 pub use init::{
     ALL_SLOTS, InitReport, SlotSummary, init, init_dry_run, machine_evidence,
     machine_evidence_from, machine_evidence_script,

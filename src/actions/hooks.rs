@@ -165,16 +165,7 @@ fn run_hook(
     progress: &dyn Fn(&str),
 ) -> Result<()> {
     let log_file = paths.log_file(ctx.name, &hook.name);
-    let template_ctx = template::Context {
-        name: ctx.name,
-        branch: ctx.branch,
-        worktree: ctx.worktree,
-        root: paths.root(),
-        project: paths.project_id(),
-        ports: ctx.ports,
-        default_role: None,
-        log: Some(&log_file),
-    };
+    let template_ctx = template_context(paths, ctx, &log_file);
     let cmd = template::render(&hook.cmd, &template_ctx)
         .with_context(|| format!("in the command for hook {}", hook.name))?;
     let fallback = hook
@@ -197,9 +188,7 @@ fn run_hook(
             .cloned()
     });
     let recorded = last_run.as_ref().and_then(|h| h.fingerprint.clone());
-    // No fingerprint at all means nothing here can say the inputs are
-    // unchanged, so the hook runs every time.
-    if current.is_some() && current == recorded {
+    if unchanged(current.as_deref(), recorded.as_deref()) {
         return Ok(());
     }
     // …and a hook that *has* globs and matched nothing with them is the
@@ -288,6 +277,58 @@ fn run_hook(
         );
     state::save(&paths.state_file(), &store)?;
     Ok(())
+}
+
+/// Whether the next start in a worktree runs a hook: the hook runs on the
+/// data that start has, and its fingerprint — the files it is keyed on
+/// and its command as that start renders it — is not the one recorded.
+///
+/// Public because `doctor` answers the same question at rest. Its own copy
+/// fingerprinted the command as written, so every hook with a placeholder
+/// in it read as changed, and it ignored the hook's scope.
+pub fn runs_again(
+    paths: &PandoPaths,
+    config: &Config,
+    hook: &config::HookConfig,
+    ctx: &HookContext<'_>,
+    recorded: Option<&str>,
+) -> bool {
+    if !hook.runs_on(ctx.own_data, !service_roles(config).is_empty()) {
+        return false;
+    }
+    let log_file = paths.log_file(ctx.name, &hook.name);
+    // A command that does not render is one the start stops on rather
+    // than skips.
+    let Ok(cmd) = template::render(&hook.cmd, &template_context(paths, ctx, &log_file)) else {
+        return true;
+    };
+    let current = hooks::fingerprint(ctx.worktree, &hook.fingerprint, &cmd);
+    !unchanged(current.as_deref(), recorded)
+}
+
+/// Whether a hook's inputs are what they were when it last ran. No
+/// fingerprint at all says nothing of the kind, so such a hook runs every
+/// time.
+fn unchanged(current: Option<&str>, recorded: Option<&str>) -> bool {
+    current.is_some() && current == recorded
+}
+
+/// What a hook's command, fallback and cwd render against in one worktree.
+fn template_context<'a>(
+    paths: &'a PandoPaths,
+    ctx: &HookContext<'a>,
+    log_file: &'a Path,
+) -> template::Context<'a> {
+    template::Context {
+        name: ctx.name,
+        branch: ctx.branch,
+        worktree: ctx.worktree,
+        root: paths.root(),
+        project: paths.project_id(),
+        ports: ctx.ports,
+        default_role: None,
+        log: Some(log_file),
+    }
 }
 
 /// Runs the pre-start probes, refusing to start when one of them fails in
