@@ -8545,6 +8545,101 @@ fn a_slot_a_key_names_beside_a_url_with_no_path_is_the_main_checkouts_too() {
     );
 }
 
+/// Writes a state for another project under the same pando home, with
+/// one worktree holding `record`.
+fn hold_elsewhere(ns: &Namespaced, record: WorktreeRecord) {
+    let mut theirs = state::State::new();
+    theirs.worktrees.insert("feat+theirs".into(), record);
+    let file = ns
+        .fx
+        .paths
+        .projects_dir()
+        .join("other-1a2b3c4d")
+        .join("state.json");
+    state::save(&file, &theirs).unwrap();
+}
+
+// A Redis on a port is the machine's. A slot another project's worktree
+// holds is not given out here even while it is empty — its app may not
+// have written yet — nor is the one its main checkout uses; and a record
+// here that claims one of them is never emptied.
+#[test]
+fn a_slot_another_project_records_is_never_given_out_or_emptied() {
+    let (ns, redis) = slots_fixture(MAIN_ENV_WITH_REDIS);
+    let mut theirs = slot_holder(1, false, 1);
+    theirs.namespaces[0].main = "2".into();
+    hold_elsewhere(&ns, theirs);
+    let (report, _) = ns.start(Mode::Namespaced).unwrap();
+    let running = guard(&report);
+    assert_eq!(ns.env_line("REDIS_DB").as_deref(), Some("3"));
+    drop(running);
+    stop(&ns.fx.paths, &ns.name, None).unwrap();
+
+    let mut store = ns.fx.state();
+    for slot in store
+        .worktrees
+        .get_mut(&ns.name)
+        .unwrap()
+        .namespaces
+        .iter_mut()
+        .filter(|n| n.service == "redis")
+    {
+        slot.name = "1".into();
+    }
+    state::save(&ns.fx.paths.state_file(), &store).unwrap();
+    let (said, progress) = collecting();
+    super::rm(&ns.fx.paths, &ns.name, false, false, &progress).unwrap();
+    let said = said.borrow().clone();
+    assert!(
+        said.iter()
+            .any(|l| l.contains("redis slot 1 is left as it is")
+                && l.contains("feat+theirs of project other-1a2b3c4d")),
+        "{said:?}"
+    );
+    assert!(
+        !redis.join("flushed").exists(),
+        "another project's slot was emptied"
+    );
+}
+
+// Every slot held counts another project's too, and offers only this
+// project's own to free.
+#[test]
+fn every_slot_held_counts_another_projects_and_offers_only_this_ones() {
+    let (ns, redis) = slots_fixture(MAIN_ENV_WITH_REDIS);
+    hold(&ns, (1..=14).map(|n| (n, false)));
+    hold_elsewhere(&ns, slot_holder(15, false, 1));
+    let asked = std::cell::RefCell::new(None::<Question>);
+    let ask = |q: &Question| -> Result<Answer> {
+        asked.replace(Some(q.clone()));
+        Ok(Answer::None)
+    };
+    let e = format!(
+        "{:#}",
+        resolve_for_start(
+            &ns.fx.paths,
+            &ns.fx.config,
+            &ns.name,
+            Mode::Namespaced,
+            &ask,
+            &noop
+        )
+        .unwrap_err()
+    );
+    assert!(e.contains("no slot was freed"), "{e}");
+    let question = asked.into_inner().expect("asked which one to free");
+    assert_eq!(question.options.len(), 14);
+    assert!(
+        question
+            .details
+            .iter()
+            .any(|d| d.contains("slot 15 (feat+theirs of project other-1a2b3c4d)")),
+        "{:?}",
+        question.details
+    );
+    assert!(!redis.join("flushed").exists());
+}
+
 // Decision 3: an app that reads no slot setting has nowhere to be told
 // another slot, so its Redis stays shared — said in one line — and the
 // database is still its own.

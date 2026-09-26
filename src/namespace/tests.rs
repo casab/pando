@@ -200,7 +200,8 @@ fn state(worktrees: &[(&str, Vec<NamespaceRecord>)]) -> State {
 fn refused(state: &State, worktree: &str, ns: &NamespaceRecord, main_now: Option<&str>) -> String {
     format!(
         "{:#}",
-        may_drop(state, worktree, ns, main_now.as_slice()).expect_err("the guard let it through")
+        may_drop(state, worktree, ns, main_now.as_slice(), &[])
+            .expect_err("the guard let it through")
     )
 }
 
@@ -208,8 +209,8 @@ fn refused(state: &State, worktree: &str, ns: &NamespaceRecord, main_now: Option
 fn a_database_pando_made_for_this_worktree_may_be_dropped() {
     let ns = database("northwind_traders__feat_x", "northwind_traders");
     let st = state(&[("feat+x", vec![ns.clone()])]);
-    may_drop(&st, "feat+x", &ns, &["northwind_traders"]).unwrap();
-    may_drop(&st, "feat+x", &ns, &[]).unwrap();
+    may_drop(&st, "feat+x", &ns, &["northwind_traders"], &[]).unwrap();
+    may_drop(&st, "feat+x", &ns, &[], &[]).unwrap();
 }
 
 #[test]
@@ -271,7 +272,7 @@ fn a_database_without_the_marker_after_the_main_name_is_refused() {
     // In another case it is still the marker: MariaDB on macOS agrees.
     let ns = database("NORTHWIND_TRADERS__feat_x", "northwind_traders");
     let st = state(&[("feat+x", vec![ns.clone()])]);
-    may_drop(&st, "feat+x", &ns, &[]).unwrap();
+    may_drop(&st, "feat+x", &ns, &[], &[]).unwrap();
 }
 
 #[test]
@@ -310,14 +311,14 @@ fn a_namespace_two_worktrees_claim_is_dropped_by_neither() {
     let mut other_server = ns.clone();
     other_server.port = 3307;
     let st = state(&[("feat+x", vec![ns.clone()]), ("feat-x", vec![other_server])]);
-    may_drop(&st, "feat+x", &ns, &[]).unwrap();
+    may_drop(&st, "feat+x", &ns, &[], &[]).unwrap();
 }
 
 #[test]
 fn a_slot_pando_allocated_may_be_emptied_and_zero_and_mains_never() {
     let ns = slot("3", "0");
     let st = state(&[("feat+x", vec![ns.clone()])]);
-    may_drop(&st, "feat+x", &ns, &["0"]).unwrap();
+    may_drop(&st, "feat+x", &ns, &["0"], &[]).unwrap();
 
     for (n, main, main_now, says) in [
         ("0", "0", None, "slot 0"),
@@ -341,7 +342,7 @@ fn a_slot_pando_allocated_may_be_emptied_and_zero_and_mains_never() {
     let st = state(&[("feat+x", vec![ns.clone()])]);
     let e = format!(
         "{:#}",
-        may_drop(&st, "feat+x", &ns, &["0", "1"]).unwrap_err()
+        may_drop(&st, "feat+x", &ns, &["0", "1"], &[]).unwrap_err()
     );
     assert!(e.contains("main checkout's own slot"), "{e}");
 }
@@ -359,7 +360,41 @@ fn a_slot_another_worktree_holds_on_the_same_server_is_never_emptied() {
     let mut other_server = slot("3", "0");
     other_server.port = 6380;
     let st = state(&[("feat+x", vec![ns.clone()]), ("feat+y", vec![other_server])]);
-    may_drop(&st, "feat+x", &ns, &[]).unwrap();
+    may_drop(&st, "feat+x", &ns, &[], &[]).unwrap();
+}
+
+// A Redis on a port is the machine's: a slot a worktree of another project
+// records, or its main checkout uses, is never emptied from this one.
+#[test]
+fn a_slot_another_project_records_is_never_emptied() {
+    let ns = slot("3", "0");
+    let st = state(&[("feat+x", vec![ns.clone()])]);
+    let theirs = |namespaces: Vec<NamespaceRecord>| {
+        vec![(
+            "shop-1a2b3c4d".to_string(),
+            state(&[("feat+y", namespaces)]),
+        )]
+    };
+    let e = format!(
+        "{:#}",
+        may_drop(&st, "feat+x", &ns, &[], &theirs(vec![slot("3", "0")])).unwrap_err()
+    );
+    assert!(
+        e.contains("recorded for feat+y of project shop-1a2b3c4d"),
+        "{e}"
+    );
+    let e = format!(
+        "{:#}",
+        may_drop(&st, "feat+x", &ns, &[], &theirs(vec![slot("5", "3")])).unwrap_err()
+    );
+    assert!(
+        e.contains("main checkout's own in project shop-1a2b3c4d"),
+        "{e}"
+    );
+
+    let mut other_server = slot("3", "3");
+    other_server.port = 6380;
+    may_drop(&st, "feat+x", &ns, &[], &theirs(vec![other_server])).unwrap();
 }
 
 #[test]
@@ -381,15 +416,15 @@ fn every_name_pando_gives_passes_the_guard_and_the_main_database_never_does() {
             for name in names(main, &worktree) {
                 let ns = database(&name, main);
                 let st = state(&[("w", vec![ns.clone()])]);
-                may_drop(&st, "w", &ns, &[main])
+                may_drop(&st, "w", &ns, &[main], &[])
                     .unwrap_or_else(|e| panic!("{main} {worktree:?}: {name} refused: {e:#}"));
             }
         }
         for spelled in [main.to_string(), main.to_uppercase(), main.to_lowercase()] {
             let ns = database(&spelled, main);
             let st = state(&[("w", vec![ns.clone()])]);
-            assert!(may_drop(&st, "w", &ns, &[main]).is_err(), "{spelled}");
-            assert!(may_drop(&st, "w", &ns, &[]).is_err(), "{spelled}");
+            assert!(may_drop(&st, "w", &ns, &[main], &[]).is_err(), "{spelled}");
+            assert!(may_drop(&st, "w", &ns, &[], &[]).is_err(), "{spelled}");
         }
     }
 }

@@ -28,10 +28,13 @@ use super::name::{MARKER, MAX_NAME, is_plain};
 ///   `<main>__<something>` — is a plain identifier, and fits the server's
 ///   limit, so the statement that drops it cannot be made to say anything
 ///   else. A slot is a number.
-/// - **No other worktree's record names the same one** on the same server.
-///   Two records claiming one database are a state file that is wrong
-///   about something, and the drop that would empty the other worktree's
-///   data is not the way to find out which.
+/// - **No other worktree's record names the same one** on the same server,
+///   in this project or in any other pando keeps state for on this machine
+///   (`others`, each by its id) — and no other project's record names it
+///   as that project's main checkout's own. Two records claiming one
+///   database are a state file that is wrong about something, and the
+///   drop that would empty the other worktree's data is not the way to
+///   find out which.
 ///
 /// The grant a developer gives the app's login is a second wall on the
 /// server's side: it covers `<main>__%` and nothing else.
@@ -40,6 +43,7 @@ pub fn may_drop(
     worktree: &str,
     namespace: &NamespaceRecord,
     main_now: &[&str],
+    others: &[(String, State)],
 ) -> Result<()> {
     let what = describe(namespace);
     let recorded = state
@@ -93,7 +97,7 @@ pub fn may_drop(
             }
         }
     }
-    let elsewhere: Vec<&str> = state
+    let mut elsewhere: Vec<String> = state
         .worktrees
         .iter()
         .filter(|(name, _)| name.as_str() != worktree)
@@ -103,13 +107,45 @@ pub fn may_drop(
                 .iter()
                 .any(|other| same_namespace(other, namespace))
         })
-        .map(|(name, _)| name.as_str())
+        .map(|(name, _)| name.clone())
         .collect();
+    for (project, other) in others {
+        for (name, record) in &other.worktrees {
+            if record
+                .namespaces
+                .iter()
+                .any(|ns| same_namespace(ns, namespace))
+            {
+                elsewhere.push(format!("{name} of project {project}"));
+            }
+        }
+    }
     if !elsewhere.is_empty() {
         bail!(
             "{what} is recorded for {} as well, so pando cannot tell whose it is and drops \
              nothing",
             elsewhere.join(", ")
+        );
+    }
+    // Another project's main checkout on the same server, as its records
+    // name it.
+    let theirs = others.iter().find(|(_, other)| {
+        other
+            .worktrees
+            .values()
+            .flat_map(|record| &record.namespaces)
+            .any(|ns| {
+                let main = NamespaceRecord {
+                    name: ns.main.clone(),
+                    ..ns.clone()
+                };
+                same_namespace(&main, namespace)
+            })
+    });
+    if let Some((project, _)) = theirs {
+        bail!(
+            "{what} is the main checkout's own in project {project}, and pando never drops or \
+             empties that"
         );
     }
     Ok(())

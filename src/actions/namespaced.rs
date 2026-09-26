@@ -685,13 +685,16 @@ fn ensure_database(
 }
 
 /// This worktree's slot on one server: the one state records, else the
-/// first one no worktree holds and the server says is empty.
+/// first one no worktree holds — of this project or of any other pando
+/// keeps state for — and the server says is empty.
 ///
 /// Empty, not merely unrecorded: a slot with keys in it that no worktree
 /// of this project holds is somebody else's — another project's, or the
-/// developer's own — and emptying it later would destroy their data. When
-/// every slot is held the start stops and says by whom; a start that can
-/// ask has already been asked which one to free.
+/// developer's own — and emptying it later would destroy their data. And
+/// unrecorded, not merely empty: another project's worktree whose app has
+/// not written yet holds an empty slot too. When every slot is held the
+/// start stops and says by whom; a start that can ask has already been
+/// asked which one to free.
 fn ensure_slot(
     paths: &PandoPaths,
     name: &str,
@@ -718,9 +721,12 @@ fn ensure_slot(
         return Ok((record(paths, name, slot(&recorded.name))?, false));
     }
     let holders = slot_holders(&store, target);
+    let elsewhere = slots_elsewhere(&other_projects(paths), target);
     let mut full: Vec<u32> = Vec::new();
     for n in allocatable(target) {
-        if holders.iter().any(|holder| holder.slot == n) {
+        if holders.iter().any(|holder| holder.slot == n)
+            || elsewhere.iter().any(|other| other.slot == n)
+        {
             continue;
         }
         if server.size(n)? > 0 {
@@ -739,6 +745,7 @@ fn ensure_slot(
             holders
                 .iter()
                 .map(Holder::describe)
+                .chain(elsewhere.iter().map(Elsewhere::describe))
                 .collect::<Vec<_>>()
                 .join(", ")
         );
@@ -824,6 +831,85 @@ fn slot_holders(store: &crate::state::State, target: &Target) -> Vec<Holder> {
     out
 }
 
+/// Every other project pando keeps state for on this machine, by id.
+///
+/// A Redis on a port is the machine's, not a project's: a slot another
+/// project's worktree holds, or its main checkout uses, is not this one's
+/// to give out or to empty. A state file that cannot be read says nothing.
+fn other_projects(paths: &PandoPaths) -> Vec<(String, crate::state::State)> {
+    let Ok(entries) = std::fs::read_dir(paths.projects_dir()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let id = entry.file_name().to_string_lossy().to_string();
+        let file = entry.path().join("state.json");
+        if id == paths.project_id() || !file.is_file() {
+            continue;
+        }
+        if let Ok(store) = crate::state::load(&file) {
+            out.push((id, store));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// A slot on a target's server that another project records: one a
+/// worktree of it holds, or the one its main checkout uses.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Elsewhere {
+    slot: u32,
+    /// `feat+x of project shop-1a2b3c4d`.
+    whose: String,
+}
+
+impl Elsewhere {
+    /// `slot 3 (feat+x of project shop-1a2b3c4d)`.
+    fn describe(&self) -> String {
+        format!("slot {} ({})", self.slot, self.whose)
+    }
+}
+
+/// Every slot pando could give out on this target's server that other
+/// projects' states record, as a worktree's or as their main checkout's
+/// own.
+fn slots_elsewhere(others: &[(String, crate::state::State)], target: &Target) -> Vec<Elsewhere> {
+    let allocatable = allocatable(target);
+    let mut out = Vec::new();
+    for (project, store) in others {
+        for (worktree, record) in &store.worktrees {
+            for ns in &record.namespaces {
+                let here = crate::state::NamespaceRecord {
+                    host: target.host.clone(),
+                    port: target.port,
+                    kind: NamespaceKind::Slot,
+                    ..ns.clone()
+                };
+                if !namespace::same_namespace(ns, &here) {
+                    continue;
+                }
+                if let Ok(slot) = ns.name.trim().parse::<u32>() {
+                    out.push(Elsewhere {
+                        slot,
+                        whose: format!("{worktree} of project {project}"),
+                    });
+                }
+                if let Ok(slot) = ns.main.trim().parse::<u32>() {
+                    out.push(Elsewhere {
+                        slot,
+                        whose: format!("the main checkout of project {project}"),
+                    });
+                }
+            }
+        }
+    }
+    out.retain(|other| allocatable.contains(&other.slot));
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// `3 days ago`, `just now` — when a stopped worktree last ran, for a
 /// choice about whose data to empty.
 fn since(at: chrono::DateTime<chrono::Utc>) -> String {
@@ -860,9 +946,12 @@ pub(super) fn free_slots_if_full(
         if holders.iter().any(|holder| holder.worktree == name) {
             continue;
         }
-        let taken = allocatable(&target)
-            .iter()
-            .all(|n| holders.iter().any(|holder| holder.slot == *n));
+        let others = slots_elsewhere(&other_projects(paths), &target);
+        let taken = allocatable(&target).iter().all(|n| {
+            holders.iter().any(|holder| holder.slot == *n)
+                || others.iter().any(|other| other.slot == *n)
+        });
+        let elsewhere: Vec<String> = others.iter().map(Elsewhere::describe).collect();
         if !taken {
             continue;
         }
@@ -874,12 +963,21 @@ pub(super) fn free_slots_if_full(
             .collect();
         if stopped.is_empty() {
             bail!(
-                "every slot of {} on {}:{} is held by a running worktree — {}. Stop one, and its \
-                 slot can be freed",
+                "every slot of {} on {}:{} is held by a running worktree{} — {}. Stop one of this \
+                 project's, and its slot can be freed",
                 target.service,
                 target.host,
                 target.port,
-                running.join(", ")
+                match elsewhere.is_empty() {
+                    true => "",
+                    false => " or another project",
+                },
+                running
+                    .iter()
+                    .chain(&elsewhere)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
         }
         let question = Question {
@@ -915,6 +1013,12 @@ pub(super) fn free_slots_if_full(
                 (!running.is_empty())
                     .then(|| format!("running, so not offered: {}", running.join(", "))),
             )
+            .chain((!elsewhere.is_empty()).then(|| {
+                format!(
+                    "another project's, so not offered: {}",
+                    elsewhere.join(", ")
+                )
+            }))
             .collect(),
             answer_file: None,
             snippet: String::new(),
@@ -962,6 +1066,7 @@ fn free_slot(
         &holder.worktree,
         &holder.namespace,
         &target.mains.iter().map(String::as_str).collect::<Vec<_>>(),
+        &other_projects(paths),
     )?;
     server.drop(&holder.namespace.name, &target.main)?;
     if let Some(record) = store.worktrees.get_mut(&holder.worktree) {
@@ -1110,6 +1215,7 @@ pub(super) fn drop_namespaces(
         .unwrap_or_else(|_| config::load_without_home(paths).config);
     let recipes = crate::recipes::Recipes::load(&paths.recipes_dir());
     let targets = plan(paths, &config).targets;
+    let others = other_projects(paths);
     for ns in &record.namespaces {
         let target = targets
             .iter()
@@ -1121,7 +1227,7 @@ pub(super) fn drop_namespaces(
             .flat_map(|t| t.mains.iter().map(String::as_str))
             .collect();
         let what = namespace::describe(ns);
-        if let Err(e) = namespace::may_drop(store, name, ns, &main_now) {
+        if let Err(e) = namespace::may_drop(store, name, ns, &main_now, &others) {
             progress(&format!("{}: {what} is left as it is — {e:#}", ns.service));
             continue;
         }
