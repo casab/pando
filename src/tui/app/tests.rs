@@ -1672,12 +1672,44 @@ fn open_needs_a_port_before_it_has_a_url() {
     press(&mut app, KeyCode::Char('o'));
     assert_eq!(app.opened, None);
     let (message, is_error) = app.active_status().unwrap();
-    assert!(message.contains("no port yet"), "{message}");
+    assert_eq!(message, "feat/one is not running — s starts it");
     assert!(is_error);
 
     with_process(&mut app, "feat+one", running_phase());
     press(&mut app, KeyCode::Char('o'));
     assert_eq!(app.opened.as_deref(), Some("http://localhost:17342"));
+}
+
+// A worktree whose processes all run with `ports = []`, a worker or a
+// watcher, is running and has no URL. `o` and `c` said to start it first,
+// beside a row that said it was running.
+#[test]
+fn o_and_c_on_a_running_worktree_that_holds_no_port_say_so() {
+    let mut app = test_app(&["feat+one"]);
+    with_process(&mut app, "feat+one", running_phase());
+    let record = app.state.worktrees.get_mut("feat+one").unwrap();
+    record.ports.clear();
+    record.roles.insert("dev".to_string(), Vec::new());
+    record.processes.get_mut("dev").unwrap().ready_port = None;
+    assert!(app.url_of("feat+one").is_none());
+
+    press(&mut app, KeyCode::Char('o'));
+    assert_eq!(app.opened, None);
+    let (message, is_error) = app.active_status().unwrap();
+    assert_eq!(
+        message,
+        "feat/one is running and holds no port, so it has no URL to open"
+    );
+    assert!(is_error);
+
+    press(&mut app, KeyCode::Char('c'));
+    assert_eq!(app.clipboard, None);
+    let (message, is_error) = app.active_status().unwrap();
+    assert_eq!(
+        message,
+        "feat/one is running and holds no port, so it has no URL to copy"
+    );
+    assert!(is_error);
 }
 
 // A stop keeps the port assignment, so `o` and `c` handed out a URL that
