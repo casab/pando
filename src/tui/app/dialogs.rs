@@ -288,6 +288,32 @@ impl App {
         self.modal = Some(Modal::PullRequests { input, selected });
     }
 
+    /// Puts what a fetch brought in place of the pull request list. The
+    /// picker's cursor is a row, and a pull request opened or closed since
+    /// the last fetch moves the rows below it, so the cursor follows the
+    /// pull request it was on; enter then takes the one that was chosen.
+    pub(super) fn replace_pr_list(&mut self, prs: Vec<PrInfo>) {
+        let before = std::mem::replace(&mut self.pr_list, prs);
+        let Some(Modal::PullRequests { input, selected }) = self.modal.as_mut() else {
+            return;
+        };
+        let rows = pr_rows(&before, input);
+        // The paint clamps a cursor past the end, so that row is the one
+        // it showed.
+        let Some(number) = rows
+            .get((*selected).min(rows.len().saturating_sub(1)))
+            .map(|pr| pr.number)
+        else {
+            return;
+        };
+        if let Some(row) = pr_rows(&self.pr_list, input)
+            .iter()
+            .position(|pr| pr.number == number)
+        {
+            *selected = row;
+        }
+    }
+
     pub(super) fn open_pull_requests(&mut self) {
         self.modal = Some(Modal::PullRequests {
             input: String::new(),

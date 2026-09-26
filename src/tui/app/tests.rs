@@ -856,6 +856,35 @@ fn enter_after_the_list_shrank_takes_the_last_row() {
     assert_eq!(pending.label, "#12 feat/new");
 }
 
+// The fetch `p` starts lands a second or so after it. A pull request
+// opened since the last fetch, or one merged since, moves the rows below
+// it, and the cursor was a row: enter made a worktree for whichever pull
+// request that row held by then.
+#[test]
+fn a_fetch_that_lands_in_the_picker_keeps_the_cursor_on_its_pull_request() {
+    use crate::worktree::PrState::{Merged, Open};
+    for fetched in [
+        vec![
+            a_pr(13, "feat/newer", Open),
+            a_pr(12, "feat/new", Open),
+            a_pr(11, "feat/one", Open),
+        ],
+        vec![
+            a_pr(12, "feat/new", Merged),
+            a_pr(11, "feat/one", Open),
+            a_pr(9, "feat/older", Open),
+        ],
+    ] {
+        let mut app = app_with_prs(&["feat+two"]);
+        press(&mut app, KeyCode::Char('p'));
+        press(&mut app, KeyCode::Down);
+        app.handle_event(AppEvent::PrsReady(Ok(fetched)));
+        press(&mut app, KeyCode::Enter);
+        let pending = app.pending.as_ref().expect("a worker started");
+        assert_eq!(pending.label, "#11 feat/one");
+    }
+}
+
 #[test]
 fn a_forks_pull_request_is_not_the_chip_of_the_main_branch() {
     let mut app = test_app(&["feat+one"]);

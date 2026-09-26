@@ -482,7 +482,7 @@ impl App {
                 self.pr_fetching = false;
                 self.pr_error = None;
                 self.prs = worktree::prs_by_branch(&prs).into_iter().collect();
-                self.pr_list = prs;
+                self.replace_pr_list(prs);
                 self.save_pr_cache();
                 true
             }
