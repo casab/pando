@@ -596,19 +596,31 @@ fn the_plain_install_is_a_problem_where_only_another_lockfile_name_is_ignored() 
 }
 
 // The old bun habit: only the binary lockfile is gitignored, and it is the
-// one present, so `bun install` rewrites nothing git tracks.
+// one present. A new worktree has none, and there `bun install` from bun
+// 1.2 on writes a `bun.lock` git does not ignore: the install that writes
+// no lockfile is the one pando proposes, and the one doctor suggests.
 #[test]
-fn the_plain_install_is_fine_where_the_lockfile_present_is_the_one_ignored() {
+fn the_install_that_writes_no_lockfile_is_fine_where_the_lockfile_present_is_the_one_ignored() {
     let fx = fixture();
     std::fs::write(fx.root.join(".gitignore"), "bun.lockb\n").unwrap();
     std::fs::write(fx.root.join("bun.lockb"), "\0").unwrap();
-    write_project_config(&fx, "[project]\ninstall = \"bun install\"\n");
-    let report = report(&fx);
+    write_project_config(&fx, "[project]\ninstall = \"bun install --no-save\"\n");
+    let unsaved = report(&fx);
     assert!(
-        !mentions(&report, "non-frozen install"),
+        !mentions(&unsaved, "non-frozen install"),
         "{:?}",
-        report.findings
+        unsaved.findings
     );
+
+    write_project_config(&fx, "[project]\ninstall = \"bun install\"\n");
+    let plain = report(&fx);
+    let fix = plain
+        .findings
+        .iter()
+        .find(|f| f.message.contains("non-frozen install"))
+        .and_then(|f| f.fix.clone())
+        .unwrap_or_default();
+    assert_eq!(fix, "use `bun install --no-save`", "{:?}", plain.findings);
 }
 
 #[test]

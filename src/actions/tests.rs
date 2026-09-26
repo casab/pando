@@ -4334,6 +4334,10 @@ fn a_plain_install_is_keyed_on_the_manifests_and_a_frozen_one_on_the_lockfiles()
     config.project.install = Some("npm install".to_string());
     let plain = install_hook(&config).unwrap();
     assert_eq!(plain.fingerprint, vec!["**/package.json".to_string()]);
+    // One that writes no lockfile at all has none to say so either.
+    config.project.install = Some("bun install --no-save".to_string());
+    let unsaved = install_hook(&config).unwrap();
+    assert_eq!(unsaved.fingerprint, vec!["**/package.json".to_string()]);
     config.project.install = Some("npm ci".to_string());
     let frozen = install_hook(&config).unwrap();
     assert!(

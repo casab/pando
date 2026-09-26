@@ -78,6 +78,14 @@ pub struct PackageManager {
     /// `None` where no such form is proposed: outside JavaScript, a
     /// project without a lockfile configures its own install.
     pub unlocked_install: Option<&'static str>,
+    /// The install that writes no lockfile at all: proposed instead of the
+    /// plain one where the lockfile present is gitignored and another name
+    /// this manager writes is not. A new worktree is checked out without
+    /// the one present, and the plain install there writes whichever name
+    /// this version of the manager writes — `bun.lock` from bun 1.2 on.
+    /// `None` for a manager with one lockfile name, where the plain
+    /// install writes the one that is ignored.
+    pub unsaved_install: Option<&'static str>,
 }
 
 /// Every manager pando knows, in detection order. Order is a contract: it
@@ -102,6 +110,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
             suggest: "pnpm install --frozen-lockfile",
         }),
         unlocked_install: Some("pnpm install"),
+        unsaved_install: None,
     },
     PackageManager {
         program: "npm",
@@ -120,6 +129,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
             suggest: "npm ci",
         }),
         unlocked_install: Some("npm install"),
+        unsaved_install: None,
     },
     PackageManager {
         program: "yarn",
@@ -142,6 +152,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
             suggest: "yarn install --frozen-lockfile",
         }),
         unlocked_install: Some("yarn install"),
+        unsaved_install: None,
     },
     PackageManager {
         program: "bun",
@@ -160,6 +171,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
             suggest: "bun install --frozen-lockfile",
         }),
         unlocked_install: Some("bun install"),
+        unsaved_install: Some("bun install --no-save"),
     },
     PackageManager {
         program: "uv",
@@ -178,6 +190,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
             suggest: "uv sync --frozen",
         }),
         unlocked_install: None,
+        unsaved_install: None,
     },
     PackageManager {
         program: "poetry",
@@ -195,6 +208,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         }),
         install_shape: None,
         unlocked_install: None,
+        unsaved_install: None,
     },
     PackageManager {
         program: "pipenv",
@@ -215,6 +229,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
             suggest: "pipenv sync",
         }),
         unlocked_install: None,
+        unsaved_install: None,
     },
     PackageManager {
         program: "bundle",
@@ -235,6 +250,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
             suggest: "BUNDLE_FROZEN=true bundle install",
         }),
         unlocked_install: None,
+        unsaved_install: None,
     },
     PackageManager {
         program: "composer",
@@ -255,6 +271,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
             suggest: "composer install",
         }),
         unlocked_install: None,
+        unsaved_install: None,
     },
     PackageManager {
         program: "mix",
@@ -270,6 +287,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         install: None,
         install_shape: None,
         unlocked_install: None,
+        unsaved_install: None,
     },
     PackageManager {
         program: "go",
@@ -283,6 +301,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         install: None,
         install_shape: None,
         unlocked_install: None,
+        unsaved_install: None,
     },
     PackageManager {
         program: "cargo",
@@ -300,6 +319,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
             suggest: "cargo fetch --locked",
         }),
         unlocked_install: None,
+        unsaved_install: None,
     },
 ];
 
@@ -323,6 +343,15 @@ pub fn for_program(program: &str) -> Option<&'static PackageManager> {
     PACKAGE_MANAGERS
         .iter()
         .find(|manager| manager.program == program)
+}
+
+/// Whether `cmd` is an install pando proposes for a project that keeps no
+/// lockfile in git: some manager's plain install, or its install that
+/// writes no lockfile.
+pub fn is_unlocked_install(cmd: &str) -> bool {
+    PACKAGE_MANAGERS.iter().any(|manager| {
+        manager.unlocked_install == Some(cmd) || manager.unsaved_install == Some(cmd)
+    })
 }
 
 /// The frozen install to propose for a lockfile, with the evidence to

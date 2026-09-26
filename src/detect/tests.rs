@@ -1048,21 +1048,35 @@ fn a_tracked_bun_lock_beside_an_ignored_bun_lockb_gets_the_frozen_install() {
 
 // The old bun habit: only the binary lockfile is gitignored, and it is the
 // one present. The frozen install would fail in every new worktree, which
-// is checked out without it.
+// is checked out without it, and there the plain install of a bun from 1.2
+// on writes a `bun.lock` git does not ignore: the install that writes no
+// lockfile is the one that cannot change the repository.
 #[test]
-fn an_ignored_bun_lockb_present_gets_the_plain_install() {
+fn an_ignored_bun_lockb_present_gets_the_install_that_writes_no_lockfile() {
     let dir = seed_fixture(&[
         ("package.json", r#"{ "scripts": { "dev": "vite" } }"#),
         (".gitignore", "bun.lockb\n"),
         ("bun.lockb", "\0"),
     ]);
     let proposal = install_proposal(dir.path(), &signals(dir.path())).unwrap();
-    assert_eq!(values(&proposal), vec!["bun install"]);
+    assert_eq!(values(&proposal), vec!["bun install --no-save"]);
     assert!(proposal.decided);
     assert!(
         proposal.candidates[0]
             .why
-            .contains("bun.lockb is gitignored"),
+            .contains("bun.lockb is gitignored and bun.lock is not"),
+        "{}",
+        proposal.candidates[0].why
+    );
+
+    // With both names ignored, whichever one the plain install writes is.
+    std::fs::write(dir.path().join(".gitignore"), "bun.lockb\nbun.lock\n").unwrap();
+    let proposal = install_proposal(dir.path(), &signals(dir.path())).unwrap();
+    assert_eq!(values(&proposal), vec!["bun install"]);
+    assert!(
+        proposal.candidates[0]
+            .why
+            .contains("bun.lockb is gitignored, so bun install"),
         "{}",
         proposal.candidates[0].why
     );

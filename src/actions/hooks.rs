@@ -34,15 +34,15 @@ const UNLOCKED_INSTALL_KEY: &str = "**/package.json";
 ///
 /// A plain install — the one a project that gitignores its lockfile gets —
 /// is keyed on the manifests instead: the lockfile is one it writes itself,
-/// so it says nothing about whether the dependencies changed, and keying on
-/// it would call every first install a lockfile rewrite.
+/// or none at all, so it says nothing about whether the dependencies
+/// changed, and keying on it would call every first install a lockfile
+/// rewrite.
 pub(super) fn install_hook(config: &Config) -> Option<config::HookConfig> {
     let install = config.project.install.as_deref()?.trim();
     if install.is_empty() {
         return None;
     }
-    let managers = &crate::catalog::package_managers::PACKAGE_MANAGERS;
-    let fingerprint = match managers.iter().any(|m| m.unlocked_install == Some(install)) {
+    let fingerprint = match crate::catalog::package_managers::is_unlocked_install(install) {
         true => vec![UNLOCKED_INSTALL_KEY.to_string()],
         false => crate::catalog::package_managers::lockfiles()
             .iter()

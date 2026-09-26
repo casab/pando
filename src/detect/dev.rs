@@ -18,8 +18,8 @@ use super::signals::Signals;
 /// worktree is checked out without it, so the frozen install fails there.
 /// Such a project, and a JavaScript one with no lockfile, gets its
 /// manager's plain install instead where the lockfiles it would write are
-/// gitignored, as [`lockfiles_ignored`] asks — the file it writes is one
-/// git ignores, so it cannot change the repository.
+/// gitignored, as [`unlocked_command`] asks — the file it writes is one
+/// git ignores, or none, so it cannot change the repository.
 pub(super) fn install_proposal(root: &Path, signals: &Signals) -> Option<Proposal> {
     let mut candidates: Vec<Candidate> = Vec::new();
     for lock in &signals.lockfiles {
@@ -51,40 +51,83 @@ pub(super) fn install_proposal(root: &Path, signals: &Signals) -> Option<Proposa
     Some(Proposal::of(Slot::Install, candidates, decided))
 }
 
-/// The plain install of `manager`, when its lockfiles are gitignored.
+/// The unlocked install of `manager`, when its lockfiles are gitignored.
 fn unlocked_install(
     root: &Path,
     manager: Option<&'static package_managers::PackageManager>,
 ) -> Option<Candidate> {
     let manager = manager?;
-    let cmd = manager.unlocked_install?;
-    if !lockfiles_ignored(root, manager) {
-        return None;
-    }
+    let cmd = unlocked_command(root, manager)?;
     let names = lockfiles_written(root, manager);
-    let verb = match names.len() {
-        1 => "is",
-        _ => "are",
+    let ignored = format!("{} {} gitignored", listed(&names), is_or_are(&names));
+    let why = match Some(cmd) == manager.unsaved_install {
+        true => {
+            let tracked: Vec<&'static str> = manager
+                .lockfiles
+                .iter()
+                .copied()
+                .filter(|lockfile| !super::signals::is_gitignored(root, lockfile))
+                .collect();
+            format!(
+                "{ignored} and {} {} not, so {cmd}, which writes no lockfile, cannot change \
+                 the repository",
+                listed(&tracked),
+                is_or_are(&tracked)
+            )
+        }
+        false => format!("{ignored}, so {cmd} cannot change the repository"),
     };
     Some(Candidate {
         value: cmd.to_string(),
-        why: format!(
-            "{} {verb} gitignored, so {cmd} cannot change the repository",
-            listed(&names)
-        ),
+        why,
         ..Candidate::default()
     })
 }
 
-/// Whether the lockfiles `manager`'s plain install would write are ones
-/// the project gitignores, which is when it cannot change the repository.
+/// The verb for a list of `names`: "is" for one, "are" for more.
+fn is_or_are(names: &[&str]) -> &'static str {
+    match names.len() {
+        1 => "is",
+        _ => "are",
+    }
+}
+
+/// The install pando proposes for `manager` in place of the frozen one,
+/// where `lockfiles_ignored` says the lockfiles are gitignored.
+///
+/// The plain install, unless a name the manager writes is not gitignored:
+/// a new worktree is checked out without the ignored lockfile present
+/// here, so the plain install there writes whichever name this version of
+/// the manager writes, and a bun from 1.2 on writes a `bun.lock` that a
+/// gitignore naming only `bun.lockb` leaves untracked in the worktree. The
+/// install that writes no lockfile is proposed there.
+pub fn unlocked_command(
+    root: &Path,
+    manager: &package_managers::PackageManager,
+) -> Option<&'static str> {
+    let plain = manager.unlocked_install?;
+    if !lockfiles_ignored(root, manager) {
+        return None;
+    }
+    let every = manager
+        .lockfiles
+        .iter()
+        .all(|lockfile| super::signals::is_gitignored(root, lockfile));
+    match every {
+        true => Some(plain),
+        false => Some(manager.unsaved_install.unwrap_or(plain)),
+    }
+}
+
+/// Whether the lockfiles `manager`'s plain install would rewrite are ones
+/// the project gitignores.
 ///
 /// The ones present are what it rewrites, so those are asked of: a
 /// gitignored `bun.lockb` is enough where only `bun.lockb` is in the
 /// gitignore, and a tracked `bun.lock` beside it is not. With none
 /// present every name is, not the first: bun writes `bun.lock` or
 /// `bun.lockb` depending on its version.
-pub fn lockfiles_ignored(root: &Path, manager: &package_managers::PackageManager) -> bool {
+fn lockfiles_ignored(root: &Path, manager: &package_managers::PackageManager) -> bool {
     let names = lockfiles_written(root, manager);
     !names.is_empty()
         && names

@@ -118,15 +118,15 @@ fn check_install(root: &Path, config: &Config, findings: &mut Vec<Finding>) {
         else {
             continue;
         };
-        // The plain install pando proposes itself where the lockfiles are
-        // gitignored: the file it rewrites is one git ignores, so it
-        // cannot change the repository.
-        if manager.unlocked_install == Some(step.trim())
-            && crate::detect::lockfiles_ignored(root, manager)
-        {
+        // The install pando proposes itself where the lockfiles are
+        // gitignored: the file it writes is one git ignores, or none, so
+        // it cannot change the repository. It is also the one to use
+        // there, where a frozen install has nothing to be frozen against.
+        let unlocked = crate::detect::unlocked_command(root, manager);
+        if unlocked == Some(step.trim()) {
             continue;
         }
-        let frozen = shape.suggest;
+        let fix = unlocked.unwrap_or(shape.suggest);
         if shape
             .frozen_markers
             .iter()
@@ -141,7 +141,7 @@ fn check_install(root: &Path, config: &Config, findings: &mut Vec<Finding>) {
                  never runs a non-frozen install",
                 step.trim()
             ),
-            format!("use `{frozen}`"),
+            format!("use `{fix}`"),
         ));
     }
 }
