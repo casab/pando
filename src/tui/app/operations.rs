@@ -336,7 +336,6 @@ impl App {
 
     pub(super) fn share_selected(&mut self, name: String) {
         let paths = self.paths.clone();
-        let config = self.config.clone();
         let worker_name = name.clone();
         let (ptx, prx) = mpsc::channel::<String>();
         // A tunnel takes up to thirty seconds to publish, and an auth
@@ -346,6 +345,10 @@ impl App {
             let progress = |msg: &str| {
                 let _ = ptx.send(msg.to_string());
             };
+            // The file as it is now, as `pando share` reads it: an
+            // `auth_cmd` deleted since the TUI opened must not still mint
+            // a session for everyone with the URL.
+            let config = config_now(&paths)?;
             actions::share(&paths, &config, &worker_name, &progress)
                 .map(|outcome| {
                     PendingOutcome::Shared(outcome.name, outcome.public_url, outcome.pre_authed)

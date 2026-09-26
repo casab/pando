@@ -1730,6 +1730,44 @@ fn t_on_a_worktree_that_is_not_shared_asks_and_then_shares() {
     assert!(app.modal.is_none());
 }
 
+// The session's copy is from when the TUI opened, and the share worker
+// took `[share]` from it: an `auth_cmd` deleted since still minted a
+// session and put it on the public URL, where `pando share` read the
+// file and did not.
+#[test]
+fn a_share_reads_the_config_on_disk_not_the_one_the_tui_opened_with() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("acme-shop");
+    crate::testutil::init_repo(&root);
+    let paths = PandoPaths::new(
+        dir.path().join("pando-home"),
+        crate::project::ProjectRef::from_root(&root).unwrap(),
+    );
+    let mut app = App::new_for_test(paths.clone(), Config::default(), vec![wt("feat+one")]);
+
+    // Written after this session opened. A provider pando does not speak
+    // is refused before anything is spawned or looked up, so the refusal
+    // says which config the worker read.
+    let file = paths.config_file();
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, "[share]\nprovider = \"ngrok\"\n").unwrap();
+
+    press(&mut app, KeyCode::Char('t'));
+    press(&mut app, KeyCode::Char('y'));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while app.pending.is_some() {
+        assert!(Instant::now() < deadline, "the worker never reported");
+        app.poll_pending();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let (message, is_error) = app.active_status().expect("a status");
+    assert!(is_error, "{message}");
+    assert!(
+        message.contains("[share].provider is \"ngrok\""),
+        "the share used the session's copy: {message}"
+    );
+}
+
 #[test]
 fn t_on_a_shared_worktree_asks_before_taking_the_url_away() {
     let mut app = test_app(&["feat+one"]);
