@@ -34,6 +34,17 @@ fn is_warning(line: &str) -> bool {
         || (line.contains("public URL") && line.contains("is closed"))
 }
 
+/// The lines an action said on its way that are worth the header, as one,
+/// or nothing when none is.
+fn warnings_in(said: &[String]) -> Option<String> {
+    let warnings: Vec<&str> = said
+        .iter()
+        .map(String::as_str)
+        .filter(|line| is_warning(line))
+        .collect();
+    (!warnings.is_empty()).then(|| warnings.join(" · "))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingKind {
     Create,
@@ -459,13 +470,8 @@ impl App {
                 // changed the worktree is what Invariant 1 promises is
                 // said, and the one command that removes the volumes an
                 // `rm` could not is not left to be found in `m`.
-                let warnings: Vec<&str> = said
-                    .iter()
-                    .map(String::as_str)
-                    .filter(|line| is_warning(line))
-                    .collect();
-                if !warnings.is_empty() {
-                    self.set_error(warnings.join(" · "));
+                if let Some(warnings) = warnings_in(&said) {
+                    self.set_error(warnings);
                 }
             }
             Ok(Err(e)) => {
@@ -474,6 +480,12 @@ impl App {
                 let said = pending.all_it_said();
                 self.pending = None;
                 self.keep_what_it_said(&format!("{} {label}", kind.verb()), &said);
+                // And on the header after the error, as after an outcome:
+                // a restart whose start half failed has already closed the
+                // share, and the error alone never said which URL had gone.
+                let also = warnings_in(&said)
+                    .map(|warnings| format!(" · {warnings}"))
+                    .unwrap_or_default();
                 // The one start failure that is not about this worktree but
                 // about the project: from now on `⏎` and `s` say so up
                 // front.
@@ -481,7 +493,7 @@ impl App {
                     && e.contains(NO_PROCESSES)
                 {
                     self.nothing_to_run = true;
-                    self.set_error_about(&name, self.nothing_to_run_line());
+                    self.set_error_about(&name, format!("{}{also}", self.nothing_to_run_line()));
                     return;
                 }
                 // A create whose install step failed kept its worktree, and
@@ -489,12 +501,15 @@ impl App {
                 // contradicted it, and the cursor goes to it as to any
                 // worktree `n` made.
                 if kind == PendingKind::Create && e.contains(actions::CREATED_BUT_INSTALL_FAILED) {
-                    self.set_error_about(&name, e);
+                    self.set_error_about(&name, format!("{e}{also}"));
                     self.select_on_arrival = Some(name);
                     self.spawn_discovery();
                     return;
                 }
-                self.set_error_about(&name, format!("could not {} {label}: {e}", kind.noun()));
+                self.set_error_about(
+                    &name,
+                    format!("could not {} {label}: {e}{also}", kind.noun()),
+                );
             }
             // A worker blocked on the question modal is not doing anything
             // a spinner could stand for, and its clock is the reader's.

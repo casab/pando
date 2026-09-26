@@ -5152,6 +5152,30 @@ fn a_restart_that_closed_a_public_url_still_says_so_once_it_is_ready() {
     );
 }
 
+// And when the start half fails after the stop half closed the share: the
+// header said only why the restart failed, and the row just lost its
+// public URL.
+#[test]
+fn a_restart_that_closed_a_public_url_and_then_failed_says_both() {
+    let mut app = test_app(&["feat+one"]);
+    let closed = "feat+one: its public URL https://x.trycloudflare.com is closed — \
+                  `pando share feat+one` gives it a new one";
+    pending_that_says(
+        &mut app,
+        "feat+one",
+        PendingKind::Restart,
+        &["stopping dev", closed, "starting dev"],
+        Err("port 17342 is in use".into()),
+    );
+    wait_for_pending(&mut app);
+    let (message, is_error) = app.active_status().expect("a status");
+    assert_eq!(
+        message,
+        format!("could not restart feat/one: port 17342 is in use · {closed}")
+    );
+    assert!(is_error);
+}
+
 // A start that returned while dev was still starting waited on dev's pid,
 // and a stop — `x`, or `pando stop` in another pane — never ended the
 // wait: every later read, missing dev, said "waiting". Missing is only
