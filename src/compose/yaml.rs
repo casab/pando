@@ -333,9 +333,9 @@ enum Node {
     /// Kept as a node of its own rather than read as the text `*name`, so
     /// the file can say it was not read whole.
     Alias(String),
-    /// A value this reader could not read (see [`unread`] and
-    /// [`value_on`]). Nothing in it is taken for a port or a mount, and
-    /// where this reader reads it the file says it was not read whole.
+    /// A value this reader could not read (see [`unread`], [`value_on`]
+    /// and [`parse_map`]). Nothing in it is taken for a port or a mount,
+    /// and where this reader reads it the file says it was not read whole.
     Unread,
     /// An unread flow collection or quoted scalar that goes on over a line
     /// no deeper than its own key, which compose takes as part of it and
@@ -504,24 +504,17 @@ fn parse_seq(lines: &[Line], at: &mut usize, indent: usize) -> Result<Node> {
         };
         match entry {
             // `- target: 80` opens a mapping whose remaining keys are
-            // indented to where `target` starts.
+            // indented to where `target` starts, and are read as any
+            // mapping's are.
             Some((key, value)) => {
-                let mut entries = vec![(key, inline_value(lines, at, value, inner)?)];
-                while let Some(next) = lines.get(*at) {
-                    if next.indent != inner {
-                        break;
+                let first = (key, inline_value(lines, at, value, inner)?);
+                items.push(match parse_map(lines, at, inner)? {
+                    Node::Map(mut entries) => {
+                        entries.insert(0, first);
+                        Node::Map(entries)
                     }
-                    let trimmed = next.text.trim_start();
-                    if trimmed.starts_with('-') {
-                        break;
-                    }
-                    let Some((key, value)) = split_key(trimmed) else {
-                        break;
-                    };
-                    *at += 1;
-                    entries.push((key, inline_value(lines, at, value, inner)?));
-                }
-                items.push(Node::Map(entries));
+                    unread => unread,
+                });
             }
             None => items.push(value_on(lines, *at, &rest, indent)),
         }
@@ -546,8 +539,19 @@ fn parse_map(lines: &[Line], at: &mut usize, indent: usize) -> Result<Node> {
             break;
         }
         let Some((key, value)) = split_key(trimmed) else {
-            *at += 1;
-            continue;
+            // A line closing the brackets of the value above goes on with
+            // that value.
+            if closes_only(trimmed) {
+                *at += 1;
+                continue;
+            }
+            // Any other line at the mapping's own column with no key in it
+            // is one this reader cannot place: a plain scalar written on
+            // the line under its key or `-`, or an explicit `? key`.
+            // Skipped, `-` over `./pgdata:/var/lib/postgresql/data` read as
+            // a mapping of nothing, a mount with no source, where compose
+            // binds `./pgdata`.
+            return Ok(Node::Unread);
         };
         *at += 1;
         let node = inline_value(lines, at, value, indent)?;
@@ -777,9 +781,13 @@ fn flow(text: &str) -> Option<Node> {
     if let Some(inner) = text.strip_prefix('{').and_then(|t| t.strip_suffix('}')) {
         let mut entries = Vec::new();
         for item in split_flow(inner) {
-            if let Some((key, value)) = split_key(&item) {
-                entries.push((key, one_line(&value)));
-            }
+            // `{"type":"bind"}` has keys compose reads and this reader
+            // does not split, and a mapping read without them lost the
+            // bind mount they made.
+            let Some((key, value)) = split_key(&item) else {
+                return Some(Node::Unread);
+            };
+            entries.push((key, one_line(&value)));
         }
         return Some(Node::Map(entries));
     }

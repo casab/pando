@@ -879,9 +879,10 @@ fn an_alias_outside_services_and_a_quoted_star_leave_the_file_whole() {
 }
 
 /// A bind mount into the worktree, in each shape this reader cannot take
-/// from one line. Compose reads every one of them, and Prettier writes the
-/// first when a flow list grows too long for its line.
-const UNREADABLE: [&str; 9] = [
+/// from one line or place in the mapping it sits in. Compose reads every
+/// one of them, and Prettier writes the first when a flow list grows too
+/// long for its line.
+const UNREADABLE: [&str; 14] = [
     "    volumes: [\n      \"./pgdata:/var/lib/postgresql/data\"\n    ]\n",
     "    volumes:\n      - {\n        type: bind,\n        source: ./pgdata,\n        \
      target: /var/lib/postgresql/data\n      }\n",
@@ -893,6 +894,14 @@ const UNREADABLE: [&str; 9] = [
      target: /var/lib/postgresql/data\n",
     "    volumes:\n      -\n        >-\n        ./pgdata:/var/lib/postgresql/data\n",
     "    volumes:\n      - ./pgdata\n        :/var/lib/postgresql/data\n",
+    "    volumes:\n      -\n        ./pgdata:/var/lib/postgresql/data\n",
+    "    volumes:\n      - type: bind\n        source:\n          ./pgdata\n        \
+     target: /var/lib/postgresql/data\n",
+    "    ? volumes\n    : - ./pgdata:/var/lib/postgresql/data\n",
+    "    volumes:\n      - type: bind\n        ? source\n        : ./pgdata\n        \
+     target: /var/lib/postgresql/data\n",
+    "    volumes: [{\"type\":\"bind\",\"source\":\"./pgdata\",\
+     \"target\":\"/var/lib/postgresql/data\"}]\n",
 ];
 
 // Each of these read as a mount with no source, an anonymous volume, and
