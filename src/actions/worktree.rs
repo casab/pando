@@ -46,7 +46,9 @@ enum CreateSource {
 /// and it can only be read once the worktree exists — unwind what was
 /// created and say so in the error. The one refusal that keeps the
 /// worktree is over a record of it another command wrote while git
-/// checked it out: that command may be running something in it.
+/// checked it out: that command may be running something in it. That
+/// record is marked as pando's, and the error says what the worktree did
+/// not get.
 pub fn new(
     paths: &PandoPaths,
     config: &Config,
@@ -179,14 +181,11 @@ pub fn new(
     // still checking it out, and record its dev server and ports under
     // this name. Written over, they drop out of pando's state while they
     // run; unwound, the worktree goes from under them. So neither: the
-    // record and the worktree are kept as that command left them.
+    // worktree is kept, and so is what that command recorded in it.
     if store.worktrees.get(&dir_name) != left.as_ref() {
-        bail!(
-            "{branch} was checked out at {}, but another pando command recorded {dir_name:?} \
-             while git was checking it out — the worktree and that record are kept, and nothing \
-             was provisioned or installed into it",
-            target.display()
-        );
+        return Err(refuse_over_raced_record(
+            paths, config, &mut store, &dir_name, branch, &target,
+        ));
     }
     if !config.project.provision_paths().is_empty() {
         progress("provisioning");
@@ -211,15 +210,7 @@ pub fn new(
     // wrong number. Almost none do; the install step never does.
     // Said only when there is something to install: a project with no
     // install command and no create hook used to print it anyway.
-    let installs = config
-        .project
-        .install
-        .as_deref()
-        .is_some_and(|cmd| !cmd.trim().is_empty())
-        || config
-            .hooks
-            .iter()
-            .any(|hook| hook.after == config::HookPoint::Create);
+    let installs = has_install_step(config);
     for line in uninitialised_submodules(&target) {
         progress(&line);
     }
@@ -240,6 +231,80 @@ pub fn new(
     run_hooks(paths, config, config::HookPoint::Create, &ctx, progress)
         .with_context(|| format!("{branch} {CREATED_BUT_INSTALL_FAILED}"))?;
     Ok(dir_name)
+}
+
+/// Whether `new` has an install step to run: the project's install
+/// command, or a hook after create.
+fn has_install_step(config: &Config) -> bool {
+    config
+        .project
+        .install
+        .as_deref()
+        .is_some_and(|cmd| !cmd.trim().is_empty())
+        || config
+            .hooks
+            .iter()
+            .any(|hook| hook.after == config::HookPoint::Create)
+}
+
+/// The refusal `new` gives over a record another command wrote while git
+/// checked the worktree out, having marked that record as pando's.
+///
+/// It did: the worktree is the one `new` just created. Left as a start
+/// writes it, the record is an adopted worktree's, and `rm` and the TUI
+/// would treat it as not pando's to remove. Only a record of this
+/// directory is marked — one under the same name for another path is not
+/// this worktree's. The error names what `new` did not give the worktree,
+/// and the commands that do.
+fn refuse_over_raced_record(
+    paths: &PandoPaths,
+    config: &Config,
+    store: &mut state::State,
+    dir_name: &str,
+    branch: &str,
+    target: &Path,
+) -> anyhow::Error {
+    let head = format!(
+        "{branch} was checked out at {}, but another pando command recorded {dir_name:?} \
+         while git was checking it out — the worktree and that record are kept",
+        target.display()
+    );
+    if let Some(record) = store.worktrees.get_mut(dir_name)
+        && !record.created_by_pando
+        && crate::paths::resolve_for_compare(&record.path)
+            == crate::paths::resolve_for_compare(target)
+    {
+        record.created_by_pando = true;
+        if let Err(e) = state::save(&paths.state_file(), store) {
+            return e.context(head);
+        }
+    }
+    // What provisioning would have written: the paths not there yet that
+    // have something to come from.
+    let missing: Vec<&str> = config
+        .project
+        .provision_paths()
+        .iter()
+        .filter(|rel| !target.join(rel).exists() && provision_source(paths, config, rel).is_some())
+        .map(String::as_str)
+        .collect();
+    let lacks = match (missing.is_empty(), has_install_step(config)) {
+        (false, true) => format!(
+            "its provisioned files ({}) or its install step",
+            missing.join(", ")
+        ),
+        (false, false) => format!("its provisioned files ({})", missing.join(", ")),
+        (true, true) => "its install step".to_string(),
+        (true, false) => {
+            return anyhow::anyhow!(
+                "{head}, and there was nothing to provision or install into it"
+            );
+        }
+    };
+    anyhow::anyhow!(
+        "{head}, but it did not get {lacks}; `pando rm {branch}` and then `pando new {branch}` \
+         make it again with nothing missing"
+    )
 }
 
 /// What `new` says about submodules it left empty, one line, or nothing.

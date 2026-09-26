@@ -7693,11 +7693,16 @@ fn new_holds_no_state_lock_through_the_checkout_and_lets_it_prompt_for_nothing()
 // terminal can find the worktree while git is still checking it out, and
 // record its dev server and ports. `new` then wrote its own record over
 // that one, and the running server dropped out of pando's state: nothing
-// could stop it, and its ports went to the next worktree.
+// could stop it, and its ports went to the next worktree. Kept as the
+// start wrote it, the record then called the worktree adopted — `rm`
+// demanded `--yes` for one pando made — and the error named neither the
+// `.env` nor the install it never got, nor a way to get them.
 #[test]
 fn new_keeps_a_record_another_command_wrote_while_git_checked_out() {
     use std::os::unix::fs::PermissionsExt;
-    let fx = fixture();
+    let mut fx = fixture();
+    fx.config.project.provision = Some(vec![".env".into()]);
+    fx.config.project.install = Some("true".into());
     let marks = tempdir().unwrap();
     let hooks = marks.path().join("hooks");
     std::fs::create_dir_all(&hooks).unwrap();
@@ -7744,6 +7749,13 @@ fn new_keeps_a_record_another_command_wrote_while_git_checked_out() {
     });
     let msg = format!("{err:#}");
     assert!(msg.contains("another pando command recorded"), "{msg}");
+    assert!(msg.contains("provisioned files (.env)"), "{msg}");
+    assert!(msg.contains("install step"), "{msg}");
+    assert!(
+        msg.contains("`pando rm feat/slow` and then `pando new feat/slow`"),
+        "{msg}"
+    );
+    assert!(!target.join(".env").exists(), "the refusal provisioned");
 
     let record = &fx.state().worktrees[&name];
     assert!(
@@ -7751,11 +7763,16 @@ fn new_keeps_a_record_another_command_wrote_while_git_checked_out() {
         "new wrote over the start's record"
     );
     assert_eq!(record.ports.get("web"), Some(&17_000));
-    assert!(!record.created_by_pando, "new claimed an adopted worktree");
+    assert!(
+        record.created_by_pando,
+        "a worktree new made is recorded as adopted"
+    );
     assert!(
         fx.names().contains(&name),
         "the worktree went from under the start's dev server"
     );
+    let listed = worktree::discover_all(&fx.paths.project).unwrap().worktrees;
+    assert_eq!(ownership(&fx.state(), &listed).get(&name), Some(&true));
 
     // Still listed, so the next mutation's sweep keeps its record.
     worktree_named(&fx, "feat/after");
