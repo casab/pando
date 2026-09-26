@@ -73,6 +73,32 @@ fn v6_loopback_free(port: u16) -> bool {
 /// Local, so anything slower than this is not a listener that is up.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// The two loopbacks a server on this machine can be listening on, IPv4
+/// first. Both, because a server told `localhost` lands on `[::1]` alone
+/// wherever that resolves first — Node's `listen(port, "localhost")` on
+/// macOS, and so Vite's default — and dialling `127.0.0.1` there is refused.
+pub const LOOPBACKS: [std::net::IpAddr; 2] = [
+    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+    std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+];
+
+/// A connection to `port` over whichever loopback accepts one, tried in
+/// [`LOOPBACKS`] order, or the last refusal when neither does.
+pub fn connect_loopback(
+    port: u16,
+    timeout: std::time::Duration,
+) -> std::io::Result<std::net::TcpStream> {
+    use std::net::{SocketAddr, TcpStream};
+    let mut refused = std::io::ErrorKind::AddrNotAvailable.into();
+    for host in LOOPBACKS {
+        match TcpStream::connect_timeout(&SocketAddr::new(host, port), timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => refused = e,
+        }
+    }
+    Err(refused)
+}
+
 /// Whether something accepts a connection on `port`, over either loopback.
 ///
 /// The readiness question asked without taking anything: a refused
@@ -81,16 +107,7 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(20
 /// `lsof`, or it was denied — since a connection says nothing about *whose*
 /// listener answered.
 pub fn something_is_listening(port: u16) -> bool {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
-    for host in [
-        IpAddr::V4(Ipv4Addr::LOCALHOST),
-        IpAddr::V6(Ipv6Addr::LOCALHOST),
-    ] {
-        if TcpStream::connect_timeout(&SocketAddr::new(host, port), CONNECT_TIMEOUT).is_ok() {
-            return true;
-        }
-    }
-    false
+    connect_loopback(port, CONNECT_TIMEOUT).is_ok()
 }
 
 /// How long the readiness probe waits for a byte once it is connected.
@@ -118,11 +135,8 @@ const SERVING_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(20
 /// for an `EADDRINUSE`.
 pub fn something_is_serving(port: u16) -> bool {
     use std::io::Read;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
-    for host in [
-        IpAddr::V4(Ipv4Addr::LOCALHOST),
-        IpAddr::V6(Ipv6Addr::LOCALHOST),
-    ] {
+    use std::net::{SocketAddr, TcpStream};
+    for host in LOOPBACKS {
         let Ok(mut stream) =
             TcpStream::connect_timeout(&SocketAddr::new(host, port), CONNECT_TIMEOUT)
         else {

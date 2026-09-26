@@ -184,10 +184,13 @@ pub fn start_tunnel(paths: &PandoPaths, name: &str, local_port: u16) -> Result<T
     // field rather than loose in a sentence — and pins it against a
     // `TUNNEL_LOG_OUTPUT` in the inherited environment; a cloudflared too
     // old to honour it falls back to the banner parser. `--config` shadows
-    // the user's own.
+    // the user's own. `localhost`, not `127.0.0.1`: a dev server told
+    // `localhost` is on `[::1]` alone on macOS — Vite's default — and
+    // cloudflared dials every address the name resolves to, so a server on
+    // either loopback answers.
     let shell_cmd = format!(
         "exec {program} tunnel --no-autoupdate --output json --config {config} \
-         --url http://127.0.0.1:{local_port}",
+         --url http://localhost:{local_port}",
         program = process::shell_quote(&cloudflared_program(paths).to_string_lossy()),
         config = process::shell_quote(&config_path.to_string_lossy()),
     );
@@ -772,7 +775,10 @@ mod tests {
         let _ = process::stop(spawn.pgid, STOP_GRACE);
 
         let log = std::fs::read_to_string(&spawn.log_path).unwrap();
-        assert!(log.contains("--url http://127.0.0.1:17042"), "{log}");
+        assert!(
+            log.contains("--url http://localhost:17042"),
+            "a name both loopbacks answer to, so a server on `[::1]` alone is reached: {log}"
+        );
         assert!(
             log.contains(&format!(
                 "--config {}",

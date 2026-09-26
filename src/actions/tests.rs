@@ -2517,7 +2517,7 @@ fn share_without_an_auth_command_tunnels_straight_to_the_web_port() {
 
     let log = std::fs::read_to_string(fx.paths.log_file(&name, "tunnel")).unwrap();
     assert!(
-        log.contains(&format!("--url http://127.0.0.1:{}", report.ports["web"])),
+        log.contains(&format!("--url http://localhost:{}", report.ports["web"])),
         "the tunnel must point at the application itself: {log}"
     );
 }
@@ -2556,7 +2556,7 @@ fn share_with_an_auth_command_runs_it_and_puts_a_proxy_in_front() {
 
     let log = std::fs::read_to_string(fx.paths.log_file(&name, "tunnel")).unwrap();
     assert!(
-        log.contains(&format!("--url http://127.0.0.1:{proxy_port}")),
+        log.contains(&format!("--url http://localhost:{proxy_port}")),
         "the tunnel must point at the proxy, not the application: {log}"
     );
 

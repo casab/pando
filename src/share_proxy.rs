@@ -20,6 +20,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::paths::PandoPaths;
+use crate::ports;
 use crate::process::{self, SpawnOptions};
 
 /// The log source the proxy writes to. Reserved in [`crate::paths`].
@@ -112,8 +113,8 @@ fn proxy_env(cookie: &str) -> Vec<(String, String)> {
 }
 
 /// The hidden subcommand's entry point. Binds `127.0.0.1:listen_port` and
-/// forwards every connection to `127.0.0.1:upstream_port` with the cookie
-/// injected.
+/// forwards every connection to `upstream_port`, on whichever loopback
+/// answers, with the cookie injected.
 ///
 /// Loopback only. The proxy exists to be reached by a tunnel running on
 /// this machine, and a bind on `0.0.0.0` would publish an
@@ -122,7 +123,7 @@ pub fn run_in_process(listen_port: u16, upstream_port: u16, cookie: &str) -> Res
     let listener = TcpListener::bind(("127.0.0.1", listen_port))
         .with_context(|| format!("bind the share proxy on 127.0.0.1:{listen_port}"))?;
     // Ports, never the cookie: this goes into the proxy log.
-    eprintln!("pando share proxy: 127.0.0.1:{listen_port} -> 127.0.0.1:{upstream_port}");
+    eprintln!("pando share proxy: 127.0.0.1:{listen_port} -> localhost:{upstream_port}");
     let cookie = cookie.to_string();
     for conn in listener.incoming() {
         match conn {
@@ -164,14 +165,11 @@ fn handle_connection_with(
     client.set_read_timeout(None).ok();
     let rewritten = rewrite_headers(&head, cookie);
 
-    let upstream_addr = format!("127.0.0.1:{upstream_port}");
-    let mut upstream = TcpStream::connect_timeout(
-        &upstream_addr
-            .parse()
-            .context("parse the upstream address")?,
-        UPSTREAM_CONNECT_TIMEOUT,
-    )
-    .with_context(|| format!("connect to the upstream {upstream_addr}"))?;
+    // Either loopback, per connection: a dev server told `localhost` is on
+    // `[::1]` alone on macOS, and one that restarts may come back on the
+    // other.
+    let mut upstream = ports::connect_loopback(upstream_port, UPSTREAM_CONNECT_TIMEOUT)
+        .with_context(|| format!("connect to the upstream on localhost:{upstream_port}"))?;
     upstream.set_read_timeout(Some(UPSTREAM_READ_TIMEOUT)).ok();
 
     upstream
@@ -483,7 +481,11 @@ mod tests {
 
     /// An upstream that records the headers it was sent and answers 200.
     fn upstream_that_records() -> (u16, mpsc::Receiver<String>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        upstream_that_records_on(TcpListener::bind("127.0.0.1:0").unwrap())
+    }
+
+    /// [`upstream_that_records`], on a listener the test bound itself.
+    fn upstream_that_records_on(listener: TcpListener) -> (u16, mpsc::Receiver<String>) {
         let port = listener.local_addr().unwrap().port();
         let (tx, rx) = mpsc::channel::<String>();
         thread::spawn(move || {
@@ -536,6 +538,35 @@ mod tests {
         assert!(!head.contains("stale=1"), "{head}");
         assert!(head.contains("Connection: close"), "{head}");
         assert!(head.contains("Host: tunnel.example"), "{head}");
+    }
+
+    // A dev server told `localhost` is on `[::1]` alone on macOS, which is
+    // Vite's default, and a proxy that dialled `127.0.0.1` only dropped
+    // every request the tunnel handed it.
+    #[test]
+    fn a_request_reaches_an_upstream_on_the_ipv6_loopback_alone() {
+        let Ok(listener) = TcpListener::bind(("::1", 0)) else {
+            eprintln!("skipping: no IPv6 loopback on this machine");
+            return;
+        };
+        let (upstream_port, seen) = upstream_that_records_on(listener);
+        let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_port = proxy.local_addr().unwrap().port();
+        thread::spawn(move || {
+            if let Ok((stream, _)) = proxy.accept() {
+                let _ = handle_connection(stream, upstream_port, COOKIE);
+            }
+        });
+
+        let mut client = TcpStream::connect(("127.0.0.1", proxy_port)).unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: tunnel.example\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.contains("200 OK"), "{response}");
+        let head = seen.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(head.contains(&format!("Cookie: {COOKIE}")), "{head}");
     }
 
     #[test]
@@ -679,7 +710,7 @@ mod tests {
     #[test]
     fn nothing_the_proxy_announces_carries_the_cookie() {
         let announcement = format!(
-            "pando share proxy: 127.0.0.1:{} -> 127.0.0.1:{}",
+            "pando share proxy: 127.0.0.1:{} -> localhost:{}",
             17005, 17000
         );
         assert!(!announcement.contains("session="), "{announcement}");
