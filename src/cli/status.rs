@@ -148,7 +148,13 @@ fn phase_reason(phase: &Phase) -> Option<String> {
 pub fn status_json<W: Write>(paths: &PandoPaths, only: Option<&str>, out: &mut W) -> Result<()> {
     let refreshed = actions::refresh(paths);
     report_refresh(&refreshed);
-    let worktrees = actions::ls(paths)?;
+    let mut worktrees = actions::ls(paths)?;
+    worktrees.retain(|w| only.is_none_or(|name| w.name == name));
+    if let Some(name) = only
+        && worktrees.is_empty()
+    {
+        return Err(not_listed(name, refreshed.state.worktrees.get(name)));
+    }
     let output = StatusOutput {
         version: JSON_VERSION,
         project: ProjectOut {
@@ -158,7 +164,6 @@ pub fn status_json<W: Write>(paths: &PandoPaths, only: Option<&str>, out: &mut W
         },
         worktrees: worktrees
             .into_iter()
-            .filter(|w| only.is_none_or(|name| w.name == name))
             .map(|w| {
                 let record = refreshed.state.worktrees.get(&w.name);
                 let empty = WorktreeRecord::new(&w.path, false);
@@ -332,10 +337,10 @@ fn status_lines<W: Write>(
         .filter(|w| only.is_none_or(|name| w.name == name))
         .collect();
     if shown.is_empty() {
-        match only {
-            Some(name) => writeln!(out, "no worktree named \"{name}\"")?,
-            None => writeln!(out, "no worktrees — `pando new <branch>` creates one")?,
+        if let Some(name) = only {
+            return Err(not_listed(name, refreshed.state.worktrees.get(name)));
         }
+        writeln!(out, "no worktrees — `pando new <branch>` creates one")?;
         return Ok(());
     }
     // Named as `ls` names them: by branch, where the directory is the
@@ -441,6 +446,29 @@ fn status_lines<W: Write>(
         }
     }
     Ok(())
+}
+
+/// The error for a name `status` was given that git does not list.
+///
+/// Such a name resolves because pando still has a record or logs of it,
+/// so `stop` can clean up after a worktree removed outside pando. Its
+/// processes may still be up and holding their ports, and then that is
+/// what the error says.
+fn not_listed(name: &str, record: Option<&WorktreeRecord>) -> anyhow::Error {
+    let up: Vec<&str> = record
+        .into_iter()
+        .flat_map(|r| &r.processes)
+        .filter(|(_, p)| !matches!(p.phase, Phase::Failed { .. }))
+        .map(|(process, _)| process.as_str())
+        .collect();
+    if up.is_empty() {
+        return anyhow::anyhow!("no worktree named \"{name}\" — git does not list it");
+    }
+    anyhow::anyhow!(
+        "git no longer lists {name}, and pando still runs {} for it — `pando stop {name}` \
+         stops what is left",
+        up.join(", ")
+    )
 }
 
 /// Width the phase word is padded to, so the cell after it lines up

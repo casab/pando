@@ -1549,8 +1549,35 @@ fn status_can_be_asked_about_one_worktree() {
     assert_eq!(v["worktrees"].as_array().unwrap().len(), 1);
     assert_eq!(v["worktrees"][0]["name"], "feat+two");
 
-    let text = capture(|b| status_text(&fx.paths, Some("nope"), b));
-    assert!(text.contains("no worktree named"), "{text}");
+    let err = status_text(&fx.paths, Some("nope"), &mut Vec::new()).unwrap_err();
+    assert!(format!("{err:#}").contains("no worktree named"), "{err:#}");
+}
+
+// A worktree removed with `git worktree remove --force` while its dev
+// server ran still resolves, from its record, so `stop` can clean up.
+// `status` of it said "no worktree named" and exited 0, and `--json`
+// printed an empty list, while its processes still held their ports.
+#[test]
+fn status_of_a_worktree_git_no_longer_lists_fails_and_names_what_still_runs() {
+    let fx = fixture();
+    let name = actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
+    with_share(&fx, &name, None);
+    let dir = fx.config.worktrees_dir(&fx.paths).join(&name);
+    git(
+        &fx.root,
+        &["worktree", "remove", "--force", dir.to_str().unwrap()],
+    );
+    assert_eq!(super::names::resolve(&fx.paths, "feat+one").unwrap(), name);
+
+    let err = status_text(&fx.paths, Some(&name), &mut Vec::new()).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("git no longer lists feat+one"), "{msg}");
+    assert!(
+        msg.contains("runs dev") && msg.contains("`pando stop feat+one`"),
+        "{msg}"
+    );
+    let err = status_json(&fx.paths, Some(&name), &mut Vec::new()).unwrap_err();
+    assert_eq!(format!("{err:#}"), msg);
 }
 
 #[test]
