@@ -2001,6 +2001,106 @@ fn the_swept_flag_survives_a_real_mutation_and_defaults_to_false() {
     assert!(fx.state().worktrees[&crashed].processes["dev"].swept);
 }
 
+// The same finding, on the paths that act on the record's own worktree.
+// The sweep signals a dead leader's group once and marks it, but a
+// `start` or a `stop` of that worktree, days later, signalled the same
+// pgid again — which by then can be anybody's process group.
+#[test]
+fn a_swept_groups_pgid_is_not_signalled_again_by_its_own_worktree() {
+    let mut fx = fixture();
+    with_dev(&mut fx, dev("sleep 30"));
+    let name = worktree_named(&fx, "feat/one");
+    // What that pgid names by the time its worktree is acted on.
+    let stranger = crate::testutil::spawn_guarded(
+        "exec sleep 300",
+        &std::env::temp_dir(),
+        &fx.paths.log_file(&name, "stranger"),
+    );
+    let plant = || {
+        let mut store = fx.state();
+        let record = ProcessRecord {
+            pid: 4_000_001,
+            swept: true,
+            ..failed_record(stranger.pgid)
+        };
+        store
+            .worktrees
+            .get_mut(&name)
+            .expect("new wrote a record")
+            .processes
+            .insert("dev".to_string(), record);
+        state::save(&fx.paths.state_file(), &store).unwrap();
+    };
+
+    plant();
+    let outcome = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+    let _guard = guard(&outcome);
+    assert!(
+        crate::process::group_alive(stranger.pgid),
+        "start signalled a pgid the sweep had already signalled"
+    );
+    assert_eq!(outcome.started.len(), 1, "and still replaced the record");
+
+    stop(&fx.paths, &name, None).unwrap();
+    plant();
+    assert_eq!(
+        stop(&fx.paths, &name, None).unwrap(),
+        StopOutcome::Stopped(vec!["dev".to_string()])
+    );
+    assert!(
+        crate::process::group_alive(stranger.pgid),
+        "stop signalled a pgid the sweep had already signalled"
+    );
+    assert!(
+        fx.state().worktrees[&name].processes.is_empty(),
+        "and still dropped the record"
+    );
+}
+
+// And the flag has to reach the file. `share` and `rm` sweep and then
+// refuse without saving, so the marks the sweep made were lost with the
+// refusal: an agent polling `pando share` for a worktree that is not up
+// yet signalled a crashed sibling's pgid on every call.
+#[test]
+fn a_mutation_that_sweeps_and_then_refuses_still_saves_the_sweep() {
+    let fx = fixture();
+    let crashed = worktree_named(&fx, "feat/crashed");
+    let idle = worktree_named(&fx, "feat/idle");
+    let plant = || {
+        let mut store = fx.state();
+        store
+            .worktrees
+            .get_mut(&crashed)
+            .expect("new wrote a record")
+            .processes
+            .insert("dev".to_string(), failed_record(4_000_001));
+        state::save(&fx.paths.state_file(), &store).unwrap();
+    };
+    let swept = || fx.state().worktrees[&crashed].processes["dev"].swept;
+
+    plant();
+    let err = share_with(
+        &fx.paths,
+        &fx.config,
+        &idle,
+        &MissingProvider,
+        &stub_proxy,
+        &noop,
+    )
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("start it first"), "{err:#}");
+    assert!(swept(), "a refused share forgot the group it signalled");
+
+    plant();
+    std::fs::write(fx.worktrees_dir().join(&idle).join("scratch.txt"), "wip").unwrap();
+    let err = rm(&fx.paths, &idle, false, false).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("modified or untracked"),
+        "{err:#}"
+    );
+    assert!(swept(), "a refused rm forgot the group it signalled");
+}
+
 /// A `Failed` record for a group that does not exist and a pid that
 /// cannot: the shape the sweep is about.
 fn failed_record(pgid: i32) -> ProcessRecord {

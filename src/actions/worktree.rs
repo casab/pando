@@ -335,6 +335,10 @@ pub fn rm(
     for notice in sweep_orphaned_groups(&mut store)? {
         progress(&notice);
     }
+    // And saved before any of the refusals below: the sweep marked every
+    // group it signalled, and a refused `rm` that forgot that signalled
+    // them all again on the next mutation.
+    state::save(&paths.state_file(), &store)?;
     drop_stale_worktree_records(&mut store, paths.root());
     let created_by_pando = store
         .worktrees

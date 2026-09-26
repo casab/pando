@@ -262,7 +262,8 @@ pub struct ProcessRecord {
     /// leader is not a dead group. A `Failed` record then lives on until
     /// its own worktree is started, stopped or removed, and re-signalling
     /// its pgid on every later mutation is how a pid that has since
-    /// wrapped around onto an unrelated session leader gets killed.
+    /// wrapped around onto an unrelated session leader gets killed. Those
+    /// three clear a swept record without signalling it again.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub swept: bool,
     pub phase: Phase,

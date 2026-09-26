@@ -134,6 +134,11 @@ pub fn share_with(
         }
         advance_before_reconcile(&mut store);
         state::reconcile(&mut store, proc::is_alive, proc::group_alive);
+        // Before any of the refusals below, which leave without the save at
+        // the end: the sweep marked every group it signalled, and a
+        // refusal that forgot that signalled them all again on the next
+        // call — an agent polling a share it already has, every time.
+        state::save(&paths.state_file(), &store)?;
 
         let record = store
             .worktrees

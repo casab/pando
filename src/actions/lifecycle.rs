@@ -284,14 +284,20 @@ fn start_checked(
     // one at another path is replaced rather than inherited. Every group it
     // recorded is signalled first: those processes are running somewhere
     // else entirely, and dropping the record would leave nothing able to
-    // find them again.
+    // find them again. Not one the orphan sweep has already signalled,
+    // though: its pgid may name somebody else's group by now.
     let stale = store.worktrees.get(name).is_some_and(|record| {
         crate::paths::resolve_for_compare(&record.path)
             != crate::paths::resolve_for_compare(&canonical)
     });
     if stale {
         let record = store.worktrees.get_mut(name).expect("just read");
-        let groups: Vec<i32> = record.processes.values().map(|p| p.pgid).collect();
+        let groups: Vec<i32> = record
+            .processes
+            .values()
+            .filter(|p| !p.swept)
+            .map(|p| p.pgid)
+            .collect();
         for pgid in groups {
             proc::stop(pgid, STOP_GRACE)?;
         }
@@ -394,7 +400,7 @@ fn start_checked(
     // because the services get roles of their own after the processes'
     // and the processes keep the ports they hold.
     let mut already: Vec<String> = Vec::new();
-    let mut clear: Vec<(String, i32)> = Vec::new();
+    let mut clear: Vec<(String, i32, bool)> = Vec::new();
     let mut kept_serving: Vec<String> = Vec::new();
     if let Some(record) = store.worktrees.get(name) {
         for (process, existing) in &record.processes {
@@ -421,7 +427,11 @@ fn start_checked(
                 // A `--only` start leaves every other record alone. One
                 // whose leader is dead is still signalled, by the sweep
                 // below, before `reconcile` drops it.
-                clear.push((process.clone(), existing.pgid));
+                //
+                // One the sweep has already signalled is cleared without a
+                // second signal: its group had its SIGTERM and SIGKILL, and
+                // by now its pgid may name somebody else's.
+                clear.push((process.clone(), existing.pgid, existing.swept));
             }
         }
     }
@@ -444,11 +454,13 @@ fn start_checked(
             false => "clearing what is left of the last run",
         });
     }
-    for (_, pgid) in &clear {
-        proc::stop(*pgid, STOP_GRACE)?;
+    for (_, pgid, swept) in &clear {
+        if !swept {
+            proc::stop(*pgid, STOP_GRACE)?;
+        }
     }
     if let Some(record) = store.worktrees.get_mut(name) {
-        for (process, _) in &clear {
+        for (process, _, _) in &clear {
             record.processes.remove(process);
         }
     }
@@ -1167,6 +1179,10 @@ pub fn stop_all_with(
 /// too: a `Failed` record survives `reconcile` on purpose, and a stop of
 /// the process it belongs to is one of the three things that ends it (the
 /// others being a start of it and an `rm` of its worktree).
+///
+/// The one record dropped without a signal is one the orphan sweep has
+/// already signalled: its group had its SIGTERM and SIGKILL then, and this
+/// stop can come days later, when its pgid names somebody else's group.
 pub(super) fn stop_recorded(
     store: &mut state::State,
     name: &str,
@@ -1253,21 +1269,25 @@ pub(super) fn stop_recorded_with(
         services_to_stop.extend(projects);
         return Ok(StopOutcome::Stopped(Vec::new()));
     }
-    let groups: Vec<(String, i32)> = record
+    let groups: Vec<(String, i32, bool)> = record
         .processes
         .iter()
         .filter(|(process, _)| only.is_none_or(|wanted| process.as_str() == wanted))
-        .map(|(process, p)| (process.clone(), p.pgid))
+        .map(|(process, p)| (process.clone(), p.pgid, p.swept))
         .collect();
     if groups.is_empty() {
         return missing_only(only, missing, record);
     }
     let mut stopped = Vec::new();
     let mut failures = Vec::new();
-    for (process, pgid) in groups {
+    for (process, pgid, swept) in groups {
         // Signal first, drop second. A record cleared for a group that was
         // never signalled is a process nothing can find again.
-        match stop(pgid) {
+        let signalled = match swept {
+            true => Ok(()),
+            false => stop(pgid),
+        };
+        match signalled {
             Ok(()) => {
                 record.processes.remove(&process);
                 stopped.push(process);
@@ -1340,12 +1360,14 @@ pub(super) fn sweep_orphaned_groups_with(
             // Once, not on every mutation. A dead leader is not a dead
             // group, so the group is signalled — but a `Failed` record now
             // survives `reconcile` until its own worktree is started,
-            // stopped or removed (each of which signals and clears it on
-            // its own path), and re-sending SIGTERM/SIGKILL to that pgid
-            // on every later mutation in the project is how a pid that has
-            // since wrapped around onto an unrelated session leader gets
-            // killed. One signal per record bounds that to the window
-            // between the leader dying and the first mutation after it.
+            // stopped or removed (each of which clears it on its own path,
+            // and signals it only if this has not), and re-sending
+            // SIGTERM/SIGKILL to that pgid on every later mutation in the
+            // project is how a pid that has since wrapped around onto an
+            // unrelated session leader gets killed. One signal per record
+            // bounds that to the window between the leader dying and the
+            // first mutation after it — and so does saving the flag: a
+            // mutation that sweeps and then refuses still writes it down.
             //
             // Alive by the read path's rule, not the leader alone: a
             // process that owns no port and backgrounded itself is one
