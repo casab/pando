@@ -647,6 +647,36 @@ fn a_row_says_what_it_is_doing_and_where() {
     );
 }
 
+// The URL is one process's port: with that one stopped on its own and a
+// sibling still up, the row and the pane showed it as a live link.
+#[test]
+fn a_url_whose_own_process_is_stopped_is_not_drawn_while_a_sibling_runs() {
+    let mut app = test_app(&["feat+one"]);
+    crate::tui::app::tests::with_process(
+        &mut app,
+        "feat+one",
+        crate::tui::app::tests::running_phase(),
+    );
+    crate::tui::app::tests::with_second_process(
+        &mut app,
+        "feat+one",
+        "api",
+        crate::tui::app::tests::running_phase(),
+    );
+    app.state
+        .worktrees
+        .get_mut("feat+one")
+        .unwrap()
+        .processes
+        .remove("dev");
+    let rendered = text_of(&draw(&mut app, 140, 20));
+    assert!(
+        !list_row(&rendered, "feat/one").contains(":17342"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("http://localhost:17342"), "{rendered}");
+}
+
 #[test]
 fn the_row_leaves_adoption_to_the_detail_pane() {
     let mut app = test_app(&["mine", "theirs"]);

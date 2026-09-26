@@ -1176,6 +1176,72 @@ fn only_starts_and_stops_one_process_of_a_pair() {
     assert_eq!(status_porcelain(&e.root), "");
 }
 
+// The URL is the web process's port. With web stopped on its own and the
+// api still up, `open` opened it on a refused connection and exited 0,
+// `ls` and `status` showed it as live, and `start --only api` printed it,
+// while `share` refused the same state.
+#[test]
+fn a_url_whose_own_process_is_stopped_is_not_handed_out_while_a_sibling_runs() {
+    if !common::python3_available() {
+        eprintln!("skipping: python3 is not installed");
+        return;
+    }
+    let e = env();
+    let listener = common::listener_on_port_env();
+    e.write_config(&format!(
+        "[processes.web]\ncmd = '''{listener}'''\nports = {{ PORT = \"web\" }}\n\n\
+         [processes.api]\ncmd = '''{listener}'''\nports = {{ PORT = \"api\" }}\n"
+    ));
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+    let out = e.pando(&["start", "feat+one", "--wait"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("http://localhost:"),
+        "{}",
+        stdout(&out)
+    );
+
+    let out = e.pando(&["stop", "feat+one", "--only", "web"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    let text = stdout(&e.pando(&["status"]));
+    assert!(text.contains("running"), "{text}");
+    assert!(!text.contains("http://"), "{text}");
+    let text = stdout(&e.pando(&["ls"]));
+    assert!(!text.contains("http://"), "{text}");
+
+    // A browser that records what it was given, so nothing real opens.
+    let opened = e.home.join("opened");
+    let browser = e.home.join("browser.sh");
+    std::fs::write(
+        &browser,
+        format!("#!/bin/sh\necho \"$1\" > '{}'\n", opened.display()),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&browser, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_pando"))
+        .env("PANDO_HOME", &e.home)
+        .env("BROWSER", &browser)
+        .current_dir(&e.root)
+        .args(["open", "feat+one"])
+        .output()
+        .unwrap();
+    assert_eq!(code(&out), EXIT_ERROR, "stdout: {}", stdout(&out));
+    assert!(
+        stderr(&out).contains("is not running web, the process its URL points at")
+            && stderr(&out).contains("pando start feat+one --only web"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!opened.exists(), "no browser was opened");
+
+    assert_eq!(code(&e.pando(&["stop", "feat+one"])), EXIT_OK);
+    let out = e.pando(&["start", "feat+one", "--only", "api"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out).trim(), "started feat+one");
+    assert_eq!(code(&e.pando(&["stop", "feat+one"])), EXIT_OK);
+}
+
 #[test]
 fn an_only_nothing_answers_to_names_the_processes_there_are() {
     let e = env();

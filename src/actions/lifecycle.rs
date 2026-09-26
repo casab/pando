@@ -24,7 +24,7 @@ use super::services::{
     forget_hooks_after_services, forget_unstarted_services, has_live_services, leave_changed_kinds,
     planned_services, preflight_isolation, replace_stopped_containers, resolve_service_env,
     service_roles, shared_service_env, stop_containers, stop_service_containers,
-    stop_service_pumps, undo_failed_isolation, worktree_url,
+    stop_service_pumps, undo_failed_isolation, url_owner_not_running, worktree_url,
 };
 use super::share::{share_closed, share_target_is_up, sweep_dead_shares_with, take_share_down};
 // Only for the intra-doc link above `sweep_orphaned_groups`.
@@ -111,7 +111,8 @@ pub struct StartReport {
     /// The `web` role's URL when any process owns that role, else the
     /// first role of the alphabetically first process that owns one — the
     /// same rule, through the same function, that `status`, `ls` and the
-    /// TUI use. See [`worktree_url`].
+    /// TUI use. See [`worktree_url`]. `None` while the process it points at
+    /// is not running.
     pub url: Option<String>,
     /// Ports this worktree owned had been taken, so it moved. Worth saying
     /// out loud: a URL the developer had bookmarked just changed.
@@ -1066,8 +1067,13 @@ fn start_checked(
     }
     // From the record, through the one function every read path uses, so
     // that `pando start` and a `pando status` a second later cannot
-    // disagree about the URL of the same worktree.
-    let url = store.worktrees.get(name).and_then(worktree_url);
+    // disagree about the URL of the same worktree. None when a `--only`
+    // left out the process it points at: nothing answers it.
+    let url = store
+        .worktrees
+        .get(name)
+        .filter(|record| url_owner_not_running(record).is_none())
+        .and_then(worktree_url);
     Ok(StartReport {
         worktree: name.to_string(),
         started,

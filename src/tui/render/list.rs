@@ -222,7 +222,12 @@ fn row_cells(app: &App, wt: &Worktree) -> RowCells {
         Some(Aggregate::Running { .. } | Aggregate::Starting { .. })
     );
     let url_port = app.url_of(&wt.name).as_deref().and_then(port_of);
-    if up && let Some(port) = &url_port {
+    // Nor while the process the URL points at is stopped and a sibling runs.
+    let served = app.url_owner_not_running(&wt.name).is_none();
+    if up
+        && served
+        && let Some(port) = &url_port
+    {
         cells.push((Col::Port, format!(":{port}"), Style::new().fg(cyan())));
     }
     if up

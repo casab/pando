@@ -4,7 +4,7 @@ use super::JSON_VERSION;
 use super::report_refresh;
 use super::short_head;
 use crate::actions;
-use crate::actions::worktree_url;
+use crate::actions::{url_owner_not_running, worktree_url};
 use crate::cache;
 use crate::paths::PandoPaths;
 use crate::state::{Aggregate, ServiceMode, WorktreeRecord};
@@ -433,12 +433,13 @@ fn status_cell(record: Option<&WorktreeRecord>, aggregate: Option<&Aggregate>) -
 
 /// The URL, while something is up to answer it. A stopped worktree keeps
 /// its ports and so could name one, but a link that goes nowhere is not
-/// worth the column.
+/// worth the column — nor is one whose own process is stopped while a
+/// sibling runs.
 fn url_cell(record: Option<&WorktreeRecord>, aggregate: Option<&Aggregate>) -> Cell {
     let up = matches!(
         aggregate,
         Some(Aggregate::Running { .. } | Aggregate::Starting { .. })
-    );
+    ) && record.is_some_and(|r| url_owner_not_running(r).is_none());
     match record.and_then(worktree_url) {
         Some(url) if up => Cell::new(url, Some(Paint::Link)),
         _ => Cell::dash(),

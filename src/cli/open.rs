@@ -59,9 +59,19 @@ pub(super) fn url_to_open(
             "{shown} has failed — `pando status {typed}` says which process, and \
              `pando restart {typed}` tries again"
         ),
-        Some(_) => worktree_url(record).with_context(|| {
-            format!("{shown} is running and holds no port, so it has no URL to open")
-        }),
+        Some(_) => {
+            // The URL is one process's port: a sibling that is up serves
+            // none of it, as `share` says of the same state.
+            if let Some(owner) = actions::url_owner_not_running(record) {
+                bail!(
+                    "{shown} is not running {owner}, the process its URL points at — \
+                     `pando start {typed} --only {owner}` starts it"
+                );
+            }
+            worktree_url(record).with_context(|| {
+                format!("{shown} is running and holds no port, so it has no URL to open")
+            })
+        }
     }
 }
 

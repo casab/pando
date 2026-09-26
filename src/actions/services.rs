@@ -1878,6 +1878,48 @@ pub(super) fn url_role(record: &WorktreeRecord) -> Option<String> {
         .or_else(|| record.ports.keys().next().cloned())
 }
 
+/// Who serves the port a worktree's URL names.
+pub(super) enum UrlOwner<'a> {
+    /// The process that owns the URL's role, as its record stands.
+    Recorded(&'a state::ProcessRecord),
+    /// The process that owns the URL's role, named, with no record: it was
+    /// stopped on its own, or a `start --only` never started it.
+    Absent(&'a str),
+    /// A record written before pando tracked who owns what.
+    Unknown,
+}
+
+/// The owner of the URL's role, told apart from a record that names none:
+/// the two need opposite answers, and one `None` for both read a stopped
+/// owner as "anything running will do".
+pub(super) fn url_owner(record: &WorktreeRecord) -> UrlOwner<'_> {
+    let Some(role) = url_role(record) else {
+        return UrlOwner::Unknown;
+    };
+    let Some(owner) = record
+        .roles
+        .iter()
+        .find(|(_, roles)| roles.contains(&role))
+        .map(|(process, _)| process)
+    else {
+        return UrlOwner::Unknown;
+    };
+    match record.processes.get(owner) {
+        Some(process) => UrlOwner::Recorded(process),
+        None => UrlOwner::Absent(owner),
+    }
+}
+
+/// The process the worktree's URL points at, when that one is not running
+/// and something else of the worktree is. Nothing answers the URL then,
+/// however much else is up, so nothing may hand it out as live.
+pub fn url_owner_not_running(record: &WorktreeRecord) -> Option<&str> {
+    match url_owner(record) {
+        UrlOwner::Absent(owner) if !record.processes.is_empty() => Some(owner),
+        _ => None,
+    }
+}
+
 /// The port the process that owns `role` is really listening on.
 ///
 /// A framework that ignores `PORT`, or one that picked the next free

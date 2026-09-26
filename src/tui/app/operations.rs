@@ -14,6 +14,12 @@ use super::dialogs::Modal;
 use super::pending::{PendingKind, PendingOutcome};
 use super::{ARM_TTL, App, Armed};
 
+/// What `o` and `c` say of a URL whose own process is stopped, in the
+/// words `pando share` uses for the same state.
+fn owner_not_running(label: &str, owner: &str) -> String {
+    format!("{label} is not running {owner}, the process its URL points at — s starts it")
+}
+
 /// Standard base64, for the OSC 52 payload. A dependency would be a lot of
 /// machinery for one escape sequence.
 pub(super) fn base64(input: &[u8]) -> String {
@@ -50,6 +56,13 @@ impl App {
     /// the port it was given.
     pub fn url_of(&self, name: &str) -> Option<String> {
         actions::worktree_url(self.record_for(name)?)
+    }
+
+    /// The process a worktree's URL points at, when that one is stopped
+    /// and a sibling runs: nothing answers the URL then, so the row, the
+    /// detail pane, `o` and `c` treat it as a stopped worktree's.
+    pub fn url_owner_not_running(&self, name: &str) -> Option<String> {
+        actions::url_owner_not_running(self.record_for(name)?).map(str::to_string)
     }
 
     pub(super) fn selected_name(&mut self) -> Option<String> {
@@ -526,10 +539,13 @@ impl App {
             Some(Aggregate::Failed { .. }) => self.set_error(format!(
                 "{label} has failed — l shows the log, r restarts it"
             )),
-            Some(_) => {
-                self.open_url(&url);
-                self.set_success(format!("opened {url}"));
-            }
+            Some(_) => match self.url_owner_not_running(&name) {
+                Some(owner) => self.set_error(owner_not_running(&label, &owner)),
+                None => {
+                    self.open_url(&url);
+                    self.set_success(format!("opened {url}"));
+                }
+            },
         }
     }
 
@@ -585,7 +601,8 @@ impl App {
     /// URL whenever there was one pasted a tunnel address where a
     /// localhost one was wanted; each URL has its own key instead.
     ///
-    /// Not once it has stopped, when the port it keeps serves nothing. A
+    /// Not once it has stopped, when the port it keeps serves nothing, nor
+    /// while the process it points at is stopped and a sibling runs. A
     /// failed one's still copies: another of its processes may answer it,
     /// as the detail pane says.
     pub(super) fn copy_selected_url(&mut self) {
@@ -599,6 +616,10 @@ impl App {
         };
         if self.phase_of(&name).is_none() {
             self.set_error(format!("{label} is not running — s starts it"));
+            return;
+        }
+        if let Some(owner) = self.url_owner_not_running(&name) {
+            self.set_error(owner_not_running(&label, &owner));
             return;
         }
         self.copy_to_clipboard(&url);

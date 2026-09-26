@@ -182,9 +182,11 @@ pub(super) fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
         rows.push((KEEP_PROCESSES, line));
     }
     // Never truncated, either of them: the URL is the thing that gets
-    // copied, and one missing its end is worse than none.
+    // copied, and one missing its end is worse than none. Not while the
+    // process it points at is stopped and a sibling runs: nothing answers.
     if let Some(phase) = app.phase_of(&name)
         && let Some(url) = app.url_of(&name)
+        && app.url_owner_not_running(&name).is_none()
     {
         // A failed worktree's URL may still answer (another process can
         // hold it), so it stays; but it is not drawn as a live link.

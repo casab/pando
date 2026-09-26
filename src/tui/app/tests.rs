@@ -1699,6 +1699,31 @@ fn o_refuses_a_failed_worktree_and_c_still_copies_its_url() {
     assert_eq!(app.clipboard.as_deref(), Some("http://localhost:17342"));
 }
 
+// The URL is one process's port. With that one stopped on its own and a
+// sibling still up, `o` opened a refused connection and `c` copied it,
+// each with a tick, while `t` refused the same state.
+#[test]
+fn o_and_c_refuse_a_url_whose_own_process_is_stopped_while_a_sibling_runs() {
+    let mut app = test_app(&["feat+one"]);
+    with_process(&mut app, "feat+one", running_phase());
+    with_second_process(&mut app, "feat+one", "api", running_phase());
+    app.state
+        .worktrees
+        .get_mut("feat+one")
+        .unwrap()
+        .processes
+        .remove("dev");
+    let refusal = "feat/one is not running dev, the process its URL points at — s starts it";
+
+    press(&mut app, KeyCode::Char('o'));
+    assert_eq!(app.opened, None);
+    assert_eq!(app.active_status(), Some((refusal, true)));
+
+    press(&mut app, KeyCode::Char('c'));
+    assert_eq!(app.clipboard, None);
+    assert_eq!(app.active_status(), Some((refusal, true)));
+}
+
 // ---- share -----------------------------------------------------------
 
 // Sharing puts the dev server on the internet, and a link once given

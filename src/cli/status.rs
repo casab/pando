@@ -9,7 +9,7 @@ use super::ls::display_name;
 use super::ls::terminal_width;
 use super::report_refresh;
 use crate::actions;
-use crate::actions::worktree_url;
+use crate::actions::{url_owner_not_running, worktree_url};
 use crate::paths::PandoPaths;
 use crate::state::{Phase, ProcessRecord, WorktreeRecord};
 use crate::term::{Paint, Style, ellipsize_distinct, ellipsize_end, text_width};
@@ -491,11 +491,14 @@ fn worktree_line(record: Option<&WorktreeRecord>, room: usize) -> String {
         return fit_line("stopped", &ports, None, None, room);
     };
     let age = human_duration(Utc::now().signed_duration_since(aggregate.since()));
+    // Not while the process it points at is stopped and a sibling runs:
+    // nothing answers it then. `--json` still carries it, as documented.
+    let url = worktree_url(record).filter(|_| url_owner_not_running(record).is_none());
     match aggregate {
         crate::state::Aggregate::Running { .. } => fit_line(
             "running",
             &ports,
-            worktree_url(record).as_deref(),
+            url.as_deref(),
             Some(&format!("up {age}")),
             room,
         ),
