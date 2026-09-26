@@ -4288,6 +4288,42 @@ fn a_question_waits_until_the_create_modal_is_done_with_the_keyboard() {
     assert!(matches!(rx.try_recv(), Ok(Ok(actions::Answer::Choice(0)))));
 }
 
+// A start's question landing while the chooser was open for another
+// worktree replaced it, and the `⏎` meant for the chooser took the
+// question's preselected answer unread.
+#[test]
+fn a_question_waits_until_the_mode_chooser_is_closed() {
+    let mut app = test_app(&["feat+one"]);
+    type_key(&mut app, KeyCode::Enter);
+    assert!(matches!(app.modal, Some(Modal::Mode { .. })));
+    let rx = open_question(&mut app, a_question());
+    assert!(
+        matches!(app.modal, Some(Modal::Mode { .. })),
+        "the chooser stays"
+    );
+    assert!(app.queued_question.is_some());
+    type_key(&mut app, KeyCode::Esc);
+    assert!(matches!(app.modal, Some(Modal::Question { .. })));
+    assert!(rx.try_recv().is_err(), "nothing answered it");
+}
+
+#[test]
+fn a_question_waits_until_help_or_messages_is_dismissed() {
+    for (key, overlay) in [('?', Modal::Help), ('m', Modal::Messages)] {
+        let mut app = test_app(&["feat+one"]);
+        type_key(&mut app, KeyCode::Char(key));
+        let rx = open_question(&mut app, a_question());
+        assert_eq!(
+            std::mem::discriminant(app.modal.as_ref().unwrap()),
+            std::mem::discriminant(&overlay)
+        );
+        // The key that closes the overlay closes only the overlay.
+        type_key(&mut app, KeyCode::Enter);
+        assert!(matches!(app.modal, Some(Modal::Question { .. })));
+        assert!(rx.try_recv().is_err(), "nothing answered it");
+    }
+}
+
 #[test]
 fn a_question_waits_for_a_filter_being_typed() {
     let mut app = test_app(&["feat+one"]);

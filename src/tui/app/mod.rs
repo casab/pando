@@ -546,25 +546,15 @@ impl App {
 
     /// Whether the keyboard belongs to something being typed or confirmed,
     /// which a question arriving now would take it from.
+    ///
+    /// Any modal: each one answers the keys pressed in it, and a question
+    /// that replaced one would take the key meant for it — the `⏎` that
+    /// confirms the mode chooser, the key that closes help or `m`.
     fn busy_typing(&self) -> bool {
-        let modal = matches!(
-            self.modal,
-            Some(
-                Modal::Create { .. }
-                    | Modal::PullRequests { .. }
-                    | Modal::Remove { .. }
-                    | Modal::Unshare { .. }
-                    | Modal::StopAll { .. }
-                    | Modal::Share { .. }
-                    | Modal::SwitchMode { .. }
-                    | Modal::Theme { .. }
-                    | Modal::Question { .. }
-            )
-        );
         let searching = self
             .log_view()
             .is_some_and(|view| view.search_mode == SearchMode::Typing);
-        modal || self.typing_filter() || searching
+        self.modal.is_some() || self.typing_filter() || searching
     }
 
     /// Whether the list's filter line has the keyboard.
