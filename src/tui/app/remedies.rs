@@ -33,6 +33,10 @@ const REMEDIES: &[(&str, &str)] = &[
         "press S to start it on the project's shared services instead",
     ),
     (
+        "start it on the main checkout's services on purpose",
+        "press S to start it on the main checkout's services on purpose",
+    ),
+    (
         "or pass --force to let git discard them",
         "or press F in the remove dialog to remove it anyway",
     ),

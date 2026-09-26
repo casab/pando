@@ -11,7 +11,7 @@ use crate::paths::PandoPaths;
 use crate::services;
 
 use super::init::{machine_evidence, slot_value};
-use super::lifecycle::{Mode, target_of, worktree_roles};
+use super::lifecycle::{Mode, refuse_losing_namespaces, target_of, worktree_roles};
 use super::namespaced::{ask_for_logins, free_slots_if_full};
 use super::runtime::{
     Machine, RuntimeOutcome, answer_prelude, resolve_runtime, runtime_shell, user_home,
@@ -456,6 +456,9 @@ pub fn resolve_for_start(
     if let Some(worktree) = &worktree {
         refuse_a_gone_directory(worktree)?;
     }
+    // Nor is anything asked for a start of a namespaced worktree that can
+    // no longer have its namespaces: that start is refused.
+    refuse_losing_namespaces(paths, config, name, mode)?;
     let target = target_of(paths, config, name, mode);
     let isolating = mode == Mode::Isolated || target == ServiceMode::Isolated;
     if isolating

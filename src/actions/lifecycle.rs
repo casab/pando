@@ -229,6 +229,7 @@ fn start_checked(
     // through a mode change is refused under the lock below whatever
     // happens, and a database made first would outlive the refusal.
     refuse_only_on_a_mode_change(paths, config, name, only, mode)?;
+    refuse_losing_namespaces(paths, config, name, mode)?;
     let canonical = std::fs::canonicalize(&worktree.path).unwrap_or_else(|_| worktree.path.clone());
 
     // A project with nothing to isolate is not an error: `--isolated` on a
@@ -346,15 +347,20 @@ fn start_checked(
         refuse_only_across_a_mode_change(only, target)?;
     }
     // The mode flipped to namespaced under a concurrent command between
-    // the read above and this one, and nothing was made for it.
-    let ready: Option<Ready> = match (target, ready.take()) {
-        (ServiceMode::Namespaced, None) => bail!(
+    // the read above and this one, and nothing was made for it — or, for a
+    // start that keeps that mode, nothing was asked of the plan: leaving
+    // namespaces for the main checkout's data is never decided by a race.
+    let raced = match target {
+        ServiceMode::Namespaced => ready.is_none(),
+        _ => keeps_namespaces(mode, was),
+    };
+    if raced {
+        bail!(
             "another start changed this worktree's mode while this one was starting, so nothing \
              was started here — start it again with the mode you want"
-        ),
-        (ServiceMode::Namespaced, made) => made,
-        _ => None,
-    };
+        );
+    }
+    let ready: Option<Ready> = ready.take().filter(|_| target == ServiceMode::Namespaced);
     // A slot this start was given that another worktree's record names by
     // now, and this one's no longer does, was freed from this one while it
     // was starting and given out again: writing it back below would hand
@@ -1586,6 +1592,7 @@ pub fn restart(
     // And a worktree whose directory is gone, which the start half would
     // refuse only after the stop half had run and the namespaces were made.
     let worktree = find_live_worktree(paths, name)?;
+    refuse_losing_namespaces(paths, config, name, mode)?;
     let was = recorded_mode(paths, name);
     let target = target_of(paths, config, name, mode);
     // Before the stop below, not after it: a refusal that has already
@@ -1764,6 +1771,53 @@ fn can_namespace(paths: &PandoPaths, config: &Config, name: &str, mode: Mode) ->
         Mode::Shared | Mode::Isolated => false,
     };
     wants && !namespaced::plan(paths, config).targets.is_empty()
+}
+
+/// Refuses a start of a worktree that runs namespaced, plain or asking for
+/// namespaces again, when no service here can have a namespace of its own
+/// any more.
+///
+/// Such a start went on shared: a recipe of the developer's own with no
+/// `[namespace]` table, or a main checkout whose env stopped naming its
+/// database, and the branch's app, its workers and every hook run again
+/// wrote into the main checkout's data — with nothing said on a plain
+/// start, and only a progress line on a namespaced one, which is what the
+/// TUI's quick start of such a worktree is. A worktree that runs on
+/// namespaces of its own leaves them for the main checkout's data only
+/// when that is asked for, never because of what the plan lost. One that
+/// never ran namespaced is on the main checkout's data already, and a
+/// namespaced start of it still goes on shared and says why. Read without
+/// the lock, like [`target_of`], so nothing is asked, made or stopped
+/// first. The worktree's namespaces are kept either way.
+pub(super) fn refuse_losing_namespaces(
+    paths: &PandoPaths,
+    config: &Config,
+    name: &str,
+    mode: Mode,
+) -> Result<()> {
+    if !keeps_namespaces(mode, recorded_mode(paths, name)) {
+        return Ok(());
+    }
+    let plan = namespaced::plan(paths, config);
+    if !plan.targets.is_empty() {
+        return Ok(());
+    }
+    let why = match plan.shared_lines() {
+        lines if lines.is_empty() => "no service is configured".to_string(),
+        lines => lines.join("; "),
+    };
+    bail!(
+        "{name} runs namespaced, but no service here can have a namespace of its own now \
+         ({why}), so nothing was started: it does not move onto the main checkout's data \
+         unless that is asked for, and its namespaces are kept. Fix that, or {}",
+        crate::remedy::SHARED_ON_PURPOSE
+    )
+}
+
+/// Whether a start in `mode` of a worktree that was in `was` has to stay
+/// on namespaces of its own: see [`refuse_losing_namespaces`].
+fn keeps_namespaces(mode: Mode, was: ServiceMode) -> bool {
+    matches!(mode, Mode::Remembered | Mode::Namespaced) && was == ServiceMode::Namespaced
 }
 
 /// The mode a start in `mode` would leave this worktree in, read without

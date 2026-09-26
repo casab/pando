@@ -32,6 +32,13 @@ pub const SHARED: Remedy = Remedy {
     cli: "start it without --isolated (with --shared, if it is isolated already)",
 };
 
+/// A namespaced worktree none of whose namespaces can be had any more; the
+/// main checkout's services still can, asked for.
+pub const SHARED_ON_PURPOSE: Remedy = Remedy {
+    neutral: "start it on the main checkout's services on purpose",
+    cli: "start it with --shared to run it on the main checkout's services on purpose",
+};
+
 /// `rm` of a worktree pando did not create.
 pub const REMOVE_ANYWAY: Remedy = Remedy {
     neutral: "confirm to remove it anyway",
@@ -60,6 +67,7 @@ pub const NAME_A_BASE: Remedy = Remedy {
 /// spellings apart.
 pub const ALL: &[Remedy] = &[
     SHARED,
+    SHARED_ON_PURPOSE,
     REMOVE_ANYWAY,
     DISCARD_CHANGES,
     REMOVE_WITHOUT_DOCKER,

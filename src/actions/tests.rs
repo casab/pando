@@ -10735,6 +10735,53 @@ fn a_project_with_nothing_to_namespace_starts_shared_and_says_why() {
     assert!(!ns.schema.exists(), "a shared start runs no schema step");
 }
 
+// A start keeps a namespaced worktree on its namespaces. Once its plan lost
+// every target — here the main checkout's env stopped naming its database
+// — a plain start went on shared, on main's data, with nothing said, and
+// wrote shared into the record so every later start stayed there; the
+// TUI's quick start, a namespaced one, did the same with a progress line.
+#[test]
+fn a_start_of_a_namespaced_worktree_that_can_no_longer_have_its_namespaces_is_refused() {
+    let ns = namespaced_fixture(MAIN_ENV);
+    let (report, _) = ns.start(Mode::Namespaced).unwrap();
+    drop(guard(&report));
+    stop(&ns.fx.paths, &ns.name, None).unwrap();
+    std::fs::write(ns.fx.root.join(".env"), "DATABASE_PORT=3306\n").unwrap();
+
+    let mut errors = Vec::new();
+    for mode in [Mode::Remembered, Mode::Namespaced] {
+        errors.push(
+            resolve_for_start(&ns.fx.paths, &ns.fx.config, &ns.name, mode, &refuse, &noop)
+                .map(|_| ())
+                .unwrap_err(),
+        );
+        errors.push(ns.start(mode).map(|_| ()).unwrap_err());
+        errors.push(
+            super::restart(&ns.fx.paths, &ns.fx.config, &ns.name, None, mode, &noop)
+                .map(|_| ())
+                .unwrap_err(),
+        );
+    }
+    for err in errors {
+        let msg = format!("{err:#}");
+        assert!(msg.contains("runs namespaced"), "{msg}");
+        assert!(msg.contains("mariadb: shared"), "{msg}");
+        assert!(
+            crate::remedy::for_cli(&msg).contains("--shared"),
+            "the way onto main's data on purpose is named: {msg}"
+        );
+    }
+    let record = ns.record();
+    assert_eq!(record.mode, Some(crate::state::ServiceMode::Namespaced));
+    assert!(record.processes.is_empty(), "{:?}", record.processes);
+    assert_eq!(record.namespaces.len(), 1, "its namespace is kept");
+
+    // Asked for, it is what it always was.
+    let (report, _) = ns.start(Mode::Shared).unwrap();
+    let _guard = guard(&report);
+    assert_eq!(ns.record().mode, Some(crate::state::ServiceMode::Shared));
+}
+
 // The schema step is scoped to starts with data of their own: a namespaced
 // start runs it, and a shared one of the same worktree does not.
 #[test]
