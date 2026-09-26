@@ -881,13 +881,18 @@ fn an_alias_outside_services_and_a_quoted_star_leave_the_file_whole() {
 /// A bind mount into the worktree, in each shape this reader cannot take
 /// from one line. Compose reads every one of them, and Prettier writes the
 /// first when a flow list grows too long for its line.
-const UNREADABLE: [&str; 5] = [
+const UNREADABLE: [&str; 9] = [
     "    volumes: [\n      \"./pgdata:/var/lib/postgresql/data\"\n    ]\n",
     "    volumes:\n      - {\n        type: bind,\n        source: ./pgdata,\n        \
      target: /var/lib/postgresql/data\n      }\n",
     "    volumes: !override\n      - ./pgdata:/var/lib/postgresql/data\n",
     "    volumes:\n      - \"./pgdata\\\n        :/var/lib/postgresql/data\"\n",
     "    volumes:\n      [\n        \"./pgdata:/var/lib/postgresql/data\"\n      ]\n",
+    "    volumes:\n      - >-\n        ./pgdata:/var/lib/postgresql/data\n",
+    "    volumes:\n      - type: bind\n        source: |-\n          ./pgdata\n        \
+     target: /var/lib/postgresql/data\n",
+    "    volumes:\n      -\n        >-\n        ./pgdata:/var/lib/postgresql/data\n",
+    "    volumes:\n      - ./pgdata\n        :/var/lib/postgresql/data\n",
 ];
 
 // Each of these read as a mount with no source, an anonymous volume, and
@@ -929,6 +934,29 @@ fn a_value_spread_over_several_lines_where_nothing_is_read_leaves_the_file_whole
          ]\n    healthcheck:\n      test:\n        [\n          \"CMD-SHELL\",\n          \
          \"pg_isready -U postgres\",\n        ]\n    volumes:\n      - \
          pgdata:/var/lib/postgresql/data\nvolumes:\n  pgdata:\n",
+    )
+    .unwrap();
+    assert!(!file.unresolved.any(), "{:?}", file.unresolved);
+    assert!(file.services["db"].healthcheck);
+    assert_eq!(
+        file.services["db"].volumes,
+        vec![Mount::Named("pgdata".to_string())]
+    );
+    assert_eq!(
+        resolve_included(&file, &["db".into()], &[]).unwrap(),
+        vec![("db".to_string(), 5432)]
+    );
+}
+
+// A script is often a block scalar, as a `command:` or as one entry of a
+// list. Its text holds no port and no mount, and it hides no key after it.
+#[test]
+fn a_block_scalar_where_nothing_is_read_leaves_the_file_whole() {
+    let file = parse(
+        "services:\n  db:\n    image: postgres:16\n    command: |\n      postgres -c \
+         fsync=off\n    healthcheck:\n      test: >-\n        pg_isready -U postgres\n    \
+         entrypoint:\n    - sh\n    - -c\n    - |\n      exec \"$@\"\n    - --\n    volumes:\n    \
+         - pgdata:/var/lib/postgresql/data\nvolumes:\n  pgdata:\n",
     )
     .unwrap();
     assert!(!file.unresolved.any(), "{:?}", file.unresolved);

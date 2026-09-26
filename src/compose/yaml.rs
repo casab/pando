@@ -621,9 +621,17 @@ fn one_line(text: &str) -> Node {
 /// value is [`Node::Unread`]. Compose also takes one that goes on over a
 /// line no deeper than its key, which this reader would read as a key of
 /// its own; that one is [`Node::Spilled`].
+///
+/// Any other value that goes on over the lines under it — a plain scalar
+/// folded onto them, a block scalar's text — is [`Node::Unread`] too. Read
+/// as its first line, `- ./pgdata` over `:/var/lib/postgresql/data` was a
+/// mount with no source, where compose binds `./pgdata`.
 fn value_on(lines: &[Line], at: usize, text: &str, indent: usize) -> Node {
     let start = without_properties(text);
     if !start.starts_with(['[', '{', '"', '\'']) {
+        if lines.get(at).is_some_and(|next| next.indent > indent) {
+            return Node::Unread;
+        }
         return one_line(text);
     }
     let mut flow = Flow::default();
@@ -708,27 +716,30 @@ fn without_properties(text: &str) -> &str {
 }
 
 /// Whether `text` starts a value rather than a mapping entry: an alias, a
-/// flow collection, or a tag, none of which a compose file writes as a
-/// key.
+/// flow collection, a tag or a block scalar, none of which a compose file
+/// writes as a key.
 fn opens_a_value(text: &str) -> bool {
-    text.trim_start().starts_with(['*', '[', '{', '!'])
+    text.trim_start()
+        .starts_with(['*', '[', '{', '!', '|', '>'])
 }
 
 /// A value this reader cannot take from its one line: a tag (`!override`,
-/// `!reset`), which changes what the value after it means, or a flow
-/// collection or a quoted scalar closed only on a later line.
+/// `!reset`), which changes what the value after it means, a block scalar
+/// (`|`, `>-`), whose text is on the lines under it, or a flow collection
+/// or a quoted scalar closed only on a later line.
 ///
 /// Read as the text on its line, each of these came out as a mount with no
 /// source, an anonymous volume that is isolated already, whatever bind
 /// mount the lines after it held. Those lines are still not read, but the
-/// file now says so.
+/// file now says so. A plain scalar cannot start with `|` or `>`, so a
+/// block scalar is never an image or a path.
 fn unread(text: &str) -> Option<Node> {
     let text = text.trim();
     let open = |start: char, end: char| {
         text.starts_with(start) && (text.len() < 2 || !text.ends_with(end))
     };
     let unclosed = open('[', ']') || open('{', '}') || open('"', '"') || open('\'', '\'');
-    (text.starts_with('!') || unclosed).then_some(Node::Unread)
+    (text.starts_with(['!', '|', '>']) || unclosed).then_some(Node::Unread)
 }
 
 /// `&name` at the front of a value, dropped. What follows it — on the line,
