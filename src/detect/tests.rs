@@ -41,8 +41,14 @@ fn values(proposal: &Proposal) -> Vec<&str> {
         .collect()
 }
 
+/// The dev command for signals built by hand, which have no root to read.
 fn dev_of(signals: &Signals, rule: Option<&'static FrameworkRule>) -> Proposal {
-    dev_cmd_proposal(signals, rule).expect("a dev command")
+    dev_cmd_proposal(Path::new("/nonexistent"), signals, rule).expect("a dev command")
+}
+
+/// The dev command detection proposes for the fixture at `root`.
+fn dev_in(root: &Path, signals: &Signals) -> Proposal {
+    dev_cmd_proposal(root, signals, framework(root, signals)).expect("a dev command")
 }
 
 // ---- parsing ---------------------------------------------------------
@@ -442,7 +448,7 @@ fn the_runner_comes_from_the_lockfile() {
 
 #[test]
 fn a_project_with_nothing_to_run_proposes_nothing() {
-    assert!(dev_cmd_proposal(&Signals::default(), None).is_none());
+    assert!(dev_cmd_proposal(Path::new("/nonexistent"), &Signals::default(), None).is_none());
 }
 
 // ---- the port --------------------------------------------------------
@@ -731,6 +737,68 @@ fn a_library_crate_matches_no_framework() {
     assert_eq!(framework(dir.path(), &s).unwrap().name, "Rust");
 }
 
+// A server in src/main.rs and a seed tool in src/bin is a common crate,
+// and cargo refuses a bare `cargo run` there: "could not determine which
+// binary to run". Proposed as decided, every start failed.
+#[test]
+fn a_crate_with_several_binaries_is_offered_each_by_name() {
+    let (dir, s) = marker_fixture(&[
+        ("Cargo.toml", "[package]\nname = \"api\"\n"),
+        ("src/main.rs", "fn main() {}"),
+        ("src/bin/seed.rs", "fn main() {}"),
+        ("src/bin/migrate/main.rs", "fn main() {}"),
+        ("src/bin/migrate/sql.rs", ""),
+    ]);
+    let proposal = dev_in(dir.path(), &s);
+    assert_eq!(
+        values(&proposal),
+        vec![
+            "cargo run --bin api",
+            "cargo run --bin migrate",
+            "cargo run --bin seed"
+        ],
+        "the crate's own binary leads"
+    );
+    assert!(!proposal.decided);
+
+    // `[[bin]]` entries count, and one that points at src/main.rs is
+    // that binary, not a second one.
+    let (dir, s) = marker_fixture(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"x\"\n\n[[bin]]\nname = \"worker\"\npath = \"src/worker.rs\"\n\n\
+             [[bin]]\nname = \"server\"\npath = \"src/main.rs\"\n",
+        ),
+        ("src/main.rs", "fn main() {}"),
+    ]);
+    assert_eq!(
+        values(&dev_in(dir.path(), &s)),
+        vec!["cargo run --bin server", "cargo run --bin worker"]
+    );
+
+    // One binary, or a `default-run`, is what a bare `cargo run` runs.
+    for (manifest, extra) in [
+        ("[package]\nname = \"api\"\n", "src/main.rs"),
+        (
+            "[package]\nname = \"api\"\ndefault-run = \"api\"\n",
+            "src/bin/seed.rs",
+        ),
+        (
+            "[package]\nname = \"api\"\nautobins = false\n",
+            "src/bin/seed.rs",
+        ),
+    ] {
+        let (dir, s) = marker_fixture(&[
+            ("Cargo.toml", manifest),
+            ("src/main.rs", "fn main() {}"),
+            (extra, "fn main() {}"),
+        ]);
+        let proposal = dev_in(dir.path(), &s);
+        assert_eq!(values(&proposal), vec!["cargo run"], "{manifest}");
+        assert!(proposal.decided, "{manifest}");
+    }
+}
+
 // `go run .` in a module whose root is not a main package fails on every
 // start: "no Go files" where the commands live under `cmd/`, "is not a
 // main package" in a library.
@@ -755,7 +823,7 @@ fn a_go_module_whose_root_is_not_a_main_package_matches_no_framework() {
     ] {
         let (dir, s) = marker_fixture(files);
         assert!(framework(dir.path(), &s).is_none(), "{files:?}");
-        assert!(dev_cmd_proposal(&s, framework(dir.path(), &s)).is_none());
+        assert!(dev_cmd_proposal(dir.path(), &s, framework(dir.path(), &s)).is_none());
     }
 
     let (dir, s) = marker_fixture(&[
@@ -768,7 +836,7 @@ fn a_go_module_whose_root_is_not_a_main_package_matches_no_framework() {
     ]);
     let rule = framework(dir.path(), &s);
     assert_eq!(rule.unwrap().name, "Go");
-    assert_eq!(values(&dev_of(&s, rule)), vec!["go run ."]);
+    assert_eq!(values(&dev_in(dir.path(), &s)), vec!["go run ."]);
 }
 
 // `config.ru` is every Rack app's and `bin/dev` is a helper in any
@@ -835,7 +903,7 @@ fn a_backend_building_its_assets_with_vite_is_run_by_its_own_server() {
     let (dir, s) = marker_fixture(&LARAVEL);
     let rule = framework(dir.path(), &s);
     assert_eq!(rule.unwrap().name, "Laravel");
-    let proposal = dev_of(&s, rule);
+    let proposal = dev_in(dir.path(), &s);
     assert_eq!(
         values(&proposal),
         vec!["php artisan serve --port {port:web}", "npm run dev"],
@@ -856,9 +924,8 @@ fn a_backend_building_its_assets_with_vite_is_run_by_its_own_server() {
         ("config/application.rb", ""),
         ("vite.config.ts", "export default {}\n"),
     ]);
-    let rule = framework(dir.path(), &s);
     assert_eq!(
-        values(&dev_of(&s, rule)),
+        values(&dev_in(dir.path(), &s)),
         vec!["bin/rails server -p {port:web}"]
     );
 
@@ -866,9 +933,8 @@ fn a_backend_building_its_assets_with_vite_is_run_by_its_own_server() {
         ("manage.py", ""),
         ("package.json", r#"{ "scripts": { "dev": "vite" } }"#),
     ]);
-    let rule = framework(dir.path(), &s);
     assert_eq!(
-        dev_of(&s, rule).candidates[0].value,
+        dev_in(dir.path(), &s).candidates[0].value,
         "python manage.py runserver 127.0.0.1:{port:web}"
     );
 }
@@ -919,7 +985,7 @@ fn a_single_apps_script_is_given_the_port_flag_its_framework_takes() {
         ),
     ] {
         let (dir, s) = marker_fixture(files);
-        let proposal = dev_of(&s, framework(dir.path(), &s));
+        let proposal = dev_in(dir.path(), &s);
         assert_eq!(values(&proposal), vec![expected]);
         assert!(proposal.decided, "{expected}");
         let first = proposal.preferred().unwrap();
@@ -941,7 +1007,7 @@ fn a_single_apps_script_is_given_the_port_flag_its_framework_takes() {
         ),
         ("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"),
     ]);
-    let proposal = dev_of(&s, framework(dir.path(), &s));
+    let proposal = dev_in(dir.path(), &s);
     assert_eq!(
         values(&proposal),
         vec!["pnpm dev --port {port:web}", "pnpm start --port {port:web}"]
@@ -966,7 +1032,7 @@ fn a_script_that_is_not_the_frameworks_own_server_is_not_given_its_flag() {
             ("package.json", &manifest),
             ("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"),
         ]);
-        let proposal = dev_of(&s, framework(dir.path(), &s));
+        let proposal = dev_in(dir.path(), &s);
         assert_eq!(proposal.candidates[0].value, "pnpm dev", "{body}");
         assert_eq!(proposal.candidates[0].ports, None, "{body}");
     }
@@ -1057,7 +1123,7 @@ fn a_package_whose_dev_script_only_builds_is_given_no_server_port() {
             r#"{ "scripts": { "dev": "vite build --watch" } }"#,
         ),
     ]);
-    let proposal = dev_of(&s, framework(dir.path(), &s));
+    let proposal = dev_in(dir.path(), &s);
     assert_eq!(values(&proposal), vec!["npm run dev"]);
     assert_eq!(proposal.candidates[0].ports, None);
 }

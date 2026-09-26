@@ -4,12 +4,12 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::catalog::frameworks::{FrameworkRule, PortMechanism};
+use crate::catalog::frameworks::{FrameworkRule, Guard, PortMechanism};
 use crate::catalog::package_managers::{self, Ecosystem};
 use crate::config::PortsSpec;
 
 use super::apply::dedup_by_value;
-use super::frameworks::{only_builds, runs};
+use super::frameworks::{only_builds, runs, several_binaries};
 use super::proposal::{Candidate, Proposal, Slot};
 use super::signals::Signals;
 
@@ -319,6 +319,7 @@ fn ranked_scripts(signals: &Signals) -> Vec<(String, String)> {
 }
 
 pub(super) fn dev_cmd_proposal(
+    root: &Path,
     signals: &Signals,
     rule: Option<&'static FrameworkRule>,
 ) -> Option<Proposal> {
@@ -346,15 +347,31 @@ pub(super) fn dev_cmd_proposal(
         let ports = command
             .contains("{port:")
             .then(|| PortsSpec::List(vec![crate::config::WEB_ROLE.to_string()]));
-        candidates.insert(
-            0,
-            Candidate {
+        let why = format!("the {} rule", rule.name);
+        // A crate with several binaries and none run by default: cargo
+        // refuses the bare command, so each binary is offered by name.
+        let binaries = match rule.guard {
+            Guard::BinaryCrate => several_binaries(root),
+            _ => Vec::new(),
+        };
+        let own: Vec<Candidate> = match binaries.is_empty() {
+            true => vec![Candidate {
                 value,
-                why: format!("the {} rule", rule.name),
+                why,
                 ports,
                 ..Candidate::default()
-            },
-        );
+            }],
+            false => binaries
+                .iter()
+                .map(|name| Candidate {
+                    value: format!("{value} --bin {name}"),
+                    why: format!("{why}, for the {name} binary"),
+                    ports: ports.clone(),
+                    ..Candidate::default()
+                })
+                .collect(),
+        };
+        candidates.splice(0..0, own);
     }
 
     dedup_by_value(&mut candidates);

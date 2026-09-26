@@ -361,7 +361,7 @@ pub fn propose_with(
         // Before the single-process slots: it decides whether there is one
         // process or several, and the slots below only fill a single one.
         processes_proposal(root, signals),
-        dev_cmd_proposal(signals, rule),
+        dev_cmd_proposal(root, signals, rule),
         port_proposal(signals, rule),
         // After the processes, because a service is only worth proposing
         // once there is something to talk to it; before the schema hook,

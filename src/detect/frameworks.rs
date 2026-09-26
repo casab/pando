@@ -105,6 +105,87 @@ fn binary_crate(root: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// The binaries of a crate that has more than one and names none to run
+/// by default, the crate's own `src/main.rs` first. `cargo run` refuses
+/// such a crate, "could not determine which binary to run", so each one
+/// has to be run by name. Empty for a crate with one binary, or with a
+/// `default-run`.
+///
+/// Cargo's own discovery: every `[[bin]]`, and unless `autobins = false`
+/// `src/main.rs` under the package's name and each `src/bin/<name>.rs` or
+/// `src/bin/<name>/main.rs` that no `[[bin]]` already names or points at.
+pub(super) fn several_binaries(root: &Path) -> Vec<String> {
+    let Some(manifest) = std::fs::read_to_string(root.join("Cargo.toml"))
+        .ok()
+        .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
+    else {
+        return Vec::new();
+    };
+    let package = manifest.get("package").and_then(toml::Value::as_table);
+    let field = |key: &str| package.and_then(|package| package.get(key));
+    if field("default-run").is_some() {
+        return Vec::new();
+    }
+    let own = field("name").and_then(toml::Value::as_str);
+    // Each binary's name, and its path where one is known.
+    let mut binaries: Vec<(String, Option<String>)> = manifest
+        .get("bin")
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|bin| {
+            let name = bin.get("name")?.as_str()?.to_string();
+            let path = bin.get("path").and_then(toml::Value::as_str);
+            Some((name, path.map(str::to_string)))
+        })
+        .collect();
+    if field("autobins").and_then(toml::Value::as_bool) != Some(false) {
+        let mut found: Vec<(String, String)> = Vec::new();
+        if let Some(own) = own
+            && root.join("src/main.rs").is_file()
+        {
+            found.push((own.to_string(), "src/main.rs".to_string()));
+        }
+        let mut in_bin: Vec<(String, String)> = std::fs::read_dir(root.join("src/bin"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                let file = entry.file_name().to_str()?.to_string();
+                match entry.path().is_dir() {
+                    true => entry
+                        .path()
+                        .join("main.rs")
+                        .is_file()
+                        .then(|| (file.clone(), format!("src/bin/{file}/main.rs"))),
+                    false => {
+                        let name = file.strip_suffix(".rs")?.to_string();
+                        Some((name, format!("src/bin/{file}")))
+                    }
+                }
+            })
+            .collect();
+        in_bin.sort();
+        found.extend(in_bin);
+        for (name, path) in found {
+            let declared = binaries
+                .iter()
+                .any(|(other, at)| *other == name || at.as_deref() == Some(path.as_str()));
+            if !declared {
+                binaries.push((name, Some(path)));
+            }
+        }
+    }
+    if binaries.len() < 2 {
+        return Vec::new();
+    }
+    let crates_own = |(name, path): &(String, Option<String>)| {
+        path.as_deref() == Some("src/main.rs") || Some(name.as_str()) == own
+    };
+    binaries.sort_by_key(|binary| !crates_own(binary));
+    binaries.into_iter().map(|(name, _)| name).collect()
+}
+
 /// Whether a Go module's root is a main package: one of its `.go` files,
 /// tests aside, declares `package main`. A library, and a module whose
 /// commands live under `cmd/`, are level zero as a library crate is:
