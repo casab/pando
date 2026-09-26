@@ -67,8 +67,12 @@ pub(super) fn share_closed(name: &str, public_url: &str) -> String {
 ///
 /// A script that waits on something that never comes would otherwise hold
 /// a share open forever, and in the TUI that is a pending slot nothing can
-/// clear.
-pub(super) const AUTH_CMD_TIMEOUT: Duration = Duration::from_secs(30);
+/// clear. Under test it is shorter: the tests that reach it are about
+/// what happens when it runs out, and 30s of waiting is all they would add.
+pub(super) const AUTH_CMD_TIMEOUT: Duration = match cfg!(test) {
+    true => Duration::from_secs(4),
+    false => Duration::from_secs(30),
+};
 
 /// How `auth_cmd` is told which port the proxy will listen on, in case it
 /// wants to mint a session scoped to it.
