@@ -884,7 +884,8 @@ pub struct LogTail {
     /// them. Logs are appended to, so bytes before `offset` never change —
     /// unless the file was rewritten.
     anchor: Vec<u8>,
-    /// Whether the last poll left bytes it saw in the file unread.
+    /// Whether the last poll left bytes it saw in the file unread, other
+    /// than the start of a character that has not been written whole.
     unread: bool,
 }
 
@@ -1051,7 +1052,8 @@ impl LogTail {
             .read_to_end(&mut raw)
             .context("read log")?;
         // Left in the file, to be read again whole on the next poll.
-        raw.truncate(raw.len() - incomplete_utf8_suffix(&raw));
+        let unfinished = incomplete_utf8_suffix(&raw);
+        raw.truncate(raw.len() - unfinished);
         if bound.is_some() {
             // Each newline read completes one line, and more than the
             // buffer holds would evict some before a follower saw them.
@@ -1065,7 +1067,11 @@ impl LogTail {
             }
         }
         self.offset += raw.len() as u64;
-        self.unread = self.offset < size;
+        // A character still being written at the end of the file cannot be
+        // read yet, so it is not unread: a follower that read on at once
+        // would spin on it until the writer finished it, or for ever if the
+        // writer died partway through.
+        self.unread = self.offset + (unfinished as u64) < size;
         self.remember_anchor(&raw);
         let mut chunk = String::from_utf8_lossy(&raw).into_owned();
         if skip_partial_first_line {
@@ -2106,6 +2112,36 @@ mod tests {
         assert_eq!(incomplete_utf8_suffix(b"ok\xF0\x9F\x98"), 3);
         assert_eq!(incomplete_utf8_suffix("ok😀".as_bytes()), 0);
         assert_eq!(incomplete_utf8_suffix(b""), 0);
+    }
+
+    // The first bytes of a character held back at the end of the file
+    // counted as unread, and a follower, which reads on at once while
+    // there is more, re-read the file without pause until the writer
+    // finished the character, or for ever if it died partway through.
+    #[test]
+    fn a_log_that_ends_partway_through_a_character_has_nothing_unread() {
+        for bound in [u64::MAX, 5] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("log.txt");
+            write_all(&path, "start\n");
+            let mut tail = LogTail::new(path.clone(), 10);
+            tail.poll().unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(b"a\n\xE2").unwrap();
+
+            tail.poll_bounded(bound).unwrap();
+            assert!(!tail.has_unread(), "reading at most {bound} bytes at once");
+            tail.poll_bounded(bound).unwrap();
+            assert!(!tail.has_unread(), "reading at most {bound} bytes at once");
+
+            f.write_all(b"\x82\xAC\n").unwrap();
+            tail.poll_bounded(bound).unwrap();
+            assert!(!tail.has_unread());
+            assert_eq!(plain_lines(&tail), vec!["start", "a", "€"]);
+        }
     }
 
     #[test]
