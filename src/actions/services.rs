@@ -1793,7 +1793,9 @@ pub fn resolved_env(
             &super::namespaced::plan(paths, config),
             &record.namespaces,
         )?),
-        state::ServiceMode::Shared => {}
+        // The main checkout's values, which a shared start hands its
+        // processes over whatever the worktree's own env file says.
+        state::ServiceMode::Shared => out.extend(shared_service_env(paths, config)),
     }
     // Each process is handed the services alone, as `start` hands them:
     // a key an earlier process set is not a service, and must not replace

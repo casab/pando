@@ -1513,6 +1513,38 @@ fn the_env_for_a_command_run_by_hand_takes_a_shared_key_from_the_last_process_by
     assert_eq!(env.get("PORT").map(String::as_str), Some("17008"));
 }
 
+// A shared start tells its processes the main checkout's service values.
+// `status --env` left them out, so a migration run by hand after the eval
+// read the worktree's own `.env` and reached a database the app was not on.
+#[test]
+fn the_env_for_a_command_run_by_hand_in_a_shared_worktree_names_the_main_checkouts_services() {
+    let mut fx = fixture();
+    std::fs::write(fx.root.join(".env"), "DATABASE_PORT=3306\n").unwrap();
+    let services: Config = toml::from_str(
+        "[[services]]\nkind = \"native\"\nname = \"mariadb\"\nenv = { DATABASE_PORT = \"mariadb\" }\n",
+    )
+    .unwrap();
+    fx.config.services = services.services;
+    with_dev(&mut fx, dev("sleep 30"));
+    let name = worktree_named(&fx, "feat/one");
+    std::fs::write(
+        fx.worktrees_dir().join(&name).join(".env"),
+        "DATABASE_PORT=52434\n",
+    )
+    .unwrap();
+    let mut store = fx.state();
+    store
+        .worktrees
+        .entry(name.clone())
+        .or_insert_with(|| WorktreeRecord::new(fx.worktrees_dir().join(&name), true))
+        .ports = BTreeMap::from([("web".to_string(), 17008)]);
+    state::save(&fx.paths.state_file(), &store).unwrap();
+
+    let env = resolved_env(&fx.paths, &fx.config, &name).unwrap();
+    assert_eq!(env.get("DATABASE_PORT").map(String::as_str), Some("3306"));
+    assert_eq!(env.get("PORT").map(String::as_str), Some("17008"));
+}
+
 // ---- stop ------------------------------------------------------------
 
 #[test]
