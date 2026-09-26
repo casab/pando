@@ -122,6 +122,12 @@ pub fn run_hooks(
     Ok(())
 }
 
+/// The scope a hook runs in, in this project: [`config::HookConfig::scope`]
+/// with whether the project has services read the way a start reads it.
+pub fn hook_scope(config: &Config, hook: &config::HookConfig) -> config::HookScope {
+    hook.scope(!service_roles(config).is_empty())
+}
+
 /// Why a hook did not run, when that is worth a line: one that only runs
 /// where the worktree has data of its own, on a start that has none.
 /// `never` is the developer's own answer and says nothing.

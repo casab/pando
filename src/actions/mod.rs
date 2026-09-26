@@ -21,7 +21,7 @@ mod share;
 mod worktree;
 
 pub use hooks::{
-    HookContext, INSTALL_HOOK, install_remedy, matched_nothing, run_hooks, runs_again,
+    HookContext, INSTALL_HOOK, hook_scope, install_remedy, matched_nothing, run_hooks, runs_again,
 };
 pub use init::{
     ALL_SLOTS, InitReport, SlotSummary, init, init_dry_run, machine_evidence,

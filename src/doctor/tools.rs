@@ -4,9 +4,9 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use crate::actions::Machine;
+use crate::actions::{self, Machine};
 use crate::catalog::package_managers;
-use crate::config::{Config, ServiceConfig};
+use crate::config::{Config, HookScope, ServiceConfig};
 use crate::paths::PandoPaths;
 use crate::process as proc;
 use crate::runtime;
@@ -306,7 +306,7 @@ fn tool_probes(paths: &PandoPaths, config: &Config) -> Vec<ToolProbe> {
         missing: None,
     });
 
-    for (program, needed_for, named_by_config) in project_programs(paths, config) {
+    for (program, needed_for, missing) in project_programs(paths, config) {
         if probes.iter().any(|p| p.program == program) {
             continue;
         }
@@ -316,38 +316,65 @@ fn tool_probes(paths: &PandoPaths, config: &Config) -> Vec<ToolProbe> {
             args: "--version",
             detail_args: None,
             detail_label: "",
-            needed_for: needed_for.clone(),
-            missing: named_by_config.then_some((Severity::Problem, needed_for)),
+            needed_for,
+            missing,
         });
     }
     probes
 }
 
-/// Programs this project will have pando run, with whether config names
-/// them.
+/// Programs this project will have pando run, each with what it is for
+/// and what to say when it is not there.
 ///
 /// Config naming one is the difference between a line and a problem: a
 /// lockfile is a signal that a manager is *probably* wanted, an
-/// `install =` is pando being told to run it.
-fn project_programs(paths: &PandoPaths, config: &Config) -> Vec<(String, String, bool)> {
-    let mut out: Vec<(String, String, bool)> = Vec::new();
+/// `install =` is pando being told to run it. A hook is a problem only
+/// when every start runs it: one only a start with data of its own runs is
+/// a note, as missing docker for compose services is, and one switched
+/// off with `on = "never"` needs nothing.
+fn project_programs(paths: &PandoPaths, config: &Config) -> Vec<ProjectProgram> {
+    let mut out: Vec<ProjectProgram> = Vec::new();
     if let Some(install) = config.project.install.as_deref()
         && let Some(program) = command_program(install)
     {
+        let needed_for = "the install step every new worktree runs".to_string();
         out.push((
             program,
-            "the install step every new worktree runs".to_string(),
-            true,
+            needed_for.clone(),
+            Some((Severity::Problem, needed_for)),
         ));
     }
     for hook in &config.hooks {
+        let scope = actions::hook_scope(config, hook);
+        if scope == HookScope::Never {
+            continue;
+        }
         let Some(program) = command_program(&hook.cmd) else {
             continue;
         };
-        if out.iter().any(|(p, _, _)| *p == program) {
-            continue;
+        let needed_for = format!("the hook {:?}", hook.name);
+        let missing = match scope {
+            HookScope::Isolated => (
+                Severity::Note,
+                format!(
+                    "{needed_for}, which only a start with data of its own (`--isolated` or \
+                     `--namespaced`) runs; a plain `start` still can"
+                ),
+            ),
+            _ => (Severity::Problem, needed_for.clone()),
+        };
+        match out.iter_mut().find(|(p, _, _)| *p == program) {
+            // One line per program, named after the hook that needs it on
+            // every start when there is one.
+            Some(entry)
+                if missing.0 == Severity::Problem
+                    && matches!(entry.2, Some((Severity::Note, _))) =>
+            {
+                *entry = (program, needed_for, Some(missing));
+            }
+            Some(_) => {}
+            None => out.push((program, needed_for, Some(missing))),
         }
-        out.push((program, format!("the hook {:?}", hook.name), true));
     }
     let signals = detect::signals(paths.root());
     for lockfile in &signals.lockfiles {
@@ -361,11 +388,15 @@ fn project_programs(paths: &PandoPaths, config: &Config) -> Vec<(String, String,
         out.push((
             program.to_string(),
             format!("{lockfile} is in this repository"),
-            false,
+            None,
         ));
     }
     out
 }
+
+/// A program the project runs, what it is for, and what to say when it is
+/// not there: [`ToolProbe::missing`].
+type ProjectProgram = (String, String, Option<(Severity, String)>);
 
 /// The program a shell command really runs: the last `&&`-joined step's
 /// first word that is not a `KEY=value` prefix.

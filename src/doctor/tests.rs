@@ -855,6 +855,97 @@ fn the_program_a_config_tells_pando_to_run_is_a_problem_when_it_is_missing() {
     );
 }
 
+/// A shell that finds every tool but one.
+fn every_tool_but(missing: &'static str) -> impl Fn(&str) -> Option<String> {
+    move |script: &str| {
+        let answer = every_tool(script)?;
+        // Each probe is one `if … fi` line of the script, in index order.
+        let asked = format!("command -v '{missing}' ");
+        let Some(index) = script
+            .lines()
+            .filter(|l| l.starts_with("if "))
+            .position(|l| l.contains(&asked))
+        else {
+            return Some(answer);
+        };
+        let found = [
+            format!("{TOOL_PATH_MARK}{index} "),
+            format!("{TOOL_VERSION_MARK}{index} "),
+        ];
+        Some(
+            answer
+                .lines()
+                .filter(|l| !found.iter().any(|mark| l.starts_with(mark.as_str())))
+                .map(|l| format!("{l}\n"))
+                .collect(),
+        )
+    }
+}
+
+#[test]
+fn a_hook_switched_off_needs_nothing_on_the_path() {
+    let fx = fixture();
+    write_project_config(
+        &fx,
+        "[[hooks]]\nname = \"schema\"\nafter = \"services\"\n\
+         cmd = \"alembic upgrade head\"\non = \"never\"\n",
+    );
+    let report = report_of(&fx, &every_tool_but("alembic"));
+    assert!(report.healthy(), "{:?}", report.findings);
+    assert!(
+        !mentions(&report, "alembic is not on the PATH"),
+        "{:?}",
+        messages(&report)
+    );
+}
+
+#[test]
+fn a_hook_only_a_start_with_its_own_data_runs_is_a_note_when_its_program_is_missing() {
+    let fx = fixture();
+    std::fs::write(
+        fx.root.join("docker-compose.yml"),
+        "services:\n  postgres:\n    image: postgres:16\n",
+    )
+    .expect("compose file");
+    let services = "[[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
+                    include = [\"postgres\"]\n";
+    let isolated = "[[hooks]]\nname = \"schema\"\nafter = \"services\"\n\
+                    cmd = \"alembic upgrade head\"\n";
+    write_project_config(&fx, &format!("{services}{isolated}"));
+    let report = report_of(&fx, &every_tool_but("alembic"));
+    assert!(report.healthy(), "{:?}", report.findings);
+    let alembic = report
+        .findings
+        .iter()
+        .find(|f| f.message.starts_with("alembic is not on the PATH"))
+        .unwrap_or_else(|| panic!("{:?}", messages(&report)));
+    assert_eq!(alembic.severity, Severity::Note);
+    assert!(
+        alembic.message.contains("`--namespaced`"),
+        "{}",
+        alembic.message
+    );
+
+    // A hook every start runs, on the same program, is the one it names.
+    write_project_config(
+        &fx,
+        &format!(
+            "{services}{isolated}[[hooks]]\nname = \"check\"\nafter = \"dev\"\n\
+             cmd = \"alembic check\"\n"
+        ),
+    );
+    let report = report_of(&fx, &every_tool_but("alembic"));
+    assert!(!report.healthy());
+    assert!(
+        mentions(
+            &report,
+            "alembic is not on the PATH `bash -lc` has — the hook \"check\""
+        ),
+        "{:?}",
+        messages(&report)
+    );
+}
+
 #[test]
 fn a_probe_that_never_finished_claims_nothing_about_the_machine() {
     let fx = fixture();
