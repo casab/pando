@@ -8364,10 +8364,20 @@ const MAIN_ENV_WITH_REDIS: &str = "DATABASE_HOST=localhost\nDATABASE_PORT=3306\n
 /// The namespaced fixture with a Redis beside the MariaDB, addressed by
 /// `REDIS_PORT` with its slot in `REDIS_DB`, as the origin project does.
 fn slots_fixture(env: &str) -> (Namespaced, PathBuf) {
+    slots_fixture_keyed(env, &["REDIS_PORT"])
+}
+
+/// [`slots_fixture`] with the Redis found by `keys` instead.
+fn slots_fixture_keyed(env: &str, keys: &[&str]) -> (Namespaced, PathBuf) {
     let mut ns = namespaced_fixture(env);
-    let redis: Config = toml::from_str(
-        "[[services]]\nkind = \"native\"\nname = \"redis\"\nenv = { REDIS_PORT = \"redis\" }\n",
-    )
+    let keys: Vec<String> = keys
+        .iter()
+        .map(|key| format!("{key} = \"redis\""))
+        .collect();
+    let redis: Config = toml::from_str(&format!(
+        "[[services]]\nkind = \"native\"\nname = \"redis\"\nenv = {{ {} }}\n",
+        keys.join(", ")
+    ))
     .unwrap();
     ns.fx.config.services.extend(redis.services);
     let fake = fake_redis(&ns.fx.paths);
@@ -8461,6 +8471,78 @@ fn a_namespaced_start_takes_the_first_empty_slot_nobody_holds_and_tells_the_app(
     assert!(said.iter().any(|l| l == "redis: slot 3"), "{said:?}");
     let argv = std::fs::read_to_string(redis.join("argv")).unwrap();
     assert!(!argv.contains("DBSIZE"), "{argv}");
+}
+
+// Every slot the main checkout's env files name is main's, not only the
+// first: a queue's slot beside a cache's is never given out, even while it
+// is empty, and a record that claims it is never emptied.
+#[test]
+fn a_second_slot_the_main_checkout_names_is_never_given_out_or_emptied() {
+    let (ns, redis) = slots_fixture_keyed(
+        "DATABASE_PORT=3306\nDATABASE_NAME=shop\nDATABASE_USER=app\n\
+         REDIS_URL=redis://localhost:6379/0\nSIDEKIQ_REDIS_URL=redis://localhost:6379/1\n",
+        &["REDIS_URL", "SIDEKIQ_REDIS_URL"],
+    );
+    let (report, _) = ns.start(Mode::Namespaced).unwrap();
+    let running = guard(&report);
+    assert_eq!(
+        ns.env_line("SIDEKIQ_REDIS_URL").as_deref(),
+        Some("redis://localhost:6379/2"),
+        "slot 1 is main's queue, empty or not"
+    );
+    drop(running);
+    stop(&ns.fx.paths, &ns.name, None).unwrap();
+
+    let mut store = ns.fx.state();
+    for slot in store
+        .worktrees
+        .get_mut(&ns.name)
+        .unwrap()
+        .namespaces
+        .iter_mut()
+        .filter(|n| n.service == "redis")
+    {
+        slot.name = "1".into();
+    }
+    state::save(&ns.fx.paths.state_file(), &store).unwrap();
+    // rm reads config from disk, as it always does.
+    std::fs::write(
+        ns.fx.paths.config_file(),
+        "[dev]\ncmd = \"sleep 30\"\nports = []\n\n\
+         [[services]]\nkind = \"native\"\nname = \"mariadb\"\nenv = { DATABASE_PORT = \"mariadb\" }\n\n\
+         [[services]]\nkind = \"native\"\nname = \"redis\"\n\
+         env = { REDIS_URL = \"redis\", SIDEKIQ_REDIS_URL = \"redis\" }\n",
+    )
+    .unwrap();
+    let (said, progress) = collecting();
+    super::rm(&ns.fx.paths, &ns.name, false, false, &progress).unwrap();
+    let said = said.borrow().clone();
+    assert!(
+        said.iter()
+            .any(|l| l.contains("redis slot 1 is left as it is")
+                && l.contains("main checkout's own slot")),
+        "{said:?}"
+    );
+    assert!(!redis.join("flushed").exists(), "main's queue was emptied");
+}
+
+// A URL with no path beside `REDIS_DB=10` names two slots, and neither is
+// ever a worktree's.
+#[test]
+fn a_slot_a_key_names_beside_a_url_with_no_path_is_the_main_checkouts_too() {
+    let (ns, _redis) = slots_fixture_keyed(
+        "DATABASE_PORT=3306\nDATABASE_NAME=shop\nDATABASE_USER=app\n\
+         REDIS_URL=redis://localhost:6379\nREDIS_DB=10\n",
+        &["REDIS_URL"],
+    );
+    hold(&ns, (1..=9).map(|n| (n, false)));
+    let (report, _) = ns.start(Mode::Namespaced).unwrap();
+    let _guard = guard(&report);
+    assert_eq!(ns.env_line("REDIS_DB").as_deref(), Some("11"));
+    assert_eq!(
+        ns.env_line("REDIS_URL").as_deref(),
+        Some("redis://localhost:6379/11")
+    );
 }
 
 // Decision 3: an app that reads no slot setting has nowhere to be told

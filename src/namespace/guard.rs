@@ -19,8 +19,9 @@ use super::name::{MARKER, MAX_NAME, is_plain};
 ///   is pando's word that pando created it. A database that was already
 ///   there is never recorded, and never dropped.
 /// - **It is never the main checkout's own**, whatever the record says: not
-///   the name recorded beside it, and not the name the main checkout's env
-///   files give today (`main_now`). Compared without case, because MariaDB
+///   the name recorded beside it, and not any name the main checkout's env
+///   files give today (`main_now`) — a queue's slot beside a cache's is
+///   main's as much as the first. Compared without case, because MariaDB
 ///   on macOS does. For a slot, never slot 0 either, which is where every
 ///   app that says nothing about slots puts its keys.
 /// - **A database carries the marker after the main name** —
@@ -38,7 +39,7 @@ pub fn may_drop(
     state: &State,
     worktree: &str,
     namespace: &NamespaceRecord,
-    main_now: Option<&str>,
+    main_now: &[&str],
 ) -> Result<()> {
     let what = describe(namespace);
     let recorded = state
@@ -50,7 +51,7 @@ pub fn may_drop(
             "{what} is not recorded as {worktree}'s, so pando did not make it and will not drop it"
         );
     }
-    let mains = std::iter::once(namespace.main.as_str()).chain(main_now);
+    let mains = std::iter::once(namespace.main.as_str()).chain(main_now.iter().copied());
     match namespace.kind {
         NamespaceKind::Database => {
             for main in mains {

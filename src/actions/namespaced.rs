@@ -125,6 +125,11 @@ pub(super) struct Target {
     pub port: u16,
     /// The main checkout's own database or slot on that server.
     pub main: String,
+    /// Every one the main checkout's env files name on that server, `main`
+    /// first: a second URL can name another slot of the same Redis — a
+    /// queue's beside a cache's — and that one is main's just as much.
+    /// None of them is ever given out or emptied.
+    pub mains: Vec<String>,
     /// Every key the app reads its database or slot from.
     pub tells: Vec<Tell>,
 }
@@ -318,7 +323,7 @@ fn target(
                 .map(|(_, host)| host)
         })
         .unwrap_or_else(|| "127.0.0.1".to_string());
-    let (main, tells) = match namespace.kind {
+    let (mains, tells) = match namespace.kind {
         NamespaceKind::Database => database_main(root, &keys, &urls)
             .ok_or("nothing in the main checkout's env files names its database")?,
         NamespaceKind::Slot => {
@@ -332,27 +337,29 @@ fn target(
         keys,
         host,
         port,
-        main,
+        main: mains[0].clone(),
+        mains,
         tells,
     })
 }
 
-/// The main checkout's own slot, and every key that says which one the app
-/// uses: the path of each URL — none is slot 0 — and a key of its own
-/// beside the address, `REDIS_DB` next to `REDIS_PORT`. An app that reads
-/// neither has nowhere to be told another slot, and stays shared.
+/// Every slot the main checkout's env files name, the one it is known by
+/// first, and every key that says which one the app uses: the path of
+/// each URL — none is slot 0 — and a key of its own beside the address,
+/// `REDIS_DB` next to `REDIS_PORT`. An app that reads neither has nowhere
+/// to be told another slot, and stays shared.
 fn slot_main(
     root: &std::path::Path,
     keys: &[String],
     urls: &[&(String, String)],
-) -> Option<(String, Vec<Tell>)> {
-    let mut main: Option<String> = None;
+) -> Option<(Vec<String>, Vec<Tell>)> {
+    let mut mains: Vec<String> = Vec::new();
     let mut tells: Vec<Tell> = Vec::new();
     for (key, url) in urls {
         let (_, path) = crate::services::url_identity(url);
         let slot = path.unwrap_or_else(|| "0".to_string());
         if slot.chars().all(|c| c.is_ascii_digit()) {
-            main.get_or_insert(slot);
+            add_main(&mut mains, slot);
             tells.push(Tell::UrlPath(key.clone()));
         }
     }
@@ -360,25 +367,39 @@ fn slot_main(
         crate::services::sibling_value(root, keys.iter().map(String::as_str), &["_DB"])
         && value.chars().all(|c| c.is_ascii_digit())
     {
-        main.get_or_insert(value);
+        add_main(&mut mains, value);
         tells.push(Tell::Key(key));
     }
-    Some((main?, tells))
+    (!mains.is_empty()).then_some((mains, tells))
 }
 
-/// The main checkout's own database, and every key that says which one
-/// the app uses: the path of each URL, and a key of its own beside the
-/// address — `DATABASE_NAME` next to `DATABASE_PORT`.
+/// Adds one name the main checkout's env files give its own, once: `07`
+/// and `7` are one slot, `Shop` and `shop` one database to MariaDB on
+/// macOS.
+fn add_main(mains: &mut Vec<String>, main: String) {
+    let same = |a: &str, b: &str| match (a.parse::<u32>(), b.parse::<u32>()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a.eq_ignore_ascii_case(b),
+    };
+    if !mains.iter().any(|known| same(known, &main)) {
+        mains.push(main);
+    }
+}
+
+/// Every database the main checkout's env files name, the one it is
+/// known by first, and every key that says which one the app uses: the
+/// path of each URL, and a key of its own beside the address —
+/// `DATABASE_NAME` next to `DATABASE_PORT`.
 fn database_main(
     root: &std::path::Path,
     keys: &[String],
     urls: &[&(String, String)],
-) -> Option<(String, Vec<Tell>)> {
-    let mut main: Option<String> = None;
+) -> Option<(Vec<String>, Vec<Tell>)> {
+    let mut mains: Vec<String> = Vec::new();
     let mut tells: Vec<Tell> = Vec::new();
     for (key, url) in urls {
         if let (_, Some(database)) = crate::services::url_identity(url) {
-            main.get_or_insert(database);
+            add_main(&mut mains, database);
             tells.push(Tell::UrlPath(key.clone()));
         }
     }
@@ -399,7 +420,7 @@ fn database_main(
             if value.is_empty() || value.chars().all(|c| c.is_ascii_digit()) {
                 continue;
             }
-            main.get_or_insert_with(|| value.to_string());
+            add_main(&mut mains, value.to_string());
             let tell = Tell::Key(sibling);
             if !tells.contains(&tell) {
                 tells.push(tell);
@@ -407,7 +428,7 @@ fn database_main(
             break;
         }
     }
-    Some((main?, tells))
+    (!mains.is_empty()).then_some((mains, tells))
 }
 
 /// What a namespaced start made ready before anything was stopped.
@@ -735,12 +756,16 @@ fn ensure_slot(
 }
 
 /// The slots pando may give a worktree on a target's server: every one it
-/// has but 0 — where an app that names no slot keeps its keys — and the
-/// main checkout's own.
+/// has but 0 — where an app that names no slot keeps its keys — and every
+/// one the main checkout's env files name.
 fn allocatable(target: &Target) -> Vec<u32> {
     let slots = target.namespace.slots.unwrap_or(0);
-    let main = target.main.parse::<u32>().ok();
-    (1..slots).filter(|n| Some(*n) != main).collect()
+    let mains: Vec<u32> = target
+        .mains
+        .iter()
+        .filter_map(|main| main.parse::<u32>().ok())
+        .collect();
+    (1..slots).filter(|n| !mains.contains(n)).collect()
 }
 
 /// A worktree holding a slot on a target's server.
@@ -936,7 +961,7 @@ fn free_slot(
         &store,
         &holder.worktree,
         &holder.namespace,
-        Some(&target.main),
+        &target.mains.iter().map(String::as_str).collect::<Vec<_>>(),
     )?;
     server.drop(&holder.namespace.name, &target.main)?;
     if let Some(record) = store.worktrees.get_mut(&holder.worktree) {
@@ -1089,11 +1114,14 @@ pub(super) fn drop_namespaces(
         let target = targets
             .iter()
             .find(|t| t.service == ns.service && t.port == ns.port && t.namespace.kind == ns.kind);
-        // The name the main checkout's env files give its own today,
+        // Every name the main checkout's env files give its own today,
         // refused whatever the record says.
-        let main_now = target.map(|t| t.main.as_str());
+        let main_now: Vec<&str> = target
+            .iter()
+            .flat_map(|t| t.mains.iter().map(String::as_str))
+            .collect();
         let what = namespace::describe(ns);
-        if let Err(e) = namespace::may_drop(store, name, ns, main_now) {
+        if let Err(e) = namespace::may_drop(store, name, ns, &main_now) {
             progress(&format!("{}: {what} is left as it is — {e:#}", ns.service));
             continue;
         }
