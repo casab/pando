@@ -22,6 +22,13 @@ const SPINNER_FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "�
 /// it on the next start instead.
 const NO_PROCESSES: &str = "no processes configured";
 
+/// Whether a line an action said on its way is worth the header as well
+/// as `m`: one that calls itself a warning, or says something could not
+/// be done. Matched loosely too: a miss still leaves the line in `m`.
+fn is_warning(line: &str) -> bool {
+    line.starts_with("warning:") || line.contains("could not")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingKind {
     Create,
@@ -165,9 +172,33 @@ pub struct PendingAction {
     pub spinner_frame: u8,
     pub progress_rx: Option<Receiver<String>>,
     pub stage: Option<String>,
+    /// Every line the worker has said, in order. The spinner shows only
+    /// the newest, and a line that arrives with the outcome is never on
+    /// screen at all, so `m` gets them once the action is done.
+    pub said: Vec<String>,
     /// What the messages call it: the branch, which is what a developer
     /// knows it by, rather than the directory name derived from it.
     pub label: String,
+}
+
+impl PendingAction {
+    /// Takes whatever the worker has said since the last poll.
+    fn take_progress(&mut self) {
+        let Some(prx) = self.progress_rx.as_ref() else {
+            return;
+        };
+        while let Ok(line) = prx.try_recv() {
+            self.stage = Some(line.clone());
+            self.said.push(line);
+        }
+    }
+
+    /// Everything it said, once the outcome is in: a line sent just before
+    /// the outcome may have arrived after this poll's first read.
+    fn all_it_said(&mut self) -> Vec<String> {
+        self.take_progress();
+        std::mem::take(&mut self.said)
+    }
 }
 
 impl App {
@@ -275,6 +306,7 @@ impl App {
             spinner_frame: 0,
             progress_rx: None,
             stage: None,
+            said: Vec::new(),
         });
         true
     }
@@ -297,25 +329,29 @@ impl App {
                 || self.queued_question.is_some())
     }
 
+    /// What an action said on its way, as one entry in `m`, before the
+    /// outcome: the CLI prints every line, and the spinner here showed
+    /// each only until the next.
+    fn keep_what_it_said(&mut self, doing: &str, said: &[String]) {
+        if !said.is_empty() {
+            self.set_status(format!("{doing}: {}", said.join(" · ")));
+        }
+    }
+
     pub fn poll_pending(&mut self) {
         let asking = self.awaiting_answer();
         let may_spin = self.spinner_may_take_header();
         let Some(pending) = self.pending.as_mut() else {
             return;
         };
-        if let Some(prx) = pending.progress_rx.as_ref() {
-            let mut latest = None;
-            while let Ok(msg) = prx.try_recv() {
-                latest = Some(msg);
-            }
-            if latest.is_some() {
-                pending.stage = latest;
-            }
-        }
+        pending.take_progress();
         match pending.rx.try_recv() {
             Ok(Ok(outcome)) => {
                 let label = pending.label.clone();
+                let said = pending.all_it_said();
+                let doing = format!("{} {label}", pending.kind.verb());
                 self.pending = None;
+                self.keep_what_it_said(&doing, &said);
                 match outcome {
                     PendingOutcome::Created(name) => {
                         self.set_success(format!("created {label} — s starts it"));
@@ -388,11 +424,25 @@ impl App {
                         self.spawn_refresh();
                     }
                 }
+                // After the outcome, so the header has them: a hook that
+                // changed the worktree is what Invariant 1 promises is
+                // said, and the one command that removes the volumes an
+                // `rm` could not is not left to be found in `m`.
+                let warnings: Vec<&str> = said
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|line| is_warning(line))
+                    .collect();
+                if !warnings.is_empty() {
+                    self.set_error(warnings.join(" · "));
+                }
             }
             Ok(Err(e)) => {
                 let (kind, label, name) =
                     (pending.kind, pending.label.clone(), pending.name.clone());
+                let said = pending.all_it_said();
                 self.pending = None;
+                self.keep_what_it_said(&format!("{} {label}", kind.verb()), &said);
                 // The one start failure that is not about this worktree but
                 // about the project: from now on `⏎` and `s` say so up
                 // front.

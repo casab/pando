@@ -4541,6 +4541,124 @@ fn a_create_whose_install_failed_says_it_was_created_and_goes_to_it() {
     assert_eq!(app.select_on_arrival, None);
 }
 
+/// Starts `kind` on `name` with a worker that says `lines` on its way and
+/// then reports `outcome` at once, the way a quick `rm` does.
+fn pending_that_says(
+    app: &mut App,
+    name: &str,
+    kind: PendingKind,
+    lines: &[&str],
+    outcome: Result<PendingOutcome, String>,
+) {
+    let (ptx, prx) = mpsc::channel::<String>();
+    let lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    app.spawn_pending(name.into(), kind, move || {
+        for line in lines {
+            let _ = ptx.send(line);
+        }
+        outcome
+    });
+    app.pending.as_mut().unwrap().progress_rx = Some(prx);
+}
+
+// `F` with Docker down: the line naming the command that removes the
+// volumes came in with the outcome, was never painted, and the record
+// that named the compose project was gone. `m` had no trace of it.
+#[test]
+fn what_an_action_said_on_its_way_is_kept_and_a_warning_is_shown() {
+    let mut app = test_app(&["feat+one"]);
+    let volumes = "Docker is not running, so the services of pando-x could not be removed — \
+                   their data volumes survive; once Docker is up, `docker compose -p pando-x \
+                   down -v` removes them";
+    pending_that_says(
+        &mut app,
+        "feat+one",
+        PendingKind::Remove,
+        &["stopping dev", volumes],
+        Ok(PendingOutcome::Removed("feat+one".into())),
+    );
+    wait_for_pending(&mut app);
+
+    let (message, is_error) = app.active_status().unwrap();
+    assert_eq!(message, volumes, "the header has the warning");
+    assert!(is_error);
+    let said: Vec<&str> = app.messages.iter().map(|m| m.message.as_str()).collect();
+    assert_eq!(
+        said,
+        vec![
+            format!("removing feat/one: stopping dev · {volumes}").as_str(),
+            "removed feat/one",
+            volumes,
+        ],
+        "m has every line, then the outcome"
+    );
+}
+
+// A frozen install that rewrote its lockfile: the warning came just
+// before the outcome, and "created feat/x" replaced it within a tick.
+#[test]
+fn a_hook_warning_outlasts_the_outcome_it_came_with() {
+    let mut app = test_app(&["feat+one"]);
+    let warning = "warning: the install hook changed one of the files it is keyed on";
+    pending_that_says(
+        &mut app,
+        "feat+x",
+        PendingKind::Create,
+        &["checking out feat/x", "installing", warning],
+        Ok(PendingOutcome::Created("feat+x".into())),
+    );
+    wait_for_pending(&mut app);
+    let (message, is_error) = app.active_status().unwrap();
+    assert_eq!(message, warning);
+    assert!(is_error);
+    assert!(
+        app.messages
+            .iter()
+            .any(|m| m.message.starts_with("created feat+x")),
+        "the outcome is still in m: {:?}",
+        app.messages
+    );
+}
+
+// Stages alone are kept in `m`, and the header still ends on the outcome.
+#[test]
+fn an_action_that_only_narrated_ends_on_its_outcome() {
+    let mut app = test_app(&["feat+one"]);
+    pending_that_says(
+        &mut app,
+        "feat+one",
+        PendingKind::Stop,
+        &["stopping dev"],
+        Ok(PendingOutcome::Stopped("feat+one".into())),
+    );
+    wait_for_pending(&mut app);
+    assert_eq!(app.active_status(), Some(("stopped feat/one", false)));
+    assert!(
+        app.messages
+            .iter()
+            .any(|m| m.message == "stopping feat/one: stopping dev")
+    );
+
+    // A failure keeps what was said before it, and ends on the error.
+    let mut app = test_app(&["feat+one"]);
+    pending_that_says(
+        &mut app,
+        "feat+one",
+        PendingKind::Start,
+        &["starting services: db"],
+        Err("db did not become ready".into()),
+    );
+    wait_for_pending(&mut app);
+    let (message, is_error) = app.active_status().unwrap();
+    assert!(message.starts_with("could not start feat/one"), "{message}");
+    assert!(is_error);
+    assert!(
+        app.messages
+            .iter()
+            .any(|m| m.message == "starting feat/one: starting services: db")
+    );
+}
+
 // ---- errors about one worktree ---------------------------------------
 
 // An error raised by feat/db's start does not follow the reader into

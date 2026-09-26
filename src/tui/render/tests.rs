@@ -2738,6 +2738,7 @@ fn the_footer_says_a_question_is_waiting() {
         spinner_frame: 0,
         progress_rx: None,
         stage: None,
+        said: Vec::new(),
         label: "feat/one".into(),
     });
     let (tx, _rx) = std::sync::mpsc::channel();
