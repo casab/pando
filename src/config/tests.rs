@@ -344,6 +344,96 @@ fn patching_never_touches_a_committed_pando_toml() {
     assert!(f.paths.config_file().starts_with(&f.paths.home));
 }
 
+// A dotfiles manager links `~/.pando/config.toml` to a file of its own.
+// The first theme picked renamed a regular file over the link, and from
+// then on the dotfile the developer edited was not the one pando read.
+#[test]
+fn a_config_that_is_a_link_is_written_through_and_stays_a_link() {
+    let f = fixture();
+    let dotfiles = f._dir.path().join("dotfiles");
+    std::fs::create_dir_all(&dotfiles).unwrap();
+    let target = dotfiles.join("pando.toml");
+    std::fs::write(&target, "[runtime]\nprelude = \"nvm use\"\n").unwrap();
+    f.paths.ensure_home().unwrap();
+    let link = f.paths.user_config_file();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    set_detected(
+        &f.paths,
+        Layer::User,
+        &["ui"],
+        "theme",
+        "nord",
+        Note::Answered,
+    )
+    .unwrap();
+
+    let meta = std::fs::symlink_metadata(&link).unwrap();
+    assert!(meta.file_type().is_symlink(), "the link is still a link");
+    assert_eq!(std::fs::read_link(&link).unwrap(), target);
+    let written = std::fs::read_to_string(&target).unwrap();
+    assert!(written.contains("prelude = \"nvm use\""), "{written}");
+    assert!(written.contains("theme = \"nord\""), "{written}");
+    let leftovers: Vec<_> = std::fs::read_dir(&dotfiles)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name != "pando.toml")
+        .collect();
+    assert_eq!(
+        leftovers,
+        Vec::<String>::new(),
+        "no temp file or lock left there"
+    );
+}
+
+// A link is followed only to a file pando may write: never into the
+// repository, and never to a file that is not there.
+#[test]
+fn a_config_linked_into_the_repository_or_nowhere_is_never_written() {
+    let f = fixture();
+    let committed = "[project]\nbase = \"main\"\n";
+    write_committed(&f, committed);
+    std::fs::create_dir_all(f.paths.project_dir()).unwrap();
+    let link = f.paths.config_file();
+    std::os::unix::fs::symlink(f.root.join("pando.toml"), &link).unwrap();
+    let write = || {
+        set_detected(
+            &f.paths,
+            Layer::Project,
+            &["dev"],
+            "cmd",
+            "pnpm dev",
+            Note::Answered,
+        )
+    };
+    let e = format!("{:#}", write().unwrap_err());
+    assert!(e.contains("is inside the repository"), "{e}");
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("pando.toml")).unwrap(),
+        committed
+    );
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+
+    let nowhere = f._dir.path().join("gone.toml");
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&nowhere, &link).unwrap();
+    let e = format!("{:#}", write().unwrap_err());
+    assert!(e.contains("which is not there"), "{e}");
+    assert!(!nowhere.exists());
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
 #[test]
 fn a_home_file_that_is_not_valid_toml_is_never_overwritten() {
     let f = fixture();

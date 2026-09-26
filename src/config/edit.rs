@@ -128,13 +128,20 @@ impl Note {
 /// two starts in a fresh project, or a theme saved while a prelude is
 /// answered, patch one file at once; unlocked, each read the file before
 /// the other wrote it and only one of their answers was kept.
+///
+/// A file that is a symbolic link — a dotfiles manager's, say — is written
+/// through: the file it links to is replaced and the link stays. Renamed
+/// onto, the link became a copy, and the file the developer edits stopped
+/// being the one pando reads without a word said. The lock stays beside
+/// the link, in pando's home.
 pub fn patch<F>(paths: &PandoPaths, layer: Layer, edit: F) -> Result<()>
 where
     F: FnOnce(&mut DocumentMut) -> Result<()>,
 {
     paths.ensure_home()?;
-    let path = layer.file(paths);
-    let _lock = crate::state::lock(&path.with_extension("toml.lock"))?;
+    let file = layer.file(paths);
+    let _lock = crate::state::lock(&file.with_extension("toml.lock"))?;
+    let path = written_through(&file, paths.root())?;
     let existing = match std::fs::read_to_string(&path) {
         Ok(text) => Some(text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -528,6 +535,33 @@ fn comment_lines(space: Option<&RawString>, out: &mut String) {
         out.push_str(line);
         out.push('\n');
     }
+}
+
+/// The file a write to `path` lands in: `path` itself, or the file it is
+/// a symbolic link to.
+///
+/// A link that leads into the repository is refused rather than followed:
+/// pando never writes there, whoever made the link. So is one that leads
+/// nowhere, because a file created wherever a dangling link points is not
+/// one anybody asked for.
+fn written_through(path: &Path, root: &Path) -> Result<PathBuf> {
+    let linked = std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink());
+    if !linked {
+        return Ok(path.to_path_buf());
+    }
+    let target = std::fs::canonicalize(path).with_context(|| {
+        let to = std::fs::read_link(path)
+            .map(|to| to.display().to_string())
+            .unwrap_or_default();
+        format!(
+            "{} is a link to {to}, which is not there — create it, or remove the link, and run \
+             again",
+            path.display()
+        )
+    })?;
+    crate::paths::ensure_outside_repository("the config", &target, root, &[])
+        .with_context(|| format!("{} is a link to {}", path.display(), target.display()))?;
+    Ok(target)
 }
 
 /// Atomic, and 0600: the temp file is created 0600, so there is never a
