@@ -472,7 +472,9 @@ fn a_login_is_read_from_the_keys_beside_the_services_address() {
         "DATABASE_HOST=localhost\nDATABASE_PORT=3306\nDATABASE_NAME=shop\n\
          DATABASE_USER=shop_user\nDATABASE_PASSWORD=s3cr3t:w0rd\n",
     );
-    let login = login_from_env_files(root.path(), &keys(&["DATABASE_PORT"])).unwrap();
+    let login = login_from_env_files(root.path(), &keys(&["DATABASE_PORT"]))
+        .unwrap()
+        .unwrap();
     assert_eq!(login.user.as_deref(), Some("shop_user"));
     assert_eq!(
         login.env(Some("MYSQL_PWD")),
@@ -485,7 +487,9 @@ fn a_login_is_read_from_the_keys_beside_the_services_address() {
     );
     // The other spellings an app uses.
     let root = main_checkout("DB_PORT=3306\nDB_USERNAME=u\nDB_PASS=p\n");
-    let login = login_from_env_files(root.path(), &keys(&["DB_PORT"])).unwrap();
+    let login = login_from_env_files(root.path(), &keys(&["DB_PORT"]))
+        .unwrap()
+        .unwrap();
     assert_eq!(login.user.as_deref(), Some("u"));
     assert_eq!(
         login.env(Some("X")),
@@ -497,7 +501,9 @@ fn a_login_is_read_from_the_keys_beside_the_services_address() {
 fn a_login_in_a_url_is_read_with_its_escapes_undone() {
     let root =
         main_checkout("DATABASE_URL=mysql://shop%40corp:p%40ss%3Aw0rd@localhost:3306/shop\n");
-    let login = login_from_env_files(root.path(), &keys(&["DATABASE_URL"])).unwrap();
+    let login = login_from_env_files(root.path(), &keys(&["DATABASE_URL"]))
+        .unwrap()
+        .unwrap();
     assert_eq!(login.user.as_deref(), Some("shop@corp"));
     assert_eq!(
         login.env(Some("MYSQL_PWD")),
@@ -506,7 +512,9 @@ fn a_login_in_a_url_is_read_with_its_escapes_undone() {
     assert!(login.from.contains("DATABASE_URL"), "{}", login.from);
     // A password alone, the way a development Redis is protected.
     let root = main_checkout("REDIS_URL=redis://:only-a-password@localhost:6379/0\n");
-    let login = login_from_env_files(root.path(), &keys(&["REDIS_URL"])).unwrap();
+    let login = login_from_env_files(root.path(), &keys(&["REDIS_URL"]))
+        .unwrap()
+        .unwrap();
     assert_eq!(login.user, None);
     assert!(login.has_password());
 }
@@ -516,18 +524,18 @@ fn a_url_with_no_login_in_it_and_no_keys_beside_it_is_no_login() {
     let root = main_checkout("DATABASE_URL=mysql://localhost:3306/shop\nREDIS_PORT=6379\n");
     assert_eq!(
         login_from_env_files(root.path(), &keys(&["DATABASE_URL"])),
-        None
+        Ok(None)
     );
     assert_eq!(
         login_from_env_files(root.path(), &keys(&["REDIS_PORT"])),
-        None
+        Ok(None)
     );
-    assert_eq!(login_from_env_files(root.path(), &keys(&[])), None);
+    assert_eq!(login_from_env_files(root.path(), &keys(&[])), Ok(None));
     // Empty values say nothing either.
     let root = main_checkout("DATABASE_PORT=3306\nDATABASE_USER=\nDATABASE_PASSWORD=\n");
     assert_eq!(
         login_from_env_files(root.path(), &keys(&["DATABASE_PORT"])),
-        None
+        Ok(None)
     );
 }
 
@@ -552,6 +560,7 @@ fn the_login_written_for_pando_is_used_when_the_env_files_have_none_that_will_do
         true,
         file,
     )
+    .unwrap()
     .unwrap();
     assert_eq!(login.user.as_deref(), Some("root"));
     assert!(
@@ -570,6 +579,7 @@ fn the_login_written_for_pando_is_used_when_the_env_files_have_none_that_will_do
         true,
         file,
     )
+    .unwrap()
     .unwrap();
     assert_eq!(login.user.as_deref(), Some("root"));
     // …and does for one that does not.
@@ -581,6 +591,7 @@ fn the_login_written_for_pando_is_used_when_the_env_files_have_none_that_will_do
         false,
         file,
     )
+    .unwrap()
     .unwrap();
     assert_eq!(login.user, None);
     // The main checkout's own login, when it has one, beats pando's.
@@ -593,6 +604,7 @@ fn the_login_written_for_pando_is_used_when_the_env_files_have_none_that_will_do
         true,
         file,
     )
+    .unwrap()
     .unwrap();
     assert_eq!(login.user.as_deref(), Some("app"));
     // Nothing anywhere is nothing.
@@ -607,8 +619,41 @@ fn the_login_written_for_pando_is_used_when_the_env_files_have_none_that_will_do
             true,
             file
         )
+        .unwrap()
         .is_none()
     );
+}
+
+// Tried as written, the login was a user called `${DB_USER}`: the one
+// written down for pando is used instead, and with none, the variable is
+// named.
+#[test]
+fn a_login_that_holds_a_reference_nothing_sets_is_not_tried() {
+    let file = std::path::Path::new("/home/.pando/projects/p/pando.toml");
+    let root = main_checkout(
+        "DATABASE_PORT=3306\nDATABASE_USER=${PANDO_TEST_UNSET_USER}\nDATABASE_PASSWORD=pw\n",
+    );
+    let keys = keys(&["DATABASE_PORT"]);
+    let e = login_from_env_files(root.path(), &keys).unwrap_err();
+    assert_eq!(e.key, "DATABASE_USER");
+    assert_eq!(e.reference, "${PANDO_TEST_UNSET_USER}");
+    let none = crate::config::Config::default();
+    assert_eq!(
+        find_login(root.path(), &none, "mariadb", &keys, true, file).unwrap_err(),
+        e
+    );
+    let mut config = crate::config::Config::default();
+    config.namespaced.insert(
+        "mariadb".into(),
+        crate::config::LoginConfig {
+            user: Some("root".into()),
+            password: None,
+        },
+    );
+    let login = find_login(root.path(), &config, "mariadb", &keys, true, file)
+        .unwrap()
+        .unwrap();
+    assert_eq!(login.user.as_deref(), Some("root"));
 }
 
 // A config and a login both end up in error messages and `{:?}`s; neither

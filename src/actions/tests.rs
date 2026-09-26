@@ -656,6 +656,74 @@ fn a_shared_start_hands_the_app_its_env_files_references_expanded() {
     );
 }
 
+// A reference nothing pando reads sets may be one the app's own loader
+// knows, from a file pando does not read. Handed on as written, ahead of
+// that loader, it was the app's login; a namespaced start rewrote the
+// database around it.
+#[test]
+fn a_key_pando_cannot_expand_is_left_to_the_apps_loader_and_its_service_stays_shared() {
+    let mut fx = fixture();
+    std::fs::write(
+        fx.root.join(".env"),
+        "DATABASE_PORT=3306\n\
+         DATABASE_URL=mysql://${PANDO_TEST_UNSET_USER}@localhost:3306/shop\n",
+    )
+    .unwrap();
+    let services: Config = toml::from_str(
+        "[[services]]\nkind = \"native\"\nname = \"mariadb\"\n\
+         env = { DATABASE_URL = \"mariadb\", DATABASE_PORT = \"mariadb\" }\n",
+    )
+    .unwrap();
+    fx.config.services = services.services;
+    let env = super::services::shared_service_env(&fx.paths, &fx.config);
+    assert_eq!(env.get("DATABASE_URL"), None);
+    assert_eq!(env.get("DATABASE_PORT").map(String::as_str), Some("3306"));
+
+    let plan = super::namespaced::plan(&fx.paths, &fx.config);
+    assert!(plan.targets.is_empty(), "{:?}", plan.targets);
+    assert_eq!(
+        plan.shared_lines(),
+        vec![
+            "mariadb: shared — DATABASE_URL in .env holds ${PANDO_TEST_UNSET_USER}, which \
+             neither pando's environment nor an earlier line of .env sets"
+                .to_string()
+        ]
+    );
+    assert_eq!(plan.shared_data, vec!["mariadb".to_string()]);
+}
+
+// A key a recipe supplied is dropped when the project never wrote it. One
+// the project wrote and pando cannot expand is not: dropped, the app's own
+// loader read the main checkout's port from it.
+#[test]
+fn an_isolated_start_refuses_a_service_key_it_cannot_expand_whoever_named_it() {
+    let mut fx = fixture();
+    let services: Config =
+        toml::from_str("[[services]]\nkind = \"native\"\nname = \"postgres\"\n").unwrap();
+    fx.config.services = services.services;
+    let ports = BTreeMap::from([("postgres".to_string(), 17_004)]);
+    std::fs::write(fx.root.join(".env"), "OTHER=1\n").unwrap();
+    assert_eq!(
+        super::services::resolve_service_env(&fx.paths, &fx.config, &fx.root, &ports).unwrap(),
+        BTreeMap::new()
+    );
+    std::fs::write(
+        fx.root.join(".env"),
+        "DATABASE_URL=postgres://${PANDO_TEST_UNSET_USER}@localhost:5432/shop\n",
+    )
+    .unwrap();
+    let e =
+        super::services::resolve_service_env(&fx.paths, &fx.config, &fx.root, &ports).unwrap_err();
+    assert!(
+        e.downcast_ref::<crate::services::Unresolved>().is_some(),
+        "{e:#}"
+    );
+    assert!(
+        format!("{e:#}").contains("DATABASE_URL in .env holds ${PANDO_TEST_UNSET_USER}"),
+        "{e:#}"
+    );
+}
+
 #[test]
 fn a_process_that_owns_no_ports_starts_and_reaches_running() {
     let mut fx = fixture();
@@ -12236,6 +12304,24 @@ fn a_redis_the_app_reads_no_slot_setting_for_stays_shared_and_says_so() {
         "shop__feat_one\n",
         "a Redis left shared does not keep the schema step off the worktree's own database"
     );
+}
+
+// Tried as written, the worktree's database was made as a user called
+// `${…}`. A login the main checkout's env builds from a variable nothing
+// sets stops the start, naming it, with nothing made.
+#[test]
+fn a_namespaced_start_stops_on_a_login_it_cannot_expand_with_nothing_made() {
+    let ns = namespaced_fixture(
+        "DATABASE_HOST=localhost\nDATABASE_PORT=3306\nDATABASE_NAME=shop\n\
+         DATABASE_USER=${PANDO_TEST_UNSET_USER}\nDATABASE_PASSWORD=s3cret-pw\n",
+    );
+    let e = format!("{:#}", ns.start(Mode::Namespaced).unwrap_err());
+    assert!(
+        e.contains("DATABASE_USER in .env holds ${PANDO_TEST_UNSET_USER}")
+            && e.contains("[namespaced.mariadb]"),
+        "{e}"
+    );
+    assert_eq!(ns.fake("created"), "", "nothing was made");
 }
 
 // A slot is not a database. A namespaced start that gave Redis a slot and

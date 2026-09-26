@@ -456,7 +456,9 @@ const ENV_FILES: [&str; 4] = [".env", ".env.example", ".env.sample", ".env.templ
 /// project already uses is read from the worktree's own env files and its
 /// port replaced with the one pando allocated. A URL keeps its
 /// credentials, its database name, and its query string; a bare number
-/// becomes the port.
+/// becomes the port. A value that holds a reference nothing sets is an
+/// error of [`Unresolved`] underneath: rewritten around it, the app logged
+/// in as a user called `${DB_USER}`.
 ///
 /// This is what replaces materialising a rewritten `.env` inside the
 /// worktree, which Invariant 1 forbids unless the project ignores it. The
@@ -472,10 +474,13 @@ pub fn app_env(
         let port = *ports.get(service).with_context(|| {
             format!("no port was allocated for the service {service:?} (env.{key})")
         })?;
-        let Some((source, value)) = files
-            .iter()
-            .find_map(|(name, map)| map.get(key).map(|value| (name.as_str(), value.as_str())))
-        else {
+        let found = value_in_files(&files, key).map_err(|unresolved| {
+            anyhow::Error::new(unresolved).context(format!(
+                "env.{key} points at the service {service:?}, but pando cannot tell what {key} \
+                 will be"
+            ))
+        })?;
+        let Some((source, value)) = found else {
             bail!(
                 "env.{key} points at the service {service:?}, but nothing in this worktree says \
                  what {key} normally looks like — add it to .env.example (or .env), or drop it \
@@ -585,10 +590,12 @@ pub fn sibling_identity<'a>(
     keys: impl IntoIterator<Item = &'a str>,
 ) -> (Option<String>, Option<String>) {
     let files = read_env_files(worktree);
+    // As written: a reference nothing sets is no plain identifier, and the
+    // create step refuses it by name.
     let lookup = |key: &str| {
         files
             .iter()
-            .find_map(|(_, map)| map.get(key))
+            .find_map(|(_, env)| env.values.get(key))
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
     };
@@ -623,24 +630,33 @@ pub fn sibling_identity<'a>(
 /// it was found under, and its value.
 ///
 /// `DATABASE_PASSWORD` beside `DATABASE_PORT`, `REDIS_DB` beside
-/// `REDIS_PORT`.
+/// `REDIS_PORT`. [`Unresolved`] when the first one set holds a reference
+/// nothing sets, as [`value_in_env`] is.
 pub fn sibling_value<'a>(
     dir: &Path,
     keys: impl IntoIterator<Item = &'a str>,
     suffixes: &[&str],
-) -> Option<(String, String)> {
+) -> Result<Option<(String, String)>, Unresolved> {
     let files = read_env_files(dir);
-    keys.into_iter().find_map(|key| {
-        let prefix = ["_PORT", "_HOST", "_URL"]
+    for key in keys {
+        let Some(prefix) = ["_PORT", "_HOST", "_URL"]
             .iter()
-            .find_map(|suffix| key.strip_suffix(suffix))?;
-        suffixes.iter().find_map(|suffix| {
+            .find_map(|suffix| key.strip_suffix(suffix))
+        else {
+            continue;
+        };
+        for suffix in suffixes {
             let sibling = format!("{prefix}{suffix}");
-            let value = files.iter().find_map(|(_, map)| map.get(&sibling))?;
+            let Some((_, value)) = value_in_files(&files, &sibling)? else {
+                continue;
+            };
             let value = value.trim();
-            (!value.is_empty()).then(|| (sibling, value.to_string()))
-        })
-    })
+            if !value.is_empty() {
+                return Ok(Some((sibling, value.to_string())));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// The user and the password a connection URL carries before its `@`,
@@ -774,15 +790,74 @@ fn percent_decoded(text: &str) -> String {
 /// What shared mode probes. The services there are the ones the developer
 /// already runs, on the ports the project's own files say, so pando reads
 /// rather than assigns.
+///
+/// A value that holds a reference nothing sets still names its port when
+/// the port is written out: the server is where it says.
 pub fn port_in_env(dir: &Path, key: &str) -> Option<u16> {
-    port_of_value(&value_in_env(dir, key)?)
+    let files = read_env_files(dir);
+    let value = files.iter().find_map(|(_, env)| env.values.get(key))?;
+    port_of_value(value)
 }
 
 /// The value an env key has in this directory's env files, in lookup order.
-pub fn value_in_env(dir: &Path, key: &str) -> Option<String> {
-    read_env_files(dir)
-        .iter()
-        .find_map(|(_, map)| map.get(key).cloned())
+///
+/// [`Unresolved`] when the value holds a reference nothing sets: handed on
+/// as written, ahead of the app's own loader, the app logged in as a user
+/// called `${DB_USER}`.
+pub fn value_in_env(dir: &Path, key: &str) -> Result<Option<String>, Unresolved> {
+    let files = read_env_files(dir);
+    Ok(value_in_files(&files, key)?.map(|(_, value)| value.to_string()))
+}
+
+/// An env key whose value holds a reference that neither pando's
+/// environment nor an earlier line of its file sets: a variable of a shell
+/// pando was not started from, of a file it does not read, like
+/// `.env.local`, or a `$` in a password that one loader reads as a
+/// reference and another as itself. What the app's own loader makes of it
+/// is not something pando can know.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unresolved {
+    pub key: String,
+    /// The file it was read from: `.env`.
+    pub file: String,
+    /// The reference, as written: `${DB_USER}`.
+    pub reference: String,
+}
+
+impl std::fmt::Display for Unresolved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} in {} holds {}, which neither pando's environment nor an earlier line of {} sets",
+            self.key, self.file, self.reference, self.file
+        )
+    }
+}
+
+impl std::error::Error for Unresolved {}
+
+/// A key's value in `files`, and the name of the file it is in: the first
+/// file that sets it wins, and when that one's value holds a reference
+/// nothing sets, the key is [`Unresolved`] rather than the text as
+/// written. A later file is not asked: an example's value is not the real
+/// one.
+fn value_in_files<'a>(
+    files: &'a [(String, ParsedEnv)],
+    key: &str,
+) -> Result<Option<(&'a str, &'a str)>, Unresolved> {
+    for (name, env) in files {
+        if let Some(reference) = env.unresolved.get(key) {
+            return Err(Unresolved {
+                key: key.to_string(),
+                file: name.clone(),
+                reference: reference.clone(),
+            });
+        }
+        if let Some(value) = env.values.get(key) {
+            return Ok(Some((name, value)));
+        }
+    }
+    Ok(None)
 }
 
 /// The port a value names: the port of a URL, or a bare number.
@@ -808,16 +883,29 @@ pub fn port_of_value(value: &str) -> Option<u16> {
     hostport.get(colon + 1..)?.parse().ok()
 }
 
-/// Every env file the worktree has, in lookup order, each as a key map.
-fn read_env_files(worktree: &Path) -> Vec<(String, std::collections::BTreeMap<String, String>)> {
+/// Every env file the worktree has, in lookup order, each by its name.
+fn read_env_files(worktree: &Path) -> Vec<(String, ParsedEnv)> {
     let mut out = Vec::new();
     for name in ENV_FILES {
         let Ok(text) = std::fs::read_to_string(worktree.join(name)) else {
             continue;
         };
-        out.push((name.to_string(), parse_env(&text)));
+        out.push((
+            name.to_string(),
+            parse_env_in(&text, &|name| std::env::var(name).ok()),
+        ));
     }
     out
+}
+
+/// An env file's keys, as [`parse_env`] reads them.
+#[derive(Debug, Default)]
+struct ParsedEnv {
+    values: std::collections::BTreeMap<String, String>,
+    /// Each key whose value holds a reference nothing sets, with the first
+    /// such reference as written: `${DB_USER}`. Its value keeps it as
+    /// written.
+    unresolved: std::collections::BTreeMap<String, String>,
 }
 
 /// `KEY=value` lines, with `export`, surrounding quotes and a trailing
@@ -839,30 +927,42 @@ fn read_env_files(worktree: &Path) -> Vec<(String, std::collections::BTreeMap<St
 /// earlier in the same file, which is the order a loader that does not
 /// override the environment resolves them in. `${NAME:-default}` and
 /// `${NAME-default}` take their default as a shell does, references in
-/// it and all, `\$` is a literal `$`, and a reference nothing defines is
-/// left as written. The
-/// app's own loader would have expanded `postgres://${POSTGRES_USER}@…`;
-/// handed it unexpanded, ahead of that loader, the app logged in as a
-/// user called `${POSTGRES_USER}`.
+/// it and all, and `\$` is a literal `$`. A reference nothing defines is
+/// left as written, and the key it is in, and any key built from that
+/// one, is known to hold it: [`value_in_env`] says so rather than hand it
+/// on. The app's own loader would have expanded
+/// `postgres://${POSTGRES_USER}@…`; handed it unexpanded, ahead of that
+/// loader, the app logged in as a user called `${POSTGRES_USER}`.
 pub fn parse_env(text: &str) -> std::collections::BTreeMap<String, String> {
-    parse_env_in(text, &|name| std::env::var(name).ok())
+    parse_env_in(text, &|name| std::env::var(name).ok()).values
 }
 
 /// [`parse_env`], with the process environment as `environment` answers
-/// for it.
-fn parse_env_in(
-    text: &str,
-    environment: &dyn Fn(&str) -> Option<String>,
-) -> std::collections::BTreeMap<String, String> {
-    let mut out = std::collections::BTreeMap::new();
+/// for it, and the keys that hold a reference nothing sets.
+fn parse_env_in(text: &str, environment: &dyn Fn(&str) -> Option<String>) -> ParsedEnv {
+    let mut out = ParsedEnv::default();
     for (key, value, quote) in text.lines().filter_map(env_entry) {
-        let value = match quote {
-            Some('\'') => value.to_string(),
-            _ => expand(value, &|name| {
-                environment(name).or_else(|| out.get(name).cloned())
+        let expanded = match quote {
+            Some('\'') => Expanded {
+                text: value.to_string(),
+                unresolved: None,
+            },
+            _ => expand(value, &|name| match environment(name) {
+                Some(text) => Some(Expanded {
+                    text,
+                    unresolved: None,
+                }),
+                None => out.values.get(name).map(|text| Expanded {
+                    text: text.clone(),
+                    unresolved: out.unresolved.get(name).cloned(),
+                }),
             }),
         };
-        out.insert(key.to_string(), value);
+        match expanded.unresolved {
+            Some(reference) => out.unresolved.insert(key.to_string(), reference),
+            None => out.unresolved.remove(key),
+        };
+        out.values.insert(key.to_string(), expanded.text);
     }
     out
 }
@@ -900,11 +1000,19 @@ fn env_entry(line: &str) -> Option<(&str, &str, Option<char>)> {
     })
 }
 
+/// A value with its references expanded, as [`expand`] makes it.
+struct Expanded {
+    text: String,
+    /// The first reference in it that nothing sets, as written.
+    unresolved: Option<String>,
+}
+
 /// A value with its `$NAME`, `${NAME}`, `${NAME:-default}` and
 /// `${NAME-default}` references replaced by what `lookup` says, as
 /// [`parse_env`] describes.
-fn expand(value: &str, lookup: &dyn Fn(&str) -> Option<String>) -> String {
+fn expand(value: &str, lookup: &dyn Fn(&str) -> Option<Expanded>) -> Expanded {
     let mut out = String::with_capacity(value.len());
+    let mut unresolved = None;
     let mut rest = value;
     while let Some(at) = rest.find(['$', '\\']) {
         out.push_str(&rest[..at]);
@@ -922,18 +1030,29 @@ fn expand(value: &str, lookup: &dyn Fn(&str) -> Option<String>) -> String {
             continue;
         };
         // A default is expanded only when it is taken, as a shell does.
-        match (lookup(reference.name), reference.default) {
-            (Some(found), Some(default)) if found.is_empty() && reference.or_empty => {
-                out.push_str(&expand(default, lookup))
+        let taken = match (lookup(reference.name), reference.default) {
+            (Some(found), Some(default)) if found.text.is_empty() && reference.or_empty => {
+                expand(default, lookup)
             }
-            (Some(found), _) => out.push_str(&found),
-            (None, Some(default)) => out.push_str(&expand(default, lookup)),
-            (None, None) => out.push_str(&tail[..1 + reference.len]),
-        }
+            (Some(found), _) => found,
+            (None, Some(default)) => expand(default, lookup),
+            (None, None) => {
+                let written = &tail[..1 + reference.len];
+                Expanded {
+                    text: written.to_string(),
+                    unresolved: Some(written.to_string()),
+                }
+            }
+        };
+        out.push_str(&taken.text);
+        unresolved = unresolved.or(taken.unresolved);
         rest = &tail[1 + reference.len..];
     }
     out.push_str(rest);
-    out
+    Expanded {
+        text: out,
+        unresolved,
+    }
 }
 
 /// A reference, as [`expand`] reads the text after its `$`.
@@ -1213,13 +1332,13 @@ mod tests {
         // An empty `.env` value is nothing, and the next spelling is read.
         assert_eq!(
             sibling_value(dir.path(), ["DB_PORT"], &["_PASSWORD", "_PWD", "_PASS"]),
-            Some(("DB_PWD".to_string(), "real".to_string()))
+            Ok(Some(("DB_PWD".to_string(), "real".to_string())))
         );
         assert_eq!(
             sibling_value(dir.path(), ["REDIS_URL"], &["_DB"]),
-            Some(("REDIS_DB".to_string(), "2".to_string()))
+            Ok(Some(("REDIS_DB".to_string(), "2".to_string())))
         );
-        assert_eq!(sibling_value(dir.path(), ["PORT"], &["_DB"]), None);
+        assert_eq!(sibling_value(dir.path(), ["PORT"], &["_DB"]), Ok(None));
     }
 
     #[test]
@@ -1827,7 +1946,8 @@ mod tests {
              QUOTED=\"$POSTGRES_USER-${FROM_SHELL}\"\n\
              FROM_SHELL=file\nSHADOWED=${FROM_SHELL}\n",
             &environment,
-        );
+        )
+        .values;
         assert_eq!(
             parsed["DATABASE_URL"],
             "postgres://app:s3cret@localhost:5432/shop"
@@ -1849,7 +1969,8 @@ mod tests {
              LITERAL='${DB_PORT}'\nESCAPED=\"a\\$DB_PORT\"\nUNKNOWN=${NOPE}/$NOPE\n\
              DOLLARS=pa$$word$ $1\nBROKEN=${DB_PORT\nLATER=${AFTER}\nAFTER=1\n",
             &|_| None,
-        );
+        )
+        .values;
         assert_eq!(parsed["DB_PORT"], "5432");
         assert_eq!(parsed["A"], "x", "`:-` stands in for an empty value");
         assert_eq!(parsed["B"], "", "`-` only for an unset one");
@@ -1875,7 +1996,8 @@ mod tests {
              TAKEN=${SET:-${DB_USER}}\n\
              ESCAPED=${UNSET:-\\${DB_USER}}\n",
             &environment,
-        );
+        )
+        .values;
         assert_eq!(parsed["DATABASE_URL"], "postgres://app@localhost:5432/app");
         assert_eq!(parsed["DEEP"], "app-x");
         assert_eq!(
@@ -1905,9 +2027,84 @@ mod tests {
         assert_eq!(env["DATABASE_URL"], "postgres://app@localhost:17004/shop");
         assert_eq!(env["DB_PORT"], "17004");
         assert_eq!(
-            value_in_env(dir.path(), "DATABASE_URL").as_deref(),
+            value_in_env(dir.path(), "DATABASE_URL").unwrap().as_deref(),
             Some("postgres://app@localhost:5432/shop"),
             "and a shared or namespaced start reads it expanded"
+        );
+    }
+
+    #[test]
+    fn a_reference_nothing_sets_is_known_and_so_is_a_key_built_from_it() {
+        let parsed = parse_env_in(
+            "USER=${NOPE}\nURL=postgres://${USER}@localhost/shop\nDEFAULTED=${NOPE:-app}\n\
+             LITERAL='${NOPE}'\nESCAPED=\\$NOPE\nREDONE=${NOPE}\nREDONE=app\n\
+             DEEP=${UNSET:-${NOPE}}\n",
+            &|_| None,
+        );
+        let unresolved = |key: &str| parsed.unresolved.get(key).map(String::as_str);
+        assert_eq!(unresolved("USER"), Some("${NOPE}"));
+        assert_eq!(
+            unresolved("URL"),
+            Some("${NOPE}"),
+            "built from a key that holds one"
+        );
+        assert_eq!(parsed.values["URL"], "postgres://${NOPE}@localhost/shop");
+        assert_eq!(unresolved("DEEP"), Some("${NOPE}"), "a default taken");
+        for key in ["DEFAULTED", "LITERAL", "ESCAPED", "REDONE"] {
+            assert_eq!(unresolved(key), None, "{key}");
+        }
+    }
+
+    // Handed on as written, ahead of the app's own loader, `${DB_USER}` was
+    // the app's login; rewritten around it, an isolated app's too.
+    #[test]
+    fn a_value_holding_a_reference_nothing_sets_is_never_handed_on_as_written() {
+        let dir = worktree_with(&[
+            (
+                ".env",
+                "DATABASE_URL=postgres://${PANDO_TEST_UNSET_USER}@localhost:5432/shop\n",
+            ),
+            (
+                ".env.example",
+                "DATABASE_URL=postgres://app@localhost:5432/shop\n",
+            ),
+        ]);
+        let unresolved = Unresolved {
+            key: "DATABASE_URL".into(),
+            file: ".env".into(),
+            reference: "${PANDO_TEST_UNSET_USER}".into(),
+        };
+        assert_eq!(
+            value_in_env(dir.path(), "DATABASE_URL"),
+            Err(unresolved.clone()),
+            "and the example's value is not the real one"
+        );
+        let e = app_env(
+            dir.path(),
+            &map(&[("DATABASE_URL", "postgres")]),
+            &ports(&[("postgres", 17_004)]),
+        )
+        .unwrap_err();
+        assert_eq!(e.downcast_ref::<Unresolved>(), Some(&unresolved));
+        let e = format!("{e:#}");
+        assert!(
+            e.contains("env.DATABASE_URL")
+                && e.contains("DATABASE_URL in .env holds ${PANDO_TEST_UNSET_USER}"),
+            "{e}"
+        );
+        assert_eq!(
+            port_in_env(dir.path(), "DATABASE_URL"),
+            Some(5432),
+            "the port is still where it says"
+        );
+        std::fs::write(
+            dir.path().join(".env"),
+            "DB_PORT=3306\nDB_PASSWORD=${PANDO_TEST_UNSET_SECRET}\nDB_PASS=other\n",
+        )
+        .unwrap();
+        assert!(
+            sibling_value(dir.path(), ["DB_PORT"], &["_PASSWORD", "_PASS"]).is_err(),
+            "the first spelling set is the one read"
         );
     }
 

@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use crate::config::Config;
+use crate::services::Unresolved;
 
 /// The keys an app keeps its user in, beside its address.
 const USER_SUFFIXES: [&str; 2] = ["_USER", "_USERNAME"];
@@ -70,41 +71,43 @@ impl Login {
 /// The login the main checkout's env files give a service the app finds
 /// through `keys`: the `user:password@` of a URL among them, else the keys
 /// beside them — `DATABASE_USER` and `DATABASE_PASSWORD` next to
-/// `DATABASE_PORT`. `None` when they carry neither a user nor a password.
+/// `DATABASE_PORT`. `None` when they carry neither a user nor a password,
+/// and [`Unresolved`] when the one they carry holds a reference nothing
+/// sets: tried as written, pando logged in as a user called `${DB_USER}`.
 ///
 /// The main checkout's, because namespaced mode is its servers: the app in
 /// a worktree logs in the same way, so the login that makes the worktree's
 /// database is the one that will use it.
-pub fn from_env_files(root: &Path, keys: &[String]) -> Option<Login> {
+pub fn from_env_files(root: &Path, keys: &[String]) -> Result<Option<Login>, Unresolved> {
     for key in keys {
-        let Some(value) = crate::services::value_in_env(root, key) else {
+        let Some(value) = crate::services::value_in_env(root, key)? else {
             continue;
         };
         let (user, password) = crate::services::url_userinfo(value.trim());
         if user.is_some() || password.is_some() {
-            return Some(Login::new(
+            return Ok(Some(Login::new(
                 user,
                 password,
                 format!("the URL in {key}, in the main checkout's env files"),
-            ));
+            )));
         }
     }
     let keys = keys.iter().map(String::as_str);
-    let user = crate::services::sibling_value(root, keys.clone(), &USER_SUFFIXES);
-    let password = crate::services::sibling_value(root, keys, &PASSWORD_SUFFIXES);
+    let user = crate::services::sibling_value(root, keys.clone(), &USER_SUFFIXES)?;
+    let password = crate::services::sibling_value(root, keys, &PASSWORD_SUFFIXES)?;
     if user.is_none() && password.is_none() {
-        return None;
+        return Ok(None);
     }
     let named: Vec<&str> = [&user, &password]
         .into_iter()
         .flatten()
         .map(|(key, _)| key.as_str())
         .collect();
-    Some(Login::new(
+    Ok(Some(Login::new(
         user.as_ref().map(|(_, value)| value.clone()),
         password.as_ref().map(|(_, value)| value.clone()),
         format!("{} in the main checkout's env files", named.join(" and ")),
-    ))
+    )))
 }
 
 /// The login pando was given for this service before — the answer to the
@@ -125,7 +128,9 @@ pub fn from_config(config: &Config, service: &str, file: &Path) -> Option<Login>
 /// `needs_user` is the engine's: MariaDB logs in as somebody, a
 /// development Redis asks only for a password, if that. A login from the
 /// env files with no user is no login for an engine that needs one, and
-/// the one written down for pando is tried next.
+/// the one written down for pando is tried next. So is it when the env
+/// files' login holds a reference nothing sets, and with nothing written
+/// down, that is the [`Unresolved`] error.
 pub fn find(
     root: &Path,
     config: &Config,
@@ -133,9 +138,11 @@ pub fn find(
     keys: &[String],
     needs_user: bool,
     file: &Path,
-) -> Option<Login> {
+) -> Result<Option<Login>, Unresolved> {
     let usable = |login: &Login| !needs_user || login.user.is_some();
-    from_env_files(root, keys)
-        .filter(usable)
-        .or_else(|| from_config(config, service, file).filter(usable))
+    let written_down = || from_config(config, service, file).filter(usable);
+    match from_env_files(root, keys) {
+        Ok(login) => Ok(login.filter(usable).or_else(written_down)),
+        Err(unresolved) => written_down().map(Some).ok_or(unresolved),
+    }
 }

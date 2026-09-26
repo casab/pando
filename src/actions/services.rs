@@ -540,7 +540,10 @@ pub(super) fn planned_services(
 /// satisfy it fails the start. A key a *recipe* supplied is a default —
 /// `DATABASE_URL` is what a Postgres recipe expects an app to read — and
 /// a project that has no such variable anywhere has not asked for one, so
-/// it is dropped rather than turned into a refusal.
+/// it is dropped rather than turned into a refusal. One whose value holds
+/// a reference nothing sets is the project's own variable, and fails the
+/// start either way: dropped, the app's own loader would read the port of
+/// the main checkout's server from it.
 pub(super) fn resolve_service_env(
     paths: &PandoPaths,
     config: &Config,
@@ -564,7 +567,9 @@ pub(super) fn resolve_service_env(
         }
         match services::app_env(worktree, &mapping, ports) {
             Ok(resolved) => out.extend(resolved),
-            Err(e) if from_config => return Err(e),
+            Err(e) if from_config || e.downcast_ref::<services::Unresolved>().is_some() => {
+                return Err(e);
+            }
             Err(_) => continue,
         }
     }
@@ -1741,6 +1746,11 @@ pub fn recorded_service_statuses(record: &WorktreeRecord) -> Vec<ServiceStatus> 
 /// for a database nobody was running. The environment wins over a dotenv
 /// file that does not override, which is how these are read; a process's
 /// own `env` in `pando.toml` still wins over this.
+///
+/// A key whose value holds a reference nothing pando reads sets is left
+/// out, for the app's own loader to read: it may know the variable from a
+/// file pando does not read, and handed the text as written ahead of it,
+/// the app logged in as a user called `${DB_USER}`.
 pub fn shared_service_env(paths: &PandoPaths, config: &Config) -> BTreeMap<String, String> {
     let mut keys: Vec<String> = Vec::new();
     for entry in compose_entries(config) {
@@ -1757,7 +1767,7 @@ pub fn shared_service_env(paths: &PandoPaths, config: &Config) -> BTreeMap<Strin
     }
     keys.into_iter()
         .filter_map(|key| {
-            let value = services::value_in_env(paths.root(), &key)?;
+            let value = services::value_in_env(paths.root(), &key).ok()??;
             Some((key, value))
         })
         .collect()
