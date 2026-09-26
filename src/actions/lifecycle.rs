@@ -1595,11 +1595,34 @@ fn mode_would_change(paths: &PandoPaths, config: &Config, name: &str, mode: Mode
 
 /// The mode this worktree runs in, or last ran in, read without the lock:
 /// shared when nothing says.
+///
+/// Only a record written for this worktree says. One left at another path
+/// by a worktree of the same name, removed and made again, is replaced by
+/// the start that finds it under the lock; read as this one's mode, it
+/// made a plain start prepare namespaces in the developer's own servers
+/// for a mode it would not run in, and fail when they did not answer. The
+/// path is asked of git only for a record that says anything but shared,
+/// the one answer it cannot change.
 pub(super) fn recorded_mode(paths: &PandoPaths, name: &str) -> ServiceMode {
-    state::load(&paths.state_file())
+    let Some(record) = state::load(&paths.state_file())
         .ok()
-        .and_then(|store| store.worktrees.get(name).map(WorktreeRecord::mode))
-        .unwrap_or_default()
+        .and_then(|mut store| store.worktrees.remove(name))
+    else {
+        return ServiceMode::default();
+    };
+    let mode = record.mode();
+    if mode == ServiceMode::default() {
+        return mode;
+    }
+    match find_worktree(paths, name) {
+        Ok(worktree)
+            if crate::paths::resolve_for_compare(&record.path)
+                == crate::paths::resolve_for_compare(&worktree.path) =>
+        {
+            mode
+        }
+        _ => ServiceMode::default(),
+    }
 }
 
 /// The mode a start asked for `mode` puts a worktree in that was in

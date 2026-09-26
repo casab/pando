@@ -9290,6 +9290,27 @@ fn a_namespaced_start_makes_the_worktrees_own_database_and_points_the_app_at_it(
     assert!(said.iter().all(|l| !l.contains("s3cret-pw")), "{said:?}");
 }
 
+// A record left at another path by a worktree of the same name is dropped
+// under the lock, so the start runs shared — but it was read as this
+// worktree's mode first, and a plain start prepared namespaces in the
+// developer's own server for a mode it would not run in, and failed
+// outright when that server did not answer.
+#[test]
+fn a_stale_namespaced_record_is_not_this_worktrees_mode_and_nothing_is_asked_of_the_server() {
+    let ns = namespaced_fixture(MAIN_ENV);
+    let mut store = ns.fx.state();
+    let record = store.worktrees.get_mut(&ns.name).unwrap();
+    record.path = ns.fx.root.join("somewhere-else");
+    record.mode = Some(crate::state::ServiceMode::Namespaced);
+    state::save(&ns.fx.paths.state_file(), &store).unwrap();
+
+    let (report, _) = ns.start(Mode::Remembered).unwrap();
+    let _guard = guard(&report);
+    assert_eq!(ns.record().mode(), crate::state::ServiceMode::Shared);
+    assert_eq!(ns.fake("argv"), "", "the server was asked something");
+    assert_eq!(ns.fake("created"), "");
+}
+
 // A restart finds the database it made and makes nothing; one somebody
 // dropped by hand is made again, empty — and then the schema step runs
 // again whatever its fingerprint says, because an empty database is not
