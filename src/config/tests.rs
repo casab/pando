@@ -51,6 +51,16 @@ fn mode_of(path: &Path) -> u32 {
     std::fs::metadata(path).unwrap().permissions().mode() & 0o777
 }
 
+/// Every temp file a write left beside the config.
+fn temp_files(f: &Fixture) -> Vec<String> {
+    std::fs::read_dir(f.paths.project_dir())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".tmp"))
+        .collect()
+}
+
 /// A file a developer wrote by hand: comments above and beside keys,
 /// tables out of alphabetical order, and a key pando is about to change.
 const HANDWRITTEN: &str = r#"# my project
@@ -242,10 +252,51 @@ fn the_config_pando_writes_is_private() {
     )
     .unwrap();
     assert_eq!(mode_of(&f.paths.config_file()), 0o600);
-    assert!(
-        !f.paths.config_file().with_extension("toml.tmp").exists(),
+    assert_eq!(
+        temp_files(&f),
+        Vec::<String>::new(),
         "the temp file must be renamed away"
     );
+}
+
+// Answers are resolved before any state lock is taken, so two starts in
+// a fresh project patch one file at once. With one temp name for every
+// writer, one of them failed on a config nothing was wrong with; with no
+// lock around the read and the write, one of two answers was lost.
+#[test]
+fn patches_made_at_the_same_time_all_land() {
+    let f = fixture();
+    let (writers, answers) = (8, 10);
+    std::thread::scope(|scope| {
+        for writer in 0..writers {
+            let paths = &f.paths;
+            scope.spawn(move || {
+                for answer in 0..answers {
+                    patch(paths, Layer::Project, |doc| {
+                        let table = doc
+                            .entry("answers")
+                            .or_insert_with(toml_edit::table)
+                            .as_table_mut()
+                            .unwrap();
+                        table.insert(&format!("w{writer}a{answer}"), toml_edit::value(true));
+                        Ok(())
+                    })
+                    .unwrap();
+                }
+            });
+        }
+    });
+    let text = home_text(&f);
+    for writer in 0..writers {
+        for answer in 0..answers {
+            assert!(
+                text.contains(&format!("w{writer}a{answer} = true")),
+                "w{writer}a{answer} was lost: {text}"
+            );
+        }
+    }
+    assert_eq!(temp_files(&f), Vec::<String>::new());
+    assert_eq!(mode_of(&f.paths.config_file()), 0o600);
 }
 
 // The no-op path compares the rendered document with the file's own
@@ -1312,8 +1363,9 @@ fn write_only_ever_touches_the_pando_home_copy() {
 
     let loaded = load(&f.paths).unwrap();
     assert_eq!(loaded.config, config);
-    assert!(
-        !f.paths.config_file().with_extension("toml.tmp").exists(),
+    assert_eq!(
+        temp_files(&f),
+        Vec::<String>::new(),
         "the temp file must not leak after the rename"
     );
 }

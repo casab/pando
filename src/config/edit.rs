@@ -122,12 +122,19 @@ impl Note {
 /// the developer wrote: their comments, their ordering, and any key a newer
 /// pando understands and this one does not. So the document is parsed as a
 /// document, edited, and written back.
+///
+/// Under a lock of the file's own, `<file>.lock` beside it, from the read
+/// to the rename. Answers are resolved before any state lock is taken, so
+/// two starts in a fresh project, or a theme saved while a prelude is
+/// answered, patch one file at once; unlocked, each read the file before
+/// the other wrote it and only one of their answers was kept.
 pub fn patch<F>(paths: &PandoPaths, layer: Layer, edit: F) -> Result<()>
 where
     F: FnOnce(&mut DocumentMut) -> Result<()>,
 {
     paths.ensure_home()?;
     let path = layer.file(paths);
+    let _lock = crate::state::lock(&path.with_extension("toml.lock"))?;
     let existing = match std::fs::read_to_string(&path) {
         Ok(text) => Some(text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -448,14 +455,44 @@ fn written_out(table: &mut EditTable, key: &str, convert: impl FnOnce(Item) -> I
     }
 }
 
-/// Atomic, and 0600: the temp file is locked down before the rename, so there
-/// is never a moment where a world-readable config exists at the final path.
+/// Atomic, and 0600: the temp file is created 0600, so there is never a
+/// moment where a world-readable config exists at the final path.
+///
+/// The temp file is this writer's own, named for the process and a
+/// counter. With one shared name, a second writer truncated the file the
+/// first was about to rename, or renamed it away before the first could,
+/// and a command failed on a config nothing was wrong with.
 fn write_private_atomic(path: &Path, text: &str) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(CONFIG_MODE))
-        .with_context(|| format!("chmod 0600 {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("rename tmp → {}", path.display()))?;
-    Ok(())
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = path.with_file_name(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(CONFIG_MODE)
+        .open(&tmp)
+        .and_then(|mut file| {
+            // Exactly 0600 whatever the umask made of the mode above.
+            file.set_permissions(std::fs::Permissions::from_mode(CONFIG_MODE))?;
+            file.write_all(text.as_bytes())
+        })
+        .with_context(|| format!("write {}", tmp.display()))
+        .and_then(|()| {
+            std::fs::rename(&tmp, path)
+                .with_context(|| format!("rename {} → {}", tmp.display(), path.display()))
+        });
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
