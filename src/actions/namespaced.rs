@@ -736,17 +736,9 @@ fn ensure_slot(
     }
     let holders = slot_holders(&store, target);
     let elsewhere = slots_elsewhere(&other_projects(paths), target);
-    let mut full: Vec<u32> = Vec::new();
-    for n in allocatable(target) {
-        if holders.iter().any(|holder| holder.slot == n)
-            || elsewhere.iter().any(|other| other.slot == n)
-        {
-            continue;
-        }
-        if server.size(n)? > 0 {
-            full.push(n);
-            continue;
-        }
+    let mut unusable = Unusable::default();
+    let mut slots = unheld(target, &holders, &elsewhere);
+    while let Some(n) = first_empty(server, &slots, &mut unusable) {
         // Taken under the lock, against state as it is by now: another
         // worktree's start running beside this one may have been given it
         // first, and neither app has written to it for its size to show.
@@ -756,34 +748,117 @@ fn ensure_slot(
         })? {
             return Ok((given, true));
         }
+        slots.retain(|m| *m > n);
     }
-    if full.is_empty() {
-        let holders = slot_holders(&crate::state::load(&paths.state_file())?, target);
+    let holders = slot_holders(&crate::state::load(&paths.state_file())?, target);
+    let held: Vec<String> = holders
+        .iter()
+        .map(Holder::describe)
+        .chain(elsewhere.iter().map(Elsewhere::describe))
+        .collect();
+    let reasons = unusable.reasons();
+    if reasons.is_empty() {
         bail!(
             "every slot of {} on {} that pando gives out is held — {}. `pando start` on a \
              terminal asks which stopped one to free; `pando rm` of one you no longer need frees \
              its slot with it{}",
             target.service,
             server.address(),
-            holders
-                .iter()
-                .map(Holder::describe)
-                .chain(elsewhere.iter().map(Elsewhere::describe))
-                .collect::<Vec<_>>()
-                .join(", "),
+            held.join(", "),
             elsewhere_hint(paths, &elsewhere)
         );
     }
     bail!(
-        "no slot of {} on {} is free: {} hold keys no worktree of this project put there, and \
-         pando never takes a slot somebody else is using",
+        "no slot of {} on {} is free: {}{}{}{}",
         target.service,
         server.address(),
-        full.iter()
-            .map(|n| format!("slot {n}"))
-            .collect::<Vec<_>>()
-            .join(", ")
+        reasons.join("; "),
+        match held.is_empty() {
+            true => String::new(),
+            false => format!("; the rest are held — {}", held.join(", ")),
+        },
+        match holders.iter().any(|holder| !holder.running) {
+            true => ". `pando start` on a terminal asks which stopped one to free",
+            false => "",
+        },
+        elsewhere_hint(paths, &elsewhere)
     )
+}
+
+/// The slots pando gives out on a target's server that no worktree
+/// records, of this project or another, in order.
+fn unheld(target: &Target, holders: &[Holder], elsewhere: &[Elsewhere]) -> Vec<u32> {
+    allocatable(target)
+        .into_iter()
+        .filter(|n| {
+            !holders.iter().any(|holder| holder.slot == *n)
+                && !elsewhere.iter().any(|other| other.slot == *n)
+        })
+        .collect()
+}
+
+/// Why the slots nobody records were not given out, as [`first_empty`]
+/// found them.
+#[derive(Debug, Default)]
+struct Unusable {
+    /// Each one the server says holds keys.
+    full: Vec<u32>,
+    /// The one the server could not be asked about, and what it said: a
+    /// server with fewer slots than its recipe says has none from there on.
+    ended: Option<(u32, String)>,
+}
+
+impl Unusable {
+    /// One phrase for each reason a slot was not free.
+    fn reasons(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.full.is_empty() {
+            out.push(format!(
+                "{} {} keys no worktree of this project records, and pando never takes a slot \
+                 somebody else is using",
+                self.full
+                    .iter()
+                    .map(|n| format!("slot {n}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                match self.full.len() {
+                    1 => "holds",
+                    _ => "hold",
+                }
+            ));
+        }
+        if let Some((n, why)) = &self.ended {
+            out.push(format!(
+                "slot {n} could not be asked how full it is, so none from it on is given out — \
+                 {why}"
+            ));
+        }
+        out
+    }
+}
+
+/// The first of `slots` the server says is empty, asked in order, with
+/// every one passed on the way written into `unusable`.
+///
+/// Asked only of a server that has answered a ping with the login, so a
+/// slot it cannot say the size of is one it does not have — a Redis with
+/// fewer databases than its recipe's `slots` — and none after it is asked.
+fn first_empty(
+    server: &namespace::Server<'_>,
+    slots: &[u32],
+    unusable: &mut Unusable,
+) -> Option<u32> {
+    for &n in slots {
+        match server.size(n) {
+            Ok(0) => return Some(n),
+            Ok(_) => unusable.full.push(n),
+            Err(e) => {
+                unusable.ended = Some((n, format!("{e:#}")));
+                return None;
+            }
+        }
+    }
+    None
 }
 
 /// What became of the slot a worktree's record names, as [`hold_on`]
@@ -1073,14 +1148,16 @@ fn since(at: chrono::DateTime<chrono::Utc>) -> String {
     }
 }
 
-/// Decision 9: when every slot a target's server has is held and this
-/// worktree has none, asks which stopped worktree gives its slot up — and
-/// empties and frees the one chosen, through the guard, before anything
-/// else of this start happens.
+/// Decision 9: when no slot of a target's server is free for this
+/// worktree, which has none — every one held, or the ones nobody holds
+/// full of somebody else's keys or past what the server has — asks which
+/// stopped worktree gives its slot up, and empties and frees the one
+/// chosen, through the guard, before anything else of this start happens.
 ///
-/// A running worktree is never offered: its app is using the slot. When
-/// every holder is running, the start stops naming them. A script gets
-/// exit 3 with the list, as for any question.
+/// The server is asked only when a stopped worktree holds one, so there
+/// is something to offer. A running worktree is never offered: its app
+/// is using the slot. When every holder is running, the start stops
+/// naming them. A script gets exit 3 with the list, as for any question.
 pub(super) fn free_slots_if_full(
     paths: &PandoPaths,
     config: &Config,
@@ -1098,20 +1175,25 @@ pub(super) fn free_slots_if_full(
             continue;
         }
         let others = slots_elsewhere(&other_projects(paths), &target);
-        let taken = allocatable(&target).iter().all(|n| {
-            holders.iter().any(|holder| holder.slot == *n)
-                || others.iter().any(|other| other.slot == *n)
-        });
         let elsewhere: Vec<String> = others.iter().map(Elsewhere::describe).collect();
-        if !taken {
-            continue;
-        }
         let stopped: Vec<&Holder> = holders.iter().filter(|holder| !holder.running).collect();
         let running: Vec<String> = holders
             .iter()
             .filter(|holder| holder.running)
             .map(Holder::describe)
             .collect();
+        let unheld = unheld(&target, &holders, &others);
+        let mut unusable = Unusable::default();
+        if !unheld.is_empty() {
+            if stopped.is_empty() {
+                continue;
+            }
+            let server = server_for(paths, config, &target)?;
+            server.ping()?;
+            if first_empty(&server, &unheld, &mut unusable).is_some() {
+                continue;
+            }
+        }
         if stopped.is_empty() {
             bail!(
                 "every slot of {} on {}:{} is held by a running worktree{} — {}. Stop one of this \
@@ -1132,11 +1214,22 @@ pub(super) fn free_slots_if_full(
                 elsewhere_hint(paths, &others)
             );
         }
+        let reasons = unusable.reasons();
         let question = Question {
             slot: Slot::FreeSlot,
             prompt: format!(
-                "Every slot of {} on {}:{} is held. Which stopped worktree gives up its slot?",
-                target.service, target.host, target.port
+                "{} slot of {} on {}:{} is {}. Which stopped worktree gives up its slot?",
+                match reasons.is_empty() {
+                    true => "Every",
+                    false => "No",
+                },
+                target.service,
+                target.host,
+                target.port,
+                match reasons.is_empty() {
+                    true => "held",
+                    false => "free",
+                }
             ),
             options: stopped
                 .iter()
@@ -1161,6 +1254,7 @@ pub(super) fn free_slots_if_full(
                  empty one the next time it starts"
                     .to_string(),
             )
+            .chain(reasons)
             .chain(
                 (!running.is_empty())
                     .then(|| format!("running, so not offered: {}", running.join(", "))),

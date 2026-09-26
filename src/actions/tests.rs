@@ -9362,7 +9362,7 @@ for last; do :; done
 case "$*" in
   *" ping") echo PONG ;;
   *DBSIZE*)
-    if [ "$last" -gt 15 ]; then echo "ERR DB index is out of range" >&2; exit 1; fi
+    if [ "$last" -ge "$(cat "$state/databases" 2>/dev/null || echo 16)" ]; then echo "ERR DB index is out of range" >&2; exit 1; fi
     if [ -f "$state/on-size-$last" ]; then sh "$state/on-size-$last"; rm -f "$state/on-size-$last"; fi
     cat "$state/slot-$last" 2>/dev/null || echo 0 ;;
   *FLUSHDB*) echo 0 > "$state/slot-$last"; echo "$last" >> "$state/flushed"; echo OK ;;
@@ -10121,6 +10121,110 @@ fn every_slot_held_by_a_running_worktree_stops_the_start_naming_them() {
     );
     assert!(e.contains("held by a running worktree"), "{e}");
     assert!(e.contains("w15 (slot 15, running)"), "{e}");
+    assert!(!redis.join("flushed").exists());
+}
+
+/// Asks which slot to free, answering `w2`; the question it put.
+fn free_w2(ns: &Namespaced) -> Question {
+    let asked = std::cell::RefCell::new(None::<Question>);
+    let ask = |q: &Question| -> Result<Answer> {
+        asked.replace(Some(q.clone()));
+        let index = q.options.iter().position(|(value, _)| value == "w2");
+        Ok(Answer::Choice(index.expect("w2 is offered")))
+    };
+    resolve_for_start(
+        &ns.fx.paths,
+        &ns.fx.config,
+        &ns.name,
+        Mode::Namespaced,
+        &ask,
+        &noop,
+    )
+    .unwrap();
+    asked.into_inner().expect("asked which one to free")
+}
+
+// A Redis with fewer databases than the recipe says has no slot past its
+// last: that is no free slot, so a start asks which stopped worktree
+// gives one up rather than failing on the first it cannot size.
+#[test]
+fn a_redis_with_fewer_slots_than_the_recipe_asks_which_stopped_worktree_frees_one() {
+    let (ns, redis) = slots_fixture(MAIN_ENV_WITH_REDIS);
+    std::fs::write(redis.join("databases"), "4\n").unwrap();
+    hold(&ns, (1..=3).map(|n| (n, false)));
+
+    // A start that cannot ask says why none is free, and how to free one.
+    let e = format!("{:#}", ns.start(Mode::Namespaced).unwrap_err());
+    assert!(
+        e.contains("no slot of redis on 127.0.0.1:6379 is free")
+            && e.contains("slot 4 could not be asked how full it is")
+            && e.contains("out of range")
+            && e.contains("w2 (slot 2, last ran")
+            && e.contains("asks which stopped one to free"),
+        "{e}"
+    );
+
+    let question = free_w2(&ns);
+    assert!(
+        question
+            .prompt
+            .starts_with("No slot of redis on 127.0.0.1:6379 is free."),
+        "{}",
+        question.prompt
+    );
+    assert!(
+        question
+            .details
+            .iter()
+            .any(|d| d.starts_with("slot 4 could not be asked")),
+        "{:?}",
+        question.details
+    );
+    assert_eq!(
+        std::fs::read_to_string(redis.join("flushed")).unwrap(),
+        "2\n"
+    );
+}
+
+// Slots nobody holds but full of somebody else's keys are no free slot
+// either: the stopped worktrees holding the rest are offered.
+#[test]
+fn slots_full_of_somebody_elses_keys_ask_which_stopped_worktree_frees_one() {
+    let (ns, redis) = slots_fixture(MAIN_ENV_WITH_REDIS);
+    hold(&ns, (1..=14).map(|n| (n, false)));
+    std::fs::write(redis.join("slot-15"), "3\n").unwrap();
+    let question = free_w2(&ns);
+    assert_eq!(question.options.len(), 14);
+    assert!(
+        question
+            .details
+            .iter()
+            .any(|d| d.starts_with("slot 15 holds keys no worktree of this project records")),
+        "{:?}",
+        question.details
+    );
+    assert_eq!(
+        std::fs::read_to_string(redis.join("flushed")).unwrap(),
+        "2\n"
+    );
+}
+
+// With a slot nobody holds and empty, nothing is asked: the start takes
+// it.
+#[test]
+fn a_free_slot_beside_stopped_holders_asks_nothing() {
+    let (ns, redis) = slots_fixture(MAIN_ENV_WITH_REDIS);
+    hold(&ns, (1..=14).map(|n| (n, false)));
+    let ask = |q: &Question| -> Result<Answer> { panic!("asked {:?}", q.slot) };
+    resolve_for_start(
+        &ns.fx.paths,
+        &ns.fx.config,
+        &ns.name,
+        Mode::Namespaced,
+        &ask,
+        &noop,
+    )
+    .unwrap();
     assert!(!redis.join("flushed").exists());
 }
 
