@@ -8324,7 +8324,8 @@ fn only_one_process_cannot_be_moved_onto_namespaces() {
 
 /// A fake `redis-cli` beside the fake `mariadb`: slot `n` holds as many
 /// keys as `slot-<n>` says, a slot past 15 is out of range, and `flushed`
-/// records every slot emptied.
+/// records every slot emptied. A script at `on-size-<n>` runs once, the
+/// first time slot `n` is sized: what another command does meanwhile.
 fn fake_redis(paths: &PandoPaths) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let state = paths.home.join("fake-redis");
@@ -8340,6 +8341,7 @@ case "$*" in
   *" ping") echo PONG ;;
   *DBSIZE*)
     if [ "$last" -gt 15 ]; then echo "ERR DB index is out of range" >&2; exit 1; fi
+    if [ -f "$state/on-size-$last" ]; then sh "$state/on-size-$last"; rm -f "$state/on-size-$last"; fi
     cat "$state/slot-$last" 2>/dev/null || echo 0 ;;
   *FLUSHDB*) echo 0 > "$state/slot-$last"; echo "$last" >> "$state/flushed"; echo OK ;;
   *) echo "unexpected: $*" >&2; exit 9 ;;
@@ -8637,6 +8639,97 @@ fn every_slot_held_counts_another_projects_and_offers_only_this_ones() {
         "{:?}",
         question.details
     );
+    assert!(!redis.join("flushed").exists());
+}
+
+// Two namespaced starts at once: the slot each is given is taken under the
+// lock, against state as it is by then, so another worktree's start that
+// was given slot 1 first leaves this one slot 2 — never both on one.
+#[test]
+fn two_starts_at_once_never_record_the_same_slot() {
+    let (ns, redis) = slots_fixture(MAIN_ENV_WITH_REDIS);
+    // The other start records slot 1 while this one is asking its size.
+    let mut raced = ns.fx.state();
+    raced
+        .worktrees
+        .insert("w-racer".into(), slot_holder(1, false, 0));
+    let racing = ns.fx.paths.home.join("raced.json");
+    state::save(&racing, &raced).unwrap();
+    std::fs::write(
+        redis.join("on-size-1"),
+        format!(
+            "cp '{}' '{}'\n",
+            racing.display(),
+            ns.fx.paths.state_file().display()
+        ),
+    )
+    .unwrap();
+    let (report, said) = ns.start(Mode::Namespaced).unwrap();
+    let _guard = guard(&report);
+    assert!(!redis.join("on-size-1").exists(), "the race never ran");
+    assert_eq!(ns.env_line("REDIS_DB").as_deref(), Some("2"), "{said:?}");
+    let store = ns.fx.state();
+    assert_eq!(store.worktrees["w-racer"].namespaces[0].name, "1");
+    let ours: Vec<&str> = store.worktrees[&ns.name]
+        .namespaces
+        .iter()
+        .filter(|n| n.service == "redis")
+        .map(|n| n.name.as_str())
+        .collect();
+    assert_eq!(ours, vec!["2"]);
+}
+
+// A slot freed from this worktree while it was starting, and given to
+// another, is not written back into its record: the start stops, and the
+// slot stays the other one's alone.
+#[test]
+fn a_slot_given_to_another_worktree_while_this_one_started_is_not_written_back() {
+    let (ns, redis) = slots_fixture(MAIN_ENV_WITH_REDIS);
+    let paths = ns.fx.paths.clone();
+    let name = ns.name.clone();
+    let progress = |line: &str| {
+        if line != "redis: slot 1, made just now" {
+            return;
+        }
+        // What a start freeing this worktree's slot, and taking it, does.
+        let mut store = state::load(&paths.state_file()).unwrap();
+        store
+            .worktrees
+            .get_mut(&name)
+            .unwrap()
+            .namespaces
+            .retain(|n| n.service != "redis");
+        store
+            .worktrees
+            .insert("w-racer".into(), slot_holder(1, false, 0));
+        state::save(&paths.state_file(), &store).unwrap();
+    };
+    let e = format!(
+        "{:#}",
+        super::start(
+            &ns.fx.paths,
+            &ns.fx.config,
+            &ns.name,
+            None,
+            Mode::Namespaced,
+            &progress
+        )
+        .unwrap_err()
+    );
+    assert!(
+        e.contains("redis slot 1 was given to w-racer while this start was starting"),
+        "{e}"
+    );
+    let store = ns.fx.state();
+    assert!(
+        store.worktrees[&ns.name]
+            .namespaces
+            .iter()
+            .all(|n| n.service != "redis"),
+        "{:?}",
+        store.worktrees[&ns.name].namespaces
+    );
+    assert!(store.worktrees[&ns.name].processes.is_empty());
     assert!(!redis.join("flushed").exists());
 }
 

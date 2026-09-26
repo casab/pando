@@ -330,6 +330,22 @@ fn start_checked(
         (ServiceMode::Namespaced, made) => made,
         _ => None,
     };
+    // A slot this start was given that another worktree's record names by
+    // now was freed from this one while it was starting and given out
+    // again: writing it back below would hand one slot to two worktrees.
+    for namespace in ready
+        .iter()
+        .flat_map(|ready| &ready.namespaces)
+        .filter(|namespace| namespace.kind == state::NamespaceKind::Slot)
+    {
+        if let Some(other) = namespaced::recorded_elsewhere(&store, name, namespace) {
+            bail!(
+                "{} was given to {other} while this start was starting, so nothing was started \
+                 here — start it again, and it gets one of its own",
+                crate::namespace::describe(namespace)
+            );
+        }
+    }
     // The mode flipped under a concurrent command between the lock-free
     // read above and this one. Rare, so checked here, under the lock,
     // rather than not at all.

@@ -653,14 +653,7 @@ fn ensure_database(
     let names = namespace::database_names(&target.main, paths.project_id(), name)?;
     for candidate in &names {
         // Another worktree's, as state knows it, is not this one's to use.
-        let held = store.worktrees.iter().any(|(other, record)| {
-            other != name
-                && record
-                    .namespaces
-                    .iter()
-                    .any(|ns| namespace::same_namespace(ns, &wanted(candidate)))
-        });
-        if held {
+        if recorded_elsewhere(&store, name, &wanted(candidate)).is_some() {
             continue;
         }
         match server.create(candidate, &target.main)? {
@@ -712,13 +705,33 @@ fn ensure_slot(
         keys: target.keys.clone(),
         used_at: chrono::Utc::now(),
     };
-    let store = crate::state::load(&paths.state_file())?;
-    if let Some(recorded) = store.worktrees.get(name).and_then(|record| {
-        record.namespaces.iter().find(|ns| {
-            ns.service == target.service && namespace::same_namespace(ns, &slot(&ns.name))
-        })
-    }) {
-        return Ok((record(paths, name, slot(&recorded.name))?, false));
+    let mut store = crate::state::load(&paths.state_file())?;
+    let recorded = store.worktrees.get(name).and_then(|record| {
+        record
+            .namespaces
+            .iter()
+            .find(|ns| {
+                ns.service == target.service && namespace::same_namespace(ns, &slot(&ns.name))
+            })
+            .map(|ns| ns.name.clone())
+    });
+    if let Some(recorded) = recorded {
+        // Still this worktree's under the lock: a start that freed it
+        // since has emptied it and may be giving it out, and writing it
+        // back would hand one slot to two worktrees. Then it gets a new
+        // one, like a worktree that never had one.
+        let kept = slot(&recorded);
+        if record_if(paths, name, &kept, |store| {
+            store.worktrees.get(name).is_some_and(|record| {
+                record
+                    .namespaces
+                    .iter()
+                    .any(|ns| ns.service == kept.service && namespace::same_namespace(ns, &kept))
+            })
+        })? {
+            return Ok((kept, false));
+        }
+        store = crate::state::load(&paths.state_file())?;
     }
     let holders = slot_holders(&store, target);
     let elsewhere = slots_elsewhere(&other_projects(paths), target);
@@ -733,9 +746,18 @@ fn ensure_slot(
             full.push(n);
             continue;
         }
-        return Ok((record(paths, name, slot(&n.to_string()))?, true));
+        // Taken under the lock, against state as it is by now: another
+        // worktree's start running beside this one may have been given it
+        // first, and neither app has written to it for its size to show.
+        let given = slot(&n.to_string());
+        if record_if(paths, name, &given, |store| {
+            recorded_elsewhere(store, name, &given).is_none()
+        })? {
+            return Ok((given, true));
+        }
     }
     if full.is_empty() {
+        let holders = slot_holders(&crate::state::load(&paths.state_file())?, target);
         bail!(
             "every slot of {} on {} that pando gives out is held — {}. `pando start` on a \
              terminal asks which stopped one to free; `pando rm` of one you no longer need frees \
@@ -1088,17 +1110,52 @@ fn record(
     name: &str,
     namespace: crate::state::NamespaceRecord,
 ) -> Result<crate::state::NamespaceRecord> {
+    record_if(paths, name, &namespace, |_| true)?;
+    Ok(namespace)
+}
+
+/// [`record`], only when `may` says so of state as it is under the lock
+/// rather than as the start read it before; whether it was written.
+fn record_if(
+    paths: &PandoPaths,
+    name: &str,
+    namespace: &crate::state::NamespaceRecord,
+    may: impl FnOnce(&crate::state::State) -> bool,
+) -> Result<bool> {
     let worktree = super::worktree::find_worktree(paths, name)?;
     let canonical = std::fs::canonicalize(&worktree.path).unwrap_or(worktree.path);
     let _lock = crate::state::lock(&paths.lock_file())?;
     let mut store = crate::state::load(&paths.state_file())?;
+    if !may(&store) {
+        return Ok(false);
+    }
     let record = store
         .worktrees
         .entry(name.to_string())
         .or_insert_with(|| crate::state::WorktreeRecord::new(canonical, false));
-    keep(record, &namespace);
+    keep(record, namespace);
     crate::state::save(&paths.state_file(), &store)?;
-    Ok(namespace)
+    Ok(true)
+}
+
+/// The worktree other than `name` whose record names this namespace, if
+/// any does.
+pub(super) fn recorded_elsewhere<'a>(
+    store: &'a crate::state::State,
+    name: &str,
+    namespace: &crate::state::NamespaceRecord,
+) -> Option<&'a str> {
+    store
+        .worktrees
+        .iter()
+        .find(|(other, record)| {
+            other.as_str() != name
+                && record
+                    .namespaces
+                    .iter()
+                    .any(|ns| namespace::same_namespace(ns, namespace))
+        })
+        .map(|(other, _)| other.as_str())
 }
 
 /// Puts a namespace into a worktree's record, or marks the one already
