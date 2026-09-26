@@ -100,7 +100,10 @@ pub fn new(
     let mut store = state::load(&paths.state_file())?;
     // Under the lock, so the porcelain read cannot race a concurrent `new`
     // whose record is already saved but whose worktree this process has not
-    // seen yet. Every record it may drop is signalled first.
+    // seen yet. The sweep signals only groups whose leader is dead: a
+    // record of a worktree removed outside pando while its processes still
+    // run is dropped with them unsignalled. A known gap, left because a
+    // path comparison that went wrong here would kill a healthy server.
     for notice in sweep_orphaned_groups(&mut store)? {
         progress(&notice);
     }
