@@ -39,7 +39,15 @@ and flush goes through `namespace::may_drop`. It writes into a server the
 developer owns, which Invariant 1 does not cover: `docs/02-principles.md`
 says what holds it. Its tests against real servers are
 `tests/namespaced.rs`, gated like `tests/engines.rs` and run against
-throwaway MariaDB and Redis servers the tests start themselves.
+throwaway MariaDB and Redis servers the tests start themselves. Proved on
+a temporary clone of the origin project against throwaway servers with
+real logins: the first namespaced start stopped with nothing made and
+printed the grant; run as printed, the next made the worktree's own
+database and Redis slot, ran its schema and seed steps into them, and the
+app came up on them — web and api answering, every connection on the
+worktree's own — with main's database and slot untouched. The TUI's `d`
+said what would go and dropped exactly that. The maintainer's own first
+run is next: the grant on their server, once.
 
 What is left is not a phase. `plans/open-follow-ups.md` carries the known
 edges, each with who found it and where it belongs, and the release
