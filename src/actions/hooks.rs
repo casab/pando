@@ -520,12 +520,14 @@ pub fn matched_nothing(worktree: &Path, hook: &config::HookConfig) -> String {
         globs.join(", ")
     );
     // The common shape of the mistake: a literal that names a directory.
-    // A glob matches files, so it needs `/**` to reach into one.
+    // A glob matches files, so it needs `/**` to reach into one. A trailing
+    // `/` is dropped first: `dir//**` has an empty segment, which matches
+    // no name at all, so the advice would keep the warning it answers.
     let directories: Vec<String> = hook
         .fingerprint
         .iter()
         .filter(|glob| !glob.contains(['*', '?']) && worktree.join(glob).is_dir())
-        .map(|glob| format!("{glob}/**"))
+        .map(|glob| format!("{}/**", glob.trim_end_matches('/')))
         .collect();
     if !directories.is_empty() {
         message.push_str(&format!(

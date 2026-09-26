@@ -4554,6 +4554,32 @@ fn an_install_with_nothing_to_fingerprint_runs_every_time() {
     assert_eq!(install_log(&fx, &name).matches("run").count(), 2);
 }
 
+// `dir/` names the directory as surely as `dir` does, and the advice for
+// it was `dir//**`: an empty segment matches no name, so following the
+// advice kept the warning it answered.
+#[test]
+fn a_directory_written_with_a_trailing_slash_gets_advice_that_matches() {
+    let dir = tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("prisma/migrations")).unwrap();
+    std::fs::write(dir.path().join("prisma/migrations/0001.sql"), "select 1;\n").unwrap();
+    let hook = crate::config::HookConfig {
+        name: "migrate".to_string(),
+        after: crate::config::HookPoint::Services,
+        fingerprint: vec!["prisma/migrations/".to_string()],
+        cmd: "true".to_string(),
+        cwd: None,
+        fallback: None,
+        on: None,
+    };
+    let said = matched_nothing(dir.path(), &hook);
+    assert!(said.contains("try prisma/migrations/**"), "{said}");
+    assert!(!said.contains("//"), "{said}");
+    assert!(
+        !crate::hooks::matched(dir.path(), &["prisma/migrations/**".to_string()]).is_empty(),
+        "and the advice is a glob that matches"
+    );
+}
+
 // ---- questions -------------------------------------------------------
 
 use crate::detect::Slot;
