@@ -838,8 +838,9 @@ fn read_env_files(worktree: &Path) -> Vec<(String, std::collections::BTreeMap<St
 /// expand them: from the process environment first, then from a key
 /// earlier in the same file, which is the order a loader that does not
 /// override the environment resolves them in. `${NAME:-default}` and
-/// `${NAME-default}` take their default as a shell does, `\$` is a
-/// literal `$`, and a reference nothing defines is left as written. The
+/// `${NAME-default}` take their default as a shell does, references in
+/// it and all, `\$` is a literal `$`, and a reference nothing defines is
+/// left as written. The
 /// app's own loader would have expanded `postgres://${POSTGRES_USER}@…`;
 /// handed it unexpanded, ahead of that loader, the app logged in as a
 /// user called `${POSTGRES_USER}`.
@@ -920,12 +921,13 @@ fn expand(value: &str, lookup: &dyn Fn(&str) -> Option<String>) -> String {
             rest = &tail[1..];
             continue;
         };
+        // A default is expanded only when it is taken, as a shell does.
         match (lookup(reference.name), reference.default) {
             (Some(found), Some(default)) if found.is_empty() && reference.or_empty => {
-                out.push_str(default)
+                out.push_str(&expand(default, lookup))
             }
             (Some(found), _) => out.push_str(&found),
-            (None, Some(default)) => out.push_str(default),
+            (None, Some(default)) => out.push_str(&expand(default, lookup)),
             (None, None) => out.push_str(&tail[..1 + reference.len]),
         }
         rest = &tail[1 + reference.len..];
@@ -964,7 +966,7 @@ fn reference(text: &str) -> Option<Reference<'_>> {
             or_empty: false,
         });
     };
-    let close = braced.find('}')?;
+    let close = closing_brace(braced)?;
     let inner = &braced[..close];
     let (name, after) = inner.split_at(name_len(inner)?);
     let (default, or_empty) = match after.strip_prefix(":-") {
@@ -978,6 +980,29 @@ fn reference(text: &str) -> Option<Reference<'_>> {
         default,
         or_empty,
     })
+}
+
+/// Where the `}` that closes a braced reference is, in the text after its
+/// `{`: past each `${…}` its default holds, so `${A:-${B}/x}` ends at the
+/// last `}` and not at B's. A `\$` opens nothing.
+fn closing_brace(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match (bytes[i], bytes.get(i + 1)) {
+            (b'\\', Some(b'$')) => i += 1,
+            (b'$', Some(b'{')) => {
+                depth += 1;
+                i += 1;
+            }
+            (b'}', _) if depth == 0 => return Some(i),
+            (b'}', _) => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Where the quote that opened a value closes, in the text after it. A
@@ -1835,6 +1860,32 @@ mod tests {
         assert_eq!(parsed["DOLLARS"], "pa$$word$ $1");
         assert_eq!(parsed["BROKEN"], "${DB_PORT");
         assert_eq!(parsed["LATER"], "${AFTER}", "only a key read before it");
+    }
+
+    // A compose-style file defaults a URL to one built from its own keys;
+    // closed at the inner `}`, the value was neither the default nor the
+    // text as written.
+    #[test]
+    fn a_default_with_references_in_it_is_expanded_whole() {
+        let environment = |name: &str| (name == "SET").then(|| "set".to_string());
+        let parsed = parse_env_in(
+            "DB_USER=app\n\
+             DATABASE_URL=${DATABASE_URL:-postgres://${DB_USER}@localhost:5432/app}\n\
+             DEEP=${UNSET:-${ALSO_UNSET:-$DB_USER}-x}\n\
+             TAKEN=${SET:-${DB_USER}}\n\
+             ESCAPED=${UNSET:-\\${DB_USER}}\n",
+            &environment,
+        );
+        assert_eq!(parsed["DATABASE_URL"], "postgres://app@localhost:5432/app");
+        assert_eq!(parsed["DEEP"], "app-x");
+        assert_eq!(
+            parsed["TAKEN"], "set",
+            "a name that is set wins, and its whole reference goes"
+        );
+        assert_eq!(
+            parsed["ESCAPED"], "${DB_USER}",
+            "`\\$` in a default opens nothing"
+        );
     }
 
     #[test]
