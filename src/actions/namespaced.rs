@@ -762,7 +762,9 @@ fn ensure_slot(
         store = crate::state::load(&paths.state_file())?;
     }
     let holders = slot_holders(&store, target);
-    let elsewhere = slots_elsewhere(&other_projects(paths), target);
+    let others = other_projects(paths);
+    none_while_unread(&others, target)?;
+    let elsewhere = slots_elsewhere(&others, target);
     let mut unusable = Unusable::default();
     let mut slots = unheld(target, &holders, &elsewhere);
     while let Some(n) = first_empty(server, &slots, &mut unusable)? {
@@ -1153,9 +1155,33 @@ fn repository_gone(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Stops a start that would give out a slot while another project's state
+/// cannot be read: it may record any of them, as a worktree's or as its
+/// main checkout's, and an empty one given out here would be shared by two
+/// apps, with [`namespace::may_drop`] refusing to empty it for either.
+fn none_while_unread(
+    others: &[(String, std::result::Result<crate::state::State, String>)],
+    target: &Target,
+) -> Result<()> {
+    if let Some((project, why)) = others
+        .iter()
+        .find_map(|(project, other)| Some((project, other.as_ref().err()?)))
+    {
+        bail!(
+            "no slot of {} on {}:{} is given out while project {project}'s state cannot be read, \
+             since it may record any of them — {why}",
+            target.service,
+            target.host,
+            target.port
+        );
+    }
+    Ok(())
+}
+
 /// Every slot pando could give out on this target's server that other
 /// projects' states record, as a worktree's or as their main checkout's
-/// own. A state that could not be read records none.
+/// own. A state that could not be read is passed over here: no slot is
+/// given out while one cannot be, by [`none_while_unread`].
 fn slots_elsewhere(
     others: &[(String, std::result::Result<crate::state::State, String>)],
     target: &Target,
@@ -1251,7 +1277,11 @@ pub(super) fn free_slots_if_full(
             .into_iter()
             .filter(|holder| holder.worktree != name)
             .collect();
-        let others = slots_elsewhere(&other_projects(paths), &target);
+        // Before anything is asked: the start this is for gives out no
+        // slot then, and freeing one would be refused by the guard anyway.
+        let projects = other_projects(paths);
+        none_while_unread(&projects, &target)?;
+        let others = slots_elsewhere(&projects, &target);
         let elsewhere: Vec<String> = others.iter().map(Elsewhere::describe).collect();
         let stopped: Vec<&Holder> = holders.iter().filter(|holder| !holder.running).collect();
         let running: Vec<String> = holders

@@ -10492,6 +10492,55 @@ fn rm_empties_no_slot_while_another_projects_state_cannot_be_read() {
     assert_eq!(ns.fake("dropped"), "", "and no database was dropped");
 }
 
+// The same project may record any slot, as a worktree's or as its main
+// checkout's: no slot is given out while its state cannot be read, and a
+// start that could ask which stopped worktree frees one asks nothing.
+#[test]
+fn no_slot_is_given_out_while_another_projects_state_cannot_be_read() {
+    let (ns, redis) = slots_fixture(MAIN_ENV_WITH_REDIS);
+    let file = ns
+        .fx
+        .paths
+        .projects_dir()
+        .join("other-1a2b3c4d")
+        .join("state.json");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, "{\"version\": 99, \"worktrees\": {}}").unwrap();
+    let unread = "no slot of redis on 127.0.0.1:6379 is given out while project \
+                  other-1a2b3c4d's state cannot be read";
+
+    let e = format!("{:#}", ns.start(Mode::Namespaced).unwrap_err());
+    assert!(e.contains(unread) && e.contains("version 99"), "{e}");
+    let store = ns.fx.state();
+    assert!(
+        store
+            .worktrees
+            .get(&ns.name)
+            .into_iter()
+            .flat_map(|record| &record.namespaces)
+            .all(|n| n.service != "redis"),
+        "{:?}",
+        store.worktrees.get(&ns.name)
+    );
+
+    hold(&ns, (1..=15).map(|n| (n, false)));
+    let ask = |q: &Question| -> Result<Answer> { panic!("asked {:?}", q.slot) };
+    let e = format!(
+        "{:#}",
+        resolve_for_start(
+            &ns.fx.paths,
+            &ns.fx.config,
+            &ns.name,
+            Mode::Namespaced,
+            &ask,
+            &noop
+        )
+        .unwrap_err()
+    );
+    assert!(e.contains(unread), "{e}");
+    assert!(!redis.join("flushed").exists());
+}
+
 // Two namespaced starts at once: the slot each is given is taken under the
 // lock, against state as it is by then, so another worktree's start that
 // was given slot 1 first leaves this one slot 2 — never both on one.
