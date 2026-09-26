@@ -3362,6 +3362,78 @@ fn a_mode_key_that_switches_a_running_worktree_asks_in_a_dialog() {
     }
 }
 
+/// A discovery listing `names`, with the app's own state.
+fn listing(app: &App, names: &[&str]) -> Snapshot {
+    Snapshot {
+        main: wt("acme-shop"),
+        worktrees: names.iter().map(|n| wt(n)).collect(),
+        created_by_pando: BTreeMap::new(),
+        state: app.state.clone(),
+        warning: None,
+        notices: Vec::new(),
+        default_base: None,
+    }
+}
+
+// A discovery moves the cursor while a dialog is open — to the worktree
+// `n` just made, or off one that went away. The chooser and the switch
+// dialog started or restarted whichever row it had landed on.
+#[test]
+fn the_mode_chooser_and_the_switch_dialog_act_on_the_worktree_they_name() {
+    let mut app = test_app(&["feat+a", "feat+b"]);
+    press(&mut app, KeyCode::Char('j'));
+    press(&mut app, KeyCode::Enter);
+    app.select_on_arrival = Some("feat+new".to_string());
+    app.apply_snapshot(listing(&app, &["feat+a", "feat+b", "feat+new"]));
+    assert_eq!(app.selected_worktree().unwrap().name, "feat+new");
+    press(&mut app, KeyCode::Enter);
+    let pending = app.pending.as_ref().expect("the chooser started something");
+    assert_eq!(
+        (pending.name.as_str(), pending.kind),
+        ("feat+b", PendingKind::Start)
+    );
+
+    let mut app = test_app(&["feat+a", "feat+b"]);
+    with_process(&mut app, "feat+b", running_phase());
+    press(&mut app, KeyCode::Char('j'));
+    press(&mut app, KeyCode::Char('i'));
+    assert!(matches!(app.modal, Some(Modal::SwitchMode { .. })));
+    app.select_on_arrival = Some("feat+new".to_string());
+    app.apply_snapshot(listing(&app, &["feat+a", "feat+b", "feat+new"]));
+    assert_eq!(app.selected_worktree().unwrap().name, "feat+new");
+    press(&mut app, KeyCode::Char('y'));
+    let pending = app
+        .pending
+        .as_ref()
+        .expect("the dialog restarted something");
+    assert_eq!(
+        (pending.name.as_str(), pending.kind),
+        ("feat+b", PendingKind::Restart)
+    );
+}
+
+// And a worktree removed from under either dialog is not replaced by its
+// neighbour: there is nothing left to start.
+#[test]
+fn a_mode_dialog_whose_worktree_went_away_starts_nothing() {
+    let mut app = test_app(&["feat+a", "feat+b"]);
+    press(&mut app, KeyCode::Char('j'));
+    press(&mut app, KeyCode::Enter);
+    app.apply_snapshot(listing(&app, &["feat+a"]));
+    press(&mut app, KeyCode::Enter);
+    assert!(app.pending.is_none());
+    assert_eq!(app.active_status(), Some(("feat+b is already gone", false)));
+
+    let mut app = test_app(&["feat+a", "feat+b"]);
+    with_process(&mut app, "feat+b", running_phase());
+    press(&mut app, KeyCode::Char('j'));
+    press(&mut app, KeyCode::Char('i'));
+    app.state.worktrees.remove("feat+b");
+    app.apply_snapshot(listing(&app, &["feat+a"]));
+    press(&mut app, KeyCode::Char('y'));
+    assert!(app.pending.is_none());
+}
+
 #[test]
 fn c_copies_the_local_url_even_when_shared_and_capital_c_the_public_one() {
     let mut app = test_app(&["feat+one"]);

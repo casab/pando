@@ -411,6 +411,19 @@ impl App {
             .is_some_and(|main| main == branch)
     }
 
+    /// Whether the worktree a dialog names was removed from under it — by
+    /// `pando rm` in another pane, or by hand — said on the status line if
+    /// so. There is nothing left to confirm, and a worker sent after it
+    /// would only come back with git's complaint.
+    pub(super) fn gone_from_under_dialog(&mut self, name: &str) -> bool {
+        if self.worktrees.iter().any(|w| w.name == name) {
+            return false;
+        }
+        let label = self.label_of(name);
+        self.set_status(format!("{label} is already gone"));
+        true
+    }
+
     /// `y` removes what git would let go of; `F` removes it whatever it
     /// holds — `rm --force`. Anything else closes the dialog.
     pub(super) fn handle_remove_key(
@@ -424,12 +437,7 @@ impl App {
             KeyCode::Char('F') => true,
             _ => return,
         };
-        // Removed from under the dialog — by `pando rm` in another pane, or
-        // by hand. There is nothing left to confirm, and a worker sent
-        // after it would only come back with git's complaint.
-        if !self.worktrees.iter().any(|w| w.name == name) {
-            let label = self.label_of(&name);
-            self.set_status(format!("{label} is already gone"));
+        if self.gone_from_under_dialog(&name) {
             return;
         }
         let blockers = self.remove_blockers(&name);

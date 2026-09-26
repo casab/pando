@@ -102,7 +102,7 @@ impl App {
         }
         let label = self.label_of(&name);
         if self.pressed_twice(key, &name, &format!("restart {label} {}", to.word())) {
-            self.restart_selected_with(mode)
+            self.restart_named(name, mode, None)
         }
     }
 
@@ -183,7 +183,14 @@ impl App {
     /// The chooser's answer. A stopped worktree starts in it; a running one
     /// switches to it — every process restarts on the other services — or,
     /// in the mode it already runs in, stays exactly as it is.
+    ///
+    /// On the worktree the chooser names, not the row under the cursor: a
+    /// discovery moves the cursor while the chooser is open, to a worktree
+    /// `n` just made or to the neighbour of one that went away.
     fn choose_mode(&mut self, name: &str, chosen: ServiceMode) {
+        if self.gone_from_under_dialog(name) {
+            return;
+        }
         let label = self.label_of(name);
         let runs = self.record_for(name).map(|r| r.mode()).unwrap_or_default();
         match self.is_up(name) {
@@ -191,9 +198,18 @@ impl App {
                 "{label} already runs {} — r restarts it",
                 chosen.word()
             )),
-            true => self.restart_selected_with(actions::Mode::from(chosen)),
-            false => self.start_selected_with(actions::Mode::from(chosen)),
+            true => self.restart_named(name.to_string(), actions::Mode::from(chosen), None),
+            false => self.start_named(name.to_string(), actions::Mode::from(chosen)),
         }
+    }
+
+    /// The switch-mode dialog's `y`: a restart in `to` of the worktree the
+    /// dialog names, for the same reason the chooser acts on its own.
+    pub(super) fn switch_mode(&mut self, name: String, to: ServiceMode) {
+        if self.gone_from_under_dialog(&name) {
+            return;
+        }
+        self.restart_named(name, actions::Mode::from(to), None)
     }
 
     /// Whether the project has nothing to run, said on the status line if
@@ -217,9 +233,12 @@ impl App {
     }
 
     fn start_selected_with(&mut self, mode: actions::Mode) {
-        let Some(name) = self.selected_name() else {
-            return;
-        };
+        if let Some(name) = self.selected_name() {
+            self.start_named(name, mode)
+        }
+    }
+
+    fn start_named(&mut self, name: String, mode: actions::Mode) {
         if self.refuses_nothing_to_run() {
             return;
         }
@@ -355,12 +374,8 @@ impl App {
         };
         let label = self.label_of(&name);
         if self.pressed_twice('r', &name, &format!("restart {label}")) {
-            self.restart_selected_with(actions::Mode::Remembered)
+            self.restart_named(name, actions::Mode::Remembered, None)
         }
-    }
-
-    pub(super) fn restart_selected_with(&mut self, mode: actions::Mode) {
-        self.restart_selected_only(mode, None);
     }
 
     /// `P`: only the process the detail pane's `▸` marks — `restart
@@ -377,22 +392,19 @@ impl App {
             }
             1 => {
                 if self.pressed_twice('P', &name, &format!("restart {label}")) {
-                    self.restart_selected_with(actions::Mode::Remembered)
+                    self.restart_named(name, actions::Mode::Remembered, None)
                 }
             }
             n => {
                 let process = processes[self.tail_index.min(n - 1)].0.clone();
                 if self.pressed_twice('P', &name, &format!("restart {process} of {label}")) {
-                    self.restart_selected_only(actions::Mode::Remembered, Some(process));
+                    self.restart_named(name, actions::Mode::Remembered, Some(process));
                 }
             }
         }
     }
 
-    fn restart_selected_only(&mut self, mode: actions::Mode, only: Option<String>) {
-        let Some(name) = self.selected_name() else {
-            return;
-        };
+    fn restart_named(&mut self, name: String, mode: actions::Mode, only: Option<String>) {
         if self.phase_of(&name).is_none() && self.refuses_nothing_to_run() {
             return;
         }

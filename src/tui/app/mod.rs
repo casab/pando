@@ -682,9 +682,7 @@ impl App {
             }
             Some(Modal::SwitchMode { name, to }) => {
                 match key.code {
-                    KeyCode::Char('y') | KeyCode::Enter => {
-                        self.restart_selected_with(actions::Mode::from(to));
-                    }
+                    KeyCode::Char('y') | KeyCode::Enter => self.switch_mode(name, to),
                     KeyCode::Esc | KeyCode::Char('n') => {}
                     _ => self.modal = Some(Modal::SwitchMode { name, to }),
                 }
