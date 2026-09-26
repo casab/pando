@@ -168,6 +168,29 @@ impl Plan {
             .map(|(service, why)| format!("{service}: shared — {why}"))
             .collect()
     }
+
+    /// Why the steps after the services — a schema, a migration, a seed —
+    /// would not run on data of the worktree's own, when they would not: a
+    /// service that stays on the main checkout's data they could reach, or
+    /// no database of the worktree's own at all, only a slot. `None` when
+    /// they run on the worktree's own, as on an isolated start.
+    pub fn not_own_data(&self) -> Option<String> {
+        if !self.shared_data.is_empty() {
+            return Some(format!(
+                "{} {} on the main checkout's data",
+                self.shared_data.join(", "),
+                match self.shared_data.len() {
+                    1 => "stays",
+                    _ => "stay",
+                }
+            ));
+        }
+        (!self
+            .targets
+            .iter()
+            .any(|target| target.namespace.kind == NamespaceKind::Database))
+        .then(|| "no database here is this worktree's own, only a slot".to_string())
+    }
 }
 
 /// Which of the project's services a namespaced start gives the worktree a
@@ -445,27 +468,10 @@ pub(super) struct Ready {
 }
 
 impl Ready {
-    /// Why the steps after the services — a schema, a migration, a seed —
-    /// would not run on data of the worktree's own, when they would not: a
-    /// service that stays on the main checkout's data they could reach, or
-    /// no database of the worktree's own at all, only a slot. `None` when
-    /// they run on the worktree's own, as on an isolated start.
+    /// [`Plan::not_own_data`] of the plan these were made for: every
+    /// target of it has its namespace here.
     pub fn not_own_data(&self) -> Option<String> {
-        if !self.plan.shared_data.is_empty() {
-            return Some(format!(
-                "{} {} on the main checkout's data",
-                self.plan.shared_data.join(", "),
-                match self.plan.shared_data.len() {
-                    1 => "stays",
-                    _ => "stay",
-                }
-            ));
-        }
-        (!self
-            .namespaces
-            .iter()
-            .any(|namespace| namespace.kind == NamespaceKind::Database))
-        .then(|| "no database here is this worktree's own, only a slot".to_string())
+        self.plan.not_own_data()
     }
 }
 

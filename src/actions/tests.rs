@@ -8283,6 +8283,52 @@ fn a_plain_start_of_an_isolated_worktree_asks_the_schema_question() {
     );
 }
 
+// A namespaced start runs the schema step only on a database of the
+// worktree's own, so one that gets only a Redis slot is not asked what
+// fills a fresh database — and one that gets its own database is.
+#[test]
+fn a_namespaced_start_asks_the_schema_question_only_when_it_gets_a_database_of_its_own() {
+    let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");
+    std::fs::create_dir_all(fx.root.join("prisma")).unwrap();
+    std::fs::write(fx.root.join("prisma/schema.prisma"), "// schema\n").unwrap();
+    git(&fx.root, &["add", "."]);
+    git(&fx.root, &["commit", "--quiet", "-m", "prisma"]);
+    std::fs::write(
+        fx.root.join(".env"),
+        "PORT=3000\nREDIS_URL=redis://localhost:6379/0\n",
+    )
+    .unwrap();
+    resolve_process(&fx.paths, &fx.config, &refuse, &noop).unwrap();
+    let mut text = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+    text.push_str(
+        "\n[[services]]\nkind = \"native\"\nname = \"redis\"\nenv = { REDIS_URL = \"redis\" }\n",
+    );
+    std::fs::write(fx.paths.config_file(), &text).unwrap();
+    let loaded = crate::config::load(&fx.paths).unwrap().config;
+    let only_a_slot =
+        super::resolve_process(&fx.paths, &loaded, Mode::Namespaced, &refuse, &noop).unwrap();
+    assert!(only_a_slot.hooks.is_empty(), "{:?}", only_a_slot.hooks);
+
+    std::fs::write(
+        fx.root.join(".env"),
+        "PORT=3000\nREDIS_URL=redis://localhost:6379/0\n\
+         DATABASE_URL=mysql://app:pw@localhost:3306/shop\n",
+    )
+    .unwrap();
+    text.push_str(
+        "\n[[services]]\nkind = \"native\"\nname = \"mariadb\"\n\
+         env = { DATABASE_URL = \"mariadb\" }\n",
+    );
+    std::fs::write(fx.paths.config_file(), &text).unwrap();
+    let loaded = crate::config::load(&fx.paths).unwrap().config;
+    let (ask, asked) = scripted(vec![Answer::None]);
+    super::resolve_process(&fx.paths, &loaded, Mode::Namespaced, &ask, &noop).unwrap();
+    assert_eq!(
+        asked.borrow().iter().map(|q| q.slot).collect::<Vec<_>>(),
+        vec![Slot::SchemaHook]
+    );
+}
+
 // The Docker-down offer said "delete the compose `[[services]]` entry"
 // whatever the file held. Counted, and named by what each entry includes,
 // so a developer with two knows there are two to find.

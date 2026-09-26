@@ -420,8 +420,14 @@ pub fn resolve_process(
     // putting them away, which is no more a reason to ask than a plain
     // one. With no worktree to read, the flag is all there is;
     // [`resolve_for_start`] knows more.
-    let own_data = matches!(mode, Mode::Isolated | Mode::Namespaced);
-    resolve_starting(paths, config, own_data, ask, progress)
+    resolve_onto(
+        paths,
+        config,
+        mode == Mode::Isolated,
+        mode == Mode::Namespaced,
+        ask,
+        progress,
+    )
 }
 
 /// [`resolve_process`] for a start of one worktree: what `start` and
@@ -454,7 +460,7 @@ pub fn resolve_for_start(
         backends_reachable(paths, config, name, &canonical, &ports)?;
     }
     let namespacing = mode == Mode::Namespaced || target == ServiceMode::Namespaced;
-    let mut config = resolve_starting(paths, config, isolating || namespacing, ask, progress)?;
+    let mut config = resolve_onto(paths, config, isolating, namespacing, ask, progress)?;
     // A namespaced start's login, when nothing gives one, is asked now
     // with the rest — before anything runs, and of the config the answers
     // above may just have given its services.
@@ -463,6 +469,51 @@ pub fn resolve_for_start(
         free_slots_if_full(paths, &config, name, ask, progress)?;
     }
     Ok(config)
+}
+
+/// The questions of a start that isolates, namespaces, or does neither.
+///
+/// A namespaced start is onto data of its own only where its plan gives it
+/// some: the schema step runs only on a database of the worktree's own
+/// with nothing left on the main checkout's data, so it is asked about
+/// only then. The plan is of the config the other answers give, because
+/// which services there are is one of them.
+fn resolve_onto(
+    paths: &PandoPaths,
+    config: &Config,
+    isolating: bool,
+    namespacing: bool,
+    ask: Ask<'_>,
+    progress: &dyn Fn(&str),
+) -> Result<Config> {
+    if isolating || !namespacing {
+        return resolve_starting(paths, config, isolating, ask, progress);
+    }
+    let answering = Answering::asking(ask);
+    let config = resolve_silencing(
+        paths,
+        config,
+        &START_SLOTS,
+        &[Slot::SchemaHook],
+        &answering,
+        progress,
+    )?;
+    if super::namespaced::plan(paths, &config)
+        .not_own_data()
+        .is_some()
+    {
+        return Ok(config);
+    }
+    // The services are settled by now; silenced so a slot nothing
+    // proposed pays no probe for a question this pass cannot ask.
+    resolve_silencing(
+        paths,
+        &config,
+        &[Slot::SchemaHook],
+        &[Slot::Services],
+        &answering,
+        progress,
+    )
 }
 
 /// The questions of a start that is, or is not, onto data of its own.
