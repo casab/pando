@@ -840,6 +840,8 @@ pub struct LogTail {
     /// them. Logs are appended to, so bytes before `offset` never change —
     /// unless the file was rewritten.
     anchor: Vec<u8>,
+    /// Whether the last poll left bytes it saw in the file unread.
+    unread: bool,
 }
 
 impl LogTail {
@@ -860,6 +862,7 @@ impl LogTail {
             open_block: None,
             identity: None,
             anchor: Vec::new(),
+            unread: false,
         }
     }
 
@@ -891,8 +894,32 @@ impl LogTail {
         self.lines_seen
     }
 
+    /// Whether the last poll stopped short of the end of the file, so the
+    /// next one reads more at once. Only a bounded poll stops short.
+    pub fn has_unread(&self) -> bool {
+        self.unread
+    }
+
     pub fn poll(&mut self) -> Result<bool> {
+        self.read_on(None)
+    }
+
+    /// [`poll`](Self::poll) for a follower, which prints every line: it
+    /// reads on from where the last poll stopped, at most `max_bytes` and
+    /// at most `capacity` whole lines, so no line is evicted before the
+    /// follower has seen it and a backlog is never held in memory whole.
+    /// The rest stays in the file, and [`has_unread`](Self::has_unread)
+    /// says so.
+    ///
+    /// Only after a first [`poll`](Self::poll): this never skips to the
+    /// end, which is how that one shows only the last lines.
+    pub fn poll_bounded(&mut self, max_bytes: u64) -> Result<bool> {
+        self.read_on(Some(max_bytes))
+    }
+
+    fn read_on(&mut self, bound: Option<u64>) -> Result<bool> {
         self.evicted_levels.clear();
+        self.unread = false;
         let mut file = match File::open(&self.path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -937,7 +964,9 @@ impl LogTail {
             self.anchor.clear();
         }
         let mut skip_partial_first_line = false;
-        if self.offset == 0 {
+        // A bounded poll reads from the start of a file that was rewritten:
+        // every line in it is new to a follower.
+        if self.offset == 0 && bound.is_none() {
             let (start, partial) = initial_start(&mut file, size, self.capacity)
                 .with_context(|| format!("read log {}", self.path.display()))?;
             self.offset = start;
@@ -952,10 +981,28 @@ impl LogTail {
         file.seek(SeekFrom::Start(self.offset))
             .context("seek log")?;
         let mut raw = Vec::new();
-        file.read_to_end(&mut raw).context("read log")?;
+        // At least a character's four bytes, or a bound read might never
+        // hold a whole one and never move on.
+        Read::by_ref(&mut file)
+            .take(bound.map_or(u64::MAX, |max| max.max(4)))
+            .read_to_end(&mut raw)
+            .context("read log")?;
         // Left in the file, to be read again whole on the next poll.
         raw.truncate(raw.len() - incomplete_utf8_suffix(&raw));
+        if bound.is_some() {
+            // Each newline read completes one line, and more than the
+            // buffer holds would evict some before a follower saw them.
+            if let Some((last, _)) = raw
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| **b == b'\n')
+                .nth(self.capacity - 1)
+            {
+                raw.truncate(last + 1);
+            }
+        }
         self.offset += raw.len() as u64;
+        self.unread = self.offset < size;
         self.remember_anchor(&raw);
         let mut chunk = String::from_utf8_lossy(&raw).into_owned();
         if skip_partial_first_line {
@@ -1276,6 +1323,36 @@ mod tests {
         assert!(tail.poll().unwrap());
         assert_eq!(plain_lines(&tail).last(), Some(&dump));
         assert_eq!(tail.lines().len(), 50);
+    }
+
+    // A follower's poll read everything since the last one at once, and a
+    // backlog longer than the buffer — a pager that stopped reading, a
+    // Ctrl-Z — lost its oldest lines without a word.
+    #[test]
+    fn bounded_polls_read_a_backlog_longer_than_the_buffer_line_by_line() {
+        for bound in [u64::MAX, 5] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("log.txt");
+            write_all(&path, "start\n");
+            let mut tail = LogTail::new(path.clone(), 4);
+            tail.poll().unwrap();
+            let backlog: Vec<String> = (0..10).map(|i| format!("line-{i}")).collect();
+            append(&path, &(backlog.join("\n") + "\n"));
+
+            let mut printed = Vec::new();
+            let mut seen = tail.lines_seen();
+            loop {
+                tail.poll_bounded(bound).unwrap();
+                let fresh = (tail.lines_seen() - seen) as usize;
+                seen = tail.lines_seen();
+                let skip = tail.lines().len() - fresh;
+                printed.extend(plain_lines(&tail).into_iter().skip(skip));
+                if !tail.has_unread() {
+                    break;
+                }
+            }
+            assert_eq!(printed, backlog, "reading at most {bound} bytes at once");
+        }
     }
 
     // A window that starts right after a newline starts on a whole line.

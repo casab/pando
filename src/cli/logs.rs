@@ -22,6 +22,11 @@ const FOLLOW_INTERVAL: Duration = Duration::from_millis(250);
 /// whatever `--tail` happened to be.
 const FOLLOW_CAPACITY: usize = 4096;
 
+/// The most a follower reads of a log at once. A backlog — a pager that
+/// stopped reading, a Ctrl-Z — is read in reads of this, each printed
+/// before the next, so it is printed whole and never held in memory whole.
+const FOLLOW_READ_BYTES: u64 = 1024 * 1024;
+
 /// One line of one log, as the machine-readable shape.
 ///
 /// The one published shape that is a *stream* rather than a document: one
@@ -129,27 +134,34 @@ pub fn logs<W: Write>(
     // Ends on Ctrl-C, which is what `-f` means everywhere else.
     loop {
         std::thread::sleep(FOLLOW_INTERVAL);
-        let grew = tailer
-            .poll()
-            .with_context(|| format!("read {}", path.display()))?;
-        if !grew {
-            continue;
+        let mut any = false;
+        // Read on until caught up, printing each read before the next: a
+        // read holds no more lines than the buffer does, so none is
+        // evicted unprinted.
+        loop {
+            let grew = tailer
+                .poll_bounded(FOLLOW_READ_BYTES)
+                .with_context(|| format!("read {}", path.display()))?;
+            if grew {
+                let seen = tailer.lines_seen();
+                // Truncation resets the file's offsets but not this count,
+                // so a restarted process picks up where the follower left
+                // off.
+                let fresh = seen.saturating_sub(printed) as usize;
+                printed = seen;
+                let skip = tailer.lines().len().saturating_sub(fresh);
+                for line in tailer.lines().iter().skip(skip) {
+                    write_log_line(out, &line.plain, line.level, json)?;
+                }
+                any = true;
+            }
+            if !tailer.has_unread() {
+                break;
+            }
         }
-        let seen = tailer.lines_seen();
-        // Truncation resets the file's offsets but not this count, so a
-        // restarted process picks up where the follower left off.
-        let fresh = seen.saturating_sub(printed) as usize;
-        printed = seen;
-        let lines: Vec<(String, LogLevel)> = tailer
-            .lines()
-            .iter()
-            .skip(tailer.lines().len().saturating_sub(fresh))
-            .map(|l| (l.plain.clone(), l.level))
-            .collect();
-        for (plain, level) in lines {
-            write_log_line(out, &plain, level, json)?;
+        if any {
+            out.flush()?;
         }
-        out.flush()?;
     }
 }
 
@@ -358,19 +370,24 @@ pub fn logs_merged<W: Write>(
         let mut any = false;
         for (i, (source, tailer)) in tailers.iter_mut().enumerate() {
             let path = tailer.path().to_path_buf();
-            let grew = tailer
-                .poll()
-                .with_context(|| format!("read {}", path.display()))?;
-            if !grew {
-                continue;
-            }
-            let seen = tailer.lines_seen();
-            let fresh = seen.saturating_sub(printed[i]) as usize;
-            printed[i] = seen;
-            let skip = tailer.lines().len().saturating_sub(fresh);
-            for line in tailer.lines().iter().skip(skip) {
-                write_line_from(out, Some((source, width)), &line.plain, line.level, json)?;
-                any = true;
+            // Read on until caught up, as a single follower does.
+            loop {
+                let grew = tailer
+                    .poll_bounded(FOLLOW_READ_BYTES)
+                    .with_context(|| format!("read {}", path.display()))?;
+                if grew {
+                    let seen = tailer.lines_seen();
+                    let fresh = seen.saturating_sub(printed[i]) as usize;
+                    printed[i] = seen;
+                    let skip = tailer.lines().len().saturating_sub(fresh);
+                    for line in tailer.lines().iter().skip(skip) {
+                        write_line_from(out, Some((source, width)), &line.plain, line.level, json)?;
+                        any = true;
+                    }
+                }
+                if !tailer.has_unread() {
+                    break;
+                }
             }
         }
         if any {

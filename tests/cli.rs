@@ -1676,6 +1676,61 @@ impl Drop for Follower {
     }
 }
 
+// `logs -f` read everything written since its last poll at once and kept
+// the newest 4096 lines of it, so a burst of more — or the backlog after
+// a pager stopped reading — lost its middle with no marker.
+#[test]
+fn follow_prints_every_line_of_a_burst_longer_than_its_buffer() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let e = env();
+    let log = e.log_file("feat+one", "dev");
+    std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+    std::fs::write(&log, "ready\n").unwrap();
+    let mut child = Follower(
+        Command::new(env!("CARGO_BIN_EXE_pando"))
+            .env("PANDO_HOME", &e.home)
+            .current_dir(&e.root)
+            .args(["logs", "feat+one", "-f"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("run pando logs -f"),
+    );
+    let (tx, rx) = mpsc::channel::<String>();
+    let out = child.0.stdout.take().expect("piped stdout");
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(out).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    let printed = |what: &str| -> String {
+        rx.recv_timeout(Duration::from_secs(20))
+            .unwrap_or_else(|_| panic!("nothing was printed for {what}"))
+    };
+    assert_eq!(printed("the initial tail"), "ready");
+
+    // One write, so it all lands between two polls.
+    let burst: String = (0..10_000).map(|i| format!("burst-{i}\n")).collect();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&log)
+        .unwrap()
+        .write_all(burst.as_bytes())
+        .unwrap();
+    for i in 0..10_000 {
+        assert_eq!(printed("the burst"), format!("burst-{i}"));
+    }
+
+    drop(child);
+    drop(rx);
+    let _ = reader.join();
+}
+
 // `--yes` takes the first option of a question nothing decided, so the line
 // it writes may not claim the rules detected it.
 #[test]
