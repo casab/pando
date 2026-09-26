@@ -618,6 +618,133 @@ fn an_empty_inline_array_of_tables_takes_an_entry_like_any_other() {
     assert_eq!(loaded.config.hooks[0].name, "migrate", "{text}");
 }
 
+/// Every comment in `written` is in `text` once, above `header`. None of
+/// the files these tests write has a `#` in a string.
+fn assert_comments_kept_above(written: &str, text: &str, header: &str) {
+    let header = text
+        .find(header)
+        .unwrap_or_else(|| panic!("no {header}: {text}"));
+    for line in written.lines() {
+        let Some(at) = line.find('#') else { continue };
+        let comment = &line[at..];
+        assert_eq!(text.matches(comment).count(), 1, "{comment}: {text}");
+        assert!(text.find(comment).unwrap() < header, "{comment}: {text}");
+    }
+}
+
+// The lines above `dev = { ... }` are its key's and the comment beside it
+// is its value's, and writing the table out dropped both: the developer's
+// comments, and on a file that opens with the table, pando's own header.
+#[test]
+fn a_table_written_out_keeps_the_comments_on_its_line_above_its_header() {
+    for (written, header) in [
+        (
+            "[processes]\n# the web app, not the docs site\n\
+             dev = { cwd = \"apps/web\" }  # keep in sync with turbo.json\n",
+            "[processes.dev]",
+        ),
+        (
+            "# the web app, not the docs site\n\
+             processes = { dev = { cwd = \"apps/web\" } }  # keep in sync with turbo.json\n",
+            "[processes.dev]",
+        ),
+        (
+            "# the web app, not the docs site\n\
+             processes.dev = { cwd = \"apps/web\" }  # keep in sync with turbo.json\n",
+            "[processes.dev]",
+        ),
+        (
+            "# pando.toml, and everything here is yours to edit.\n\n\
+             # the web app, not the docs site\n\
+             dev = { cwd = \"apps/web\" }  # keep in sync with turbo.json\n",
+            "[dev]",
+        ),
+        (
+            "dev = {\n\
+             \x20 # the web app, not the docs site\n\
+             \x20 cwd = \"apps/web\",  # keep in sync with turbo.json\n\
+             }\n",
+            "[dev]",
+        ),
+    ] {
+        let f = fixture();
+        write_home(&f, written);
+        set_detected(
+            &f.paths,
+            Layer::Project,
+            &["dev"],
+            "cmd",
+            "pnpm dev",
+            Note::Answered,
+        )
+        .unwrap();
+        let text = home_text(&f);
+        assert_comments_kept_above(written, &text, header);
+        let loaded = load(&f.paths).expect("the file pando wrote must load");
+        assert_eq!(loaded.config.processes["dev"].cmd, "pnpm dev", "{text}");
+    }
+}
+
+// A level inline only to hold the next has no header of its own left, and
+// one that still holds a value of its own does.
+#[test]
+fn an_inline_level_s_comments_go_above_the_first_header_the_rewrite_leaves() {
+    let f = fixture();
+    let written = "# both apps\n\
+                   processes = { dev = { cwd = \"apps/web\" }, docs = { cmd = \"x\" } }  # beside\n";
+    write_home(&f, written);
+    set_detected(
+        &f.paths,
+        Layer::Project,
+        &["dev"],
+        "cmd",
+        "pnpm dev",
+        Note::Answered,
+    )
+    .unwrap();
+    let text = home_text(&f);
+    assert_comments_kept_above(written, &text, "[processes]");
+    assert!(text.contains("[processes.dev]"), "{text}");
+}
+
+// `hooks = []` becomes an array of tables whose first header is the entry
+// pando appends; a list of inline tables keeps the comments written
+// between its entries.
+#[test]
+fn an_array_written_out_keeps_the_comments_on_its_line_above_its_first_entry() {
+    for written in [
+        "# run in order\nhooks = []  # none yet\n",
+        "# run in order\n\
+         hooks = [\n\
+         \x20 # the schema first\n\
+         \x20 { name = \"schema\", after = \"services\", cmd = \"true\" },\n\
+         ]  # none yet\n",
+    ] {
+        let f = fixture();
+        write_home(&f, written);
+        set_detected_array_entry(
+            &f.paths,
+            Layer::Project,
+            "hooks",
+            vec![
+                ("name".to_string(), "migrate".into()),
+                ("after".to_string(), "services".into()),
+                ("cmd".to_string(), "true".into()),
+            ],
+            Note::Answered,
+        )
+        .unwrap();
+        let text = home_text(&f);
+        assert_comments_kept_above(written, &text, "[[hooks]]");
+        let loaded = load(&f.paths).expect("the file pando wrote must load");
+        assert_eq!(
+            loaded.config.hooks.last().unwrap().name,
+            "migrate",
+            "{text}"
+        );
+    }
+}
+
 #[test]
 fn a_patch_that_changes_nothing_leaves_the_file_alone() {
     let f = fixture();

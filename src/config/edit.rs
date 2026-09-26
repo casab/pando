@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use std::path::{Path, PathBuf};
 use toml::Table;
-use toml_edit::{DocumentMut, Item, Table as EditTable};
+use toml_edit::{DocumentMut, Item, RawString, Table as EditTable, Value};
 
 /// Only ever writes the pando-home copy. A committed `pando.toml` is never
 /// touched, which is why this takes `PandoPaths` rather than a path.
@@ -266,8 +266,9 @@ pub fn set_detected_array_entry(
     patch(paths, layer, move |doc| {
         // `hooks = []`, or a list of inline tables, is an array of tables
         // written inline, and becomes one written out.
+        let mut comments = String::new();
         if doc.get(&array).is_some_and(Item::is_array) {
-            written_out(doc.as_table_mut(), &array, |item| match item {
+            comments = written_out(doc.as_table_mut(), &array, |item| match item {
                 Item::Value(toml_edit::Value::Array(inline)) if inline.is_empty() => {
                     Item::ArrayOfTables(toml_edit::ArrayOfTables::new())
                 }
@@ -291,6 +292,11 @@ pub fn set_detected_array_entry(
         }
         table.decor_mut().set_suffix(comment);
         tables.push(table);
+        // The comments on the line that was rewritten go above the first
+        // entry's header, the first line the rewrite leaves.
+        if let Some(first) = tables.get_mut(0).filter(|_| !comments.is_empty()) {
+            first.decor_mut().set_prefix(comments);
+        }
         Ok(())
     })
 }
@@ -414,16 +420,20 @@ fn write_target<'a>(
 /// rewritten as one with a header of its own, the only form with room for
 /// the note beside each key pando adds. A level that was inline only to
 /// hold the next is implicit, for the same reason a created one is.
+///
+/// The developer's comments on a rewritten line go above the first header
+/// it leaves: its own, or, for a level left with no header, the next one's.
 fn ensure_table<'a>(doc: &'a mut DocumentMut, path: &[&str]) -> Result<&'a mut EditTable> {
     let mut table = doc.as_table_mut();
     let leaf = path.len().saturating_sub(1);
+    let mut comments = String::new();
     for (depth, part) in path.iter().enumerate() {
         let existed = table.contains_key(part);
         let inline = table.get(part).is_some_and(Item::is_inline_table);
         if inline {
-            written_out(table, part, |item| {
+            comments.push_str(&written_out(table, part, |item| {
                 item.into_table().map_or_else(|item| item, Item::Table)
-            });
+            }));
         }
         let entry = table
             .entry(part)
@@ -437,21 +447,86 @@ fn ensure_table<'a>(doc: &'a mut DocumentMut, path: &[&str]) -> Result<&'a mut E
         if (!existed || inline) && depth < leaf {
             table.set_implicit(true);
         }
+        // An implicit level holding only the next is never printed, so its
+        // comments wait for the next level's header.
+        let headerless = path
+            .get(depth + 1)
+            .is_some_and(|next| table.is_implicit() && table.iter().all(|(key, _)| key == *next));
+        if !comments.is_empty() && !headerless {
+            table.decor_mut().set_prefix(std::mem::take(&mut comments));
+        }
     }
     Ok(table)
 }
 
 /// Replaces the value under `key` with its written-out form, a table or an
-/// array of tables with a header of its own.
+/// array of tables with a header of its own, and returns the developer's
+/// comments from the line it was on, for the caller to put above a header.
 ///
-/// The key's spacing goes with it: it was the `dev = ` of an inline value,
-/// and kept on a header it reads `[dev ]`.
-fn written_out(table: &mut EditTable, key: &str, convert: impl FnOnce(Item) -> Item) {
+/// Those are the lines above the key and every comment written beside or
+/// inside the value, which the written-out form has no place for. The
+/// key's spacing is not kept: it was the `dev = ` of an inline value, and
+/// kept on a header it reads `[dev ]`.
+fn written_out(table: &mut EditTable, key: &str, convert: impl FnOnce(Item) -> Item) -> String {
+    let mut comments = String::new();
     if let Some(mut key) = table.key_mut(key) {
+        let prefix = key.leaf_decor().prefix().and_then(RawString::as_str);
+        let above = prefix.unwrap_or_default();
+        // What follows the last line break is only the key's indent.
+        comments.push_str(&above[..above.rfind('\n').map_or(0, |end| end + 1)]);
         key.leaf_decor_mut().clear();
     }
     if let Some(item) = table.get_mut(key) {
+        if let Some(value) = item.as_value() {
+            comments_in(value, &mut comments);
+        }
         *item = convert(std::mem::take(item));
+    }
+    comments
+}
+
+/// The comments written on or inside `value` that its written-out form
+/// drops, in file order, each on a line of its own.
+///
+/// That form drops the space around the value, the space inside it, and
+/// the space around each of its keys and their values; a value nested
+/// deeper keeps its own. An array's elements are inline tables, each
+/// written out the same way.
+fn comments_in(value: &Value, out: &mut String) {
+    comment_lines(value.decor().prefix(), out);
+    match value {
+        Value::Array(array) => {
+            for element in array.iter() {
+                comments_in(element, out);
+            }
+            comment_lines(Some(array.trailing()), out);
+        }
+        Value::InlineTable(table) => {
+            for (key, element) in table.iter() {
+                comment_lines(
+                    table.key(key).and_then(|key| key.leaf_decor().prefix()),
+                    out,
+                );
+                comment_lines(element.decor().prefix(), out);
+                comment_lines(element.decor().suffix(), out);
+            }
+            comment_lines(Some(table.trailing()), out);
+        }
+        _ => {}
+    }
+    comment_lines(value.decor().suffix(), out);
+}
+
+/// The comments in the space around a value. That space holds nothing but
+/// whitespace and comments, so every `#` in it starts one.
+fn comment_lines(space: Option<&RawString>, out: &mut String) {
+    let lines = space
+        .and_then(RawString::as_str)
+        .unwrap_or_default()
+        .lines();
+    for line in lines.map(str::trim).filter(|line| line.starts_with('#')) {
+        out.push_str(line);
+        out.push('\n');
     }
 }
 
