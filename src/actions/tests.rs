@@ -2237,6 +2237,28 @@ fn a_mutation_that_sweeps_and_then_refuses_still_saves_the_sweep() {
         "{err:#}"
     );
     assert!(swept(), "a refused rm forgot the group it signalled");
+
+    // A branch another worktree has checked out passes every check `new`
+    // makes itself, and git refuses it after the sweep.
+    plant();
+    let elsewhere = fx.root.parent().unwrap().join("elsewhere");
+    git(
+        &fx.root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "taken",
+            elsewhere.to_str().unwrap(),
+        ],
+    );
+    let err = new(&fx.paths, &fx.config, "taken", None, &noop).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("git worktree add failed"),
+        "{err:#}"
+    );
+    assert!(swept(), "a refused new forgot the group it signalled");
 }
 
 /// A `Failed` record for a group that does not exist and a pid that
