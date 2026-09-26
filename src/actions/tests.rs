@@ -10400,7 +10400,9 @@ fn a_namespace_login_with_no_user_is_refused_and_nothing_is_written() {
 /// A fake `mariadb` in pando's own `bin`, which every namespace command
 /// finds first on PATH. Its databases are files under `dbs/`; `deny`
 /// refuses every CREATE the way a login without the grant is refused; and
-/// `argv` and `env` record what it was run with.
+/// `argv` and `env` record what it was run with. A script at
+/// `on-create-<name>` runs once, the first time `<name>` is to be made:
+/// what another command does meanwhile.
 fn fake_mariadb(paths: &PandoPaths) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let state = paths.home.join("fake-mariadb");
@@ -10418,6 +10420,7 @@ case "$*" in
   *"CURRENT_USER()"*) echo "app@localhost" ;;
   *"CREATE DATABASE"*)
     db=$(printf '%s' "$*" | sed -n 's/.*CREATE DATABASE `\([^`]*\)`.*/\1/p')
+    if [ -f "$state/on-create-$db" ]; then sh "$state/on-create-$db"; rm -f "$state/on-create-$db"; fi
     if [ -f "$state/deny" ]; then
       echo "ERROR 1044 (42000) at line 1: Access denied for user 'app'@'localhost' to database '$db'" >&2; exit 1
     fi
@@ -10688,6 +10691,114 @@ fn a_database_already_there_is_left_alone_and_the_worktree_gets_its_other_name()
     assert!(
         said.iter().any(|l| l.contains("pando did not make it")),
         "{said:?}"
+    );
+}
+
+/// Writes the state another start of the fixture's worktree leaves once it
+/// has recorded `database` as the worktree's, and returns the command that
+/// puts it in place: what that start does meanwhile.
+fn recorded_by_another_start(ns: &Namespaced, database: &str) -> String {
+    let mut raced = ns.fx.state();
+    raced
+        .worktrees
+        .get_mut(&ns.name)
+        .unwrap()
+        .namespaces
+        .push(crate::state::NamespaceRecord {
+            service: "mariadb".into(),
+            recipe: "mariadb".into(),
+            kind: crate::state::NamespaceKind::Database,
+            host: "localhost".into(),
+            port: 3306,
+            name: database.into(),
+            main: "shop".into(),
+            mains: vec!["shop".into()],
+            keys: vec!["DATABASE_PORT".into()],
+            used_at: Utc::now(),
+        });
+    let racing = ns.fx.paths.home.join("raced.json");
+    state::save(&racing, &raced).unwrap();
+    format!(
+        "cp '{}' '{}'\n",
+        racing.display(),
+        ns.fx.paths.state_file().display()
+    )
+}
+
+// Two starts of one worktree at once, the TUI's and the CLI's. The other
+// made the database and recorded it after this one read state, so this
+// one's CREATE found it there: it was said not to be pando's, and a second
+// database was made and recorded beside it, for the next start to move the
+// app back from. It is the worktree's own, and its only one.
+#[test]
+fn a_database_another_start_of_this_worktree_just_made_is_its_own_and_its_only_one() {
+    let ns = namespaced_fixture(MAIN_ENV);
+    let hook = ns.fake.join("on-create-shop__feat_one");
+    std::fs::write(
+        &hook,
+        format!(
+            "touch '{}'\n{}",
+            ns.fake.join("dbs/shop__feat_one").display(),
+            recorded_by_another_start(&ns, "shop__feat_one")
+        ),
+    )
+    .unwrap();
+    let (report, said) = ns.start(Mode::Namespaced).unwrap();
+    let _guard = guard(&report);
+    assert!(!hook.exists(), "the race never ran");
+    assert_eq!(ns.fake("created"), "", "this start made a database");
+    let names: Vec<String> = ns.record().namespaces.into_iter().map(|n| n.name).collect();
+    assert_eq!(names, vec!["shop__feat_one"]);
+    assert_eq!(
+        ns.env_line("DATABASE_NAME").as_deref(),
+        Some("shop__feat_one")
+    );
+    assert!(
+        said.iter().all(|l| !l.contains("pando did not make it")),
+        "{said:?}"
+    );
+}
+
+// The same race, when this start had moved on to the other name before the
+// other start recorded the first: the one recorded first is the worktree's,
+// and the one this start made is left, empty, for doctor to list — never
+// recorded beside it.
+#[test]
+fn a_database_made_while_another_start_of_this_worktree_recorded_one_is_left_unrecorded() {
+    let ns = namespaced_fixture(MAIN_ENV);
+    let [first, second] =
+        crate::namespace::database_names("shop", ns.fx.paths.project_id(), &ns.name).unwrap();
+    // The other start has made the first name, and not yet recorded it.
+    std::fs::write(
+        ns.fake.join(format!("on-create-{first}")),
+        format!("touch '{}'\n", ns.fake.join("dbs").join(&first).display()),
+    )
+    .unwrap();
+    // It records it while this one makes the second.
+    std::fs::write(
+        ns.fake.join(format!("on-create-{second}")),
+        recorded_by_another_start(&ns, &first),
+    )
+    .unwrap();
+    let (report, said) = ns.start(Mode::Namespaced).unwrap();
+    let _guard = guard(&report);
+    assert_eq!(ns.fake("created"), format!("{second}\n"));
+    let names: Vec<String> = ns.record().namespaces.into_iter().map(|n| n.name).collect();
+    assert_eq!(names, vec![first.clone()]);
+    assert_eq!(ns.env_line("DATABASE_NAME"), Some(first.clone()));
+    assert!(
+        said.iter()
+            .any(|l| l.contains(&format!("{second} is left on localhost:3306, empty"))),
+        "{said:?}"
+    );
+    assert_eq!(ns.fake("dropped"), "", "nothing was dropped");
+    let leftovers = namespace_leftovers(&ns.fx.paths, &ns.fx.config, &ns.fx.state());
+    assert_eq!(
+        leftovers
+            .iter()
+            .map(|l| l.name.as_str())
+            .collect::<Vec<_>>(),
+        vec![second.as_str()]
     );
 }
 

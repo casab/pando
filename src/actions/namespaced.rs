@@ -641,6 +641,11 @@ pub(super) fn ask_for_logins(
 /// again — or made again, if somebody dropped it by hand — else a new one
 /// under the first of its two names the server does not already have.
 ///
+/// A worktree has one database on a server. Another start of it running
+/// beside this one — the TUI's and the CLI's — may make and record one
+/// after this one read state; that one is the worktree's then, and is
+/// never taken for somebody else's.
+///
 /// Returns it, recorded, and whether it was made just now.
 fn ensure_database(
     paths: &PandoPaths,
@@ -662,16 +667,7 @@ fn ensure_database(
         used_at: chrono::Utc::now(),
     };
     let store = crate::state::load(&paths.state_file())?;
-    let recorded = store.worktrees.get(name).and_then(|record| {
-        record.namespaces.iter().find(|ns| {
-            ns.service == target.service
-                && ns.kind == NamespaceKind::Database
-                && ns.main == target.main
-                && namespace::same_namespace(ns, &wanted(&ns.name))
-        })
-    });
-    if let Some(recorded) = recorded {
-        let recorded = recorded.clone();
+    if let Some(recorded) = recorded_database(&store, name, target) {
         if server.exists(&recorded.name)? {
             return Ok((record(paths, name, wanted(&recorded.name))?, false));
         }
@@ -694,14 +690,49 @@ fn ensure_database(
         }
         match server.create(candidate, &target.main)? {
             namespace::Created::Made => {
-                return Ok((record(paths, name, wanted(candidate))?, true));
+                // Recorded only while no other start of this worktree has
+                // recorded one since: with two, the app would run on the
+                // one whose start spawned first, and the next start would
+                // move it to the one recorded first.
+                let made = wanted(candidate);
+                if record_if(paths, name, &made, |store| {
+                    recorded_database(store, name, target).is_none()
+                })? {
+                    return Ok((made, true));
+                }
+                let store = crate::state::load(&paths.state_file())?;
+                let Some(first) = recorded_database(&store, name, target) else {
+                    bail!(
+                        "another command changed {name}'s record while this start made \
+                         {candidate}, so nothing was started — start it again"
+                    );
+                };
+                progress(&format!(
+                    "{}: another start of this worktree recorded {} while this one made \
+                     {candidate}, so {} is its database — {candidate} is left on {}, empty, and \
+                     `pando doctor` lists it",
+                    target.service,
+                    first.name,
+                    first.name,
+                    server.address()
+                ));
+                return Ok((record(paths, name, wanted(&first.name))?, false));
             }
-            namespace::Created::AlreadyThere => progress(&format!(
-                "{}: {candidate} is already on {} and pando did not make it, so it is left \
-                 alone",
-                target.service,
-                server.address()
-            )),
+            namespace::Created::AlreadyThere => {
+                // Made and recorded by another start of this worktree since
+                // this one read state: its own all the same.
+                if let Some(first) =
+                    recorded_database(&crate::state::load(&paths.state_file())?, name, target)
+                {
+                    return Ok((record(paths, name, wanted(&first.name))?, false));
+                }
+                progress(&format!(
+                    "{}: {candidate} is already on {} and pando did not make it, so it is left \
+                     alone",
+                    target.service,
+                    server.address()
+                ));
+            }
         }
     }
     bail!(
@@ -711,6 +742,32 @@ fn ensure_database(
         server.address(),
         names.join(" and ")
     )
+}
+
+/// The database a worktree's record names for a target, if it names one:
+/// the same service and main database, on the same server.
+fn recorded_database(
+    store: &crate::state::State,
+    name: &str,
+    target: &Target,
+) -> Option<crate::state::NamespaceRecord> {
+    store
+        .worktrees
+        .get(name)?
+        .namespaces
+        .iter()
+        .find(|ns| {
+            let here = crate::state::NamespaceRecord {
+                host: target.host.clone(),
+                port: target.port,
+                ..(*ns).clone()
+            };
+            ns.service == target.service
+                && ns.kind == NamespaceKind::Database
+                && ns.main == target.main
+                && namespace::same_namespace(ns, &here)
+        })
+        .cloned()
 }
 
 /// This worktree's slot on one server: the one state records, else the
