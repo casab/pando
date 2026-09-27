@@ -4066,25 +4066,37 @@ fn a_provider_that_cannot_reach_cloudflare_fails_the_share_and_leaves_no_proxy()
 // and `share` waited for that helper rather than for its own timeout.
 // `sleep 45 &` cost 47s; `sleep 3600 &` cost an hour, in the TUI as a
 // pending slot nothing could clear.
+//
+// The budget runs out half a second after the auth command's shell exits,
+// however long that shell took to get there, as in `process`'s own test of
+// this. Its own clock would have to cover a login shell's start as well,
+// and on a loaded machine a clock short enough to wait out here is spent
+// before the script has printed anything.
 #[test]
 fn an_auth_command_that_backgrounds_a_helper_is_bounded_by_its_own_timeout() {
     let Some((fx, name, _guards, _)) = shared_fixture() else {
         return;
     };
     let pidfile = fx.paths.home.join("auth-child.pid");
+    let holds_for = Duration::from_secs(45);
     let mut config = fx.config.clone();
     config.share.auth_cmd = Some(format!(
-        "printf 'session=abc'; sleep 45 & echo $! > {}",
+        "printf 'session=abc'; sleep {} & echo $! > {}",
+        holds_for.as_secs(),
         pidfile.display()
     ));
 
-    let started = std::time::Instant::now();
-    let outcome = share_stubbed(&fx, &config, &name).unwrap();
+    let started = Instant::now();
+    let outcome =
+        proc::with_budget_over_when(proc::after_the_exit(Duration::from_millis(500)), || {
+            share_stubbed(&fx, &config, &name)
+        })
+        .unwrap();
     let elapsed = started.elapsed();
     let _share = share_guard(&fx, &name);
 
     assert!(
-        elapsed < AUTH_CMD_TIMEOUT + Duration::from_secs(10),
+        elapsed < holds_for,
         "the share waited for a helper the script backgrounded: {elapsed:?}"
     );
     assert!(
@@ -4097,8 +4109,12 @@ fn an_auth_command_that_backgrounds_a_helper_is_bounded_by_its_own_timeout() {
         .trim()
         .parse()
         .expect("a pid");
+    // Until half the helper's life: long enough for a loaded machine to
+    // land the kill, and short enough that the helper being gone cannot be
+    // it ending by itself.
+    let kill_lands_by = (started + holds_for / 2).saturating_duration_since(Instant::now());
     assert!(
-        wait_until(Duration::from_secs(5), || !crate::process::is_alive(child)),
+        wait_until(kill_lands_by, || !crate::process::is_alive(child)),
         "the helper outlived the auth command that started it"
     );
 }

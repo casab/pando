@@ -279,14 +279,15 @@ pub fn run_captured(
     let code = loop {
         match child.try_wait().context("wait for the command")? {
             Some(status) => break status.code(),
-            None if Instant::now() >= deadline => {
+            None if budget_over(deadline, None) => {
                 // The group, not the child: the shell may have started
                 // something that is the actual reason this is still here.
                 let _ = stop(pgid, Duration::from_secs(1));
                 let _ = child.wait();
                 // The group is gone, so the pipes are closing; give the
                 // readers that long and no longer.
-                wait_until(&out_reader, &err_reader, Instant::now() + DRAIN_SETTLE);
+                let settled = Instant::now() + DRAIN_SETTLE;
+                wait_until(&out_reader, &err_reader, || Instant::now() >= settled);
                 let stderr = text_of(&err_buf);
                 // Not the command itself: a project's `auth_cmd` may hold a
                 // literal credential, and a timeout must not be how it
@@ -307,9 +308,13 @@ pub fn run_captured(
     // The shell has exited, which is not the same as its pipes being
     // closed: anything it backgrounded inherited them. It gets the rest of
     // the budget, then the group goes the way a timed-out one does.
-    if !wait_until(&out_reader, &err_reader, deadline) {
+    let exited = Instant::now();
+    if !wait_until(&out_reader, &err_reader, || {
+        budget_over(deadline, Some(exited))
+    }) {
         let _ = stop(pgid, Duration::from_secs(1));
-        wait_until(&out_reader, &err_reader, Instant::now() + DRAIN_SETTLE);
+        let settled = Instant::now() + DRAIN_SETTLE;
+        wait_until(&out_reader, &err_reader, || Instant::now() >= settled);
     }
     Ok(Captured {
         code,
@@ -323,17 +328,68 @@ pub fn run_captured(
 /// already in it are the diagnosis.
 const DRAIN_SETTLE: Duration = Duration::from_millis(500);
 
-/// Whether both readers finished before `deadline`.
+/// What a test on this thread said ends a command's budget. It is asked
+/// with the moment the shell exited, or `None` while the shell is running;
+/// once it has exited, only while something it started holds a pipe.
+type BudgetOver = Box<dyn Fn(Option<Instant>) -> bool>;
+
+thread_local! {
+    static BUDGET_OVER_HERE: std::cell::RefCell<Option<BudgetOver>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Whether a command's budget is spent: its deadline has passed, or
+/// `with_budget_over_when` is running on this thread and says it is.
+/// `exited` is when the shell exited, if it has.
+fn budget_over(deadline: Instant, exited: Option<Instant>) -> bool {
+    Instant::now() >= deadline
+        || BUDGET_OVER_HERE.with(|over| over.borrow().as_ref().is_some_and(|over| over(exited)))
+}
+
+/// Runs `f` with the budget of every [`run_captured`] it makes on this
+/// thread also over as soon as `over` says so. For tests: a budget short
+/// enough to wait out in one has to cover a login shell's start as well,
+/// which takes milliseconds on an idle machine and has taken seconds on a
+/// loaded one, and a command killed before it got to what the test is
+/// about proves nothing about it. An event the test names ends the budget
+/// instead, and the clock stays as the backstop. Per thread, so the tests
+/// beside it keep the clock alone.
+#[cfg(test)]
+pub(crate) fn with_budget_over_when<R>(
+    over: impl Fn(Option<Instant>) -> bool + 'static,
+    f: impl FnOnce() -> R,
+) -> R {
+    let before = BUDGET_OVER_HERE.with(|o| o.replace(Some(Box::new(over))));
+    // Put back on unwind too, so a failing test leaves nothing behind on
+    // a thread the harness may reuse.
+    struct Restore(Option<BudgetOver>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BUDGET_OVER_HERE.with(|o| *o.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(before);
+    f()
+}
+
+/// For [`with_budget_over_when`]: a budget that runs out `grace` after the
+/// shell exits, however long the shell took to get there.
+#[cfg(test)]
+pub(crate) fn after_the_exit(grace: Duration) -> impl Fn(Option<Instant>) -> bool {
+    move |exited| exited.is_some_and(|at| at.elapsed() >= grace)
+}
+
+/// Whether both readers finished before `over` said to stop waiting.
 fn wait_until(
     out: &std::thread::JoinHandle<()>,
     err: &std::thread::JoinHandle<()>,
-    deadline: Instant,
+    over: impl Fn() -> bool,
 ) -> bool {
     loop {
         if out.is_finished() && err.is_finished() {
             return true;
         }
-        if Instant::now() >= deadline {
+        if over() {
             return false;
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -456,6 +512,24 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// How long a test waits for a login shell to get somewhere, before it
+    /// gives up and fails. Only a failing test waits it out, so it is sized
+    /// for a loaded machine rather than an idle one: a shell that starts in
+    /// milliseconds alone has taken seconds with builds and other suites
+    /// running beside it, and a test that fails for that says nothing about
+    /// pando.
+    const BACKSTOP: Duration = Duration::from_secs(60);
+
+    /// The pid a script wrote to `file` with `echo`, once all of it is
+    /// there: the newline is the last byte `echo` writes.
+    fn pid_in(file: &Path) -> Option<u32> {
+        std::fs::read_to_string(file)
+            .ok()?
+            .strip_suffix('\n')?
+            .parse()
+            .ok()
+    }
+
     #[test]
     fn is_alive_returns_false_for_nonexistent_pid() {
         assert!(!is_alive(999_999));
@@ -464,13 +538,7 @@ mod tests {
     #[test]
     fn a_captured_command_reports_what_it_printed_and_how_it_ended() {
         let dir = tempdir().unwrap();
-        let captured = run_captured(
-            "echo out; echo err >&2",
-            dir.path(),
-            &[],
-            Duration::from_secs(10),
-        )
-        .unwrap();
+        let captured = run_captured("echo out; echo err >&2", dir.path(), &[], BACKSTOP).unwrap();
         assert!(captured.success());
         assert_eq!(captured.code, Some(0));
         assert_eq!(captured.stdout.trim(), "out");
@@ -484,7 +552,7 @@ mod tests {
             "echo noise >&2; echo 'the real reason' >&2; exit 7",
             dir.path(),
             &[],
-            Duration::from_secs(10),
+            BACKSTOP,
         )
         .unwrap();
         assert!(!captured.success());
@@ -499,7 +567,7 @@ mod tests {
             "pwd; printf 'SECRET=%s\\n' \"$SECRET\"",
             dir.path(),
             &[("SECRET".to_string(), "abc".to_string())],
-            Duration::from_secs(10),
+            BACKSTOP,
         )
         .unwrap();
         let canonical = dir.path().canonicalize().unwrap();
@@ -524,7 +592,7 @@ mod tests {
             "for i in $(seq 1 5000); do echo 'a line of output that is not especially short'; done",
             dir.path(),
             &[],
-            Duration::from_secs(30),
+            BACKSTOP,
         )
         .unwrap();
         assert!(captured.success());
@@ -534,30 +602,36 @@ mod tests {
     // The whole reason this is not `Command::output()`: a script that hangs
     // must not hang the share that asked it a question — and killing the
     // shell alone would leave whatever it started behind.
+    //
+    // The budget runs out once the script has started what it hangs on,
+    // however long its login shell took to get that far. A command killed
+    // before it ran anything at all would prove nothing, and a clock short
+    // enough to wait out here is one a loaded machine can spend entirely on
+    // the shell's start.
     #[test]
     fn a_captured_command_that_hangs_is_killed_with_everything_it_started() {
         let dir = tempdir().unwrap();
         let pidfile = dir.path().join("child.pid");
-        // Generous, because `bash -lc` sources a login profile first: a
-        // command killed before it ran anything at all would prove nothing.
-        let err = run_captured(
-            &format!("sleep 300 & echo $! > {}; wait", pidfile.display()),
-            dir.path(),
-            &[],
-            Duration::from_secs(3),
-        )
+        let child_started = {
+            let pidfile = pidfile.clone();
+            move |_| pid_in(&pidfile).is_some()
+        };
+        let err = with_budget_over_when(child_started, || {
+            run_captured(
+                &format!("sleep 300 & echo $! > {}; wait", pidfile.display()),
+                dir.path(),
+                &[],
+                BACKSTOP,
+            )
+        })
         .unwrap_err();
         assert!(
             format!("{err:#}").contains("still running after"),
             "{err:#}"
         );
 
-        let child: u32 = std::fs::read_to_string(&pidfile)
-            .expect("the script wrote its child's pid")
-            .trim()
-            .parse()
-            .expect("a pid");
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let child = pid_in(&pidfile).expect("the script wrote its child's pid");
+        let deadline = Instant::now() + BACKSTOP;
         while is_alive(child) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(25));
         }
@@ -572,47 +646,58 @@ mod tests {
     // minting script to do — held its stdout open after the shell exited
     // and blocked the caller for as long as that child lived: 45 s here,
     // an hour for `sleep 3600 &`, whatever the timeout said.
+    //
+    // The budget runs out half a second after the shell exits, however long
+    // the shell took to get there. It used to be a two-second clock from
+    // the spawn, which also had to cover a login shell's start: on a loaded
+    // machine the start took longer, the shell was killed before it had
+    // backgrounded anything, and the test failed at its `unwrap` without
+    // having asked about the pipe at all. The half second is the reader's:
+    // what the shell printed is in the pipe before it exits, and it is read
+    // before the group is killed rather than raced against the kill.
     #[test]
     fn a_captured_command_is_bounded_when_a_background_child_holds_its_pipe() {
         let dir = tempdir().unwrap();
         let pidfile = dir.path().join("child.pid");
-        let timeout = Duration::from_secs(2);
+        let holds_for = Duration::from_secs(45);
         let started = Instant::now();
-        let captured = run_captured(
-            &format!(
-                "printf 'session=abc'; sleep 45 & echo $! > {}",
-                pidfile.display()
-            ),
-            dir.path(),
-            &[],
-            timeout,
-        )
+        let captured = with_budget_over_when(after_the_exit(Duration::from_millis(500)), || {
+            run_captured(
+                &format!(
+                    "printf 'session=abc'; sleep {} & echo $! > {}",
+                    holds_for.as_secs(),
+                    pidfile.display()
+                ),
+                dir.path(),
+                &[],
+                BACKSTOP,
+            )
+        })
         .unwrap();
         let elapsed = started.elapsed();
 
         assert!(
-            elapsed < Duration::from_secs(20),
+            elapsed < holds_for,
             "a backgrounded child held the pipe and the caller waited for it: {elapsed:?}"
         );
         assert!(captured.success(), "{captured:?}");
         assert_eq!(
             captured.stdout.trim(),
             "session=abc",
-            "what was read before the deadline is still what the caller asked for"
+            "what was read before the budget ran out is still what the caller asked for"
         );
 
-        let child: u32 = std::fs::read_to_string(&pidfile)
-            .expect("the script wrote its child's pid")
-            .trim()
-            .parse()
-            .expect("a pid");
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let child = pid_in(&pidfile).expect("the script wrote its child's pid");
+        // Half the child's life: long enough for a loaded machine to land
+        // the kill, and short enough that the child being gone cannot be it
+        // ending by itself.
+        let deadline = started + holds_for / 2;
         while is_alive(child) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(25));
         }
         assert!(
             !is_alive(child),
-            "the group that outlasted the deadline was not killed with it"
+            "the group that outlasted its budget was not killed with it"
         );
     }
 
@@ -677,8 +762,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let log = dir.path().join("log.txt");
         let r = spawn_detached(SpawnOptions {
-            // bash backgrounds the sleep and exits immediately.
-            shell_cmd: "sleep 30 & exit 0",
+            // bash backgrounds the sleep and exits immediately. The sleep
+            // outlives every wait below, so the group is still there however
+            // long the shell took to start.
+            shell_cmd: "sleep 300 & exit 0",
             cwd: dir.path(),
             log_file: &log,
             env: &[],
@@ -686,7 +773,7 @@ mod tests {
         })
         .unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + BACKSTOP;
         while is_alive(r.pid) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -696,7 +783,9 @@ mod tests {
             "the backgrounded child keeps the group alive"
         );
 
-        stop(r.pgid, Duration::from_secs(5)).unwrap();
+        // `stop` returns once the group is empty, so the grace is only
+        // waited out if the child ignores SIGTERM, which a sleep does not.
+        stop(r.pgid, BACKSTOP).unwrap();
         assert!(
             !group_alive(r.pgid),
             "stop must empty the group, not just outlive its leader"
@@ -726,7 +815,7 @@ mod tests {
                 status_file: Some(&status),
             })
             .unwrap();
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + BACKSTOP;
             while recorded_exit_status(&status).is_none() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -739,7 +828,7 @@ mod tests {
             // exiting, so the status file appearing does not mean the
             // process is already reaped. Asserting straight off that race
             // is a flake under load, which is how this one was found.
-            let gone = Instant::now() + Duration::from_secs(10);
+            let gone = Instant::now() + BACKSTOP;
             while is_alive(r.pid) && Instant::now() < gone {
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -763,7 +852,7 @@ mod tests {
             status_file: Some(&status),
         })
         .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + BACKSTOP;
         while recorded_exit_status(&status).is_none() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -825,7 +914,7 @@ mod tests {
                 .unwrap();
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + BACKSTOP;
         while !listed().is_empty() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -848,7 +937,7 @@ mod tests {
             status_file: None,
         })
         .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + BACKSTOP;
         while is_alive(r.pid) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -898,7 +987,7 @@ mod tests {
         })
         .unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + BACKSTOP;
         while is_alive(r.pid) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -928,12 +1017,17 @@ mod tests {
         })
         .unwrap();
 
+        // Returning before the grace is up is what says SIGTERM was enough:
+        // past it `stop` sends SIGKILL. How long SIGTERM takes to land is
+        // the machine's load, not pando, so the grace is long and the
+        // assertion is against it rather than against a guess.
+        let grace = BACKSTOP;
         let start = Instant::now();
-        stop(r.pgid, Duration::from_secs(5)).unwrap();
+        stop(r.pgid, grace).unwrap();
         let elapsed = start.elapsed();
         assert!(
-            elapsed < Duration::from_secs(2),
-            "sleep should die on SIGTERM well under the grace window; took {elapsed:?}"
+            elapsed < grace,
+            "sleep should die on SIGTERM within the grace window; took {elapsed:?}"
         );
         std::thread::sleep(Duration::from_millis(50));
         assert!(!is_alive(r.pid));
@@ -955,7 +1049,7 @@ mod tests {
         })
         .unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + BACKSTOP;
         while is_alive(r.pid) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
