@@ -284,7 +284,7 @@ something to know that breaks nothing. Every finding carries its own `fix`.
 `config.layers[].keys[].note` is the provenance of every key pando wrote,
 verbatim from the file and so with the comment's own `#` on the front:
 `# detected: <evidence>`, `# answered: <date>`, `# answered: a program,
-<date>`, `# answered: --yes took the first of N options`, or, for the
+<date>`, `# answered: --yes took the first of N options` (`# answered: --yes took the only option` when there was one), or, for the
 services question, whose answer is a set, `# answered: --yes took the
 <taken> of <offered> the rules resolved`. A `[[services]]` entry's note
 is on the entry's own key, its place in the list: `services[0]`. A key

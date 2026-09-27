@@ -104,6 +104,7 @@ impl Note {
         match self {
             Note::Detected(why) => format!("  # detected: {why}"),
             Note::Answered => format!("  # answered: {}", Utc::now().format("%Y-%m-%d")),
+            Note::TookFirst(1) => "  # answered: --yes took the only option".to_string(),
             Note::TookFirst(options) => {
                 format!("  # answered: --yes took the first of {options} options")
             }

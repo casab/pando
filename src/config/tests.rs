@@ -214,6 +214,7 @@ fn every_provenance_note_pando_writes_is_a_form_agent_json_documents() {
         Note::Detected("<evidence>".into()),
         Note::Answered,
         Note::TookFirst(7),
+        Note::TookFirst(1),
         Note::TookRuled {
             taken: 3,
             offered: 5,
