@@ -298,6 +298,16 @@ fn await_url(pid: u32, log_path: &Path) -> Result<Published> {
 /// a slow edge is not a dead one: the URL comes back with the tail, for
 /// the caller to pass on.
 fn await_url_until(pid: u32, log_path: &Path, deadline: Instant) -> Result<Published> {
+    await_url_while(|| process::is_alive(pid), log_path, deadline)
+}
+
+/// [`await_url_until`], asking `is_alive` whether the tunnel still runs, so
+/// a test can have it write its last lines and exit between two looks.
+fn await_url_while(
+    is_alive: impl Fn() -> bool,
+    log_path: &Path,
+    deadline: Instant,
+) -> Result<Published> {
     loop {
         // Liveness first, then the log. A tunnel seen dead has written
         // all it ever will, so the log read after that is the whole of
@@ -306,7 +316,7 @@ fn await_url_until(pid: u32, log_path: &Path, deadline: Instant) -> Result<Publi
         // loop slept never connected, whether its URL is first seen with
         // it alive or with it gone. Read the other way round, the log can
         // predate the very lines that decide it.
-        let alive = process::is_alive(pid);
+        let alive = is_alive();
         let url = parse_url_from_log(log_path);
         let connected = url.is_some() && log_says_connected(log_path);
         match (url, alive) {
@@ -856,6 +866,44 @@ mod tests {
         let message = format!("{err:#}");
         assert!(message.contains("never connected"), "{message}");
         assert!(message.contains("Failed to dial"), "{message}");
+    }
+
+    // Liveness is asked before the log is read, so a tunnel that writes its
+    // last lines and exits between the two looks is judged on those lines.
+    // Read the other way round, the log would predate them: the first case
+    // would say it never connected, the second that it never published.
+    #[test]
+    fn a_tunnel_that_writes_its_last_lines_as_it_exits_is_judged_on_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("cloudflared.log");
+        let append = |line: &str| {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+            writeln!(file, "{line}").unwrap();
+        };
+        let banner = format!("INF |  {FAKE_TUNNEL_URL}  |");
+
+        std::fs::write(&log, format!("{banner}\n")).unwrap();
+        let connects_and_exits = || {
+            append(FAKE_REGISTERED);
+            false
+        };
+        let err =
+            await_url_while(connects_and_exits, &log, Instant::now() + READY_TIMEOUT).unwrap_err();
+        assert!(format!("{err:#}").contains("and then exited"), "{err:#}");
+
+        std::fs::write(&log, "").unwrap();
+        let publishes_and_exits = || {
+            append(&banner);
+            false
+        };
+        let err =
+            await_url_while(publishes_and_exits, &log, Instant::now() + READY_TIMEOUT).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(&format!("published {FAKE_TUNNEL_URL}")),
+            "{message}"
+        );
     }
 
     // And one that did connect before it went is told apart by the same

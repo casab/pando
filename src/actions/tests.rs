@@ -4073,7 +4073,7 @@ fn a_provider_that_cannot_reach_cloudflare_fails_the_share_and_leaves_no_proxy()
 // and on a loaded machine a clock short enough to wait out here is spent
 // before the script has printed anything.
 #[test]
-fn an_auth_command_that_backgrounds_a_helper_is_bounded_by_its_own_timeout() {
+fn an_auth_command_that_backgrounds_a_helper_does_not_hold_the_share_open() {
     let Some((fx, name, _guards, _)) = shared_fixture() else {
         return;
     };
@@ -4116,6 +4116,37 @@ fn an_auth_command_that_backgrounds_a_helper_is_bounded_by_its_own_timeout() {
     assert!(
         wait_until(kill_lands_by, || !crate::process::is_alive(child)),
         "the helper outlived the auth command that started it"
+    );
+}
+
+// What bounds an auth command is AUTH_CMD_TIMEOUT, and its error says so.
+// The budget runs out once the script has started what it hangs on, so
+// the test does not wait thirty seconds out; the message still names the
+// budget the share gave the command.
+#[test]
+fn a_hanging_auth_command_is_given_the_auth_timeout() {
+    let Some((fx, name, _guards, _)) = shared_fixture() else {
+        return;
+    };
+    let pidfile = fx.paths.home.join("auth-hang.pid");
+    let mut config = fx.config.clone();
+    config.share.auth_cmd = Some(format!("sleep 300 & echo $! > {}; wait", pidfile.display()));
+    let hanging = {
+        let pidfile = pidfile.clone();
+        move |_| std::fs::read_to_string(&pidfile).is_ok_and(|pid| pid.ends_with('\n'))
+    };
+
+    let err = proc::with_budget_over_when(hanging, || share_stubbed(&fx, &config, &name))
+        .expect_err("an auth command that never finishes fails the share");
+    let _share = share_guard(&fx, &name);
+
+    let message = format!("{err:#}");
+    assert!(
+        message.contains(&format!(
+            "still running after {}s",
+            AUTH_CMD_TIMEOUT.as_secs()
+        )),
+        "{message}"
     );
 }
 

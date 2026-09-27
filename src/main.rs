@@ -18,6 +18,9 @@ const EXIT_USAGE: u8 = 2;
 pub const EXIT_NEEDS_ANSWER: u8 = 3;
 
 fn main() -> ExitCode {
+    // Before any thread exists: a fork made while another thread sets up
+    // libnotify kills the child on macOS (see the function).
+    pando::process::settle_before_fork();
     // Parsed before anything else so `--help` and `--version` work outside a
     // repository, and a usage error exits 2 through clap.
     let cli = Cli::parse();

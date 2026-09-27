@@ -74,8 +74,13 @@ pub(crate) fn new_session(command: &mut Command) -> &mut Command {
 /// per process, so finishing it here, on the thread about to fork, closes
 /// the window for every fork after. Any libnotify call does it; this one
 /// asks nothing of the daemon.
+///
+/// `main` calls it first, before the TUI or anything else starts a thread,
+/// so a fork std makes for any reason finds it settled, not only the ones
+/// [`new_session`] asks for. `new_session` calls it as well, for the test
+/// binaries, which never run `main`.
 #[cfg(target_os = "macos")]
-fn settle_before_fork() {
+pub fn settle_before_fork() {
     LIBNOTIFY_SETTLED.call_once(|| {
         unsafe extern "C" {
             fn notify_is_valid_token(token: libc::c_int) -> bool;
@@ -93,7 +98,7 @@ static LIBNOTIFY_SETTLED: std::sync::Once = std::sync::Once::new();
 /// Nothing to settle: the handlers that make a fork unsafe mid-set-up are
 /// macOS's.
 #[cfg(not(target_os = "macos"))]
-fn settle_before_fork() {}
+pub fn settle_before_fork() {}
 
 /// Starts a command in its own session, writing its output to a log file.
 ///
@@ -742,6 +747,45 @@ mod tests {
         );
     }
 
+    // The same bound with no seam: the clock alone ends the drain. A helper
+    // holding the pipe for five minutes lets go of the call at the budget on
+    // a machine that started the shell in time, and a machine too loaded to
+    // start it in time ends the call the other way, with the shell still
+    // running. Both answers come long before the helper would have let go;
+    // a drain the clock did not bound would take all five minutes.
+    #[test]
+    fn the_clock_alone_bounds_the_drain() {
+        let dir = tempdir().unwrap();
+        let pidfile = dir.path().join("child.pid");
+        let started = Instant::now();
+        let result = run_captured(
+            &format!("printf x; sleep 300 & echo $! > {}", pidfile.display()),
+            dir.path(),
+            &[],
+            Duration::from_secs(2),
+        );
+        let elapsed = started.elapsed();
+
+        match result {
+            Ok(captured) => assert_eq!(captured.stdout, "x", "{captured:?}"),
+            Err(err) => assert!(
+                format!("{err:#}").contains("still running after"),
+                "{err:#}"
+            ),
+        }
+        assert!(
+            elapsed < Duration::from_secs(150),
+            "the drain waited on the helper rather than the clock: {elapsed:?}"
+        );
+        if let Some(child) = pid_in(&pidfile) {
+            let deadline = Instant::now() + BACKSTOP;
+            while is_alive(child) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            assert!(!is_alive(child), "the helper outlived the call");
+        }
+    }
+
     // A `[share].auth_cmd` may hold a literal credential — printing one is
     // the shape of the simplest possible auth command — and a timeout must
     // not be how it reaches a terminal, a log, or a TUI status line.
@@ -1027,9 +1071,12 @@ mod tests {
         assert!(LIBNOTIFY_SETTLED.is_completed());
     }
 
-    // `pre_exec` is what makes std fork rather than spawn, and a fork that
-    // skips `new_session` skips the settling that makes it safe. So the one
-    // `pre_exec` in pando is the one in `new_session`.
+    // `pre_exec` is the fork trigger pando has reason to use: std also forks
+    // rather than spawns for a changed PATH with a bare program, a uid or
+    // gid, or a relative program with a cwd, none of which pando does, and
+    // `main` settles libnotify before any of them could. Within the tests,
+    // which never run `main`, a fork that skipped `new_session` would skip
+    // the settling, so the one `pre_exec` in pando is the one there.
     #[test]
     fn every_session_pando_starts_is_started_by_new_session() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1093,7 +1140,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let log = dir.path().join("log.txt");
         let r = spawn_detached(SpawnOptions {
-            shell_cmd: "sleep 30",
+            shell_cmd: "sleep 300",
             cwd: dir.path(),
             log_file: &log,
             env: &[],
@@ -1102,7 +1149,8 @@ mod tests {
         .unwrap();
 
         // Returning before the grace is up is what says SIGTERM was enough:
-        // past it `stop` sends SIGKILL. How long SIGTERM takes to land is
+        // past it `stop` sends SIGKILL, and the child outlives the grace, so
+        // it cannot have ended by itself. How long SIGTERM takes to land is
         // the machine's load, not pando, so the grace is long and the
         // assertion is against it rather than against a guess.
         let grace = BACKSTOP;

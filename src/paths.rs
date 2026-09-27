@@ -706,8 +706,10 @@ mod tests {
         assert!(!home.exists(), "a refused home must not be created");
     }
 
-    // The only test that touches the environment. `default_home` is the one
-    // function in the crate that reads it, and nothing else calls that.
+    // The only test that changes the environment mid-run, and on a variable
+    // nothing else reads: `default_home` is the one function in the crate
+    // that reads PANDO_HOME. (`testutil::no_auto_maintenance` sets git's
+    // GIT_CONFIG_* once, before any fixture, and never changes them.)
     #[test]
     fn default_home_honours_pando_home_then_falls_back() {
         let previous = std::env::var_os("PANDO_HOME");

@@ -545,13 +545,24 @@ fn run_capturing_status(mut cmd: Command, timeout: Duration) -> Option<(bool, St
         // the pipe closes only when every process holding it has exited;
         // waiting for either made the deadline a suggestion, and on a machine
         // deep in swap `start --wait` sat on one `ps` for minutes.
+        //
+        // Marked before its reaper starts, since a reaper that finished first
+        // would unmark nothing and leave the mark for good; unmarked again if
+        // no thread could be had, since then nothing else would. A refused
+        // thread leaves the child to pando's exit.
         let _ = child.kill();
         lingering().insert(program.clone());
-        thread::spawn(move || {
-            let _ = child.wait();
-            let _ = reader.join();
+        let reaping = program.clone();
+        let reaper = thread::Builder::new()
+            .name("scan-reap".into())
+            .spawn(move || {
+                let _ = child.wait();
+                let _ = reader.join();
+                lingering().remove(&reaping);
+            });
+        if reaper.is_err() {
             lingering().remove(&program);
-        });
+        }
         return None;
     };
     let status = child.wait();

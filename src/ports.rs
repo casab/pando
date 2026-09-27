@@ -596,11 +596,10 @@ pub fn assign_with(
 /// Reserves the port a worktree's share proxy listens on, leaving every
 /// port its processes already hold exactly where it is.
 ///
-/// Additive on purpose. [`assign_with`] reuses a worktree's window only
-/// when the recorded roles are exactly the ones being asked for, so folding
-/// `share` into the role set would make the next start decide the window
-/// had changed and move every port — including the one a running
-/// application is being reached on. A share must never do that.
+/// Additive on purpose. Folded into the role set, `share` would take a slot
+/// in the worktree's window that the next process role needs, and that
+/// role would have to share the slot or move the window, the port a running
+/// application is reached on with it. A share must never do that.
 ///
 /// The port is remembered on the record, so share → unshare → share gives
 /// the same number. It is looked for inside the worktree's own eight-port
@@ -1427,7 +1426,7 @@ mod tests {
     // A live shared → isolated switch adds service roles, so the reuse
     // path is skipped and the window is re-derived while the dev server
     // kept serving through the switch still holds its port. Its own port
-    // is free for its own role, so the same base comes back and the URL
+    // is free for its own role, so the same window comes back and the URL
     // does not move; a service role is never handed a port a live process
     // is on.
     #[test]

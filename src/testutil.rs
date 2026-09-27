@@ -62,10 +62,12 @@ pub fn git(cwd: &Path, args: &[&str]) {
 /// for a command it runs in another repository, so a test's origin turns
 /// maintenance off in its own config.
 ///
-/// The tests here otherwise leave the process environment alone (see
-/// [`fake_cloudflared`]). This is set once, before any fixture repository
-/// exists, and to the same value for every test, so unlike a PATH one test
-/// sets for itself there is nothing for two tests to disagree about.
+/// The one other test that writes the environment is
+/// `paths::tests::default_home_honours_pando_home_then_falls_back`, on
+/// PANDO_HOME (fakes go in pando's own `bin`, see [`fake_cloudflared`]).
+/// This is set once, before any fixture repository exists, and to the same
+/// value for every test, so unlike a PATH one test sets for itself there
+/// is nothing for two tests to disagree about.
 pub fn no_auto_maintenance() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
