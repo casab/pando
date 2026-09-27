@@ -65,15 +65,16 @@
         <a class="btn" href="#try">Try it here <span class="kbd">↓</span></a>
         <a class="btn ghost" href="#install">Install</a>
       </div>
-      <div class="hero-steps">
+      <div class="hero-steps" role="group" aria-label="Install pando, then run it in your project">
         <div class="hs-row">
-          <span class="hs-n">1</span><span class="hs-l">install</span>
+          <span class="hs-n" aria-hidden="true">1</span>
           <code class="hs-cmd"><span class="p">$</span> git clone https://github.com/mertkaradayi/pando &amp;&amp; cd pando &amp;&amp; cargo install --path .</code>
-          <button class="copy" type="button" data-copy="git clone https://github.com/mertkaradayi/pando &amp;&amp; cd pando &amp;&amp; cargo install --path ." aria-label="Copy the install command">copy</button>
+          <button class="copy hs-copy" type="button" data-copy="git clone https://github.com/mertkaradayi/pando &amp;&amp; cd pando &amp;&amp; cargo install --path ." aria-label="Copy the install command">copy</button>
         </div>
         <div class="hs-row">
-          <span class="hs-n">2</span><span class="hs-l">run it</span>
-          <span class="hs-txt">open a terminal in any project you work on, and type <code>pando</code></span>
+          <span class="hs-n" aria-hidden="true">2</span>
+          <code class="hs-cmd"><span class="p">$</span> pando<span class="cur" aria-hidden="true"></span></code>
+          <span class="hs-c">then, in any project you work on</span>
         </div>
       </div>
     </div>
@@ -967,7 +968,7 @@ theme = <span class="s">"catppuccin"</span>
           <div class="is-h"><span class="hs-n">1</span>Install it</div>
           <p class="is-note">It needs <code>git</code> and a recent stable Rust (<a href="https://rustup.rs">rustup.rs</a>).</p>
           <div class="term">
-            <div class="term-bar"><span class="dots"><i></i><i></i><i></i></span><span class="grow">one line: copy, paste, done</span><button class="copy" type="button" data-copy="git clone https://github.com/mertkaradayi/pando &amp;&amp; cd pando &amp;&amp; cargo install --path ." aria-label="Copy the install command">copy</button></div>
+            <div class="term-bar"><span class="dots"><i></i><i></i><i></i></span><span class="grow">one line: copy, paste, done</span><button class="copy hs-copy" type="button" data-copy="git clone https://github.com/mertkaradayi/pando &amp;&amp; cd pando &amp;&amp; cargo install --path ." aria-label="Copy the install command">copy</button></div>
 <pre class="wrap-cmd"><span class="p">$</span> git clone https://github.com/mertkaradayi/pando &amp;&amp; cd pando &amp;&amp; cargo install --path .</pre>
           </div>
           <p class="demo-hint">It clones pando, builds it, and puts the <code>pando</code> command in <code>~/.cargo/bin</code>. <code>pando --version</code> says which version you have.</p>
