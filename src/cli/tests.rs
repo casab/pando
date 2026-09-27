@@ -3657,9 +3657,22 @@ fn the_job_carries_the_briefs_first_run_section_and_only_that() {
             "where it starts",
         ),
         ("Do not re-derive", "that the evidence is not re-derived"),
-        ("confirm pando's guesses", "that a guess is confirmed"),
+        // A first run asks the developer nothing: the maintainer's call,
+        // after the first real run asked about apps and services.
+        (
+            "Ask the developer nothing",
+            "that the developer is not asked",
+        ),
+        ("`pando init --yes`", "pando's choices saved in one step"),
+        (
+            "every app of a monorepo runs",
+            "the apps question settled, not asked",
+        ),
         ("pando init --answers - --dry-run", "the preview"),
-        ("always through stdin", "that answers never go in a file"),
+        (
+            "through stdin, never an answers file",
+            "that answers never go in a file",
+        ),
         ("at least 10 minutes", "the check's timeout"),
         ("consent to this test", "that the prompt is consent"),
         ("never rerun unchanged", "fix, then rerun"),

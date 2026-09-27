@@ -22,22 +22,27 @@ repository: every setting goes through `pando init --answers -`, and the
 worktree `pando check` makes is pando's own, inside `.git`, removed when it
 is done.
 
-1. **Start with `pando signals` and `pando doctor --json`.** Do not
-   re-derive what they report (the brief's §0). The open questions
-   `init --agent` listed are the ones `signals` publishes with
-   `"decided": false`.
-2. **Answer the open questions, and confirm pando's guesses where they
-   hold.** Ask the developer only what the brief's §1 calls theirs, once,
-   with pando's options.
-3. **Preview, then save, always through stdin:**
+1. **Ask the developer nothing.** A first run is the fast path: pando's
+   rules have a first choice for almost everything, and taking it gets the
+   developer to ready soonest. They change any of it later.
+2. **Save pando's choices in one step: `pando init --yes`.** It takes
+   pando's first choice for every open question and writes it under
+   `~/.pando`, never into the repository. That settles the two choices
+   §1 calls the developer's as well: every app of a monorepo runs, and
+   how private services would run does not matter to the check, which
+   uses the developer's own services as the main checkout does.
+3. **A question with no option is yours to answer, not theirs.** When
+   `pando init --yes` leaves one open (exit 3, the question on stderr),
+   answer it from the repository's own evidence: `pando signals` and
+   `pando doctor --json` have it. Do not re-derive what they report
+   (§0). Answer through stdin, never an answers file, which in the
+   project would be a file in the developer's repository:
 
    ```bash
    pando init --answers - --dry-run    # the answers as one JSON object on stdin; writes nothing
    pando init --answers -              # the same object, written
    ```
 
-   Never an answers file: one in the project would be a file in the
-   developer's repository.
 4. **Run `pando check`, with a timeout of at least 10 minutes.** It makes a
    throwaway worktree of the commit a new branch would fork from, runs the
    install, starts every app, checks the one the browser opens really
@@ -48,8 +53,9 @@ is done.
      `pando init --answers - --replace`, which replaces a slot that is
      already answered, then run the check again.
    - A machine failure (`kind: "machine"`: a server not running, Docker
-     stopped, a runtime missing) is the developer's. Tell them the command
-     pando printed and change no setting.
+     stopped, a runtime missing) is the developer's, and the one thing to
+     tell them before you are done: the command pando printed. Change no
+     setting for it.
    - Exit 3 is not a failure: a question is still open, and the check
      started nothing. Answer it with `pando init --answers -`, then run
      the check again.
@@ -59,6 +65,10 @@ is done.
 
    > pando is set up and tested for <project>.
    > You're ready: run `pando`.
+
+The rest of this brief is for when a failure needs it
+(`pando init --agent --reference brief`); a first run that passes never
+does.
 
 ---
 
@@ -96,6 +106,7 @@ intelligible. Never as a substitute for `signals`.
 
 ## 1. The question budget
 
+> On a first run (the section above): **zero** questions, always.
 > On a project the rules fully understand: **zero** questions.
 > On a project they half understand: **one**.
 

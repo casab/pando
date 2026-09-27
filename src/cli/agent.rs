@@ -272,13 +272,14 @@ fn project_now(paths: &PandoPaths, config: &Config) -> String {
 
     match open.is_empty() {
         true => out.push_str(
-            "\nOpen questions: none. `pando init --answers - --dry-run` with `{}` on stdin shows \
-             what pando would write.\n\n",
+            "\nOpen questions: none. `pando init --yes` saves pando's choices; then \
+             `pando check`.\n\n",
         ),
         false => {
             out.push_str(
-                "\nOpen questions, with pando's options (answer by value; the marked one is what \
-                 pando takes on its own):\n\n",
+                "\nOpen questions, with pando's options. The marked one is what `pando init \
+                 --yes` takes: take it, and ask the developer nothing. Answer by value only one \
+                 that has no option.\n\n",
             );
             for p in open {
                 out.push_str(&open_question(paths, p));

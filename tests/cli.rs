@@ -2654,6 +2654,12 @@ fn init_agent_names_the_open_questions_and_pandos_guesses() {
         "{job}"
     );
     assert!(job.contains("← pando's choice"), "{job}");
+    // Taken, not asked: a first run puts no question to the developer.
+    let flat = job.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("take it, and ask the developer nothing"),
+        "{job}"
+    );
     // Guessed, with the evidence.
     assert!(
         job.contains("- install: pando's guess: `pnpm install --frozen-lockfile` (pnpm-lock.yaml)"),
