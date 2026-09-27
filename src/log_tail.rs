@@ -1822,9 +1822,13 @@ mod tests {
         tail.poll().unwrap();
         let before = std::fs::metadata(&path).unwrap().ino();
 
-        std::fs::remove_file(&path).unwrap();
+        // Written beside the old one and renamed over it, the way a log is
+        // rotated: removing the old file first lets ext4 hand the new one
+        // the same inode at once.
         let rotated: String = (0..30).map(|n| format!("old line {n}\n")).collect();
-        write_all(&path, &rotated);
+        let fresh = dir.path().join("dev.log.new");
+        write_all(&fresh, &rotated);
+        std::fs::rename(&fresh, &path).unwrap();
         assert_ne!(
             std::fs::metadata(&path).unwrap().ino(),
             before,

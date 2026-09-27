@@ -1495,6 +1495,10 @@ mod tests {
     fn a_loopback_only_listener_is_not_free_either() {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
+        // The premise holds on macOS, where this was found. Linux refuses
+        // the wildcard while loopback holds the port, so there a probe of
+        // either address already says it is taken.
+        #[cfg(target_os = "macos")]
         assert!(
             std::net::TcpListener::bind(("0.0.0.0", port)).is_ok(),
             "the premise: the wildcard address is still bindable"
