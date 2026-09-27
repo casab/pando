@@ -65,7 +65,17 @@
         <a class="btn" href="#try">Try it here <span class="kbd">↓</span></a>
         <a class="btn ghost" href="#install">Install</a>
       </div>
-      <div class="hero-cmd"><code><span class="p">$</span> cd your-project &amp;&amp; pando</code><button class="copy" type="button" data-copy="cd your-project && pando">copy</button></div>
+      <div class="hero-steps">
+        <div class="hs-row">
+          <span class="hs-n">1</span><span class="hs-l">install</span>
+          <code class="hs-cmd"><span class="p">$</span> git clone https://github.com/mertkaradayi/pando &amp;&amp; cd pando &amp;&amp; cargo install --path .</code>
+          <button class="copy" type="button" data-copy="git clone https://github.com/mertkaradayi/pando &amp;&amp; cd pando &amp;&amp; cargo install --path ." aria-label="Copy the install command">copy</button>
+        </div>
+        <div class="hs-row">
+          <span class="hs-n">2</span><span class="hs-l">run it</span>
+          <span class="hs-txt">open a terminal in any project you work on, and type <code>pando</code></span>
+        </div>
+      </div>
     </div>
     <div class="scroll-hint" aria-hidden="true">scroll · the story<i></i></div>
 
@@ -951,24 +961,31 @@ theme = <span class="s">"catppuccin"</span>
     <div class="eyebrow rv"><span class="n">10</span><span class="dot">·</span><span class="nm">Install</span><span class="bt">// from source</span></div>
     <h2 class="headline" data-type><span class="chev" aria-hidden="true">›</span><span class="txt">Build it. Run it.</span><span class="cur" aria-hidden="true"></span></h2>
     <p class="sub rv">no published binary yet: build it from source with a recent stable Rust</p>
-    <div class="split">
+    <div class="split wide-left">
+      <ol class="install-steps rv">
+        <li>
+          <div class="is-h"><span class="hs-n">1</span>Install it</div>
+          <p class="is-note">It needs <code>git</code> and a recent stable Rust (<a href="https://rustup.rs">rustup.rs</a>).</p>
+          <div class="term">
+            <div class="term-bar"><span class="dots"><i></i><i></i><i></i></span><span class="grow">one line: copy, paste, done</span><button class="copy" type="button" data-copy="git clone https://github.com/mertkaradayi/pando &amp;&amp; cd pando &amp;&amp; cargo install --path ." aria-label="Copy the install command">copy</button></div>
+<pre class="wrap-cmd"><span class="p">$</span> git clone https://github.com/mertkaradayi/pando &amp;&amp; cd pando &amp;&amp; cargo install --path .</pre>
+          </div>
+          <p class="demo-hint">It clones pando, builds it, and puts the <code>pando</code> command in <code>~/.cargo/bin</code>. <code>pando --version</code> says which version you have.</p>
+        </li>
+        <li>
+          <div class="is-h"><span class="hs-n">2</span>Run it in your project</div>
+          <p>Open a terminal in any git repository you work on, your own project, not pando's, and type:</p>
+<pre class="code run-cmd"><span class="p">$</span> pando</pre>
+          <p class="demo-hint">The first time, it opens the <a href="#first-run">setup screen</a>. After that, the list of every worktree. There's nothing to configure first, and nothing is written into your checkout. <code>pando completions zsh</code> (or bash, fish…) prints a completion script.</p>
+        </li>
+      </ol>
       <div class="rv">
-        <div class="term">
-          <div class="term-bar"><span class="dots"><i></i><i></i><i></i></span><span class="grow">sixty seconds</span><button class="copy" type="button" data-copy="git clone https://github.com/mertkaradayi/pando &amp;&amp; cd pando &amp;&amp; cargo install --path .">copy</button></div>
-<pre id="install-cmds"><span class="p">$</span> git clone https://github.com/mertkaradayi/pando &amp;&amp; cd pando
-<span class="p">$</span> cargo install --path .     <span class="c"># pando lands in ~/.cargo/bin</span>
-
-<span class="p">$</span> cd ~/code/your-project
-<span class="p">$</span> pando                      <span class="c"># the first time: the setup screen</span></pre>
-        </div>
-        <p class="demo-hint"><code>pando --version</code> says which version you have. <code>pando completions zsh</code> (or bash, fish…) prints a completion script. pando is developed on Rust 1.90.</p>
-      </div>
-      <div class="rv">
-        <p>Want to see it before you point it at your own project? pando's test suite builds repositories of every shape it knows. One of them is a good place to start:</p>
+        <p>Want to see it before you point it at your own project? From the pando checkout you just cloned, its test suite can build repositories of every shape it knows. One of them is a good place to start:</p>
 <pre class="code"><span class="p">$</span> scripts/fixture-repo.sh --list
 <span class="p">$</span> scripts/fixture-repo.sh mono-web-api --listener
 <span class="c"># builds one in a temporary directory,
 # and prints how to run pando in it</span></pre>
+        <p class="demo-hint">pando is developed on Rust 1.90. There is no published binary, crate or Homebrew tap yet.</p>
       </div>
     </div>
 
