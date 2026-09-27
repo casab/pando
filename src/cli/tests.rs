@@ -179,93 +179,6 @@ fn a_name_that_is_one_worktrees_directory_and_anothers_branch_is_refused() {
     assert_eq!(super::names::resolve(&fx.paths, "other").unwrap(), "other");
 }
 
-// `start --only web --wait` is about web. A sibling that failed an hour
-// ago used to fail it; a process with no port was "ready" the moment it
-// was alive, so a dev command that exited a second later was a success.
-#[test]
-fn a_wait_watches_only_what_it_started_and_a_portless_process_for_a_while() {
-    use super::wait::{Verdict, verdict};
-    let now = Utc::now();
-    let mut record = WorktreeRecord::new("/tmp/nowhere", true);
-    let mut api = fake_process(now - chrono::Duration::hours(1));
-    api.phase = Phase::Failed {
-        at: now,
-        reason: "process exited".into(),
-    };
-    record.processes.insert("api".into(), api);
-    let mut web = fake_process(now - chrono::Duration::seconds(60));
-    web.ready_port = Some(17_342);
-    web.phase = Phase::Running { since: now };
-    record.processes.insert("web".into(), web);
-
-    assert_eq!(verdict(&record, Some("web"), now), Verdict::Ready);
-    assert!(matches!(
-        verdict(&record, None, now),
-        Verdict::Failed { process, .. } if process == "api"
-    ));
-
-    // No port: running as soon as it is alive, and watched a while more.
-    let mut dev = fake_process(now);
-    dev.phase = Phase::Running { since: now };
-    record.processes.insert("dev".into(), dev);
-    assert_eq!(verdict(&record, Some("dev"), now), Verdict::Waiting);
-    let later = now + chrono::Duration::from_std(super::wait::NO_PORT_WATCH).unwrap();
-    assert_eq!(
-        verdict(&record, Some("dev"), later + chrono::Duration::seconds(1)),
-        Verdict::Ready
-    );
-}
-
-// A worker that died four seconds in was "started" with exit 0, because
-// the watch was three; and "worker is ready (0.1s)" was printed before
-// the watch had even begun.
-#[test]
-fn a_portless_process_is_watched_long_enough_and_called_up_only_after() {
-    use super::wait::{Verdict, ready_line, verdict};
-    let now = Utc::now();
-    let mut record = WorktreeRecord::new("/tmp/nowhere", true);
-    let mut worker = fake_process(now);
-    worker.phase = Phase::Running { since: now };
-    record.processes.insert("worker".into(), worker.clone());
-    let at = |secs| now + chrono::Duration::seconds(secs);
-
-    // Still watched at four seconds: a death then fails the wait.
-    assert_eq!(verdict(&record, None, at(4)), Verdict::Waiting);
-    assert_eq!(
-        ready_line(
-            "worker",
-            &worker,
-            at(1),
-            std::time::Duration::from_millis(100)
-        ),
-        None
-    );
-    assert_eq!(verdict(&record, None, at(6)), Verdict::Ready);
-    assert_eq!(
-        ready_line("worker", &worker, at(6), std::time::Duration::from_secs(6)).unwrap(),
-        "worker is up (no port to check; watched 5s)"
-    );
-
-    // Its own timeout stretches the watch, but not past ten seconds.
-    worker.ready_timeout_s = Some(8);
-    record.processes.insert("worker".into(), worker.clone());
-    assert_eq!(verdict(&record, None, at(7)), Verdict::Waiting);
-    assert_eq!(verdict(&record, None, at(9)), Verdict::Ready);
-    worker.ready_timeout_s = Some(300);
-    record.processes.insert("worker".into(), worker.clone());
-    assert_eq!(verdict(&record, None, at(9)), Verdict::Waiting);
-    assert_eq!(verdict(&record, None, at(11)), Verdict::Ready);
-
-    // A process with a port is ready the moment it is running.
-    let mut web = fake_process(now);
-    web.ready_port = Some(17_343);
-    web.phase = Phase::Running { since: now };
-    assert_eq!(
-        ready_line("web", &web, now, std::time::Duration::from_millis(1500)).unwrap(),
-        "web is ready (1.5s)"
-    );
-}
-
 // The heuristic is on `--help`, where a script author will look for it.
 #[test]
 fn start_help_says_how_a_portless_process_is_judged_ready() {
@@ -275,42 +188,6 @@ fn start_help_says_how_a_portless_process_is_judged_ready() {
     let help = start.render_long_help().to_string();
     assert!(help.contains("no port"), "{help}");
     assert!(help.contains("5s") && help.contains("10s"), "{help}");
-}
-
-// The wait outlives the phase machine, which keeps a process `Starting`
-// past its window while the port scan cannot answer.
-#[test]
-fn a_wait_lasts_as_long_as_the_phase_can_stay_starting() {
-    let now = Utc::now();
-    let mut record = WorktreeRecord::new("/tmp/nowhere", true);
-    let mut web = fake_process(now);
-    web.ready_timeout_s = Some(10);
-    record.processes.insert("web".into(), web);
-    let limit = super::wait::limit(&record, None);
-    assert!(
-        limit.as_secs() > crate::state::longest_starting_secs(10) as u64,
-        "{limit:?}"
-    );
-}
-
-// `ready.timeout_s` takes any number TOML can write. The window plus its
-// grace overflowed past half of `i64::MAX`: a debug build panicked, and a
-// release build wrapped negative and gave up after 20 seconds on a
-// process the phase machine was still, correctly, waiting for.
-#[test]
-fn a_huge_ready_timeout_makes_a_long_wait_and_not_an_overflow() {
-    let now = Utc::now();
-    for timeout in [i64::MAX as u64, u64::MAX, i64::MAX as u64 / 2 + 1] {
-        let mut record = WorktreeRecord::new("/tmp/nowhere", true);
-        let mut web = fake_process(now);
-        web.ready_timeout_s = Some(timeout);
-        record.processes.insert("web".into(), web);
-        let limit = super::wait::limit(&record, None);
-        assert!(
-            limit > std::time::Duration::from_secs(1 << 40),
-            "{timeout}: {limit:?}"
-        );
-    }
 }
 
 // A database that crashed during `start --wait` was forgotten by the
@@ -395,20 +272,6 @@ fn a_refresh_that_only_failed_to_save_still_answers_about_the_worktree() {
         format!("{err:#}"),
         "feat/two has nothing running — it stopped while pando waited"
     );
-}
-
-fn fake_process(started_at: chrono::DateTime<Utc>) -> ProcessRecord {
-    ProcessRecord {
-        pid: 1,
-        pgid: 1,
-        started_at,
-        log_path: PathBuf::from("/does/not/exist/dev.log"),
-        ready_port: None,
-        ready_timeout_s: None,
-        observed_ports: Vec::new(),
-        swept: false,
-        phase: Phase::Starting { since: started_at },
-    }
 }
 
 #[test]

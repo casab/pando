@@ -62,6 +62,7 @@ pub mod recipes;
 pub mod remedy;
 pub mod runtime;
 pub mod services;
+pub mod setup;
 pub mod share_proxy;
 pub mod state;
 pub mod template;

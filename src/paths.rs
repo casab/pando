@@ -68,6 +68,24 @@ impl PandoPaths {
         self.project_dir().join("state.lock")
     }
 
+    /// The last `pando check`'s result, and while one runs, its progress.
+    /// pando's own record, not a published shape: `check --json` is.
+    pub fn check_file(&self) -> PathBuf {
+        self.project_dir().join("check.json")
+    }
+
+    /// Held for the whole of a `pando check`, so two never run at once and
+    /// anything that reads the check can tell one is running.
+    pub fn check_lock_file(&self) -> PathBuf {
+        self.project_dir().join("check.lock")
+    }
+
+    /// What the setup screen remembers about this project: a skip, the
+    /// time pando tried on its own, the CLI's one-time tip.
+    pub fn setup_file(&self) -> PathBuf {
+        self.project_dir().join("setup.json")
+    }
+
     /// The lock a namespaced start hands out a slot under, the same for
     /// every project on this machine: a Redis on a port is the machine's,
     /// and each project's own lock covers only its own records.
@@ -255,6 +273,12 @@ fn socket_base() -> PathBuf {
 /// into the same `logs/<worktree>/` directory and whichever of them starts
 /// last truncates the other's log. Phase 3's `[[hooks]]` and Phase 4's
 /// `share` extend this rather than keeping a second list somewhere else.
+/// The directory name of `pando check`'s throwaway worktree, under the
+/// worktrees directory. A dot first: git refuses a ref component that
+/// starts with one, so no branch's directory can be this, and the TUI's
+/// watcher already passes over dot names.
+pub const CHECK_WORKTREE: &str = ".pando-check";
+
 pub const RESERVED_LOG_SOURCES: [&str; 3] = ["install", "tunnel", "proxy"];
 
 /// Refuses a name that would not be exactly one component of
@@ -447,6 +471,9 @@ mod tests {
         assert_eq!(p.config_file(), base.join("pando.toml"));
         assert_eq!(p.state_file(), base.join("state.json"));
         assert_eq!(p.lock_file(), base.join("state.lock"));
+        assert_eq!(p.check_file(), base.join("check.json"));
+        assert_eq!(p.check_lock_file(), base.join("check.lock"));
+        assert_eq!(p.setup_file(), base.join("setup.json"));
         assert_eq!(p.cache_dir(), base.join("cache"));
         assert_eq!(p.enrich_cache_file(), base.join("cache/enrich.json"));
         assert_eq!(p.pr_cache_file(), base.join("cache/prs.json"));
@@ -487,6 +514,9 @@ mod tests {
             p.config_file(),
             p.state_file(),
             p.lock_file(),
+            p.check_file(),
+            p.check_lock_file(),
+            p.setup_file(),
             p.cache_dir(),
             p.enrich_cache_file(),
             p.pr_cache_file(),

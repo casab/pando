@@ -925,6 +925,30 @@ fn defaults_load_when_no_file_exists() {
     );
 }
 
+// `pando check` makes its worktree beside the real ones, under a name no
+// branch's directory can have: git refuses a ref component that starts
+// with a dot.
+#[test]
+fn the_check_worktree_sits_beside_the_real_ones_under_a_name_no_branch_has() {
+    let f = fixture();
+    let config = load(&f.paths).unwrap().config;
+    let path = config.check_worktree_path(&f.paths);
+    assert_eq!(
+        path.parent(),
+        Some(config.worktrees_dir(&f.paths).as_path())
+    );
+    assert_eq!(path.file_name().unwrap(), crate::paths::CHECK_WORKTREE);
+    let refused = std::process::Command::new("git")
+        .args(["check-ref-format", "--branch", crate::paths::CHECK_WORKTREE])
+        .output()
+        .unwrap();
+    assert!(
+        !refused.status.success(),
+        "git took {CHECK:?} as a branch",
+        CHECK = crate::paths::CHECK_WORKTREE
+    );
+}
+
 #[test]
 fn the_pando_home_layer_overrides_the_committed_layer() {
     let f = fixture();

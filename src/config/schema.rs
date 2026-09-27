@@ -520,6 +520,12 @@ impl Config {
             .unwrap_or_else(|| paths.worktrees_dir())
     }
 
+    /// Where `pando check` makes its throwaway worktree: beside the real
+    /// ones, so it is on the same volume and at the same depth.
+    pub fn check_worktree_path(&self, paths: &PandoPaths) -> PathBuf {
+        self.worktrees_dir(paths).join(crate::paths::CHECK_WORKTREE)
+    }
+
     /// The configured `worktrees_dir`, with `~` expanded and a relative
     /// value taken from the repository root — where `git -C <root>
     /// worktree add` puts it. Resolved against the directory pando was run

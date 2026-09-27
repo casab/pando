@@ -6,14 +6,15 @@
 //! with `git check-ignore` before anything is created.
 //!
 //! One file per concern: worktrees, hooks, questions, `init`, the runtime
-//! check, start/stop/restart, private services, namespaced starts, share,
-//! and reading state.
+//! check, start/stop/restart, when a start is ready, private services,
+//! namespaced starts, share, and reading state.
 
 mod hooks;
 mod init;
 mod lifecycle;
 mod namespaced;
 mod questions;
+mod readiness;
 mod refresh;
 mod runtime;
 mod services;
@@ -39,6 +40,10 @@ pub use questions::{
     Answer, Answering, Ask, NEW_SLOTS, NeedsAnswer, Question, RefusedAnswer, START_SLOTS,
     Volunteered, question_for, recommended, resolve, resolve_for_new, resolve_for_start,
     resolve_on, resolve_process, resolve_silencing, settled,
+};
+pub use readiness::{
+    NO_PORT_WATCH, NO_PORT_WATCH_MAX, ReadyVerdict, no_port_watch, ready_limit, ready_line,
+    ready_verdict, still_watched, watched_processes,
 };
 pub use refresh::{FAILURE_SHOWN_LINES, Refreshed, failure_tail, inspect, refresh};
 pub use runtime::{Machine, runs_through_runner, runtime_shell, user_home, with_prelude};

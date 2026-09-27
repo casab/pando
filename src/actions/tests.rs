@@ -13413,3 +13413,146 @@ fn doctor_reports_a_leftover_database_as_a_note_with_its_fix() {
     );
     assert_eq!(ns.fake("dropped"), "");
 }
+
+// `start --only web --wait` is about web. A sibling that failed an hour
+// ago used to fail it; a process with no port was "ready" the moment it
+// was alive, so a dev command that exited a second later was a success.
+#[test]
+fn a_wait_watches_only_what_it_started_and_a_portless_process_for_a_while() {
+    let now = Utc::now();
+    let mut record = WorktreeRecord::new("/tmp/nowhere", true);
+    let mut api = portless_record(now - chrono::Duration::hours(1));
+    api.phase = Phase::Failed {
+        at: now,
+        reason: "process exited".into(),
+    };
+    record.processes.insert("api".into(), api);
+    let mut web = portless_record(now - chrono::Duration::seconds(60));
+    web.ready_port = Some(17_342);
+    web.phase = Phase::Running { since: now };
+    record.processes.insert("web".into(), web);
+
+    assert_eq!(
+        ready_verdict(&record, Some("web"), now),
+        ReadyVerdict::Ready
+    );
+    assert!(matches!(
+        ready_verdict(&record, None, now),
+        ReadyVerdict::Failed { process, .. } if process == "api"
+    ));
+
+    // No port: running as soon as it is alive, and watched a while more.
+    let mut dev = portless_record(now);
+    dev.phase = Phase::Running { since: now };
+    record.processes.insert("dev".into(), dev);
+    assert_eq!(
+        ready_verdict(&record, Some("dev"), now),
+        ReadyVerdict::Waiting
+    );
+    let later = now + chrono::Duration::from_std(NO_PORT_WATCH).unwrap();
+    assert_eq!(
+        ready_verdict(&record, Some("dev"), later + chrono::Duration::seconds(1)),
+        ReadyVerdict::Ready
+    );
+}
+
+// A worker that died four seconds in was "started" with exit 0, because
+// the watch was three; and "worker is ready (0.1s)" was printed before
+// the watch had even begun.
+#[test]
+fn a_portless_process_is_watched_long_enough_and_called_up_only_after() {
+    let now = Utc::now();
+    let mut record = WorktreeRecord::new("/tmp/nowhere", true);
+    let mut worker = portless_record(now);
+    worker.phase = Phase::Running { since: now };
+    record.processes.insert("worker".into(), worker.clone());
+    let at = |secs| now + chrono::Duration::seconds(secs);
+
+    // Still watched at four seconds: a death then fails the wait.
+    assert_eq!(ready_verdict(&record, None, at(4)), ReadyVerdict::Waiting);
+    assert_eq!(
+        ready_line(
+            "worker",
+            &worker,
+            at(1),
+            std::time::Duration::from_millis(100)
+        ),
+        None
+    );
+    assert_eq!(ready_verdict(&record, None, at(6)), ReadyVerdict::Ready);
+    assert_eq!(
+        ready_line("worker", &worker, at(6), std::time::Duration::from_secs(6)).unwrap(),
+        "worker is up (no port to check; watched 5s)"
+    );
+
+    // Its own timeout stretches the watch, but not past ten seconds.
+    worker.ready_timeout_s = Some(8);
+    record.processes.insert("worker".into(), worker.clone());
+    assert_eq!(ready_verdict(&record, None, at(7)), ReadyVerdict::Waiting);
+    assert_eq!(ready_verdict(&record, None, at(9)), ReadyVerdict::Ready);
+    worker.ready_timeout_s = Some(300);
+    record.processes.insert("worker".into(), worker.clone());
+    assert_eq!(ready_verdict(&record, None, at(9)), ReadyVerdict::Waiting);
+    assert_eq!(ready_verdict(&record, None, at(11)), ReadyVerdict::Ready);
+
+    // A process with a port is ready the moment it is running.
+    let mut web = portless_record(now);
+    web.ready_port = Some(17_343);
+    web.phase = Phase::Running { since: now };
+    assert_eq!(
+        ready_line("web", &web, now, std::time::Duration::from_millis(1500)).unwrap(),
+        "web is ready (1.5s)"
+    );
+}
+
+// The wait outlives the phase machine, which keeps a process `Starting`
+// past its window while the port scan cannot answer.
+#[test]
+fn a_wait_lasts_as_long_as_the_phase_can_stay_starting() {
+    let now = Utc::now();
+    let mut record = WorktreeRecord::new("/tmp/nowhere", true);
+    let mut web = portless_record(now);
+    web.ready_timeout_s = Some(10);
+    record.processes.insert("web".into(), web);
+    let limit = ready_limit(&record, None);
+    assert!(
+        limit.as_secs() > crate::state::longest_starting_secs(10) as u64,
+        "{limit:?}"
+    );
+}
+
+// `ready.timeout_s` takes any number TOML can write. The window plus its
+// grace overflowed past half of `i64::MAX`: a debug build panicked, and a
+// release build wrapped negative and gave up after 20 seconds on a
+// process the phase machine was still, correctly, waiting for.
+#[test]
+fn a_huge_ready_timeout_makes_a_long_wait_and_not_an_overflow() {
+    let now = Utc::now();
+    for timeout in [i64::MAX as u64, u64::MAX, i64::MAX as u64 / 2 + 1] {
+        let mut record = WorktreeRecord::new("/tmp/nowhere", true);
+        let mut web = portless_record(now);
+        web.ready_timeout_s = Some(timeout);
+        record.processes.insert("web".into(), web);
+        let limit = ready_limit(&record, None);
+        assert!(
+            limit > std::time::Duration::from_secs(1 << 40),
+            "{timeout}: {limit:?}"
+        );
+    }
+}
+
+/// A process record for the readiness tests: `Starting` since
+/// `started_at`, with no port and no log.
+fn portless_record(started_at: chrono::DateTime<Utc>) -> ProcessRecord {
+    ProcessRecord {
+        pid: 1,
+        pgid: 1,
+        started_at,
+        log_path: PathBuf::from("/does/not/exist/dev.log"),
+        ready_port: None,
+        ready_timeout_s: None,
+        observed_ports: Vec::new(),
+        swept: false,
+        phase: Phase::Starting { since: started_at },
+    }
+}
