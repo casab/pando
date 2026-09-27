@@ -2669,6 +2669,10 @@ fn reference_memory_prints_the_block_the_job_ends_with() {
         "{section}"
     );
     assert!(section.contains("\"Remember how to run it\""), "{section}");
+    assert!(
+        section.contains("save it only if the developer says yes"),
+        "{section}"
+    );
 }
 
 /// `CLAUDE.md` names the CLI verbs and calls them canonical — "used
@@ -3821,10 +3825,17 @@ fn the_job_carries_the_briefs_first_run_section_and_only_that() {
             "Never a `CLAUDE.md`, `AGENTS.md` or any other file inside the repository",
             "that the block never goes in the repository",
         ),
+        // The memory file is the developer's, read in every session:
+        // the maintainer's call, after agents wrote it without asking.
         (
-            "I'll remember how to run it with pando",
-            "that the done message mentions it",
+            "write nothing to it without their yes",
+            "that the block is saved only on a yes",
         ),
+        (
+            "Want me to remember how to run it with pando?",
+            "the question the done message ends with",
+        ),
+        ("On a no, or no answer, write nothing", "what a no means"),
     ] {
         assert!(
             flat.contains(phrase),

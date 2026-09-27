@@ -1,7 +1,7 @@
 //! `init --agent`: the setup job for the developer's own coding agent, for
 //! this project and this pando, and `--reference`, the brief and the
-//! contract it points at, or the block the agent saves to remember how to
-//! run the project.
+//! contract it points at, or the block the agent saves, on the
+//! developer's yes, to remember how to run the project.
 //!
 //! The setup prompt names this command and nothing else, so what an agent
 //! learns about the job it learns here: pando's view of the project, the
@@ -49,7 +49,7 @@ pub enum Reference {
     /// Every JSON shape pando publishes: agent/json.md.
     Json,
     /// Not a document: how to run this project with pando, made for it, for
-    /// an agent to save in its own memory.
+    /// an agent to save in its own memory once the developer says yes.
     Memory,
 }
 
@@ -118,13 +118,15 @@ pub(super) fn job(paths: &PandoPaths) -> String {
     out
 }
 
-/// The job's last section: the block an agent saves, fenced, so what it
-/// saves is exactly what `--reference memory` prints.
+/// The job's last section: the block an agent saves once the developer
+/// says yes, fenced, so what it saves is exactly what `--reference
+/// memory` prints.
 fn remember(paths: &PandoPaths) -> String {
     format!(
         "\n## Remember how to run {project}\n\n\
-         Save this in your own memory once the check passes, as \"Remember how to run it\" \
-         says:\n\n```markdown\n{block}```\n",
+         Once the check passes, offer to save this in your own memory, and save it only if \
+         the developer says yes, as \"Remember how to run it\" says:\n\n\
+         ```markdown\n{block}```\n",
         project = paths.project.display_name,
         block = crate::setup::memory_block(paths),
     )
@@ -175,8 +177,9 @@ pub(super) fn last_check(setup: &crate::setup::Setup) -> Option<String> {
         ),
         (SetupState::Ready, Some(_)) => Some(format!(
             "The last test passed, on these settings, with pando {}: there is nothing left to \
-             set up. Save the block at the end of this job if you have not, and tell the \
-             developer they are ready.\n\n",
+             set up. Tell the developer they are ready, and if they have not said yes or no to \
+             the block at the end of this job, offer it as \"Remember how to run it\" says: \
+             save it only on a yes.\n\n",
             record.map_or("", |r| r.pando_version.as_str())
         )),
         _ => None,

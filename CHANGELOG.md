@@ -21,8 +21,9 @@ may change behaviour.
   namespaced mode it proves the schema step in namespaces of its own.
 - The setup screen turns green by itself when a check passes, and the
   first-time tip and a passed check draw the grove on the CLI too.
-- The agent remembers, in its own memory and never in the repository,
-  how to run the project's worktrees with pando.
+- The agent offers to remember, in its own memory and never in the
+  repository, how to run the project's worktrees with pando, and saves
+  it only if the developer says yes.
 - The main checkout runs like a worktree, and is listed first.
 - The licence (AGPL-3.0-only), contribution guide, code of conduct,
   security policy, and CI on macOS and Linux.

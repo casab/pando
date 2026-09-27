@@ -17,14 +17,17 @@ nothing except through `pando init --answers`.**
 
 The developer pasted one line: run `pando init --agent` and follow what it
 says. That command printed pando's view of this project and this section.
-You are done when `pando check` passes and you have saved how to run the
-project. Change no file in the developer's repository: every setting goes
+You are done when `pando check` passes and you have offered to remember
+how to run the project. Change no file in the developer's repository, and
+none of theirs outside it without a yes: every setting goes
 through `pando init --answers -`, and the worktree `pando check` makes is
 pando's own, inside `.git`, removed when it is done.
 
 1. **Ask the developer nothing.** A first run is the fast path: pando's
    rules have a first choice for almost everything, and taking it gets the
-   developer to ready soonest. They change any of it later.
+   developer to ready soonest. They change any of it later. The one
+   question a first run asks comes at the very end, in step 7, and it is
+   about a file of theirs, not about the setup.
 2. **Save pando's choices in one step: `pando init --yes`.** It takes
    pando's first choice for every open question and writes it under
    `~/.pando`, never into the repository. That settles the two choices
@@ -64,27 +67,33 @@ pando's own, inside `.git`, removed when it is done.
      the check again.
    - Stop after three changed attempts, and tell the developer what is
      wrong in pando's own words.
-6. **Remember how to run it.** The job ends with a block that says how
-   this project's worktrees, and its main checkout, run with pando;
-   `pando init --agent --reference memory` prints it alone. Save it in
-   your own persistent memory, outside the developer's repository —
-   Claude Code: `~/.claude/CLAUDE.md`; Codex: `~/.codex/AGENTS.md`; any
-   other agent: its own memory — replacing an earlier pando block for the
-   same project root (its heading names the root) rather than adding a
-   second. Never a `CLAUDE.md`, `AGENTS.md` or any other file inside the
-   repository. A later session in any worktree then starts, stops and
-   reads it through pando. If a sandbox will not let you write the file,
-   give the developer the block and the file's name instead.
-7. **Tell the developer you're done, in two lines:**
+6. **Remember how to run it, only if the developer says yes.** The job
+   ends with a block that says how this project's worktrees, and its main
+   checkout, run with pando; `pando init --agent --reference memory`
+   prints it alone. It belongs in your own persistent memory — Claude
+   Code: `~/.claude/CLAUDE.md`; Codex: `~/.codex/AGENTS.md`; any other
+   agent: its own memory — so a later session in any worktree starts,
+   stops and reads it through pando. That file is the developer's, read
+   in every session of every project, so write nothing to it without
+   their yes: ask with the done message in step 7. On a yes, save the
+   block there, replacing an earlier pando block for the same project
+   root (its heading names the root) rather than adding a second. On a
+   no, or no answer, write nothing, and give them the block to keep
+   wherever they like. Never a `CLAUDE.md`, `AGENTS.md` or any other file
+   inside the repository. If a sandbox will not let you write the file
+   after a yes, give the developer the block and the file's name instead.
+7. **Tell the developer you're done, in two lines, then ask step 6's
+   question:**
 
    > pando is set up and tested for <project>.
    > You're ready: run `pando`.
+   >
+   > Want me to remember how to run it with pando? I'd add a short block
+   > to `~/.claude/CLAUDE.md`, which I read in every session.
 
-   Mention the block in one short clause on the first line: "…tested
-   for <project>, and I'll remember how to run it with pando."
-
-   When the check's notes say the schema step was not tested, add one
-   line: it is untested until namespaced mode is set up, which the first
+   Name your own memory file in the question. When the check's notes say
+   the schema step was not tested, add one line before the question: it
+   is untested until namespaced mode is set up, which the first
    `pando start --namespaced` does by asking for its login once.
 
 The rest of this brief is for when a failure needs it

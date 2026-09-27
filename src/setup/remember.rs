@@ -3,7 +3,7 @@
 //!
 //! One text, three readers: the job `init --agent` prints ends with it,
 //! `init --agent --reference memory` prints it alone for an agent to save
-//! in its own memory, and `new` writes it under the project's pando
+//! in its own memory once the developer says yes, and `new` writes it under the project's pando
 //! directory as `CLAUDE.md` and `AGENTS.md`. Claude Code reads a
 //! `CLAUDE.md` in every directory above the one it runs in, so an agent
 //! opened in a worktree pando made finds it with nothing saved at all.

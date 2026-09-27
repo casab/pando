@@ -299,7 +299,8 @@ Examples:
         /// contract for every JSON shape pando publishes: both the text
         /// this pando was built with. `memory` is not a document but the
         /// block the job ends with, made for this project: how to run its
-        /// worktrees with pando, for an agent to save in its own memory.
+        /// worktrees with pando, for an agent to save in its own memory
+        /// once the developer says yes.
         #[arg(long, requires = "agent", value_name = "DOC")]
         reference: Option<Reference>,
     },

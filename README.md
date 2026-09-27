@@ -211,10 +211,11 @@ on stdin, never a file in your repository, and proves the answers with
 `pando check`: a throwaway worktree of the commit a new branch would fork
 from, installed, started, its page asked for, and removed again, with no
 branch and nothing left behind. When it passes, the agent says so, and
-the setup screen turns green by itself: you're ready. The agent also
-remembers, in its own memory and never in your repository, how to run
-this project's worktrees with pando, so a later session starts, stops and
-reads them through pando rather than by hand. From then on,
+the setup screen turns green by itself: you're ready. The agent then
+offers to remember how to run this project's worktrees with pando, in its
+own memory and never in your repository, and saves it only if you say
+yes, so a later session starts, stops and reads them through pando rather
+than by hand. From then on,
 `pando` opens the list.
 
 No agent? Press enter on the setup screen and pando tries its own guess,
