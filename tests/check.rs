@@ -400,8 +400,24 @@ fn a_question_still_open_exits_3_and_prints_the_result() {
     assert_eq!(v["result"], "not_set_up");
     assert_eq!(v["slot"], "processes");
     assert_eq!(v["commit"], serde_json::Value::Null);
-    assert!(err.contains("never answers one itself"), "{err}");
+    assert!(
+        err.contains("starts nothing while a question is open"),
+        "{err}"
+    );
     assert!(err.contains("Run these as separate processes?"), "{err}");
+    // `check` takes no `--yes`: the way out goes through `init`, and back.
+    assert!(!err.contains("rerun with --yes"), "{err}");
+    assert!(err.contains("`pando init --yes`"), "{err}");
+    assert!(err.contains("then run `pando check` again"), "{err}");
+    assert!(
+        err.contains("`pando init --answers -` with, on stdin,"),
+        "{err}"
+    );
+    assert!(
+        err.lines()
+            .any(|l| l == "pando: the check starts nothing while a question is open"),
+        "{err}"
+    );
     assert_eq!(
         e.record().unwrap().outcome,
         CheckOutcome::NotSetUp {

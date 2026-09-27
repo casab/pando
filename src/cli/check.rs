@@ -55,13 +55,11 @@ pub(super) fn check<W: Write>(
         );
     }
     if let Some(needs) = unanswered {
-        // The question below is worded for the commands that take `--yes`;
-        // the check is not one of them, because a test that answered for
-        // itself would test its own guess.
-        super::notice(
-            "the check starts nothing while a question is open, and never answers one itself —              answer it with `pando init` (`--yes` takes pando's first choices, `--answers -` a              program's), then run `pando check` again",
-        );
-        return Err(anyhow::Error::new(needs));
+        // The check never answers a question itself: a test that took
+        // its own guess would test the guess. So the question is worded
+        // for `pando init`, and `pando check` again after it.
+        super::notice("the check starts nothing while a question is open");
+        return Err(anyhow::Error::new(super::CheckNeedsAnswer(needs)));
     }
     match &record.outcome {
         CheckOutcome::Passed => {

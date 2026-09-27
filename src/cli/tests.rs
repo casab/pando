@@ -1229,6 +1229,44 @@ fn a_question_with_options_still_points_at_yes() {
     assert!(render_needs_answer(&needs).contains("--yes"));
 }
 
+// `check` never answers a question itself and takes no `--yes`, so the
+// way out it prints goes through `pando init` and back to `pando check`,
+// and a program's answer through stdin: the brief forbids an answers file
+// in the repository.
+#[test]
+fn a_question_from_check_sends_the_reader_through_init_and_back() {
+    let needs = actions::NeedsAnswer {
+        question: dev_question(&["pnpm dev", "pnpm dev:web"]),
+    };
+    let text = super::render_needs_answer_for(&needs, super::Rerun::InitThenCheck);
+    assert!(!text.contains("rerun with --yes"), "{text}");
+    assert!(
+        text.contains(
+            "or let `pando init --yes` take the first option; then run `pando check` again"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("`pando init --answers -` with, on stdin,"),
+        "{text}"
+    );
+    assert!(!text.contains("<file.json>"), "{text}");
+    // Every other command keeps its own way out.
+    let plain = render_needs_answer(&needs);
+    assert!(
+        plain.contains("rerun with --yes to take the first option"),
+        "{plain}"
+    );
+    assert!(!plain.contains("pando check"), "{plain}");
+
+    let nothing = actions::NeedsAnswer {
+        question: dev_question(&[]),
+    };
+    let text = super::render_needs_answer_for(&nothing, super::Rerun::InitThenCheck);
+    assert!(!text.contains("--yes"), "nothing for --yes to take: {text}");
+    assert!(text.contains("then run `pando check` again"), "{text}");
+}
+
 // ---- status ----------------------------------------------------------
 
 #[test]

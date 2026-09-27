@@ -25,6 +25,18 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         // A question is not a failure. It gets its own exit code and its own
         // shape, so an agent can answer it instead of guessing what broke.
+        // The same, from `check`, which takes no `--yes`: the way out goes
+        // through `pando init`.
+        Err(e) if e.downcast_ref::<pando::cli::CheckNeedsAnswer>().is_some() => {
+            let needs = e
+                .downcast_ref::<pando::cli::CheckNeedsAnswer>()
+                .expect("just checked");
+            to_stderr(&pando::cli::render_needs_answer_for(
+                &needs.0,
+                pando::cli::Rerun::InitThenCheck,
+            ));
+            ExitCode::from(EXIT_NEEDS_ANSWER)
+        }
         Err(e) if e.downcast_ref::<actions::NeedsAnswer>().is_some() => {
             let needs = e
                 .downcast_ref::<actions::NeedsAnswer>()

@@ -31,7 +31,10 @@ use self::answers::report_unused;
 use self::answers::volunteered_from;
 use self::prompt::everyday_asker;
 pub use agent::Reference;
-pub use answers::{Answers, UsageError, render_needs_answer, slot_name};
+pub use answers::{
+    Answers, CheckNeedsAnswer, Rerun, UsageError, render_needs_answer, render_needs_answer_for,
+    slot_name,
+};
 pub use doctor::{adopt_project, doctor};
 pub use logs::logs;
 pub use ls::{Col, LsView, keep_columns, ls_json, ls_text, ls_text_at, ls_text_with};

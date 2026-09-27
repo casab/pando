@@ -396,13 +396,61 @@ pub(super) fn render_init(report: &actions::InitReport, verb: &str) -> String {
 /// with the file named absolutely, what to paste into it, and the answers
 /// file a program would use instead.
 pub fn render_needs_answer(needs: &actions::NeedsAnswer) -> String {
-    let mut out = render_question(needs);
-    out.push_str(&how_to_answer(&needs.question));
+    render_needs_answer_for(needs, Rerun::WithYes)
+}
+
+/// How the way out of a question sends somebody back: by running the
+/// same command again with `--yes`, or, for a command that takes no
+/// `--yes` — `check`, which never answers a question itself — through
+/// `pando init` and then that command again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rerun {
+    WithYes,
+    /// Through `init`, then `pando check` again.
+    InitThenCheck,
+}
+
+impl Rerun {
+    /// "…, or <this>": taking `what` without being asked.
+    fn take(self, what: &str) -> String {
+        match self {
+            Rerun::WithYes => format!("rerun with --yes to take {what}"),
+            Rerun::InitThenCheck => format!("let `pando init --yes` take {what}"),
+        }
+    }
+
+    /// What follows any way out: nothing, or the command to run again.
+    fn then(self) -> &'static str {
+        match self {
+            Rerun::WithYes => "",
+            Rerun::InitThenCheck => "; then run `pando check` again",
+        }
+    }
+}
+
+/// [`render_needs_answer`], sending the reader back the way `rerun` says.
+pub fn render_needs_answer_for(needs: &actions::NeedsAnswer, rerun: Rerun) -> String {
+    let mut out = render_question(needs, rerun);
+    out.push_str(&how_to_answer(&needs.question, rerun));
     out
 }
 
+/// A question `pando check` found open. Exit 3 like any other, worded for
+/// a command with no `--yes`: `main` renders it with
+/// [`Rerun::InitThenCheck`].
+#[derive(Debug)]
+pub struct CheckNeedsAnswer(pub actions::NeedsAnswer);
+
+impl std::fmt::Display for CheckNeedsAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for CheckNeedsAnswer {}
+
 /// The paste-ready answer and the program's way in, under the question.
-fn how_to_answer(question: &actions::Question) -> String {
+fn how_to_answer(question: &actions::Question, rerun: Rerun) -> String {
     let mut out = String::new();
     let file = answer_file(question);
     let snippet = question.snippet.trim_end();
@@ -440,15 +488,22 @@ fn how_to_answer(question: &actions::Question) -> String {
     // start alone, so an answers file has nowhere to put it; the table
     // above is the way in.
     if actions::ALL_SLOTS.contains(&question.slot) {
+        // `check` is run by agents, which answer through stdin: a file
+        // of answers in the project would be a file in the repository.
+        let program = match rerun {
+            Rerun::WithYes => "`pando init --answers <file.json>` with",
+            Rerun::InitThenCheck => "`pando init --answers -` with, on stdin,",
+        };
         out.push_str(&format!(
-            "  or from a program: `pando init --answers <file.json>` with {{\"{}\": {value}}}\n",
-            slot_name(question.slot)
+            "  or from a program: {program} {{\"{}\": {value}}}{}\n",
+            slot_name(question.slot),
+            rerun.then()
         ));
     }
     out
 }
 
-fn render_question(needs: &actions::NeedsAnswer) -> String {
+fn render_question(needs: &actions::NeedsAnswer, rerun: Rerun) -> String {
     let mut out = format!(
         "pando: {}
 ",
@@ -483,9 +538,10 @@ fn render_question(needs: &actions::NeedsAnswer) -> String {
     let file = answer_file(&needs.question);
     if needs.question.multi {
         out.push_str(&format!(
-            "pando: answer it in {file} with a [[services]] table, or rerun with --yes to \
-             take the ticked ones
-"
+            "pando: answer it in {file} with a [[services]] table, or {}{}
+",
+            rerun.take("the ticked ones"),
+            rerun.then()
         ));
         return out;
     }
@@ -494,8 +550,9 @@ fn render_question(needs: &actions::NeedsAnswer) -> String {
         // offering it is an instruction to run the same failure again.
         out.push_str(&format!(
             "  (pando found no candidates for this)
-pando: answer it in {file} — nothing pando can accept for you exists here
-"
+pando: answer it in {file} — nothing pando can accept for you exists here{}
+",
+            rerun.then()
         ));
         return out;
     }
@@ -505,14 +562,17 @@ pando: answer it in {file} — nothing pando can accept for you exists here
         // did not write. Pointing at `--yes` here is an instruction to run
         // the same failure again.
         out.push_str(&format!(
-            "pando: answer it in {file} — none of these is an option --yes may take for you
-"
+            "pando: answer it in {file} — none of these is an option --yes may take for you{}
+",
+            rerun.then()
         ));
         return out;
     }
     out.push_str(&format!(
-        "pando: answer it in {file}, or rerun with --yes to take the first option
-"
+        "pando: answer it in {file}, or {}{}
+",
+        rerun.take("the first option"),
+        rerun.then()
     ));
     out
 }
