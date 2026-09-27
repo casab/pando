@@ -1,0 +1,51 @@
+name: Bug report
+description: pando did something wrong, or said something wrong.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. Please remove anything private — hostnames, credentials, company names — from what you paste.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what pando did, and what you expected instead.
+      placeholder: |
+        I ran `pando start feat/login` and …
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The smallest sequence that shows it. A fixture from `scripts/fixture-repo.sh` that reproduces it is ideal.
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: pando doctor
+      description: The output of `pando doctor`, run in the project it happened in.
+      render: text
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or output
+      description: What pando printed, or the relevant lines of `pando logs <name>`.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: pando version
+      description: The output of `pando --version`.
+      placeholder: pando 0.4.0
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: macOS 15.4, Apple silicon
+    validations:
+      required: true

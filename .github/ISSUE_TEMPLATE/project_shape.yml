@@ -1,0 +1,37 @@
+name: pando does not understand my project
+description: Detection chose the wrong command, port, service or install — or could not run the project at all.
+labels: [detection]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        These reports are the most valuable ones pando gets: its tests run on generated fixtures, and every real project teaches it a shape they did not have. Describe the shape, not your code, and remove anything private.
+  - type: textarea
+    id: shape
+    attributes:
+      label: The project's shape
+      description: Languages, package manager, monorepo or not, how it starts in development, which services it needs and how (compose file, native install, cloud).
+      placeholder: |
+        A pnpm monorepo with two apps (web on Vite, api on Express), a root `dev` script that runs both with turbo, Postgres and Redis from docker-compose.yml, and an .env.example at the root.
+    validations:
+      required: true
+  - type: textarea
+    id: wrong
+    attributes:
+      label: What pando got wrong
+      description: What it chose or asked, and what would have been right.
+    validations:
+      required: true
+  - type: textarea
+    id: signals
+    attributes:
+      label: pando signals
+      description: The output of `pando signals`, which is what pando saw. Remove anything private.
+      render: json
+  - type: input
+    id: version
+    attributes:
+      label: pando version
+      placeholder: pando 0.4.0
+    validations:
+      required: true
