@@ -466,6 +466,14 @@ fn a_stop_during_a_check_records_it_interrupted() {
     e.wait_for_step("waiting for dev");
     let stopped = e.pando(&["stop", "--all"]);
     assert!(stopped.status.success(), "{}", stderr(&stopped));
+    // Named for what it is, as the TUI names it, never by its directory.
+    let said = String::from_utf8_lossy(&stopped.stdout);
+    assert_eq!(said.trim(), "stopped the running pando check");
+    assert!(
+        !stderr(&stopped).contains(CHECK_WORKTREE),
+        "{}",
+        stderr(&stopped)
+    );
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     assert_eq!(json(&out)["result"], "interrupted");

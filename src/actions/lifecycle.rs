@@ -13,7 +13,7 @@ use crate::ports;
 use crate::process::{self as proc, SpawnOptions};
 use crate::state::{self, Phase, ProcessRecord, ServiceMode, WorktreeRecord};
 use crate::template;
-use crate::worktree::Worktree;
+use crate::worktree::{self, Worktree};
 
 use super::hooks::{HookContext, run_hooks, run_probes};
 use super::namespaced::{self, Ready};
@@ -1329,7 +1329,8 @@ pub fn stop_all_with(
         }
         if listed.is_some_and(|listed| !listed.contains(name)) && record.is_live() {
             progress(&format!(
-                "{name} came up after the list of what stops was shown — left running"
+                "{} came up after the list of what stops was shown — left running",
+                worktree::label(name)
             ));
             kept.push(name.clone());
             continue;
@@ -1350,7 +1351,7 @@ pub fn stop_all_with(
                 stopped.push(name);
             }
             Ok(StopOutcome::NotRunning) => {}
-            Err(e) => failures.push(format!("stopping {name}: {e:#}")),
+            Err(e) => failures.push(format!("stopping {}: {e:#}", worktree::label(&name))),
         }
     }
     // Nothing is dropped while a group is still unaccounted for: the pgid

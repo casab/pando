@@ -54,6 +54,19 @@ pub fn is_check(name: &str) -> bool {
     name == crate::paths::CHECK_WORKTREE
 }
 
+/// What `pando check`'s worktree is called wherever a person reads its
+/// name: its directory name is nobody's word for it.
+pub const CHECK_LABEL: &str = "the running pando check";
+
+/// `name` as a message says it: the check's worktree by what it is, any
+/// other by its own name.
+pub fn label(name: &str) -> &str {
+    match is_check(name) {
+        true => CHECK_LABEL,
+        false => name,
+    }
+}
+
 /// Directory name for a branch: `feat/checkout` becomes `feat+checkout`.
 /// Slashes are the only thing that cannot appear in a directory name, and a
 /// plus reads as a join rather than an escape.
@@ -1066,6 +1079,15 @@ mod tests {
     use super::*;
     use crate::testutil::{git, init_repo};
     use tempfile::{TempDir, tempdir};
+
+    // The check's worktree is named for what it is wherever a person reads
+    // a name; every other worktree keeps its own.
+    #[test]
+    fn a_label_names_the_check_for_what_it_is_and_nothing_else() {
+        assert_eq!(label(crate::paths::CHECK_WORKTREE), CHECK_LABEL);
+        assert_eq!(label("feat+login"), "feat+login");
+        assert_eq!(label("x+.pando-check"), "x+.pando-check");
+    }
 
     fn project_at(path: &Path) -> ProjectRef {
         ProjectRef::from_root(path).unwrap()

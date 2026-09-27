@@ -805,6 +805,12 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
                     if stopped.is_empty() {
                         writeln!(out, "nothing was running")?;
                     } else {
+                        // A running `pando check` is stopped with the rest,
+                        // and named for what it is, not its directory.
+                        let stopped: Vec<&str> = stopped
+                            .iter()
+                            .map(|name| crate::worktree::label(name))
+                            .collect();
                         writeln!(out, "stopped {}", stopped.join(", "))?;
                     }
                     Ok(())

@@ -75,8 +75,9 @@ const ERROR_TTL: Duration = Duration::from_secs(15);
 /// again, and `m` has it after that.
 const LASTING_TTL: Duration = Duration::from_secs(30);
 
-/// What the running `pando check` is called wherever the TUI names it.
-pub const CHECK_LABEL: &str = "the running pando check";
+/// What the running `pando check` is called wherever the TUI names it:
+/// the same words the CLI uses.
+pub use crate::worktree::CHECK_LABEL;
 
 /// Messages `m` keeps, newest last.
 const MESSAGE_HISTORY: usize = 50;
