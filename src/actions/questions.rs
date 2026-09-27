@@ -460,7 +460,7 @@ pub const START_SLOTS: [Slot; 6] = [
 /// database this start does not have is a question about a mode it is
 /// not in. Its proposal is never decided, so such a start neither asks it
 /// nor takes it.
-const SILENT_UNLESS_ISOLATED: [Slot; 2] = [Slot::Services, Slot::SchemaHook];
+pub(super) const SILENT_UNLESS_ISOLATED: [Slot; 2] = [Slot::Services, Slot::SchemaHook];
 
 /// Fills the dev process from detection when config has none.
 pub fn resolve_process(

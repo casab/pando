@@ -44,7 +44,7 @@ pub use log_view::{LOG_VIEWER_CAPACITY, LineInspect, LogFilter, LogView, SearchM
 pub use merged::{ALL_SOURCE, MergedTail, SOURCE_SEPARATOR, ViewTail, strip_source};
 pub use pending::{AwaitingReady, PendingAction, PendingKind, PendingOutcome};
 pub use remedies::as_tui_remedy;
-pub use setup::{SetupLine, SetupScreen, SetupWatch, has_settings};
+pub use setup::{SetupLine, SetupScreen, SetupWatch, Trying, has_settings};
 pub use setup_row::{SetupHint, SetupRow};
 pub use tails::LogTails;
 pub use themes::ThemeState;
@@ -583,6 +583,7 @@ impl App {
             }
             AppEvent::SetupDetected(proposals) => self.setup_detected(*proposals),
             AppEvent::SetupRead(result) => self.setup_read(*result),
+            AppEvent::SetupTried(result) => self.setup_tried(*result),
             AppEvent::AskQuestion(boxed) => {
                 // Somebody typing — a branch name, a filter, a search —
                 // would otherwise have their next keystrokes answer it:

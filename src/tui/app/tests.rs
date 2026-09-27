@@ -7185,16 +7185,22 @@ fn esc_is_remembered_and_the_screen_never_comes_back() {
     );
 }
 
-// A library has nothing to run and never will: every way off the screen
-// still works, and nothing offers to test it.
+// A library has nothing to run and never will: pando's own guess says
+// so, every way off the screen still works, and nothing offers to test
+// it.
 #[test]
 fn a_library_is_never_stuck() {
-    let (_dir, mut app, _rx) = setup_app();
+    let (_dir, mut app, rx) = setup_app();
     press(&mut app, KeyCode::Char('v'));
     assert_eq!(app.checks_started, 0, "nothing to test");
     assert!(app.flash().is_some_and(|s| s.is_error()));
     press(&mut app, KeyCode::Enter);
-    assert!(app.setup_screen.is_none(), "⏎ opens the dashboard");
+    tick_until(&mut app, &rx, "the guess", |app| {
+        screen(app).line() == SetupLine::OwnGuess(Trying::CannotTell)
+    });
+    assert_eq!(app.checks_started, 0, "nothing to test");
+    press(&mut app, KeyCode::Esc);
+    assert!(app.setup_screen.is_none(), "esc opens the dashboard");
 
     let (_dir, mut app, _rx) = setup_app();
     press(&mut app, KeyCode::Char('q'));
@@ -7492,4 +7498,215 @@ fn the_dashboard_reads_a_corrected_setup_against_the_new_settings() {
         app.config.processes["web"].cmd, "pnpm dev",
         "the session's config is adopted only as before"
     );
+}
+
+// ---- letting pando try on its own ---------------------------------------
+
+/// Puts a project into the setup screen's repository and commits it.
+fn project_files(app: &App, files: &[(&str, &str)]) {
+    let root = app.paths.root();
+    for (name, text) in files {
+        let path = root.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    crate::testutil::git(root, &["add", "."]);
+    crate::testutil::git(root, &["commit", "--quiet", "-m", "project"]);
+}
+
+/// A project pando can read whole: a dev script, a lockfile, a port.
+const READABLE: &[(&str, &str)] = &[
+    (
+        "package.json",
+        "{ \"scripts\": { \"dev\": \"next dev\" } }\n",
+    ),
+    ("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"),
+    (".env.example", "PORT=3000\n"),
+];
+
+/// What `git worktree list` says, beside the main checkout.
+fn worktree_list(app: &App) -> Vec<PathBuf> {
+    crate::worktree::discover(&app.paths.project)
+        .unwrap()
+        .into_iter()
+        .map(|w| w.path)
+        .collect()
+}
+
+/// The files a guess that stopped must not have written.
+fn written_by_a_guess(app: &App) -> Vec<PathBuf> {
+    [
+        app.paths.config_file(),
+        app.paths.user_config_file(),
+        app.paths.setup_file(),
+        app.paths.home.join("preview"),
+    ]
+    .into_iter()
+    .filter(|path| path.exists())
+    .collect()
+}
+
+/// The frame as text, a row per line.
+fn painted(app: &mut App, width: u16, height: u16) -> String {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal
+        .draw(|f| crate::tui::render::render(f, app))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    (0..height)
+        .map(|y| {
+            (0..width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `⏎` with no settings, until the guess has started its check.
+fn guess_and_start_the_check(app: &mut App, rx: &Receiver<AppEvent>) {
+    press(app, KeyCode::Enter);
+    assert_eq!(
+        screen(app).line(),
+        SetupLine::OwnGuess(Trying::Resolving),
+        "the screen says pando is trying"
+    );
+    assert!(app.pending.is_none(), "the action slot stays free");
+    press(app, KeyCode::Enter);
+    assert!(app.setup_screen.is_some(), "a second ⏎ waits for the first");
+    tick_until(app, rx, "the check", |app| app.checks_started == 1);
+    assert!(has_settings(&screen(app).config));
+    assert_eq!(screen(app).line(), SetupLine::Starting);
+}
+
+// ⏎ with no settings: pando's first choices are written under its home,
+// setup.json says they were pando's guess, and the check they start is
+// the same detached `pando check` the screen watches for an agent. Its
+// pass turns the screen ready.
+#[test]
+fn enter_lets_pando_try_on_its_own_and_a_pass_turns_the_screen_ready() {
+    let (_dir, mut app, rx) = setup_app();
+    project_files(&app, READABLE);
+    let before = worktree_list(&app);
+    guess_and_start_the_check(&mut app, &rx);
+
+    assert!(SetupMemory::load(&app.paths).tried_by_pando_at.is_some());
+    let written = std::fs::read_to_string(app.paths.config_file()).unwrap();
+    assert!(written.contains("pnpm dev"), "{written}");
+    assert!(
+        !app.paths.user_config_file().exists(),
+        "nothing machine-wide"
+    );
+    assert!(!app.paths.root().join("pando.toml").exists());
+    assert_eq!(worktree_list(&app), before, "the check makes its own");
+
+    tick_until(&mut app, &rx, "the settings read", |app| {
+        screen(app).setup.state == SetupState::Untested
+    });
+    save_record(&app, &record(&app, CheckOutcome::Passed, RanBy::Tui));
+    tick_until(&mut app, &rx, "the pass", |app| screen(app).is_ready());
+    assert_eq!(screen(&app).line(), SetupLine::Passed);
+    let shown = painted(&mut app, 120, 30);
+    assert!(
+        shown.contains("set up by pando's own guess and tested"),
+        "the ready view says whose guess it was:\n{shown}"
+    );
+    press(&mut app, KeyCode::Enter);
+    assert!(app.setup_screen.is_none(), "⏎ now opens pando");
+    assert!(app.config.processes.contains_key("dev"));
+}
+
+// The guess's check fails like any other: the failure line, and `a`.
+#[test]
+fn a_guess_whose_check_fails_shows_the_failure() {
+    let (_dir, mut app, rx) = setup_app();
+    project_files(&app, READABLE);
+    guess_and_start_the_check(&mut app, &rx);
+    tick_until(&mut app, &rx, "the settings read", |app| {
+        screen(app).setup.state == SetupState::Untested
+    });
+    let failed = CheckOutcome::Failed {
+        kind: FailureKind::Settings,
+        reason: "dev exited after 0.8s".into(),
+    };
+    save_record(&app, &record(&app, failed, RanBy::Tui));
+    tick_until(&mut app, &rx, "the failure", |app| {
+        matches!(screen(app).line(), SetupLine::Failed { .. })
+    });
+    assert_eq!(
+        screen(&app).line(),
+        SetupLine::Failed {
+            reason: "dev exited after 0.8s".into(),
+            by_program: false,
+        }
+    );
+}
+
+// A server pando cannot say how to start: nothing is written, no
+// worktree is made, no check is asked for, and the screen hands it to
+// the agent.
+#[test]
+fn a_project_pando_cannot_start_gets_no_worktree_and_no_settings() {
+    let (_dir, mut app, rx) = setup_app();
+    project_files(
+        &app,
+        &[
+            (
+                "package.json",
+                "{ \"scripts\": { \"build\": \"node build.js\" } }\n",
+            ),
+            ("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"),
+        ],
+    );
+    let before = worktree_list(&app);
+    press(&mut app, KeyCode::Enter);
+    tick_until(&mut app, &rx, "the guess", |app| {
+        screen(app).line() == SetupLine::OwnGuess(Trying::CannotTell)
+    });
+    assert_eq!(worktree_list(&app), before);
+    assert_eq!(written_by_a_guess(&app), Vec::<PathBuf>::new());
+    assert_eq!(app.checks_started, 0);
+    assert!(!has_settings(&screen(&app).config));
+    press(&mut app, KeyCode::Char('a'));
+    assert_eq!(app.clipboard.as_deref(), Some(crate::setup::SETUP_PROMPT));
+}
+
+// A runtime pando's shell does not meet: the prelude that would fix it
+// is machine-wide, so pando never takes it. The screen shows doctor's
+// line for it, nothing is written, and no check is asked for.
+#[test]
+fn a_needed_prelude_shows_doctors_line_and_writes_nothing() {
+    let (_dir, mut app, rx) = setup_app();
+    let mut files = READABLE.to_vec();
+    // A version no machine resolves, so the probe disagrees whatever this
+    // one has on its PATH, or with nothing there at all.
+    files.push((".nvmrc", "1.2.3\n"));
+    project_files(&app, &files);
+    press(&mut app, KeyCode::Enter);
+    tick_until(&mut app, &rx, "the guess", |app| {
+        matches!(
+            screen(app).line(),
+            SetupLine::OwnGuess(Trying::NeedsPrelude { .. })
+        )
+    });
+    let SetupLine::OwnGuess(Trying::NeedsPrelude { line, .. }) = screen(&app).line() else {
+        unreachable!()
+    };
+    let config = crate::config::load(&app.paths).unwrap().config;
+    let shell = actions::runtime_shell(app.paths.root());
+    let machine = actions::Machine {
+        shell: &shell,
+        home: actions::user_home(),
+    };
+    let doctor = crate::doctor::runtime_findings(&app.paths, &config, &machine);
+    assert_eq!(
+        Some(&line),
+        doctor.first().map(|f| &f.message),
+        "doctor's own"
+    );
+    assert!(line.contains("asks for node 1.2.3"), "{line}");
+    assert_eq!(written_by_a_guess(&app), Vec::<PathBuf>::new());
+    assert_eq!(app.checks_started, 0);
 }

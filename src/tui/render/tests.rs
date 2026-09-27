@@ -4558,3 +4558,65 @@ fn the_stop_all_confirmation_names_a_running_check() {
     );
     assert!(!rendered.contains(check), "{rendered}");
 }
+
+// `⏎` lets pando try on its own only while there is nothing to run; once
+// there is, the footer never offers it.
+#[test]
+fn the_footer_offers_pandos_own_guess_only_with_no_settings() {
+    let (_dir, mut app) = app_on_setup_screen(false);
+    let text = text_of(&draw(&mut app, 120, 30));
+    let footer = text.lines().last().unwrap();
+    assert!(footer.contains("⏎ let pando try on its own"), "{footer}");
+
+    let (_dir, mut app) = app_on_setup_screen(true);
+    let text = text_of(&draw(&mut app, 120, 30));
+    assert!(!text.contains("try on its own"), "{text}");
+    finished(
+        &mut app,
+        SetupState::Ready,
+        CheckOutcome::Passed,
+        RanBy::Tui,
+    );
+    let text = text_of(&draw(&mut app, 120, 30));
+    assert!(!text.contains("try on its own"), "{text}");
+}
+
+// pando's own guess on the live line: while it works it out, and each
+// way it stops with nothing written.
+#[test]
+fn pandos_own_guess_says_where_it_stands() {
+    use crate::tui::app::Trying;
+    let (_dir, mut app) = app_on_setup_screen(false);
+    app.setup_screen.as_mut().unwrap().trying = Some(Trying::Resolving);
+    let text = text_of(&draw(&mut app, 120, 30));
+    assert!(
+        text.contains("pando is trying its own guess for acme-shop…"),
+        "{text}"
+    );
+
+    app.setup_screen.as_mut().unwrap().trying = Some(Trying::CannotTell);
+    let text = text_of(&draw(&mut app, 140, 30));
+    assert!(
+        text.contains(
+            "✗ pando can't tell how acme-shop starts; this one needs your agent · a copies the \
+             prompt"
+        ),
+        "{text}"
+    );
+
+    app.setup_screen.as_mut().unwrap().trying = Some(Trying::NeedsPrelude {
+        line: "this project asks for node 22 (.nvmrc), and `bash -lc` here resolves 18.20.0".into(),
+        fix: Some("set [runtime].prelude to one of:\n  . ~/.nvm/nvm.sh && nvm use".into()),
+    });
+    let text = text_of(&draw(&mut app, 140, 30));
+    assert!(
+        text.contains("! this project asks for node 22 (.nvmrc)"),
+        "{text}"
+    );
+    assert!(text.contains(". ~/.nvm/nvm.sh && nvm use"), "{text}");
+    assert!(
+        text.contains("pando never sets a runtime prelude on its own"),
+        "{text}"
+    );
+    assert!(text.contains("a copies the prompt"), "{text}");
+}

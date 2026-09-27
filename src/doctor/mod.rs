@@ -136,6 +136,25 @@ pub fn run_on(paths: &PandoPaths, machine: &Machine<'_>) -> Report {
     }
 }
 
+/// Doctor's runtime findings alone, worded as `doctor` words them: for
+/// the setup screen, which never takes a runtime prelude on its own and
+/// shows doctor's line for it instead.
+pub fn runtime_findings(
+    paths: &PandoPaths,
+    config: &crate::config::Config,
+    machine: &Machine<'_>,
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    runtime_report(paths, config, machine, &mut findings);
+    for finding in &mut findings {
+        finding.message = config::with_real_user_config(paths, &finding.message);
+        if let Some(fix) = &mut finding.fix {
+            *fix = config::with_real_user_config(paths, fix);
+        }
+    }
+    findings
+}
+
 fn adoption_report(paths: &PandoPaths, findings: &mut Vec<Finding>) -> Vec<Adoptable> {
     let found = adoptable(paths);
     for entry in &found {

@@ -13845,3 +13845,170 @@ fn portless_record(started_at: chrono::DateTime<Utc>) -> ProcessRecord {
         phase: Phase::Starting { since: started_at },
     }
 }
+
+// ---- trying pando's own guess ------------------------------------------
+
+/// What the setup screen's `⏎` leaves in pando's home, besides the
+/// answers: every file a failed guess must not have written.
+fn written_by_a_guess(fx: &Fx) -> Vec<PathBuf> {
+    [
+        fx.paths.config_file(),
+        fx.paths.user_config_file(),
+        fx.paths.setup_file(),
+        fx.paths.decisions_file(),
+        fx.paths.home.join("preview"),
+    ]
+    .into_iter()
+    .filter(|path| path.exists())
+    .collect()
+}
+
+// The slots the guess settles are the ones `new` and a start settle, and
+// never the prelude, which is about the machine.
+#[test]
+fn trying_on_its_own_settles_the_create_and_start_slots_only() {
+    let tried = super::trying::tried_slots();
+    let expected: Vec<Slot> = NEW_SLOTS
+        .iter()
+        .chain(START_SLOTS.iter())
+        .copied()
+        .filter(|slot| *slot != Slot::Prelude)
+        .collect();
+    assert_eq!(tried, expected);
+    assert!(!tried.contains(&Slot::Prelude));
+    assert!(
+        ALL_SLOTS
+            .iter()
+            .all(|slot| *slot == Slot::Prelude || tried.contains(slot))
+    );
+}
+
+// pando's first choice for every create and start slot, written as `new`
+// and a shared start write it: the schema step and the services question
+// are silenced, as on a shared start, so nothing touches data. The start
+// that tests it then has nothing left to ask.
+#[test]
+fn trying_on_its_own_writes_first_choices_and_remembers_whose_they_were() {
+    let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");
+    std::fs::create_dir_all(fx.root.join("prisma")).unwrap();
+    std::fs::write(fx.root.join("prisma/schema.prisma"), "// schema\n").unwrap();
+    git(&fx.root, &["add", "."]);
+    git(&fx.root, &["commit", "--quiet", "-m", "prisma"]);
+    let machine = FakeMachine::with_nvm();
+    let shell = machine.shell("22.11.0", "", "");
+    let m = Machine {
+        shell: &shell,
+        home: machine.home.path().to_path_buf(),
+    };
+
+    let (said, progress) = collecting();
+    let guessed = try_on_its_own_on(&fx.paths, &fx.config, &progress, &m).unwrap();
+    let OwnGuess::Saved(config) = guessed else {
+        panic!("a project pando can read is saved: {guessed:?}");
+    };
+    assert_eq!(
+        config.project.install.as_deref(),
+        Some("pnpm install --frozen-lockfile")
+    );
+    assert_eq!(config.processes["dev"].cmd, "pnpm dev");
+    assert!(
+        config.hooks.is_empty(),
+        "no schema step: {:?}",
+        config.hooks
+    );
+    assert_eq!(config.runtime.prelude, None);
+    assert!(
+        !fx.paths.user_config_file().exists(),
+        "nothing machine-wide"
+    );
+    assert!(
+        !fx.paths.home.join("preview").exists(),
+        "the scratch is gone"
+    );
+    assert!(fx.names().is_empty(), "no worktree is made");
+    assert!(
+        crate::setup::SetupMemory::load(&fx.paths)
+            .tried_by_pando_at
+            .is_some()
+    );
+    assert!(
+        said.borrow().iter().any(|line| line.contains("pnpm dev")),
+        "every guess is said: {:?}",
+        said.borrow()
+    );
+
+    // What `pando check` resolves before it makes anything, `new`'s pass
+    // then a shared start's, finds nothing left to ask.
+    let loaded = crate::config::load(&fx.paths).unwrap().config;
+    assert!(loaded.runnable_processes().next().is_some());
+    let loaded = resolve_for_new(&fx.paths, &loaded, &refuse, &noop).unwrap();
+    super::resolve_process(&fx.paths, &loaded, Mode::Shared, &refuse, &noop).unwrap();
+}
+
+// A server pando knows is there and cannot say how to start: the dev
+// command has no option. The guess stops before anything is written —
+// not even the install it could have guessed.
+#[test]
+fn a_dev_command_with_no_option_stops_the_guess_with_nothing_written() {
+    let fx = fixture();
+    std::fs::write(
+        fx.root.join("package.json"),
+        "{\n  \"scripts\": { \"build\": \"node build.js\" }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(fx.root.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+    let machine = FakeMachine::with_nvm();
+    let shell = machine.shell("22.11.0", "", "");
+    let m = Machine {
+        shell: &shell,
+        home: machine.home.path().to_path_buf(),
+    };
+    let guessed = try_on_its_own_on(&fx.paths, &fx.config, &noop, &m).unwrap();
+    assert!(
+        matches!(guessed, OwnGuess::NoOption(Slot::DevCmd)),
+        "{guessed:?}"
+    );
+    assert_eq!(written_by_a_guess(&fx), Vec::<PathBuf>::new());
+    assert!(fx.names().is_empty());
+}
+
+// A library: every question answered, and still nothing to run.
+#[test]
+fn a_project_with_nothing_to_run_writes_nothing() {
+    let fx = detectable_fixture(r#"{ "build": "tsc" }"#, "");
+    let machine = FakeMachine::with_nvm();
+    let shell = machine.shell("22.11.0", "", "");
+    let m = Machine {
+        shell: &shell,
+        home: machine.home.path().to_path_buf(),
+    };
+    let guessed = try_on_its_own_on(&fx.paths, &fx.config, &noop, &m).unwrap();
+    assert!(matches!(guessed, OwnGuess::NothingToRun), "{guessed:?}");
+    assert_eq!(written_by_a_guess(&fx), Vec::<PathBuf>::new());
+}
+
+// A runtime pando's shell does not meet is fixed by a prelude line, and
+// that line is machine-wide: never taken on the developer's behalf. The
+// guess stops with the report the question would have carried, and
+// writes nothing — not the project's answers either.
+#[test]
+fn a_needed_prelude_is_never_taken_and_nothing_is_written() {
+    let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");
+    std::fs::write(fx.root.join(".nvmrc"), "22\n").unwrap();
+    let machine = FakeMachine::with_nvm();
+    let shell = machine.shell("18.20.0", "nvm", "22.11.0");
+    let m = Machine {
+        shell: &shell,
+        home: machine.home.path().to_path_buf(),
+    };
+    let guessed = try_on_its_own_on(&fx.paths, &fx.config, &noop, &m).unwrap();
+    let OwnGuess::NeedsPrelude(report) = guessed else {
+        panic!("the prelude is the developer's: {guessed:?}");
+    };
+    assert!(
+        report.iter().any(|line| line.contains("asks for node 22")),
+        "{report:?}"
+    );
+    assert_eq!(written_by_a_guess(&fx), Vec::<PathBuf>::new());
+    assert_eq!(user_config(&fx), "");
+}

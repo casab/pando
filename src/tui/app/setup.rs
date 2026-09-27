@@ -9,6 +9,10 @@
 //! files and a lock asked without waiting. Nothing here starts a check in
 //! the TUI: `v` starts `pando check` as a detached child, and the screen
 //! watches its record like any other check's.
+//!
+//! `⏎` with no settings lets pando try its own guess: the guess is worked
+//! out on a worker, written by `actions`, and tested by the same detached
+//! check, so the single action slot is never the setup's.
 
 use chrono::{DateTime, Utc};
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
@@ -16,8 +20,10 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::actions::{self, OwnGuess};
 use crate::config::Config;
 use crate::detect;
+use crate::doctor;
 use crate::paths::PandoPaths;
 use crate::setup::{self, CheckOutcome, RanBy, Setup, SetupMemory, SetupState};
 
@@ -45,6 +51,8 @@ pub struct SetupScreen {
     /// A `v` whose check has not yet said anything: when it was pressed,
     /// on both clocks, so the record it writes can be told from the last.
     pub check_requested: Option<(Instant, DateTime<Utc>)>,
+    /// Where "let pando try on its own" stands, once `⏎` asked for it.
+    pub trying: Option<Trying>,
 }
 
 /// The watch on the four files, one for the setup screen and the
@@ -84,6 +92,32 @@ pub enum SetupLine {
     NotSetUp {
         slot: String,
     },
+    /// pando's own guess, working or stopped.
+    OwnGuess(Trying),
+}
+
+/// "Let pando try on its own", until the check it starts takes over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Trying {
+    /// The guess is being worked out, on a worker.
+    Resolving,
+    /// A question pando has no option for, or nothing to run after every
+    /// answer: the agent's job. Nothing was written.
+    CannotTell,
+    /// The runtime needs a prelude line, which pando never takes on its
+    /// own: doctor's line for it, and doctor's fix. Nothing was written.
+    NeedsPrelude { line: String, fix: Option<String> },
+}
+
+/// What the worker trying pando's guess hands back.
+pub enum Tried {
+    /// The answers are on disk: the config as the files hold it now.
+    Saved(Box<Config>),
+    CannotTell,
+    NeedsPrelude {
+        line: String,
+        fix: Option<String>,
+    },
 }
 
 /// The four files that move a setup along: the project's own
@@ -122,6 +156,7 @@ impl SetupScreen {
             detected: None,
             settings_seen_at: None,
             check_requested: None,
+            trying: None,
         }
     }
 
@@ -136,10 +171,19 @@ impl SetupScreen {
         has_settings(&self.config)
             && self.setup.state != SetupState::Testing
             && self.check_requested.is_none()
+            && self.trying != Some(Trying::Resolving)
+    }
+
+    /// Whether `⏎` lets pando try its own guess: nothing to run yet.
+    pub fn may_try(&self) -> bool {
+        !has_settings(&self.config)
     }
 
     /// The live line, from the state and the last record.
     pub fn line(&self) -> SetupLine {
+        if let Some(trying) = self.guess_line() {
+            return SetupLine::OwnGuess(trying);
+        }
         let record = self.setup.last_check.as_ref();
         match self.setup.state {
             SetupState::Testing => {
@@ -166,11 +210,25 @@ impl SetupScreen {
         }
     }
 
+    /// pando's own guess, while it is worked out, and where it stopped
+    /// while there are still no settings.
+    fn guess_line(&self) -> Option<Trying> {
+        match &self.trying {
+            Some(Trying::Resolving) => Some(Trying::Resolving),
+            Some(stopped) if self.may_try() => Some(stopped.clone()),
+            _ => None,
+        }
+    }
+
     /// Whether the line has a spinner, which the tick turns.
     pub fn spinning(&self) -> bool {
         matches!(
             self.line(),
-            SetupLine::Reading | SetupLine::Waiting | SetupLine::Starting | SetupLine::Testing(_)
+            SetupLine::Reading
+                | SetupLine::Waiting
+                | SetupLine::Starting
+                | SetupLine::Testing(_)
+                | SetupLine::OwnGuess(Trying::Resolving)
         )
     }
 }
@@ -390,7 +448,7 @@ impl App {
                 self.set_success("copied the setup prompt — paste it into your coding agent");
             }
             KeyCode::Char('v') => self.test_setup(),
-            KeyCode::Enter => self.leave_setup(),
+            KeyCode::Enter => self.setup_enter(),
             KeyCode::Esc => self.skip_setup(),
             KeyCode::Char('?') => {
                 self.help_scroll = 0;
@@ -435,6 +493,64 @@ impl App {
         spawn_check(&self.paths)
     }
 
+    /// `⏎`: pando's own guess while there is nothing to run, and the
+    /// dashboard once there is.
+    fn setup_enter(&mut self) {
+        let Some(screen) = self.setup_screen.as_ref() else {
+            return;
+        };
+        if screen.trying == Some(Trying::Resolving) {
+            self.set_status("pando is already trying its own guess");
+        } else if screen.may_try() {
+            self.try_on_its_own();
+        } else {
+            self.leave_setup();
+        }
+    }
+
+    /// Lets pando try its own guess, on a worker: the resolve runs
+    /// detection and git. What it answers is said where `m` keeps it.
+    fn try_on_its_own(&mut self) {
+        let Some(screen) = self.setup_screen.as_mut() else {
+            return;
+        };
+        screen.trying = Some(Trying::Resolving);
+        let paths = self.paths.clone();
+        let tx = self.event_tx.clone();
+        thread::spawn(move || {
+            let notices = tx.clone();
+            let progress = move |line: &str| {
+                let _ = notices.send(AppEvent::Notice(line.to_string()));
+            };
+            let result = guess(&paths, &progress);
+            let _ = tx.send(AppEvent::SetupTried(Box::new(result)));
+        });
+    }
+
+    /// The guess is worked out. Saved, it is tested at once, by the same
+    /// detached check `v` starts.
+    pub(super) fn setup_tried(&mut self, result: Result<Tried, String>) -> bool {
+        let Some(screen) = self.setup_screen.as_mut() else {
+            return false;
+        };
+        screen.trying = None;
+        match result {
+            Ok(Tried::Saved(config)) => {
+                if *config != screen.config {
+                    screen.config = *config;
+                    screen.settings_seen_at = Some(Instant::now());
+                }
+                self.test_setup();
+            }
+            Ok(Tried::CannotTell) => screen.trying = Some(Trying::CannotTell),
+            Ok(Tried::NeedsPrelude { line, fix }) => {
+                screen.trying = Some(Trying::NeedsPrelude { line, fix });
+            }
+            Err(e) => self.set_error(format!("pando could not try its own guess: {e}")),
+        }
+        true
+    }
+
     /// `⏎`: the dashboard, with the settings the files hold now.
     fn leave_setup(&mut self) {
         if let Some(screen) = self.setup_screen.take() {
@@ -453,6 +569,39 @@ impl App {
         }
         self.leave_setup();
     }
+}
+
+/// pando's own guess, from the settings as the files hold them now. A
+/// runtime it will not take is said in doctor's own words.
+fn guess(paths: &PandoPaths, progress: &dyn Fn(&str)) -> Result<Tried, String> {
+    let config = config_now(paths)?;
+    let guessed =
+        actions::try_on_its_own(paths, &config, progress).map_err(|e| format!("{e:#}"))?;
+    Ok(match guessed {
+        OwnGuess::Saved(_) => Tried::Saved(Box::new(config_now(paths)?)),
+        OwnGuess::NoOption(_) | OwnGuess::NothingToRun => Tried::CannotTell,
+        OwnGuess::NeedsPrelude(report) => {
+            let shell = actions::runtime_shell(paths.root());
+            let machine = actions::Machine {
+                shell: &shell,
+                home: actions::user_home(),
+            };
+            match doctor::runtime_findings(paths, &config, &machine)
+                .into_iter()
+                .next()
+            {
+                Some(finding) => Tried::NeedsPrelude {
+                    line: finding.message,
+                    fix: finding.fix,
+                },
+                // Doctor sees it no longer: the lines the question had.
+                None => Tried::NeedsPrelude {
+                    line: report.first().cloned().unwrap_or_default(),
+                    fix: Some(report.get(1..).unwrap_or_default().join("\n")),
+                },
+            }
+        }
+    })
 }
 
 /// Where a check the TUI started writes what it prints: under the

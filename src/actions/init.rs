@@ -278,7 +278,7 @@ pub fn init_dry_run(
 /// Puts the scratch copies back to what the real files say: each one
 /// copied over, or removed where the real one does not exist, and the
 /// decisions log a pass recorded into removed.
-fn seed_scratch(files: &[(PathBuf, PathBuf)], previewed: &PandoPaths) -> Result<()> {
+pub(super) fn seed_scratch(files: &[(PathBuf, PathBuf)], previewed: &PandoPaths) -> Result<()> {
     for (from, to) in files {
         let Ok(text) = std::fs::read_to_string(from) else {
             remove_if_there(to)?;
@@ -311,8 +311,8 @@ fn remove_if_there(path: &Path) -> Result<()> {
 /// services from the built-in recipes alone, which is not what the real
 /// run proposes. They are links, not copies, and removing the scratch
 /// removes the links and leaves what they point at.
-struct Scratch {
-    dir: PathBuf,
+pub(super) struct Scratch {
+    pub(super) dir: PathBuf,
     /// The directories this preview had to create to hold the scratch
     /// copy, innermost first, so they go with it. A dry run promises to
     /// write nothing, and an empty project directory left in the home is
@@ -321,7 +321,7 @@ struct Scratch {
 }
 
 impl Scratch {
-    fn new(paths: &PandoPaths) -> Result<Scratch> {
+    pub(super) fn new(paths: &PandoPaths) -> Result<Scratch> {
         let project_dir = paths.project_dir();
         let created: Vec<PathBuf> = [
             Some(project_dir.clone()),

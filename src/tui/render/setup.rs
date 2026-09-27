@@ -13,7 +13,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::setup::SETUP_PROMPT;
 use crate::theme::{green, orange, red, surface, text, text_dim, text_muted, yellow};
-use crate::tui::app::{App, SetupLine, SetupScreen};
+use crate::tui::app::{App, SetupLine, SetupScreen, Trying};
 
 use super::chrome::{hint_line, status_mark};
 use super::welcome::{ago, ready_view};
@@ -116,6 +116,9 @@ pub(super) fn setup_hints(screen: &SetupScreen) -> Vec<(&'static str, &'static s
         hints.push(("a", "copy the prompt", true));
         if screen.may_test() {
             hints.push(("v", "test it", true));
+        }
+        if screen.may_try() {
+            hints.push(("⏎", "let pando try on its own", true));
         }
         hints.push(("esc", "just manage worktrees", true));
     }
@@ -336,6 +339,52 @@ fn live_lines(app: &App, screen: &SetupScreen, pad: usize, room: usize) -> Vec<L
             pad,
             room,
         ),
+        SetupLine::OwnGuess(trying) => guess_lines(app, &trying, pad, room),
+    }
+}
+
+/// pando's own guess: working it out, or why it stopped with nothing
+/// written.
+fn guess_lines(app: &App, trying: &Trying, pad: usize, room: usize) -> Vec<Line<'static>> {
+    let project = &app.paths.project.display_name;
+    let dim = Style::new().fg(text_dim());
+    match trying {
+        Trying::Resolving => marked(
+            app.spinner(),
+            yellow(),
+            &format!("pando is trying its own guess for {project}…"),
+            dim,
+            pad,
+            room,
+        ),
+        Trying::CannotTell => marked(
+            "✗",
+            red(),
+            &format!(
+                "pando can't tell how {project} starts; this one needs your agent · a copies \
+                 the prompt"
+            ),
+            dim,
+            pad,
+            room,
+        ),
+        // Doctor's line, and its fix a line at a time: each is one a
+        // developer may copy.
+        Trying::NeedsPrelude { line, fix } => {
+            let mut lines = marked("!", yellow(), line, dim, pad, room);
+            let muted = Style::new().fg(text_muted());
+            for row in fix.iter().flat_map(|fix| fix.lines()) {
+                lines.extend(wrapped(row, pad + 2, room.saturating_sub(2).max(1), muted));
+            }
+            lines.extend(wrapped(
+                "pando never sets a runtime prelude on its own: it is for every project on this \
+                 machine · a copies the prompt",
+                pad + 2,
+                room.saturating_sub(2).max(1),
+                dim,
+            ));
+            lines
+        }
     }
 }
 

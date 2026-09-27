@@ -7,7 +7,8 @@
 //!
 //! One file per concern: worktrees, hooks, questions, `init`, the runtime
 //! check, start/stop/restart, when a start is ready, private services,
-//! namespaced starts, share, reading state, and `pando check`.
+//! namespaced starts, share, reading state, `pando check`, and trying
+//! pando's own guess for the setup screen.
 
 mod check;
 mod hooks;
@@ -20,6 +21,7 @@ mod refresh;
 mod runtime;
 mod services;
 mod share;
+mod trying;
 mod worktree;
 
 pub use check::{
@@ -58,6 +60,7 @@ pub use services::{
     worktree_url,
 };
 pub use share::{ENV_SHARE_PORT, ShareOutcome, SpawnProxy, share, share_with, unshare};
+pub use trying::{OwnGuess, try_on_its_own, try_on_its_own_on};
 pub use worktree::{
     CREATED_BUT_INSTALL_FAILED, KEPT_OVER_RACED_RECORD, Ownership, created_by_pando,
     guard_write_locations, ls, new, new_for_pr, ownership, path, path_in, rm,

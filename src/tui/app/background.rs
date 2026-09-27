@@ -63,6 +63,8 @@ pub enum AppEvent {
     /// The setup screen's re-read after a config file changed: the config
     /// as it loads now and the setup against it, or why it does not load.
     SetupRead(Box<Result<(Config, crate::setup::Setup), String>>),
+    /// pando's own guess, worked out for the setup screen's `⏎`.
+    SetupTried(Box<Result<super::setup::Tried, String>>),
 }
 
 /// One consistent read of the repository, taken off the UI thread.

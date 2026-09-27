@@ -282,7 +282,7 @@ pub const SETUP_KEYS: &[KeyHelp] = &[
     key(
         "⏎",
         &[KeyCode::Enter],
-        "open pando with the settings as they are now",
+        "no settings yet: let pando try its own guess and test it; after that, open pando",
     ),
     key(
         "esc",
