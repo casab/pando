@@ -534,7 +534,6 @@ fn every_column(width: usize) -> Vec<(Col, usize)> {
         (Col::Port, 6),
         (Col::Ports, 9),
         (Col::Share, 1),
-        (Col::Mode, 1),
         (Col::Signals, width),
         (Col::Pr, 4),
         (Col::Status, 8),
@@ -552,13 +551,12 @@ fn list_columns_shed_the_least_useful_first_and_the_status_last() {
             Col::Port,
             Col::Ports,
             Col::Share,
-            Col::Mode,
             Col::Signals,
             Col::Status,
         ],
         "wide enough for everything, the pull request first, the status word last"
     );
-    let medium = list_columns(80, &all);
+    let medium = list_columns(76, &all);
     assert!(!medium.contains(&Col::Ports), "{medium:?}");
     assert!(
         medium.contains(&Col::Aside) && medium.contains(&Col::Port),
@@ -707,12 +705,7 @@ fn a_header_row_names_each_column_over_its_cells() {
     let rendered = text_of(&draw(&mut app, 180, 10));
     let header = list_row(&rendered, "branch");
     let row = list_row(&rendered, "feat/one");
-    for (title, cell) in [
-        ("branch", "feat/one"),
-        ("port", ":17342"),
-        ("mode", "▣"),
-        ("git", "✎ ↑1"),
-    ] {
+    for (title, cell) in [("branch", "feat/one"), ("port", ":17342"), ("git", "↑1 ✎")] {
         let at = |line: &str, needle: &str| {
             line.find(needle)
                 .map(|i| line[..i].chars().count())
@@ -2543,10 +2536,10 @@ fn a_rows_pull_request_says_its_number_and_state_first() {
             .unwrap_or_else(|| panic!("no {needle}:\n{rendered}"))
     };
     for (branch, chip, color) in [
-        ("feat/open", "◍ #482 open", green()),
-        ("feat/draft", "◌ #490 draft", crate::theme::text_muted()),
-        ("feat/merged", "✓ #463 merged", crate::theme::magenta()),
-        ("feat/closed", "✗ #400 closed", red()),
+        ("feat/open", "◍ #482", green()),
+        ("feat/draft", "◌ #490", crate::theme::text_muted()),
+        ("feat/merged", "✓ #463", crate::theme::magenta()),
+        ("feat/closed", "✗ #400", red()),
     ] {
         let row = list_row(&rendered, branch);
         assert_eq!(at(&row, chip), at(&header, "PR"), "{branch}:\n{rendered}");
@@ -2558,6 +2551,8 @@ fn a_rows_pull_request_says_its_number_and_state_first() {
             .unwrap_or_default();
         assert!(after_label.starts_with(chip), "{branch}:\n{rendered}");
         assert_eq!(style_at(&buf, branch, chip).fg, Some(color), "{chip}");
+        // The mark says the state; no word repeats it.
+        assert_eq!(after_label.trim_end(), chip, "{branch}:\n{rendered}");
     }
     assert!(!header.contains("changes"), "{header}");
 }
@@ -2571,42 +2566,95 @@ fn ahead_and_behind_are_coloured_apart_in_the_list_and_the_detail_pane() {
     let buf = draw(&mut app, 160, 30);
     let rendered = text_of(&buf);
     assert!(
-        list_row(&rendered, "feat/one").contains("↑2 ↓3"),
+        list_row(&rendered, "feat/one").contains("↓3 ↑2"),
         "{rendered}"
     );
-    assert_eq!(style_at(&buf, "↑2 ↓3", "↑2").fg, Some(green()));
-    assert_eq!(style_at(&buf, "↑2 ↓3", "↓3").fg, Some(yellow()));
+    assert_eq!(style_at(&buf, "↓3 ↑2", "↑2").fg, Some(green()));
+    assert_eq!(style_at(&buf, "↓3 ↑2", "↓3").fg, Some(yellow()));
     assert_eq!(style_at(&buf, "│ git ", "↑2 ahead").fg, Some(green()));
     assert_eq!(style_at(&buf, "│ git ", "↓3 behind").fg, Some(yellow()));
 }
 
-// A mode is a mark in the list, in the mode's colour; the detail pane puts
-// the word beside it.
+// A mode is a mark after the branch, in the mode's colour, not a column
+// of its own; the detail pane puts the word beside it.
 #[test]
-fn a_mode_is_a_mark_in_the_list_and_a_mark_and_word_in_the_detail_pane() {
+fn a_mode_is_a_mark_after_the_branch_and_a_mark_and_word_in_the_detail_pane() {
     use crate::state::ServiceMode;
-    let mut app = test_app(&["feat+iso", "feat+ns"]);
+    let mut app = test_app(&["feat+iso", "feat+ns", "feat+plain"]);
     with_process(&mut app, "feat+iso", running_phase());
     with_mode(&mut app, "feat+iso", ServiceMode::Isolated);
     with_process(&mut app, "feat+ns", running_phase());
     with_mode(&mut app, "feat+ns", ServiceMode::Namespaced);
     let buf = draw(&mut app, 180, 30);
     let rendered = text_of(&buf);
-    let iso = list_row(&rendered, "feat/iso");
-    let ns = list_row(&rendered, "feat/ns");
-    assert!(iso.contains("▣") && !iso.contains("isolated"), "{rendered}");
-    assert!(ns.contains("◧") && !ns.contains("namespaced"), "{rendered}");
+    assert!(
+        list_row(&rendered, "feat/iso").contains("feat/iso ▣"),
+        "{rendered}"
+    );
+    assert!(
+        list_row(&rendered, "feat/ns").contains("feat/ns ◧"),
+        "{rendered}"
+    );
+    assert!(
+        !list_row(&rendered, "feat/plain").contains('▣'),
+        "{rendered}"
+    );
+    assert!(
+        !list_row(&rendered, "branch").contains("mode"),
+        "{rendered}"
+    );
     assert_eq!(
-        style_at(&buf, "feat/iso", "▣").fg,
+        style_at(&buf, "feat/iso ▣", "▣").fg,
         Some(crate::theme::magenta())
     );
     assert_eq!(
-        style_at(&buf, "feat/ns", "◧").fg,
+        style_at(&buf, "feat/ns ◧", "◧").fg,
         Some(crate::theme::namespaced())
     );
     assert!(
         rendered.contains("▣ isolated"),
         "the selected one's detail:\n{rendered}"
+    );
+
+    // A label too long for the pane gives way; the mark does not.
+    app.worktrees[1].branch = Some(format!("feat/{}", "n".repeat(120)));
+    let rendered = text_of(&draw(&mut app, 100, 30));
+    assert!(list_row(&rendered, "feat/nnn").contains(" ◧"), "{rendered}");
+}
+
+// The git cell is slots, each as wide as its widest in the list: every
+// behind arrow under the one above, then every ahead arrow, then the `✎`.
+#[test]
+fn the_git_column_lines_behind_ahead_and_uncommitted_up_in_slots() {
+    let mut app = test_app(&["feat+a", "feat+b", "feat+c", "feat+d"]);
+    app.worktrees[0].ahead_behind = Some((56, 120));
+    app.worktrees[0].dirty = Some(true);
+    app.worktrees[1].ahead_behind = Some((0, 7));
+    app.worktrees[2].ahead_behind = Some((3, 0));
+    app.worktrees[2].dirty = Some(true);
+    app.worktrees[3].ahead_behind = Some((0, 0));
+    let rendered = text_of(&draw(&mut app, 180, 14));
+    let column = |needle: &str| {
+        rendered
+            .lines()
+            .filter(|line| line.starts_with('│'))
+            .map(|line| line.split("││").next().unwrap_or_default().to_string())
+            .filter_map(|row| row.find(needle).map(|i| row[..i].chars().count()))
+            .collect::<Vec<_>>()
+    };
+    let behind = column("↓");
+    let ahead = column("↑");
+    let dirty = column("✎");
+    assert_eq!(behind.len(), 2, "{rendered}");
+    assert!(behind.windows(2).all(|w| w[0] == w[1]), "{rendered}");
+    assert_eq!(ahead.len(), 2, "{rendered}");
+    assert!(ahead.windows(2).all(|w| w[0] == w[1]), "{rendered}");
+    assert_eq!(dirty.len(), 2, "{rendered}");
+    assert!(dirty.windows(2).all(|w| w[0] == w[1]), "{rendered}");
+    assert!(behind[0] < ahead[0] && ahead[0] < dirty[0], "{rendered}");
+    assert!(
+        list_row(&rendered, "feat/a").contains("↓99+ ↑56 ✎"),
+        "{rendered}"
     );
 }
 
@@ -2621,7 +2669,7 @@ fn the_detail_pane_has_a_git_row() {
         .find(|line| line.contains("││ git "))
         .unwrap_or_default();
     assert!(row.contains("uncommitted changes"), "{rendered}");
-    assert!(row.contains("↑2 ahead, ↓1 behind of main"), "{rendered}");
+    assert!(row.contains("↓1 behind, ↑2 ahead of main"), "{rendered}");
 
     app.worktrees[0].dirty = Some(false);
     app.worktrees[0].ahead_behind = Some((0, 0));

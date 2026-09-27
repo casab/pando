@@ -380,11 +380,12 @@ fn git_row(app: &App, wt: &crate::worktree::Worktree, width: usize) -> Line<'sta
                 Span::styled(format!("↓{b}"), down),
                 Span::styled(format!(" behind{base}"), dim),
             ],
+            // Behind first, in the list's order.
             (a, b) => vec![
-                Span::styled(format!("↑{a}"), up),
-                Span::styled(" ahead, ", dim),
                 Span::styled(format!("↓{b}"), down),
-                Span::styled(format!(" behind{base}"), dim),
+                Span::styled(" behind, ", dim),
+                Span::styled(format!("↑{a}"), up),
+                Span::styled(format!(" ahead{base}"), dim),
             ],
         };
         parts.push(drift);
