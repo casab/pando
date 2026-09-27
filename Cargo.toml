@@ -4,6 +4,8 @@ version = "0.4.0"
 edition = "2024"
 description = "One repo. Every branch alive."
 # The files in tests/ are modules of one test binary: tests/integration.rs.
+# The binary embeds agent/brief.md and agent/json.md (`pando init --agent`),
+# so both must ship with the crate.
 autotests = false
 
 [lib]

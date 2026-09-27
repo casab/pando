@@ -5,12 +5,60 @@ Claude Code plugin in `skills/`, the Codex skills in `codex/` — point at
 this file rather than repeating any of it. If you are reading one of those
 wrappers and it seems to contain reasoning, the wrapper is wrong.
 
-You will need [`json.md`](./json.md) beside this file: it is the contract
-for every shape named here, and it is versioned.
+You will need the contract for every shape named here, which is
+versioned: `pando init --agent --reference json` prints it (or
+[`json.md`](./json.md) beside this file).
 
 Your job in one sentence: **turn the evidence pando already publishes into
 answers, ask the human only the things that are genuinely theirs, and write
 nothing except through `pando init --answers`.**
+
+## First run: set pando up, then prove it with `pando check`
+
+The developer pasted one line: run `pando init --agent` and follow what it
+says. That command printed pando's view of this project and this section.
+You are done when `pando check` passes. Change no file in the developer's
+repository: every setting goes through `pando init --answers -`, and the
+worktree `pando check` makes is pando's own, inside `.git`, removed when it
+is done.
+
+1. **Start with `pando signals` and `pando doctor --json`.** Do not
+   re-derive what they report (the brief's §0). The open questions
+   `init --agent` listed are the ones `signals` publishes with
+   `"decided": false`.
+2. **Answer the open questions, and confirm pando's guesses where they
+   hold.** Ask the developer only what the brief's §1 calls theirs, once,
+   with pando's options.
+3. **Preview, then save, always through stdin:**
+
+   ```bash
+   pando init --answers - --dry-run    # the answers as one JSON object on stdin; writes nothing
+   pando init --answers -              # the same object, written
+   ```
+
+   Never an answers file: one in the project would be a file in the
+   developer's repository.
+4. **Run `pando check`, with a timeout of at least 10 minutes.** It makes a
+   throwaway worktree of the commit a new branch would fork from, runs the
+   install, starts every app, checks the one the browser opens really
+   answers, and removes it all. The prompt the developer pasted is their
+   consent to this test.
+5. **When the check fails, fix, then rerun; never rerun unchanged.**
+   - A settings failure is yours: correct the answer with
+     `pando init --answers - --replace`, which replaces a slot that is
+     already answered, then run the check again.
+   - A machine failure (`kind: "machine"`: a server not running, Docker
+     stopped, a runtime missing) is the developer's. Tell them the command
+     pando printed and change no setting.
+   - Exit 3 is not a failure: a question is still open, and the check
+     started nothing. Answer it with `pando init --answers -`, then run
+     the check again.
+   - Stop after three changed attempts, and tell the developer what is
+     wrong in pando's own words.
+6. **Tell the developer you're done, in two lines:**
+
+   > pando is set up and tested for <project>.
+   > You're ready: run `pando`.
 
 ---
 
@@ -150,11 +198,12 @@ Four more facts that are not visible in the shape:
 ## 4. Writing: `pando init --answers`, and nothing else
 
 ```bash
-pando init --answers answers.json --dry-run   # look first
-pando init --answers answers.json             # then write
+pando init --answers - --dry-run   # look first: the answers on stdin
+pando init --answers -             # then write
 ```
 
-`answers.json` is one object, keys are the slot names above, and:
+The answers are one JSON object on stdin — never a file in the
+developer's repository — keys are the slot names above, and:
 
 - a **string** is the option whose `value` is exactly that text — **by
   value, never by index.** An index breaks the day a rule finds one more
@@ -294,9 +343,9 @@ the recipes on the evidence and there is nothing to ask at all.
 
 A setup ends with proof, not with a summary.
 
-1. `pando init --answers answers.json --dry-run` — stdout is the file as it
-   would be, with the provenance comments. Show it to the developer.
-2. `pando init --answers answers.json` — the real write.
+1. `pando init --answers - --dry-run` — stdout is the file as it would
+   be, with the provenance comments. Show it to the developer.
+2. `pando init --answers -` — the real write.
 3. `pando doctor` — and **report what it said**, including the notes.
    Exit 0 means nothing found will break a command; exit 1 means something
    will, and every problem is printed with its own fix.
@@ -322,6 +371,10 @@ Do not claim a project starts unless you started it. If you did not run
 `pando start`, say that you did not.
 
 ### Prove it by running, when the developer agrees
+
+On a first run, `pando check` is this proof and the pasted prompt is the
+agreement: see the first-run section. What follows is for proving more
+than a check does, such as an isolated start.
 
 Rules read files; only a start meets the project. A config every slot of
 which is `decided` can still describe an environment that does not run —
@@ -407,9 +460,10 @@ Absolute. None of these has an exception worth taking.
   is not.
 - **Never run a mutating pando command against a repository the developer
   did not point you at.** `new`, `start`, `stop`, `restart`, `rm`,
-  `share`, `unshare`, `init` are mutating. `ls`, `status`, `path`, `logs`,
-  `doctor`, `signals` are not; `open` changes nothing but launches a
-  browser, which is the developer's to ask for. Check the working directory is the repository they asked about.
+  `share`, `unshare`, `init`, `check` are mutating. `ls`, `status`,
+  `path`, `logs`, `doctor`, `signals` and `init --agent` are not; `open`
+  changes nothing but launches a browser, which is the developer's to ask
+  for. Check the working directory is the repository they asked about.
 - **Never install a toolchain or a database engine.** Not node, not a
   version manager, not Postgres, not docker. Report what is missing, with
   what pando said about it.
@@ -580,6 +634,7 @@ a `source` key. Pass `--source` when you know which log you want.
 |---|---|
 | `0` | carry on |
 | `1` | read stderr. It is one sentence. **Do not retry** — a failure that repeats is a failure that repeats |
+| `1` from `pando check` | the setup is wrong, or the machine is: fix it before trying again. The first-run section says which is yours |
 | `2` | you asked wrongly: a bad flag, or an answers file naming a question pando does not ask. Fix the request |
 | `3` | **a question is unanswered, and it is on stderr** with its options. Answer it through `init --answers`, or put it to the human. Never retry unchanged, and never add `--yes` to make it go away |
 

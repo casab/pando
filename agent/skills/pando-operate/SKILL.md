@@ -8,6 +8,7 @@ description: Run a project's worktrees day to day with pando — start, stop, ch
 **The procedure is `${CLAUDE_PLUGIN_ROOT}/brief.md`, section "Operating,
 day to day".** Read it. This file is glue and contains none of the
 reasoning; `${CLAUDE_PLUGIN_ROOT}/json.md` is the contract for the shapes.
+Or run `pando init --agent --reference brief`, which prints the brief.
 
 ## The two rules that matter most
 

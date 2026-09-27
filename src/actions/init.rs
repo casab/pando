@@ -411,7 +411,10 @@ fn init_report(
 
 /// What config says about one slot, in the fewest words that are still
 /// true. A line for a human to read; nothing parses it back.
-pub(super) fn slot_value(config: &Config, slot: Slot) -> Option<String> {
+///
+/// Public because `init --agent` says what is already set in the same
+/// words `init` reports it with.
+pub fn slot_value(config: &Config, slot: Slot) -> Option<String> {
     match slot {
         Slot::Install => config.project.install.clone(),
         Slot::VersionFiles => (!config.runtime.version_files.is_empty())

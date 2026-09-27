@@ -12,6 +12,9 @@ the reasoning — if it disagrees with the brief, the brief is right.
 brief names. (In a pando checkout the two are `agent/brief.md` and
 `agent/json.md`; `agent/codex/install.sh` is what put copies here.)
 
+Or run `pando init --agent`: it prints the setup job for this project,
+with the brief's first-run section, and the steps end with `pando check`.
+
 ## Before you start
 
 Confirm the working directory is the repository the developer asked you

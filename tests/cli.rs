@@ -2597,6 +2597,228 @@ fn init_with_yes_records_that_a_flag_chose() {
     );
 }
 
+// ---- init --agent ---------------------------------------------------------
+
+/// Every path under `dir`, with each file's bytes: what "writes nothing"
+/// is checked against, contents included.
+fn contents(dir: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(at) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&at) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match path.is_dir() {
+                true => {
+                    out.insert(path.clone(), None);
+                    stack.push(path);
+                }
+                false => {
+                    out.insert(path.clone(), std::fs::read(&path).ok());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// What an agent's shell is trusted to show whole. Claude Code's cuts
+/// output at about 30,000 characters, and the job is meant to be read
+/// in one go beside everything else the agent has.
+const JOB_LIMIT: usize = 10 * 1024;
+
+// The head start: a workspace whose process list is a question gets the
+// question with pando's options and the one it would take, and the
+// guesses it would take without asking, each with its reason.
+#[test]
+fn init_agent_names_the_open_questions_and_pandos_guesses() {
+    let e = env_of(Kind::MonoWebApi);
+    let out = e.pando(&["init", "--agent"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    let job = stdout(&out);
+    assert!(
+        job.starts_with("# Set up pando for mono-web-api (pando "),
+        "{job}"
+    );
+    assert!(job.contains("on branch main"), "{job}");
+    // Open, with its options, pando's own marked.
+    assert!(job.contains("- processes: open, below"), "{job}");
+    assert!(
+        job.contains("- processes: Run these as separate processes?"),
+        "{job}"
+    );
+    assert!(
+        job.contains("`api: pnpm dev in apps/api; web: pnpm dev --port {port:web} in apps/web`"),
+        "{job}"
+    );
+    assert!(job.contains("← pando's choice"), "{job}");
+    // Guessed, with the evidence.
+    assert!(
+        job.contains("- install: pando's guess: `pnpm install --frozen-lockfile` (pnpm-lock.yaml)"),
+        "{job}"
+    );
+    // The main checkout's database, by its port and never its value.
+    assert!(job.contains("postgres :5432"), "{job}");
+    assert!(
+        !job.contains("postgres://"),
+        "a value is never printed: {job}"
+    );
+    assert!(job.contains("## First run"), "{job}");
+    assert!(
+        job.contains("`pando init --agent --reference json`"),
+        "{job}"
+    );
+}
+
+// Answered slots read as set, and the open-question list goes quiet once
+// nothing is left for anybody to answer.
+#[test]
+fn init_agent_after_init_says_what_is_set_and_that_nothing_is_open() {
+    let e = env_of(Kind::NextPnpmCompose);
+    assert_eq!(code(&e.pando(&["init", "--yes"])), EXIT_OK);
+    let out = e.pando(&["init", "--agent"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    let job = stdout(&out);
+    assert!(
+        job.contains("- install: set: `pnpm install --frozen-lockfile`"),
+        "{job}"
+    );
+    assert!(job.contains("- runs: dev: `pnpm dev`"), "{job}");
+    assert!(job.contains("(written)"), "{job}");
+    assert!(job.contains("Open questions: none."), "{job}");
+}
+
+// The limit, on every fixture — the monorepo, the services, the messy
+// ones — before and after their questions are answered.
+#[test]
+fn init_agent_stays_under_ten_kilobytes_on_every_fixture() {
+    for kind in Kind::ALL {
+        let e = env_of(kind);
+        for pass in ["fresh", "after init --yes"] {
+            let out = e.pando(&["init", "--agent"]);
+            assert_eq!(code(&out), EXIT_OK, "{kind:?} {pass}: {}", stderr(&out));
+            let size = out.stdout.len();
+            assert!(
+                size < JOB_LIMIT,
+                "{kind:?} {pass}: the job is {size} bytes, over {JOB_LIMIT}"
+            );
+            let _ = e.pando(&["init", "--yes"]);
+        }
+    }
+}
+
+// Read-only, like `signals`: not the repository, not pando's home, not
+// even the home's directory when there is none yet.
+#[test]
+fn init_agent_writes_nothing_not_even_pandos_home() {
+    let e = env_of(Kind::MonoWebApi);
+    let home = contents(&e.home);
+    let repo = contents(&e.root);
+    let out = e.pando(&["init", "--agent"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    assert_eq!(contents(&e.home), home, "pando's home changed");
+    assert_eq!(contents(&e.root), repo, "the repository changed");
+    assert_eq!(status_porcelain(&e.root), "");
+
+    std::fs::remove_dir_all(&e.home).unwrap();
+    let out = e.pando(&["init", "--agent"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    assert!(!e.home.exists(), "init --agent made pando's home");
+}
+
+// A config pando cannot read is the first thing the job says, and the
+// command still runs and exits 0 — where plain `init` is stopped by it.
+#[test]
+fn init_agent_reports_a_config_it_cannot_read_rather_than_refusing() {
+    let e = env();
+    e.write_config("[project\ninstall = \n");
+    let out = e.pando(&["init", "--agent"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    let job = stdout(&out);
+    assert!(
+        job.contains("**pando cannot read its settings for this project:**"),
+        "{job}"
+    );
+    assert!(job.contains("`pando doctor`"), "{job}");
+    // Before the facts: it is the thing to tell the developer first.
+    assert!(
+        job.find("cannot read its settings") < job.find("## This project"),
+        "{job}"
+    );
+    assert_eq!(code(&e.pando(&["init"])), EXIT_ERROR);
+}
+
+// After a failed check the job leads with it: the reason and the failed
+// process's last lines, ahead of the facts. The lines are redacted again
+// on the way out, so a secret a record still holds never reaches the
+// agent.
+#[test]
+fn init_agent_after_a_failed_check_starts_with_the_failure() {
+    let e = env();
+    e.write_config(SLEEPER);
+    let paths = common::paths_for(&e.home, &e.root);
+    let config = pando::config::load(&paths).unwrap().config;
+    let mut record = pando::setup::CheckRecord::begin(
+        pando::setup::fingerprint(&config),
+        pando::setup::RanBy::Program,
+    );
+    record.outcome = pando::setup::CheckOutcome::Failed {
+        kind: pando::setup::FailureKind::Settings,
+        reason: "dev exited after 0.8s".to_string(),
+    };
+    record.failed_tail = vec![
+        "DATABASE_URL=postgres://u:hunter2@localhost/db".to_string(),
+        "Error: Cannot find module 'dotenv'".to_string(),
+    ];
+    record.save(&paths).unwrap();
+    let before = contents(&e.home);
+
+    let out = e.pando(&["init", "--agent"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    let job = stdout(&out);
+    let failed = job.find("## The last test failed").expect(&job);
+    assert!(failed < job.find("## This project").unwrap(), "{job}");
+    assert!(job.contains("dev exited after 0.8s"), "{job}");
+    assert!(
+        !job.contains("hunter2"),
+        "a password reached the job: {job}"
+    );
+    assert!(
+        job.contains("    Error: Cannot find module 'dotenv'"),
+        "{job}"
+    );
+    assert!(
+        job.contains("localhost/db"),
+        "the line itself is kept: {job}"
+    );
+    assert_eq!(
+        contents(&e.home),
+        before,
+        "reading the record wrote something"
+    );
+}
+
+// The whole documents, as this pando was built with them.
+#[test]
+fn init_agent_reference_prints_the_brief_and_the_contract_whole() {
+    let e = env();
+    for (doc, file) in [("brief", "agent/brief.md"), ("json", "agent/json.md")] {
+        let out = e.pando(&["init", "--agent", "--reference", doc]);
+        assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+        let expected =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(file)).unwrap();
+        assert_eq!(stdout(&out), expected, "--reference {doc}");
+    }
+    // And never without `--agent`, or beside a flag that answers.
+    assert_eq!(
+        code(&e.pando(&["init", "--reference", "brief"])),
+        EXIT_USAGE
+    );
+    assert_eq!(code(&e.pando(&["init", "--agent", "--yes"])), EXIT_USAGE);
+}
+
 // ---- an answers file ------------------------------------------------------
 
 /// The answers a program would send for the deliberately ambiguous

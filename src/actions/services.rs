@@ -1781,18 +1781,7 @@ pub fn shared_service_env(paths: &PandoPaths, config: &Config) -> BTreeMap<Strin
 pub fn shared_service_statuses(paths: &PandoPaths, config: &Config) -> Vec<ServiceStatus> {
     let mut out: Vec<ServiceStatus> = shared_service_keys(paths, config)
         .into_iter()
-        .map(|shared| {
-            let port = services::port_in_env(paths.root(), &shared.key);
-            ServiceStatus {
-                name: shared.service,
-                port,
-                up: port.map(ports::something_is_listening) == Some(true),
-                // Shared services are the developer's own `docker compose
-                // up` or their own `brew services start`; pando runs no
-                // pump in front of anything it did not start.
-                logging: false,
-            }
-        })
+        .map(|shared| shared_service_status(paths, &shared.key, &shared.service))
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
@@ -1840,6 +1829,26 @@ pub(super) fn shared_service_keys(paths: &PandoPaths, config: &Config) -> Vec<Sh
         }
     }
     out
+}
+
+/// One shared service, found through the env key the app reads it by:
+/// the port the main checkout's own env files give that key, and whether
+/// something answers there. Never the value itself, which can carry a
+/// login.
+///
+/// Also what `init --agent` reports for a service detection proposes and
+/// nobody has answered yet, so the two say the same thing about it.
+pub fn shared_service_status(paths: &PandoPaths, key: &str, service: &str) -> ServiceStatus {
+    let port = services::port_in_env(paths.root(), key);
+    ServiceStatus {
+        name: service.to_string(),
+        port,
+        up: port.map(ports::something_is_listening) == Some(true),
+        // Shared services are the developer's own `docker compose up` or
+        // their own `brew services start`; pando runs no pump in front of
+        // anything it did not start.
+        logging: false,
+    }
 }
 
 /// The environment a command run by hand inside a worktree needs, so that

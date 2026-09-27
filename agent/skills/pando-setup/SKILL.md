@@ -11,6 +11,9 @@ contains none of the reasoning — if it disagrees with the brief, the brief
 is right. `${CLAUDE_PLUGIN_ROOT}/json.md` is the contract for every shape
 the brief names.
 
+Or run `pando init --agent`: it prints the setup job for this project,
+with the brief's first-run section, and the steps end with `pando check`.
+
 ## Before you start
 
 Confirm the working directory is the repository the developer asked you

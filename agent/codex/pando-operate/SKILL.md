@@ -8,7 +8,8 @@ description: Run a project's worktrees day to day with pando — start, stop, ch
 **The procedure is `brief.md`, beside this file, section "Operating, day
 to day".** Read it. This file is glue and contains none of the reasoning;
 `json.md`, also beside this file, is the contract for the shapes. (In a
-pando checkout they are `agent/brief.md` and `agent/json.md`.)
+pando checkout they are `agent/brief.md` and `agent/json.md`.) Or run
+`pando init --agent --reference brief`, which prints the brief.
 
 ## The two rules that matter most
 

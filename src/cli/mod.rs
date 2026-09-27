@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::io::Write;
 
+mod agent;
 mod answers;
 mod check;
 mod completion;
@@ -28,6 +29,7 @@ use self::answers::render_init;
 use self::answers::report_unused;
 use self::answers::volunteered_from;
 use self::prompt::everyday_asker;
+pub use agent::Reference;
 pub use answers::{Answers, UsageError, render_needs_answer, slot_name};
 pub use doctor::{adopt_project, doctor};
 pub use logs::logs;
@@ -228,6 +230,11 @@ Examples:
     /// The batch form of the questions `new` and `start` ask just in time,
     /// through the same paths: nothing is started, nothing is written into
     /// the repository, and a second run asks nothing.
+    #[command(after_help = "\
+Examples:
+  pando init                          ask every open question, on a terminal
+  pando init --answers - --dry-run    a program's answers, from stdin, previewed
+  pando init --agent                  the setup job, for your coding agent to follow")]
     #[command(display_order = 13)]
     Init {
         /// Accept pando's own recommendation for anything it would ask.
@@ -257,6 +264,23 @@ Examples:
         /// Print the config this would write, and write nothing.
         #[arg(long)]
         dry_run: bool,
+        /// Print the setup job for a coding agent, and write nothing.
+        ///
+        /// What pando sees in this project now, the questions still open
+        /// with pando's options, what each command the agent will run
+        /// writes, and the steps: answer, save, `pando check`, and say
+        /// when it is done. After a failed check, the failure comes first.
+        /// Asks nothing and exits 0, even when pando cannot read the
+        /// project's settings: that is reported in the job.
+        #[arg(long, conflicts_with_all = ["yes", "answers", "dry_run", "replace"])]
+        agent: bool,
+        /// With `--agent`: print a whole reference instead of the job.
+        ///
+        /// `brief` is the procedure the job's steps come from, `json` the
+        /// contract for every JSON shape pando publishes. Both are the
+        /// text this pando was built with.
+        #[arg(long, requires = "agent", value_name = "DOC")]
+        reference: Option<Reference>,
     },
     /// Test the setup: start it all in a throwaway worktree, then remove it.
     ///
@@ -510,8 +534,10 @@ impl Command {
                 // `init`'s whole job is to fill this file in. A layer
                 // pando cannot read is exactly the thing to fix first,
                 // and patching on top of one it could not parse would
-                // lose whatever is in it.
-                | Command::Init { .. }
+                // lose whatever is in it. `--agent` writes nothing, and a
+                // config it cannot read is a fact the job reports: the
+                // agent is who tells the developer.
+                | Command::Init { agent: false, .. }
                 // It starts the project, on the settings a start would use.
                 | Command::Check { .. }
                 // `--env` renders templates, which only config holds. Plain
@@ -673,10 +699,16 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             Ok(())
         }
         Command::Init {
+            agent: true,
+            reference,
+            ..
+        } => agent::agent(paths, reference, &mut out),
+        Command::Init {
             yes,
             answers,
             replace,
             dry_run,
+            ..
         } => {
             let answers = answers.as_deref().map(read_answers).transpose()?;
             // Every slot the file names: `actions` refuses the ones

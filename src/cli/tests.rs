@@ -2416,13 +2416,19 @@ fn commands_named_in(text: &str) -> Vec<String> {
 /// asked rather than a list kept beside it, so there is nothing to
 /// keep in step.
 fn assert_every_documented_command_is_real(file: &str) {
-    use clap::CommandFactory;
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
     let text =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    assert_every_command_is_real(file, &text);
+}
+
+/// [`assert_every_documented_command_is_real`], of text that is not a
+/// file: `file` is only what a failure calls it.
+fn assert_every_command_is_real(file: &str, text: &str) {
+    use clap::CommandFactory;
     let cli = Cli::command();
     let mut checked = 0;
-    for command in commands_named_in(&text) {
+    for command in commands_named_in(text) {
         let mut tokens = command.split_whitespace();
         let Some(verb) = tokens.next() else { continue };
         // A bare `pando` with a flag of its own, like --version.
@@ -2483,6 +2489,28 @@ fn every_host_wrapper_only_names_commands_pando_has() {
 #[test]
 fn the_brief_only_names_commands_pando_has() {
     assert_every_documented_command_is_real("agent/brief.md");
+}
+
+// The setup prompt is the one line a developer copies into their agent,
+// and it names one command. A flag renamed under it would leave every
+// setup screen, header hint and README handing agents a command that
+// fails.
+#[test]
+fn the_setup_prompt_only_names_commands_pando_has() {
+    assert_every_command_is_real("setup::SETUP_PROMPT", crate::setup::SETUP_PROMPT);
+    assert!(
+        crate::setup::SETUP_PROMPT.contains("`pando init --agent`"),
+        "the prompt hands the job to `init --agent`: {}",
+        crate::setup::SETUP_PROMPT
+    );
+}
+
+// The job an agent follows lists the commands it will run; the same
+// rename would rot it.
+#[test]
+fn the_setup_job_only_names_commands_pando_has() {
+    let fx = fixture();
+    assert_every_command_is_real("init --agent", &super::agent::job(&fx.paths));
 }
 
 /// `CLAUDE.md` names the CLI verbs and calls them canonical — "used
@@ -3545,4 +3573,240 @@ fn a_checks_worktree_is_in_no_list_and_answers_to_no_name() {
         "{:?}",
         report.findings
     );
+}
+
+// ---- init --agent -----------------------------------------------------
+
+// The binary carries the brief and the contract so `--reference` prints
+// what this pando was built with. An embedded copy that drifted from the
+// file would be a second brief, which is the one thing the agent layer
+// is built never to have.
+#[test]
+fn the_embedded_brief_and_contract_are_the_files() {
+    let read = |file: &str| {
+        std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file))
+            .unwrap_or_else(|e| panic!("read {file}: {e}"))
+    };
+    assert_eq!(super::agent::BRIEF, read("agent/brief.md"));
+    assert_eq!(super::agent::JSON_CONTRACT, read("agent/json.md"));
+}
+
+// The job's rules and steps are the brief's first-run section, printed
+// from it: one copy. Every step the plan gives an agent is in it, and
+// nothing of the brief past it.
+#[test]
+fn the_job_carries_the_briefs_first_run_section_and_only_that() {
+    let section = super::agent::first_run_section();
+    assert!(section.starts_with("## First run"), "{section}");
+    let flat = section.split_whitespace().collect::<Vec<_>>().join(" ");
+    for (phrase, why) in [
+        (
+            "`pando signals` and `pando doctor --json`",
+            "where it starts",
+        ),
+        ("Do not re-derive", "that the evidence is not re-derived"),
+        ("confirm pando's guesses", "that a guess is confirmed"),
+        ("pando init --answers - --dry-run", "the preview"),
+        ("always through stdin", "that answers never go in a file"),
+        ("at least 10 minutes", "the check's timeout"),
+        ("consent to this test", "that the prompt is consent"),
+        ("never rerun unchanged", "fix, then rerun"),
+        (
+            "pando init --answers - --replace",
+            "how a setting is corrected",
+        ),
+        ("kind: \"machine\"", "whose a machine failure is"),
+        ("three changed attempts", "when to stop"),
+        (
+            "pando is set up and tested for <project>. > You're ready: run `pando`.",
+            "the two lines that say it is done",
+        ),
+        ("Change no file", "the rule about the repository"),
+    ] {
+        assert!(
+            flat.contains(phrase),
+            "the job never says {why}: {phrase:?}\n{section}"
+        );
+    }
+    assert!(
+        !section.contains("## 0."),
+        "the section runs on into the brief's next one:\n{section}"
+    );
+
+    let fx = fixture();
+    let job = super::agent::job(&fx.paths);
+    assert!(
+        job.starts_with(&format!(
+            "# Set up pando for acme-shop (pando {})\n",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "{job}"
+    );
+    assert!(job.contains(section.trim_end()), "{job}");
+    assert!(
+        job.contains("`pando init --agent --reference brief`"),
+        "{job}"
+    );
+    assert!(
+        job.contains("`pando init --agent --reference json`"),
+        "{job}"
+    );
+    // What each command writes, with this project's own paths.
+    assert!(
+        job.contains(&fx.paths.project_dir().display().to_string()),
+        "{job}"
+    );
+    assert!(job.contains("Codex's workspace-write"), "{job}");
+}
+
+/// A setup in `state` whose last check ended with `outcome`.
+fn setup_after(
+    state: crate::setup::SetupState,
+    outcome: crate::setup::CheckOutcome,
+    tail: &[&str],
+) -> crate::setup::Setup {
+    let mut record =
+        crate::setup::CheckRecord::begin("today".to_string(), crate::setup::RanBy::Program);
+    record.outcome = outcome;
+    record.failed_tail = tail.iter().map(|line| line.to_string()).collect();
+    crate::setup::Setup {
+        state,
+        last_check: Some(record),
+        memory: crate::setup::SetupMemory::default(),
+        fingerprint: "today".to_string(),
+    }
+}
+
+// After a failed check the same prompt brings the failure to the agent:
+// the reason, the failed process's last lines as the check recorded them,
+// and whose it is to fix — a settings failure the agent's, a machine one
+// the developer's.
+#[test]
+fn a_failed_check_leads_with_its_reason_its_last_lines_and_whose_it_is() {
+    use crate::setup::{CheckOutcome, FailureKind, SetupState};
+    let failed = |kind| CheckOutcome::Failed {
+        kind,
+        reason: "web exited after 0.8s".to_string(),
+    };
+    let text = super::agent::last_check(&setup_after(
+        SetupState::Failing,
+        failed(FailureKind::Settings),
+        &["Error: Cannot find module 'dotenv'"],
+    ))
+    .expect("a failure is said");
+    assert!(
+        text.starts_with("## The last test failed\n\nweb exited after 0.8s\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("    Error: Cannot find module 'dotenv'\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("`pando init --answers - --replace`"),
+        "{text}"
+    );
+    assert!(text.contains("never rerun it unchanged"), "{text}");
+
+    let text = super::agent::last_check(&setup_after(
+        SetupState::Failing,
+        failed(FailureKind::Machine),
+        &[],
+    ))
+    .unwrap();
+    assert!(text.contains("the developer's"), "{text}");
+    assert!(text.contains("change no setting"), "{text}");
+    assert!(!text.contains("--replace"), "{text}");
+    assert!(!text.contains("Its last lines"), "{text}");
+
+    let text = super::agent::last_check(&setup_after(
+        SetupState::Failing,
+        CheckOutcome::NotSetUp {
+            slot: "dev_cmd".to_string(),
+        },
+        &[],
+    ))
+    .unwrap();
+    assert!(text.contains("`dev_cmd` has no answer"), "{text}");
+}
+
+// The other states get a line, and a project never checked gets none:
+// the job itself is the whole story there.
+#[test]
+fn every_other_check_state_is_one_line_or_nothing() {
+    use crate::setup::{CheckOutcome, SetupState};
+    for (state, outcome, says) in [
+        (
+            SetupState::Testing,
+            CheckOutcome::Running,
+            "A test is running now",
+        ),
+        (
+            SetupState::Interrupted,
+            CheckOutcome::Interrupted,
+            "never finished",
+        ),
+        (
+            SetupState::Stale,
+            CheckOutcome::Passed,
+            "settings changed since the last test",
+        ),
+        (
+            SetupState::Ready,
+            CheckOutcome::Passed,
+            "The last test passed",
+        ),
+    ] {
+        let text = super::agent::last_check(&setup_after(state, outcome, &[]))
+            .unwrap_or_else(|| panic!("{state:?} says nothing"));
+        assert!(text.contains(says), "{state:?}: {text}");
+        assert!(
+            !text.contains("## The last test failed"),
+            "{state:?}: {text}"
+        );
+    }
+    let never = crate::setup::Setup {
+        state: SetupState::Untested,
+        last_check: None,
+        memory: crate::setup::SetupMemory::default(),
+        fingerprint: "today".to_string(),
+    };
+    assert_eq!(super::agent::last_check(&never), None);
+}
+
+// `--agent` prints; it never answers, writes or previews a write, so
+// the flags that do are refused beside it, and `--reference` means
+// nothing without it.
+#[test]
+fn init_agent_refuses_the_flags_that_answer_or_write() {
+    for extra in [&["--yes"][..], &["--dry-run"][..], &["--answers", "-"][..]] {
+        let mut argv = vec!["pando", "init", "--agent"];
+        argv.extend_from_slice(extra);
+        let err = Cli::try_parse_from(&argv).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "{argv:?}"
+        );
+    }
+    assert!(
+        Cli::try_parse_from(["pando", "init", "--agent", "--answers", "-", "--replace"]).is_err()
+    );
+    let err = Cli::try_parse_from(["pando", "init", "--reference", "brief"]).unwrap_err();
+    assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    for doc in ["brief", "json"] {
+        Cli::try_parse_from(["pando", "init", "--agent", "--reference", doc])
+            .unwrap_or_else(|e| panic!("--reference {doc}: {e}"));
+    }
+}
+
+// A config pando cannot read is the first thing the job reports, so the
+// command that reports it cannot be one a broken config stops.
+#[test]
+fn init_agent_runs_on_a_config_pando_cannot_read() {
+    let command = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
+    assert!(!command(&["pando", "init", "--agent"]).needs_config());
+    assert!(!command(&["pando", "init", "--agent", "--reference", "json"]).needs_config());
+    assert!(command(&["pando", "init"]).needs_config());
+    assert!(command(&["pando", "init", "--answers", "-", "--dry-run"]).needs_config());
 }

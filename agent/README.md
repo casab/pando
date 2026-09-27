@@ -21,7 +21,9 @@ within a month, and a procedure written for a language model still reads
 perfectly when it is wrong.
 
 You do not need either wrapper. An agent that reads `brief.md` and
-`json.md` has everything they have.
+`json.md` has everything they have, and the pando binary carries both:
+`pando init --agent` prints the setup job for the project it runs in, and
+`--reference brief` or `--reference json` prints either file whole.
 
 ## Claude Code
 
@@ -44,6 +46,7 @@ a stale copy is the one failure mode this layout has.
 
 ## If you are the agent
 
-Read [`brief.md`](./brief.md). Start with `pando signals` and
-`pando doctor --json`, write only through `pando init --answers`, and
-never write a byte into the developer's repository.
+Run `pando init --agent`, or read [`brief.md`](./brief.md). Start with
+`pando signals` and `pando doctor --json`, write only through
+`pando init --answers`, and never write a byte into the developer's
+repository.
