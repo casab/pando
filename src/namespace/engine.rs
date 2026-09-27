@@ -244,8 +244,7 @@ impl Server<'_> {
             .stdout
             .lines()
             .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .next_back()
+            .rfind(|line| !line.is_empty())
             .and_then(|line| line.trim_start_matches("(integer)").trim().parse().ok());
         match (out.success(), count) {
             (true, Some(count)) => Ok(count),

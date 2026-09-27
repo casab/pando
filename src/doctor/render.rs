@@ -29,7 +29,7 @@ impl Report {
             .collect();
         // Problems first inside a section: the thing that is broken should
         // not be below three lines about something that merely is.
-        out.sort_by(|a, b| b.severity.cmp(&a.severity));
+        out.sort_by_key(|f| std::cmp::Reverse(f.severity));
         out
     }
 

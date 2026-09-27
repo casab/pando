@@ -121,10 +121,10 @@ pub fn check(
         .and_then(|config| resolve_process(paths, &config, Mode::Shared, &unasked, say.detail));
     let config = match resolved {
         Ok(config) => config,
-        Err(e) => match e.downcast::<NeedsAnswer>() {
-            Ok(needs) => return Ok(not_set_up(paths, config, ran_by, needs)),
-            Err(e) => return Err(e),
-        },
+        Err(e) => {
+            let needs = e.downcast::<NeedsAnswer>()?;
+            return Ok(not_set_up(paths, config, ran_by, needs));
+        }
     };
 
     let mut run = Run::begin(paths, &config, ran_by, say);

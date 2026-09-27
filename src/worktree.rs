@@ -946,7 +946,7 @@ fn merge_pr_lists(open: Vec<PrInfo>, recent: Vec<PrInfo>) -> Vec<PrInfo> {
             merged.push(pr);
         }
     }
-    merged.sort_by(|a, b| b.number.cmp(&a.number));
+    merged.sort_by_key(|p| std::cmp::Reverse(p.number));
     merged
 }
 

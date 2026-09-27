@@ -2719,7 +2719,7 @@ fn motions_on_an_empty_and_a_one_line_log_stay_in_range() {
         app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
         app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         paint(&mut app, 80, 8);
-        assert!(viewer(&app).cursor <= lines.len().saturating_sub(1).max(0));
+        assert!(viewer(&app).cursor <= lines.len().saturating_sub(1));
     }
 }
 

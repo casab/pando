@@ -110,9 +110,9 @@ fn every_stem_stands_on_one_root_line() {
         assert_eq!(cells[line][0].ch, '╺');
         assert_eq!(cells[line][w - 1].ch, '╸');
         // Between the tap roots, nothing: the line is what joins them.
-        for x in 0..w {
+        for (x, cell) in cells[tap].iter().enumerate() {
             if !picture.stems.contains(&x) {
-                assert_eq!(cells[tap][x].material, Material::Sky, "{name}\n{text}");
+                assert_eq!(cell.material, Material::Sky, "{name}\n{text}");
             }
         }
     }
