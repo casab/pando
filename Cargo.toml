@@ -41,3 +41,13 @@ tempfile = "3.27.0"
 # stay as quick as they were.
 [profile.dev.package."*"]
 opt-level = 2
+
+# No debug info in a dev build. On macOS, rustc leaves a debug build's
+# object files in target/debug/deps for the debugger to read, and every
+# incremental rebuild names them afresh, so each edit left about 1,500
+# files behind for good: 246,000 files and 20 GB after the audit, with
+# every compile, clippy and link slowed by scanning them. Without debug
+# info rustc deletes them. Panics still name their file and line; for a
+# debugger, build with CARGO_PROFILE_DEV_DEBUG=true.
+[profile.dev]
+debug = false
