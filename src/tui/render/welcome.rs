@@ -140,9 +140,7 @@ fn fact<'a>(label: &str, value: String, width: usize) -> Line<'a> {
 fn dev_summary(app: &App) -> String {
     let processes: Vec<String> = app
         .config
-        .processes
-        .iter()
-        .filter(|(_, process)| !process.cmd.is_empty())
+        .runnable_processes()
         .map(|(name, process)| format!("{name}: {}", process.cmd))
         .collect();
     if processes.is_empty() {

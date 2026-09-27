@@ -512,6 +512,16 @@ impl UiSection {
 }
 
 impl Config {
+    /// The processes a start can run: those with a command. None means
+    /// nothing is set up to run yet — the setup state's "new", and what
+    /// the welcome screen calls "not settled yet". Blank counts as none,
+    /// as it does for `start`, which refuses a process without one.
+    pub fn runnable_processes(&self) -> impl Iterator<Item = (&String, &ProcessConfig)> {
+        self.processes
+            .iter()
+            .filter(|(_, process)| !process.cmd.trim().is_empty())
+    }
+
     /// Where worktrees are created: the configured directory if any, else
     /// pando's own. The single helper every caller uses, so a configured
     /// value is honoured by `actions` and the TUI watcher alike.

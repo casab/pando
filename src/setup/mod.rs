@@ -3,7 +3,17 @@
 //!
 //! Read from files pando owns — the config layers, the last check's
 //! record, and what the setup screen remembers — never from the
-//! repository.
+//! repository. [`read`] decides one of seven [`SetupState`]s, in order:
+//! a check running, the last one interrupted, nothing to run yet, then the
+//! last check against today's run settings, compared by [`fingerprint`].
+
+mod fingerprint;
+mod record;
+mod state;
+
+pub use fingerprint::{FINGERPRINT_VERSION, fingerprint};
+pub use record::{CheckOutcome, CheckRecord, FailureKind, ProcessResult, RanBy, SetupMemory};
+pub use state::{Setup, SetupState, decide, read};
 
 /// The prompt a developer pastes into their coding agent: one line,
 /// identical on the setup screen, in the header hint, in the CLI tip and
@@ -11,3 +21,6 @@
 /// so the prompt never changes with them.
 pub const SETUP_PROMPT: &str =
     "Set up pando for this project: run `pando init --agent` and follow what it says.";
+
+#[cfg(test)]
+mod tests;

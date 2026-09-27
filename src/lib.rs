@@ -6,7 +6,7 @@
 //! catalog · paths · term · remedy · theme → compose → project · config · ports · process · runtime · state
 //!       · env_command · template · recipes
 //!       → detect · hooks · worktree · cache · log_tail · observe · services
-//!         · native · namespace · decisions
+//!         · native · namespace · decisions · setup
 //!       → tunnel · share_proxy
 //!       → actions
 //!       → doctor

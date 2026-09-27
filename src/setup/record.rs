@@ -1,0 +1,207 @@
+//! The two files pando keeps about a project's setup: the last check's
+//! record (`check.json`) and what the setup screen remembers
+//! (`setup.json`).
+//!
+//! Both are read tolerantly: a file that is missing, unreadable or of a
+//! shape this pando does not know reads as "none", never as an error, so a
+//! damaged file costs a retest and nothing else. Both are written the way
+//! `state.json` is, to a temp file renamed over the old one, so a reader
+//! on the TUI's tick never sees half a record.
+
+use crate::paths::PandoPaths;
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+
+/// The last `pando check`, or the one running now.
+///
+/// pando's own record, not a published shape: `check --json` is the
+/// contract, and this file is free to change with it. Every field a later
+/// version might add is defaulted, so an older record still reads.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CheckRecord {
+    pub started_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<DateTime<Utc>>,
+    /// The pando that ran it. Shown ("tested with pando 0.5.0"), never
+    /// compared: an upgrade does not invalidate a test.
+    pub pando_version: String,
+    /// The run settings' fingerprint after the check's own resolve pass.
+    pub fingerprint_before: String,
+    /// The same, taken again at the end. A check that finished with a
+    /// different one tested settings that changed under it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint_after: Option<String>,
+    /// The commit the throwaway worktree was made at, once it is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    /// The ref that commit was taken from; none when it fell back to HEAD.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_ref: Option<String>,
+    pub outcome: CheckOutcome,
+    /// One entry per process the check started, in start order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub processes: Vec<ProcessResult>,
+    /// The failed process's last lines, already redacted by whoever wrote
+    /// the record: this file is read into the agent's job.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_tail: Vec<String>,
+    /// What a running check has done so far, one line per step ("made a
+    /// test worktree", "installing", "starting web, api…"), for the screen
+    /// that watches it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub progress: Vec<String>,
+    pub ran_by: RanBy,
+    /// Anything the check wants said beside its result, such as the hooks
+    /// it skipped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
+/// How a check ended, or that it has not yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum CheckOutcome {
+    Running,
+    Passed,
+    Failed {
+        kind: FailureKind,
+        reason: String,
+    },
+    /// A run question was still open (exit 3); `slot` names it.
+    NotSetUp {
+        slot: String,
+    },
+    /// Stopped before it finished: a signal, or a `stop` of the check's
+    /// own worktree.
+    Interrupted,
+}
+
+/// Whose a failure is to fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FailureKind {
+    /// pando's settings for the project are wrong: the agent fixes them.
+    Settings,
+    /// The machine is not ready — a server not running, Docker stopped, a
+    /// runtime missing: the developer's, and no setting changes it.
+    Machine,
+}
+
+/// One process of a check.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProcessResult {
+    pub name: String,
+    pub ready: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// What the HTTP probe got, for the one process it asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+    /// How long it took to be ready, or to fail.
+    #[serde(default)]
+    pub secs: f64,
+}
+
+/// Who ran a check, so the screen can say "your agent is probably on it"
+/// only when a program did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RanBy {
+    Tui,
+    Terminal,
+    /// stderr was not a terminal.
+    Program,
+}
+
+impl CheckRecord {
+    /// A check that has just begun, by this pando, with its first
+    /// fingerprint.
+    pub fn begin(fingerprint: String, ran_by: RanBy) -> Self {
+        Self {
+            started_at: Utc::now(),
+            finished_at: None,
+            pando_version: env!("CARGO_PKG_VERSION").to_string(),
+            fingerprint_before: fingerprint,
+            fingerprint_after: None,
+            commit: None,
+            base_ref: None,
+            outcome: CheckOutcome::Running,
+            processes: Vec::new(),
+            failed_tail: Vec::new(),
+            progress: Vec::new(),
+            ran_by,
+            notes: Vec::new(),
+        }
+    }
+
+    /// The fingerprint the result stands for: the one taken last.
+    pub fn fingerprint(&self) -> &str {
+        self.fingerprint_after
+            .as_deref()
+            .unwrap_or(&self.fingerprint_before)
+    }
+
+    /// Whether the settings changed while the check ran, so its result
+    /// speaks for neither the settings before nor after.
+    pub fn changed_while_running(&self) -> bool {
+        self.fingerprint_after
+            .as_deref()
+            .is_some_and(|after| after != self.fingerprint_before)
+    }
+
+    /// The project's record, or none when there is no readable one.
+    pub fn load(paths: &PandoPaths) -> Option<Self> {
+        read_json(&paths.check_file())
+    }
+
+    pub fn save(&self, paths: &PandoPaths) -> Result<()> {
+        write_json(&paths.check_file(), self)
+    }
+}
+
+/// What the setup screen and the CLI's tip remember about a project.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SetupMemory {
+    /// `esc` on the setup screen: never shown it again, only a hint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped_at: Option<DateTime<Utc>>,
+    /// "Let pando try on its own", so the ready view can say whose guess
+    /// the settings were.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tried_by_pando_at: Option<DateTime<Utc>>,
+    /// The CLI's first-time tip, which prints once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tip_shown_at: Option<DateTime<Utc>>,
+}
+
+impl SetupMemory {
+    /// The project's memory; nothing remembered when there is no readable
+    /// file.
+    pub fn load(paths: &PandoPaths) -> Self {
+        read_json(&paths.setup_file()).unwrap_or_default()
+    }
+
+    pub fn save(&self, paths: &PandoPaths) -> Result<()> {
+        write_json(&paths.setup_file(), self)
+    }
+}
+
+fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let json = serde_json::to_string_pretty(value)
+        .with_context(|| format!("serialize {}", path.display()))?;
+    std::fs::write(&tmp, json).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("rename tmp → {}", path.display()))?;
+    Ok(())
+}
