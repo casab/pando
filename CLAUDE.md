@@ -157,6 +157,12 @@ database, a prod schema dump, and cookie auth."
   (`plans/open-follow-ups.md`); under a parallel build they fail for
   reasons that have nothing to do with the change. Rerun a readiness or
   timeout failure alone before concluding anything.
+- The files in `tests/` are modules of one test binary,
+  `tests/integration.rs`: a new file there is a `mod` line in it, and one
+  file's tests run with `cargo test --test integration <file>::`.
+  A test that waits out a production timeout shortens it the way
+  `services::with_probe_timeout` does, rather than adding seconds to
+  every run.
 - Beyond those read-only uses, the maintainer's own repositories are off
   limits to pando sessions, which has a consequence worth stating plainly:
   **the fixture corpus is the main validation pando gets.** A corpus of tidy shapes therefore proves very
