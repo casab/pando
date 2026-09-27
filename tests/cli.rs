@@ -2724,6 +2724,36 @@ fn contents(dir: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Option
     out
 }
 
+// What `contents` takes in includes `.git`, which holds still between two
+// looks only while no git goes on working there after returning. git's
+// automatic maintenance does just that, so it is off: for every git this
+// binary starts, at the command scope, which no config file overrides; and
+// in a fixture origin's own config, since the receive-pack a push starts
+// there is given nothing from the environment.
+#[test]
+fn no_git_started_here_runs_automatic_maintenance() {
+    let dir = TempDir::new().unwrap();
+    let fixture = build_with_origin(Kind::Plain, dir.path());
+    let setting = |repo: &Path, args: &[&str]| {
+        let out = common::git_raw(repo, args);
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    assert_eq!(
+        setting(
+            &fixture.root,
+            &["config", "--show-scope", "--get", "maintenance.auto"]
+        ),
+        "command\tfalse\n"
+    );
+    assert_eq!(
+        setting(
+            fixture.remote.as_deref().unwrap(),
+            &["config", "--local", "--get", "maintenance.auto"]
+        ),
+        "false\n"
+    );
+}
+
 /// What an agent's shell is trusted to show whole. Claude Code's cuts
 /// output at about 30,000 characters, and the job is meant to be read
 /// in one go beside everything else the agent has.

@@ -22,6 +22,7 @@ const FIXTURE_IDENTITY: [&str; 10] = [
 ];
 
 pub fn git(cwd: &Path, args: &[&str]) {
+    no_auto_maintenance();
     let out = Command::new("git")
         .args(FIXTURE_IDENTITY)
         .current_dir(cwd)
@@ -36,6 +37,53 @@ pub fn git(cwd: &Path, args: &[&str]) {
         cwd.display(),
         String::from_utf8_lossy(&out.stderr).trim()
     );
+}
+
+/// Turns git's automatic maintenance off for every git this test binary
+/// starts — the fixtures', the library's, and any a process it runs
+/// starts — once, before its first fixture: every fixture repository is
+/// made through [`git`], which calls this.
+///
+/// A commit, a merge, a rebase or a fetch ends by starting `git maintenance
+/// run --auto`, as does the receive-pack a push starts in the repository
+/// it pushes to, unless `maintenance.auto` is false. Since git 2.47 that
+/// run detaches, and since 2.55 its detached half holds
+/// `.git/objects/maintenance.lock` until it is done, so a repository goes
+/// on changing after the command that changed it has returned, and the
+/// detached half can outlive the test that started it. No test here is
+/// about git's housekeeping.
+///
+/// In the environment rather than in a config file: git reads
+/// `GIT_CONFIG_COUNT` pairs (2.31 and later) as it reads `-c`, over every
+/// config file, so neither the developer's own config nor a repository's
+/// turns it back on, and every child inherits them. Added after any pairs
+/// the environment already had. The one git they do not reach is the
+/// `receive-pack` a push starts in a bare origin, because git clears them
+/// for a command it runs in another repository, so a test's origin turns
+/// maintenance off in its own config.
+///
+/// The tests here otherwise leave the process environment alone (see
+/// [`fake_cloudflared`]). This is set once, before any fixture repository
+/// exists, and to the same value for every test, so unlike a PATH one test
+/// sets for itself there is nothing for two tests to disagree about.
+pub fn no_auto_maintenance() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let n: usize = std::env::var("GIT_CONFIG_COUNT")
+            .ok()
+            .and_then(|count| count.parse().ok())
+            .unwrap_or(0);
+        // SAFETY: std's own environment lock orders these with every other
+        // std::env read and with Command's spawn, and nothing in these
+        // tests reads the environment through libc behind std's back. The
+        // pair goes in before the count that reaches it, so a git spawned
+        // in between never reads a count past its pairs.
+        unsafe {
+            std::env::set_var(format!("GIT_CONFIG_KEY_{n}"), "maintenance.auto");
+            std::env::set_var(format!("GIT_CONFIG_VALUE_{n}"), "false");
+            std::env::set_var("GIT_CONFIG_COUNT", (n + 1).to_string());
+        }
+    });
 }
 
 /// The HOME every login shell pando starts under test is given: empty, and

@@ -46,6 +46,7 @@ pub fn git(cwd: &Path, args: &[&str]) {
 
 pub fn git_raw(cwd: &Path, args: &[&str]) -> std::process::Output {
     hermetic_home();
+    no_auto_maintenance();
     Command::new("git")
         .args(FIXTURE_IDENTITY)
         .current_dir(cwd)
@@ -74,6 +75,48 @@ pub fn hermetic_home() {
         // std::env read and with Command's spawn, and nothing in these
         // tests reads the environment through libc behind std's back.
         unsafe { std::env::set_var("HOME", &home) };
+    });
+}
+
+/// Turns git's automatic maintenance off for every git this test binary
+/// starts — the fixtures', pando's, and any a process pando runs starts —
+/// once, before its first fixture: every fixture is made through
+/// [`git_raw`], which calls this.
+///
+/// A commit, a merge, a rebase or a fetch ends by starting `git maintenance
+/// run --auto`, as does the receive-pack a push starts in the repository
+/// it pushes to, unless `maintenance.auto` is false. Since git 2.47 that
+/// run detaches, and since 2.55 its detached half holds
+/// `.git/objects/maintenance.lock` until it is done, so a repository goes
+/// on changing after the command that changed it has returned. The two
+/// `init --agent` tests in `cli.rs` that compare `.git` before and after
+/// failed on it on CI: the lock of the fixture's own commit was there for
+/// the first look and gone by the second. No test here is about git's
+/// housekeeping.
+///
+/// In the environment rather than in a config file: git reads
+/// `GIT_CONFIG_COUNT` pairs (2.31 and later) as it reads `-c`, over every
+/// config file, so no system, global or repository setting turns it back
+/// on, and every child inherits them. Added after any pairs the
+/// environment already had. The one git they do not reach is the
+/// `receive-pack` a push starts in a bare origin, because git clears them
+/// for a command it runs in another repository; [`build_with_origin`] turns
+/// maintenance off in the origin's own config.
+pub fn no_auto_maintenance() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let n: usize = std::env::var("GIT_CONFIG_COUNT")
+            .ok()
+            .and_then(|count| count.parse().ok())
+            .unwrap_or(0);
+        // SAFETY: as for HOME above. The pair goes in before the count
+        // that reaches it, so a git spawned in between never reads a count
+        // past its pairs.
+        unsafe {
+            std::env::set_var(format!("GIT_CONFIG_KEY_{n}"), "maintenance.auto");
+            std::env::set_var(format!("GIT_CONFIG_VALUE_{n}"), "false");
+            std::env::set_var("GIT_CONFIG_COUNT", (n + 1).to_string());
+        }
     });
 }
 
@@ -659,6 +702,9 @@ pub fn build_with_origin(kind: Kind, parent: &Path) -> Fixture {
             bare.to_str().unwrap(),
         ],
     );
+    // A push's receive-pack gets no config from the environment: see
+    // `no_auto_maintenance`.
+    git(&bare, &["config", "maintenance.auto", "false"]);
     let seed = build(kind, &parent.join("seed"));
     git(
         &seed.root,

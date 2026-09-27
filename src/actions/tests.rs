@@ -7441,6 +7441,9 @@ fn fixture_with_origin(remote_branches: &[&str]) -> Fx {
             bare.to_str().unwrap(),
         ],
     );
+    // A push's receive-pack gets no config from the environment: see
+    // `testutil::no_auto_maintenance`.
+    git(&bare, &["config", "maintenance.auto", "false"]);
     let seed = dir.path().join("seed");
     git(
         dir.path(),
