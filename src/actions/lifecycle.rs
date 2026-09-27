@@ -130,6 +130,11 @@ impl StartReport {
     pub fn started_nothing(&self) -> bool {
         self.started.is_empty()
     }
+
+    /// The names of the processes this call spawned.
+    pub fn spawned(&self) -> Vec<String> {
+        self.started.iter().map(|p| p.process.clone()).collect()
+    }
 }
 
 /// The names of a list of processes, for a message.

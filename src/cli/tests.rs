@@ -216,7 +216,7 @@ fn a_wait_tells_what_its_refresh_forgot() {
 
     let said = std::cell::RefCell::new(Vec::new());
     let named = super::names::target_named(&fx.paths, Some("feat/one"), "start").unwrap();
-    super::wait::wait_ready(&fx.paths, &named, None, &|line| {
+    super::wait::wait_ready(&fx.paths, &named, None, &[], &|line| {
         said.borrow_mut().push(line.to_string())
     })
     .unwrap();
@@ -225,6 +225,41 @@ fn a_wait_tells_what_its_refresh_forgot() {
         said.iter().any(|l| l.contains("its mariadb exited")),
         "{said:?}"
     );
+}
+
+// A server that bound its port while the wait's first scan was still
+// running was never seen starting, so `start --wait` printed "starting
+// dev", returned 0 and never said dev was ready. On a loaded machine that
+// is the common case. What the command itself spawned is news however
+// fast it came up; only what was running before it is not.
+#[test]
+fn a_wait_says_a_process_it_spawned_is_ready_even_when_the_first_look_finds_it_ready() {
+    let fx = fixture();
+    let name = actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
+    let mut store = crate::state::load(&fx.paths.state_file()).unwrap();
+    let record = store.worktrees.get_mut(&name).unwrap();
+    // Already Running when the wait first looks, as a server that bound
+    // before the scan finished is.
+    let mut dev = listening(std::process::id() as i32, &[]);
+    dev.ready_port = Some(17_342);
+    record.processes.insert("dev".to_string(), dev);
+    crate::state::save(&fx.paths.state_file(), &store).unwrap();
+    let named = super::names::target_named(&fx.paths, Some("feat/one"), "start").unwrap();
+
+    let said = std::cell::RefCell::new(Vec::new());
+    let note = |line: &str| said.borrow_mut().push(line.to_string());
+    super::wait::wait_ready(&fx.paths, &named, None, &["dev".to_string()], &note).unwrap();
+    assert!(
+        said.borrow().iter().any(|l| l.starts_with("dev is ready")),
+        "{:?}",
+        said.borrow()
+    );
+
+    // The same worktree, when this command spawned nothing: dev was up
+    // before it, and there is nothing new to say.
+    said.borrow_mut().clear();
+    super::wait::wait_ready(&fx.paths, &named, None, &[], &note).unwrap();
+    assert!(said.borrow().is_empty(), "{:?}", said.borrow());
 }
 
 // A refresh that read the state and could not save what it changed was
@@ -267,7 +302,7 @@ fn a_refresh_that_only_failed_to_save_still_answers_about_the_worktree() {
         format!("{err:#}"),
         "feat/two is not running — `pando start feat/two` starts it"
     );
-    let err = super::wait::wait_ready(&fx.paths, &named, None, &quiet).unwrap_err();
+    let err = super::wait::wait_ready(&fx.paths, &named, None, &[], &quiet).unwrap_err();
     assert_eq!(
         format!("{err:#}"),
         "feat/two has nothing running — it stopped while pando waited"

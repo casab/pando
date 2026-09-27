@@ -544,26 +544,40 @@ pub fn assign_with(
     // A port this worktree's own live process is holding is free *for the
     // role it already has*, and for no other. A shared worktree switching
     // to isolated grows service roles, so the fast path above is skipped —
-    // but roles are processes first, so the same base gives the processes
-    // the same numbers, and the server kept serving through the switch
-    // keeps its URL. Only for the same role: under any other, a kept port
-    // still has to pass the probe, so a service is never handed a port a
-    // live process is on. One that was kept but is not held any more (a
-    // stopped container's) is simply free.
-    let window = reserve_window(base, roles.len(), |window| {
+    // but roles are processes first, so the same window gives the
+    // processes the same numbers, and the server kept serving through the
+    // switch keeps its URL. Only for the same role: under any other, a
+    // kept port still has to pass the probe, so a service is never handed
+    // a port a live process is on. One that was kept but is not held any
+    // more (a stopped container's) is simply free.
+    let fits = |window: &[u16]| {
         roles.iter().zip(window).all(|(role, &port)| {
             let own = keep.contains(&port) && previous.get(role) == Some(&port);
             (own || is_free(port))
                 && !taken_by_others.contains(&port)
                 && own_share_port != Some(port)
         })
-    })
-    .with_context(|| {
-        format!(
-            "no free run of {} ports for {name} in {PORT_MIN}..={PORT_MAX}",
-            roles.len()
-        )
-    })?;
+    };
+    // The window this worktree already has comes first, and the hash's
+    // base only after it. A worktree whose base was taken when it was
+    // first given ports sits a base or more along, and re-deriving from
+    // the base moved it back the moment the base came free: a switch
+    // between isolated and shared changed the URL of an application whose
+    // port nobody had taken.
+    let own_window = previous
+        .values()
+        .min()
+        .and_then(|&start| window_at(align_to_grid(start), roles.len()))
+        .filter(|window| fits(window));
+    let window = match own_window {
+        Some(window) => window,
+        None => reserve_window(base, roles.len(), fits).with_context(|| {
+            format!(
+                "no free run of {} ports for {name} in {PORT_MIN}..={PORT_MAX}",
+                roles.len()
+            )
+        })?,
+    };
 
     let ports: BTreeMap<String, u16> = roles.iter().cloned().zip(window).collect();
     // Only a role that still exists and really changed number. The reuse
@@ -1460,6 +1474,67 @@ mod tests {
         )
         .unwrap();
         assert!(!moved.ports.values().any(|&p| p == web));
+    }
+
+    // A worktree whose base was taken when it was first given ports sits
+    // a base along. A change of roles — isolated to shared, and back —
+    // re-derived its window from the base, so once the base was free again
+    // the web port moved back to it: `start --shared` changed the URL of
+    // an application whose port nobody had taken.
+    #[test]
+    fn a_change_of_roles_keeps_the_window_the_worktree_already_has() {
+        let (_dir, paths) = assign_fixture();
+        let mut store = crate::state::State::new();
+        with_record(&mut store, "feat+one");
+        let base = derive_base(paths.project_id(), "feat+one");
+        let isolated = assign_with(
+            &paths,
+            &mut store,
+            "feat+one",
+            &roles(&["web", "postgres", "redis"]),
+            &[],
+            move |port| port != base,
+        )
+        .unwrap();
+        let web = isolated.ports["web"];
+        assert_ne!(web, base, "the base was taken, so the worktree sits along");
+
+        let shared = assign_with(
+            &paths,
+            &mut store,
+            "feat+one",
+            &roles(&["web"]),
+            &[],
+            all_free,
+        )
+        .unwrap();
+        assert_eq!(shared.ports["web"], web, "the URL stays where it was");
+        assert!(!shared.reassigned);
+
+        let again = assign_with(
+            &paths,
+            &mut store,
+            "feat+one",
+            &roles(&["web", "postgres", "redis"]),
+            &[],
+            all_free,
+        )
+        .unwrap();
+        assert_eq!(again.ports, isolated.ports, "and back again");
+        assert!(!again.reassigned);
+
+        // Its own window taken, the base's is next, as it always was.
+        let moved = assign_with(
+            &paths,
+            &mut store,
+            "feat+one",
+            &roles(&["web"]),
+            &[],
+            move |port| port != web,
+        )
+        .unwrap();
+        assert_eq!(moved.ports["web"], base);
+        assert!(moved.reassigned);
     }
 
     #[test]

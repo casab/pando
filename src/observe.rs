@@ -14,9 +14,10 @@
 //! must never fail a command.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::io::Read;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{Mutex, MutexGuard, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -502,10 +503,27 @@ fn run_capturing(cmd: Command, timeout: Duration) -> Option<String> {
     run_capturing_status(cmd, timeout).map(|(_, text)| text)
 }
 
+/// The programs a scan killed at its deadline that have not exited yet.
+///
+/// A killed child exits only once it is back out of the kernel, and `ps`
+/// on a machine deep in swap, or `lsof` on a hung network mount, can stay
+/// in there for minutes. A second copy started meanwhile gets stuck the
+/// same way. So while one lingers, the next is not started, and the scan
+/// is one that could not run, answered at once.
+static LINGERING: Mutex<BTreeSet<OsString>> = Mutex::new(BTreeSet::new());
+
+fn lingering() -> MutexGuard<'static, BTreeSet<OsString>> {
+    LINGERING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// [`run_capturing`], with whether the command exited successfully. Its
 /// output is decoded leniently: a stray invalid byte in one line used to
 /// cost the whole listing, which `read_to_string` then leaves empty.
 fn run_capturing_status(mut cmd: Command, timeout: Duration) -> Option<(bool, String)> {
+    let program = cmd.get_program().to_os_string();
+    if lingering().contains(&program) {
+        return None;
+    }
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -521,14 +539,24 @@ fn run_capturing_status(mut cmd: Command, timeout: Duration) -> Option<(bool, St
         let _ = stdout.read_to_end(&mut buf);
         let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
     });
-    let text = rx.recv_timeout(timeout).ok();
-    if text.is_none() {
+    let Ok(text) = rx.recv_timeout(timeout) else {
+        // Killed, and reaped on a thread of its own rather than here. The
+        // kill lands only when the child gets back out of the kernel, and
+        // the pipe closes only when every process holding it has exited;
+        // waiting for either made the deadline a suggestion, and on a machine
+        // deep in swap `start --wait` sat on one `ps` for minutes.
         let _ = child.kill();
-    }
+        lingering().insert(program.clone());
+        thread::spawn(move || {
+            let _ = child.wait();
+            let _ = reader.join();
+            lingering().remove(&program);
+        });
+        return None;
+    };
     let status = child.wait();
     let _ = reader.join();
-    let succeeded = status.is_ok_and(|s| s.success());
-    text.map(|text| (succeeded, text))
+    Some((status.is_ok_and(|s| s.success()), text))
 }
 
 #[cfg(test)]
@@ -928,6 +956,86 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "a scan must not outlive its deadline"
+        );
+    }
+
+    // A killed child that could not be reaped at once held the scan until
+    // it could: the wait for it, and for its output to close, came after
+    // the kill. On a machine deep in swap `ps` took minutes to die, and so
+    // did `start --wait`. Here a child of the scan's own child holds the
+    // output open until the test lets it go, which is the same wait.
+    #[test]
+    fn a_scan_whose_child_lingers_after_the_kill_still_ends_at_its_deadline() {
+        let dir = tempdir().unwrap();
+        let release = dir.path().join("release");
+        let open = dir.path().join("open");
+        std::fs::write(&open, "").unwrap();
+        let held = dir.path().join("held");
+        // A program no other test runs: what lingers is kept per program.
+        // Given a path that exists, it answers at once; otherwise a child
+        // of its own holds its output open until that path appears.
+        let script = dir.path().join("lingering-scan");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n[ -e \"$1\" ] && { echo done; exit 0; }\n\
+             (echo held > \"$2\"; while [ ! -e \"$1\" ]; do sleep 0.05; done) &\n\
+             exec sleep 30\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let scan = |gate: &std::path::Path, deadline: Duration| {
+            let mut cmd = Command::new(&script);
+            cmd.arg(gate).arg(&held);
+            run_capturing(cmd, deadline)
+        };
+        let holding = || held.exists();
+        let lingers = || lingering().contains(script.as_os_str());
+
+        thread::scope(|s| {
+            // On a thread, so that the bug fails this test instead of
+            // hanging it: the scan answers at its deadline or not at all.
+            let (tx, rx) = mpsc::channel();
+            let gate = release.as_path();
+            s.spawn(move || {
+                loop {
+                    let answer = scan(gate, Duration::from_millis(200));
+                    // The kill can land before the shell has forked the
+                    // child that holds the output. A run like that holds
+                    // nothing and proves nothing, so the scan runs again.
+                    crate::testutil::wait_until(Duration::from_secs(30), || {
+                        holding() || !lingers()
+                    });
+                    let held = holding();
+                    let _ = tx.send((answer, held));
+                    if held {
+                        return;
+                    }
+                }
+            });
+            let answered = loop {
+                match rx.recv_timeout(Duration::from_secs(60)) {
+                    Ok((answer, true)) => break Ok(answer),
+                    Ok((_, false)) => continue,
+                    Err(e) => break Err(e),
+                }
+            };
+            // While the first is still there, a second is not started: had
+            // it been, it would have answered "done".
+            let again = scan(&open, Duration::from_secs(30));
+            std::fs::write(&release, "").unwrap();
+            assert_eq!(answered, Ok(None), "a scan must not outlive its deadline");
+            assert_eq!(again, None, "nothing runs beside a scan still lingering");
+        });
+
+        // Once the first has gone, the program runs again.
+        assert!(
+            crate::testutil::wait_until(Duration::from_secs(30), || !lingers()),
+            "the lingering child was reaped once it let go"
+        );
+        assert_eq!(
+            scan(&open, Duration::from_secs(30)).as_deref(),
+            Some("done\n")
         );
     }
 }

@@ -710,7 +710,7 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             }
             let wait = waits(wait, no_wait);
             if wait {
-                wait::wait_ready(paths, &named, only.as_deref(), &notice)?;
+                wait::wait_ready(paths, &named, only.as_deref(), &report.spawned(), &notice)?;
             }
             let url = url_suffix(report.url.as_deref());
             if report.started_nothing() {
@@ -869,7 +869,7 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             let report = actions::restart(paths, config, &name, only.as_deref(), mode, &notice)
                 .map_err(|e| with_a_way_past(paths, named.reword(e)))?;
             if waits(wait, no_wait) {
-                wait::wait_ready(paths, &named, only.as_deref(), &notice)?;
+                wait::wait_ready(paths, &named, only.as_deref(), &report.spawned(), &notice)?;
             }
             writeln!(out, "restarted {name}{}", url_suffix(report.url.as_deref()))?;
             Ok(())

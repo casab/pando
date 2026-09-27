@@ -20,12 +20,16 @@ const POLL: Duration = Duration::from_millis(250);
 /// there. Fails — exit 1 — as soon as one of them fails, with its reason,
 /// the closing lines of its log, and where the rest is.
 ///
+/// `spawned` are the processes the command that waits has just started.
+/// Each is said to be ready once it is, however quickly it got there.
+///
 /// Messages name the worktree as a person knows it, and the commands they
 /// suggest spell it as it was typed.
 pub(super) fn wait_ready(
     paths: &PandoPaths,
     named: &Named,
     only: Option<&str>,
+    spawned: &[String],
     notice: &dyn Fn(&str),
 ) -> Result<()> {
     let Named {
@@ -71,9 +75,13 @@ pub(super) fn wait_ready(
             let Some(line) = ready_line(process, p, now, began.elapsed()) else {
                 continue;
             };
-            // Only a process this wait watched come up is narrated: one
-            // that was already running says nothing new.
-            if announced.insert(process.clone()) && said_waiting {
+            // A process this wait watched come up is narrated, and so is
+            // one this command spawned that was up by the first look: a
+            // server that binds its port while the first scan is still
+            // running is never seen starting, which on a loaded machine
+            // is common. Only one that was already running before this
+            // command says nothing new.
+            if announced.insert(process.clone()) && (said_waiting || spawned.contains(process)) {
                 notice(&line);
             }
         }
