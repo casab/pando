@@ -60,7 +60,12 @@ password_env = "MYSQL_PWD"
 ping = "mariadb --protocol=tcp -h {host} -P {port} -u {user} -N -B -e 'SELECT 1'"
 exists = "mariadb --protocol=tcp -h {host} -P {port} -u {user} -N -B -e \"SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = '{namespace}'\""
 list = "mariadb --protocol=tcp -h {host} -P {port} -u {user} -N -B -e \"SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME LIKE '{prefix_like}'\""
-create = "mariadb --protocol=tcp -h {host} -P {port} -u {user} -e 'CREATE DATABASE `{namespace}`'"
+# Made in main's shape: its default character set and collation, read
+# from information_schema and put in the CREATE through a prepared
+# statement. A schema written for main runs into it as it runs into main;
+# under a wider server default its keys can pass the 3072-byte limit
+# (error 1071). Where main cannot be seen, the server's default.
+create = """mariadb --protocol=tcp -h {host} -P {port} -u {user} -e "SET @ddl = COALESCE((SELECT CONCAT('CREATE DATABASE \\`{namespace}\\` CHARACTER SET ', DEFAULT_CHARACTER_SET_NAME, ' COLLATE ', DEFAULT_COLLATION_NAME) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = '{main}'), 'CREATE DATABASE \\`{namespace}\\`'); PREPARE pando_create FROM @ddl; EXECUTE pando_create; DEALLOCATE PREPARE pando_create""""
 drop = "mariadb --protocol=tcp -h {host} -P {port} -u {user} -e 'DROP DATABASE IF EXISTS `{namespace}`'"
 denied = ["ERROR 1044"]
 account = "mariadb --protocol=tcp -h {host} -P {port} -u {user} -N -B -e 'SELECT CURRENT_USER()'"

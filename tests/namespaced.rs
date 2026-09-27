@@ -241,6 +241,56 @@ fn a_real_mariadb_makes_a_worktrees_database_once_the_printed_grant_is_run() {
     );
 }
 
+// A worktree's database is made in main's shape. A schema written for
+// main's character set — here utf8mb3, where a primary key on 1024
+// characters is exactly the 3072-byte limit — was run into a database made in the
+// server's wider default, where the same index is 4096 bytes and the
+// schema step died on error 1071.
+#[test]
+fn a_real_mariadb_makes_a_worktrees_database_in_mains_character_set() {
+    if skip(&["mariadb-install-db", "mariadbd", "mariadb"]) {
+        return;
+    }
+    let db = mariadb();
+    root_sql(
+        &db,
+        "ALTER DATABASE shop CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci; \
+         GRANT ALL ON `shop\\_\\_%`.* TO 'app'@'localhost';",
+    )
+    .unwrap();
+    const SCHEMA: &str = "CREATE TABLE t (k VARCHAR(1024) NOT NULL, PRIMARY KEY (k))";
+    // What the server's default would have done with that schema: the
+    // failure this test is about, so the test proves something.
+    root_sql(&db, "CREATE DATABASE plain_default").unwrap();
+    let default = root_sql(&db, &format!("USE plain_default; {SCHEMA}")).unwrap_err();
+    assert!(default.contains("1071"), "{default}");
+
+    let recipe = recipe("mariadb");
+    let bin = db.dir.path().join("bin");
+    let server = app_server(&recipe, &db, &bin);
+    assert_eq!(
+        server.create("shop__feat_x", "shop").unwrap(),
+        Created::Made
+    );
+    let shape = "SELECT DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME \
+                 FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ";
+    assert_eq!(
+        root_sql(&db, &format!("{shape}'shop__feat_x'")).unwrap(),
+        root_sql(&db, &format!("{shape}'shop'")).unwrap(),
+        "made in main's shape"
+    );
+    root_sql(&db, &format!("USE shop__feat_x; {SCHEMA}"))
+        .expect("main's schema runs into the worktree's database");
+
+    // A main pando cannot see — here, one that is not there — leaves the
+    // server's default, and the database is still made.
+    assert_eq!(
+        server.create("shop__feat_y", "not_there").unwrap(),
+        Created::Made
+    );
+    assert!(server.exists("shop__feat_y").unwrap());
+}
+
 // ---- Redis --------------------------------------------------------------------
 
 const REDIS_PASSWORD: &str = "redis p@ss";

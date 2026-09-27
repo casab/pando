@@ -821,6 +821,14 @@ fn a_database_is_made_found_and_dropped_with_the_password_in_the_environment_alo
     let argv = fake.read("argv");
     assert!(argv.contains("-h localhost -P 3306 -u app"), "{argv}");
     assert!(argv.contains("CREATE DATABASE `shop__feat_x`"), "{argv}");
+    // Made in main's shape: its character set and collation, looked up by
+    // its name.
+    assert!(
+        argv.contains("WHERE SCHEMA_NAME = 'shop'")
+            && argv.contains("CHARACTER SET ', DEFAULT_CHARACTER_SET_NAME")
+            && argv.contains("' COLLATE ', DEFAULT_COLLATION_NAME"),
+        "{argv}"
+    );
     assert!(
         !argv.contains("hunter2"),
         "the password reached the client's arguments: {argv}"
@@ -830,7 +838,6 @@ fn a_database_is_made_found_and_dropped_with_the_password_in_the_environment_alo
     for command in [
         Some(recipe.ping.as_str()),
         recipe.exists.as_deref(),
-        recipe.create.as_deref(),
         Some(recipe.drop.as_str()),
         recipe.account.as_deref(),
     ]
@@ -841,6 +848,9 @@ fn a_database_is_made_found_and_dropped_with_the_password_in_the_environment_alo
         assert!(script.contains("mariadb"), "{script}");
         assert!(!script.contains("hunter2"), "{script}");
     }
+    let create = db.create_script("shop__feat_x", "shop").unwrap();
+    assert!(create.contains("mariadb"), "{create}");
+    assert!(!create.contains("hunter2"), "{create}");
     let env = fake.read("env");
     assert!(env.lines().all(|line| line == PASSWORD), "{env}");
 }
@@ -1048,4 +1058,17 @@ fn a_prefix_is_an_sql_pattern_matching_only_itself_and_what_follows() {
     );
     assert_eq!(prefix_like("a%b"), "a\\%b\\_\\_%");
     assert_eq!(prefix_like("shop"), "shop\\_\\_%");
+}
+
+// A main database whose name is not plain is not put in a command: the
+// lookup of its shape finds nothing, and the server's default is used.
+#[test]
+fn a_main_that_is_not_a_plain_name_stays_out_of_the_create() {
+    let fake = FakeClient::new("mariadb", "MYSQL_PWD", FAKE_MARIADB);
+    let recipe = recipe_namespace("mariadb");
+    let db = server(&recipe, &fake, "mariadb");
+    assert_eq!(db.create("shop__feat_x", "sh'op").unwrap(), Created::Made);
+    let argv = fake.read("argv");
+    assert!(argv.contains("WHERE SCHEMA_NAME = ''"), "{argv}");
+    assert!(!argv.contains("sh'op"), "{argv}");
 }

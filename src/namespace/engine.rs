@@ -133,9 +133,17 @@ impl Server<'_> {
     /// A server that already has it did not make it for pando, which is
     /// [`Created::AlreadyThere`] and not an error. A login that may not is
     /// an error carrying the grant that lets it — and nothing was made.
+    ///
+    /// `{main}` in the recipe's command is the main database's name, so
+    /// the new one can be made in its shape: a schema written for main's
+    /// character set is run into this one, and under a wider default its
+    /// keys can outgrow the server's limit. A main that is not a plain
+    /// name is not put in a command; the recipe then falls back on the
+    /// server's default, as it does when it cannot see main.
     pub fn create(&self, name: &str, main: &str) -> Result<Created> {
-        let command = self.command(self.recipe.create.as_deref(), "create")?;
-        let out = self.run(command, Some(name))?;
+        let script = self.create_script(name, main)?;
+        let env = self.login.env(self.recipe.password_env.as_deref());
+        let out = proc::run_captured(&script, &std::env::temp_dir(), &env, TIMEOUT)?;
         if out.success() {
             return Ok(Created::Made);
         }
@@ -360,6 +368,7 @@ impl Server<'_> {
             port: Some(self.port.to_string()),
             user: self.login.user.as_deref().map(shell_quote),
             namespace: namespace.map(str::to_string),
+            main: None,
             prefix_like: None,
             account_user: None,
             account_host: None,
@@ -393,6 +402,21 @@ impl Server<'_> {
         let env = self.login.env(self.recipe.password_env.as_deref());
         proc::run_captured(&script, &std::env::temp_dir(), &env, TIMEOUT)
     }
+
+    /// [`Self::script`] for the recipe's `create` of `name`, whose `{main}`
+    /// is the main database's name — or nothing, for one that is not a
+    /// plain name.
+    pub fn create_script(&self, name: &str, main: &str) -> Result<String> {
+        let command = self.command(self.recipe.create.as_deref(), "create")?;
+        if !is_plain(name) {
+            bail!("{name:?} is not a plain name, so pando will not put it in a command");
+        }
+        let vars = Vars {
+            main: Some(if is_plain(main) { main } else { "" }.to_string()),
+            ..self.vars(Some(name))
+        };
+        Ok(self.with_path(&template::render_with(command, &vars)?))
+    }
 }
 
 /// The prefix every namespace of `main` starts with, as an SQL `LIKE`
@@ -415,16 +439,19 @@ struct Vars {
     port: Option<String>,
     user: Option<String>,
     namespace: Option<String>,
+    /// The main database's name, in `create` alone.
+    main: Option<String>,
     prefix_like: Option<String>,
     account_user: Option<String>,
     account_host: Option<String>,
 }
 
-const KNOWN: [&str; 7] = [
+const KNOWN: [&str; 8] = [
     "host",
     "port",
     "user",
     "namespace",
+    "main",
     "prefix_like",
     "account_user",
     "account_host",
@@ -440,6 +467,7 @@ impl template::Resolver for Vars {
             "port" => &self.port,
             "user" => &self.user,
             "namespace" => &self.namespace,
+            "main" => &self.main,
             "prefix_like" => &self.prefix_like,
             "account_user" => &self.account_user,
             "account_host" => &self.account_host,
