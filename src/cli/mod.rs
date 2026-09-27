@@ -11,6 +11,7 @@ use std::io::Write;
 
 mod agent;
 mod answers;
+mod art;
 mod check;
 mod completion;
 mod doctor;
@@ -615,7 +616,7 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
     let mut out = Stdout;
     match command {
         Command::New { branch, base, yes } => {
-            tip::first_time_tip(paths, config, stderr_is_terminal(), &notice);
+            tip::first_time_tip(paths, config, stderr_is_terminal(), &notice, &draw);
             let config = &actions::resolve_for_new(paths, config, &everyday_asker(yes), &notice)?;
             let name = actions::new(paths, config, &branch, base.as_deref(), &notice)
                 .map_err(|e| with_a_way_past(paths, e))?;
@@ -671,7 +672,7 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
                 .map_err(|e| with_a_way_past(paths, named.reword(e)))?;
             // After the refusals, which say nothing unless the start is
             // not going to happen, and before the first question.
-            tip::first_time_tip(paths, config, stderr_is_terminal(), &notice);
+            tip::first_time_tip(paths, config, stderr_is_terminal(), &notice, &draw);
             let config = &actions::resolve_for_start(
                 paths,
                 config,
@@ -1004,6 +1005,11 @@ fn with_a_way_past(paths: &PandoPaths, e: anyhow::Error) -> anyhow::Error {
         return anyhow::anyhow!(fixed);
     }
     e
+}
+
+/// A line of a picture on stderr, as it is: no `pando:` in front.
+fn draw(line: &str) {
+    to_stderr(&format!("{line}\n"));
 }
 
 /// Everything pando narrates goes to stderr, so a command's stdout stays

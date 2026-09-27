@@ -29,11 +29,17 @@ pub(super) fn check<W: Write>(
         std::env::var(actions::CHECK_RAN_BY_ENV).ok().as_deref(),
         terminal,
     );
-    let step = |line: &str| super::notice(line);
+    // The step last said: the start under the check narrates its own
+    // "starting dev", and said twice in a row it reads as a stutter.
+    let last_step = std::cell::RefCell::new(String::new());
+    let step = |line: &str| {
+        super::notice(line);
+        *last_step.borrow_mut() = line.to_string();
+    };
     // What the commands under the check say is for a person watching it
     // happen: a program reads the steps, and the result.
     let detail = |line: &str| {
-        if terminal {
+        if terminal && *last_step.borrow() != line {
             let style = crate::term::Style::for_stderr();
             let line = style.paint(&format!("pando: {line}"), crate::term::Paint::Faint);
             super::to_stderr(&format!("{line}\n"));
@@ -64,10 +70,28 @@ pub(super) fn check<W: Write>(
     match &record.outcome {
         CheckOutcome::Passed => {
             if !json {
+                // A person watching sees the grove come alive — the
+                // setup screen's picture, turned green — and the line in
+                // colour. A program reads the same line, plain.
+                if terminal {
+                    for line in super::art::grove_lines(
+                        super::art::stderr_columns(),
+                        crate::grove::seed_of(&paths.project.id),
+                        true,
+                        &crate::term::Style::for_stderr(),
+                    ) {
+                        super::draw(&line);
+                    }
+                }
+                let style = crate::term::Style::for_stdout();
                 writeln!(
                     out,
-                    "✓ {} is ready: `pando` opens it",
-                    paths.project.display_name
+                    "{} {}",
+                    style.paint("✓", crate::term::Paint::Good),
+                    style.paint(
+                        &format!("{} is ready: `pando` opens it", paths.project.display_name),
+                        crate::term::Paint::Heading
+                    )
                 )?;
             }
             Ok(())

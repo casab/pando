@@ -3878,11 +3878,76 @@ fn init_agent_runs_on_a_config_pando_cannot_read() {
 
 /// What the first-time tip said, line by line, and whether it said it.
 fn tip_lines(fx: &Fx, config: &Config, terminal: bool) -> (bool, Vec<String>) {
+    let (shown, said, _) = tip_with_picture(fx, config, terminal);
+    (shown, said)
+}
+
+/// The tip's lines, and the picture drawn above them.
+fn tip_with_picture(fx: &Fx, config: &Config, terminal: bool) -> (bool, Vec<String>, Vec<String>) {
     let said = std::cell::RefCell::new(Vec::new());
-    let shown = super::tip::first_time_tip(&fx.paths, config, terminal, &|line: &str| {
-        said.borrow_mut().push(line.to_string())
-    });
-    (shown, said.into_inner())
+    let drawn = std::cell::RefCell::new(Vec::new());
+    let shown = super::tip::first_time_tip(
+        &fx.paths,
+        config,
+        terminal,
+        &|line: &str| said.borrow_mut().push(line.to_string()),
+        &|line: &str| drawn.borrow_mut().push(line.to_string()),
+    );
+    (shown, said.into_inner(), drawn.into_inner())
+}
+
+// The CLI's grove is the TUI's in sixteen colours: gold leaves while the
+// setup waits, green ones once a check passed, plain text with colour
+// off, and nothing on a terminal too narrow for it.
+#[test]
+fn the_cli_grove_is_painted_for_its_moment() {
+    let seed = crate::grove::seed_of("acme-shop");
+    let colour = crate::term::Style::with(true, None);
+    let waiting = super::art::grove_lines(80, seed, false, &colour).concat();
+    let alive = super::art::grove_lines(80, seed, true, &colour).concat();
+    assert!(waiting.contains("\x1b[33m"), "gold leaves");
+    assert!(!waiting.contains("\x1b[32m"), "no green before it is ready");
+    assert!(alive.contains("\x1b[32m"), "green leaves once it is");
+    let plain = super::art::grove_lines(80, seed, true, &crate::term::Style::plain());
+    assert!(plain.iter().all(|l| !l.contains('\x1b')));
+    assert_eq!(
+        plain,
+        crate::grove::grove(64, 7, 0, seed)
+            .iter()
+            .map(
+                |row| format!("  {}", row.iter().map(|c| c.ch).collect::<String>())
+                    .trim_end()
+                    .to_string()
+            )
+            .collect::<Vec<_>>(),
+        "the same picture, colour aside"
+    );
+    assert!(super::art::grove_lines(20, seed, false, &colour).is_empty());
+}
+
+// A first run from the CLI opens on the same picture as one from the
+// TUI: the project's grove, above the three lines, and only then.
+#[test]
+fn the_first_time_tip_opens_on_the_projects_grove() {
+    let fx = fixture();
+    let (shown, said, drawn) = tip_with_picture(&fx, &fx.config, true);
+    assert!(shown);
+    assert_eq!(said.len(), 3, "{said:?}");
+    let picture: Vec<&String> = drawn.iter().filter(|l| !l.is_empty()).collect();
+    assert!(picture.len() >= crate::grove::MIN_HEIGHT, "{drawn:?}");
+    let all = picture.iter().map(|l| l.as_str()).collect::<String>();
+    for shade in ['█', '░'] {
+        assert!(all.contains(shade), "{drawn:?}");
+    }
+    // Tests' stderr is no terminal: the picture comes plain, no escapes.
+    assert!(!all.contains('\x1b'), "{drawn:?}");
+    // Said once: the second run draws nothing either.
+    let (shown, said, drawn) = tip_with_picture(&fx, &fx.config, true);
+    assert!(!shown && said.is_empty() && drawn.is_empty());
+    // And never on a pipe.
+    let fx = fixture();
+    let (_, _, drawn) = tip_with_picture(&fx, &fx.config, false);
+    assert!(drawn.is_empty());
 }
 
 #[test]
