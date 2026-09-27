@@ -27,12 +27,19 @@ struct Block {
 }
 
 const BLANK: u8 = 0;
-const EXPLANATION: u8 = 1;
-const STEPS: u8 = 2;
-const HEADING: u8 = 3;
-const STEP_ONE: u8 = 4;
-const LIVE: u8 = 5;
-const PROMPT: u8 = 6;
+/// The grove: the first thing a short screen gives up, after blank rows.
+const GROVE: u8 = 1;
+const EXPLANATION: u8 = 2;
+const STEPS: u8 = 3;
+const HEADING: u8 = 4;
+const STEP_ONE: u8 = 5;
+const LIVE: u8 = 6;
+const PROMPT: u8 = 7;
+
+/// The tallest and widest the grove is drawn: past these it is a forest
+/// that crowds out what the screen is for.
+const GROVE_ROWS: usize = 11;
+const GROVE_WIDTH: usize = 100;
 
 pub(super) fn render_setup(f: &mut Frame, area: Rect, app: &App) {
     let Some(screen) = app.setup_screen.as_ref() else {
@@ -51,7 +58,12 @@ pub(super) fn render_setup(f: &mut Frame, area: Rect, app: &App) {
     } else {
         setup_blocks(app, screen, width)
     };
-    let lines = fit(blocks, body.height as usize);
+    let blocks = with_grove(blocks, app, width, body.height as usize, screen.is_ready());
+    let mut lines = fit(blocks, body.height as usize);
+    // A little lower than the top on a tall screen, so it does not sit in
+    // a corner over an empty half.
+    let spare = (body.height as usize).saturating_sub(lines.len());
+    lines.splice(0..0, std::iter::repeat_n(Line::raw(""), spare / 3));
     f.render_widget(Paragraph::new(lines), body);
     render_setup_footer(f, footer, screen);
 }
@@ -475,6 +487,108 @@ fn marked(
             ])
         })
         .collect()
+}
+
+/// `blocks` with the grove above them, in the rows they leave over: as
+/// tall as [`GROVE_ROWS`] where there is room, shorter where there is
+/// less, and not at all where it would not read as a grove.
+///
+/// The picture is pando's namesake — one aspen, thousands of stems, one
+/// root system — seeded by the project, so each project has its own
+/// grove. While pando is being set up its leaves are gold and its roots
+/// dark; once the check passes, the grove comes alive: green leaves, and
+/// the roots lit, joining every stem.
+fn with_grove(
+    mut blocks: Vec<Block>,
+    app: &App,
+    width: usize,
+    height: usize,
+    alive: bool,
+) -> Vec<Block> {
+    let used: usize = blocks.iter().map(|b| b.lines.len()).sum();
+    // A caption under the picture, and a blank row under that. At least
+    // the smallest grove: on a classic 80×24 a blank row or two between
+    // the steps is a fair price for it, and `fit` pays blank rows first.
+    let rows = height
+        .saturating_sub(used + 2)
+        .clamp(crate::grove::MIN_HEIGHT, GROVE_ROWS);
+    let pad = indent(width);
+    let room = width.saturating_sub(pad * 2);
+    let art_width = room.min(GROVE_WIDTH);
+    let picture = crate::grove::grove(
+        art_width,
+        rows,
+        u64::from(app.tick),
+        crate::grove::seed_of(&app.paths.project.id),
+    );
+    if picture.is_empty() {
+        return blocks;
+    }
+    let left = pad + (room - art_width) / 2;
+    let mut lines: Vec<Line<'static>> = picture
+        .iter()
+        .map(|row| grove_line(row, left, alive))
+        .collect();
+    let caption = match alive {
+        true => "one root, every branch alive",
+        false => "Pando: one aspen, 47,000 stems, one root. Your repo, every branch alive.",
+    };
+    lines.push(Line::from(vec![
+        Span::raw(" ".repeat(left)),
+        Span::styled(
+            truncate(caption, art_width),
+            Style::new()
+                .fg(if alive { green() } else { text_muted() })
+                .add_modifier(Modifier::ITALIC),
+        ),
+    ]));
+    // Under the blank the screen opens with.
+    let at = usize::from(blocks.first().is_some_and(|b| b.priority == BLANK));
+    blocks.insert(
+        at,
+        Block {
+            priority: GROVE,
+            lines,
+        },
+    );
+    blocks.insert(at + 1, blank());
+    blocks
+}
+
+/// One row of the grove as spans, a run of one material at a time.
+fn grove_line(row: &[crate::grove::Cell], left: usize, alive: bool) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ".repeat(left))];
+    let mut run = String::new();
+    let mut style = Style::new();
+    for cell in row {
+        let next = grove_style(cell, alive);
+        if next != style && !run.is_empty() {
+            spans.push(Span::styled(std::mem::take(&mut run), style));
+        }
+        style = next;
+        run.push(cell.ch);
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(run, style));
+    }
+    Line::from(spans)
+}
+
+/// A grove cell's colour: gold leaves and dark roots while pando is being
+/// set up; green leaves flecked with gold, and roots lit, once it is ready.
+fn grove_style(cell: &crate::grove::Cell, alive: bool) -> Style {
+    use crate::grove::Material;
+    let fg = match (cell.material, alive) {
+        (Material::Sky, _) => return Style::new(),
+        (Material::Canopy, false) => yellow(),
+        (Material::Canopy, true) if cell.ch == '█' => yellow(),
+        (Material::Canopy, true) => green(),
+        (Material::Trunk, _) => text(),
+        (Material::Eye, _) | (Material::Ground, _) => text_muted(),
+        (Material::Root, false) => text_muted(),
+        (Material::Root, true) => orange(),
+    };
+    Style::new().fg(fg)
 }
 
 /// The rows that fit in `height`, dropping the least important blocks

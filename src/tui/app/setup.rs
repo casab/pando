@@ -286,10 +286,9 @@ impl App {
         let config_changed = now[..3] != watch.seen[..3];
         let check_changed = now[3] != watch.seen[3];
         watch.seen = now;
-        let mut repaint = self
-            .setup_screen
-            .as_ref()
-            .is_some_and(SetupScreen::spinning);
+        // The setup screen's grove quakes, so it is drawn again on every
+        // tick while it is up, spinner or not.
+        let mut repaint = self.setup_screen.is_some();
         if config_changed {
             self.spawn_setup_read();
         } else if self.setup_watch.reading {

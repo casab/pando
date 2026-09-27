@@ -4635,3 +4635,158 @@ fn pandos_own_guess_says_where_it_stands() {
     );
     assert!(text.contains("a copies the prompt"), "{text}");
 }
+
+// ---- the grove ---------------------------------------------------------
+
+/// The rows the grove takes on a drawn setup screen: from its first row
+/// to its caption, which ends it.
+fn grove_rows(buf: &Buffer, caption: &str) -> std::ops::Range<u16> {
+    let text = text_of(buf);
+    let rows: Vec<&str> = text.lines().collect();
+    let end = rows
+        .iter()
+        .position(|row| row.contains(caption))
+        .unwrap_or_else(|| panic!("no grove caption {caption:?}:\n{text}"));
+    let start = rows[..end]
+        .iter()
+        .rposition(|row| row.trim().is_empty())
+        .map_or(1, |blank| blank + 1);
+    start as u16..end as u16
+}
+
+/// The colours drawn in `rows`, cell by cell, for the cells that are not
+/// blank.
+fn colours_in(buf: &Buffer, rows: std::ops::Range<u16>) -> Vec<(char, ratatui::style::Color)> {
+    let mut out = Vec::new();
+    for y in rows {
+        for x in 0..buf.area().width {
+            let cell = buf.cell((x, y)).unwrap();
+            let ch = cell.symbol().chars().next().unwrap_or(' ');
+            if ch != ' ' {
+                out.push((ch, cell.fg));
+            }
+        }
+    }
+    out
+}
+
+const WAITING_CAPTION: &str = "Pando: one aspen, 47,000 stems, one root.";
+const ALIVE_CAPTION: &str = "one root, every branch alive";
+
+// The first thing a first run shows is pando's namesake: a grove of
+// aspen stems over one root system, drawn in dithered blocks, above the
+// prompt — at a classic 80×24 as well as on a tall screen.
+#[test]
+fn the_setup_screen_opens_on_a_grove_above_the_prompt() {
+    for (width, height) in [(120, 42), (80, 30), (80, 24)] {
+        let (_dir, mut app) = app_on_setup_screen(false);
+        let buf = draw(&mut app, width, height);
+        let text = text_of(&buf);
+        let grove = grove_rows(&buf, WAITING_CAPTION);
+        // Its top row may be all sky, which reads as blank here.
+        assert!(
+            grove.len() >= crate::grove::MIN_HEIGHT - 1,
+            "{width}×{height}: a grove of {} rows\n{text}",
+            grove.len()
+        );
+        let prompt = text
+            .lines()
+            .position(|row| row.contains(SETUP_PROMPT))
+            .unwrap_or_else(|| panic!("{width}×{height}: no prompt\n{text}"));
+        assert!(prompt > grove.end as usize, "{width}×{height}\n{text}");
+        // Stems, and the dither between them.
+        let drawn: String = colours_in(&buf, grove.clone())
+            .iter()
+            .map(|(c, _)| *c)
+            .collect();
+        for shade in ['█', '▓', '▒', '░'] {
+            assert!(
+                drawn.contains(shade),
+                "{width}×{height}: no {shade}\n{text}"
+            );
+        }
+    }
+}
+
+// A short screen gives the grove up before anything it is there to say:
+// the prompt, the steps, the live line.
+#[test]
+fn a_short_screen_gives_the_grove_up_first() {
+    let (_dir, mut app) = app_on_setup_screen(false);
+    let text = text_of(&draw(&mut app, 80, 18));
+    assert!(!text.contains(WAITING_CAPTION), "{text}");
+    assert!(!text.contains('█'), "{text}");
+    assert_eq!(rows_with(&text, SETUP_PROMPT).len(), 1, "{text}");
+    assert!(text.contains("reading acme-shop"), "{text}");
+}
+
+// While pando is being set up the leaves are gold and the roots dark;
+// once the check passes the grove comes alive: green leaves flecked with
+// gold, and the roots lit, joining every stem.
+#[test]
+fn the_grove_comes_alive_when_the_setup_is_ready() {
+    use crate::theme::{green, orange, text, text_muted, yellow};
+    let (_dir, mut app) = app_on_setup_screen(false);
+    let buf = draw(&mut app, 100, 40);
+    let waiting = colours_in(&buf, grove_rows(&buf, WAITING_CAPTION));
+    let colours: Vec<_> = waiting.iter().map(|(_, fg)| *fg).collect();
+    assert!(colours.contains(&yellow()), "gold leaves");
+    assert!(colours.contains(&text()), "white stems");
+    assert!(colours.contains(&text_muted()), "dark roots");
+    assert!(!colours.contains(&green()) && !colours.contains(&orange()));
+
+    let (_dir, mut app) = ready_screen(
+        vec![ProcessResult {
+            name: "web".into(),
+            ready: true,
+            port: Some(20_280),
+            http_status: Some(200),
+            secs: 2.1,
+        }],
+        SetupMemory::default(),
+    );
+    let buf = draw(&mut app, 100, 40);
+    let alive = colours_in(&buf, grove_rows(&buf, ALIVE_CAPTION));
+    let colours: Vec<_> = alive.iter().map(|(_, fg)| *fg).collect();
+    assert!(colours.contains(&green()), "green leaves");
+    assert!(colours.contains(&orange()), "the roots lit");
+    // Gold only where the leaves are densest.
+    assert!(
+        alive
+            .iter()
+            .filter(|(_, fg)| *fg == yellow())
+            .all(|(ch, _)| *ch == '█'),
+        "gold flecks only on solid leaves"
+    );
+}
+
+// Aspens quake: from one tick to the next the leaves move and nothing
+// else on the screen does.
+#[test]
+fn the_grove_quakes_on_the_tick_and_nothing_else_moves() {
+    let (_dir, mut app) = app_on_setup_screen(false);
+    let before = text_of(&draw(&mut app, 100, 40));
+    let grove = {
+        let (_dir, mut probe) = app_on_setup_screen(false);
+        grove_rows(&draw(&mut probe, 100, 40), WAITING_CAPTION)
+    };
+    app.tick = app.tick.wrapping_add(3);
+    let after = text_of(&draw(&mut app, 100, 40));
+    let mut moved = 0;
+    for (y, (a, b)) in before.lines().zip(after.lines()).enumerate() {
+        if a == b {
+            continue;
+        }
+        let y = y as u16;
+        // The spinner turns with the tick too.
+        if a.contains("reading acme-shop") {
+            continue;
+        }
+        assert!(
+            grove.contains(&y),
+            "row {y} moved outside the grove:\n{a}\n{b}"
+        );
+        moved += 1;
+    }
+    assert!(moved > 0, "the grove did not quake");
+}

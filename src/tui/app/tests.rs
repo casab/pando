@@ -7710,3 +7710,18 @@ fn a_needed_prelude_shows_doctors_line_and_writes_nothing() {
     assert_eq!(written_by_a_guess(&app), Vec::<PathBuf>::new());
     assert_eq!(app.checks_started, 0);
 }
+
+// The setup screen's grove quakes, so every tick draws it again — on the
+// ready view too, where nothing else on the screen spins.
+#[test]
+fn the_setup_screen_is_drawn_again_on_every_tick_for_its_grove() {
+    let (_dir, mut app) = app_on_setup_screen(true);
+    app.setup_screen.as_mut().unwrap().setup.state = crate::setup::SetupState::Ready;
+    assert!(!app.setup_screen.as_ref().unwrap().spinning());
+    for _ in 0..3 {
+        assert!(
+            app.handle_event(AppEvent::Tick),
+            "a tick that did not repaint"
+        );
+    }
+}
