@@ -78,6 +78,39 @@ impl std::error::Error for DaemonDown {}
 /// lock around it, which freezes `pando ls` and the TUI's tick with it.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
+thread_local! {
+    static PROBE_TIMEOUT_HERE: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// [`PROBE_TIMEOUT`], unless [`with_probe_timeout`] is running on this
+/// thread.
+fn probe_timeout() -> Duration {
+    PROBE_TIMEOUT_HERE
+        .with(|t| t.get())
+        .unwrap_or(PROBE_TIMEOUT)
+}
+
+/// Runs `f` with the probes it makes on this thread bounded by `timeout`
+/// instead of [`PROBE_TIMEOUT`]. For tests: a hung daemon is waited out
+/// for one whole probe, and twenty seconds of that was the slowest test
+/// in the suite. Per thread, so the tests running beside it keep the
+/// real bound.
+#[doc(hidden)]
+pub fn with_probe_timeout<R>(timeout: Duration, f: impl FnOnce() -> R) -> R {
+    let before = PROBE_TIMEOUT_HERE.with(|t| t.replace(Some(timeout)));
+    // Put back on unwind too, so a failing test leaves nothing behind on
+    // a thread the harness may reuse.
+    struct Restore(Option<Duration>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PROBE_TIMEOUT_HERE.with(|t| t.set(self.0));
+        }
+    }
+    let _restore = Restore(before);
+    f()
+}
+
 /// How long `stop` and `down -v` may take. Generous, because compose gives
 /// each container its own grace period and a project can have several;
 /// bounded, because `rm` runs them under the state lock too.
@@ -291,7 +324,7 @@ impl Compose {
         let text = self.run_with(
             &["--profile", "*"],
             &["config", "--format", "json"],
-            Some(PROBE_TIMEOUT),
+            Some(probe_timeout()),
         )?;
         crate::compose::parse_config_json(&text)
     }
@@ -313,13 +346,13 @@ impl Compose {
     /// is not running" is a refusal rather than the end of a start that
     /// already took the running environment down.
     pub fn reachable(&self) -> Result<()> {
-        self.run(&["ps", "--all", "--format", "json"], Some(PROBE_TIMEOUT))?;
+        self.run(&["ps", "--all", "--format", "json"], Some(probe_timeout()))?;
         Ok(())
     }
 
     /// What compose says about every container of this project.
     pub fn ps(&self) -> Result<Vec<Status>> {
-        let text = self.run(&["ps", "--all", "--format", "json"], Some(PROBE_TIMEOUT))?;
+        let text = self.run(&["ps", "--all", "--format", "json"], Some(probe_timeout()))?;
         parse_ps(&text)
     }
 

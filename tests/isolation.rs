@@ -1886,14 +1886,19 @@ fn rm_forced_past_a_hung_docker_does_not_wait_on_it() {
     docker::daemon_hung(&f.home);
     let _containers = docker::down_on_drop(&f.home, &f.project(&name));
 
+    // The daemon is waited out for one probe, so the probe is shortened
+    // here: at the real twenty seconds this was the suite's slowest test.
+    let probe = Duration::from_secs(3);
     let said = std::sync::Mutex::new(Vec::<String>::new());
     let began = std::time::Instant::now();
-    actions::rm(&f.paths, &name, false, true, &|m| {
-        said.lock().unwrap().push(m.to_string())
+    services::with_probe_timeout(probe, || {
+        actions::rm(&f.paths, &name, false, true, &|m| {
+            said.lock().unwrap().push(m.to_string())
+        })
     })
     .unwrap();
     assert!(
-        began.elapsed() < pando::services::PROBE_TIMEOUT * 3,
+        began.elapsed() < probe * 3,
         "rm waited {:?} on a daemon that does not answer",
         began.elapsed()
     );
