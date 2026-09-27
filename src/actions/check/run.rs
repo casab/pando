@@ -624,11 +624,10 @@ impl<'a> Run<'a> {
                 None,
             ),
         };
+        // `ready` stays what the wait found: the port answered. A page
+        // that failed is the outcome's to say, with its status here.
         if let Some(result) = self.record.processes.iter_mut().find(|p| p.name == owner) {
             result.http_status = status;
-            if outcome.is_some() {
-                result.ready = false;
-            }
         }
         if outcome.is_some() {
             self.failed_in(&owner, &log);

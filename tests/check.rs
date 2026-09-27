@@ -312,6 +312,8 @@ fn a_page_that_answers_500_fails_the_check() {
         v["reason"]
     );
     assert_eq!(v["processes"][0]["http_status"], 500);
+    // It came up; its page is what failed, and `reason` says so.
+    assert_eq!(v["processes"][0]["ready"], true);
     assert_eq!(v["failed_process"], "dev");
     e.assert_nothing_left(&branches);
 }
@@ -344,6 +346,9 @@ fn a_page_that_never_comes_fails_when_the_wait_is_over() {
         }
         other => panic!("{other:?}"),
     }
+    // Its port answered, so it is ready; only its page never came.
+    let dev = &checked.record.processes[0];
+    assert!(dev.ready && dev.http_status.is_none(), "{dev:?}");
     assert!(!e.check_dir().exists());
 }
 

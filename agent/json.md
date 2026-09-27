@@ -452,7 +452,9 @@ interruption — as the one object on stdout.
   "commit": "a1b2c3d4…",           // the full sha tested, or null
   "base_ref": "origin/main",       // the ref it was read from; null for HEAD
   "processes": [
-    { "name": "web", "ready": true, "port": 17008,
+    { "name": "web", "ready": true, // it came up: its port answered, or,
+                                     // with no port, it stayed up
+      "port": 17008,
       "http_status": 200,          // the page's status; null for every other process
       "secs": 4.2 }                // how long it took to be ready, or to fail
   ],
@@ -473,6 +475,11 @@ answers `5xx` — and is fixed through `pando init --answers -`, then
 checked again. `machine` is this machine: a shared service nothing
 answers on, found before anything was made. `reason` then carries the
 command that starts it, and no setting changes it.
+
+`ready` is about the process alone, judged as `start --wait` judges it.
+The page is judged apart: a process can be `ready` with a page that
+failed, and then `http_status` and `reason` say how. A check passes only
+when every process is ready and the page answers.
 
 A page answers when its status is below 500; a server that answers in
 something other than plain HTTP — TLS, say — passes with a note, since
