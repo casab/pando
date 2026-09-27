@@ -2,7 +2,8 @@
   "name": "pando",
   "description": "The pando plugin: set pando up on a project, and operate it day to day.",
   "owner": {
-    "name": "pando"
+    "name": "Mert Karadayi",
+    "url": "https://github.com/mertkaradayi"
   },
   "plugins": [
     {

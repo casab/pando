@@ -2,5 +2,12 @@
   "name": "pando",
   "version": "0.4.0",
   "description": "Set pando up on a project and operate it: a git worktree per branch, each with its own dev server, private services, logs and shareable URL. Two skills, both thin over agent/brief.md.",
+  "author": {
+    "name": "Mert Karadayi",
+    "url": "https://github.com/mertkaradayi"
+  },
+  "homepage": "https://github.com/mertkaradayi/pando",
+  "repository": "https://github.com/mertkaradayi/pando",
+  "license": "AGPL-3.0-only",
   "keywords": ["pando", "worktree", "dev-server", "git"]
 }

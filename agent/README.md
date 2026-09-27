@@ -34,7 +34,7 @@ directory under `~/.pando`, above every worktree it makes.
 The plugin root is this directory, so the brief ships with the skills.
 
 ```bash
-claude plugin marketplace add <this repository>
+claude plugin marketplace add mertkaradayi/pando
 claude plugin install pando@pando
 ```
 
