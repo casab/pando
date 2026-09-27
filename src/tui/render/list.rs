@@ -6,22 +6,24 @@
 //! column, so a cell never has to be decoded from help:
 //!
 //! ```text
-//!      branch           │ PR     │ port   │ git        │ status
-//! ──────────────────────┼────────┼────────┼────────────┼───────
-//!  ▸ ● feat/checkout ▣  │ ◍ #482 │ :17342 │ ↓1  ↑2  ✎  │
-//!    ✗ fix/crash        │ ✓ #463 │        │ ↓14        │ failed
+//!      branch                  │ PR     │ port   │ git
+//! ─────────────────────────────┼────────┼────────┼──────────
+//!  ▸ ● feat/checkout ▣         │ ◍ #482 │ :17342 │ ↓1  ↑2 ✎
+//!    ✗ fix/crash        failed │ ✓ #463 │        │ ↓14
 //! ```
 //!
 //! Faint lines divide the columns and rule the header off; the rows sit
-//! one under the other, and the highlight is what marks the cursor's.
+//! one under the other, and the highlight is what marks the cursor's. The
+//! columns after the label are as wide as their widest cells and sit
+//! against the right edge; the label takes whatever room is left.
 //!
 //! A column is only there when some row has something in it, and its
 //! title goes with it.
 //!
 //! The glyph says whether it runs, so the steady states have no word: a
 //! word is kept for what needs reading — a failure, or an action in
-//! flight — and goes at the end, where it moves nothing as it comes and
-//! goes. The full URL is the detail pane's; the row has its port. Being
+//! flight — and goes at the right end of the label's cell, which is as
+//! wide with it as without, so it moves nothing as it comes and goes. The full URL is the detail pane's; the row has its port. Being
 //! adopted is not on the row: most worktrees are, and it changes nothing
 //! about what a key does — the detail pane and the remove dialog say it
 //! where it matters.
@@ -91,9 +93,6 @@ pub enum Col {
     /// Behind, ahead and `✎` for uncommitted changes, each in a slot of
     /// its own; or prunable or locked. The last column shed.
     Signals,
-    /// `failed`, or what is being done to it: `starting`, `stopping`…
-    /// Empty for a worktree that simply runs or is stopped.
-    Status,
 }
 
 impl Col {
@@ -106,7 +105,6 @@ impl Col {
             Col::Ports => "other ports",
             Col::Share => "public",
             Col::Signals => "git",
-            Col::Status => "status",
         }
     }
 }
@@ -115,27 +113,25 @@ impl Col {
 const LABEL_TITLE: &str = "branch";
 
 /// Left to right.
-const LAYOUT: [Col; 7] = [
+const LAYOUT: [Col; 6] = [
     Col::Pr,
     Col::Aside,
     Col::Port,
     Col::Ports,
     Col::Share,
     Col::Signals,
-    Col::Status,
 ];
 
 /// The order columns give way in when the label is too narrow to read:
-/// the least useful first. The git column goes after the status word,
-/// because it carries the uncommitted mark; only a sliver of a pane,
-/// where the label alone fits, loses it.
-const SHED: [Col; 7] = [
+/// the least useful first. The git column goes last, because it carries
+/// the uncommitted mark; only a sliver of a pane, where the label alone
+/// fits, loses it.
+const SHED: [Col; 6] = [
     Col::Ports,
     Col::Aside,
     Col::Port,
     Col::Share,
     Col::Pr,
-    Col::Status,
     Col::Signals,
 ];
 
@@ -190,6 +186,10 @@ struct RowCells {
     label: String,
     /// The mark of a mode other than the default, after the label.
     mode: Option<(&'static str, Color)>,
+    /// `failed`, or what is being done to it: `starting`, `stopping`…
+    /// At the right end of the label's cell. None for a worktree that
+    /// simply runs or is stopped.
+    status: Option<(&'static str, Style)>,
     git: GitParts,
     /// Whether anything of it is up, or being done to it: its label is
     /// full brightness, and a stopped one's recedes, so the eye goes to
@@ -237,13 +237,13 @@ fn row_cells(app: &App, wt: &Worktree) -> RowCells {
             _ => None,
         },
     };
-    if let Some(word) = word {
+    let status = word.map(|word| {
         let mut style = Style::new().fg(color);
         if matches!(phase, Some(Aggregate::Failed { .. })) && pending.is_none() {
             style = style.add_modifier(Modifier::BOLD);
         }
-        cells.push((Col::Status, one(word, style)));
-    }
+        (word, style)
+    });
 
     // Only while something runs: a stopped or failed worktree keeps its
     // ports, but one on its row would promise a page that is not there.
@@ -285,6 +285,7 @@ fn row_cells(app: &App, wt: &Worktree) -> RowCells {
         glyph: (glyph, color),
         label,
         mode: app.record_for(&wt.name).and_then(|r| mode_mark(r.mode())),
+        status,
         git: git_parts(wt),
         live: phase.is_some() || pending.is_some(),
         cells,
@@ -398,12 +399,12 @@ pub(super) fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
     let full = list_area.width as usize;
     let width = full.saturating_sub(1);
     let mut shown = list_columns(width, &widths);
-    // The label is as wide as the widest one, and no wider: on a wide
-    // screen the room left over goes after the columns, not into a gap
-    // between the branch and where it runs.
+    // The columns are as wide as their widest cells and no wider, and sit
+    // against the right edge: the room left over goes to the label, so a
+    // wide screen has no stretch of nothing after the last column.
     let widest_label = rows
         .iter()
-        .map(|row| text_width(&row.label) + mode_width(row))
+        .map(|row| text_width(&row.label) + mode_width(row) + status_width(row))
         .max()
         .unwrap_or(0);
     let label_room = |shown: &[Col]| {
@@ -422,7 +423,7 @@ pub(super) fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
         }
         shown.retain(|&c| c != col);
     }
-    let label_width = label_room(&shown).min(widest_label.max(ROW_NAME_MIN));
+    let label_width = label_room(&shown);
     let col_width = |col: &Col| widths.iter().find(|(c, _)| c == col).map_or(0, |(_, w)| *w);
     let grid = Style::new().fg(border());
     let lead = ROW_CHROME_WIDTH + ROW_RUN_WIDTH;
@@ -505,10 +506,17 @@ pub(super) fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
             ),
             Span::styled(glyph, Style::new().fg(color)),
         ];
-        // The mode's mark is kept whole; the label is what gives way.
+        // The mode's mark is kept whole, and so is the status word while
+        // the label keeps enough to be told apart; the label gives way.
         let mark = mode_width(row).min(label_width);
-        let label = truncate_distinct(&row.label, label_width - mark, differs_at);
-        let used = text_width(&label) + mark;
+        let status = status_width(row);
+        let status = if label_width >= mark + status + ROW_NAME_MIN {
+            status
+        } else {
+            0
+        };
+        let label = truncate_distinct(&row.label, label_width - mark - status, differs_at);
+        let used = text_width(&label) + mark + status;
         spans.push(Span::styled(
             label,
             Style::new().fg(if row.live { text() } else { text_dim() }),
@@ -519,6 +527,11 @@ pub(super) fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
             spans.push(Span::styled(format!(" {glyph}"), Style::new().fg(color)));
         }
         spans.push(Span::raw(" ".repeat(label_width.saturating_sub(used))));
+        if let Some((word, style)) = row.status
+            && status > 0
+        {
+            spans.push(Span::styled(format!(" {word}"), style));
+        }
         for col in &shown {
             let w = col_width(col);
             let cell = row.cell(*col).cloned().unwrap_or_default();
@@ -581,6 +594,12 @@ pub(super) fn mode_mark(mode: ServiceMode) -> Option<(&'static str, Color)> {
 /// The cells a mode's mark takes after the label: a space and the mark.
 fn mode_width(row: &RowCells) -> usize {
     row.mode.map_or(0, |(glyph, _)| 1 + text_width(glyph))
+}
+
+/// The cells the status word takes at the end of the label's: a space
+/// and the word.
+fn status_width(row: &RowCells) -> usize {
+    row.status.map_or(0, |(word, _)| 1 + text_width(word))
 }
 
 /// What goes in a row's git slots: what is wrong with its entry, or `↓n`

@@ -536,12 +536,11 @@ fn every_column(width: usize) -> Vec<(Col, usize)> {
         (Col::Share, 1),
         (Col::Signals, width),
         (Col::Pr, 4),
-        (Col::Status, 8),
     ]
 }
 
 #[test]
-fn list_columns_shed_the_least_useful_first_and_the_status_last() {
+fn list_columns_shed_the_least_useful_first_and_git_last() {
     let all = every_column(4);
     assert_eq!(
         list_columns(200, &all),
@@ -552,11 +551,10 @@ fn list_columns_shed_the_least_useful_first_and_the_status_last() {
             Col::Ports,
             Col::Share,
             Col::Signals,
-            Col::Status,
         ],
-        "wide enough for everything, the pull request first, the status word last"
+        "wide enough for everything, the pull request first, git last"
     );
-    let medium = list_columns(76, &all);
+    let medium = list_columns(66, &all);
     assert!(!medium.contains(&Col::Ports), "{medium:?}");
     assert!(
         medium.contains(&Col::Aside) && medium.contains(&Col::Port),
@@ -565,8 +563,8 @@ fn list_columns_shed_the_least_useful_first_and_the_status_last() {
 
     let narrow = list_columns(35, &all);
     assert!(!narrow.contains(&Col::Port), "{narrow:?}");
-    assert!(narrow.contains(&Col::Status), "{narrow:?}");
-    // Narrower still, the uncommitted mark outlasts the status word.
+    assert!(narrow.contains(&Col::Pr), "{narrow:?}");
+    // Narrower still, the uncommitted mark outlasts the pull request.
     let narrower = list_columns(24, &all);
     assert_eq!(narrower, vec![Col::Signals], "{narrower:?}");
 
@@ -2828,21 +2826,47 @@ fn the_port_stays_put_between_starting_and_running() {
     );
 }
 
-// On a wide screen the room goes after the columns, not into a gap
-// between the branch and where it runs.
+// On a wide screen the room goes to the label: the columns are as wide
+// as their cells, and the last one ends against the right edge.
 #[test]
-fn a_wide_list_puts_the_port_right_after_the_branch() {
-    let mut app = test_app(&["feat+one"]);
+fn a_wide_list_puts_the_columns_against_the_right_edge() {
+    let mut app = test_app(&["feat+one", "feat+two"]);
     with_process(&mut app, "feat+one", running_phase());
+    app.worktrees[1].ahead_behind = Some((3, 14));
+    app.worktrees[1].dirty = Some(true);
     let rendered = text_of(&draw(&mut app, 200, 10));
-    let row = list_row(&rendered, "feat/one");
-    let branch_end = row.find("feat/one").unwrap() + "feat/one".len();
-    let status = row.find(":17342").unwrap();
+    let row = list_row(&rendered, "feat/two");
+    assert!(row.ends_with("↓14 ↑3 ✎ "), "{row:?}\n{rendered}");
+    let header = list_row(&rendered, "branch");
+    assert!(header.contains("│ git      "), "{header:?}");
     assert!(
-        status - branch_end <= 12,
-        "{} columns between them:\n{row}",
-        status - branch_end
+        header.ends_with("git      "),
+        "no more room than it needs: {header:?}"
     );
+}
+
+// A status word is at the end of the label's cell, which is as wide with
+// it as without: a row starting or failing moves no column.
+#[test]
+fn a_status_word_ends_the_label_cell_and_moves_nothing() {
+    let mut app = test_app(&["feat+one", "feat+two"]);
+    with_process(&mut app, "feat+one", running_phase());
+    let before = text_of(&draw(&mut app, 160, 10));
+    with_process(
+        &mut app,
+        "feat+two",
+        crate::state::Phase::Failed {
+            at: chrono::Utc::now(),
+            reason: "process exited".into(),
+        },
+    );
+    let after = text_of(&draw(&mut app, 160, 10));
+    let row = list_row(&after, "feat/two");
+    assert!(row.contains("failed │"), "{after}");
+    let rule = |rendered: &str| list_row(rendered, "branch").find('│');
+    assert_eq!(rule(&before), rule(&after), "{before}\n{after}");
+    let port = |rendered: &str| list_row(rendered, "feat/one").find(":17342");
+    assert_eq!(port(&before), port(&after), "{before}\n{after}");
 }
 
 // With room to spare, every port of a multi-process worktree shows.
