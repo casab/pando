@@ -513,9 +513,9 @@ the whole project and the fixes it found, with a test suite that reads
 no developer's shell profile and needs none of their tools. What changed
 in each version is in the [changelog](CHANGELOG.md).
 
-macOS is what it is developed and tested on. The Unix-only parts have
-Linux branches written, and CI now builds them on Linux, but Linux is
-intended rather than demonstrated: nobody has run it there yet.
+macOS is what it is developed on. CI runs the whole test suite on macOS
+and on Linux for every change, and both pass — but the suite runs on
+fixtures, and nobody has yet used pando on Linux for real work.
 
 What that does not mean: there is no crate, no release binary and no
 package to install, and almost every worktree pando has created has been
@@ -528,7 +528,7 @@ situations it invented still breaks on first contact with one it did
 not. If pando breaks on yours, that is the most useful issue you can open.
 
 Next, roughly in order: a published crate and release binaries, a
-Homebrew tap, Linux proven in CI, a JSON schema for `pando.toml`, and a
+Homebrew tap, a JSON schema for `pando.toml`, and a
 recipe directory with its own contribution guide.
 
 ## License
