@@ -12,10 +12,10 @@
 //! along: a rate limit is not a defect in pando.
 //!
 //! ```sh
-//! PANDO_TEST_CLOUDFLARED=1 cargo test --test tunnel -- --nocapture
+//! PANDO_TEST_CLOUDFLARED=1 cargo test --test integration tunnel:: -- --nocapture
 //! ```
 
-mod common;
+use crate::common;
 
 use std::io::{Read, Write};
 use std::net::TcpListener;

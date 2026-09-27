@@ -5,7 +5,7 @@
 //! invocation the adapter made asserted exactly, because the difference
 //! between `down` and `down -v` is a database a developer wanted kept.
 
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, Ordering};

@@ -5,7 +5,7 @@
 //! mode is remembered, `stop` takes both halves down, and `rm` takes the
 //! volumes with it.
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

@@ -5,7 +5,7 @@
 //! thing worth asserting is *which hooks ran and in what order* — a log
 //! file per hook would say each one ran but never say when.
 
-mod common;
+use crate::common;
 
 use std::path::{Path, PathBuf};
 

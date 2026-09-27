@@ -5,7 +5,7 @@
 //! find against what a human decided the answer is — not against the rules'
 //! own output.
 
-mod common;
+use crate::common;
 
 use common::{Kind, build};
 use pando::config::Config;

@@ -250,7 +250,7 @@ fn the_plugin_manifest_is_valid_and_the_marketplace_points_at_it() {
 // "an agent can configure this correctly on the first try" is only worth
 // something if the shapes are the ones a first run really meets.
 
-mod common;
+use crate::common;
 
 use common::{Kind, build, paths_for, status_porcelain};
 use pando::config::{Config, PortsSpec, ServiceConfig};

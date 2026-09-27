@@ -9,7 +9,7 @@
 //! legitimately write `.git/worktrees/<name>`, and that is the one thing
 //! the invariant explicitly allows.
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

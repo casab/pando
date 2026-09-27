@@ -18,7 +18,7 @@
 //! about the test asking it. Scoping is the fix; serialising them would
 //! hide the coupling rather than remove it.
 
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 use std::process::Command;

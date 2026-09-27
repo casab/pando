@@ -11,7 +11,7 @@
 //! servers. Run it with:
 //!
 //! ```text
-//! PANDO_TEST_NATIVE=1 cargo test --test namespaced -- --nocapture
+//! PANDO_TEST_NATIVE=1 cargo test --test integration namespaced:: -- --nocapture
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -323,7 +323,7 @@ fn a_real_redis_empties_one_slot_and_never_falls_back_to_slot_0() {
 
 // ---- a whole namespaced start -----------------------------------------------------
 
-mod common;
+use crate::common;
 
 /// Stops whatever a test started through pando, even when it panics.
 struct Started(pando::paths::PandoPaths);

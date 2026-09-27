@@ -13,7 +13,7 @@
 //! semantics are faked. `tests/postgres.rs` runs the same path against a
 //! real server when `PANDO_TEST_NATIVE=1` asks for it.
 
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 use std::time::Duration;

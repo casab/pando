@@ -2,7 +2,7 @@
 //! prints. Everything runs against a generated fixture repository with an
 //! injected `PANDO_HOME`, so no test can reach a real repo or the real home.
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 use std::process::{Command, Output};

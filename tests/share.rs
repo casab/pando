@@ -4,7 +4,7 @@
 //! Everything here binds loopback ports and spawns the real binary, so each
 //! test owns a guard that stops its child even when an assertion panics.
 
-mod common;
+use crate::common;
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};

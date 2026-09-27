@@ -19,7 +19,7 @@
 //! Run it with:
 //!
 //! ```text
-//! PANDO_TEST_NATIVE=1 cargo test --test engines -- --nocapture
+//! PANDO_TEST_NATIVE=1 cargo test --test integration engines:: -- --nocapture
 //! ```
 //!
 //! Each engine skips on its own when this machine does not have it, so a
@@ -29,7 +29,7 @@
 //! `initdb` refuses to run as root, so a CI container that runs as root
 //! has to run this as an unprivileged user or leave it gated off.
 
-mod common;
+use crate::common;
 
 use std::process::Command;
 
