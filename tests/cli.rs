@@ -4030,6 +4030,13 @@ fn doctor_and_start_say_a_project_has_nothing_to_run() {
 fn doctor_exits_one_for_a_problem_it_printed_and_says_nothing_else() {
     let e = env();
     e.write_config("[project]\ninstall = \"pnpm install\"\n\n[dev]\ncmd = \"true\"\n");
+    // A pnpm on the PATH, or a machine without one has two problems: the
+    // one this test is about, and the missing tool.
+    common::fake_pnpm(&e.home);
+    e.write_user_config(&format!(
+        "[runtime]\nprelude = 'export PATH=\"{}:$PATH\"'\n",
+        e.home.join("bin").display()
+    ));
     let out = e.pando(&["doctor"]);
     assert_eq!(code(&out), EXIT_ERROR, "stdout: {}", stdout(&out));
     let text = stdout(&out);

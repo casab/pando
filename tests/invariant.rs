@@ -1703,6 +1703,9 @@ fn the_whole_agent_path_never_writes_into_the_repository() {
         // The machine answer, so a host that does not resolve a pin is
         // answering the same question as one that does.
         std::fs::write(h.home.join("config.toml"), "[runtime]\nprelude = \"\"\n").unwrap();
+        // And whether it has the engines the env examples name, which
+        // decides whether `init` has a services question left to ask.
+        common::fake_engines(&h.home);
         let file = h.home.join("answers.json");
         std::fs::write(&file, answers).unwrap();
         let file = file.to_str().unwrap().to_string();

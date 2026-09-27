@@ -129,6 +129,33 @@ pub fn fake_node(home: &Path, version: &str) {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// Installs a stand-in at `<home>/bin` for every binary a built-in
+/// recipe needs, so the machine probe finds every engine on every host.
+///
+/// Whether an engine is installed decides whether pando ticks it by
+/// default, and so whether `init` asks which services to run. That is a
+/// fact about the host, and a test that answers it only on a laptop with
+/// Postgres and Redis installed fails on one without them. The stand-ins
+/// only have to be found: nothing under these tests starts an engine.
+pub fn fake_engines(home: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for (_, loaded) in pando::recipes::Recipes::built_in().entries() {
+        for binary in &loaded.recipe.binaries {
+            let path = bin.join(binary);
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\necho \"{binary}: a stand-in under test runs nothing\" >&2\nexit 1\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+}
+
 /// `git status --porcelain` output for a checkout. Empty means clean.
 pub fn status_porcelain(cwd: &Path) -> String {
     let out = git_raw(cwd, &["status", "--porcelain"]);

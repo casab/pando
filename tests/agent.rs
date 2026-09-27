@@ -441,6 +441,9 @@ fn fixture(kind: Kind) -> Fixture {
     // machine — including the one fixture that pins a version nothing
     // resolves, whose whole point is the refusal.
     std::fs::write(home.join("config.toml"), "[runtime]\nprelude = \"\"\n").unwrap();
+    // The other: whether this machine has the engines the fixture's env
+    // example names, which decides whether the services are ticked.
+    common::fake_engines(&home);
     Fixture {
         root,
         home,
@@ -450,7 +453,26 @@ fn fixture(kind: Kind) -> Fixture {
 
 impl Fixture {
     fn pando(&self, args: &[&str], stdin: Option<&str>) -> std::process::Output {
-        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pando"))
+        self.pando_in(args, stdin, None)
+    }
+
+    /// The same, with `HOME` — the developer's home, where version
+    /// managers live — set to `user`.
+    fn pando_with_home(&self, args: &[&str], user: &Path) -> std::process::Output {
+        self.pando_in(args, None, Some(user))
+    }
+
+    fn pando_in(
+        &self,
+        args: &[&str],
+        stdin: Option<&str>,
+        user: Option<&Path>,
+    ) -> std::process::Output {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pando"));
+        if let Some(user) = user {
+            command.env("HOME", user);
+        }
+        let mut child = command
             .env("PANDO_HOME", &self.home)
             .current_dir(&self.root)
             .args(args)
@@ -604,7 +626,13 @@ fn a_pinned_runtime_nothing_resolves_is_configured_and_then_refused() {
         "the project is configurable; it is this machine that cannot run it"
     );
 
-    let doctor = fx.pando(&["doctor", "--json"], None);
+    // Whether a version manager is installed decides what the fix says,
+    // and that is a fact about the host: give this one a home with nvm in
+    // it, so the fix is the prelude on every machine.
+    let user = fx.home.join("user-home");
+    std::fs::create_dir_all(user.join(".nvm")).unwrap();
+    std::fs::write(user.join(".nvm/nvm.sh"), "# a stand-in nvm\n").unwrap();
+    let doctor = fx.pando_with_home(&["doctor", "--json"], &user);
     let report: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&doctor.stdout)).expect("doctor --json");
     let problems: Vec<&serde_json::Value> = report["findings"]
