@@ -2834,6 +2834,75 @@ fn init_agent_writes_nothing_not_even_pandos_home() {
     assert!(!e.home.exists(), "init --agent made pando's home");
 }
 
+// `--reference memory` prints the block the job ends with, and only it:
+// read-only like the job, and with nothing written it is the same text.
+#[test]
+fn init_agent_reference_memory_prints_the_block_the_job_ends_with() {
+    let e = env();
+    let home = contents(&e.home);
+    let repo = contents(&e.root);
+    let out = e.pando(&["init", "--agent", "--reference", "memory"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    let block = stdout(&out);
+    assert!(block.starts_with("## pando runs "), "{block}");
+    let job = stdout(&e.pando(&["init", "--agent"]));
+    assert!(
+        job.ends_with(&format!("```markdown\n{block}```\n")),
+        "the job does not end with the block, fenced:\n{job}"
+    );
+    assert_eq!(contents(&e.home), home, "pando's home changed");
+    assert_eq!(contents(&e.root), repo, "the repository changed");
+}
+
+// Every worktree pando makes gets the block above it, under the names
+// Claude Code and Codex read, in pando's own home and nowhere else — not
+// the repository, not the worktree. Written again by the next `new`,
+// whole: a copy somebody edited is replaced, never appended to.
+#[test]
+fn new_writes_the_memory_files_above_its_worktrees_and_only_there() {
+    let e = env();
+    let block = stdout(&e.pando(&["init", "--agent", "--reference", "memory"]));
+    let files = ["CLAUDE.md", "AGENTS.md"].map(|name| e.project_dir().join(name));
+    let written = |file: &Path| std::fs::read_to_string(file).unwrap();
+
+    let out = e.pando(&["new", "feat/one"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    let worktree = e.project_dir().join("worktrees").join("feat+one");
+    assert!(worktree.is_dir());
+    for file in &files {
+        let text = written(file);
+        assert!(
+            text.starts_with("<!-- pando wrote this file and rewrites it"),
+            "{text}"
+        );
+        assert!(text.ends_with(&block), "{}: {text}", file.display());
+        assert!(worktree.starts_with(file.parent().unwrap()));
+    }
+    for place in [&e.root, &worktree] {
+        for name in ["CLAUDE.md", "AGENTS.md"] {
+            assert!(
+                !place.join(name).exists(),
+                "{name} was written into {}",
+                place.display()
+            );
+        }
+    }
+    assert_eq!(status_porcelain(&e.root), "", "the repository changed");
+    assert_eq!(status_porcelain(&worktree), "", "the worktree changed");
+
+    for file in &files {
+        std::fs::write(file, "an edit of somebody's\n").unwrap();
+    }
+    let out = e.pando(&["new", "feat/two"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    for file in &files {
+        let text = written(file);
+        assert!(!text.contains("an edit of somebody's"), "{text}");
+        assert_eq!(text.matches("## pando runs ").count(), 1, "{text}");
+        assert!(text.ends_with(&block), "{text}");
+    }
+}
+
 // A config pando cannot read is the first thing the job says, and the
 // command still runs and exits 0 — where plain `init` is stopped by it.
 #[test]

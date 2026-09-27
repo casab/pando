@@ -1,12 +1,14 @@
 //! `init --agent`: the setup job for the developer's own coding agent, for
 //! this project and this pando, and `--reference`, the brief and the
-//! contract it points at.
+//! contract it points at, or the block the agent saves to remember how to
+//! run the project.
 //!
 //! The setup prompt names this command and nothing else, so what an agent
 //! learns about the job it learns here: pando's view of the project, the
 //! questions still open, what each command it will run writes, and the
 //! brief's first-run section — the rules and the steps, which live in the
-//! brief and are printed from it rather than written twice.
+//! brief and are printed from it rather than written twice. It ends with
+//! that block, [`crate::setup::memory_block`].
 //!
 //! Kept under about 10 KB, which the tests hold it to: agents' shells cut
 //! long output — Claude Code's at about 30,000 characters — and the brief
@@ -39,13 +41,16 @@ pub(super) const JSON_CONTRACT: &str = include_str!("../../agent/json.md");
 /// The heading the job's rules and steps are found under in [`BRIEF`].
 const FIRST_RUN_HEADING: &str = "## First run";
 
-/// Which document `--reference` prints.
+/// What `--reference` prints.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reference {
     /// The whole procedure: agent/brief.md.
     Brief,
     /// Every JSON shape pando publishes: agent/json.md.
     Json,
+    /// Not a document: how to run this project with pando, made for it, for
+    /// an agent to save in its own memory.
+    Memory,
 }
 
 /// `init --agent`, and `init --agent --reference`.
@@ -57,6 +62,7 @@ pub fn agent<W: Write>(
     let text = match reference {
         Some(Reference::Brief) => BRIEF.to_string(),
         Some(Reference::Json) => JSON_CONTRACT.to_string(),
+        Some(Reference::Memory) => crate::setup::memory_block(paths),
         None => job(paths),
     };
     out.write_all(text.as_bytes())?;
@@ -75,8 +81,9 @@ pub(super) fn job(paths: &PandoPaths) -> String {
     let _ = writeln!(
         out,
         "pando runs each git branch of this repository in its own worktree, with its own\n\
-         ports, logs and services. You are done when `pando check` passes; then tell the\n\
-         developer: \"pando is set up and tested for {project}. You're ready: run `pando`.\"\n"
+         ports, logs and services. You are done when `pando check` passes and you have saved\n\
+         the block at the end; then tell the developer: \"pando is set up and tested for\n\
+         {project}. You're ready: run `pando`.\"\n"
     );
 
     // Its own load, as doctor does: `main` keeps the error to itself and
@@ -107,7 +114,20 @@ pub(super) fn job(paths: &PandoPaths) -> String {
         "\n\nFor the full procedure: `pando init --agent --reference brief`.\n\
          For every JSON shape: `pando init --agent --reference json`.\n",
     );
+    out.push_str(&remember(paths));
     out
+}
+
+/// The job's last section: the block an agent saves, fenced, so what it
+/// saves is exactly what `--reference memory` prints.
+fn remember(paths: &PandoPaths) -> String {
+    format!(
+        "\n## Remember how to run {project}\n\n\
+         Save this in your own memory once the check passes, as \"Remember how to run it\" \
+         says:\n\n```markdown\n{block}```\n",
+        project = paths.project.display_name,
+        block = crate::setup::memory_block(paths),
+    )
 }
 
 /// What the last check says, when it says something the agent has to act
@@ -155,7 +175,8 @@ pub(super) fn last_check(setup: &crate::setup::Setup) -> Option<String> {
         ),
         (SetupState::Ready, Some(_)) => Some(format!(
             "The last test passed, on these settings, with pando {}: there is nothing left to \
-             set up. Tell the developer they are ready.\n\n",
+             set up. Save the block at the end of this job if you have not, and tell the \
+             developer they are ready.\n\n",
             record.map_or("", |r| r.pando_version.as_str())
         )),
         _ => None,

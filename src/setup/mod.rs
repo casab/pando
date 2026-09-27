@@ -7,11 +7,13 @@
 //! a check running, the last one interrupted, nothing to run yet, then the
 //! last check against today's run settings, compared by [`fingerprint`].
 //! What a check stores of a failed process's log goes through
-//! [`redact_line`] first.
+//! [`redact_line`] first. [`memory_block`] is what an agent keeps about
+//! running the project once it is set up, and pando's own copies of it.
 
 mod fingerprint;
 mod record;
 mod redact;
+mod remember;
 mod state;
 
 pub use fingerprint::{FINGERPRINT_VERSION, fingerprint};
@@ -19,6 +21,7 @@ pub use record::{
     CheckMode, CheckOutcome, CheckRecord, FailureKind, ProcessResult, RanBy, SetupMemory,
 };
 pub use redact::redact_line;
+pub use remember::{MEMORY_FILE_HEADER, memory_block, write_memory_files};
 pub use state::{Setup, SetupState, check_running, decide, read};
 
 /// The prompt a developer pastes into their coding agent: one line,

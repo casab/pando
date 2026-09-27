@@ -2601,6 +2601,76 @@ fn the_setup_job_only_names_commands_pando_has() {
     assert_every_command_is_real("init --agent", &super::agent::job(&fx.paths));
 }
 
+// The block an agent saves and follows in every later session, so a
+// command in it that does not parse fails there for as long as the copy
+// is kept. Checked outside the job's fence, where the spans are read.
+#[test]
+fn the_memory_block_names_the_project_its_root_and_only_real_commands() {
+    let fx = fixture();
+    let block = crate::setup::memory_block(&fx.paths);
+    assert_every_command_is_real("init --agent --reference memory", &block);
+    assert!(
+        block.starts_with(&format!(
+            "## pando runs acme-shop ({})\n",
+            fx.paths.root().display()
+        )),
+        "{block}"
+    );
+    let flat = block.split_whitespace().collect::<Vec<_>>().join(" ");
+    for (phrase, why) in [
+        ("`pando start <name> --wait`", "how to start one"),
+        ("`pando stop <name>`", "how to stop one"),
+        ("`pando restart <name> --wait`", "how to restart one"),
+        ("`pando status <name> --json`", "what runs, and the URL"),
+        ("`pando open <name>`", "the URL for a person"),
+        ("`pando logs <name>`", "the logs"),
+        ("`--follow`", "following a log"),
+        ("`--source <process>`", "one process's log"),
+        ("`pando new <branch>`", "a worktree for a branch"),
+        (
+            "the main checkout",
+            "that the main checkout runs the same way",
+        ),
+        (
+            "never with the dev command by hand",
+            "that pando starts them",
+        ),
+        ("exit 3", "the code that is a question"),
+        (
+            "`pando init --agent --reference brief`",
+            "where the rest is",
+        ),
+    ] {
+        assert!(flat.contains(phrase), "the block never says {why}: {block}");
+    }
+    let lines = block.lines().count();
+    assert!(
+        (12..=20).contains(&lines),
+        "the block is {lines} lines: short enough to keep, long enough to follow"
+    );
+}
+
+// `--reference memory` prints the block and nothing else, and the job's
+// last section is the same block, fenced, so what an agent saves from
+// either is the same text.
+#[test]
+fn reference_memory_prints_the_block_the_job_ends_with() {
+    let fx = fixture();
+    let block = crate::setup::memory_block(&fx.paths);
+    let mut out = Vec::new();
+    super::agent::agent(&fx.paths, Some(super::agent::Reference::Memory), &mut out).unwrap();
+    assert_eq!(String::from_utf8(out).unwrap(), block);
+    let job = super::agent::job(&fx.paths);
+    let section = &job[job
+        .find("\n## Remember how to run acme-shop\n")
+        .expect("the job has a section for the block")..];
+    assert!(
+        section.ends_with(&format!("```markdown\n{block}```\n")),
+        "{section}"
+    );
+    assert!(section.contains("\"Remember how to run it\""), "{section}");
+}
+
 /// `CLAUDE.md` names the CLI verbs and calls them canonical — "used
 /// identically in every document" — which is exactly the claim that
 /// rots. It was missing `restart` for as long as `restart` existed,
@@ -3736,6 +3806,25 @@ fn the_job_carries_the_briefs_first_run_section_and_only_that() {
             "the two lines that say it is done",
         ),
         ("Change no file", "the rule about the repository"),
+        ("Remember how to run it", "that the agent keeps the block"),
+        (
+            "`pando init --agent --reference memory`",
+            "where the block is printed alone",
+        ),
+        ("`~/.claude/CLAUDE.md`", "where Claude Code keeps it"),
+        ("`~/.codex/AGENTS.md`", "where Codex keeps it"),
+        (
+            "replacing an earlier pando block for the same project root",
+            "that a second setup replaces the first block",
+        ),
+        (
+            "Never a `CLAUDE.md`, `AGENTS.md` or any other file inside the repository",
+            "that the block never goes in the repository",
+        ),
+        (
+            "I'll remember how to run it with pando",
+            "that the done message mentions it",
+        ),
     ] {
         assert!(
             flat.contains(phrase),
@@ -3908,7 +3997,7 @@ fn init_agent_refuses_the_flags_that_answer_or_write() {
     );
     let err = Cli::try_parse_from(["pando", "init", "--reference", "brief"]).unwrap_err();
     assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
-    for doc in ["brief", "json"] {
+    for doc in ["brief", "json", "memory"] {
         Cli::try_parse_from(["pando", "init", "--agent", "--reference", doc])
             .unwrap_or_else(|e| panic!("--reference {doc}: {e}"));
     }
@@ -3921,6 +4010,7 @@ fn init_agent_runs_on_a_config_pando_cannot_read() {
     let command = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
     assert!(!command(&["pando", "init", "--agent"]).needs_config());
     assert!(!command(&["pando", "init", "--agent", "--reference", "json"]).needs_config());
+    assert!(!command(&["pando", "init", "--agent", "--reference", "memory"]).needs_config());
     assert!(command(&["pando", "init"]).needs_config());
     assert!(command(&["pando", "init", "--answers", "-", "--dry-run"]).needs_config());
 }

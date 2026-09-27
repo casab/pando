@@ -17,10 +17,10 @@ nothing except through `pando init --answers`.**
 
 The developer pasted one line: run `pando init --agent` and follow what it
 says. That command printed pando's view of this project and this section.
-You are done when `pando check` passes. Change no file in the developer's
-repository: every setting goes through `pando init --answers -`, and the
-worktree `pando check` makes is pando's own, inside `.git`, removed when it
-is done.
+You are done when `pando check` passes and you have saved how to run the
+project. Change no file in the developer's repository: every setting goes
+through `pando init --answers -`, and the worktree `pando check` makes is
+pando's own, inside `.git`, removed when it is done.
 
 1. **Ask the developer nothing.** A first run is the fast path: pando's
    rules have a first choice for almost everything, and taking it gets the
@@ -64,10 +64,24 @@ is done.
      the check again.
    - Stop after three changed attempts, and tell the developer what is
      wrong in pando's own words.
-6. **Tell the developer you're done, in two lines:**
+6. **Remember how to run it.** The job ends with a block that says how
+   this project's worktrees, and its main checkout, run with pando;
+   `pando init --agent --reference memory` prints it alone. Save it in
+   your own persistent memory, outside the developer's repository —
+   Claude Code: `~/.claude/CLAUDE.md`; Codex: `~/.codex/AGENTS.md`; any
+   other agent: its own memory — replacing an earlier pando block for the
+   same project root (its heading names the root) rather than adding a
+   second. Never a `CLAUDE.md`, `AGENTS.md` or any other file inside the
+   repository. A later session in any worktree then starts, stops and
+   reads it through pando. If a sandbox will not let you write the file,
+   give the developer the block and the file's name instead.
+7. **Tell the developer you're done, in two lines:**
 
    > pando is set up and tested for <project>.
    > You're ready: run `pando`.
+
+   Mention the block in one short clause on the first line: "…tested
+   for <project>, and I'll remember how to run it with pando."
 
    When the check's notes say the schema step was not tested, add one
    line: it is untested until namespaced mode is set up, which the first
@@ -462,7 +476,7 @@ the decisions log would have held.
 Absolute. None of these has an exception worth taking.
 
 - **Never write into the developer's repository.** Not a config file, not a
-  cache, not a marker, not a `.env`. pando's own promise is "not a byte",
+  cache, not a marker, not a `.env`, not a `CLAUDE.md` or `AGENTS.md`. pando's own promise is "not a byte",
   and a developer will not distinguish your plugin from the tool. If a
   project cannot run without an untracked file, say which file and why, and
   let them create it in their own project.

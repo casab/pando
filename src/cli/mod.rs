@@ -285,8 +285,10 @@ Examples:
         ///
         /// What pando sees in this project now, the questions still open
         /// with pando's options, what each command the agent will run
-        /// writes, and the steps: answer, save, `pando check`, and say
-        /// when it is done. After a failed check, the failure comes first.
+        /// writes, and the steps: answer, save, `pando check`, remember
+        /// how to run the project, and say when it is done. It ends with
+        /// the block to remember. After a failed check, the failure comes
+        /// first.
         /// Asks nothing and exits 0, even when pando cannot read the
         /// project's settings: that is reported in the job.
         #[arg(long, conflicts_with_all = ["yes", "answers", "dry_run", "replace"])]
@@ -294,8 +296,10 @@ Examples:
         /// With `--agent`: print a whole reference instead of the job.
         ///
         /// `brief` is the procedure the job's steps come from, `json` the
-        /// contract for every JSON shape pando publishes. Both are the
-        /// text this pando was built with.
+        /// contract for every JSON shape pando publishes: both the text
+        /// this pando was built with. `memory` is not a document but the
+        /// block the job ends with, made for this project: how to run its
+        /// worktrees with pando, for an agent to save in its own memory.
         #[arg(long, requires = "agent", value_name = "DOC")]
         reference: Option<Reference>,
     },

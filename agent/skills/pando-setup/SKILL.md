@@ -13,6 +13,9 @@ the brief names.
 
 Or run `pando init --agent`: it prints the setup job for this project,
 with the brief's first-run section, and the steps end with `pando check`.
+Its last section is a block saying how to run this project's worktrees
+with pando: save it in your own memory (`~/.claude/CLAUDE.md`), never in the
+repository, so later sessions run them through pando.
 
 ## Before you start
 

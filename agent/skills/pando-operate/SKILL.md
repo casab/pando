@@ -37,6 +37,8 @@ pando unshare <name>
 ```
 
 `<name>` is the branch (`feat/one`) or the directory (`feat+one`).
+A pando block in your memory (`~/.claude/CLAUDE.md`) is this, for one project;
+`pando init --agent --reference memory` prints it again.
 
 ## Diagnosing
 

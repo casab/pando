@@ -86,6 +86,17 @@ impl PandoPaths {
         self.project_dir().join("setup.json")
     }
 
+    /// What an agent keeps about running this project with pando, under
+    /// the two names coding agents read: `CLAUDE.md` and `AGENTS.md`.
+    /// Claude Code reads a `CLAUDE.md` in every directory above the one it
+    /// runs in, and this one is above [`Self::worktrees_dir`].
+    pub fn agent_memory_files(&self) -> [PathBuf; 2] {
+        [
+            self.project_dir().join("CLAUDE.md"),
+            self.project_dir().join("AGENTS.md"),
+        ]
+    }
+
     /// The lock a namespaced start hands out a slot under, the same for
     /// every project on this machine: a Redis on a port is the machine's,
     /// and each project's own lock covers only its own records.
@@ -517,6 +528,8 @@ mod tests {
             p.check_file(),
             p.check_lock_file(),
             p.setup_file(),
+            p.agent_memory_files()[0].clone(),
+            p.agent_memory_files()[1].clone(),
             p.cache_dir(),
             p.enrich_cache_file(),
             p.pr_cache_file(),
@@ -540,6 +553,27 @@ mod tests {
                 loc.display()
             );
         }
+    }
+
+    // The memory files are found by walking up from a worktree, so they
+    // sit in the directory that holds the worktrees, under the names the
+    // agents read.
+    #[test]
+    fn the_agent_memory_files_sit_above_every_worktree() {
+        let p = paths();
+        let names: Vec<_> = p
+            .agent_memory_files()
+            .iter()
+            .map(|file| {
+                assert_eq!(file.parent(), Some(p.project_dir().as_path()));
+                assert!(
+                    p.worktree_path("feat+x")
+                        .starts_with(file.parent().unwrap())
+                );
+                file.file_name().unwrap().to_string_lossy().to_string()
+            })
+            .collect();
+        assert_eq!(names, ["CLAUDE.md", "AGENTS.md"]);
     }
 
     // A process name is a path component of its log file, so anything that

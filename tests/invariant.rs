@@ -265,10 +265,13 @@ fn everything_pando_writes_lives_under_its_own_home() {
     let h = harness();
     let name = actions::new(&h.paths, &h.config, "feat/one", None, &|_| {}).unwrap();
 
+    let [claude_md, agents_md] = h.paths.agent_memory_files();
     for path in [
         h.paths.config_file(),
         h.paths.state_file(),
         h.paths.worktree_path(&name),
+        claude_md,
+        agents_md,
     ] {
         assert!(path.exists(), "{} should have been written", path.display());
         assert!(
@@ -1788,8 +1791,9 @@ fn stamped(root: &Path) -> BTreeMap<String, (Entry, Option<std::time::SystemTime
 
 /// What `pando check` may leave changed in pando's home, relative to the
 /// project's own directory: its record and its lock, the logs it keeps,
-/// and the state file it recorded its worktree in and dropped it from.
-/// Nothing in the repository, and nothing else in the home.
+/// the state file it recorded its worktree in and dropped it from, and the
+/// memory files every worktree pando makes writes above it. Nothing in the
+/// repository, and nothing else in the home.
 fn a_check_may_change(relative: &str, project: &str) -> bool {
     let Some(inside) = relative
         .strip_prefix("projects/")
@@ -1801,7 +1805,13 @@ fn a_check_may_change(relative: &str, project: &str) -> bool {
     inside.is_empty()
         || matches!(
             inside,
-            "check.json" | "check.lock" | "state.json" | "state.lock" | "logs"
+            "check.json"
+                | "check.lock"
+                | "state.json"
+                | "state.lock"
+                | "logs"
+                | "CLAUDE.md"
+                | "AGENTS.md"
         )
         || inside.ends_with(".lock")
         || inside.starts_with("logs/.pando-check")
