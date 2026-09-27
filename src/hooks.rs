@@ -477,10 +477,65 @@ fn append(path: &Path, text: &str) {
 
 /// The closing line of the output, which is where a build tool puts the
 /// reason it stopped.
+/// The line of a failed run's output that says why: the last one that
+/// reads as an error, or else the last one that says anything at all.
+///
+/// The closing line alone was often nothing — a `}` ending a printed
+/// error object, a stack frame — while the sentence that said what went
+/// wrong sat a few lines up. Stack frames (`at …`) and lines of bare
+/// punctuation are passed over; a line naming an error, a failure, a
+/// refusal or a missing thing is preferred to one that does not.
 fn last_line(text: &str) -> String {
-    match text.lines().rev().find(|l| !l.trim().is_empty()) {
-        Some(line) => format!(": {}", line.trim()),
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| says_something(l))
+        .collect();
+    let reason = lines
+        .iter()
+        .rev()
+        .find(|l| reads_as_an_error(l))
+        .or(lines.last());
+    match reason {
+        Some(line) => format!(": {}", clip(line, REASON_CHARS)),
         None => String::new(),
+    }
+}
+
+/// How much of a reason line is kept: it goes into a sentence, and the
+/// whole log is a path away.
+const REASON_CHARS: usize = 240;
+
+/// Whether a line of output has words in it: not blank, not bare
+/// punctuation, not a frame of a stack trace.
+fn says_something(line: &str) -> bool {
+    line.chars().any(char::is_alphanumeric) && !line.starts_with("at ")
+}
+
+fn reads_as_an_error(line: &str) -> bool {
+    const SIGNS: [&str; 13] = [
+        "error",
+        "err!",
+        "failed",
+        "failure",
+        "exception",
+        "denied",
+        "refused",
+        "not found",
+        "no such",
+        "cannot",
+        "can't",
+        "panicked",
+        "fatal error",
+    ];
+    let lower = line.to_lowercase();
+    SIGNS.iter().any(|sign| lower.contains(sign))
+}
+
+fn clip(line: &str, chars: usize) -> String {
+    match line.char_indices().nth(chars) {
+        Some((at, _)) => format!("{}…", &line[..at]),
+        None => line.to_string(),
     }
 }
 
@@ -765,6 +820,30 @@ mod tests {
         assert!(msg.contains("ERR_PNPM_OUTDATED_LOCKFILE"), "{msg}");
         assert!(msg.contains("install.log"), "{msg}");
         assert!(std::fs::read_to_string(&log).unwrap().contains("ERR_PNPM"));
+    }
+
+    // A schema step died on a database error and printed the error object
+    // after it: the closing line was `}`, and "exited 1: }" was all a
+    // failed start said. The line that says what went wrong is the reason.
+    #[test]
+    fn a_failing_hook_is_explained_by_the_line_that_says_why() {
+        let log = "Connected to the database\n\
+                   Executing migration: schema.sql...\n\
+                   Database initialization failed:\n\
+                   SqlError: (conn:7, no: 1071, SQLState: 42000) Specified key was too long\n\
+                   \x20   at Module.createError (file:///x/errors.js:66:10)\n\
+                   \x20   at Query.readResponsePacket (file:///x/parser.js:70:21)\n\
+                   {\n  errno: 1071,\n  fatal: false,\n  code: 'ER_TOO_LONG_KEY'\n}\n";
+        assert_eq!(
+            last_line(log),
+            ": SqlError: (conn:7, no: 1071, SQLState: 42000) Specified key was too long"
+        );
+        // With nothing that reads as an error, the last line with words.
+        assert_eq!(last_line("building\ndone in 3s\n)\n"), ": done in 3s");
+        assert_eq!(last_line("\n  \n"), "");
+        // A long line is clipped: the log has the rest.
+        let long = format!("error: {}\n", "x".repeat(400));
+        assert_eq!(last_line(&long).chars().count(), 2 + REASON_CHARS + 1);
     }
 
     #[test]

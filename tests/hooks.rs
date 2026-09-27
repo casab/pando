@@ -263,6 +263,11 @@ fn when_both_the_command_and_its_fallback_fail_the_fallbacks_reason_is_reported(
         .unwrap_err()
     );
     assert!(err.contains("the migrate hook failed"), "{err}");
+    // Where the entry is, and the ways to fix it — never "delete it".
+    assert!(
+        err.contains("fix or remove it there, or have your coding agent run `pando init --agent`"),
+        "{err}"
+    );
     assert!(err.contains("SECOND"), "{err}");
     assert!(
         err.contains("FIRST"),
@@ -499,9 +504,10 @@ fn a_hook_that_leaves_an_untracked_file_in_the_worktree_names_it() {
 
 // A hook pando invented — the detected `migrate` this phase adds is the one
 // that matters — failed with a message naming the hook but never saying
-// pando wrote it, nor where the one edit lives.
+// pando wrote it, nor where the one edit lives. It says both, and how to
+// fix it: there, or through the developer's coding agent.
 #[test]
-fn a_failing_hook_names_the_entry_it_came_from_and_says_it_can_be_deleted() {
+fn a_failing_hook_names_the_entry_it_came_from_and_how_to_fix_it() {
     let f = hx(Kind::Plain, |_| {
         "[project]\ninstall = \"true\"\n\n\
          [dev]\ncmd = \"sleep 30\"\nports = []\n\n\
@@ -528,7 +534,12 @@ fn a_failing_hook_names_the_entry_it_came_from_and_says_it_can_be_deleted() {
         err.contains(&f.paths.config_file().display().to_string()),
         "it names the file the one edit lives in: {err}"
     );
-    assert!(err.contains("delete it"), "{err}");
+    assert!(err.contains("fix or remove it there"), "{err}");
+    assert!(
+        err.contains("`pando init --agent` and `pando check`"),
+        "{err}"
+    );
+    assert!(err.contains("exited 7: boom"), "{err}");
 }
 
 // `fingerprint = ["prisma/migrations"]` instead of `["prisma/migrations/**"]`

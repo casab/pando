@@ -497,7 +497,8 @@ fn hook_failed(paths: &PandoPaths, config: &Config, hook: &config::HookConfig) -
         return base;
     }
     format!(
-        "{base} — this is the [[hooks]] entry named {:?} in {}; delete it if it is wrong",
+        "{base} — this is the [[hooks]] entry named {:?} in {}; fix or remove it there, or \
+         have your coding agent run `pando init --agent` and `pando check`",
         hook.name,
         hook_source_file(paths, &hook.name).display()
     )
