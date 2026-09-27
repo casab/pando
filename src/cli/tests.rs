@@ -2505,6 +2505,20 @@ fn the_setup_prompt_only_names_commands_pando_has() {
     );
 }
 
+// One prompt, everywhere: the README a person reads first hands them the
+// same line the setup screen copies, word for word.
+#[test]
+fn the_readme_carries_the_setup_prompt_as_it_is() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md");
+    let text = std::fs::read_to_string(&path).expect("the README");
+    assert!(
+        text.lines().any(|line| line == crate::setup::SETUP_PROMPT),
+        "README.md does not carry the setup prompt on a line of its own: {}",
+        crate::setup::SETUP_PROMPT
+    );
+    assert_every_command_is_real("README.md's setup prompt", crate::setup::SETUP_PROMPT);
+}
+
 // The job an agent follows lists the commands it will run; the same
 // rename would rot it.
 #[test]

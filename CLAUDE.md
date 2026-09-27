@@ -56,6 +56,18 @@ lifecycle, detection, share, the CLI, the TUI and doctor, and 0.4.0 was
 built and tagged with them. The findings it left for the maintainer,
 each with why, are in `plans/open-follow-ups.md`.
 
+On 2026-09-27 the guided first run was built, from
+`plans/first-run-setup.md`: the first `pando` in a project with nothing
+to run opens a setup screen whose one-line prompt hands the job to the
+developer's own coding agent; `pando init --agent` prints that job,
+`pando init --answers - --replace` corrects an answer, and `pando check`
+proves the setup in a throwaway detached worktree it removes again. The
+screen turns green by itself when a check passes; `esc` always skips it,
+and a project configured before this is never sent to it. Where a
+project's setup stands is `setup::read`, from files under `~/.pando`
+only. It is unreleased, and the maintainer's own proof on a real project,
+with a real agent, is next.
+
 What is left is not a phase. `plans/open-follow-ups.md` carries the known
 edges, each with who found it and where it belongs, and the release
 checklist in `docs/08-roadmap.md` is untouched: no licence, no CI, no
@@ -123,12 +135,14 @@ database, a prod schema dump, and cookie auth."
 
 ## Testing policy
 
-- Mutating commands (`new`, `start`, `stop`, `rm`, `share`, `init`) run only
-  against generated fixture repositories in temporary directories. Tests
-  create them; a fixtures script creates them for manual runs.
+- Mutating commands (`new`, `start`, `stop`, `rm`, `share`, `init`,
+  `check`) run only against generated fixture repositories in temporary
+  directories. Tests create them; a fixtures script creates them for
+  manual runs. `check` counts: it makes and removes a worktree, runs the
+  project's install and starts its apps.
 - Real repositories on this machine may be used only with read-only commands:
-  `ls`, `doctor`, `signals`, `status`, `path`. Never `new` or `start` on them
-  during development.
+  `ls`, `doctor`, `signals`, `status`, `path`, `init --agent`. Never `new`,
+  `start` or `check` on them during development.
 - dwt's origin project is read-only in the same way, and more strictly:
   reading its files and those read-only commands, run with `PANDO_HOME`
   pointed at a temporary directory so the maintainer's own `~/.pando` is

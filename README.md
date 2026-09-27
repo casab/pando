@@ -58,17 +58,43 @@ grant you give once to that prefix and nothing else, and dropped only by
 `rm`, only when pando's own records say pando made it. See
 [Shared, namespaced, isolated](#shared-namespaced-isolated).
 
-## First run
+## Your first run
+
+Install pando (see [Install](#install)), then:
 
 ```bash
 cd your-project
-pando            # the TUI: n makes a worktree, s starts it
+pando
 ```
 
-Nothing is asked where pando can tell. It reads the repository — the
-lockfile, the dev script, the env example, the version file — and takes
-its own first choice for anything it has one for, printing each as it goes
-with the file it wrote it to:
+The first time, pando opens its setup screen instead of the list. Every
+project is a little different, so the surest start is to let your own
+coding agent look at it. Press `a` to copy this one line, and paste it
+into Claude Code or Codex, opened in the project:
+
+```
+Set up pando for this project: run `pando init --agent` and follow what it says.
+```
+
+`pando init --agent` prints the job for this project and this version of
+pando: what pando already sees, the questions only the project can
+answer, and the steps. The agent answers through `pando init --answers -`
+on stdin, never a file in your repository, and proves the answers with
+`pando check`: a throwaway worktree of the commit a new branch would fork
+from, installed, started, its page asked for, and removed again, with no
+branch and nothing left behind. When it passes, the agent says so, and
+the setup screen turns green by itself: you're ready. From then on,
+`pando` opens the list.
+
+No agent? Press enter on the setup screen and pando tries its own guess,
+tested by the same `pando check`. Esc skips the setup altogether and goes
+straight to the list; nothing is ever gated on it.
+
+`pando new` and `pando start` work on a project that was never set up
+too. Nothing is asked where pando can tell: it reads the repository —
+the lockfile, the dev script, the env example, the version file — and
+takes its own first choice for anything it has one for, printing each as
+it goes with the file it wrote it to:
 
 ```
 pando: process list: using "npm run dev" (package.json scripts.dev, which starts the
@@ -78,14 +104,10 @@ pando: process list: using "npm run dev" (package.json scripts.dev, which starts
 
 That file is the whole configuration; edit any line, or delete one and
 run `pando init`, which puts every open question to you instead of taking
-a default. `pando doctor` says what was detected and from where. A
-question pando has no option for at all is still asked, and so is the one
-real choice isolation brings — which services to run private copies of.
-
-A project pando cannot read on its own — a dev server started some way no
-rule knows — is what the agent plugin below is for: `/pando:pando-setup`
-in Claude Code reads the project, writes the answers through
-`pando init --answers`, and proves them by starting a scratch worktree.
+a default. `pando doctor` says what was detected and from where, and
+`pando check` tests the setup again at any time. A question pando has no
+option for at all is still asked, and so is the one real choice
+isolation brings — which services to run private copies of.
 
 ## For agents
 
@@ -100,6 +122,11 @@ parsing English, and answers come back through one validated write path.
   `pando init --answers`, never a byte in the repository.
 - [`agent/`](agent/README.md) — a Claude Code plugin and Codex skills, both
   thin over that one brief.
+
+The binary carries the brief and the shapes too: `pando init --agent`
+prints the setup job for the project you are in, and
+`pando init --agent --reference brief` or `--reference json` prints either
+document whole.
 
 ## Commands
 
@@ -149,6 +176,7 @@ t        share it publicly, or stop sharing
 ! e      a shell in it, or open it in your editor
 n d      new worktree, remove one
 p        open pull requests: ⏎ makes a worktree for one
+a v      copy the setup prompt, or test the setup (pando check)
 m ?      what pando said in full, and every key
 ```
 
