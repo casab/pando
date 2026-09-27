@@ -135,8 +135,8 @@ pub const LIST_LEGEND: &[(&str, &str)] = &[
     ("✗", "failed — l shows the log that says why"),
     ("○", "stopped — s starts it"),
     (
-        "uncommitted",
-        "changes: uncommitted changes — the detail pane's git row says more",
+        "◍ #n open",
+        "PR: its pull request — ◌ draft, ✓ merged, ✗ closed",
     ),
     (
         "prunable",
@@ -147,13 +147,17 @@ pub const LIST_LEGEND: &[(&str, &str)] = &[
         "◈",
         "public: shared on the internet — O opens, C copies the URL",
     ),
-    ("isolated", "mode: runs private copies of the services"),
+    ("▣", "mode: isolated — runs private copies of the services"),
     (
-        "namespaced",
-        "mode: a database and a slot of its own in the project's own servers (experimental)",
+        "◧",
+        "mode: namespaced — a database and a slot of its own in the project's own servers \
+         (experimental)",
+    ),
+    (
+        "✎",
+        "git: uncommitted changes — the detail pane's git row says more",
     ),
     ("↑n ↓n", "git: commits ahead of / behind the base branch"),
-    ("◍n", "its pull request: ◌ draft, ✓ merged, ✗ closed"),
     (
         "gh @login",
         "the GitHub account gh uses in this project's directory; R asks again",

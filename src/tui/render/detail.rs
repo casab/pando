@@ -14,7 +14,9 @@ use crate::theme::{
 };
 use crate::tui::app::{App, compact_age};
 
-use super::list::{pr_color, row_marker, run_marker, signal_color, signal_text};
+use super::list::{
+    mode_mark, pr_chip, pr_color, row_marker, run_marker, signal_color, signal_text,
+};
 use super::{chunk_cells, home_relative, text_width, truncate, truncate_line, truncate_middle};
 
 // Detail rows, by how much they are worth keeping when the pane is short.
@@ -232,9 +234,15 @@ pub(super) fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
             detail_row(
                 "pr",
                 vec![
-                    Span::styled(format!("#{}", pr.number), Style::new().fg(pr_color(pr))),
+                    Span::styled(pr_chip(pr), Style::new().fg(pr_color(pr))),
                     Span::styled(
-                        format!("  {}", truncate(&pr.title, width.saturating_sub(18))),
+                        format!(
+                            "  {}",
+                            truncate(
+                                &pr.title,
+                                width.saturating_sub(LABEL_WIDTH + text_width(&pr_chip(pr)) + 2)
+                            )
+                        ),
                         Style::new().fg(text_dim()),
                     ),
                 ],
@@ -302,13 +310,18 @@ fn mode_row<'a>(app: &App, name: &str, width: usize) -> Option<Line<'a>> {
         ),
         ServiceMode::Shared => (text_dim(), "  the project's services · i isolates"),
     };
-    let word = mode.word();
+    // The list's mark beside the word, so the mark is learnt here.
+    let word = match mode_mark(mode) {
+        Some((mark, _)) => format!("{mark} {}", mode.word()),
+        None => mode.word().to_string(),
+    };
+    let used = text_width(&word);
     Some(detail_row(
         "mode",
         vec![
             Span::styled(word, Style::new().fg(color)),
             Span::styled(
-                truncate(what, width.saturating_sub(LABEL_WIDTH + word.len())),
+                truncate(what, width.saturating_sub(LABEL_WIDTH + used)),
                 Style::new().fg(text_muted()),
             ),
         ],
@@ -319,27 +332,28 @@ fn mode_row<'a>(app: &App, name: &str, width: usize) -> Option<Line<'a>> {
 /// the branch stands from its base. The same facts `pando ls` prints in its
 /// GIT column, in words.
 fn git_row(app: &App, wt: &crate::worktree::Worktree, width: usize) -> Line<'static> {
-    let mut parts: Vec<(String, Style)> = Vec::new();
+    let mut parts: Vec<Vec<Span<'static>>> = Vec::new();
     match wt.dirty {
-        Some(true) => parts.push((
-            "uncommitted changes".to_string(),
+        Some(true) => parts.push(vec![Span::styled(
+            "✎ uncommitted changes",
             Style::new().fg(yellow()).add_modifier(Modifier::BOLD),
-        )),
-        Some(false) => parts.push(("clean".to_string(), Style::new().fg(text_dim()))),
+        )]),
+        Some(false) => parts.push(vec![Span::styled("clean", Style::new().fg(text_dim()))]),
         // Unknown is only `reading` while a read is under way. A worktree
         // whose directory is gone has nothing to read, and a `git status`
         // that failed or ran out of time is not going to answer by itself.
-        None if wt.prunable => parts.push((
-            "no working tree to read".to_string(),
+        None if wt.prunable => parts.push(vec![Span::styled(
+            "no working tree to read",
             Style::new().fg(signal_color(wt)),
-        )),
-        None if app.enriching > 0 || app.git_refreshing => {
-            parts.push(("reading git…".to_string(), Style::new().fg(text_muted())))
-        }
-        None => parts.push((
-            "status could not be read".to_string(),
+        )]),
+        None if app.enriching > 0 || app.git_refreshing => parts.push(vec![Span::styled(
+            "reading git…",
             Style::new().fg(text_muted()),
-        )),
+        )]),
+        None => parts.push(vec![Span::styled(
+            "status could not be read",
+            Style::new().fg(text_muted()),
+        )]),
     }
     if let Some((ahead, behind)) = wt.ahead_behind {
         let base = app
@@ -347,23 +361,40 @@ fn git_row(app: &App, wt: &crate::worktree::Worktree, width: usize) -> Line<'sta
             .as_deref()
             .map(|b| format!(" of {b}"))
             .unwrap_or_default();
-        let drift = match (ahead, behind) {
-            (0, 0) => format!(
-                "even with {}",
-                app.default_base.as_deref().unwrap_or("the base")
-            ),
-            (a, 0) => format!("↑{a} ahead{base}"),
-            (0, b) => format!("↓{b} behind{base}"),
-            (a, b) => format!("↑{a} ahead, ↓{b} behind{base}"),
+        // Ahead and behind in the list's colours; the words stay dim.
+        let dim = Style::new().fg(text_dim());
+        let [up, down] = [green(), yellow()].map(|color| Style::new().fg(color));
+        let drift: Vec<Span<'static>> = match (ahead, behind) {
+            (0, 0) => vec![Span::styled(
+                format!(
+                    "even with {}",
+                    app.default_base.as_deref().unwrap_or("the base")
+                ),
+                dim,
+            )],
+            (a, 0) => vec![
+                Span::styled(format!("↑{a}"), up),
+                Span::styled(format!(" ahead{base}"), dim),
+            ],
+            (0, b) => vec![
+                Span::styled(format!("↓{b}"), down),
+                Span::styled(format!(" behind{base}"), dim),
+            ],
+            (a, b) => vec![
+                Span::styled(format!("↑{a}"), up),
+                Span::styled(" ahead, ", dim),
+                Span::styled(format!("↓{b}"), down),
+                Span::styled(format!(" behind{base}"), dim),
+            ],
         };
-        parts.push((drift, Style::new().fg(text_dim())));
+        parts.push(drift);
     }
     let mut spans: Vec<Span<'static>> = Vec::new();
-    for (i, (text, style)) in parts.into_iter().enumerate() {
+    for (i, part) in parts.into_iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled(" · ", Style::new().fg(text_muted())));
         }
-        spans.push(Span::styled(text, style));
+        spans.extend(part);
     }
     super::truncate_line(detail_row("git", spans), width)
 }

@@ -547,16 +547,16 @@ fn list_columns_shed_the_least_useful_first_and_the_status_last() {
     assert_eq!(
         list_columns(200, &all),
         vec![
+            Col::Pr,
             Col::Aside,
             Col::Port,
             Col::Ports,
             Col::Share,
             Col::Mode,
             Col::Signals,
-            Col::Pr,
             Col::Status,
         ],
-        "wide enough for everything, the status word last"
+        "wide enough for everything, the pull request first, the status word last"
     );
     let medium = list_columns(80, &all);
     assert!(!medium.contains(&Col::Ports), "{medium:?}");
@@ -565,9 +565,12 @@ fn list_columns_shed_the_least_useful_first_and_the_status_last() {
         "{medium:?}"
     );
 
-    let narrow = list_columns(30, &all);
+    let narrow = list_columns(35, &all);
     assert!(!narrow.contains(&Col::Port), "{narrow:?}");
     assert!(narrow.contains(&Col::Status), "{narrow:?}");
+    // Narrower still, the uncommitted mark outlasts the status word.
+    let narrower = list_columns(24, &all);
+    assert_eq!(narrower, vec![Col::Signals], "{narrower:?}");
 
     assert_eq!(
         list_columns(16, &all),
@@ -706,10 +709,9 @@ fn a_header_row_names_each_column_over_its_cells() {
     let row = list_row(&rendered, "feat/one");
     for (title, cell) in [
         ("branch", "feat/one"),
-        ("changes", "uncommitted"),
         ("port", ":17342"),
-        ("mode", "isolated"),
-        ("git", "↑1"),
+        ("mode", "▣"),
+        ("git", "✎ ↑1"),
     ] {
         let at = |line: &str, needle: &str| {
             line.find(needle)
@@ -2494,8 +2496,8 @@ fn removing_a_running_worktree_warns_that_it_stops_it() {
 
 // ---- git state on screen ---------------------------------------------
 
-// A worktree with uncommitted changes says `uncommitted` right after its
-// label, even on a pane too narrow for the drift column.
+// A worktree with uncommitted changes is marked `✎` in its git cell, even
+// on a pane too narrow for the pull request or the status word.
 #[test]
 fn a_dirty_worktree_is_marked_in_the_list_at_any_width() {
     let mut app = test_app(&["feat+tui", "feat+clean"]);
@@ -2503,12 +2505,109 @@ fn a_dirty_worktree_is_marked_in_the_list_at_any_width() {
     for width in [60, 100, 200] {
         let rendered = text_of(&draw(&mut app, width, 12));
         let row = list_row(&rendered, "feat/tui");
-        assert!(row.contains("uncommitted"), "at {width}:\n{rendered}");
+        assert!(row.contains("✎"), "at {width}:\n{rendered}");
         assert!(
-            !list_row(&rendered, "feat/clean").contains("uncommitted"),
+            !list_row(&rendered, "feat/clean").contains("✎"),
             "at {width}:\n{rendered}"
         );
     }
+}
+
+// The pull request comes first after the branch: its number, and its state
+// as a mark and a word, in the colour GitHub gives that state.
+#[test]
+fn a_rows_pull_request_says_its_number_and_state_first() {
+    use crate::worktree::PrState;
+    let mut app = test_app(&["feat+open", "feat+draft", "feat+merged", "feat+closed"]);
+    for (branch, number, state, draft) in [
+        ("feat/open", 482, PrState::Open, false),
+        ("feat/draft", 490, PrState::Open, true),
+        ("feat/merged", 463, PrState::Merged, false),
+        ("feat/closed", 400, PrState::Closed, false),
+    ] {
+        app.prs.insert(
+            branch.into(),
+            crate::worktree::PrInfo {
+                state,
+                ..a_pr(number, branch, draft, false)
+            },
+        );
+    }
+    app.worktrees[0].dirty = Some(true);
+    let buf = draw(&mut app, 160, 14);
+    let rendered = text_of(&buf);
+    let header = list_row(&rendered, "branch");
+    let at = |line: &str, needle: &str| {
+        line.find(needle)
+            .map(|i| line[..i].chars().count())
+            .unwrap_or_else(|| panic!("no {needle}:\n{rendered}"))
+    };
+    for (branch, chip, color) in [
+        ("feat/open", "◍ #482 open", green()),
+        ("feat/draft", "◌ #490 draft", crate::theme::text_muted()),
+        ("feat/merged", "✓ #463 merged", crate::theme::magenta()),
+        ("feat/closed", "✗ #400 closed", red()),
+    ] {
+        let row = list_row(&rendered, branch);
+        assert_eq!(at(&row, chip), at(&header, "PR"), "{branch}:\n{rendered}");
+        // The first column after the label's rule.
+        let after_label = row
+            .trim_start_matches('│')
+            .split(" │ ")
+            .nth(1)
+            .unwrap_or_default();
+        assert!(after_label.starts_with(chip), "{branch}:\n{rendered}");
+        assert_eq!(style_at(&buf, branch, chip).fg, Some(color), "{chip}");
+    }
+    assert!(!header.contains("changes"), "{header}");
+}
+
+// Ahead is work of the branch's own, in green; behind is something to
+// rebase onto, in yellow; each with its own arrow.
+#[test]
+fn ahead_and_behind_are_coloured_apart_in_the_list_and_the_detail_pane() {
+    let mut app = test_app(&["feat+one"]);
+    app.worktrees[0].ahead_behind = Some((2, 3));
+    let buf = draw(&mut app, 160, 30);
+    let rendered = text_of(&buf);
+    assert!(
+        list_row(&rendered, "feat/one").contains("↑2 ↓3"),
+        "{rendered}"
+    );
+    assert_eq!(style_at(&buf, "↑2 ↓3", "↑2").fg, Some(green()));
+    assert_eq!(style_at(&buf, "↑2 ↓3", "↓3").fg, Some(yellow()));
+    assert_eq!(style_at(&buf, "│ git ", "↑2 ahead").fg, Some(green()));
+    assert_eq!(style_at(&buf, "│ git ", "↓3 behind").fg, Some(yellow()));
+}
+
+// A mode is a mark in the list, in the mode's colour; the detail pane puts
+// the word beside it.
+#[test]
+fn a_mode_is_a_mark_in_the_list_and_a_mark_and_word_in_the_detail_pane() {
+    use crate::state::ServiceMode;
+    let mut app = test_app(&["feat+iso", "feat+ns"]);
+    with_process(&mut app, "feat+iso", running_phase());
+    with_mode(&mut app, "feat+iso", ServiceMode::Isolated);
+    with_process(&mut app, "feat+ns", running_phase());
+    with_mode(&mut app, "feat+ns", ServiceMode::Namespaced);
+    let buf = draw(&mut app, 180, 30);
+    let rendered = text_of(&buf);
+    let iso = list_row(&rendered, "feat/iso");
+    let ns = list_row(&rendered, "feat/ns");
+    assert!(iso.contains("▣") && !iso.contains("isolated"), "{rendered}");
+    assert!(ns.contains("◧") && !ns.contains("namespaced"), "{rendered}");
+    assert_eq!(
+        style_at(&buf, "feat/iso", "▣").fg,
+        Some(crate::theme::magenta())
+    );
+    assert_eq!(
+        style_at(&buf, "feat/ns", "◧").fg,
+        Some(crate::theme::namespaced())
+    );
+    assert!(
+        rendered.contains("▣ isolated"),
+        "the selected one's detail:\n{rendered}"
+    );
 }
 
 #[test]

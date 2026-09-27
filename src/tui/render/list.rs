@@ -6,10 +6,10 @@
 //! column, so a cell never has to be decoded from help:
 //!
 //! ```text
-//!      branch          │ changes     │ port   │ mode     │ git │ status
-//! ─────────────────────┼─────────────┼────────┼──────────┼─────┼───────
-//!  ▸ ● feat/checkout   │ uncommitted │ :17342 │ isolated │ ↑2  │
-//!    ✗ fix/crash       │             │        │          │     │ failed
+//!      branch          │ PR           │ port   │ mode │ git     │ status
+//! ─────────────────────┼──────────────┼────────┼──────┼─────────┼───────
+//!  ▸ ● feat/checkout   │ ◍ #482 open  │ :17342 │ ▣    │ ✎ ↑2 ↓1 │
+//!    ✗ fix/crash       │ ✓ #463 merged│        │      │         │ failed
 //! ```
 //!
 //! Faint lines divide the columns and rule the header off; the rows sit
@@ -26,9 +26,13 @@
 //! about what a key does — the detail pane and the remove dialog say it
 //! where it matters.
 //!
-//! `uncommitted` sits right after the label and is
-//! never shed: it is what stops a removal, and what somebody switching
-//! branches most needs to see.
+//! The pull request sits right after the label — its number and whether
+//! it is open, a draft, merged or closed — because whether a branch has
+//! landed is what somebody choosing among thirty worktrees asks first.
+//! The mode is a mark, not a word, and so is uncommitted work: `✎` leads
+//! the git cell, and that column is the last to be shed, because it is
+//! what stops a removal. A cell may be in more than one colour — ahead is green and
+//! behind yellow in one `↑2 ↓1` — and each part also has its own glyph.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -68,8 +72,8 @@ const ROW_NAME_MIN: usize = 12;
 /// label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Col {
-    /// `uncommitted` for uncommitted changes. Never shed.
-    Dirty,
+    /// Its pull request: `◍ #482 open`, `✓ #463 merged`.
+    Pr,
     /// The directory name, when it is not just the branch with its
     /// slashes encoded — an adopted worktree somebody named themselves.
     Aside,
@@ -81,11 +85,12 @@ pub enum Col {
     Ports,
     /// `◈` for a worktree with a public URL.
     Share,
-    /// `isolated` for a worktree with private copies of the services.
+    /// `▣` for a worktree with private copies of the services, `◧` for one
+    /// with a namespace of its own in the project's servers.
     Mode,
-    /// Ahead and behind, or prunable or locked.
+    /// `✎` for uncommitted changes, then ahead and behind; or prunable or
+    /// locked. The last column shed.
     Signals,
-    Pr,
     /// `failed`, or what is being done to it: `starting`, `stopping`…
     /// Empty for a worktree that simply runs or is stopped.
     Status,
@@ -95,14 +100,13 @@ impl Col {
     /// What the header row calls it.
     pub fn title(self) -> &'static str {
         match self {
-            Col::Dirty => "changes",
+            Col::Pr => "PR",
             Col::Aside => "dir",
             Col::Port => "port",
             Col::Ports => "other ports",
             Col::Share => "public",
             Col::Mode => "mode",
             Col::Signals => "git",
-            Col::Pr => "PR",
             Col::Status => "status",
         }
     }
@@ -112,29 +116,30 @@ impl Col {
 const LABEL_TITLE: &str = "branch";
 
 /// Left to right.
-const LAYOUT: [Col; 9] = [
-    Col::Dirty,
+const LAYOUT: [Col; 8] = [
+    Col::Pr,
     Col::Aside,
     Col::Port,
     Col::Ports,
     Col::Share,
     Col::Mode,
     Col::Signals,
-    Col::Pr,
     Col::Status,
 ];
 
 /// The order columns give way in when the label is too narrow to read:
-/// the least useful first, the status word last.
+/// the least useful first. The git column goes after the status word,
+/// because it carries the uncommitted mark; only a sliver of a pane,
+/// where the label alone fits, loses it.
 const SHED: [Col; 8] = [
     Col::Ports,
     Col::Aside,
-    Col::Signals,
-    Col::Pr,
     Col::Mode,
     Col::Port,
     Col::Share,
+    Col::Pr,
     Col::Status,
+    Col::Signals,
 ];
 
 /// Which optional columns survive at this pane width, given each one's
@@ -164,6 +169,13 @@ pub fn list_columns(list_width: usize, widths: &[(Col, usize)]) -> Vec<Col> {
     shown
 }
 
+/// What one cell says: a run of text in one colour, or several.
+type Cell = Vec<Span<'static>>;
+
+fn cell_width(cell: &Cell) -> usize {
+    cell.iter().map(|span| text_width(&span.content)).sum()
+}
+
 /// One row's cells, before the list decides which columns it can afford.
 struct RowCells {
     glyph: (&'static str, Color),
@@ -172,13 +184,20 @@ struct RowCells {
     /// full brightness, and a stopped one's recedes, so the eye goes to
     /// the few rows that run in a list of thirty.
     live: bool,
-    cells: Vec<(Col, String, Style)>,
+    cells: Vec<(Col, Cell)>,
 }
 
 impl RowCells {
-    fn cell(&self, col: Col) -> Option<&(Col, String, Style)> {
-        self.cells.iter().find(|(c, _, _)| *c == col)
+    fn cell(&self, col: Col) -> Option<&Cell> {
+        self.cells
+            .iter()
+            .find(|(c, _)| *c == col)
+            .map(|(_, cell)| cell)
     }
+}
+
+fn one(text: impl Into<String>, style: Style) -> Cell {
+    vec![Span::styled(text.into(), style)]
 }
 
 fn row_cells(app: &App, wt: &Worktree) -> RowCells {
@@ -190,7 +209,7 @@ fn row_cells(app: &App, wt: &Worktree) -> RowCells {
         None => Some("detached".to_string()),
     };
     if let Some(aside) = aside {
-        cells.push((Col::Aside, aside, Style::new().fg(text_muted())));
+        cells.push((Col::Aside, one(aside, Style::new().fg(text_muted()))));
     }
 
     let phase = app.phase_of(&wt.name);
@@ -212,7 +231,7 @@ fn row_cells(app: &App, wt: &Worktree) -> RowCells {
         if matches!(phase, Some(Aggregate::Failed { .. })) && pending.is_none() {
             style = style.add_modifier(Modifier::BOLD);
         }
-        cells.push((Col::Status, word.to_string(), style));
+        cells.push((Col::Status, one(word, style)));
     }
 
     // Only while something runs: a stopped or failed worktree keeps its
@@ -228,7 +247,7 @@ fn row_cells(app: &App, wt: &Worktree) -> RowCells {
         && served
         && let Some(port) = &url_port
     {
-        cells.push((Col::Port, format!(":{port}"), Style::new().fg(cyan())));
+        cells.push((Col::Port, one(format!(":{port}"), Style::new().fg(cyan()))));
     }
     if up
         && let Some(record) = app.record_for(&wt.name)
@@ -242,38 +261,21 @@ fn row_cells(app: &App, wt: &Worktree) -> RowCells {
             .collect::<Vec<_>>()
             .join(" ");
         if !others.is_empty() {
-            cells.push((Col::Ports, others, Style::new().fg(text_dim())));
+            cells.push((Col::Ports, one(others, Style::new().fg(text_dim()))));
         }
     }
     if app.public_url_of(&wt.name).is_some() {
-        cells.push((Col::Share, "◈".to_string(), Style::new().fg(green())));
+        cells.push((Col::Share, one("◈", Style::new().fg(green()))));
     }
-    match app.record_for(&wt.name).map(|r| r.mode()) {
-        Some(ServiceMode::Isolated) => cells.push((
-            Col::Mode,
-            ServiceMode::Isolated.word().to_string(),
-            Style::new().fg(magenta()),
-        )),
-        Some(ServiceMode::Namespaced) => cells.push((
-            Col::Mode,
-            ServiceMode::Namespaced.word().to_string(),
-            Style::new().fg(namespaced()),
-        )),
-        Some(ServiceMode::Shared) | None => {}
+    if let Some((mark, color)) = app.record_for(&wt.name).and_then(|r| mode_mark(r.mode())) {
+        cells.push((Col::Mode, one(mark, Style::new().fg(color))));
     }
-    if wt.dirty == Some(true) && !wt.prunable && !wt.locked {
-        cells.push((
-            Col::Dirty,
-            "uncommitted".to_string(),
-            Style::new().fg(yellow()),
-        ));
-    }
-    let drift = drift_text(wt);
-    if !drift.is_empty() {
-        cells.push((Col::Signals, drift, Style::new().fg(signal_color(wt))));
+    let git = git_cell(wt);
+    if !git.is_empty() {
+        cells.push((Col::Signals, git));
     }
     if let Some(pr) = app.pr_for(wt) {
-        cells.push((Col::Pr, pr_chip(pr), Style::new().fg(pr_color(pr))));
+        cells.push((Col::Pr, one(pr_chip(pr), Style::new().fg(pr_color(pr)))));
     }
     RowCells {
         glyph: (glyph, color),
@@ -371,7 +373,7 @@ pub(super) fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
             let widest = rows
                 .iter()
                 .filter_map(|row| row.cell(col))
-                .map(|(_, text, _)| text_width(text))
+                .map(cell_width)
                 .max()
                 .unwrap_or(0);
             // A column with something in it is at least as wide as its
@@ -407,7 +409,7 @@ pub(super) fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
     // A branch cut short is the one thing the list exists to show. The
     // columns the detail pane repeats in full give way, least useful
     // first, before any label is cut.
-    for col in [Col::Ports, Col::Aside, Col::Pr, Col::Signals] {
+    for col in [Col::Ports, Col::Aside] {
         if label_room(&shown) >= widest_label {
             break;
         }
@@ -505,12 +507,12 @@ pub(super) fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
         ];
         for col in &shown {
             let w = col_width(col);
-            let (text, style) = row
-                .cell(*col)
-                .map(|(_, text, style)| (text.as_str(), *style))
-                .unwrap_or(("", Style::new()));
+            let cell = row.cell(*col).cloned().unwrap_or_default();
+            let cell = truncate_line(Line::from(cell), w).spans;
+            let used = cell_width(&cell);
             spans.push(Span::styled(COL_RULE, grid));
-            spans.push(Span::styled(pad(&truncate(text, w), w), style));
+            spans.extend(cell);
+            spans.push(Span::raw(" ".repeat(w.saturating_sub(used))));
         }
         let mut line = fill_to(spans);
         if is_selected {
@@ -551,13 +553,53 @@ pub(in crate::tui) fn run_marker(phase: Option<&Aggregate>) -> (&'static str, Co
     }
 }
 
-/// How far a row's branch has drifted, or what is wrong with it: the
-/// signals without the dirty mark, which has a column of its own.
-pub(super) fn drift_text(wt: &Worktree) -> String {
-    if wt.prunable || wt.locked {
-        return signal_text(wt);
+/// The mark for a mode that is not the default one, in its colour: `▣`,
+/// a box of its own, for private copies of the services; `◧`, part of a
+/// box, for a namespace in the project's own servers.
+pub(super) fn mode_mark(mode: ServiceMode) -> Option<(&'static str, Color)> {
+    match mode {
+        ServiceMode::Isolated => Some(("▣", magenta())),
+        ServiceMode::Namespaced => Some(("◧", namespaced())),
+        ServiceMode::Shared => None,
     }
-    signal_text(wt).trim_start_matches('*').to_string()
+}
+
+/// A row's git cell: what is wrong with its entry, or `✎` for uncommitted
+/// changes, `↑n` ahead in green — work of its own, ready to push — and
+/// `↓n` behind in yellow, something to rebase onto.
+pub(super) fn git_cell(wt: &Worktree) -> Cell {
+    if wt.prunable || wt.locked {
+        return one(signal_text(wt), Style::new().fg(signal_color(wt)));
+    }
+    let mut parts = Vec::new();
+    if wt.dirty == Some(true) {
+        parts.push(("✎".to_string(), yellow()));
+    }
+    for (text, color) in drift_parts(wt) {
+        parts.push((text, color));
+    }
+    let mut cell = Vec::new();
+    for (i, (text, color)) in parts.into_iter().enumerate() {
+        if i > 0 {
+            cell.push(Span::raw(" "));
+        }
+        cell.push(Span::styled(text, Style::new().fg(color)));
+    }
+    cell
+}
+
+/// `↑n` and `↓n`, each in its colour, for whichever is not zero.
+fn drift_parts(wt: &Worktree) -> Vec<(String, Color)> {
+    let mut parts = Vec::new();
+    if let Some((ahead, behind)) = wt.ahead_behind {
+        if ahead > 0 {
+            parts.push((format!("↑{}", cap(ahead)), green()));
+        }
+        if behind > 0 {
+            parts.push((format!("↓{}", cap(behind)), yellow()));
+        }
+    }
+    parts
 }
 
 /// The git state of a row, in one short cell: what is wrong first, then
@@ -603,14 +645,16 @@ fn cap(n: u32) -> String {
     }
 }
 
-fn pr_chip(pr: &PrInfo) -> String {
-    let mark = match pr.state {
-        PrState::Open if pr.draft => "◌",
-        PrState::Open => "◍",
-        PrState::Merged => "✓",
-        PrState::Closed => "✗",
+/// `◍ #482 open`: a mark, the number, and the state in a word, so the
+/// state is read as well as seen.
+pub(super) fn pr_chip(pr: &PrInfo) -> String {
+    let (mark, word) = match pr.state {
+        PrState::Open if pr.draft => ("◌", "draft"),
+        PrState::Open => ("◍", "open"),
+        PrState::Merged => ("✓", "merged"),
+        PrState::Closed => ("✗", "closed"),
     };
-    format!("{mark}{}", pr.number)
+    format!("{mark} #{} {word}", pr.number)
 }
 
 /// GitHub's own colours for a pull request's state, so the chip reads the
