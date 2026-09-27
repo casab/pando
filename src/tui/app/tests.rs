@@ -7309,3 +7309,187 @@ fn help_lists_exactly_the_keys_the_setup_screen_answers() {
         );
     }
 }
+
+// ---- the dashboard's setup line, and a and v from the list ----------------
+
+// `a` on the list copies the setup prompt: the header's hint and the
+// failing line both offer it.
+#[test]
+fn a_on_the_list_copies_the_setup_prompt() {
+    let mut app = test_app(&["feat+one"]);
+    press(&mut app, KeyCode::Char('a'));
+    assert_eq!(app.clipboard.as_deref(), Some(crate::setup::SETUP_PROMPT));
+}
+
+// `v` on the list starts one check, only when there is something to
+// test, and not while one runs; the action slot is never the check's.
+#[test]
+fn v_on_the_list_starts_one_check_when_there_are_settings() {
+    let (_dir, mut app) = app_with_logs(&["feat+one"]);
+    press(&mut app, KeyCode::Char('v'));
+    assert_eq!(
+        app.checks_started, 0,
+        "a process with no command runs nothing"
+    );
+    assert!(app.flash().is_some_and(|s| s.is_error()));
+
+    let (_dir, mut app) = a_setup_screen_every_key_can_act_on();
+    app.setup_screen = None;
+    app.read_setup_row();
+    assert_eq!(
+        app.setup_row.hint(),
+        Some(SetupHint::Note {
+            text: "not tested yet · v tests it".into(),
+            failed: false
+        })
+    );
+    press(&mut app, KeyCode::Char('v'));
+    assert_eq!(app.checks_started, 1);
+    assert!(app.pending.is_none(), "the action slot stays free");
+    assert_eq!(app.setup_row.hint(), Some(SetupHint::Starting));
+    press(&mut app, KeyCode::Char('v'));
+    assert_eq!(app.checks_started, 1, "one at a time");
+
+    // A check someone else started holds the lock: refused too.
+    app.setup_row.check_requested = None;
+    let _held = crate::state::lock(&app.paths.check_lock_file()).unwrap();
+    app.read_setup_row();
+    assert!(matches!(app.setup_row.hint(), Some(SetupHint::Testing(_))));
+    press(&mut app, KeyCode::Char('v'));
+    assert_eq!(app.checks_started, 1, "refused while a check runs");
+}
+
+// The dashboard follows a check as the setup screen does: its record's
+// latest line while it runs, gone once it passes, and a line in `m` to
+// say so.
+#[test]
+fn the_dashboard_follows_a_check_on_the_tick() {
+    let (_dir, mut app) = a_setup_screen_every_key_can_act_on();
+    app.setup_screen = None;
+    app.read_setup_row();
+    let fingerprint = crate::setup::fingerprint(&app.config);
+    let held = crate::state::lock(&app.paths.check_lock_file()).unwrap();
+    let mut running = CheckRecord::begin(fingerprint.clone(), RanBy::Terminal);
+    running.progress = vec!["made a test worktree".into(), "installing".into()];
+    save_record(&app, &running);
+    app.handle_event(AppEvent::Tick);
+    assert_eq!(
+        app.setup_row.hint(),
+        Some(SetupHint::Testing(Some("installing".into())))
+    );
+
+    let mut passed = running.clone();
+    passed.outcome = CheckOutcome::Passed;
+    passed.fingerprint_after = Some(fingerprint);
+    passed.finished_at = Some(Utc::now());
+    save_record(&app, &passed);
+    drop(held);
+    // Ticked until the lock reads free: a test beside this one forking a
+    // child holds a copy of its descriptor until the child execs.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.setup_row.hint().is_some() && Instant::now() < deadline {
+        app.handle_event(AppEvent::Tick);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(app.setup_row.hint(), None, "ready says nothing");
+    assert!(
+        app.active_status()
+            .is_some_and(|(said, _)| said.contains("the test passed")),
+        "{:?}",
+        app.active_status()
+    );
+}
+
+// A config a worker resolved is a new fingerprint: the line is read again
+// against it, so a passed test on other settings reads as stale.
+#[test]
+fn a_config_change_rereads_the_setup_line() {
+    let (_dir, mut app) = a_setup_screen_every_key_can_act_on();
+    app.setup_screen = None;
+    app.read_setup_row();
+    let fingerprint = crate::setup::fingerprint(&app.config);
+    let mut passed = CheckRecord::begin(fingerprint.clone(), RanBy::Terminal);
+    passed.outcome = CheckOutcome::Passed;
+    passed.fingerprint_after = Some(fingerprint);
+    passed.finished_at = Some(Utc::now());
+    save_record(&app, &passed);
+    app.handle_event(AppEvent::Tick);
+    assert_eq!(app.setup_row.hint(), None);
+
+    let mut config = app.config.clone();
+    config.processes.get_mut("web").unwrap().cmd = "pnpm start".into();
+    app.handle_event(AppEvent::ConfigResolved(Box::new(config)));
+    assert_eq!(
+        app.setup_row.hint(),
+        Some(SetupHint::Note {
+            text: "settings changed since the last test · v tests it".into(),
+            failed: false
+        })
+    );
+}
+
+// Leaving the setup screen hands the dashboard the settings and the
+// setup as they are, not as the TUI started.
+#[test]
+fn leaving_the_setup_screen_reads_the_setup_line_against_its_settings() {
+    let (_dir, mut app, rx) = setup_app();
+    app.read_setup_row();
+    save_settings(&mut app, &rx);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(
+        app.setup_row.hint(),
+        Some(SetupHint::Note {
+            text: "not tested yet · v tests it".into(),
+            failed: false
+        })
+    );
+}
+
+// The agent fixes a failing setup with `init --answers --replace` and
+// tests again. The dashboard reads the new settings from their file and
+// the passed record against them: ready, not "settings changed". The
+// session's own config, which starts worktrees, is left as it was.
+#[test]
+fn the_dashboard_reads_a_corrected_setup_against_the_new_settings() {
+    let (_dir, mut app, rx) = setup_app();
+    app.read_setup_row();
+    save_settings(&mut app, &rx);
+    press(&mut app, KeyCode::Enter);
+    let failed = CheckOutcome::Failed {
+        kind: FailureKind::Settings,
+        reason: "web exited after 0.8s".into(),
+    };
+    let mut record = CheckRecord::begin(crate::setup::fingerprint(&app.config), RanBy::Program);
+    record.outcome = failed;
+    record.finished_at = Some(Utc::now());
+    save_record(&app, &record);
+    tick_until(&mut app, &rx, "the failure", |app| {
+        matches!(
+            app.setup_row.hint(),
+            Some(SetupHint::Note { failed: true, .. })
+        )
+    });
+
+    write_seen(
+        &app.paths.config_file(),
+        "[processes.web]\ncmd = \"pnpm start\"\n",
+    );
+    let corrected = crate::config::load(&app.paths).unwrap().config;
+    let fingerprint = crate::setup::fingerprint(&corrected);
+    let mut passed = CheckRecord::begin(fingerprint.clone(), RanBy::Program);
+    passed.outcome = CheckOutcome::Passed;
+    passed.fingerprint_after = Some(fingerprint);
+    passed.finished_at = Some(Utc::now());
+    save_record(&app, &passed);
+    tick_until(&mut app, &rx, "ready", |app| {
+        app.setup_row
+            .setup
+            .as_ref()
+            .is_some_and(|s| s.state == SetupState::Ready)
+    });
+    assert_eq!(app.setup_row.hint(), None, "ready says nothing");
+    assert_eq!(
+        app.config.processes["web"].cmd, "pnpm dev",
+        "the session's config is adopted only as before"
+    );
+}

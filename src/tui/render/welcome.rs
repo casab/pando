@@ -11,9 +11,10 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Padding, Paragraph};
 
-use crate::config::ServiceConfig;
-use crate::theme::{blue, border, orange, text, text_dim, text_muted};
-use crate::tui::app::App;
+use crate::config::{Config, ServiceConfig};
+use crate::setup::{CheckRecord, Setup, SetupState};
+use crate::theme::{blue, border, green, orange, text, text_dim, text_muted};
+use crate::tui::app::{App, compact_age};
 
 use super::{home_relative, truncate, truncate_middle, wrap_text};
 
@@ -36,41 +37,28 @@ pub(super) fn render_welcome(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
     let width = inner.width as usize;
-    let project = &app.paths.project.display_name;
-
     let mut lines: Vec<Line> = Vec::new();
-    let intro = format!(
-        "pando runs one dev environment per branch of {project}: a git worktree, \
-         its dev server on its own port, and its logs."
-    );
-    for row in wrap_text(&intro, width) {
-        lines.push(Line::styled(row, Style::new().fg(text())));
-    }
-    lines.push(Line::raw(""));
-
-    let root = app
-        .main
+    // A project whose test passed says what it proved, never "not settled
+    // yet": the ready view's facts, the same renderer the setup screen
+    // turns green with.
+    let ready = app
+        .setup_row
+        .setup
         .as_ref()
-        .map(|m| m.path.clone())
-        .unwrap_or_else(|| app.paths.root().to_path_buf());
-    let branch = app
-        .main
-        .as_ref()
-        .and_then(|m| m.branch.clone())
-        .map(|b| format!("  on {b}"))
-        .unwrap_or_default();
-    lines.push(fact(
-        "project",
-        format!("{}{branch}", home_relative(&root)),
-        width,
-    ));
-    lines.push(fact("dev", dev_summary(app), width));
-    if let Some(services) = services_summary(app) {
-        lines.push(fact("services", services, width));
+        .filter(|setup| setup.state == SetupState::Ready);
+    if let Some(setup) = ready {
+        let view = ready_view(app, &app.config, setup, width);
+        lines.extend(view.headline);
+        lines.extend(view.when);
+        lines.push(Line::raw(""));
+        lines.extend(view.facts);
+        lines.push(Line::raw(""));
+        lines.extend(view.settings);
+        lines.push(Line::raw(""));
+    } else {
+        welcome_facts(app, &mut lines, width);
     }
     let worktrees_dir = app.config.worktrees_dir(&app.paths);
-    lines.push(fact("worktrees", home_relative(&worktrees_dir), width));
-    lines.push(Line::raw(""));
 
     for (key, what) in [
         (
@@ -123,6 +111,43 @@ pub(super) fn render_welcome(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines), body);
 }
 
+/// What pando is, and what it already knows about the project: the
+/// welcome before a test has passed.
+fn welcome_facts(app: &App, lines: &mut Vec<Line<'static>>, width: usize) {
+    let project = &app.paths.project.display_name;
+    let intro = format!(
+        "pando runs one dev environment per branch of {project}: a git worktree, \
+         its dev server on its own port, and its logs."
+    );
+    for row in wrap_text(&intro, width) {
+        lines.push(Line::styled(row, Style::new().fg(text())));
+    }
+    lines.push(Line::raw(""));
+    let root = app
+        .main
+        .as_ref()
+        .map(|m| m.path.clone())
+        .unwrap_or_else(|| app.paths.root().to_path_buf());
+    let branch = app
+        .main
+        .as_ref()
+        .and_then(|m| m.branch.clone())
+        .map(|b| format!("  on {b}"))
+        .unwrap_or_default();
+    lines.push(fact(
+        "project",
+        format!("{}{branch}", home_relative(&root)),
+        width,
+    ));
+    lines.push(fact("dev", dev_summary(app), width));
+    if let Some(services) = services_summary(app) {
+        lines.push(fact("services", services, width));
+    }
+    let worktrees_dir = app.config.worktrees_dir(&app.paths);
+    lines.push(fact("worktrees", home_relative(&worktrees_dir), width));
+    lines.push(Line::raw(""));
+}
+
 fn fact<'a>(label: &str, value: String, width: usize) -> Line<'a> {
     Line::from(vec![
         Span::styled(
@@ -172,4 +197,197 @@ fn services_summary(app: &App) -> Option<String> {
         "{} — shared by default, i isolates one worktree",
         names.join(" · ")
     ))
+}
+
+/// The ready view's parts: one renderer, fed from a config and the setup
+/// read against it, for the setup screen to lay out by priority and the
+/// dashboard's welcome to show whole. Rows carry no left margin.
+pub(super) struct ReadyView {
+    /// `✓ You're ready to use pando in <project>`.
+    pub headline: Vec<Line<'static>>,
+    /// Who set it up, when it was tested, and with which pando.
+    pub when: Vec<Line<'static>>,
+    /// apps, install, services, and the test row.
+    pub facts: Vec<Line<'static>>,
+    /// Where the settings are, and whose.
+    pub settings: Vec<Line<'static>>,
+}
+
+pub(super) fn ready_view(app: &App, config: &Config, setup: &Setup, width: usize) -> ReadyView {
+    let project = &app.paths.project.display_name;
+    let width = width.max(1);
+    let record = setup.last_check.as_ref();
+
+    let headline = wrap_text(
+        &format!("You're ready to use pando in {project}"),
+        width.saturating_sub(2).max(1),
+    )
+    .into_iter()
+    .enumerate()
+    .map(|(i, row)| {
+        let lead = if i == 0 {
+            Span::styled("✓ ", Style::new().fg(green()).add_modifier(Modifier::BOLD))
+        } else {
+            Span::raw("  ")
+        };
+        Line::from(vec![
+            lead,
+            Span::styled(row, Style::new().fg(text()).add_modifier(Modifier::BOLD)),
+        ])
+    })
+    .collect();
+
+    // "pando's own guess" only when the passing test came after pando
+    // tried on its own: a rule-decided answer reads the same whoever
+    // wrote it, so nothing else can say so honestly.
+    let by_pando = match (setup.memory.tried_by_pando_at, record) {
+        (Some(tried), Some(record)) => record.started_at >= tried,
+        _ => false,
+    };
+    let who = if by_pando {
+        "set up by pando's own guess and tested"
+    } else {
+        "set up and tested"
+    };
+    let when = record
+        .and_then(|r| r.finished_at)
+        .map(|at| ago((chrono::Utc::now() - at).num_seconds()))
+        .unwrap_or_else(|| "just now".to_string());
+    let mut said = format!("{who} {when}");
+    if let Some(record) = record {
+        said.push_str(&format!(" · tested with pando {}", record.pando_version));
+    }
+    let when = wrap_text(&said, width.saturating_sub(2).max(1))
+        .into_iter()
+        .map(|row| Line::styled(format!("  {row}"), Style::new().fg(text_dim())))
+        .collect();
+
+    let room = width.saturating_sub(2);
+    let mut facts = Vec::new();
+    if let Some(apps) = apps_summary(config) {
+        facts.push(indented(fact("apps", apps, room)));
+    }
+    if let Some(install) = config
+        .project
+        .install
+        .as_deref()
+        .filter(|cmd| !cmd.trim().is_empty())
+    {
+        facts.push(indented(fact("install", install.to_string(), room)));
+    }
+    if let Some(names) = service_names(config) {
+        // The check tests the shared mode: the developer's own services,
+        // the ones the main checkout talks to.
+        facts.push(indented(fact(
+            "services",
+            format!("{names} (yours, used as main uses them)"),
+            room,
+        )));
+    }
+    if let Some(record) = record {
+        facts.push(indented(test_row(record, room)));
+    }
+
+    let settings = wrap_text(
+        &format!(
+            "settings: {}, yours to edit",
+            home_relative(&app.paths.config_file())
+        ),
+        width.saturating_sub(2).max(1),
+    )
+    .into_iter()
+    .map(|row| Line::styled(format!("  {row}"), Style::new().fg(text_muted())))
+    .collect();
+
+    ReadyView {
+        headline,
+        when,
+        facts,
+        settings,
+    }
+}
+
+/// "just now" under a minute, a compact age after.
+pub(super) fn ago(secs: i64) -> String {
+    if secs < 60 {
+        "just now".to_string()
+    } else {
+        format!("{} ago", compact_age(secs))
+    }
+}
+
+fn indented(line: Line<'static>) -> Line<'static> {
+    let mut spans = vec![Span::raw("  ")];
+    spans.extend(line.spans);
+    Line::from(spans)
+}
+
+/// `web + api   pnpm dev` when the apps share one command, each app with
+/// its own otherwise.
+fn apps_summary(config: &Config) -> Option<String> {
+    let processes: Vec<(&String, &crate::config::ProcessConfig)> =
+        config.runnable_processes().collect();
+    let (_, first) = processes.first()?;
+    if processes.iter().all(|(_, p)| p.cmd == first.cmd) {
+        let names: Vec<&str> = processes.iter().map(|(n, _)| n.as_str()).collect();
+        return Some(format!("{}   {}", names.join(" + "), first.cmd));
+    }
+    Some(
+        processes
+            .iter()
+            .map(|(name, p)| format!("{name}: {}", p.cmd))
+            .collect::<Vec<_>>()
+            .join(" · "),
+    )
+}
+
+/// `✓ passed   web answered (HTTP 200) · commit a1b2c3d of main`: what
+/// the check proved, and on which commit.
+fn test_row(record: &CheckRecord, width: usize) -> Line<'static> {
+    let mut said = Vec::new();
+    match record.processes.iter().find(|p| p.http_status.is_some()) {
+        Some(probed) => said.push(format!(
+            "{} answered (HTTP {})",
+            probed.name,
+            probed.http_status.unwrap_or_default()
+        )),
+        None if !record.processes.is_empty() => {
+            let names: Vec<&str> = record.processes.iter().map(|p| p.name.as_str()).collect();
+            said.push(format!("{} ready", names.join(", ")));
+        }
+        None => {}
+    }
+    if let Some(commit) = &record.commit {
+        let short: String = commit.chars().take(7).collect();
+        said.push(match &record.base_ref {
+            Some(base) => format!("commit {short} of {base}"),
+            None => format!("commit {short}"),
+        });
+    }
+    let passed = "✓ passed   ";
+    let room = width.saturating_sub(FACT_LABEL + passed.chars().count());
+    Line::from(vec![
+        Span::styled(
+            format!("{:<FACT_LABEL$}", "test"),
+            Style::new().fg(text_muted()),
+        ),
+        Span::styled(passed, Style::new().fg(green())),
+        Span::styled(truncate(&said.join(" · "), room), Style::new().fg(blue())),
+    ])
+}
+
+/// The services' names, one list, as the welcome names them.
+fn service_names(config: &Config) -> Option<String> {
+    let names: Vec<String> = config
+        .services
+        .iter()
+        .map(|service| match service {
+            ServiceConfig::Compose { file, include, .. } if include.is_empty() => {
+                format!("compose ({file})")
+            }
+            ServiceConfig::Compose { include, .. } => include.join(", "),
+            ServiceConfig::Native { name, .. } => name.clone(),
+        })
+        .collect();
+    (!names.is_empty()).then(|| names.join(", "))
 }

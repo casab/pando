@@ -26,15 +26,9 @@ use super::background::{AppEvent, config_now};
 use super::dialogs::Modal;
 use super::pending::SPINNER_FRAMES;
 
-/// The variable that tells `pando check` the TUI started it, for its
-/// record's `ran_by`. `pando check` owns the name; the same literal until
-/// it is shared from there.
-#[cfg(not(test))]
-const CHECK_RAN_BY_ENV: &str = "PANDO_CHECK_RAN_BY";
-
 /// How long a `v` waits for the check it started to say anything before
 /// the screen says it did not start.
-const CHECK_START_TIMEOUT: Duration = Duration::from_secs(10);
+pub(super) const CHECK_START_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The setup screen's state, for as long as it is up.
 pub struct SetupScreen {
@@ -51,6 +45,13 @@ pub struct SetupScreen {
     /// A `v` whose check has not yet said anything: when it was pressed,
     /// on both clocks, so the record it writes can be told from the last.
     pub check_requested: Option<(Instant, DateTime<Utc>)>,
+}
+
+/// The watch on the four files, one for the setup screen and the
+/// dashboard's setup line alike: what was last seen of them, and the one
+/// config re-read a worker may have in flight.
+#[derive(Default)]
+pub struct SetupWatch {
     /// The four files' modification times and sizes, as last seen.
     seen: Watched,
     /// A config re-read is on a worker; another change waits for it.
@@ -99,7 +100,7 @@ fn watched_files(paths: &PandoPaths) -> [PathBuf; 4] {
     ]
 }
 
-fn stat(path: &Path) -> Option<(SystemTime, u64)> {
+pub(super) fn stat(path: &Path) -> Option<(SystemTime, u64)> {
     let meta = std::fs::metadata(path).ok()?;
     Some((meta.modified().ok()?, meta.len()))
 }
@@ -114,16 +115,13 @@ pub fn has_settings(config: &Config) -> bool {
 }
 
 impl SetupScreen {
-    fn new(paths: &PandoPaths, config: Config, setup: Setup) -> Self {
+    fn new(config: Config, setup: Setup) -> Self {
         Self {
             config,
             setup,
             detected: None,
             settings_seen_at: None,
             check_requested: None,
-            seen: look(paths),
-            reading: false,
-            read_again: false,
         }
     }
 
@@ -191,7 +189,8 @@ impl App {
     /// Puts the setup screen up over the dashboard, and starts pando's own
     /// detection reading the project behind it.
     pub fn open_setup(&mut self, setup: Setup) {
-        self.setup_screen = Some(SetupScreen::new(&self.paths, self.config.clone(), setup));
+        self.setup_screen = Some(SetupScreen::new(self.config.clone(), setup));
+        self.watch_setup_files();
         self.spawn_setup_detection();
     }
 
@@ -212,47 +211,84 @@ impl App {
         SPINNER_FRAMES[self.tick as usize % SPINNER_FRAMES.len()]
     }
 
-    /// The tick's look at the four files. Returns whether to repaint.
+    /// Starts the watch on the four files from what they are now.
+    pub(super) fn watch_setup_files(&mut self) {
+        self.setup_watch.seen = look(&self.paths);
+    }
+
+    /// The tick's look at the four files, for the setup screen while it
+    /// is up and for the dashboard's setup line after. Returns whether to
+    /// repaint.
     pub(super) fn poll_setup(&mut self) -> bool {
-        let Some(screen) = self.setup_screen.as_mut() else {
+        if self.setup_screen.is_none() && self.setup_row.setup.is_none() {
             return false;
-        };
+        }
         let now = look(&self.paths);
-        let config_changed = now[..3] != screen.seen[..3];
-        let check_changed = now[3] != screen.seen[3];
-        screen.seen = now;
-        let mut repaint = screen.spinning();
+        let watch = &mut self.setup_watch;
+        let config_changed = now[..3] != watch.seen[..3];
+        let check_changed = now[3] != watch.seen[3];
+        watch.seen = now;
+        let mut repaint = self
+            .setup_screen
+            .as_ref()
+            .is_some_and(SetupScreen::spinning);
         if config_changed {
             self.spawn_setup_read();
-        } else if screen.reading {
+        } else if self.setup_watch.reading {
             // The read in flight may have taken the record before this
             // change: the one after it takes it again.
-            screen.read_again |= check_changed;
-        } else if check_changed
-            || screen.setup.state == SetupState::Testing
-            || screen.check_requested.is_some()
-        {
+            self.setup_watch.read_again |= check_changed;
+        } else if check_changed || self.waiting_on_a_check() {
             // A running check finishes by writing its record and then
             // letting go of the lock, and a killed one only lets go: the
             // lock is asked on every tick while one runs, not only when
             // the record changes.
-            let setup = setup::read(&self.paths, &screen.config);
-            repaint |= self.adopt_setup(setup);
+            let setup = setup::read(&self.paths, self.files_config());
+            repaint |= self.adopt_read(setup);
         }
         repaint | self.expire_check_request()
+    }
+
+    /// Whether a check runs, or a `v` waits for one: the lock is asked
+    /// on every tick until it is over.
+    fn waiting_on_a_check(&self) -> bool {
+        match &self.setup_screen {
+            Some(screen) => {
+                screen.setup.state == SetupState::Testing || screen.check_requested.is_some()
+            }
+            None => self.setup_row.waiting_on_a_check(),
+        }
+    }
+
+    /// The config as its files said at the last read: what the setup is
+    /// read against, which need not be the session's own until it is
+    /// adopted.
+    fn files_config(&self) -> &Config {
+        match &self.setup_screen {
+            Some(screen) => &screen.config,
+            None => self.setup_row.files_config.as_ref().unwrap_or(&self.config),
+        }
+    }
+
+    /// A fresh read goes to whoever shows it: the screen while it is up,
+    /// the dashboard's line after.
+    fn adopt_read(&mut self, setup: Setup) -> bool {
+        if self.setup_screen.is_some() {
+            self.adopt_setup(setup)
+        } else {
+            self.adopt_setup_row(setup)
+        }
     }
 
     /// Re-reads the config, and the setup against it, on a worker:
     /// `config_now` lists the worktrees. One at a time.
     fn spawn_setup_read(&mut self) {
-        let Some(screen) = self.setup_screen.as_mut() else {
-            return;
-        };
-        if screen.reading {
-            screen.read_again = true;
+        let watch = &mut self.setup_watch;
+        if watch.reading {
+            watch.read_again = true;
             return;
         }
-        screen.reading = true;
+        watch.reading = true;
         let paths = self.paths.clone();
         let tx = self.event_tx.clone();
         thread::spawn(move || {
@@ -265,20 +301,24 @@ impl App {
     }
 
     /// A re-read landed. A config that does not load is one somebody is
-    /// writing: the last good one stays, and `m` has why.
+    /// writing: the last good one stays, and `m` has why. The dashboard
+    /// keeps the config it read for its line only: the session starts
+    /// worktrees on its own until it adopts one.
     pub(super) fn setup_read(&mut self, result: Result<(Config, Setup), String>) -> bool {
-        let Some(screen) = self.setup_screen.as_mut() else {
-            return false;
-        };
-        screen.reading = false;
-        let again = std::mem::take(&mut screen.read_again);
+        self.setup_watch.reading = false;
+        let again = std::mem::take(&mut self.setup_watch.read_again);
         let repaint = match result {
             Ok((config, setup)) => {
-                if config != screen.config {
-                    screen.config = config;
-                    screen.settings_seen_at = Some(Instant::now());
+                match self.setup_screen.as_mut() {
+                    Some(screen) => {
+                        if config != screen.config {
+                            screen.config = config;
+                            screen.settings_seen_at = Some(Instant::now());
+                        }
+                    }
+                    None => self.setup_row.files_config = Some(config),
                 }
-                self.adopt_setup(setup);
+                self.adopt_read(setup);
                 true
             }
             Err(e) => {
@@ -417,7 +457,7 @@ impl App {
 
 /// Where a check the TUI started writes what it prints: under the
 /// project's pando directory, never the repository.
-fn check_log_file(paths: &PandoPaths) -> PathBuf {
+pub(super) fn check_log_file(paths: &PandoPaths) -> PathBuf {
     paths.project_dir().join("tui-check.log")
 }
 
@@ -444,7 +484,7 @@ fn spawn_check(paths: &PandoPaths) -> anyhow::Result<()> {
         .current_dir(paths.root())
         // The home this TUI uses, whatever it was resolved from.
         .env("PANDO_HOME", &paths.home)
-        .env(CHECK_RAN_BY_ENV, "tui")
+        .env(crate::actions::CHECK_RAN_BY_ENV, "tui")
         .stdin(Stdio::null())
         .stdout(log.try_clone().context("share the check's log")?)
         .stderr(log);

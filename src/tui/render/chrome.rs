@@ -2,14 +2,14 @@
 //! themselves to fit.
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::state::Aggregate;
 use crate::theme::{blue, green, orange, red, surface, text, text_dim, text_muted, yellow};
-use crate::tui::app::{App, Mode, Status, StatusKind};
+use crate::tui::app::{App, Mode, SetupHint, Status, StatusKind};
 use crate::worktree::GhAccount;
 
 use super::{text_width, truncate, truncate_line, wrap_text};
@@ -70,18 +70,81 @@ pub(super) fn flash_rows(status: &Status, width: usize, max_rows: usize) -> Vec<
     rows
 }
 
-/// How many rows the header needs: one, unless an error has to wrap. Never
-/// more than a third of the screen.
+/// Below this a screen gives no row to the setup line: the list needs
+/// what there is.
+const SETUP_LINE_MIN_HEIGHT: u16 = 6;
+
+/// How many rows the header needs: one, unless an error has to wrap, and
+/// one more for the setup line when there is one to say. Never more than
+/// a third of the screen, save the setup line on a screen of three rows.
 pub(super) fn header_height(app: &App, width: u16, height: u16) -> u16 {
+    let setup = u16::from(app.setup_row.hint().is_some() && height >= SETUP_LINE_MIN_HEIGHT);
     let max_rows = max_error_rows(height).min((height / 3).max(1) as usize);
     let rows = app
         .flash()
         .map(|status| flash_rows(status, width as usize, max_rows).len())
         .unwrap_or(1) as u16;
-    rows.max(1)
+    rows.max(1) + setup
+}
+
+/// The header's last row: where the project's setup stands and the key
+/// that moves it on, until a test has passed.
+pub(super) fn setup_hint_line(app: &App, width: usize) -> Option<Line<'static>> {
+    let hint = app.setup_row.hint()?;
+    let mut spans = vec![Span::styled(" setup: ", Style::new().fg(text_muted()))];
+    let (lead, lead_color, said) = match hint {
+        SetupHint::Testing(Some(line)) => (
+            app.spinner(),
+            yellow(),
+            format!("testing the settings · {line}"),
+        ),
+        SetupHint::Testing(None) => (app.spinner(), yellow(), "testing the settings…".into()),
+        SetupHint::Starting => (app.spinner(), yellow(), "starting the test…".into()),
+        SetupHint::Note { text, failed: true } => ("✗", red(), text),
+        SetupHint::Note { text, .. } => ("", yellow(), text),
+    };
+    if !lead.is_empty() {
+        spans.push(Span::styled(
+            format!("{lead} "),
+            Style::new().fg(lead_color),
+        ));
+    }
+    // What stands in the first part, the key that acts on it after the
+    // last ` · `, its letter as every key is shown.
+    let (what, key_part) = match said.rsplit_once(" · ") {
+        Some((what, key_part)) if key_part.len() > 2 && key_part.as_bytes()[1] == b' ' => {
+            (what.to_string(), Some(key_part.to_string()))
+        }
+        _ => (said, None),
+    };
+    spans.push(Span::styled(what, Style::new().fg(lead_color)));
+    if let Some(key_part) = key_part {
+        let (key, rest) = key_part.split_at(1);
+        spans.push(Span::styled(" · ", Style::new().fg(text_muted())));
+        spans.push(Span::styled(
+            key.to_string(),
+            Style::new().fg(orange()).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(rest.to_string(), Style::new().fg(text_dim())));
+    }
+    Some(truncate_line(Line::from(spans), width))
 }
 
 pub(super) fn render_header(f: &mut Frame, area: Rect, app: &App) {
+    // The setup line keeps the header's last row whatever else it says.
+    let area = match setup_hint_line(app, area.width as usize) {
+        // As `header_height` counted it.
+        Some(line) if f.area().height >= SETUP_LINE_MIN_HEIGHT && area.height >= 2 => {
+            let [top, bottom] =
+                Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
+            f.render_widget(
+                Paragraph::new(line).style(Style::new().bg(surface())),
+                bottom,
+            );
+            top
+        }
+        _ => area,
+    };
     // A message takes over the whole bar for its few seconds; the footer
     // keeps its key hints throughout.
     if let Some(status) = app.flash() {

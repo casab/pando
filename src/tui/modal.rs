@@ -1068,14 +1068,19 @@ fn render_stop_all(f: &mut Frame, area: Rect, names: &[String], app: &App) {
     // Past this many names the rest are counted, and sooner in a short
     // tmux split: the names get only the rows the rest leave them.
     const MAX_ROWS: usize = 12;
+    // A running check is not one of the developer's worktrees: it is
+    // counted apart, and named by `label_of` below.
+    let check = names.iter().any(|name| crate::worktree::is_check(name));
+    let worktrees = names.len() - usize::from(check);
+    let asked = match (worktrees, check) {
+        (0, true) => "stop the running pando check?".to_string(),
+        (1, false) => "stop the one worktree that is up?".to_string(),
+        (1, true) => "stop the one worktree that is up, and the pando check?".to_string(),
+        (n, false) => format!("stop all {n} worktrees that are up?"),
+        (n, true) => format!("stop all {n} worktrees that are up, and the pando check?"),
+    };
     let title = Line::styled(
-        truncate(
-            &match names.len() {
-                1 => "stop the one worktree that is up?".to_string(),
-                n => format!("stop all {n} worktrees that are up?"),
-            },
-            cap,
-        ),
+        truncate(&asked, cap),
         Style::new().fg(text()).add_modifier(Modifier::BOLD),
     );
     let warning: Vec<Line> = wrap_text("their services and public URLs go down too", cap)

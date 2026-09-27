@@ -4205,3 +4205,356 @@ fn every_setup_footer_hint_is_a_key_help_documents() {
         }
     }
 }
+
+// ---- the ready view and the dashboard's setup line ------------------------
+
+use crate::setup::{ProcessResult, Setup, SetupMemory};
+
+fn process_result(name: &str, port: Option<u16>, http: Option<u16>) -> ProcessResult {
+    ProcessResult {
+        name: name.into(),
+        ready: true,
+        port,
+        http_status: http,
+        secs: 1.5,
+    }
+}
+
+/// A passed check of `web` and `api`, probed on web, at a commit of main.
+fn passed_record(fingerprint: &str, processes: Vec<ProcessResult>) -> CheckRecord {
+    let mut record = CheckRecord::begin(fingerprint.to_string(), RanBy::Program);
+    record.outcome = CheckOutcome::Passed;
+    record.fingerprint_after = Some(fingerprint.to_string());
+    record.finished_at = Some(chrono::Utc::now());
+    record.pando_version = "0.5.0".into();
+    record.commit = Some("a1b2c3d4e5f60718".into());
+    record.base_ref = Some("main".into());
+    record.processes = processes;
+    record
+}
+
+/// A project with two apps on one command, an install and a native
+/// service: the plan's acme-shop.
+fn with_acme_settings(config: &mut crate::config::Config) {
+    for name in ["web", "api"] {
+        config.processes.insert(
+            name.into(),
+            crate::config::ProcessConfig {
+                cmd: "pnpm dev".into(),
+                ..Default::default()
+            },
+        );
+    }
+    config.project.install = Some("pnpm install --frozen-lockfile".into());
+    config.services.push(crate::config::ServiceConfig::Native {
+        name: "mariadb".into(),
+        preset: Some("mariadb".into()),
+        port_env: None,
+        init: None,
+        cmd: None,
+        ready: None,
+        ready_timeout_s: None,
+        env: Default::default(),
+    });
+}
+
+/// The setup screen turned green: the plan's acme-shop, passed.
+fn ready_screen(processes: Vec<ProcessResult>, memory: SetupMemory) -> (tempfile::TempDir, App) {
+    let (dir, mut app) = app_on_setup_screen(true);
+    let screen = app.setup_screen.as_mut().unwrap();
+    with_acme_settings(&mut screen.config);
+    let fingerprint = crate::setup::fingerprint(&screen.config);
+    let record = passed_record(&fingerprint, processes);
+    // Whatever pando tried on its own, it tried before this test.
+    let memory = SetupMemory {
+        tried_by_pando_at: memory
+            .tried_by_pando_at
+            .map(|_| record.started_at - chrono::Duration::seconds(30)),
+        ..memory
+    };
+    screen.setup = Setup {
+        state: SetupState::Ready,
+        last_check: Some(record),
+        memory,
+        fingerprint,
+    };
+    (dir, app)
+}
+
+#[test]
+fn the_ready_view_says_what_the_test_proved() {
+    let processes = vec![
+        process_result("api", Some(20280), None),
+        process_result("web", Some(20281), Some(200)),
+    ];
+    let (_dir, mut app) = ready_screen(processes, SetupMemory::default());
+    let text = text_of(&draw(&mut app, 120, 30));
+    assert!(
+        text.contains("✓ You're ready to use pando in acme-shop"),
+        "{text}"
+    );
+    assert!(
+        text.contains("set up and tested just now · tested with pando 0.5.0"),
+        "{text}"
+    );
+    assert!(!text.contains("pando's own guess"), "{text}");
+    assert!(text.contains("apps       api + web   pnpm dev"), "{text}");
+    assert!(
+        text.contains("install    pnpm install --frozen-lockfile"),
+        "{text}"
+    );
+    assert!(
+        text.contains("services   mariadb (yours, used as main uses them)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("test       ✓ passed   web answered (HTTP 200) · commit a1b2c3d of main"),
+        "{text}"
+    );
+    // A temporary home is a long path, and wraps.
+    assert!(text.contains("settings: "), "{text}");
+    assert!(text.contains("pando.toml,"), "{text}");
+    assert!(text.contains("yours to edit"), "{text}");
+    assert!(text.contains("⏎ open pando"), "{text}");
+}
+
+// "pando's own guess" only when the passing test followed pando trying
+// on its own.
+#[test]
+fn the_ready_view_says_pandos_own_guess_only_after_pando_tried() {
+    let memory = SetupMemory {
+        tried_by_pando_at: Some(chrono::Utc::now()),
+        ..Default::default()
+    };
+    let processes = vec![process_result("web", Some(20281), Some(404))];
+    let (_dir, mut app) = ready_screen(processes, memory);
+    let text = text_of(&draw(&mut app, 120, 30));
+    assert!(
+        text.contains("set up by pando's own guess and tested just now"),
+        "{text}"
+    );
+    assert!(text.contains("web answered (HTTP 404)"), "{text}");
+
+    // Tried, but the test that passed came before it: somebody else's.
+    let (_dir, mut app) = ready_screen(Vec::new(), SetupMemory::default());
+    let screen = app.setup_screen.as_mut().unwrap();
+    let started = screen.setup.last_check.as_ref().unwrap().started_at;
+    screen.setup.memory.tried_by_pando_at = Some(started + chrono::Duration::seconds(5));
+    let text = text_of(&draw(&mut app, 120, 30));
+    assert!(text.contains("set up and tested just now"), "{text}");
+    assert!(!text.contains("pando's own guess"), "{text}");
+}
+
+// No app the probe asked: what was ready, and the commit.
+#[test]
+fn the_ready_view_of_a_portless_app_names_what_was_ready() {
+    let processes = vec![process_result("worker", None, None)];
+    let (_dir, mut app) = ready_screen(processes, SetupMemory::default());
+    let text = text_of(&draw(&mut app, 120, 30));
+    assert!(
+        text.contains("✓ passed   worker ready · commit a1b2c3d of main"),
+        "{text}"
+    );
+    assert!(!text.contains("HTTP"), "{text}");
+}
+
+#[test]
+fn the_ready_view_fits_every_size() {
+    for (width, height) in [
+        (160, 50),
+        (120, 30),
+        (80, 24),
+        (60, 16),
+        (40, 12),
+        (30, 8),
+        (20, 6),
+        (12, 4),
+        (1, 1),
+    ] {
+        let processes = vec![process_result("web", Some(20281), Some(200))];
+        let (_dir, mut app) = ready_screen(processes, SetupMemory::default());
+        let text = text_of(&draw(&mut app, width, height));
+        if width >= 40 && height >= 8 {
+            assert!(text.contains("You're ready"), "{width}×{height}:\n{text}");
+            assert!(text.contains("open pando"), "{width}×{height}:\n{text}");
+        }
+        if width >= 80 && height >= 16 {
+            assert!(text.contains("✓ passed"), "{width}×{height}:\n{text}");
+        }
+    }
+}
+
+/// A dashboard app whose setup reads as `state`, with a check record for
+/// the states that have one.
+fn dashboard(names: &[&str], state: SetupState, outcome: Option<CheckOutcome>) -> App {
+    let mut app = test_app(names);
+    with_acme_settings(&mut app.config);
+    let fingerprint = crate::setup::fingerprint(&app.config);
+    let last_check = outcome.map(|outcome| {
+        let mut record = passed_record(&fingerprint, Vec::new());
+        record.outcome = outcome;
+        record.progress = vec!["made a test worktree".into(), "installing".into()];
+        record
+    });
+    app.setup_row.setup = Some(Setup {
+        state,
+        last_check,
+        memory: SetupMemory::default(),
+        fingerprint,
+    });
+    app
+}
+
+/// The header's rows, above the list or the welcome.
+fn header_rows(app: &mut App) -> Vec<String> {
+    let text = text_of(&draw(app, 140, 30));
+    let first_border = text.lines().position(|l| l.contains('╭')).unwrap_or(1);
+    text.lines()
+        .take(first_border)
+        .map(str::to_string)
+        .collect()
+}
+
+// Each state has one line in the header, with the key that moves it on,
+// whether or not there are worktrees; a ready project has none.
+#[test]
+fn the_header_says_where_the_setup_stands() {
+    let failed = CheckOutcome::Failed {
+        kind: FailureKind::Settings,
+        reason: "web exited after 0.8s".into(),
+    };
+    let open = CheckOutcome::NotSetUp {
+        slot: "dev_cmd".into(),
+    };
+    let cases: Vec<(SetupState, Option<CheckOutcome>, Option<&str>)> = vec![
+        (
+            SetupState::Untested,
+            None,
+            Some("setup: not tested yet · v tests it"),
+        ),
+        (
+            SetupState::Stale,
+            Some(CheckOutcome::Passed),
+            Some("setup: settings changed since the last test · v tests it"),
+        ),
+        (
+            SetupState::Interrupted,
+            Some(CheckOutcome::Running),
+            Some("setup: the last test was interrupted · v tests again"),
+        ),
+        (
+            SetupState::Failing,
+            Some(failed),
+            Some("setup: ✗ the test failed: web exited after 0.8s · a copies the prompt"),
+        ),
+        (
+            SetupState::Failing,
+            Some(open),
+            Some("setup: not set up: dev_cmd is open · a copies the prompt"),
+        ),
+        (
+            SetupState::New { skipped: true },
+            None,
+            Some("setup: not set up · a copies the setup prompt"),
+        ),
+        (
+            SetupState::Testing,
+            Some(CheckOutcome::Running),
+            Some("testing the settings · installing"),
+        ),
+        (SetupState::Ready, Some(CheckOutcome::Passed), None),
+    ];
+    for names in [&["feat+one"][..], &[][..]] {
+        for (state, outcome, said) in &cases {
+            let mut app = dashboard(names, *state, outcome.clone());
+            let rows = header_rows(&mut app);
+            match said {
+                Some(said) => {
+                    assert_eq!(rows.len(), 2, "{state:?}: {rows:?}");
+                    assert!(rows[1].contains(said), "{state:?} {names:?}: {rows:?}");
+                }
+                None => {
+                    assert_eq!(rows.len(), 1, "{state:?}: {rows:?}");
+                    assert!(!rows[0].contains("setup:"), "{rows:?}");
+                }
+            }
+        }
+    }
+}
+
+// A flash takes the header's first row for its few seconds; the setup
+// line keeps the last.
+#[test]
+fn a_flash_leaves_the_setup_line_where_it_is() {
+    let mut app = dashboard(&["feat+one"], SetupState::Untested, None);
+    app.set_success("copied something");
+    let rows = header_rows(&mut app);
+    assert!(rows[0].contains("copied something"), "{rows:?}");
+    assert!(rows[1].contains("not tested yet"), "{rows:?}");
+}
+
+// A ready project with nothing listed shows what the test proved, never
+// "not settled yet".
+#[test]
+fn a_ready_project_with_no_worktrees_welcomes_with_the_ready_view() {
+    let mut app = dashboard(&[], SetupState::Ready, None);
+    let fingerprint = crate::setup::fingerprint(&app.config);
+    let processes = vec![process_result("web", Some(20281), Some(200))];
+    app.setup_row.setup.as_mut().unwrap().last_check = Some(passed_record(&fingerprint, processes));
+    let text = text_of(&draw(&mut app, 120, 34));
+    assert!(
+        text.contains("✓ You're ready to use pando in acme-shop"),
+        "{text}"
+    );
+    assert!(text.contains("web answered (HTTP 200)"), "{text}");
+    assert!(text.contains("api + web   pnpm dev"), "{text}");
+    assert!(
+        text.contains("create a worktree"),
+        "the key onward:\n{text}"
+    );
+    assert!(!text.contains("not settled yet"), "{text}");
+    assert!(
+        !text.contains("⏎ open pando"),
+        "the dashboard is open:\n{text}"
+    );
+
+    // Not ready: today's welcome.
+    let mut app = dashboard(&[], SetupState::Untested, None);
+    let text = text_of(&draw(&mut app, 120, 34));
+    assert!(text.contains("one dev environment per branch"), "{text}");
+}
+
+// A running `pando check` is live in state, so `X` stops it with the
+// rest; its confirmation names it for what it is, never by the
+// directory name nobody chose, and counts only the worktrees as such.
+#[test]
+fn the_stop_all_confirmation_names_a_running_check() {
+    let check = crate::paths::CHECK_WORKTREE;
+    let mut app = test_app(&["feat+one"]);
+    with_process(&mut app, "feat+one", running_phase());
+    with_process(&mut app, check, running_phase());
+    app.handle_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE));
+    assert!(
+        matches!(&app.modal, Some(Modal::StopAll { names }) if names.iter().any(|n| n == check)),
+        "the check is stopped with the rest"
+    );
+    let rendered = text_of(&draw(&mut app, 120, 30));
+    assert!(
+        rendered.contains("stop the one worktree that is up, and the pando check?"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("the running pando check"), "{rendered}");
+    assert!(rendered.contains("feat/one"), "{rendered}");
+    assert!(!rendered.contains(check), "{rendered}");
+
+    // The check alone.
+    app.modal = Some(Modal::StopAll {
+        names: vec![check.to_string()],
+    });
+    let rendered = text_of(&draw(&mut app, 120, 30));
+    assert!(
+        rendered.contains("stop the running pando check?"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains(check), "{rendered}");
+}

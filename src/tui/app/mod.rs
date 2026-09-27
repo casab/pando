@@ -24,6 +24,7 @@ mod operations;
 mod pending;
 mod remedies;
 mod setup;
+mod setup_row;
 mod tails;
 mod themes;
 
@@ -43,7 +44,8 @@ pub use log_view::{LOG_VIEWER_CAPACITY, LineInspect, LogFilter, LogView, SearchM
 pub use merged::{ALL_SOURCE, MergedTail, SOURCE_SEPARATOR, ViewTail, strip_source};
 pub use pending::{AwaitingReady, PendingAction, PendingKind, PendingOutcome};
 pub use remedies::as_tui_remedy;
-pub use setup::{SetupLine, SetupScreen, has_settings};
+pub use setup::{SetupLine, SetupScreen, SetupWatch, has_settings};
+pub use setup_row::{SetupHint, SetupRow};
 pub use tails::LogTails;
 pub use themes::ThemeState;
 
@@ -72,6 +74,9 @@ const ERROR_TTL: Duration = Duration::from_secs(15);
 /// A result somebody may want to read twice — a public URL — stays longer
 /// again, and `m` has it after that.
 const LASTING_TTL: Duration = Duration::from_secs(30);
+
+/// What the running `pando check` is called wherever the TUI names it.
+pub const CHECK_LABEL: &str = "the running pando check";
 
 /// Messages `m` keeps, newest last.
 const MESSAGE_HISTORY: usize = 50;
@@ -312,6 +317,11 @@ pub struct App {
     /// project until the developer leaves it, whatever the setup does
     /// meanwhile.
     pub setup_screen: Option<SetupScreen>,
+    /// Where the setup stands, for the dashboard's header line once the
+    /// setup screen is gone or was never up.
+    pub setup_row: SetupRow,
+    /// The four files both of those follow, polled on the tick.
+    pub setup_watch: SetupWatch,
     /// The checks `v` asked for, counted instead of started when tests
     /// drive the app.
     #[cfg(test)]
@@ -386,6 +396,8 @@ impl App {
             launch: None,
             theme: ThemeState::new(theme_settings, &themes_dir),
             setup_screen: None,
+            setup_row: SetupRow::default(),
+            setup_watch: SetupWatch::default(),
             #[cfg(test)]
             checks_started: 0,
             #[cfg(test)]
@@ -399,6 +411,8 @@ impl App {
         app.hydrate_from_cache();
         // Whatever git lists: a new project is new with worktrees too.
         app.open_setup_if_new();
+        app.read_setup_row();
+        app.watch_setup_files();
         app.spawn_enrichment(None, false);
         app.spawn_pr_fetch();
         app.spawn_gh_account_check();
@@ -422,7 +436,7 @@ impl App {
             AppEvent::Tick => {
                 self.tick = self.tick.wrapping_add(1);
                 let spinning = self.pending.is_some();
-                let setup = self.poll_setup();
+                let setup = self.poll_setup() | self.poll_setup_row();
                 self.poll_pending();
                 let grew = self.poll_logs();
                 if self.tick.is_multiple_of(SLOW_TICK_EVERY) {
@@ -597,6 +611,11 @@ impl App {
         // want of one, and nothing else.
         if !self.config.processes.is_empty() {
             self.nothing_to_run = false;
+        }
+        // The fingerprint is the config's: a setup read against the old
+        // one may be stale against this.
+        if self.setup_row.setup.is_some() {
+            self.read_setup_row();
         }
     }
 
@@ -808,6 +827,8 @@ impl App {
             KeyCode::Char('p') => self.open_pull_requests(),
             KeyCode::Char('d') => self.open_remove(),
             KeyCode::Char('y') => self.copy_selected_path(),
+            KeyCode::Char('a') => self.copy_setup_prompt(),
+            KeyCode::Char('v') => self.test_setup_from_list(),
             // The local URL, always: what gets pasted into a browser tab,
             // a curl, a chat. `C` is the public one, and never stands in.
             KeyCode::Char('c') => self.copy_selected_url(),
@@ -1007,7 +1028,14 @@ impl App {
     /// developer knows it by. The directory name is derived from it
     /// (`feat/x` lives in `feat+x`) and only shows where the branch is
     /// missing — a detached checkout — or where a path needs it.
+    ///
+    /// `pando check`'s throwaway worktree has no row and no branch, and
+    /// its directory name is nobody's word for it: it is named for what
+    /// it is, in the stop-everything confirmation and what follows it.
     pub fn label_of(&self, name: &str) -> String {
+        if worktree::is_check(name) {
+            return CHECK_LABEL.to_string();
+        }
         self.worktrees
             .iter()
             .find(|w| w.name == name)
@@ -1465,6 +1493,8 @@ impl App {
             launch: None,
             theme: ThemeState::new(theme_settings, &themes_dir),
             setup_screen: None,
+            setup_row: SetupRow::default(),
+            setup_watch: SetupWatch::default(),
             checks_started: 0,
             clipboard: None,
             opened: None,

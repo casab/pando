@@ -121,6 +121,16 @@ pub const LIST_KEYS: &[KeyHelp] = &[
         &[KeyCode::Char('m')],
         "messages: what pando said, in full",
     ),
+    key(
+        "a",
+        &[KeyCode::Char('a')],
+        "copy the setup prompt, for your coding agent",
+    ),
+    key(
+        "v",
+        &[KeyCode::Char('v')],
+        "test the project's settings with `pando check`",
+    ),
     key("T", &[KeyCode::Char('T')], "pick a colour theme"),
     key("R", &[KeyCode::Char('R')], "refresh now"),
     key("?", &[KeyCode::Char('?')], "this help"),
@@ -165,6 +175,11 @@ pub const LIST_LEGEND: &[(&str, &str)] = &[
     (
         "shared: pg ● up",
         "the project's shared services at their default ports: up answers, down does not",
+    ),
+    (
+        "setup: …",
+        "the header's line on pando's setup for the project, until a test passes: v tests it, \
+         a copies the setup prompt",
     ),
     (
         "d … F",
@@ -289,6 +304,10 @@ pub const SETUP_LEGEND: &[(&str, &str)] = &[
     (
         "✗",
         "the test failed — a copies the prompt, which now includes why",
+    ),
+    (
+        "○",
+        "the last test was interrupted, or a question is still open",
     ),
 ];
 

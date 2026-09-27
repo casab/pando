@@ -13,9 +13,10 @@ use ratatui::widgets::Paragraph;
 
 use crate::setup::SETUP_PROMPT;
 use crate::theme::{green, orange, red, surface, text, text_dim, text_muted, yellow};
-use crate::tui::app::{App, SetupLine, SetupScreen, compact_age};
+use crate::tui::app::{App, SetupLine, SetupScreen};
 
 use super::chrome::{hint_line, status_mark};
+use super::welcome::{ago, ready_view};
 use super::{home_relative, text_width, truncate, truncate_line, wrap_text};
 
 /// A block of rows and how much it matters: the least is dropped first
@@ -46,7 +47,7 @@ pub(super) fn render_setup(f: &mut Frame, area: Rect, app: &App) {
     render_setup_header(f, header, app, screen);
     let width = body.width as usize;
     let blocks = if screen.is_ready() {
-        ready_blocks(app, width)
+        ready_blocks(screen, app, width)
     } else {
         setup_blocks(app, screen, width)
     };
@@ -207,50 +208,56 @@ fn setup_blocks(app: &App, screen: &SetupScreen, width: usize) -> Vec<Block> {
     blocks
 }
 
-/// The minimal ready view: what the check proved, and the key onward.
-fn ready_blocks(app: &App, width: usize) -> Vec<Block> {
-    let project = &app.paths.project.display_name;
+/// The ready view: the welcome's renderer with the test row, fed from the
+/// screen's own config and record, and the key onward.
+fn ready_blocks(screen: &SetupScreen, app: &App, width: usize) -> Vec<Block> {
     let pad = indent(width);
     let room = width.saturating_sub(pad * 2).max(1);
-    let when = app
-        .setup_screen
-        .as_ref()
-        .and_then(|s| s.setup.last_check.as_ref())
-        .and_then(|r| r.finished_at)
-        .map(|at| ago((chrono::Utc::now() - at).num_seconds()))
-        .unwrap_or_else(|| "just now".to_string());
-    vec![
+    let view = ready_view(app, &screen.config, &screen.setup, room);
+    let margin = |lines: Vec<Line<'static>>| -> Vec<Line<'static>> {
+        lines
+            .into_iter()
+            .map(|line| {
+                let mut spans = vec![Span::raw(" ".repeat(pad))];
+                spans.extend(line.spans);
+                truncate_line(Line::from(spans), width)
+            })
+            .collect()
+    };
+    let mut blocks = vec![
         blank(),
         Block {
             priority: PROMPT,
-            lines: marked(
-                "✓",
-                green(),
-                &format!("You're ready to use pando in {project}"),
-                Style::new().fg(text()).add_modifier(Modifier::BOLD),
-                pad,
-                room,
-            ),
+            lines: margin(view.headline),
         },
         Block {
             priority: LIVE,
-            lines: wrapped(
-                &format!("set up and tested {when}"),
-                pad + 2,
-                room.saturating_sub(2).max(1),
-                Style::new().fg(text_dim()),
-            ),
+            lines: margin(view.when),
         },
-    ]
-}
-
-/// "just now" under a minute, a compact age after.
-fn ago(secs: i64) -> String {
-    if secs < 60 {
-        "just now".to_string()
-    } else {
-        format!("{} ago", compact_age(secs))
+        blank(),
+    ];
+    // The test row matters more than the facts it tested.
+    let test_at = view.facts.len().saturating_sub(1);
+    for (i, fact) in view.facts.into_iter().enumerate() {
+        blocks.push(Block {
+            priority: if i == test_at { HEADING } else { STEPS },
+            lines: margin(vec![fact]),
+        });
     }
+    blocks.push(blank());
+    blocks.push(Block {
+        priority: EXPLANATION,
+        lines: margin(view.settings),
+    });
+    blocks.push(blank());
+    blocks.push(Block {
+        priority: STEP_ONE,
+        lines: margin(vec![Line::from(vec![
+            Span::styled("⏎", Style::new().fg(orange()).add_modifier(Modifier::BOLD)),
+            Span::styled(" open pando", Style::new().fg(text())),
+        ])]),
+    });
+    blocks
 }
 
 /// The live line, from what the files say.
