@@ -22,7 +22,9 @@ pub(super) fn hooks_report(
     // has.
     let listed = match config.hooks.is_empty() || worktrees.is_empty() {
         true => Vec::new(),
-        false => crate::worktree::discover(&paths.project).unwrap_or_default(),
+        false => crate::worktree::discover_all(&paths.project)
+            .map(|found| std::iter::once(found.main).chain(found.worktrees).collect())
+            .unwrap_or_default(),
     };
     // Whether a namespaced start has data of its own is its plan's answer,
     // read from the config, recipes and env files that start reads.

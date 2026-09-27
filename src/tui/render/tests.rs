@@ -7,7 +7,8 @@ use crate::theme::{
 };
 use crate::tui::app::App;
 use crate::tui::app::tests::{
-    app_with_logs, running_phase, test_app, with_process, with_second_process, write_log, wt,
+    app_with_logs, app_with_main, running_phase, test_app, with_process, with_second_process,
+    write_log, wt,
 };
 use crate::tui::app::{BranchLoadState, Modal};
 use ratatui::Terminal;
@@ -4917,4 +4918,37 @@ fn the_wordmark_heads_the_screen_where_it_fits() {
     let text = text_of(&draw(&mut app, 60, 40));
     assert!(!text.contains(&first_row), "{text}");
     assert!(text.contains("█▀█ ▄▀█ █▄ █ █▀▄ █▀█"), "{text}");
+}
+
+// The main checkout is the first row, by its branch, with its mark and
+// the words for it; the list's title and the header count worktrees.
+#[test]
+fn the_list_draws_the_main_checkout_first_with_its_mark() {
+    let mut app = app_with_main(&["feat+one", "feat+two"]);
+    with_process(&mut app, "acme-shop", running_phase());
+    let text = text_of(&draw(&mut app, 120, 14));
+    let rows: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("main ⌂") || l.contains("feat/one") || l.contains("feat/two"))
+        .collect();
+    assert_eq!(rows.len(), 3, "{text}");
+    assert!(rows[0].contains("main ⌂"), "main first: {text}");
+    assert!(rows[0].contains("main checkout"), "{text}");
+    assert!(rows[1].contains("feat/one"), "{text}");
+    assert!(text.contains("worktrees (2)"), "{text}");
+    assert!(text.contains("2 worktrees"), "{text}");
+    assert!(
+        text.contains("main checkout"),
+        "the detail pane says it too: {text}"
+    );
+}
+
+// And a first run keeps its welcome: a main checkout pando never ran is
+// not a worktree to list.
+#[test]
+fn a_project_with_no_worktree_still_gets_the_welcome() {
+    let mut app = app_with_main(&[]);
+    let text = text_of(&draw(&mut app, 120, 30));
+    assert!(text.contains("welcome"), "{text}");
+    assert!(!text.contains("main ⌂"), "{text}");
 }

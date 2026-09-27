@@ -62,9 +62,9 @@ pub use services::{
 pub use share::{ENV_SHARE_PORT, ShareOutcome, SpawnProxy, share, share_with, unshare};
 pub use trying::{OwnGuess, try_on_its_own, try_on_its_own_on};
 pub use worktree::{
-    CREATED_BUT_INSTALL_FAILED, KEPT_OVER_RACED_RECORD, Ownership, created_by_pando,
-    guard_write_locations, ls, new, new_for_pr, ownership, path, path_in, rm,
-    sanitize_branch_to_dir,
+    CREATED_BUT_INSTALL_FAILED, KEPT_OVER_RACED_RECORD, MAIN_RUNS_ONLY, Ownership,
+    created_by_pando, guard_write_locations, ls, ls_all, new, new_for_pr, ownership, path, path_in,
+    rm, sanitize_branch_to_dir,
 };
 
 #[cfg(test)]

@@ -276,9 +276,10 @@ impl App {
             .map(|w| (w.name.clone(), w))
             .collect();
         let mut fresh = Vec::new();
-        self.worktrees = snapshot
-            .worktrees
-            .into_iter()
+        // The main checkout is the first row, enriched like any other.
+        // Whether it shows is `refilter`'s to say: see `App::main_row_shown`.
+        self.worktrees = std::iter::once(snapshot.main.clone())
+            .chain(snapshot.worktrees)
             .map(|mut w| {
                 match known.get(&w.name) {
                     Some(old) if old.head == w.head => {

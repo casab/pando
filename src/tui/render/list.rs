@@ -214,7 +214,11 @@ fn one(text: impl Into<String>, style: Style) -> Cell {
 fn row_cells(app: &App, wt: &Worktree) -> RowCells {
     let mut cells = Vec::new();
     let label = wt.branch.clone().unwrap_or_else(|| wt.name.clone());
+    let main = app.is_main(&wt.name);
     let aside = match &wt.branch {
+        // Said where a renamed worktree says its directory: it is what
+        // this row is, and why `d` refuses it.
+        _ if main => Some("main checkout".to_string()),
         Some(branch) if actions::sanitize_branch_to_dir(branch) != wt.name => Some(wt.name.clone()),
         Some(_) => None,
         None => Some("detached".to_string()),
@@ -284,7 +288,12 @@ fn row_cells(app: &App, wt: &Worktree) -> RowCells {
     RowCells {
         glyph: (glyph, color),
         label,
-        mode: app.record_for(&wt.name).and_then(|r| mode_mark(r.mode())),
+        // The main checkout only ever runs shared, so its mark is where
+        // a mode's would be: `⌂`, kept when the column that names it goes.
+        mode: match main {
+            true => Some((MAIN_MARK, text_muted())),
+            false => app.record_for(&wt.name).and_then(|r| mode_mark(r.mode())),
+        },
         status,
         git: git_parts(wt),
         live: phase.is_some() || pending.is_some(),
@@ -293,14 +302,16 @@ fn row_cells(app: &App, wt: &Worktree) -> RowCells {
 }
 
 pub(super) fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
+    // Worktrees, counted without the main checkout's row: it is not one.
     let title = if app.filter.is_empty() {
-        format!(" worktrees ({}) ", app.worktrees.len())
+        format!(" worktrees ({}) ", app.linked_count())
     } else {
-        format!(
-            " worktrees ({}/{}) ",
-            app.filtered_indices.len(),
-            app.worktrees.len()
-        )
+        let matched = app
+            .filtered_indices
+            .iter()
+            .filter(|&&idx| !app.is_main(&app.worktrees[idx].name))
+            .count();
+        format!(" worktrees ({matched}/{}) ", app.linked_count())
     };
     let block = Block::bordered()
         .title(Span::styled(title, Style::new().fg(text_dim())))
@@ -579,6 +590,10 @@ pub(in crate::tui) fn run_marker(phase: Option<&Aggregate>) -> (&'static str, Co
         None => ("○ ", text_muted()),
     }
 }
+
+/// The main checkout's mark after its branch: home, the checkout every
+/// worktree came from.
+pub(super) const MAIN_MARK: &str = "⌂";
 
 /// The mark for a mode that is not the default one, in its colour: `▣`,
 /// a box of its own, for private copies of the services; `◧`, part of a

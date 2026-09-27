@@ -23,7 +23,13 @@ pub(super) fn worktrees_report(
             "move it aside to start over — worktrees pando created will then read as adopted",
         ));
     }
-    let listed = crate::worktree::discover(&paths.project).unwrap_or_default();
+    // The main checkout with them: pando runs it too, and its record is
+    // keyed by its directory's name like any worktree's.
+    let found = crate::worktree::discover_all(&paths.project).ok();
+    let main_name = found.as_ref().map(|found| found.main.name.clone());
+    let listed: Vec<crate::worktree::Worktree> = found
+        .map(|found| std::iter::once(found.main).chain(found.worktrees).collect())
+        .unwrap_or_default();
     let declared = declared_services(config);
     if let Some(left) = actions::leftover_check(paths, config) {
         findings.push(Finding::problem(
@@ -209,6 +215,7 @@ pub(super) fn worktrees_report(
                 .map(state::Aggregate::word)
                 .unwrap_or("stopped"),
             created_by_pando: record.created_by_pando,
+            main: main_name.as_deref() == Some(name.as_str()),
             mode: record.mode(),
             isolated: record.mode() == state::ServiceMode::Isolated,
             locked: git.is_some_and(|g| g.locked),

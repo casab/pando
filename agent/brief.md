@@ -642,6 +642,12 @@ is exit 2: name it the other way. Inside a worktree most verbs take no
 name, but always pass one. Without it, `stop` stops only the worktree the
 shell is in, or **every** worktree when the shell is in none of them.
 
+The main checkout runs too: `pando start <its branch>` or its directory's
+name, and it is the first entry in `ls --json` with `"main": true`. pando
+runs only its processes there — no install, no hooks, shared services
+only — so it must already be set up; `--isolated`, `--namespaced` and
+`rm` refuse it.
+
 `logs` without `--source` reads `dev`. A worktree with no `dev` log and
 several processes gets them all merged, and each `--json` line then carries
 a `source` key. Pass `--source` when you know which log you want.

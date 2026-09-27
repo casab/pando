@@ -31,7 +31,7 @@ use super::share::{share_closed, share_target_is_up, sweep_dead_shares_with, tak
 // Only for the intra-doc link above `sweep_orphaned_groups`.
 #[cfg(doc)]
 use super::share::sweep_dead_shares;
-use super::worktree::{find_live_worktree, find_worktree};
+use super::worktree::{Checkout, MAIN_RUNS_ONLY, find_live_checkout, find_worktree};
 
 /// How long a process group gets to exit on its own before SIGKILL.
 pub(super) const STOP_GRACE: Duration = Duration::from_secs(5);
@@ -264,7 +264,10 @@ fn start_checked(
         restarting,
         skip_after_services,
     } = preflight;
-    let worktree = find_live_worktree(paths, name)?;
+    let Checkout { worktree, main } = find_live_checkout(paths, name)?;
+    if main {
+        refuse_main_mode(name, mode)?;
+    }
     // Before anything is installed, signalled or spawned: a `--only` naming
     // a process that does not exist must have no side effects at all.
     let selection = selected_processes(config, only)?;
@@ -300,6 +303,11 @@ fn start_checked(
     // be skipped", and the authoritative one is made under the lock below.
     // A restart is never that case: what it names is about to be replaced.
     let mut everything_up = !restarting && every_process_running(paths, name, &selection);
+    // Said once, before anything runs: a developer who expected the
+    // install to run in their own checkout reads why it does not here.
+    if main && !everything_up {
+        progress(MAIN_RUNS_ONLY);
+    }
 
     // A start that switches this worktree to its own services replaces
     // every process it is running. So everything that switch needs —
@@ -838,6 +846,10 @@ fn start_checked(
     // A namespaced start is on data of its own only where its database is:
     // one that got a Redis slot and left its database on the main
     // checkout's would otherwise run the branch's migrations against main.
+    //
+    // The main checkout runs none of them, nor a probe: each is a command
+    // run in the repository, and Invariant 1 has no exception for it. It
+    // is the developer's own checkout, installed and migrated by them.
     let not_own = ready.as_ref().and_then(Ready::not_own_data);
     let hook_ctx = HookContext {
         name,
@@ -848,7 +860,7 @@ fn start_checked(
         own_data: isolate || (ready.is_some() && not_own.is_none()),
         not_own: not_own.as_deref(),
     };
-    if !everything_up {
+    if !everything_up && !main {
         run_hooks(
             paths,
             config,
@@ -902,7 +914,7 @@ fn start_checked(
         everything_up = false;
     }
 
-    if !everything_up {
+    if !everything_up && !main {
         if !skip_after_services {
             run_hooks(
                 paths,
@@ -1153,7 +1165,7 @@ fn start_checked(
     // Outside the lock, because a `dev` hook is a command like any other
     // and holding the lock through it would freeze the TUI's tick.
     drop(_lock);
-    if !everything_up && !skip_after_services {
+    if !everything_up && !skip_after_services && !main {
         run_hooks(paths, config, config::HookPoint::Dev, &hook_ctx, progress)?;
     }
     // From the record, through the one function every read path uses, so
@@ -1681,7 +1693,11 @@ pub fn restart(
     selected_processes(config, only)?;
     // And a worktree whose directory is gone, which the start half would
     // refuse only after the stop half had run and the namespaces were made.
-    let worktree = find_live_worktree(paths, name)?;
+    // And the main checkout in a mode it cannot run in, for the same reason.
+    let Checkout { worktree, main } = find_live_checkout(paths, name)?;
+    if main {
+        refuse_main_mode(name, mode)?;
+    }
     refuse_losing_namespaces(paths, config, name, mode)?;
     let was = recorded_mode(paths, name);
     let target = target_of(paths, config, name, mode);
@@ -1744,6 +1760,25 @@ pub fn restart(
             skip_after_services: false,
         },
         progress,
+    )
+}
+
+/// Refuses a start of the main checkout in a mode that would give it data
+/// of its own.
+///
+/// The project's shared services are the main checkout's own — they are
+/// what main is — and `--isolated` and `--namespaced` exist to give a
+/// worktree data apart from main's. Checked before anything is asked,
+/// made or stopped.
+pub(super) fn refuse_main_mode(name: &str, mode: Mode) -> Result<()> {
+    let flag = match mode {
+        Mode::Isolated => "--isolated",
+        Mode::Namespaced => "--namespaced",
+        Mode::Remembered | Mode::Shared => return Ok(()),
+    };
+    bail!(
+        "{name} is the main checkout, and it runs on the project's own services, which hold \
+         its own data — {flag} gives a worktree data apart from main's, so it is for worktrees"
     )
 }
 

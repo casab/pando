@@ -288,6 +288,8 @@ pub struct WorktreeReport {
     /// Whether pando created it, or adopted one that was already there.
     /// `rm` asks before removing an adopted one.
     pub created_by_pando: bool,
+    /// The main checkout, which pando runs too and never removes.
+    pub main: bool,
     /// Which services it talks to: `shared`, `namespaced` or `isolated`.
     pub mode: crate::state::ServiceMode,
     /// Whether this worktree runs private copies of the project's

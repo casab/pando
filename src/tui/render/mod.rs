@@ -89,8 +89,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     render_header(f, header, app);
     // No worktrees at all is the first run, and a welcome says more than
-    // an empty box beside a pane about nothing.
-    if app.worktrees.is_empty() {
+    // an empty box beside a pane about nothing. A main checkout pando has
+    // never run is no row of its own yet: see `App::main_row_shown`.
+    if !app.main_row_shown() {
         app.list_area = None;
         render_welcome(f, body, app);
     } else {

@@ -690,6 +690,14 @@ impl App {
             return;
         };
         let name = wt.name.clone();
+        // No dialog: there is nothing to confirm.
+        if self.is_main(&name) {
+            let label = self.label_of(&name);
+            self.set_error(format!(
+                "{label} is the main checkout — pando runs it, but never removes it"
+            ));
+            return;
+        }
         let created_by_pando = self.created_by_pando.get(&name).copied().unwrap_or(false);
         self.modal = Some(Modal::Remove {
             name: name.clone(),

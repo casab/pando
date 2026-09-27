@@ -48,7 +48,7 @@ pub const LIST_KEYS: &[KeyHelp] = &[
         "⏎",
         &[KeyCode::Enter],
         "choose its mode — shared, namespaced (experimental), isolated — and start it, or \
-         switch it when it runs",
+         switch it when it runs; the main checkout (⌂) just starts, shared",
     ),
     key(
         "s",
@@ -114,7 +114,11 @@ pub const LIST_KEYS: &[KeyHelp] = &[
         &[KeyCode::Char('p')],
         "open pull requests: ⏎ makes a worktree for one",
     ),
-    key("d", &[KeyCode::Char('d')], "remove it"),
+    key(
+        "d",
+        &[KeyCode::Char('d')],
+        "remove it (never the main checkout)",
+    ),
     key("/", &[KeyCode::Char('/')], "filter by branch or name"),
     key(
         "m",
@@ -156,6 +160,11 @@ pub const LIST_LEGEND: &[(&str, &str)] = &[
     (
         "◈",
         "public: shared on the internet — O opens, C copies the URL",
+    ),
+    (
+        "main ⌂",
+        "the main checkout, the first row: only its processes run, shared — no install, no \
+         hooks — and d never removes it",
     ),
     ("branch ▣", "isolated: runs private copies of the services"),
     (

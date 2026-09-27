@@ -22,6 +22,12 @@ fn owner_not_running(label: &str, owner: &str) -> String {
 
 /// Standard base64, for the OSC 52 payload. A dependency would be a lot of
 /// machinery for one escape sequence.
+/// Why the main checkout runs only one way: its services are the
+/// project's own, which hold its data, and the other modes exist to give a
+/// worktree data apart from main's.
+pub(super) const MAIN_ONLY_SHARED: &str = "the main checkout runs on the project's own services, \
+     which hold its data — isolated and namespaced are for worktrees";
+
 pub(super) fn base64(input: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
@@ -83,6 +89,11 @@ impl App {
     /// as `start_selected`; the flag reaches detection too, because the
     /// services question is only worth asking when it is being answered.
     pub(super) fn start_selected_isolated(&mut self) {
+        if let Some(name) = self.selected_worktree().map(|wt| wt.name.clone())
+            && self.is_main(&name)
+        {
+            return self.set_error(MAIN_ONLY_SHARED);
+        }
         self.start_selected_in(ServiceMode::Isolated, 'i')
     }
 
@@ -172,6 +183,18 @@ impl App {
         };
         if self.refuses_nothing_to_run() {
             return;
+        }
+        // The main checkout has one mode, so there is nothing to choose:
+        // ⏎ starts it, on the project's own services, and says what it
+        // would have switched to were it a worktree.
+        if self.is_main(&name) {
+            let label = self.label_of(&name);
+            return match self.is_up(&name) {
+                true => self.set_status(format!(
+                    "{label} is the main checkout, on the project's own services — r restarts it"
+                )),
+                false => self.start_named(name, actions::Mode::Shared),
+            };
         }
         let current = self
             .record_for(&name)

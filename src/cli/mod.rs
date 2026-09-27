@@ -68,6 +68,11 @@ A worktree is named by its branch (feat/login) or its directory (feat+login).
 Inside a worktree, start, stop, restart, logs, open, share and unshare need
 no name: they act on the worktree you are in.
 
+The main checkout runs too, named by its branch or its directory, or with
+no name from inside it — but for stop, which there stops every one. pando
+runs only its processes: no install, no hooks, on the project's own
+services.
+
 Exit codes:
   0  ok
   1  error
@@ -110,7 +115,7 @@ Examples:
         base: Option<String>,
     },
     /// List worktrees: what each one runs, its URL and ports, and its git
-    /// state.
+    /// state. The main checkout is the first row.
     ///
     /// Fitted to the terminal: on a narrow one the least useful columns go
     /// first, and the name, status and URL stay. MODE appears once a
@@ -138,7 +143,8 @@ Examples:
     /// Remove a worktree and wipe its pando data. The branch is kept.
     #[command(display_order = 12)]
     Rm {
-        /// The worktree, by branch or directory name.
+        /// The worktree, by branch or directory name. Never the main
+        /// checkout.
         #[arg(value_name = WORKTREE, value_hint = clap::ValueHint::Other)]
         name: String,
         /// Confirm removing a worktree pando did not create.
@@ -158,15 +164,20 @@ Example:
   cd \"$(pando path feat/login)\"")]
     #[command(display_order = 11)]
     Path {
-        /// The worktree, by branch or directory name.
+        /// The worktree or the main checkout, by branch or directory name.
         #[arg(value_name = WORKTREE, value_hint = clap::ValueHint::Other)]
         name: String,
     },
-    /// Start a worktree's processes.
+    /// Start a worktree's processes, or the main checkout's.
     ///
     /// On a terminal it waits until every process is ready, and says why
     /// when one is not. Anywhere else — a script, an agent, a pipe — it
     /// returns as soon as everything is spawned unless `--wait` is given.
+    ///
+    /// The main checkout is yours, set up by you: pando runs its processes
+    /// on ports it allocates and nothing else — no install, no hooks — on
+    /// the project's own services. `--isolated` and `--namespaced` are for
+    /// worktrees.
     #[command(after_help = "\
 Examples:
   pando start feat/login               start everything; on a terminal, wait until it is ready
@@ -174,10 +185,11 @@ Examples:
   pando start feat/login --wait        wait, even from a script
   pando start feat/login --isolated    with private copies of the services
   pando start feat/login --namespaced  experimental: a database of its own in your own server
+  pando start main                     the main checkout's processes, beside the worktrees
   pando start --only api               one process of the worktree you are in")]
     #[command(display_order = 2)]
     Start {
-        /// The worktree, by branch or directory name.
+        /// The worktree or the main checkout, by branch or directory name.
         ///
         /// The one you are in when left out.
         #[arg(value_name = WORKTREE, value_hint = clap::ValueHint::Other)]
@@ -337,10 +349,11 @@ Examples:
         #[arg(long, conflicts_with = "adopt")]
         json: bool,
     },
-    /// Stop a worktree's processes.
+    /// Stop a worktree's processes, or the main checkout's.
     ///
-    /// With no name: the worktree you are in, or every worktree when you
-    /// are in none of them. `--all` stops every one from anywhere.
+    /// With no name: the worktree you are in, or every worktree and the
+    /// main checkout when you are in none of them — in the main checkout
+    /// itself too. `--all` stops every one from anywhere.
     #[command(after_help = "\
 Examples:
   pando stop feat/login               one worktree
@@ -349,7 +362,7 @@ Examples:
   pando stop --all                    every worktree of this repository")]
     #[command(display_order = 3)]
     Stop {
-        /// The worktree, by branch or directory name.
+        /// The worktree or the main checkout, by branch or directory name.
         #[arg(
             conflicts_with = "all",
             value_name = WORKTREE,
@@ -363,13 +376,14 @@ Examples:
         #[arg(long)]
         all: bool,
     },
-    /// Stop and start again, keeping the ports.
+    /// Stop and start again, keeping the ports: a worktree, or the main
+    /// checkout.
     ///
     /// Waits for readiness on a terminal, like `start`, and not elsewhere
     /// unless `--wait` is given.
     #[command(display_order = 4)]
     Restart {
-        /// The worktree, by branch or directory name.
+        /// The worktree or the main checkout, by branch or directory name.
         ///
         /// The one you are in when left out.
         #[arg(value_name = WORKTREE, value_hint = clap::ValueHint::Other)]
@@ -412,7 +426,7 @@ Examples:
   eval \"$(pando status --env feat/login)\"   its environment, in this shell")]
     #[command(display_order = 7)]
     Status {
-        /// The worktree, by branch or directory name.
+        /// The worktree or the main checkout, by branch or directory name.
         ///
         /// Every one when left out.
         #[arg(value_name = WORKTREE, value_hint = clap::ValueHint::Other)]
@@ -430,7 +444,7 @@ Examples:
     /// Publish a running worktree at a public URL.
     #[command(display_order = 9)]
     Share {
-        /// The worktree, by branch or directory name.
+        /// The worktree or the main checkout, by branch or directory name.
         ///
         /// The one you are in when left out.
         #[arg(value_name = WORKTREE, value_hint = clap::ValueHint::Other)]
@@ -439,7 +453,7 @@ Examples:
     /// Take a worktree's public URL down.
     #[command(display_order = 10)]
     Unshare {
-        /// The worktree, by branch or directory name.
+        /// The worktree or the main checkout, by branch or directory name.
         ///
         /// The one you are in when left out.
         #[arg(value_name = WORKTREE, value_hint = clap::ValueHint::Other)]
@@ -455,7 +469,7 @@ Examples:
   pando open feat/login --public  the URL `pando share` published")]
     #[command(display_order = 5)]
     Open {
-        /// The worktree, by branch or directory name.
+        /// The worktree or the main checkout, by branch or directory name.
         ///
         /// The one you are in when left out.
         #[arg(value_name = WORKTREE, value_hint = clap::ValueHint::Other)]
@@ -472,7 +486,7 @@ Examples:
   pando logs -f                         follow the worktree you are in")]
     #[command(display_order = 6)]
     Logs {
-        /// The worktree, by branch or directory name.
+        /// The worktree or the main checkout, by branch or directory name.
         ///
         /// The one you are in when left out.
         #[arg(value_name = WORKTREE, value_hint = clap::ValueHint::Other)]

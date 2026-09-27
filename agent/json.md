@@ -261,6 +261,7 @@ half `signals` deliberately leaves out. It writes nothing anywhere.
   "tools":    [ { "name": "git", "path": "/usr/bin/git", "version": "...",
                   "detail": null, "needed_for": "...", "found": true } ],
   "worktrees":[ { "name": "...", "path": "...", "phase": "...", "created_by_pando": true,
+                  "main": false,  // the main checkout's record, once pando has run it
                   "mode": "shared|namespaced|isolated", "isolated": false,
                   "locked": false, "prunable": false,
                   "prunable_reason": null, "known_to_git": true,
@@ -324,6 +325,7 @@ next start runs it again. A worktree it has never run in has no entry.
   "worktrees": [
     {
       "name": "feat+one",
+      "main": false,                   // true for the main checkout, listed first
       "branch": "feat/one",
       "path": "/abs/path",
       "ports": { "web": 17008 },       // the roles this worktree holds
@@ -352,6 +354,11 @@ next start runs it again. A worktree it has never run in has no entry.
   ]
 }
 ```
+
+`main` is true for the main checkout, which pando runs too. It is the
+first entry once pando has anything recorded for it — or when it is the
+one named — and absent before, so a project whose main checkout was never
+started lists its worktrees alone. Its `mode` is always `shared`.
 
 `mode` says which services a worktree's processes talk to, or last
 talked to once it is stopped: `shared` is the main checkout's servers and
@@ -384,7 +391,7 @@ when the share is behind an auth command.
   "version": 2,
   "project": { "id": "...", "root": "...", "name": "..." },
   "worktrees": [
-    { "name": "feat+one", "path": "...", "branch": "feat/one", "head": "abc1234",
+    { "name": "feat+one", "main": false, "path": "...", "branch": "feat/one", "head": "abc1234",
       "detached": false, "dirty": false, "ahead": 0, "behind": 0,
       "created_by_pando": true, "mode": "shared|namespaced|isolated",
       "prunable": false, "locked": null,
@@ -392,6 +399,10 @@ when the share is behind an auth command.
   ]
 }
 ```
+
+The first entry is always the main checkout, with `main` true and
+`created_by_pando` false: pando runs it, and never removes it. Every other
+entry is a worktree, `main` false.
 
 `dirty`, `ahead` and `behind` are `null` when git could not be asked.
 `locked` is `null` when the worktree is not locked, and the lock reason —

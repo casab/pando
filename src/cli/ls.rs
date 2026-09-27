@@ -261,18 +261,26 @@ pub fn ls_text_at<W: Write>(paths: &PandoPaths, out: &mut W, width: usize) -> Re
 pub fn ls_text_with<W: Write>(paths: &PandoPaths, out: &mut W, view: &LsView) -> Result<()> {
     // The listing forks git and the refresh scans sockets; neither needs
     // the other, so they run side by side.
-    let (worktrees, refreshed) = std::thread::scope(|scope| {
+    let (listing, refreshed) = std::thread::scope(|scope| {
         let refreshing = scope.spawn(|| actions::refresh(paths));
-        let worktrees = actions::ls(paths);
-        (worktrees, refreshing.join().unwrap_or_default())
+        let listing = actions::ls_all(paths);
+        (listing, refreshing.join().unwrap_or_default())
     });
-    let worktrees = worktrees?;
+    let listing = listing?;
     report_refresh(&refreshed);
-    let owned = actions::ownership(&refreshed.state, &worktrees);
-    if worktrees.is_empty() {
+    let owned = actions::ownership(&refreshed.state, &listing.worktrees);
+    // A project with no worktree whose main checkout pando never ran has
+    // nothing to list but the way to start: the listing a first run gets.
+    if listing.worktrees.is_empty() && !refreshed.state.worktrees.contains_key(&listing.main.name) {
         writeln!(out, "no worktrees — `pando new <branch>` creates one")?;
         return Ok(());
     }
+    // The main checkout first: pando runs it too, and it is the one place
+    // every worktree came from.
+    let main_name = listing.main.name.clone();
+    let worktrees: Vec<Worktree> = std::iter::once(listing.main)
+        .chain(listing.worktrees)
+        .collect();
 
     let records: Vec<Option<&WorktreeRecord>> = worktrees
         .iter()
@@ -287,19 +295,28 @@ pub fn ls_text_with<W: Write>(paths: &PandoPaths, out: &mut W, view: &LsView) ->
         .flatten()
         .any(|r| r.mode() != ServiceMode::Shared);
     let any_shared = records.iter().flatten().any(|r| r.share.is_some());
-    let any_renamed = worktrees.iter().any(|w| !named_for_branch(w));
+    // The main checkout is named by its branch here, as the TUI names
+    // it, so its directory's name never brings the column on its own.
+    let any_renamed = worktrees
+        .iter()
+        .any(|w| w.name != main_name && !named_for_branch(w));
 
     let mut rows: Vec<BTreeMap<Col, Cell>> = Vec::new();
     let mut compact_rows: Vec<BTreeMap<Col, Cell>> = Vec::new();
     for (w, record) in worktrees.iter().zip(records.iter().copied()) {
         let created = owned.get(&w.name).copied().unwrap_or(false);
         let aggregate = record.and_then(crate::state::aggregate_phase);
+        let is_main = w.name == main_name;
+        let name = match (&w.branch, is_main) {
+            (Some(branch), true) => branch.clone(),
+            _ => display_name(w),
+        };
         let mut row = BTreeMap::from([
-            (Col::Name, Cell::new(display_name(w), None)),
+            (Col::Name, Cell::new(name, None)),
             (Col::Status, status_cell(record, aggregate.as_ref())),
             (Col::Url, url_cell(record, aggregate.as_ref())),
             (Col::Ports, ports_cell(record, aggregate.as_ref())),
-            (Col::Git, git_cell(w, created)),
+            (Col::Git, git_cell(w, created, is_main)),
         ]);
         if any_own_data {
             row.insert(Col::Mode, mode_cell(record));
@@ -318,7 +335,7 @@ pub fn ls_text_with<W: Write>(paths: &PandoPaths, out: &mut W, view: &LsView) ->
             compact.insert(Col::Public, short);
         }
         if any_renamed {
-            let branch = match (named_for_branch(w), &w.branch) {
+            let branch = match (named_for_branch(w) || is_main, &w.branch) {
                 (true, _) => Cell::new("", None),
                 (false, Some(branch)) => Cell::new(branch, None),
                 (false, None) => Cell::new("(detached)", Some(Paint::Warn)),
@@ -476,8 +493,9 @@ fn mode_cell(record: Option<&WorktreeRecord>) -> Cell {
 /// What git has to say, in git's own words, ordered by how much it should
 /// stop you — a prunable or locked entry, then uncommitted changes — then how far it is ahead of and behind the
 /// base branch, and
-/// whether pando made it: `rm` asks before removing one it did not.
-fn git_cell(w: &Worktree, created_by_pando: bool) -> Cell {
+/// whether pando made it: `rm` asks before removing one it did not, and
+/// never removes the main checkout, which the row says it is.
+fn git_cell(w: &Worktree, created_by_pando: bool, main: bool) -> Cell {
     let (word, paint) = if w.prunable {
         ("prunable", Paint::Bad)
     } else if w.locked {
@@ -498,7 +516,9 @@ fn git_cell(w: &Worktree, created_by_pando: bool) -> Cell {
             text.push_str(&format!(" ↓{behind}"));
         }
     }
-    if !created_by_pando {
+    if main {
+        text.push_str(" main checkout");
+    } else if !created_by_pando {
         text.push_str(" adopted");
     }
     Cell::new(text, Some(paint))
@@ -521,6 +541,8 @@ pub(super) struct ProjectOut {
 #[derive(Serialize)]
 struct WorktreeOut {
     name: String,
+    /// The main checkout: always the first entry, never pando's to remove.
+    main: bool,
     path: String,
     branch: Option<String>,
     head: Option<String>,
@@ -547,16 +569,22 @@ struct PrOut {
 
 pub fn ls_json<W: Write>(paths: &PandoPaths, out: &mut W) -> Result<()> {
     // Side by side, as for the text.
-    let (worktrees, refreshed) = std::thread::scope(|scope| {
+    let (listing, refreshed) = std::thread::scope(|scope| {
         let refreshing = scope.spawn(|| actions::refresh(paths));
-        let worktrees = actions::ls(paths);
-        (worktrees, refreshing.join().unwrap_or_default())
+        let listing = actions::ls_all(paths);
+        (listing, refreshing.join().unwrap_or_default())
     });
-    let worktrees = worktrees?;
+    let listing = listing?;
     // A share the refresh closed or a service it forgot is saved as gone,
     // so this is the one run that can say so.
     report_refresh(&refreshed);
-    let owned = actions::ownership(&refreshed.state, &worktrees);
+    let owned = actions::ownership(&refreshed.state, &listing.worktrees);
+    // The main checkout first, always: a program sees everything pando
+    // can run, and `main` tells it which one is not a worktree.
+    let main_name = listing.main.name.clone();
+    let worktrees: Vec<Worktree> = std::iter::once(listing.main)
+        .chain(listing.worktrees)
+        .collect();
     // Cache only: the CLI never spawns `gh`, so `ls --json` stays fast and
     // works offline. The TUI is what refreshes this.
     let prs = cache::load_prs(&paths.pr_cache_file());
@@ -590,6 +618,7 @@ pub fn ls_json<W: Write>(paths: &PandoPaths, out: &mut W) -> Result<()> {
                 WorktreeOut {
                     created_by_pando: owned.get(&w.name).copied().unwrap_or(false),
                     mode,
+                    main: w.name == main_name,
                     name: w.name,
                     path: w.path.display().to_string(),
                     branch: w.branch,

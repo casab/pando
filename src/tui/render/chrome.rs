@@ -180,7 +180,8 @@ pub(super) fn render_header(f: &mut Frame, area: Rect, app: &App) {
         .as_ref()
         .and_then(|m| m.branch.clone())
         .unwrap_or_else(|| "(detached)".to_string());
-    let count = app.worktrees.len();
+    // Worktrees, which the main checkout is not; what runs counts it.
+    let count = app.linked_count();
     let (mut running, mut failed) = (0, 0);
     for wt in &app.worktrees {
         match app.phase_of(&wt.name) {

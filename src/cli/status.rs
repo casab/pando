@@ -75,6 +75,8 @@ struct ShareOut {
 #[derive(Serialize)]
 struct StatusWorktreeOut {
     name: String,
+    /// The main checkout, listed first once pando has run it.
+    main: bool,
     branch: Option<String>,
     path: String,
     ports: BTreeMap<String, u16>,
@@ -149,9 +151,7 @@ pub fn status_json<W: Write>(paths: &PandoPaths, only: Option<&str>, out: &mut W
     report_refresh(&refreshed);
     // The listing alone: the shape has no git fields, and enriching would
     // be a `git status` in every worktree for nothing.
-    let mut worktrees = crate::worktree::discover(&paths.project)?;
-    worktrees
-        .retain(|w| !crate::worktree::is_check(&w.name) && only.is_none_or(|name| w.name == name));
+    let (worktrees, main_name) = shown_checkouts(paths, only, &refreshed.state)?;
     if let Some(name) = only
         && worktrees.is_empty()
     {
@@ -172,6 +172,7 @@ pub fn status_json<W: Write>(paths: &PandoPaths, only: Option<&str>, out: &mut W
                 let record = record.unwrap_or(&empty);
                 StatusWorktreeOut {
                     name: w.name.clone(),
+                    main: w.name == main_name,
                     branch: w.branch.clone(),
                     path: w.path.display().to_string(),
                     ports: record.ports.clone(),
@@ -330,8 +331,7 @@ fn status_lines<W: Write>(
     // config that does not load only costs those lines.
     let config = crate::config::load(paths).ok().map(|loaded| loaded.config);
     // The listing alone, as for the JSON: nothing here reads a git field.
-    let mut shown = crate::worktree::discover(&paths.project)?;
-    shown.retain(|w| !crate::worktree::is_check(&w.name) && only.is_none_or(|name| w.name == name));
+    let (shown, main_name) = shown_checkouts(paths, only, &refreshed.state)?;
     if shown.is_empty() {
         if let Some(name) = only {
             return Err(not_listed(name, refreshed.state.worktrees.get(name)));
@@ -342,7 +342,16 @@ fn status_lines<W: Write>(
     // Named as `ls` names them: by branch, where the directory is the
     // branch spelled for a filesystem. Measured in columns, and cut only as
     // far as leaves the phase word room, never below `ls`'s floor.
-    let all_names: Vec<String> = shown.iter().map(display_name).collect();
+    let all_names: Vec<String> = shown
+        .iter()
+        .map(|w| match (w.name == main_name, &w.branch) {
+            // By its branch, as `ls` and the TUI name it, and said to be
+            // the main checkout: the line is about it, not a worktree.
+            (true, Some(branch)) => format!("{branch} (main checkout)"),
+            (true, None) => format!("{} (main checkout)", display_name(w)),
+            (false, _) => display_name(w),
+        })
+        .collect();
     let widest = all_names.iter().map(|n| text_width(n)).max().unwrap_or(0);
     let names = widest.min(width.saturating_sub(COL_GAP + PHASE_CELL).max(NAME_FLOOR));
     for (w, shown_name) in shown.iter().zip(&all_names) {
@@ -447,6 +456,34 @@ fn pad(text: &str, width: usize) -> String {
         "{text}{}",
         " ".repeat(width.saturating_sub(text_width(text)))
     )
+}
+
+/// What `status` lists, and the main checkout's name: the main checkout
+/// first, once pando has anything recorded for it or when it is the one
+/// asked about, then every worktree but a check's — or, with `only`, the
+/// one it names.
+///
+/// A main checkout pando never ran is not a row: a project with no
+/// worktree still reads "no worktrees", and one with some lists them.
+fn shown_checkouts(
+    paths: &PandoPaths,
+    only: Option<&str>,
+    state: &crate::state::State,
+) -> Result<(Vec<crate::worktree::Worktree>, String)> {
+    let found = crate::worktree::discover_all(&paths.project)?;
+    let main_name = found.main.name.clone();
+    let main = match only {
+        Some(name) => name == main_name,
+        None => state.worktrees.contains_key(&main_name),
+    };
+    let shown = main
+        .then_some(found.main)
+        .into_iter()
+        .chain(found.worktrees.into_iter().filter(|w| {
+            !crate::worktree::is_check(&w.name) && only.is_none_or(|name| w.name == name)
+        }))
+        .collect();
+    Ok((shown, main_name))
 }
 
 /// The error for a name `status` was given that git does not list.

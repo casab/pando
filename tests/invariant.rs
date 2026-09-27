@@ -571,6 +571,87 @@ fn starting_and_stopping_never_writes_into_the_repository() {
     );
 }
 
+// The main checkout runs too, and Invariant 1 has no exception for it:
+// its start runs its processes and nothing else — not the install, not a
+// hook, not a probe — and the tree is the same byte for byte after a
+// start, a restart and a stop as before them. Every step here would write
+// into the directory it ran in.
+#[test]
+fn running_the_main_checkout_never_writes_into_the_repository() {
+    if !common::python3_available() {
+        eprintln!("skipping: python3 is not installed");
+        return;
+    }
+    let mut toml = String::new();
+    toml.push_str("[project]\nprovision = [\".env\", \".env.local\"]\n");
+    toml.push_str("install = \"touch install-ran\"\n\n[dev]\ncmd = '''");
+    toml.push_str(&common::listener_on_port_template());
+    toml.push_str("'''\nports = [\"web\"]\n\n");
+    for (name, after) in [("made", "create"), ("migrate", "services"), ("seed", "dev")] {
+        toml.push_str(&format!(
+            "[[hooks]]\nname = \"{name}\"\nafter = \"{after}\"\non = \"always\"\n\
+             cmd = \"touch {name}-ran\"\n\n"
+        ));
+    }
+    toml.push_str(
+        "[[probes]]\nname = \"writes\"\ncmd = \"touch probe-ran; false\"\n\
+         match = \"never\"\nhint = \"never\"\n",
+    );
+    let h = harness_with(&toml);
+    assert_eq!(h.config.hooks.len(), 3, "{:?}", h.config.hooks);
+    let main = h.root.file_name().unwrap().to_string_lossy().to_string();
+
+    let started = actions::start(
+        &h.paths,
+        &h.config,
+        &main,
+        None,
+        actions::Mode::Remembered,
+        &|_| {},
+    )
+    .unwrap();
+    let port = started.ports["web"];
+    h.assert_untouched("start of the main checkout", None);
+    let running = wait_for(|| {
+        actions::refresh(&h.paths).state.worktrees[&main]
+            .observed_ports
+            .contains(&port)
+    });
+    assert!(
+        running,
+        "the listener never came up on {port}: {:?}",
+        std::fs::read_to_string(h.paths.log_file(&main, "dev"))
+    );
+    h.assert_untouched("the main checkout running", None);
+
+    let mut out = Vec::new();
+    pando::cli::status_json(&h.paths, None, &mut out).unwrap();
+    pando::cli::ls_text_at(&h.paths, &mut out, 200).unwrap();
+    h.assert_untouched("status and ls", None);
+
+    actions::restart(
+        &h.paths,
+        &h.config,
+        &main,
+        None,
+        actions::Mode::Remembered,
+        &|_| {},
+    )
+    .unwrap();
+    h.assert_untouched("restart of the main checkout", None);
+
+    assert_eq!(
+        actions::stop(&h.paths, &main, None, &|_| {}).unwrap(),
+        actions::StopOutcome::Stopped(vec!["dev".to_string()])
+    );
+    h.assert_untouched("stop of the main checkout", None);
+    assert!(
+        actions::rm(&h.paths, &main, true, true, &|_| {}).is_err(),
+        "rm never removes it"
+    );
+    h.assert_untouched("a refused rm of the main checkout", None);
+}
+
 /// Phase 2b review, finding 1: a process's name is a path component of its
 /// log file, so a hand-written `[processes."../../x"]` created — and
 /// truncated — a `.log` file outside pando's home, and, aimed back at the

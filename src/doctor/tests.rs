@@ -2360,6 +2360,27 @@ fn a_worktree_pando_has_a_record_for_that_git_has_forgotten_is_reported() {
     assert!(report.healthy(), "{:?}", report.findings);
 }
 
+// The main checkout's record is one git lists, under its directory's
+// name: reported as the main checkout, never as forgotten or adopted.
+#[test]
+fn the_main_checkouts_record_is_reported_as_the_main_checkout() {
+    let fx = fixture();
+    let main = fx.root.file_name().unwrap().to_string_lossy().to_string();
+    write_state(
+        &fx,
+        &one_worktree(&main, state::WorktreeRecord::new(&fx.root, false)),
+    );
+    let report = report(&fx);
+    assert_eq!(report.worktrees.len(), 1);
+    assert!(report.worktrees[0].main);
+    assert!(report.worktrees[0].known_to_git);
+    assert!(
+        !mentions(&report, "git does not list it"),
+        "{:?}",
+        messages(&report)
+    );
+}
+
 #[test]
 fn a_failed_process_is_a_problem_carrying_its_reason_and_a_hint_from_the_log() {
     let fx = fixture();

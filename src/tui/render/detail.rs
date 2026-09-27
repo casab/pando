@@ -250,7 +250,11 @@ pub(super) fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
         ));
     }
     let adopted = !app.created_by_pando.get(&name).copied().unwrap_or(false);
-    let note = if adopted { "  adopted" } else { "" };
+    let note = match (app.is_main(&name), adopted) {
+        (true, _) => "  main checkout",
+        (false, true) => "  adopted",
+        (false, false) => "",
+    };
     rows.push((
         KEEP_PATH,
         detail_row(

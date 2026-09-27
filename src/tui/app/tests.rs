@@ -1031,10 +1031,6 @@ fn enter_on_a_filtered_row_keeps_it_over_a_created_worktree_not_yet_listed() {
 fn a_selected_worktree_that_goes_away_leaves_the_cursor_on_its_neighbour() {
     let names = ["feat+a", "feat+b", "feat+c", "feat+d"];
     let mut app = test_app(&names);
-    press(&mut app, KeyCode::Char('j'));
-    press(&mut app, KeyCode::Char('j'));
-    assert_eq!(app.selected_worktree().unwrap().name, "feat+c");
-    app.tail_index = 1;
     let snapshot = |listed: &[&str]| Snapshot {
         main: wt("acme-shop"),
         worktrees: listed.iter().map(|n| wt(n)).collect(),
@@ -1044,6 +1040,13 @@ fn a_selected_worktree_that_goes_away_leaves_the_cursor_on_its_neighbour() {
         notices: Vec::new(),
         default_base: None,
     };
+    // The main checkout's row first, as a discovery lists it; the cursor
+    // stays on feat+a, under it.
+    app.apply_snapshot(snapshot(&names));
+    press(&mut app, KeyCode::Char('j'));
+    press(&mut app, KeyCode::Char('j'));
+    assert_eq!(app.selected_worktree().unwrap().name, "feat+c");
+    app.tail_index = 1;
     app.apply_snapshot(snapshot(&["feat+a", "feat+b", "feat+d"]));
     assert_eq!(app.selected_worktree().unwrap().name, "feat+d");
     assert_eq!(app.tail_index, 0, "a different worktree's tail starts over");
@@ -1330,7 +1333,11 @@ fn a_snapshot_keeps_enrichment_for_unchanged_worktrees() {
         default_base: Some("main".into()),
     });
 
-    assert_eq!(fresh, vec!["feat+two"], "only new entries need enriching");
+    assert_eq!(
+        fresh,
+        vec!["acme-shop", "feat+two"],
+        "only new entries need enriching — the main checkout's row is new here"
+    );
     let kept = app.worktrees.iter().find(|w| w.name == "feat+one").unwrap();
     assert_eq!(
         kept.head_sha.as_deref(),
@@ -1353,7 +1360,7 @@ fn a_snapshot_re_enriches_a_worktree_whose_head_moved() {
         notices: Vec::new(),
         default_base: None,
     });
-    assert_eq!(fresh, vec!["feat+one"]);
+    assert_eq!(fresh, vec!["acme-shop", "feat+one"]);
 }
 
 // The ownership map is what the Remove modal's "pando did not create
@@ -1436,7 +1443,8 @@ fn a_refresh_keeps_the_cursor_on_the_same_worktree_when_the_order_changes() {
         "fix+three",
         "the cursor must stay on the worktree it was on"
     );
-    assert_eq!(app.list_state.selected(), Some(0));
+    // Under the main checkout's row, which is always first.
+    assert_eq!(app.list_state.selected(), Some(1));
 }
 
 #[test]
@@ -7724,4 +7732,133 @@ fn the_setup_screen_is_drawn_again_on_every_tick_for_its_grove() {
             "a tick that did not repaint"
         );
     }
+}
+
+// ---- the main checkout -----------------------------------------------
+
+/// The main checkout as discovery finds it: the repository's own
+/// directory, on `main`.
+pub fn main_checkout() -> Worktree {
+    Worktree {
+        path: PathBuf::from("/pando-test-does-not-exist/acme-shop"),
+        branch: Some("main".into()),
+        ..wt("acme-shop")
+    }
+}
+
+/// An app whose last discovery listed the main checkout and `names`.
+pub fn app_with_main(names: &[&str]) -> App {
+    let mut app = test_app(names);
+    let snapshot = Snapshot {
+        main: main_checkout(),
+        worktrees: names.iter().map(|n| wt(n)).collect(),
+        created_by_pando: names.iter().map(|n| (n.to_string(), true)).collect(),
+        state: app.state.clone(),
+        warning: None,
+        notices: Vec::new(),
+        default_base: None,
+    };
+    app.apply_snapshot(snapshot);
+    app.select_index(0);
+    app
+}
+
+#[test]
+fn the_main_checkout_is_the_first_row_and_not_counted_as_a_worktree() {
+    let app = app_with_main(&["feat+one", "feat+two"]);
+    let rows: Vec<&str> = app
+        .filtered_indices
+        .iter()
+        .map(|&i| app.worktrees[i].name.as_str())
+        .collect();
+    assert_eq!(rows, ["acme-shop", "feat+one", "feat+two"]);
+    assert!(app.is_main("acme-shop") && !app.is_main("feat+one"));
+    assert_eq!(app.linked_count(), 2);
+    assert_eq!(app.label_of("acme-shop"), "main");
+}
+
+// A project with no worktree is a first run, whose welcome is about
+// making one: a main checkout pando never ran is no row yet. Started from
+// a shell, it gets its row with the refresh that reads its record.
+#[test]
+fn a_main_checkout_pando_never_ran_waits_for_its_record_before_the_first_worktree() {
+    let mut app = app_with_main(&[]);
+    assert!(!app.main_row_shown());
+    assert!(app.selected_worktree().is_none());
+    press(&mut app, KeyCode::Char('s'));
+    assert!(app.pending.is_none(), "nothing is selected on the welcome");
+
+    let mut state = app.state.clone();
+    state.worktrees.insert(
+        "acme-shop".to_string(),
+        WorktreeRecord::new("/pando-test-does-not-exist/acme-shop", false),
+    );
+    app.handle_event(refreshed(state));
+    assert!(app.main_row_shown());
+    assert_eq!(app.selected_worktree().unwrap().name, "acme-shop");
+}
+
+#[test]
+fn the_row_keys_act_on_the_main_checkout() {
+    for (key, kind) in [
+        (KeyCode::Char('s'), PendingKind::Start),
+        (KeyCode::Char('x'), PendingKind::Stop),
+        (KeyCode::Char('r'), PendingKind::Restart),
+    ] {
+        let mut app = app_with_main(&["feat+one"]);
+        with_process(&mut app, "acme-shop", running_phase());
+        assert_eq!(app.selected_worktree().unwrap().name, "acme-shop");
+        press(&mut app, key);
+        if kind != PendingKind::Start {
+            press(&mut app, key);
+        }
+        let pending = app.pending.as_ref().expect("the key started something");
+        assert_eq!((pending.name.as_str(), pending.kind), ("acme-shop", kind));
+    }
+    let mut app = app_with_main(&["feat+one"]);
+    with_process(&mut app, "acme-shop", running_phase());
+    press(&mut app, KeyCode::Char('l'));
+    assert!(matches!(app.view, View::Log(_)), "l opens its log");
+}
+
+// It has one mode, so ⏎ has nothing to choose: it starts it, shared.
+#[test]
+fn enter_starts_the_main_checkout_with_no_chooser() {
+    let mut app = app_with_main(&["feat+one"]);
+    press(&mut app, KeyCode::Enter);
+    assert!(app.modal.is_none(), "no mode chooser for it");
+    let pending = app.pending.as_ref().expect("enter started it");
+    assert_eq!(
+        (pending.name.as_str(), pending.kind),
+        ("acme-shop", PendingKind::Start)
+    );
+
+    let mut app = app_with_main(&["feat+one"]);
+    with_process(&mut app, "acme-shop", running_phase());
+    press(&mut app, KeyCode::Enter);
+    assert!(app.modal.is_none() && app.pending.is_none());
+    let (message, _) = app.active_status().unwrap();
+    assert!(message.contains("the main checkout"), "{message}");
+}
+
+// `i` would give it data apart from its own, and `d` would remove it:
+// both refuse, with the reason, and open nothing.
+#[test]
+fn the_main_checkout_refuses_isolation_and_removal() {
+    let mut app = app_with_main(&["feat+one"]);
+    press(&mut app, KeyCode::Char('i'));
+    assert!(app.pending.is_none() && app.modal.is_none());
+    let (message, is_error) = app.active_status().unwrap();
+    assert!(is_error && message.contains("isolated and namespaced are for worktrees"));
+
+    press(&mut app, KeyCode::Char('d'));
+    assert!(app.modal.is_none(), "no remove dialog");
+    let (message, is_error) = app.active_status().unwrap();
+    assert!(is_error, "{message}");
+    assert!(message.contains("never removes it"), "{message}");
+
+    // A worktree's `d` still asks.
+    press(&mut app, KeyCode::Char('j'));
+    press(&mut app, KeyCode::Char('d'));
+    assert!(matches!(app.modal, Some(Modal::Remove { .. })));
 }

@@ -542,7 +542,10 @@ pub fn rm(
 ) -> Result<()> {
     let discovery = worktree::discover_all(&paths.project)?;
     if discovery.main.name == name {
-        bail!("{name:?} is the main checkout — pando never removes it");
+        bail!(
+            "{name:?} is the main checkout — pando runs it, but never removes it; `pando stop \
+             {name}` stops what runs there"
+        );
     }
     let target = discovery.worktrees.iter().find(|w| w.name == name);
     // Read without the lock, and before the home is made: this only asks
@@ -761,25 +764,54 @@ pub fn rm(
     Ok(())
 }
 
-/// The managed worktree called `name`, or an error naming what is there.
-pub(super) fn find_worktree(paths: &PandoPaths, name: &str) -> Result<Worktree> {
+/// A checkout pando can run: a worktree, or the main checkout itself.
+#[derive(Debug, Clone)]
+pub(super) struct Checkout {
+    pub(super) worktree: Worktree,
+    /// The main checkout: the developer's own, set up by them. pando runs
+    /// its processes and nothing else there — see [`MAIN_RUNS_ONLY`].
+    pub(super) main: bool,
+}
+
+/// What a start of the main checkout says it does, once. Invariant 1 has
+/// no exception for it: an install, a hook or a probe runs a command in
+/// the repository, and what that command writes is not pando's to know.
+pub const MAIN_RUNS_ONLY: &str =
+    "the main checkout: pando runs its processes and nothing else — no install, no hooks";
+
+/// The checkout called `name` — a managed worktree, or the main checkout
+/// by its directory name — or an error naming what is there.
+pub(super) fn find_checkout(paths: &PandoPaths, name: &str) -> Result<Checkout> {
     let discovery = worktree::discover_all(&paths.project)?;
     if discovery.main.name == name {
-        bail!("{name:?} is the main checkout — pando starts worktrees, not the repository itself");
+        return Ok(Checkout {
+            worktree: discovery.main,
+            main: true,
+        });
     }
     discovery
         .worktrees
         .into_iter()
         .find(|w| w.name == name)
+        .map(|worktree| Checkout {
+            worktree,
+            main: false,
+        })
         .with_context(|| format!("no worktree named {name:?}"))
 }
 
-/// [`find_worktree`] for a start or restart, which runs things in the
-/// worktree: see [`refuse_a_gone_directory`].
-pub(super) fn find_live_worktree(paths: &PandoPaths, name: &str) -> Result<Worktree> {
-    let worktree = find_worktree(paths, name)?;
-    refuse_a_gone_directory(&worktree)?;
-    Ok(worktree)
+/// [`find_checkout`], for a caller that runs or reads a checkout the same
+/// way whichever it is.
+pub(super) fn find_worktree(paths: &PandoPaths, name: &str) -> Result<Worktree> {
+    Ok(find_checkout(paths, name)?.worktree)
+}
+
+/// [`find_checkout`] for a start or restart, which runs things in the
+/// checkout: see [`refuse_a_gone_directory`].
+pub(super) fn find_live_checkout(paths: &PandoPaths, name: &str) -> Result<Checkout> {
+    let checkout = find_checkout(paths, name)?;
+    refuse_a_gone_directory(&checkout.worktree)?;
+    Ok(checkout)
 }
 
 /// Refuses a worktree git still lists but whose directory is gone, naming
@@ -841,6 +873,22 @@ pub fn ls(paths: &PandoPaths) -> Result<Vec<Worktree>> {
     worktrees.retain(|w| !worktree::is_check(&w.name));
     worktree::enrich_from_git(&mut worktrees, paths.root()).ok();
     Ok(worktrees)
+}
+
+/// [`ls`], with the main checkout beside the worktrees, enriched in the
+/// same pass: what a listing that puts main first shows.
+pub fn ls_all(paths: &PandoPaths) -> Result<worktree::Discovery> {
+    let mut discovery = worktree::discover_all(&paths.project)?;
+    discovery.worktrees.retain(|w| !worktree::is_check(&w.name));
+    let mut all: Vec<Worktree> = std::iter::once(discovery.main)
+        .chain(discovery.worktrees)
+        .collect();
+    worktree::enrich_from_git(&mut all, paths.root()).ok();
+    let main = all.remove(0);
+    Ok(worktree::Discovery {
+        main,
+        worktrees: all,
+    })
 }
 
 /// The absolute, canonical path of a worktree.

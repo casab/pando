@@ -11,13 +11,15 @@ use crate::paths::PandoPaths;
 use crate::services;
 
 use super::init::{machine_evidence, slot_value};
-use super::lifecycle::{Mode, refuse_losing_namespaces, target_of, worktree_roles};
+use super::lifecycle::{
+    Mode, refuse_losing_namespaces, refuse_main_mode, target_of, worktree_roles,
+};
 use super::namespaced::{ask_for_logins, free_slots_if_full};
 use super::runtime::{
     Machine, RuntimeOutcome, answer_prelude, resolve_runtime, runtime_shell, user_home,
 };
 use super::services::{backends_reachable, placeholder_ports, service_roles};
-use super::worktree::{find_worktree, refuse_a_gone_directory};
+use super::worktree::{find_checkout, refuse_a_gone_directory};
 use crate::state::ServiceMode;
 
 /// Something pando needs to know and cannot work out on its own.
@@ -507,10 +509,15 @@ pub fn resolve_for_start(
     // asked: a login given, or a slot freed, for a start that cannot run
     // there is a cost with nothing for it. A name git does not list is
     // `start`'s to refuse.
-    let worktree = find_worktree(paths, name).ok();
-    if let Some(worktree) = &worktree {
-        refuse_a_gone_directory(worktree)?;
+    let checkout = find_checkout(paths, name).ok();
+    if let Some(checkout) = &checkout {
+        refuse_a_gone_directory(&checkout.worktree)?;
+        // Nor for the main checkout in a mode it never runs in.
+        if checkout.main {
+            refuse_main_mode(name, mode)?;
+        }
     }
+    let worktree = checkout.map(|checkout| checkout.worktree);
     // Nor is anything asked for a start of a namespaced worktree that can
     // no longer have its namespaces: that start is refused.
     refuse_losing_namespaces(paths, config, name, mode)?;

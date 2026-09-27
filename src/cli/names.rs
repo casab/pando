@@ -1,6 +1,8 @@
 //! Which worktree a command means: the name as typed, the branch it
 //! checks out, or the worktree the shell is standing in — and, when it is
-//! none of those, the names that were probably meant.
+//! none of those, the names that were probably meant. The main checkout
+//! is one of them, by its directory's name or its branch: pando runs it
+//! too.
 
 use super::UsageError;
 use super::ls::display_name;
@@ -30,17 +32,15 @@ const LIST_ALL_UP_TO: usize = 6;
 /// one to delete by.
 pub(super) fn resolve(paths: &PandoPaths, typed: &str) -> Result<String> {
     refuse_empty(typed)?;
-    resolve_listed(paths, &discover_listed(paths)?, typed, false)
+    resolve_listed(paths, &discover_listed(paths)?, typed)
 }
 
-/// The path of what `typed` names, where the main checkout is a place too:
-/// `path` is the one verb for which it is a fine answer — by its
-/// directory's name or by the branch it has checked out. Resolved and
-/// looked up in one listing of the worktrees.
+/// The path of what `typed` names, the main checkout's included. Resolved
+/// and looked up in one listing of the worktrees.
 pub(super) fn path(paths: &PandoPaths, typed: &str) -> Result<PathBuf> {
     refuse_empty(typed)?;
     let discovery = discover_listed(paths)?;
-    let name = resolve_listed(paths, &discovery, typed, true)?;
+    let name = resolve_listed(paths, &discovery, typed)?;
     crate::actions::path_in(discovery, &name)
 }
 
@@ -66,12 +66,7 @@ fn refuse_empty(typed: &str) -> Result<()> {
 }
 
 /// [`resolve`], against a listing already made.
-fn resolve_listed(
-    paths: &PandoPaths,
-    discovery: &Discovery,
-    typed: &str,
-    main_ok: bool,
-) -> Result<String> {
+fn resolve_listed(paths: &PandoPaths, discovery: &Discovery, typed: &str) -> Result<String> {
     // One worktree's directory and another's branch can be the same
     // string — a branch literally called `a+b` beside the directory `a+b`
     // of the branch `a/b`. Picking the directory silently is how `rm`
@@ -89,19 +84,11 @@ fn resolve_listed(
     if by_dir.is_some() {
         return Ok(typed.to_string());
     }
-    // The main checkout used to be passed through like a worktree, and
-    // every verb but `path` then did something odd with it: `status`
-    // printed "no worktree named" and exited 0, `stop` said it "was not
-    // running", `open` suggested a `start` that refuses it.
+    // The main checkout, by its directory's name or by its branch: every
+    // verb takes it, and the ones it cannot do — `rm` — say why.
     let main = &discovery.main;
     if main.name == typed || (by_branch_name.is_none() && main.branch.as_deref() == Some(typed)) {
-        if main_ok {
-            return Ok(main.name.clone());
-        }
-        anyhow::bail!(
-            "{typed:?} is the main checkout, not a worktree — pando runs worktrees; \
-             `pando ls` lists them"
-        );
+        return Ok(main.name.clone());
     }
     if let Some(w) = by_branch(&discovery.worktrees, typed) {
         return Ok(w.name.clone());
@@ -159,6 +146,7 @@ fn shown_in(discovery: &Discovery, name: &str) -> String {
     discovery
         .worktrees
         .iter()
+        .chain(std::iter::once(&discovery.main))
         .find(|w| w.name == name)
         .map(|w| w.display_name())
         .unwrap_or_else(|| name.to_string())
@@ -320,18 +308,22 @@ fn or_list(names: &[String]) -> String {
 /// Levenshtein distance, the one config's "did you mean" uses too.
 pub(super) use crate::config::edit_distance;
 
-/// The worktree `dir` is inside, if any — the one a command run with no
-/// name from within a worktree means.
+/// The linked worktree `dir` is inside, if any — the one `stop` run with
+/// no name means. Never the main checkout: `stop` there stops every one,
+/// main's own processes among them, as it always has.
 pub(super) fn containing(paths: &PandoPaths, dir: &Path) -> Result<Option<String>> {
-    Ok(containing_in(&discover_listed(paths)?, dir))
+    Ok(containing_in(&discover_listed(paths)?, dir, false))
 }
 
-/// [`containing`], against a listing already made.
-fn containing_in(discovery: &Discovery, dir: &Path) -> Option<String> {
+/// [`containing`], against a listing already made, and the main checkout
+/// counted when `with_main` says: every verb but `stop` means it.
+fn containing_in(discovery: &Discovery, dir: &Path, with_main: bool) -> Option<String> {
     let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let main = with_main.then_some(&discovery.main);
     discovery
         .worktrees
         .iter()
+        .chain(main)
         .filter(|w| dir.starts_with(&w.path))
         // Nested worktrees are legal git, and the innermost is the one
         // the shell is in.
@@ -355,10 +347,10 @@ pub(super) fn target_named(paths: &PandoPaths, typed: Option<&str>, verb: &str) 
     }
     let discovery = discover_listed(paths)?;
     let dir = match typed {
-        Some(typed) => resolve_listed(paths, &discovery, typed, false)?,
+        Some(typed) => resolve_listed(paths, &discovery, typed)?,
         None => {
             let cwd = std::env::current_dir()?;
-            containing_in(&discovery, &cwd).ok_or_else(|| {
+            containing_in(&discovery, &cwd, true).ok_or_else(|| {
                 UsageError(format!(
                     "which worktree? `pando {verb} <name>`, or run it from inside one"
                 ))

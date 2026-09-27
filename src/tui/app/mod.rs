@@ -1045,6 +1045,33 @@ impl App {
             .unwrap_or_else(|| name.to_string())
     }
 
+    /// Whether `name` is the main checkout's row.
+    pub fn is_main(&self, name: &str) -> bool {
+        self.main.as_ref().is_some_and(|main| main.name == name)
+    }
+
+    /// How many worktrees the list has, the main checkout not among them:
+    /// it is not a worktree, and the header and the list's title count
+    /// worktrees.
+    pub fn linked_count(&self) -> usize {
+        self.worktrees
+            .iter()
+            .filter(|w| !self.is_main(&w.name))
+            .count()
+    }
+
+    /// Whether the main checkout has a row: once the project has a
+    /// worktree, or pando has anything recorded for main. A project with
+    /// neither is a first run, and the welcome it gets is about making a
+    /// worktree — a main checkout pando never ran does not change that.
+    pub fn main_row_shown(&self) -> bool {
+        self.linked_count() > 0
+            || self
+                .main
+                .as_ref()
+                .is_some_and(|main| self.state.worktrees.contains_key(&main.name))
+    }
+
     pub fn selected_worktree(&self) -> Option<&Worktree> {
         let row = self.list_state.selected()?;
         let idx = *self.filtered_indices.get(row)?;
@@ -1108,10 +1135,12 @@ impl App {
     fn refilter_keeping(&mut self, keep: Option<String>, fallback: usize) {
         let needle = self.filter.to_lowercase();
         let keep_name = keep;
+        let main_shown = self.main_row_shown();
         self.filtered_indices = self
             .worktrees
             .iter()
             .enumerate()
+            .filter(|(_, w)| main_shown || !self.is_main(&w.name))
             .filter(|(_, w)| {
                 needle.is_empty()
                     || w.name.to_lowercase().contains(&needle)
@@ -1312,7 +1341,13 @@ impl App {
     /// Returns whether anything changed.
     pub(super) fn adopt_state(&mut self, state: State) -> bool {
         let changed = state != self.state;
+        let shown = self.main_row_shown();
         let before = std::mem::replace(&mut self.state, state);
+        // A main checkout started from a shell while the welcome is up gets
+        // its row with the state that records it, not a discovery later.
+        if self.main_row_shown() != shown {
+            self.refilter();
+        }
         let died = self.deaths_since(&before);
         self.announce_ready(&died);
         self.announce_deaths(died);

@@ -351,8 +351,186 @@ fn starting_a_worktree_that_does_not_exist_says_so() {
     with_dev(&mut fx, dev("sleep 30"));
     let err = start(&fx.paths, &fx.config, "nope", None, &noop).unwrap_err();
     assert!(format!("{err:#}").contains("no worktree named"));
-    let err = start(&fx.paths, &fx.config, "acme-shop", None, &noop).unwrap_err();
-    assert!(format!("{err:#}").contains("main checkout"));
+}
+
+// ---- the main checkout -------------------------------------------------
+
+/// A project whose every step would leave a mark in the directory it runs
+/// in: the install, a hook at each point, and a probe. None of them may
+/// run in the main checkout.
+fn with_marking_steps(fx: &mut Fx) {
+    use crate::config::{HookConfig, HookPoint, HookScope, ProbeConfig};
+    fx.config.project.install = Some("touch install-ran".to_string());
+    let hook = |name: &str, after: HookPoint| HookConfig {
+        name: name.to_string(),
+        after,
+        fingerprint: Vec::new(),
+        cmd: format!("touch {name}-ran"),
+        cwd: None,
+        fallback: None,
+        on: Some(HookScope::Always),
+    };
+    fx.config.hooks = vec![
+        hook("create", HookPoint::Create),
+        hook("deps", HookPoint::Install),
+        hook("migrate", HookPoint::Services),
+        hook("seed", HookPoint::Dev),
+    ];
+    fx.config.probes = vec![ProbeConfig {
+        name: "writes".to_string(),
+        cmd: "touch probe-ran; false".to_string(),
+        match_: "never".to_string(),
+        hint: "never".to_string(),
+    }];
+}
+
+const MARKS: [&str; 6] = [
+    "install-ran",
+    "create-ran",
+    "deps-ran",
+    "migrate-ran",
+    "seed-ran",
+    "probe-ran",
+];
+
+// The main checkout runs by its directory's name: its processes, in it,
+// on ports pando allocates, with the variables a worktree's get — and
+// nothing else. Invariant 1 has no exception for it.
+#[test]
+fn the_main_checkout_runs_its_processes_on_allocated_ports_and_nothing_else() {
+    let mut fx = fixture();
+    with_dev(&mut fx, dev("env | sort && sleep 30"));
+    with_marking_steps(&mut fx);
+    let said = std::cell::RefCell::new(Vec::<String>::new());
+    let progress = |line: &str| said.borrow_mut().push(line.to_string());
+
+    let report = start(&fx.paths, &fx.config, "acme-shop", None, &progress).unwrap();
+    let _guard = guard(&report);
+    let port = report.ports["web"];
+    assert_eq!(report.worktree, "acme-shop");
+    assert_eq!(names_of(&report.started), ["dev"]);
+    assert!(
+        said.borrow().iter().any(|line| line == MAIN_RUNS_ONLY),
+        "{:?}",
+        said.borrow()
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || log_of(&fx, "acme-shop")
+            .contains("PANDO_PROJECT")),
+        "{}",
+        log_of(&fx, "acme-shop")
+    );
+    let log = log_of(&fx, "acme-shop");
+    for expected in [
+        format!("PORT={port}"),
+        "PANDO_NAME=acme-shop".to_string(),
+        "PANDO_BRANCH=main".to_string(),
+        format!("PANDO_WORKTREE={}", fx.root.display()),
+    ] {
+        assert!(log.contains(&expected), "missing {expected} in:\n{log}");
+    }
+    let record = &fx.state().worktrees["acme-shop"];
+    assert!(!record.created_by_pando, "never pando's");
+    assert_eq!(record.mode(), state::ServiceMode::Shared);
+    assert!(record.hooks.is_empty(), "{:?}", record.hooks);
+    for mark in MARKS {
+        assert!(
+            !fx.root.join(mark).exists(),
+            "{mark} ran in the main checkout"
+        );
+    }
+    let status = Command::new("git")
+        .current_dir(&fx.root)
+        .args(["status", "--porcelain", "--ignored"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&status.stdout),
+        "!! .env\n",
+        "nothing but the developer's own ignored file"
+    );
+
+    // Beside a worktree, on ports of its own; the worktree runs its steps.
+    let name = worktree_named(&fx, "feat/one");
+    let beside = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+    let _beside = guard(&beside);
+    assert_ne!(beside.ports["web"], port);
+    assert!(fx.worktrees_dir().join(&name).join("seed-ran").exists());
+
+    // Stopped and restarted like one, keeping its port.
+    assert_eq!(
+        stop(&fx.paths, "acme-shop", None).unwrap(),
+        StopOutcome::Stopped(vec!["dev".to_string()])
+    );
+    let again = restart(&fx.paths, &fx.config, "acme-shop", None, &noop).unwrap();
+    let _again = guard(&again);
+    assert_eq!(again.ports["web"], port);
+    for mark in MARKS {
+        assert!(!fx.root.join(mark).exists(), "{mark} ran on the restart");
+    }
+}
+
+// Its services are the project's own, which hold its data: the modes that
+// give a worktree data apart from main's are refused, before anything is
+// asked, made or stopped. And `rm` never removes it.
+#[test]
+fn the_main_checkout_refuses_the_private_modes_and_removal() {
+    let mut fx = fixture();
+    with_dev(&mut fx, dev("sleep 30"));
+    for mode in [Mode::Isolated, Mode::Namespaced] {
+        let flag = match mode {
+            Mode::Isolated => "--isolated",
+            _ => "--namespaced",
+        };
+        for err in [
+            super::start(&fx.paths, &fx.config, "acme-shop", None, mode, &noop).unwrap_err(),
+            super::restart(&fx.paths, &fx.config, "acme-shop", None, mode, &noop).unwrap_err(),
+            resolve_for_start(
+                &fx.paths,
+                &fx.config,
+                "acme-shop",
+                mode,
+                &|_| bail!("nothing may be asked"),
+                &noop,
+            )
+            .unwrap_err(),
+        ] {
+            let said = format!("{err:#}");
+            assert!(
+                said.contains("is the main checkout") && said.contains(flag),
+                "{said}"
+            );
+        }
+    }
+    assert!(!fx.paths.state_file().exists(), "nothing was recorded");
+
+    let err = rm(&fx.paths, "acme-shop", true, true).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("the main checkout — pando runs it, but never removes it"),
+        "{err:#}"
+    );
+    assert!(fx.root.join("README.md").exists());
+}
+
+// `stop --all` and the TUI's X stop the main checkout with the worktrees,
+// and keep its record, as every stop does.
+#[test]
+fn stopping_everything_stops_the_main_checkout_too() {
+    let mut fx = fixture();
+    with_dev(&mut fx, dev("sleep 30"));
+    let main = start(&fx.paths, &fx.config, "acme-shop", None, &noop).unwrap();
+    let _main = guard(&main);
+    let name = worktree_named(&fx, "feat/one");
+    let one = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+    let _one = guard(&one);
+
+    let mut stopped = stop_all(&fx.paths).unwrap();
+    stopped.sort();
+    assert_eq!(stopped, ["acme-shop", "feat+one"]);
+    let record = &fx.state().worktrees["acme-shop"];
+    assert!(record.processes.is_empty());
+    assert_eq!(record.ports["web"], main.ports["web"], "its port is kept");
+    assert!(fx.root.is_dir());
 }
 
 #[test]

@@ -295,19 +295,18 @@ fn a_name_resolves_by_directory_by_branch_or_by_the_directory_it_is_run_in() {
     assert_eq!(super::names::containing(&fx.paths, &fx.root).unwrap(), None);
 }
 
-// The main checkout is a place `path` can go, and nothing else pando
-// does. It used to resolve like a worktree for every verb: `status
-// acme-shop` printed "no worktree named" and exited 0, `stop` said it
-// "was not running", and `open` suggested a `start` that refuses it.
+// The main checkout resolves for every verb, by its directory's name or
+// its branch: pando runs it too. It used to resolve for `path` alone, and
+// before that like a worktree nothing could act on.
 #[test]
-fn the_main_checkout_resolves_for_path_only_and_an_empty_name_is_a_usage_error() {
+fn the_main_checkout_resolves_by_name_or_branch_and_an_empty_name_is_a_usage_error() {
     let fx = fixture();
     let name = actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
     for typed in ["acme-shop", "main"] {
-        let err = super::names::resolve(&fx.paths, typed).unwrap_err();
-        assert!(
-            format!("{err:#}").contains("is the main checkout"),
-            "{typed}: {err:#}"
+        assert_eq!(
+            super::names::resolve(&fx.paths, typed).unwrap(),
+            "acme-shop",
+            "{typed}"
         );
         assert_eq!(
             super::names::path(&fx.paths, typed).unwrap().file_name(),
@@ -316,6 +315,8 @@ fn the_main_checkout_resolves_for_path_only_and_an_empty_name_is_a_usage_error()
         );
     }
     assert_eq!(super::names::resolve(&fx.paths, "feat/one").unwrap(), name);
+    // `stop` with no name inside it stops every one, as it always has.
+    assert_eq!(super::names::containing(&fx.paths, &fx.root).unwrap(), None);
 
     let err = super::names::resolve(&fx.paths, "").unwrap_err();
     assert!(err.downcast_ref::<UsageError>().is_some(), "{err:#}");
@@ -734,12 +735,11 @@ fn ls_names_lists_what_a_worktree_argument_accepts() {
     let text = capture(|b| super::completion::names(&fx.paths, b));
     let names: Vec<&str> = text.lines().collect();
     assert_eq!(names, ["acme-shop", "feat/one"], "{text}");
-    // The main checkout is offered for `path`, the one verb it is a place
-    // for; every worktree resolves for all of them.
+    // Every one resolves for every verb, the main checkout included.
     for name in &names {
         super::names::path(&fx.paths, name).unwrap();
+        super::names::resolve(&fx.paths, name).unwrap();
     }
-    super::names::resolve(&fx.paths, names[1]).unwrap();
 }
 
 // A menu entry is a line: the long `--help` paragraph belongs to `--help`.
@@ -1483,7 +1483,7 @@ fn status_and_ls_json_publish_the_mode_beside_the_old_isolated_flag() {
 
         let text = capture(|b| ls_json(&fx.paths, b));
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(v["worktrees"][0]["mode"], mode.word(), "{text}");
+        assert_eq!(v["worktrees"][1]["mode"], mode.word(), "{text}");
     }
 }
 
@@ -2159,13 +2159,15 @@ fn long_names_that_share_a_prefix_stay_distinct_on_a_narrow_terminal() {
         "never cut when not a terminal: {wide}"
     );
     let narrow = capture(|b| ls_text_at(&fx.paths, b, 50));
+    // The main checkout first, then the two.
     let names: Vec<&str> = narrow
         .lines()
         .skip(1)
         .map(|l| l.split_whitespace().next().unwrap())
         .collect();
-    assert_eq!(names.len(), 2, "{narrow}");
-    assert_ne!(names[0], names[1], "{narrow}");
+    assert_eq!(names.len(), 3, "{narrow}");
+    assert_eq!(names[0], "main", "{narrow}");
+    assert_ne!(names[1], names[2], "{narrow}");
     for line in narrow.lines() {
         assert!(line.chars().count() <= 50, "{line:?} in\n{narrow}");
     }
@@ -2270,8 +2272,18 @@ fn ls_json_emits_the_documented_shape() {
     assert_eq!(v["project"]["name"], "acme-shop");
     assert_eq!(v["project"]["root"], fx.root.display().to_string().as_str());
 
-    let w = &v["worktrees"][0];
+    // The main checkout first, marked, and never pando's.
+    let main = &v["worktrees"][0];
+    assert_eq!(main["name"], "acme-shop");
+    assert_eq!(main["main"], true);
+    assert_eq!(main["branch"], "main");
+    assert_eq!(main["created_by_pando"], false);
+    assert_eq!(main["mode"], "shared");
+    assert_eq!(main["path"], fx.root.display().to_string().as_str());
+
+    let w = &v["worktrees"][1];
     assert_eq!(w["name"], "feat+one");
+    assert_eq!(w["main"], false);
     assert_eq!(w["branch"], "feat/one");
     assert_eq!(w["detached"], false);
     assert_eq!(w["dirty"], false);
@@ -2287,11 +2299,13 @@ fn ls_json_emits_the_documented_shape() {
 }
 
 #[test]
-fn ls_json_is_an_empty_list_rather_than_an_error_with_no_worktrees() {
+fn ls_json_lists_the_main_checkout_alone_rather_than_an_error_with_no_worktrees() {
     let fx = fixture();
     let text = capture(|b| ls_json(&fx.paths, b));
     let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(v["worktrees"].as_array().unwrap().len(), 0);
+    let listed = v["worktrees"].as_array().unwrap();
+    assert_eq!(listed.len(), 1, "{text}");
+    assert_eq!(listed[0]["main"], true, "{text}");
 }
 
 #[test]
@@ -2310,7 +2324,7 @@ fn ls_json_reports_a_locked_worktree_with_its_reason() {
     );
     let text = capture(|b| ls_json(&fx.paths, b));
     let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(v["worktrees"][0]["locked"], "benchmarking");
+    assert_eq!(v["worktrees"][1]["locked"], "benchmarking");
 }
 
 // The CLI never spawns `gh`; chips come from whatever the TUI last saw.
@@ -2336,10 +2350,10 @@ fn ls_json_fills_the_pr_field_from_the_cache() {
 
     let text = capture(|b| ls_json(&fx.paths, b));
     let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(v["worktrees"][0]["pr"]["number"], 42);
-    assert_eq!(v["worktrees"][0]["pr"]["state"], "open");
+    assert_eq!(v["worktrees"][1]["pr"]["number"], 42);
+    assert_eq!(v["worktrees"][1]["pr"]["state"], "open");
     assert_eq!(
-        v["worktrees"][0]["pr"]["url"],
+        v["worktrees"][1]["pr"]["url"],
         "https://example.test/pull/42"
     );
 }
@@ -4101,4 +4115,83 @@ fn new_and_start_still_work_on_a_new_project_after_the_tip() {
     .unwrap();
     actions::stop(&fx.paths, &name, None, &quiet).unwrap();
     assert!(!report.started_nothing());
+}
+
+// ---- the main checkout -------------------------------------------------
+
+/// One section of the contract, by its heading.
+fn contract_section(heading: &str) -> String {
+    let doc = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("agent/json.md"),
+    )
+    .unwrap();
+    doc.split(heading)
+        .nth(1)
+        .unwrap_or_else(|| panic!("agent/json.md has no {heading}"))
+        .split("\n## ")
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+// Every key a worktree entry of `ls --json` and `status --json` prints is
+// one the contract names — the main checkout's `main` among them — and
+// the main checkout is the first entry of both once pando has run it.
+#[test]
+fn agent_json_documents_every_ls_and_status_worktree_key_and_main_comes_first() {
+    let fx = fixture();
+    actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
+    let mut store = crate::state::load(&fx.paths.state_file()).unwrap();
+    let mut main = crate::state::WorktreeRecord::new(&fx.root, false);
+    main.ports.insert("web".to_string(), 17_342);
+    store.worktrees.insert("acme-shop".to_string(), main);
+    crate::state::save(&fx.paths.state_file(), &store).unwrap();
+
+    for (heading, text) in [
+        ("## `pando ls --json`", capture(|b| ls_json(&fx.paths, b))),
+        (
+            "## `pando status --json`",
+            capture(|b| status_json(&fx.paths, None, b)),
+        ),
+    ] {
+        let section = contract_section(heading);
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let listed = v["worktrees"].as_array().unwrap();
+        assert_eq!(listed.len(), 2, "{text}");
+        assert_eq!(listed[0]["name"], "acme-shop", "{text}");
+        assert_eq!(listed[0]["main"], true, "{text}");
+        assert_eq!(listed[1]["main"], false, "{text}");
+        for entry in listed {
+            for key in entry.as_object().unwrap().keys() {
+                assert!(
+                    section.contains(&format!("\"{key}\"")),
+                    "agent/json.md never documents {heading} worktrees[].{key}"
+                );
+            }
+        }
+    }
+}
+
+// `status` lists the main checkout once pando has anything recorded for
+// it, first and said to be it; asked about by name, always.
+#[test]
+fn status_shows_the_main_checkout_once_it_has_a_record() {
+    let fx = fixture();
+    actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
+    let text = capture(|b| status_text_at(&fx.paths, None, b, 200));
+    assert!(!text.contains("main checkout"), "{text}");
+    let text = capture(|b| status_json(&fx.paths, Some("acme-shop"), b));
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["worktrees"][0]["main"], true, "{text}");
+
+    let mut store = crate::state::load(&fx.paths.state_file()).unwrap();
+    store.worktrees.insert(
+        "acme-shop".to_string(),
+        crate::state::WorktreeRecord::new(&fx.root, false),
+    );
+    crate::state::save(&fx.paths.state_file(), &store).unwrap();
+    let text = capture(|b| status_text_at(&fx.paths, None, b, 200));
+    let first = text.lines().next().unwrap();
+    assert!(first.starts_with("main (main checkout)"), "{text}");
+    assert!(text.contains("feat/one"), "{text}");
 }

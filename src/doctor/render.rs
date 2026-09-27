@@ -323,9 +323,10 @@ fn render_worktrees(out: &mut String, worktrees: &[WorktreeReport], style: &Styl
         return;
     }
     for worktree in worktrees {
-        let mut flags: Vec<&str> = vec![match worktree.created_by_pando {
-            true => "pando-created",
-            false => "adopted",
+        let mut flags: Vec<&str> = vec![match (worktree.main, worktree.created_by_pando) {
+            (true, _) => "main checkout",
+            (false, true) => "pando-created",
+            (false, false) => "adopted",
         }];
         if worktree.mode != crate::state::ServiceMode::Shared {
             flags.push(worktree.mode.word());

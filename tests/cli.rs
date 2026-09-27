@@ -346,7 +346,8 @@ fn ls_lists_the_worktrees_once_beyond_what_every_command_does() {
             .filter(|call| call.contains("worktree list --porcelain"))
             .collect();
         assert_eq!(listings.len(), 3, "{args:?}: {listings:#?}");
-        assert_eq!(git_calls_to(&calls, "status").len(), 2, "{args:?}");
+        // One per worktree, and one for the main checkout's row.
+        assert_eq!(git_calls_to(&calls, "status").len(), 3, "{args:?}");
     }
 }
 
@@ -1472,23 +1473,122 @@ fn stop_with_no_name_inside_a_worktree_stops_only_that_one() {
     assert!(stdout(&out).contains("feat+two"), "{}", stdout(&out));
 }
 
+// Inside the main checkout, a verb that takes a name means it — but
+// `stop`, which there stops every one, as it always has, and whose
+// `--only` so needs a worktree named.
 #[test]
-fn a_verb_that_needs_a_worktree_and_gets_none_is_a_usage_error() {
+fn in_the_main_checkout_a_verb_with_no_name_means_it_but_stop_means_every_one() {
     let e = env();
-    for args in [
-        vec!["start"],
-        vec!["logs"],
-        vec!["open"],
-        vec!["stop", "--only", "web"],
-    ] {
-        let out = e.pando(&args);
-        assert_eq!(code(&out), EXIT_USAGE, "{args:?}: {}", stderr(&out));
+    e.write_config(SLEEPER);
+    let main = e.root.file_name().unwrap().to_string_lossy().to_string();
+    let out = e.pando(&["start", "--no-wait"]);
+    assert_eq!(code(&out), EXIT_OK, "{}", stderr(&out));
+    assert!(
+        stdout(&out).starts_with(&format!("started {main}")),
+        "{}",
+        stdout(&out)
+    );
+    assert!(
+        poll_until(|| stdout(&e.pando(&["logs", "--tail", "5"])).contains("started-ok")),
+        "logs with no name reads the main checkout's"
+    );
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+    assert_eq!(code(&e.pando(&["start", "feat/one", "--no-wait"])), EXIT_OK);
+
+    let out = e.pando(&["stop", "--only", "dev"]);
+    assert_eq!(code(&out), EXIT_USAGE, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("run it from inside one"),
+        "{}",
+        stderr(&out)
+    );
+
+    let out = e.pando(&["stop"]);
+    assert_eq!(code(&out), EXIT_OK, "{}", stderr(&out));
+    let said = stdout(&out);
+    assert!(said.contains(&main) && said.contains("feat+one"), "{said}");
+}
+
+// The main checkout runs by its branch or its directory's name: its
+// processes on an allocated port, and nothing else — not the install,
+// not a hook — so it stays exactly as the developer left it. The modes
+// that give a worktree data apart from main's, and `rm`, refuse it.
+#[test]
+fn the_main_checkout_runs_by_branch_or_name_and_runs_nothing_else() {
+    let e = env();
+    e.write_config(&format!(
+        "[project]\ninstall = \"touch install-ran\"\n\n{SLEEPER}\n\
+         [[hooks]]\nname = \"migrate\"\nafter = \"services\"\non = \"always\"\n\
+         cmd = \"touch migrate-ran\"\n"
+    ));
+    let main = e.root.file_name().unwrap().to_string_lossy().to_string();
+
+    let out = e.pando(&["start", "main", "--no-wait"]);
+    assert_eq!(code(&out), EXIT_OK, "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out).trim().split(" — ").next(),
+        Some(&*format!("started {main}"))
+    );
+    assert!(
+        stderr(&out).contains("no install, no hooks"),
+        "{}",
+        stderr(&out)
+    );
+    let status: serde_json::Value =
+        serde_json::from_str(&stdout(&e.pando(&["status", "--json"]))).unwrap();
+    let first = &status["worktrees"][0];
+    assert_eq!(first["name"], main.as_str(), "{status}");
+    assert_eq!(first["main"], true, "{status}");
+    let port = first["ports"]["web"].as_u64().expect("an allocated port");
+    let listed: serde_json::Value =
+        serde_json::from_str(&stdout(&e.pando(&["ls", "--json"]))).unwrap();
+    assert_eq!(listed["worktrees"][0]["main"], true, "{listed}");
+    assert_eq!(
+        stdout(&e.pando(&["ls", "--names"])).lines().next(),
+        Some(main.as_str())
+    );
+    assert!(poll_until(
+        || stdout(&e.pando(&["logs", "main"])).contains("started-ok")
+    ));
+
+    for flag in ["--isolated", "--namespaced"] {
+        let out = e.pando(&["start", &main, flag]);
+        assert_eq!(code(&out), EXIT_ERROR, "{flag}: {}", stderr(&out));
         assert!(
-            stderr(&out).contains("run it from inside one"),
-            "{args:?}: {}",
+            stderr(&out).contains("is the main checkout") && stderr(&out).contains(flag),
+            "{flag}: {}",
             stderr(&out)
         );
     }
+    let out = e.pando(&["rm", "main"]);
+    assert_eq!(code(&out), EXIT_ERROR, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("never removes it"),
+        "{}",
+        stderr(&out)
+    );
+
+    let out = e.pando(&["restart", &main, "--no-wait"]);
+    assert_eq!(code(&out), EXIT_OK, "{}", stderr(&out));
+    let status: serde_json::Value =
+        serde_json::from_str(&stdout(&e.pando(&["status", "main", "--json"]))).unwrap();
+    assert_eq!(status["worktrees"][0]["ports"]["web"].as_u64(), Some(port));
+
+    let out = e.pando(&["stop", "main"]);
+    assert_eq!(code(&out), EXIT_OK, "{}", stderr(&out));
+    assert_eq!(stdout(&out).trim(), format!("stopped {main}"));
+
+    for mark in ["install-ran", "migrate-ran"] {
+        assert!(
+            !e.root.join(mark).exists(),
+            "{mark} ran in the main checkout"
+        );
+    }
+    assert_eq!(
+        status_porcelain(&e.root),
+        "",
+        "the main checkout is untouched"
+    );
 }
 
 #[test]

@@ -139,9 +139,10 @@ pando                 open the TUI for the repo you are in
 pando new <branch>    create a worktree and branch from the default base
 pando start <name>    start its dev server; --isolated for private services,
                       --namespaced (experimental) for its own database in yours
-pando stop [name]     stop one worktree; --all for every one
+pando stop [name]     stop one worktree, or the main checkout; --all for every one
 pando restart <name>  stop and start again, keeping the ports
-pando ls              list worktrees: status, URL, ports, git; -l for paths
+pando ls              list the main checkout and the worktrees: status, URL,
+                      ports, git; -l for paths
 pando rm <name>       stop everything, remove the worktree, wipe its data
 pando share <name>    expose it at a public URL
 pando unshare <name>  take the public URL down
@@ -159,6 +160,12 @@ pando completions     print a completion script for bash, zsh, fish…
 A worktree is named by its branch (`feat/login`) or by its directory
 (`feat+login`). Inside a worktree, `start`, `stop`, `restart`, `logs`,
 `open`, `share` and `unshare` need no name.
+
+The main checkout runs too, first in every list, named the same way —
+`pando start main` — or with no name from inside it (but for `stop`,
+which there stops everything). It is yours and set up by you, so pando
+runs only its processes, on ports it allocates, and nothing else: no
+install, no hooks, and always on the project's own services.
 
 On a terminal, `start` and `restart` wait until every process answers,
 and when one does not they print the last lines of its log and why.
@@ -178,7 +185,7 @@ o O      open its URL, or the public one
 c C y    copy its local URL, its public URL, its path
 t        share it publicly, or stop sharing
 ! e      a shell in it, or open it in your editor
-n d      new worktree, remove one
+n d      new worktree, remove one (never the main checkout, ⌂)
 p        open pull requests: ⏎ makes a worktree for one
 a v      copy the setup prompt, or test the setup (pando check)
 m ?      what pando said in full, and every key
