@@ -67,8 +67,10 @@ cd your-project
 pando
 ```
 
-The first time, pando opens its setup screen instead of the list. Every
-project is a little different, so the surest start is to let your own
+The first time, pando opens its setup screen instead of the list, on a
+grove of its own: Pando, the aspen that is one tree with 47,000 stems,
+drawn in dithered blocks, its leaves quaking. It comes alive when the
+setup passes. Every project is a little different, so the surest start is to let your own
 coding agent look at it. Press `a` to copy this one line, and paste it
 into Claude Code or Codex, opened in the project:
 
