@@ -287,42 +287,6 @@ fn await_url(pid: u32, log_path: &Path) -> Result<Published> {
 
 /// [`await_url`] with the deadline given, so a test can drive the timeout
 /// branch without sitting through it.
-fn await_url_until(pid: u32, log_path: &Path, deadline: Instant) -> Result<Published> {
-    let url = loop {
-        // Read the log before testing liveness, not after: a provider that
-        // published a URL and exited in the same breath has still told us
-        // what we asked, and checking liveness first would throw it away.
-        let found = parse_url_from_log(log_path);
-        let alive = process::is_alive(pid);
-        if let Some(url) = found {
-            if !alive {
-                bail!(
-                    "cloudflared published {url} and then exited — tail: {}",
-                    tail_log(log_path)
-                );
-            }
-            break url;
-        }
-        if !alive {
-            bail!(
-                "cloudflared exited before publishing a URL — tail: {}",
-                tail_log(log_path)
-            );
-        }
-        if Instant::now() >= deadline {
-            bail!(
-                "cloudflared published no URL within {}s — tail: {}",
-                READY_TIMEOUT.as_secs(),
-                tail_log(log_path)
-            );
-        }
-        std::thread::sleep(POLL_INTERVAL);
-    };
-    await_edge_until(pid, log_path, url, deadline)
-}
-
-/// Waits, on the same deadline, for the tunnel that published `url` to
-/// connect to Cloudflare's edge.
 ///
 /// cloudflared prints its URL as soon as the quick-tunnel API answers,
 /// before it has a single connection to the edge that serves it. On a
@@ -333,40 +297,50 @@ fn await_url_until(pid: u32, log_path: &Path, deadline: Instant) -> Result<Publi
 /// A deadline passed with the tunnel still trying is not a failure, since
 /// a slow edge is not a dead one: the URL comes back with the tail, for
 /// the caller to pass on.
-fn await_edge_until(
-    pid: u32,
-    log_path: &Path,
-    url: String,
-    deadline: Instant,
-) -> Result<Published> {
+fn await_url_until(pid: u32, log_path: &Path, deadline: Instant) -> Result<Published> {
     loop {
-        let connected = log_says_connected(log_path);
+        // Liveness first, then the log. A tunnel seen dead has written
+        // all it ever will, so the log read after that is the whole of
+        // what its exit means, however much of it was written between two
+        // looks: one that published, failed to dial and exited while this
+        // loop slept never connected, whether its URL is first seen with
+        // it alive or with it gone. Read the other way round, the log can
+        // predate the very lines that decide it.
         let alive = process::is_alive(pid);
-        if !alive {
-            if connected {
-                bail!(
-                    "cloudflared published {url} and then exited — tail: {}",
-                    tail_log(log_path)
-                );
-            }
-            bail!(
+        let url = parse_url_from_log(log_path);
+        let connected = url.is_some() && log_says_connected(log_path);
+        match (url, alive) {
+            (None, false) => bail!(
+                "cloudflared exited before publishing a URL — tail: {}",
+                tail_log(log_path)
+            ),
+            (Some(url), false) if connected => bail!(
+                "cloudflared published {url} and then exited — tail: {}",
+                tail_log(log_path)
+            ),
+            (Some(url), false) => bail!(
                 "cloudflared published {url} but never connected to Cloudflare's edge — tail: {}",
                 tail_log(log_path)
-            );
+            ),
+            (Some(url), true) if connected => {
+                return Ok(Published {
+                    url,
+                    unconnected: None,
+                });
+            }
+            (Some(url), true) if Instant::now() >= deadline => {
+                return Ok(Published {
+                    url,
+                    unconnected: Some(tail_log(log_path)),
+                });
+            }
+            (None, true) if Instant::now() >= deadline => bail!(
+                "cloudflared published no URL within {}s — tail: {}",
+                READY_TIMEOUT.as_secs(),
+                tail_log(log_path)
+            ),
+            (_, true) => std::thread::sleep(POLL_INTERVAL),
         }
-        if connected {
-            return Ok(Published {
-                url,
-                unconnected: None,
-            });
-        }
-        if Instant::now() >= deadline {
-            return Ok(Published {
-                url,
-                unconnected: Some(tail_log(log_path)),
-            });
-        }
-        std::thread::sleep(POLL_INTERVAL);
     }
 }
 
@@ -794,9 +768,8 @@ mod tests {
     }
 
     /// The fake in the home, spawned as `start_tunnel` spawns it but not
-    /// waited on, once its log says `said`: the timeout is 30s, far too
-    /// long for a test to sit through, so the test drives the wait.
-    fn spawn_unwaited(fx: &Fx, said: &str) -> (process::SpawnResult, PathBuf) {
+    /// waited on, so the test drives the wait.
+    fn spawn_fake(fx: &Fx) -> (process::SpawnResult, PathBuf) {
         let log = fx.paths.log_file("feat+one", TUNNEL_LOG);
         truncate_log(&log).unwrap();
         let spawn = process::spawn_detached(SpawnOptions {
@@ -810,7 +783,17 @@ mod tests {
             status_file: None,
         })
         .unwrap();
-        assert!(wait_until(Duration::from_secs(5), || {
+        (spawn, log)
+    }
+
+    /// [`spawn_fake`], once its log says `said`: the timeout is 30s, far
+    /// too long for a test to sit through. The wait for `said` has the
+    /// budget the product gives a provider to say anything, since a login
+    /// shell on a loaded machine can take seconds to start, and it returns
+    /// the moment the line is there.
+    fn spawn_unwaited(fx: &Fx, said: &str) -> (process::SpawnResult, PathBuf) {
+        let (spawn, log) = spawn_fake(fx);
+        assert!(wait_until(READY_TIMEOUT, || {
             std::fs::read_to_string(&log)
                 .map(|s| s.contains(said))
                 .unwrap_or(false)
@@ -852,6 +835,45 @@ mod tests {
             message.contains("Failed to dial"),
             "the dial error is the diagnosis: {message}"
         );
+    }
+
+    // The same tunnel, first looked at once it had already gone: what a
+    // poller the machine did not run for half a second sees. It was
+    // reported as one that published and then exited — true, and no help,
+    // since the dial error in its tail explains a tunnel that never
+    // reached the edge.
+    #[test]
+    fn a_tunnel_first_seen_after_it_exited_still_never_connected() {
+        let fx = fixture();
+        fake_cloudflared_unreachable_edge(&fx.paths.home);
+        let (spawn, log) = spawn_fake(&fx);
+        // The budget the wait itself gives a provider, since a start on a
+        // loaded machine can take seconds: this waits for the exit, and
+        // the fake always exits.
+        assert!(wait_until(READY_TIMEOUT, || !process::is_alive(spawn.pid)));
+
+        let err = await_url_until(spawn.pid, &log, Instant::now() + READY_TIMEOUT).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("never connected"), "{message}");
+        assert!(message.contains("Failed to dial"), "{message}");
+    }
+
+    // And one that did connect before it went is told apart by the same
+    // look, not by which of the two the wait happened to see first.
+    #[test]
+    fn a_tunnel_that_connected_and_then_exited_says_so() {
+        let fx = fixture();
+        crate::testutil::fake_cloudflared(
+            &fx.paths.home,
+            &format!("echo 'INF |  {FAKE_TUNNEL_URL}  |'\necho '{FAKE_REGISTERED}'\nexit 1\n"),
+        );
+        let (spawn, log) = spawn_fake(&fx);
+        assert!(wait_until(READY_TIMEOUT, || !process::is_alive(spawn.pid)));
+
+        let err = await_url_until(spawn.pid, &log, Instant::now() + READY_TIMEOUT).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("and then exited"), "{message}");
+        assert!(!message.contains("never connected"), "{message}");
     }
 
     // A slow edge is not a dead one: the URL comes back, with the reason

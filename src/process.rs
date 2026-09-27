@@ -42,6 +42,59 @@ pub(crate) fn login_shell(shell_cmd: &str) -> Command {
     command
 }
 
+/// Starts the child `command` spawns in a session of its own: the leader of
+/// a new process group, with no controlling terminal.
+///
+/// The one place pando asks for that, because it is `setsid` in the child
+/// between fork and exec, so the child is forked rather than spawned, and
+/// a fork has to be made safe first: [`settle_before_fork`].
+pub(crate) fn new_session(command: &mut Command) -> &mut Command {
+    settle_before_fork();
+    // SAFETY: `setsid` is async-signal-safe, and it is all the closure does.
+    unsafe {
+        command.pre_exec(|| {
+            nix::unistd::setsid()
+                .map(|_| ())
+                .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
+        });
+    }
+    command
+}
+
+/// Finishes libnotify's one-time set-up in this process before any fork,
+/// so no fork can land in the middle of it.
+///
+/// On macOS a forked child runs libSystem's fork handlers before it execs,
+/// and libnotify's reaches its globals through a once-gate. When another
+/// thread is setting them up at the moment of the fork — the first FSEvents
+/// watcher in a process does, the TUI's among them — the child finds the
+/// gate held by a thread it does not have and is killed before `exec`
+/// ("os_once_t is corrupt", in its crash report): a dev server, a tunnel or
+/// a hook that never ran, with nothing in its log. The set-up happens once
+/// per process, so finishing it here, on the thread about to fork, closes
+/// the window for every fork after. Any libnotify call does it; this one
+/// asks nothing of the daemon.
+#[cfg(target_os = "macos")]
+fn settle_before_fork() {
+    LIBNOTIFY_SETTLED.call_once(|| {
+        unsafe extern "C" {
+            fn notify_is_valid_token(token: libc::c_int) -> bool;
+        }
+        // SAFETY: it takes any integer, and reads nothing but its argument
+        // and libnotify's own globals.
+        unsafe { notify_is_valid_token(0) };
+    });
+}
+
+/// Done once [`settle_before_fork`] has run in this process.
+#[cfg(target_os = "macos")]
+static LIBNOTIFY_SETTLED: std::sync::Once = std::sync::Once::new();
+
+/// Nothing to settle: the handlers that make a fork unsafe mid-set-up are
+/// macOS's.
+#[cfg(not(target_os = "macos"))]
+fn settle_before_fork() {}
+
 /// Starts a command in its own session, writing its output to a log file.
 ///
 /// `status_file`, when given, is how a caller learns *how* the process
@@ -107,13 +160,7 @@ pub fn spawn_detached(opts: SpawnOptions<'_>) -> Result<SpawnResult> {
     }
 
     // Full detachment: new session, new process group, no controlling tty.
-    unsafe {
-        cmd.pre_exec(|| {
-            nix::unistd::setsid()
-                .map(|_| ())
-                .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
-        });
-    }
+    new_session(&mut cmd);
 
     let mut child = cmd.spawn().context("spawn detached bash")?;
     let pid = child.id();
@@ -246,13 +293,7 @@ pub fn run_captured(
     for (key, value) in env {
         command.env(key, value);
     }
-    unsafe {
-        command.pre_exec(|| {
-            nix::unistd::setsid()
-                .map(|_| ())
-                .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
-        });
-    }
+    new_session(&mut command);
     let mut child = command
         .spawn()
         .with_context(|| format!("run {shell_cmd:?}"))?;
@@ -972,6 +1013,49 @@ mod tests {
         stop(r.pgid, Duration::from_secs(5)).unwrap();
         std::thread::sleep(Duration::from_millis(100));
         assert!(!is_alive(r.pid), "child should be dead after stop");
+    }
+
+    // The TUI's first FSEvents watcher sets libnotify up on a thread of its
+    // own, and a fork made while it did was killed before `exec`: a tunnel
+    // whose log stayed empty, one full run in fifteen. Settled before the
+    // command can be spawned, the set-up is over before any fork starts.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_command_given_its_own_session_forks_only_once_libnotify_is_settled() {
+        let mut command = Command::new("true");
+        new_session(&mut command);
+        assert!(LIBNOTIFY_SETTLED.is_completed());
+    }
+
+    // `pre_exec` is what makes std fork rather than spawn, and a fork that
+    // skips `new_session` skips the settling that makes it safe. So the one
+    // `pre_exec` in pando is the one in `new_session`.
+    #[test]
+    fn every_session_pando_starts_is_started_by_new_session() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        // Built rather than written out, so this file's own needle is not
+        // one of the uses it finds.
+        let needle = [".pre", "_exec("].concat();
+        let mut uses = Vec::new();
+        let mut dirs = vec![root.join("src")];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    let rel = path.strip_prefix(root).unwrap().display().to_string();
+                    for (n, line) in text.lines().enumerate() {
+                        if line.contains(&needle) {
+                            uses.push(format!("{rel}:{}", n + 1));
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(uses.len(), 1, "{uses:?}");
+        assert!(uses[0].starts_with("src/process.rs:"), "{uses:?}");
     }
 
     #[test]

@@ -330,14 +330,7 @@ fn shell(shell_cmd: &str, cwd: &Path, env: &[(String, String)], detached: bool) 
         command.env(key, value);
     }
     if detached {
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            command.pre_exec(|| {
-                nix::unistd::setsid()
-                    .map(|_| ())
-                    .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
-            });
-        }
+        crate::process::new_session(&mut command);
     }
     command
 }

@@ -616,7 +616,6 @@ pub(super) fn check_log_file(paths: &PandoPaths) -> PathBuf {
 #[cfg(not(test))]
 fn spawn_check(paths: &PandoPaths) -> anyhow::Result<()> {
     use anyhow::Context as _;
-    use std::os::unix::process::CommandExt as _;
     use std::process::{Command, Stdio};
 
     let exe = std::env::current_exe().context("find pando's own binary")?;
@@ -636,13 +635,7 @@ fn spawn_check(paths: &PandoPaths) -> anyhow::Result<()> {
         .stdin(Stdio::null())
         .stdout(log.try_clone().context("share the check's log")?)
         .stderr(log);
-    unsafe {
-        command.pre_exec(|| {
-            nix::unistd::setsid()
-                .map(|_| ())
-                .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
-        });
-    }
+    crate::process::new_session(&mut command);
     let mut child = command.spawn().context("start pando check")?;
     thread::spawn(move || {
         let _ = child.wait();
