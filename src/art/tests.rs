@@ -73,7 +73,7 @@ fn only_the_leaves_quake() {
 // it, and one root line joins them all, running on past both edges.
 #[test]
 fn every_stem_stands_on_one_root_line() {
-    for (w, h, name) in [(78, 12, "acme-shop"), (40, 8, "marketplace"), (30, 7, "x")] {
+    for (w, h, name) in [(78, 12, "acme-shop"), (40, 8, "bookshop"), (30, 7, "x")] {
         let picture = grove(w, h, 0, seed_of(name));
         let cells = &picture.cells;
         let text = to_text(cells);
@@ -121,7 +121,7 @@ fn every_stem_stands_on_one_root_line() {
 #[test]
 fn each_project_has_a_grove_of_its_own() {
     let a = grove(78, 12, 0, seed_of("acme-shop"));
-    let b = grove(78, 12, 0, seed_of("marketplace"));
+    let b = grove(78, 12, 0, seed_of("bookshop"));
     assert_ne!(to_text(&a.cells), to_text(&b.cells));
     assert!(
         !cells_where(&a.cells, Material::Eye).is_empty(),

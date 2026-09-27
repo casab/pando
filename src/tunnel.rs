@@ -606,9 +606,9 @@ mod tests {
     fn a_url_is_extracted_from_the_line_cloudflared_really_prints() {
         assert_eq!(
             published_url(
-                "2026-09-21T12:00:00Z INF |  https://threaded-fathers-explore-supplier.trycloudflare.com  |"
+                "2026-09-21T12:00:00Z INF |  https://quiet-aspen-grove-example.trycloudflare.com  |"
             ),
-            Some("https://threaded-fathers-explore-supplier.trycloudflare.com".into())
+            Some("https://quiet-aspen-grove-example.trycloudflare.com".into())
         );
     }
 
