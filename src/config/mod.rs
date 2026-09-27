@@ -28,8 +28,8 @@ mod suggest;
 mod validate;
 
 pub use edit::{
-    Layer, Note, install_origin, patch, prelude_origin, services_origin, set_detected,
-    set_detected_array_entry, set_detected_table, write,
+    Layer, Note, declared_below, install_origin, patch, prelude_origin, remove_keys,
+    services_origin, set_detected, set_detected_array_entry, set_detected_table, write,
 };
 pub use layers::{Loaded, load, load_without_home};
 pub use redact::{HIDDEN, hide_passwords, is_password};

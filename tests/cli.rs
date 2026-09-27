@@ -2760,6 +2760,121 @@ fn dry_run_prints_the_config_it_would_write_and_writes_nothing() {
     );
 }
 
+// ---- correcting an answer: --replace --------------------------------------
+
+/// The slots the decisions log records for a project, with the kind of
+/// line each was.
+fn decision_lines(e: &Env) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(e.project_dir().join("decisions.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+// The way a setup found wrong is corrected without anybody editing the
+// file: previewed, then applied, through the same checks, and written
+// down as a program's — so the next command does not take it for a
+// person overriding the program's first answer.
+#[test]
+fn replace_corrects_answered_slots_and_says_a_program_did() {
+    let e = env_of(Kind::NextMessy);
+    assert_eq!(
+        code(&e.pando_stdin(&["init", "--answers", "-"], ANSWERS)),
+        EXIT_OK
+    );
+    let first = std::fs::read_to_string(e.config_file()).unwrap();
+    const CORRECTED: &str = r#"{"dev_cmd": "pnpm dev:all", "services": ["db"]}"#;
+
+    let out = e.pando_stdin(
+        &["init", "--answers", "-", "--dry-run", "--replace"],
+        CORRECTED,
+    );
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    let preview = stdout(&out);
+    assert!(preview.contains(r#"cmd = "pnpm dev:all""#), "{preview}");
+    assert_eq!(
+        std::fs::read_to_string(e.config_file()).unwrap(),
+        first,
+        "a preview writes nothing"
+    );
+    let logged = decision_lines(&e).len();
+
+    let out = e.pando_stdin(&["init", "--answers", "-", "--replace"], CORRECTED);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains(&format!("wrote {}", e.config_file().display())),
+        "{}",
+        stdout(&out)
+    );
+    let written = std::fs::read_to_string(e.config_file()).unwrap();
+    assert!(
+        written.contains(r#"cmd = "pnpm dev:all"  # answered: a program,"#),
+        "{written}"
+    );
+    assert!(!written.contains("pnpm dev:web"), "{written}");
+    assert_eq!(
+        written.matches("[[services]]").count(),
+        1,
+        "a set is replaced, not appended to: {written}"
+    );
+    assert!(written.contains(r#"include = ["db"]"#), "{written}");
+    assert!(
+        written.contains(r#"ports = { WEB_PORT = "web" }"#),
+        "a slot the file did not name is left as it was: {written}"
+    );
+    let lines = decision_lines(&e);
+    let new: Vec<(&str, &str)> = lines[logged..]
+        .iter()
+        .map(|l| (l["slot"].as_str().unwrap(), l["kind"].as_str().unwrap()))
+        .collect();
+    assert_eq!(new, vec![("dev_cmd", "answer"), ("services", "answer")]);
+
+    // A later command reads both as the program's, not as a person's.
+    assert_eq!(code(&e.pando(&["init"])), EXIT_OK);
+    assert!(
+        !decision_lines(&e).iter().any(|l| l["kind"] == "override"),
+        "{:?}",
+        decision_lines(&e)
+    );
+    assert_eq!(status_porcelain(&e.root), "");
+}
+
+// The prelude is about the machine, and only a person changes it: an
+// answer for it under `--replace` is a refused answer, and nothing in the
+// pass is written.
+#[test]
+fn replace_refuses_an_answered_prelude_and_writes_nothing() {
+    let e = env_of(Kind::NextMessy);
+    let machine = "[runtime]\nprelude = \"\"\n";
+    std::fs::create_dir_all(&e.home).unwrap();
+    std::fs::write(e.home.join("config.toml"), machine).unwrap();
+
+    let out = e.pando_stdin(
+        &["init", "--answers", "-", "--replace"],
+        r#"{"prelude": "true", "dev_cmd": "pnpm dev:web"}"#,
+    );
+    assert_eq!(code(&out), EXIT_USAGE, "stdout: {}", stdout(&out));
+    assert!(
+        stderr(&out).contains("--replace never changes it"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(
+        std::fs::read_to_string(e.home.join("config.toml")).unwrap(),
+        machine
+    );
+    assert!(!e.config_file().exists());
+}
+
+#[test]
+fn replace_needs_an_answers_file() {
+    let e = env_of(Kind::NextMessy);
+    let out = e.pando(&["init", "--replace"]);
+    assert_eq!(code(&out), EXIT_USAGE, "stdout: {}", stdout(&out));
+    assert!(stderr(&out).contains("--answers"), "{}", stderr(&out));
+}
+
 // ---- a slot the rules are silent about ------------------------------------
 //
 // "Every question has a custom answer" has to hold where pando had no

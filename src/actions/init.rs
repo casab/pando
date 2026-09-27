@@ -11,7 +11,7 @@ use crate::detect::{self, Slot};
 use crate::paths::PandoPaths;
 use crate::process as proc;
 
-use super::questions::{Answering, resolve_silencing, settled, slot_label};
+use super::questions::{Answering, RefusedAnswer, resolve_silencing, settled, slot_label};
 use super::services::service_roles;
 // Only for the intra-doc links above `ALL_SLOTS` and `init_dry_run`.
 #[cfg(doc)]
@@ -89,7 +89,55 @@ pub fn init(
     answers: &Answering<'_>,
     progress: &dyn Fn(&str),
 ) -> Result<InitReport> {
+    refuse_unreplaceable(paths, config, answers)?;
     init_slots(paths, config, &ALL_SLOTS, answers, progress)
+}
+
+/// What `--replace` may not change, refused before anything is written.
+///
+/// The prelude, once it has an answer: it is about this machine, and only
+/// a person changes it. Unanswered, a program's answer to it is a first
+/// answer like any other, verified before it is written.
+///
+/// And a slot whose answer is whole tables that a file beneath pando's own
+/// declares — the `pando.toml` a team committed, or the machine-wide
+/// config. pando's own layer is written over the others, and an array of
+/// tables there hides theirs entirely while a process table merges with
+/// theirs: either way the result would not be the answer given. pando
+/// never writes those files, so the answer there is a person's to change.
+fn refuse_unreplaceable(
+    paths: &PandoPaths,
+    config: &Config,
+    answers: &Answering<'_>,
+) -> Result<()> {
+    for slot in answers.named_for_replacing() {
+        if slot.layer() == config::Layer::User {
+            if settled(*slot, config) {
+                let file =
+                    config::prelude_origin(paths).unwrap_or_else(|| paths.user_config_file());
+                return Err(anyhow::Error::new(RefusedAnswer(format!(
+                    "the {} is already answered, and --replace never changes it: it is about \
+                     this machine, and only a person changes it, in {} — leave it out of the \
+                     answers file",
+                    slot_label(*slot),
+                    file.display()
+                ))));
+            }
+            continue;
+        }
+        for table in slot.answer_tables() {
+            if let Some(file) = config::declared_below(paths, table) {
+                return Err(anyhow::Error::new(RefusedAnswer(format!(
+                    "the {} comes from {}, which pando never writes, and --replace changes only \
+                     pando's own config, {} — nothing was written",
+                    slot_label(*slot),
+                    file.display(),
+                    paths.config_file().display()
+                ))));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// [`init`] over some of the slots: the dry run leaves out the ones
@@ -111,7 +159,7 @@ fn init_slots(
     // read again is a failure worth having at the end of `init` rather
     // than at the start of whatever the developer runs next.
     let loaded = config::load(paths)?;
-    Ok(init_report(paths, &loaded, &before))
+    Ok(init_report(paths, &loaded, &before, answers))
 }
 
 /// [`init`], against a copy of the files it would write.
@@ -132,6 +180,9 @@ pub fn init_dry_run(
     answers: &Answering<'_>,
     progress: &dyn Fn(&str),
 ) -> Result<(InitReport, Vec<(PathBuf, String)>)> {
+    // Of the real files: the copies are of pando's own two, and the
+    // committed one is not copied at all.
+    refuse_unreplaceable(paths, config, answers)?;
     let scratch = Scratch::new(paths)?;
     let previewed = PandoPaths::new(scratch.dir.clone(), paths.project.clone());
     // What pando has already written for this project and this machine, so
@@ -328,7 +379,12 @@ impl Drop for Scratch {
     }
 }
 
-fn init_report(paths: &PandoPaths, loaded: &config::Loaded, before: &[bool]) -> InitReport {
+fn init_report(
+    paths: &PandoPaths,
+    loaded: &config::Loaded,
+    before: &[bool],
+    answers: &Answering<'_>,
+) -> InitReport {
     let slots: Vec<SlotSummary> = ALL_SLOTS
         .iter()
         .enumerate()
@@ -336,7 +392,9 @@ fn init_report(paths: &PandoPaths, loaded: &config::Loaded, before: &[bool]) -> 
             slot: *slot,
             label: slot_label(*slot),
             value: slot_value(&loaded.config, *slot),
-            answered_now: !before[i] && settled(*slot, &loaded.config),
+            // A replaced slot was settled before the run too, and this run
+            // is what answered it all the same.
+            answered_now: (!before[i] && settled(*slot, &loaded.config)) || answers.replaced(*slot),
         })
         .collect();
     let user_file = slots

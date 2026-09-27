@@ -114,6 +114,11 @@ impl Answers {
         Some(answer_from(question, value))
     }
 
+    /// Every slot the file answers.
+    pub(super) fn slots(&self) -> Vec<crate::detect::Slot> {
+        self.by_slot.keys().copied().collect()
+    }
+
     /// Slots the file answered that no question ever asked about.
     pub(super) fn unasked(&self) -> Vec<crate::detect::Slot> {
         let asked = self.asked.borrow();
@@ -307,10 +312,13 @@ pub(super) fn init_asker(
 /// Never silent: a program that answered a question pando did not ask has
 /// to learn that from the run rather than from a config that looks nothing
 /// like what it sent.
-pub(super) fn report_unused(answers: &Answers, before: &Config) {
+///
+/// Under `--replace` an answered slot is not a reason for an answer to go
+/// unused, so a slot nothing asked about is just that.
+pub(super) fn report_unused(answers: &Answers, before: &Config, replace: bool) {
     for slot in answers.unasked() {
         let name = slot_name(slot);
-        if actions::settled(slot, before) {
+        if actions::settled(slot, before) && !replace {
             notice(&format!(
                 "{name} is already answered — the answers file was not applied to it"
             ));

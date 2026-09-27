@@ -242,6 +242,16 @@ Examples:
         /// does and is written down as a program's.
         #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
         answers: Option<String>,
+        /// Apply the answers to questions already answered too.
+        ///
+        /// Without it, an answer for a slot config already has is reported
+        /// and left alone. With it, the answer replaces what config says —
+        /// through the same checks, written down as a program's — and wins
+        /// over what a rule would decide. The runtime prelude is the one
+        /// exception: it is about this machine, only a person changes it,
+        /// and an answer for it once it has one is refused.
+        #[arg(long, requires = "answers")]
+        replace: bool,
         /// Print the config this would write, and write nothing.
         #[arg(long)]
         dry_run: bool,
@@ -640,9 +650,16 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
         Command::Init {
             yes,
             answers,
+            replace,
             dry_run,
         } => {
             let answers = answers.as_deref().map(read_answers).transpose()?;
+            // Every slot the file names: `actions` refuses the ones
+            // `--replace` may not change, before anything is written.
+            let replacing: Vec<crate::detect::Slot> = match (&answers, replace) {
+                (Some(answers), true) => answers.slots(),
+                _ => Vec::new(),
+            };
             let ask = init_asker(answers.as_ref(), yes);
             // The second channel: what the file has to say about a slot no
             // rule proposed anything for, where there is no question to
@@ -651,7 +668,8 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             let answering = match &volunteered {
                 Some(program) => actions::Answering::by_program(&ask, program),
                 None => actions::Answering::asking(&ask),
-            };
+            }
+            .replacing(&replacing);
             let (report, preview) = match dry_run {
                 true => actions::init_dry_run(paths, config, &answering, &notice)?,
                 false => (
@@ -662,7 +680,7 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             // Before the summary, because it is about what the file the
             // summary describes does *not* say.
             if let Some(answers) = &answers {
-                report_unused(answers, config);
+                report_unused(answers, config, replace);
             }
             for warning in &report.warnings {
                 notice(warning);

@@ -508,12 +508,37 @@ Refusals, all exit 2 and all naming the key: a name that is not a question;
 a shape the question cannot take; a value that is not one of the options at
 a question that has them; an empty string; a `prelude` that fails its own
 probe on this machine, which is never written down. An answer for a slot that was
-already answered, or that nothing asked about, is **reported on stderr and
-not applied** — it is not an error, and the run still exits 0. A slot with
-no proposal at all is not "nothing asked about": it takes a custom answer,
-except at `services` and `prelude`. See the three-state table above.
+already answered (without `--replace`), or that nothing asked about, is
+**reported on stderr and not applied** — it is not an error, and the run
+still exits 0. A slot with no proposal at all is not "nothing asked about":
+it takes a custom answer, except at `services` and `prelude`. See the
+three-state table above.
 
 `--dry-run` runs the same pass against copies of the files it would write
 and prints them on stdout, config first. Use it to show a diff before
 writing. A question nothing answers is not a failure there: the slot is
 listed as `(unanswered)` and the dry run still exits 0.
+
+### Correcting an answer: `--replace`
+
+`pando init --answers - --replace` applies the file to questions that are
+already answered too. Preview it first with
+`pando init --answers - --dry-run --replace`.
+It is how a setup found wrong is corrected without editing `pando.toml`.
+Every slot the file names takes the file's answer, in place of what config
+says and of what a rule would decide, through the same checks a first
+answer gets. It is written with the same note, `# answered: a program`
+and the date, and an `answer` line in the decisions log, so the change is
+never read as a person's override. Only pando's own config for the project
+is written; a slot the file does not name is left as it is. `--replace`
+needs `--answers`; without it, clap refuses the command with exit 2.
+
+Refused under `--replace`, exit 2, before anything is written:
+
+- a `prelude` that is already answered. The prelude is about the machine,
+  and only a person changes it. If it has no answer yet, the file's answer
+  is a first answer, as without the flag.
+- `processes`, `services` or `schema_hook` when the committed `pando.toml`
+  or the machine-wide config declares them. pando never writes those files,
+  and its own config written over them would hide their tables or merge
+  with them rather than replace them.

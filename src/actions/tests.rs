@@ -5942,6 +5942,294 @@ fn a_second_init_asks_nothing_and_answers_nothing() {
     );
 }
 
+// ---- init --answers --replace ----------------------------------------------
+
+/// What an answers file gives a pass, as the one closure both of its
+/// channels are: the program's answer to every slot it names.
+fn said_by_program(answers: &[(Slot, Answer)], q: &Question) -> Option<Result<Answer>> {
+    answers
+        .iter()
+        .find(|(slot, _)| *slot == q.slot)
+        .map(|(_, answer)| Ok(Answer::Program(Box::new(answer.clone()))))
+}
+
+/// An `init --answers` pass: the program answers what it names, and
+/// nobody is asked anything else.
+fn init_with_answers(
+    fx: &Fx,
+    answers: &[(Slot, Answer)],
+    replace: &[Slot],
+    progress: &dyn Fn(&str),
+) -> Result<InitReport> {
+    let config = crate::config::load(&fx.paths)?.config;
+    let ask = |q: &Question| {
+        said_by_program(answers, q)
+            .unwrap_or_else(|| panic!("nothing should have asked about {:?}", q.slot))
+    };
+    let program = |q: &Question| said_by_program(answers, q);
+    init(
+        &fx.paths,
+        &config,
+        &Answering::by_program(&ask, &program).replacing(replace),
+        progress,
+    )
+}
+
+fn decisions_of(fx: &Fx) -> Vec<crate::decisions::Entry> {
+    crate::decisions::read(&fx.paths.decisions_file())
+}
+
+// `--replace` is how a setup a check found wrong gets corrected without
+// anyone editing the file: the rule's answer goes, and the program's takes
+// its place with the program's note and its line in the log.
+#[test]
+fn a_replaced_answer_is_applied_and_written_down_as_a_programs() {
+    let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");
+    init(&fx.paths, &fx.config, &Answering::asking(&refuse), &noop).unwrap();
+    let answers = [(Slot::Install, Answer::Custom("make deps".to_string()))];
+
+    // Without `--replace`, an answered slot keeps its answer.
+    let before = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+    let report = init_with_answers(&fx, &answers, &[], &noop).unwrap();
+    assert!(!report.answered_anything());
+    assert_eq!(
+        std::fs::read_to_string(fx.paths.config_file()).unwrap(),
+        before
+    );
+
+    let report = init_with_answers(&fx, &answers, &[Slot::Install], &noop).unwrap();
+    let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+    assert!(
+        written.contains(r#"install = "make deps"  # answered: a program,"#),
+        "{written}"
+    );
+    assert!(!written.contains("--frozen-lockfile"), "{written}");
+    assert!(
+        written.contains(r#"cmd = "pnpm dev"  # detected:"#),
+        "a slot the file did not name is left as it was: {written}"
+    );
+    let install = report
+        .slots
+        .iter()
+        .find(|s| s.slot == Slot::Install)
+        .unwrap();
+    assert!(install.answered_now, "{report:?}");
+    assert_eq!(install.value.as_deref(), Some("make deps"));
+    let last = decisions_of(&fx).pop().expect("the replacement is logged");
+    assert_eq!(last.slot, Slot::Install);
+    assert!(
+        matches!(&last.what, crate::decisions::What::Answer { wrote, .. }
+            if wrote.as_deref() == Some("make deps")),
+        "{last:?}"
+    );
+}
+
+// The log is how a person's change is told from a program's: a later run
+// compares config against the last thing the log says. A replacement the
+// log did not record would read, on the next run, as a person overriding
+// the program's first answer.
+#[test]
+fn a_programs_replacement_is_not_read_as_a_persons_override() {
+    let fx = detectable_fixture(
+        r#"{ "dev": "concurrently 'next dev' 'node worker.js'", "dev:web": "next dev" }"#,
+        "PORT=3000\n",
+    );
+    let first = [(Slot::DevCmd, Answer::Custom("pnpm dev:web".to_string()))];
+    init_with_answers(&fx, &first, &[], &noop).unwrap();
+
+    // A lone `[dev]` with a command is no longer one detection may fill,
+    // and it is still the one process a replacement is about.
+    let second = [(Slot::DevCmd, Answer::Custom("pnpm dev:all".to_string()))];
+    init_with_answers(&fx, &second, &[Slot::DevCmd], &noop).unwrap();
+    let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+    assert!(
+        written.contains(r#"cmd = "pnpm dev:all"  # answered: a program,"#),
+        "{written}"
+    );
+    assert!(!written.contains("pnpm dev:web"), "{written}");
+
+    let said = std::cell::RefCell::new(Vec::<String>::new());
+    let progress = |line: &str| said.borrow_mut().push(line.to_string());
+    let loaded = crate::config::load(&fx.paths).unwrap();
+    init(
+        &fx.paths,
+        &loaded.config,
+        &Answering::asking(&refuse),
+        &progress,
+    )
+    .unwrap();
+    assert!(
+        !said
+            .borrow()
+            .iter()
+            .any(|line| line.contains("not what a program answered")),
+        "{:?}",
+        said.borrow()
+    );
+    assert!(
+        !decisions_of(&fx)
+            .iter()
+            .any(|e| matches!(e.what, crate::decisions::What::Override { .. })),
+        "{:?}",
+        decisions_of(&fx)
+    );
+}
+
+// The prelude is about the machine, and only a person changes it: refused
+// before a single key of the pass is written, the project's included.
+#[test]
+fn replace_never_changes_the_prelude() {
+    let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");
+    let user = fx.paths.user_config_file();
+    std::fs::create_dir_all(user.parent().unwrap()).unwrap();
+    let machine = "[runtime]\nprelude = \"source ~/.nvm/nvm.sh\"\n";
+    std::fs::write(&user, machine).unwrap();
+
+    let answers = [
+        (Slot::Prelude, Answer::Custom("true".to_string())),
+        (Slot::Install, Answer::Custom("make deps".to_string())),
+    ];
+    let err = init_with_answers(&fx, &answers, &[Slot::Prelude, Slot::Install], &noop).unwrap_err();
+    assert!(err.downcast_ref::<RefusedAnswer>().is_some(), "{err:#}");
+    assert!(
+        format!("{err:#}").contains("--replace never changes it"),
+        "{err:#}"
+    );
+    assert_eq!(std::fs::read_to_string(&user).unwrap(), machine);
+    assert!(!fx.paths.config_file().exists());
+    assert!(decisions_of(&fx).is_empty());
+
+    // The preview refuses it the same way.
+    let config = crate::config::load(&fx.paths).unwrap().config;
+    let ask = |q: &Question| said_by_program(&answers, q).unwrap();
+    let program = |q: &Question| said_by_program(&answers, q);
+    let err = init_dry_run(
+        &fx.paths,
+        &config,
+        &Answering::by_program(&ask, &program).replacing(&[Slot::Prelude]),
+        &noop,
+    )
+    .unwrap_err();
+    assert!(err.downcast_ref::<RefusedAnswer>().is_some(), "{err:#}");
+}
+
+// A whole-table answer is replaced, not appended to: one schema step
+// after, not two, and pando's header still at the top of the file. And
+// "no" to a step the rules never found takes the old one away.
+#[test]
+fn a_replaced_schema_step_takes_the_old_ones_place() {
+    let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");
+    let first = [(
+        Slot::SchemaHook,
+        Answer::Custom("npm run db:migrate".to_string()),
+    )];
+    init_with_answers(&fx, &first, &[], &noop).unwrap();
+    let second = [(
+        Slot::SchemaHook,
+        Answer::Custom("npm run migrate:all".to_string()),
+    )];
+    init_with_answers(&fx, &second, &[Slot::SchemaHook], &noop).unwrap();
+
+    let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+    assert!(written.starts_with("# pando.toml"), "{written}");
+    assert_eq!(written.matches("[[hooks]]").count(), 1, "{written}");
+    assert!(
+        written.contains(r#"cmd = "npm run migrate:all""#),
+        "{written}"
+    );
+    assert!(!written.contains("db:migrate"), "{written}");
+    assert!(
+        written.contains("[[hooks]]  # answered: a program,"),
+        "{written}"
+    );
+
+    let none = [(Slot::SchemaHook, Answer::None)];
+    init_with_answers(&fx, &none, &[Slot::SchemaHook], &noop).unwrap();
+    let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+    assert!(!written.contains("[[hooks]]"), "{written}");
+    assert!(written.starts_with("# pando.toml"), "{written}");
+}
+
+// The process list is tables, and a table written over one merges with
+// it: the old `[dev]` and its ports go, and the port question the new
+// process leaves open is answered by its rule again.
+#[test]
+fn a_replaced_process_list_takes_the_old_ones_tables_away() {
+    let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");
+    init(&fx.paths, &fx.config, &Answering::asking(&refuse), &noop).unwrap();
+    let answers = [(Slot::Processes, Answer::Custom("./serve".to_string()))];
+    init_with_answers(&fx, &answers, &[Slot::Processes], &noop).unwrap();
+
+    let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+    assert_eq!(written.matches("[dev]").count(), 1, "{written}");
+    assert!(written.contains(r#"cmd = "./serve""#), "{written}");
+    assert!(!written.contains(r#""pnpm dev""#), "{written}");
+    let config = crate::config::load(&fx.paths).unwrap().config;
+    assert_eq!(config.processes.len(), 1);
+    assert_eq!(config.processes["dev"].cmd, "./serve");
+    assert!(
+        written.contains(r#"ports = { PORT = "web" }  # detected:"#),
+        "{written}"
+    );
+}
+
+// A file beneath pando's own declares the step: pando never writes it,
+// and its own layer written over it would hide it rather than replace it.
+#[test]
+fn a_replacement_a_lower_layer_declares_is_refused() {
+    let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");
+    std::fs::write(
+        fx.root.join("pando.toml"),
+        "[[hooks]]\nname = \"migrate\"\nafter = \"services\"\ncmd = \"make migrate\"\n",
+    )
+    .unwrap();
+    let answers = [(
+        Slot::SchemaHook,
+        Answer::Custom("npm run migrate".to_string()),
+    )];
+    let err = init_with_answers(&fx, &answers, &[Slot::SchemaHook], &noop).unwrap_err();
+    assert!(err.downcast_ref::<RefusedAnswer>().is_some(), "{err:#}");
+    assert!(format!("{err:#}").contains("pando.toml"), "{err:#}");
+    assert!(!fx.paths.config_file().exists());
+}
+
+// The preview of a replacement shows the replaced value, and writes
+// neither the file nor the log.
+#[test]
+fn a_dry_run_replacement_shows_the_new_value_and_writes_nothing() {
+    let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");
+    init(&fx.paths, &fx.config, &Answering::asking(&refuse), &noop).unwrap();
+    let before = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+    let logged = decisions_of(&fx).len();
+
+    let answers = [(Slot::Install, Answer::Custom("make deps".to_string()))];
+    let config = crate::config::load(&fx.paths).unwrap().config;
+    let ask = |q: &Question| said_by_program(&answers, q).unwrap();
+    let program = |q: &Question| said_by_program(&answers, q);
+    let (report, preview) = init_dry_run(
+        &fx.paths,
+        &config,
+        &Answering::by_program(&ask, &program).replacing(&[Slot::Install]),
+        &noop,
+    )
+    .unwrap();
+
+    let (_, body) = preview
+        .iter()
+        .find(|(path, _)| *path == fx.paths.config_file())
+        .expect("the project file is previewed");
+    assert!(
+        body.contains(r#"install = "make deps"  # answered: a program,"#),
+        "{body}"
+    );
+    assert!(report.answered_anything());
+    assert_eq!(
+        std::fs::read_to_string(fx.paths.config_file()).unwrap(),
+        before
+    );
+    assert_eq!(decisions_of(&fx).len(), logged);
+}
+
 // One question per undecided slot, in one pass, and every answer on
 // disk when it ends.
 #[test]
@@ -10147,6 +10435,7 @@ fn each_native_service_entry_cites_its_own_evidence() {
         &mut config,
         &[&postgres, &redis],
         crate::config::Note::Detected(postgres.why.clone()),
+        false,
     )
     .unwrap();
     let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();

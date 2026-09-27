@@ -308,6 +308,80 @@ pub fn set_detected_array_entry(
     })
 }
 
+/// Takes keys and tables out of one layer's file: an answer being
+/// replaced, removed before its replacement is written.
+///
+/// Each path is a table, or a key in one; a table the removal leaves
+/// empty goes with it. The header pando wrote at the top of the file is
+/// the first table's leading comment, so removing that table would take
+/// the header too — it is put back.
+pub fn remove_keys(paths: &PandoPaths, layer: Layer, keys: &[&[&str]]) -> Result<()> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let keys: Vec<Vec<String>> = keys
+        .iter()
+        .map(|path| path.iter().map(|part| part.to_string()).collect())
+        .collect();
+    let header = layer.header();
+    patch(paths, layer, move |doc| {
+        let headed = doc.to_string().starts_with(header);
+        for path in &keys {
+            remove_path(doc.as_table_mut(), path);
+        }
+        let body = doc.to_string();
+        if headed && !body.starts_with(header) {
+            *doc = format!("{header}{}", body.trim_start())
+                .parse()
+                .context("put the header back")?;
+        }
+        Ok(())
+    })
+}
+
+/// Removes `path` below `table`, and any table on the way the removal
+/// leaves empty. A path that is not there is already removed.
+fn remove_path(table: &mut dyn toml_edit::TableLike, path: &[String]) -> bool {
+    let Some((first, rest)) = path.split_first() else {
+        return false;
+    };
+    if rest.is_empty() {
+        return table.remove(first).is_some();
+    }
+    let Some(inner) = table.get_mut(first).and_then(Item::as_table_like_mut) else {
+        return false;
+    };
+    let removed = remove_path(inner, rest);
+    if removed && inner.is_empty() {
+        table.remove(first);
+    }
+    removed
+}
+
+/// The file beneath pando's own project layer that sets `path` — the
+/// `pando.toml` a team committed, or the machine-wide config — if one
+/// does. Read as bare tables, like the other origin questions here.
+pub fn declared_below(paths: &PandoPaths, path: &[&str]) -> Option<PathBuf> {
+    let (last, tables) = path.split_last()?;
+    [paths.root().join("pando.toml"), Layer::User.file(paths)]
+        .into_iter()
+        .find(|file| {
+            let Some(mut at) = std::fs::read_to_string(file)
+                .ok()
+                .and_then(|text| toml::from_str::<Table>(&text).ok())
+            else {
+                return false;
+            };
+            for part in tables {
+                match at.remove(*part) {
+                    Some(toml::Value::Table(inner)) => at = inner,
+                    _ => return false,
+                }
+            }
+            at.contains_key(*last)
+        })
+}
+
 /// Whether a layer other than the one being patched already declares a
 /// process: the `pando.toml` a team committed, or the machine-wide file.
 ///

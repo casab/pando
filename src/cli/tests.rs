@@ -2661,6 +2661,49 @@ fn the_published_contract_names_every_question_in_order() {
     }
 }
 
+/// `--replace` as the contract describes it: an `init` flag that needs
+/// `--answers`, and that the preview takes as well. clap is asked, so the
+/// document and the parser cannot say two things.
+#[test]
+fn the_contract_describes_replace_as_clap_has_it() {
+    let doc = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("agent/json.md");
+    let text =
+        std::fs::read_to_string(&doc).unwrap_or_else(|e| panic!("read {}: {e}", doc.display()));
+    let section = &text[text
+        .find("## The answers file")
+        .expect("agent/json.md has an answers file section")..];
+    for command in [
+        "pando init --answers - --replace",
+        "pando init --answers - --dry-run --replace",
+    ] {
+        assert!(
+            section.contains(&format!("`{command}`")),
+            "the answers file section never shows `{command}`"
+        );
+        let argv: Vec<&str> = command.split_whitespace().collect();
+        Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?} does not parse: {e}"));
+    }
+    assert!(
+        section.contains("`--replace`\nneeds `--answers`")
+            || section.contains("`--replace` needs `--answers`"),
+        "the section says --replace needs --answers"
+    );
+    let alone = Cli::try_parse_from(["pando", "init", "--replace"])
+        .expect_err("--replace without --answers is refused");
+    assert_eq!(
+        alone.kind(),
+        clap::error::ErrorKind::MissingRequiredArgument
+    );
+    // And beside `--yes`, which only ever answers what the file does not.
+    Cli::try_parse_from(["pando", "init", "--answers", "-", "--replace", "--yes"])
+        .expect("--replace combines with --yes");
+    // The one slot it never changes is named where the refusals are.
+    assert!(
+        section.contains("a `prelude` that is already answered"),
+        "{section}"
+    );
+}
+
 fn parse_err(json: &str) -> String {
     format!("{:#}", Answers::parse(json).unwrap_err())
 }

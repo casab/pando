@@ -170,13 +170,24 @@ pub struct Answering<'a> {
     /// and, by its presence, the fact that a program rather than a person
     /// is driving this pass at all.
     pub program: Option<Volunteered<'a>>,
+    /// The slots whose answer the program replaces: `init --answers
+    /// --replace`. Empty on every other pass.
+    replace: &'a [Slot],
+    /// Which of them this pass wrote, so `init` can say so: a replaced
+    /// slot was settled before the run and is settled after it.
+    replaced: std::cell::RefCell<Vec<Slot>>,
 }
 
 impl<'a> Answering<'a> {
     /// A pass with a person behind it: nothing is volunteered, and a slot
     /// the rules are silent about stays silent.
     pub fn asking(ask: Ask<'a>) -> Answering<'a> {
-        Answering { ask, program: None }
+        Answering {
+            ask,
+            program: None,
+            replace: &[],
+            replaced: Default::default(),
+        }
     }
 
     /// A pass a program is driving, with its own answers to fall back on.
@@ -184,7 +195,46 @@ impl<'a> Answering<'a> {
         Answering {
             ask,
             program: Some(program),
+            replace: &[],
+            replaced: Default::default(),
         }
+    }
+
+    /// The same pass, with the program's answers taking the place of
+    /// what config already says about these slots, and of what a rule
+    /// would decide for them.
+    ///
+    /// Only for a pass whose `ask` puts these slots to the program: the
+    /// answer that replaces is always a program's, and written down as
+    /// one. Only project-layer slots are ever replaced — the prelude is
+    /// about the machine, and only a person changes it, so it is
+    /// answered here only when nothing has answered it yet, and `init`
+    /// refuses the rest.
+    pub fn replacing(self, slots: &'a [Slot]) -> Answering<'a> {
+        Answering {
+            replace: slots,
+            ..self
+        }
+    }
+
+    /// Whether this pass replaces the answer to `slot`.
+    pub(super) fn replaces(&self, slot: Slot) -> bool {
+        slot.layer() == config::Layer::Project && self.replace.contains(&slot)
+    }
+
+    /// The slots [`replacing`](Self::replacing) named, whatever their
+    /// layer.
+    pub(super) fn named_for_replacing(&self) -> &[Slot] {
+        self.replace
+    }
+
+    /// Whether this pass wrote a replacement for `slot`.
+    pub(super) fn replaced(&self, slot: Slot) -> bool {
+        self.replaced.borrow().contains(&slot)
+    }
+
+    fn wrote_replacement(&self, slot: Slot) {
+        self.replaced.borrow_mut().push(slot);
     }
 }
 
@@ -256,6 +306,10 @@ pub(super) struct Pending {
     answer: serde_json::Value,
     shape: decisions::Shape,
     evidence: decisions::Evidence,
+    /// Whether this answer takes the place of one config already has:
+    /// the old one's tables are removed when this one is written, and
+    /// not a moment before.
+    replaces: bool,
 }
 
 /// What a program answered, in the shape an answers file would have sent.
@@ -329,6 +383,7 @@ pub(super) fn pending_decision(
                 })
                 .collect(),
         },
+        replaces: false,
     })
 }
 
@@ -693,7 +748,11 @@ pub fn resolve_on(
     }
     // Of the config as loaded, so [`settled`]'s answer holds: nothing in
     // this run has changed it yet.
-    if prelude_proposal.is_none() && slots.iter().all(|slot| settled(*slot, &config)) {
+    if prelude_proposal.is_none()
+        && slots
+            .iter()
+            .all(|slot| settled(*slot, &config) && !answers.replaces(*slot))
+    {
         return Ok(config);
     }
     let signals = detect::signals(paths.root());
@@ -721,8 +780,9 @@ pub fn resolve_on(
     // `start` never asks which services to run private copies of — see
     // `SILENT_UNLESS_ISOLATED` — so paying for a login shell to find out
     // what this machine has would be a cost with no question behind it.
-    let asking_about_services =
-        !already_answered(Slot::Services, &config) && !silent.contains(&Slot::Services);
+    let asking_about_services = (!already_answered(Slot::Services, &config)
+        || answers.replaces(Slot::Services))
+        && !silent.contains(&Slot::Services);
     let evidence = match asking_about_services {
         true => machine_evidence(paths, &recipes),
         false => detect::MachineEvidence::unknown(),
@@ -761,7 +821,14 @@ pub fn resolve_on(
         if !matches!(slot, Slot::Processes | Slot::DevCmd | Slot::PortEnv) {
             flush(paths, &mut deferred, progress)?;
         }
-        if matches!(slot, Slot::DevCmd | Slot::PortEnv) && !may_fill_dev {
+        // A replacement is a program saying the answer config has is
+        // wrong, so the answer being there is no reason to skip it.
+        let replacing = answers.replaces(*slot);
+        // …and a lone `dev` process is one whose command and ports it may
+        // replace, whoever wrote them. Any other shape has no single
+        // process for either slot to be about.
+        let fills_dev = may_fill_dev || (replacing && detect::fills_one_dev_process(&config));
+        if matches!(slot, Slot::DevCmd | Slot::PortEnv) && !fills_dev {
             continue;
         }
         // Just in time, and once: a slot the developer has already filled
@@ -773,15 +840,26 @@ pub fn resolve_on(
         // Re-read from `config` on every pass, because an earlier slot in
         // this same run may have answered a later one: taking the
         // per-app form settles the dev command and its ports with it.
-        if already_answered(*slot, &config) || !detect::still_needed(*slot, &config) {
+        if !replacing && (already_answered(*slot, &config) || !detect::still_needed(*slot, &config))
+        {
             continue;
+        }
+        // The old answer is set aside in memory now, so the new one is
+        // checked against a config without it. On disk it goes only
+        // when the new one is written.
+        if replacing {
+            unanswer(*slot, &mut config);
         }
         let Some(proposal) = proposals.iter().find(|p| p.slot == *slot) else {
             // No rule had anything to say. There is nobody to ask — but a
             // program driving this pass may still have an answer for it.
-            if volunteer(paths, &mut config, *slot, answers, progress)? && *slot == Slot::Processes
-            {
-                may_fill_dev = detect::fills_one_dev_process(&config);
+            if volunteer(paths, &mut config, *slot, answers, progress)? {
+                if replacing {
+                    answers.wrote_replacement(*slot);
+                }
+                if *slot == Slot::Processes {
+                    may_fill_dev = detect::fills_one_dev_process(&config);
+                }
             }
             continue;
         };
@@ -804,7 +882,9 @@ pub fn resolve_on(
         // single-candidate path below, because "these three" is not one of
         // the options — it is a subset of them.
         if slot.is_multi() {
-            let (chosen, note): (Vec<detect::Candidate>, config::Note) = if proposal.decided {
+            let (chosen, note): (Vec<detect::Candidate>, config::Note) = if proposal.decided
+                && !replacing
+            {
                 let taken: Vec<detect::Candidate> =
                     proposal.preferred_set().into_iter().cloned().collect();
                 // With nothing taken the reason is the proposal's own: a
@@ -877,11 +957,14 @@ pub fn resolve_on(
                     ),
                 }
             };
-            apply_service_answer(paths, &mut config, proposal, &chosen, note)?;
+            apply_service_answer(paths, &mut config, proposal, &chosen, note, replacing)?;
             record_decision(paths, pending, progress);
+            if replacing {
+                answers.wrote_replacement(*slot);
+            }
             continue;
         }
-        let candidate = if proposal.decided {
+        let candidate = if proposal.decided && !replacing {
             let candidate = proposal
                 .preferred()
                 .expect("a decided proposal has a candidate")
@@ -901,6 +984,9 @@ pub fn resolve_on(
             let offered = question.options.len();
             let (answer, by) = answered_by(ask(&question)?);
             pending = pending_decision(&question, proposal, &answer, by);
+            if let Some(pending) = pending.as_mut() {
+                pending.replaces = replacing;
+            }
             match answer {
                 Answer::Choice(index) => {
                     let candidate = pick(proposal, index)?;
@@ -933,6 +1019,9 @@ pub fn resolve_on(
                         pending,
                         progress,
                     )?;
+                    if replacing {
+                        answers.wrote_replacement(*slot);
+                    }
                     continue;
                 }
                 // "No" to the schema step, recorded as the step pando found
@@ -977,6 +1066,9 @@ pub fn resolve_on(
                 pending,
                 progress,
             )?;
+        }
+        if replacing {
+            answers.wrote_replacement(*slot);
         }
         if *slot == Slot::Processes {
             // The answer decided the shape. The per-app form leaves the
@@ -1037,12 +1129,21 @@ fn write_answer(
     if candidate.value.trim().is_empty() {
         bail!("an empty answer is not a {}", slot_label(slot));
     }
+    let replaces = pending.as_ref().is_some_and(|pending| pending.replaces);
+    // A config read back from disk still has the answer being replaced.
+    if replaces {
+        unanswer(slot, config);
+    }
     // Before a single key is written: an answer that would make the
     // merged config refuse to load is refused now, while nothing is on
     // disk, instead of at the next load with half a project broken.
     let mut proposed = config.clone();
     detect::apply(slot, candidate, &mut proposed);
     refuse_unloadable(paths, slot, &candidate.value, &proposed)?;
+    // Checked, so the old answer can go: now, and only now.
+    if replaces {
+        forget_on_disk(paths, slot)?;
+    }
     // A slot whose answer is a whole `[[table]]` entry: appended, with
     // the note on the entry's own header rather than on each key.
     if let Some((array, entries)) = detect::array_edits(slot, &[candidate]) {
@@ -1172,7 +1273,11 @@ fn volunteer(
         return Ok(false);
     };
     let (answer, by) = answered_by(answer?);
-    let pending = pending_decision(&question, &proposal, &answer, by);
+    let replacing = answers.replaces(slot);
+    let mut pending = pending_decision(&question, &proposal, &answer, by);
+    if let Some(pending) = pending.as_mut() {
+        pending.replaces = replacing;
+    }
     match answer {
         Answer::Custom(value) => {
             let candidate = detect::custom(slot, value.trim());
@@ -1188,6 +1293,18 @@ fn volunteer(
                 pending,
                 progress,
             )?;
+        }
+        // "No", replacing a schema step config has: with no step the
+        // rules found to write down as switched off, the answer is the
+        // step taken away.
+        Answer::None if slot == Slot::SchemaHook && replacing => {
+            forget_on_disk(paths, slot)?;
+            record_decision(paths, pending, progress);
+            progress(&format!(
+                "{}: the rules found no schema step, so the one config had was removed",
+                slot_label(slot)
+            ));
+            return Ok(true);
         }
         // "No" to a schema step the rules never found is already true:
         // there is no command to write down as switched off, and an
@@ -1223,16 +1340,20 @@ fn volunteer(
 /// again on every start: a prompt the developer already declined, and exit
 /// 3 for a script, with nowhere to put the answer but the TOML by hand.
 /// `Slot::PortEnv` writes `ports = []` for exactly this reason.
+///
+/// `replaces` when the answer takes the place of one config has: the old
+/// entries are removed once the new ones have been checked.
 fn apply_service_answer(
     paths: &PandoPaths,
     config: &mut Config,
     proposal: &detect::Proposal,
     chosen: &[detect::Candidate],
     note: config::Note,
+    replaces: bool,
 ) -> Result<()> {
     let refs: Vec<&detect::Candidate> = chosen.iter().collect();
     if proposal.mechanism == Some("native") {
-        return apply_native_service_answer(paths, config, &refs, note);
+        return apply_native_service_answer(paths, config, &refs, note, replaces);
     }
     // The compose file the question was about. Without one there is
     // nothing to write an entry for, and nothing was asked either.
@@ -1243,6 +1364,9 @@ fn apply_service_answer(
     detect::apply_services(&file, &refs, &mut proposed);
     let names: Vec<&str> = refs.iter().map(|c| c.value.as_str()).collect();
     refuse_unloadable(paths, Slot::Services, &names.join(", "), &proposed)?;
+    if replaces {
+        forget_on_disk(paths, Slot::Services)?;
+    }
     let (array, entries) = detect::service_entry(&file, &refs);
     config::set_detected_array_entry(paths, Slot::Services.layer(), array, entries, note)?;
     detect::apply_services(&file, &refs, config);
@@ -1263,11 +1387,15 @@ pub(super) fn apply_native_service_answer(
     config: &mut Config,
     chosen: &[&detect::Candidate],
     note: config::Note,
+    replaces: bool,
 ) -> Result<()> {
     if chosen.is_empty() {
         let mut proposed = config.clone();
         proposed.isolation.none = true;
         refuse_unloadable(paths, Slot::Services, "none of them", &proposed)?;
+        if replaces {
+            forget_on_disk(paths, Slot::Services)?;
+        }
         config::set_detected(
             paths,
             config::Layer::Project,
@@ -1287,6 +1415,9 @@ pub(super) fn apply_native_service_answer(
     detect::apply_native_services(chosen, &mut proposed);
     let names: Vec<&str> = chosen.iter().map(|c| c.value.as_str()).collect();
     refuse_unloadable(paths, Slot::Services, &names.join(", "), &proposed)?;
+    if replaces {
+        forget_on_disk(paths, Slot::Services)?;
+    }
     for candidate in chosen {
         let (array, entries) = detect::native_entry(candidate);
         // One entry per service, so each cites its own evidence: a redis
@@ -1301,6 +1432,32 @@ pub(super) fn apply_native_service_answer(
     }
     detect::apply_native_services(chosen, config);
     Ok(())
+}
+
+/// Sets aside what config says about a slot whose answer is being
+/// replaced, for the slots whose answer [`detect::apply`] adds to rather
+/// than writes over: the processes, the services, the schema step.
+///
+/// Only ever of a config whose value came from pando's own layer — `init`
+/// refuses a replacement anything beneath it declares —
+/// so what this leaves is what the file will say once
+/// [`forget_on_disk`] has run.
+fn unanswer(slot: Slot, config: &mut Config) {
+    match slot {
+        Slot::Processes => config.processes.clear(),
+        Slot::Services => {
+            config.services.clear();
+            config.isolation.none = false;
+        }
+        Slot::SchemaHook => config.hooks.clear(),
+        _ => {}
+    }
+}
+
+/// [`unanswer`], in the file: the old answer's tables, removed from
+/// pando's own layer once the answer taking their place has been checked.
+fn forget_on_disk(paths: &PandoPaths, slot: Slot) -> Result<()> {
+    config::remove_keys(paths, slot.layer(), slot.answer_tables())
 }
 
 /// "None of them", written as the empty form of the slot's own value.

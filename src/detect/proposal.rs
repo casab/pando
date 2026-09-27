@@ -129,6 +129,25 @@ impl Slot {
             _ => None,
         }
     }
+
+    /// The tables and keys whose whole content is this slot's answer, for
+    /// the slots whose answer is more than one key: what a replacement
+    /// takes away before it writes. A key written over itself is replaced
+    /// by the writing; a `[[table]]` entry is appended, and a process
+    /// table merges with the one already there, so neither is.
+    pub fn answer_tables(self) -> &'static [&'static [&'static str]] {
+        match self {
+            // `[dev]` is shorthand for `[processes.dev]`: either one is
+            // the answer.
+            Slot::Processes => &[&["processes"], &["dev"]],
+            // `[isolation] none` is how the native half says "none of
+            // them".
+            Slot::Services => &[&["services"], &["isolation", "none"]],
+            Slot::SchemaHook => &[&["hooks"]],
+            _ => &[],
+        }
+    }
+
     /// Where the answer is written, as a table path plus a key. `None` for
     /// [`Slot::Processes`], whose answer is whole tables rather than one
     /// key; [`edits`](super::edits) is what knows how to write that.
