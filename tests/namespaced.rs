@@ -601,7 +601,7 @@ fn a_real_namespaced_check_proves_the_schema_step_and_leaves_only_main() {
     let answering = "python3 -u -c \"import http.server as h,os;\
                      C=type('C',(h.BaseHTTPRequestHandler,),dict(do_GET=lambda s:\
                      (s.send_response(200),s.end_headers())));\
-                     h.HTTPServer(('127.0.0.1',int(os.environ['PORT'])),C).serve_forever()\"";
+                     type('S',(h.socketserver.TCPServer,),dict(allow_reuse_address=1))(('127.0.0.1',int(os.environ['PORT'])),C).serve_forever()\"";
     std::fs::write(
         paths.config_file(),
         format!(

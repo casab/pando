@@ -1829,7 +1829,7 @@ fn a_check_leaves_the_repository_untouched_and_the_home_changed_only_where_it_re
     // A server that answers 404 to everything: a page, served.
     let server = "python3 -u -c \"import http.server as h,os;C=type('C',(h.BaseHTTPRequestHandler,),\
                   dict(do_GET=lambda s:(s.send_response(404),s.end_headers())));\
-                  h.HTTPServer(('127.0.0.1',int(os.environ['PORT'])),C).serve_forever()\"";
+                  type('S',(h.socketserver.TCPServer,),dict(allow_reuse_address=1))(('127.0.0.1',int(os.environ['PORT'])),C).serve_forever()\"";
     let h = harness_with(&format!(
         "[project]\nprovision = [\".env\", \".env.local\"]\ninstall = \"true\"\n\n\
          [dev]\ncmd = '''{server}'''\nports = {{ PORT = \"web\" }}\n"
