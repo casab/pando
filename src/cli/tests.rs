@@ -3810,3 +3810,126 @@ fn init_agent_runs_on_a_config_pando_cannot_read() {
     assert!(command(&["pando", "init"]).needs_config());
     assert!(command(&["pando", "init", "--answers", "-", "--dry-run"]).needs_config());
 }
+
+/// What the first-time tip said, line by line, and whether it said it.
+fn tip_lines(fx: &Fx, config: &Config, terminal: bool) -> (bool, Vec<String>) {
+    let said = std::cell::RefCell::new(Vec::new());
+    let shown = super::tip::first_time_tip(&fx.paths, config, terminal, &|line: &str| {
+        said.borrow_mut().push(line.to_string())
+    });
+    (shown, said.into_inner())
+}
+
+#[test]
+fn the_first_time_tip_is_said_once_on_a_terminal_and_remembered() {
+    let fx = fixture();
+    let (shown, said) = tip_lines(&fx, &fx.config, true);
+    assert!(shown);
+    assert_eq!(
+        said,
+        [
+            "first time in acme-shop. To set it up with your coding agent, paste:".to_string(),
+            format!("  {}", crate::setup::SETUP_PROMPT),
+            "`pando check` tests the setup at any time.".to_string(),
+        ]
+    );
+    let memory = crate::setup::SetupMemory::load(&fx.paths);
+    assert!(memory.tip_shown_at.is_some(), "{memory:?}");
+
+    assert_eq!(tip_lines(&fx, &fx.config, true), (false, Vec::new()));
+}
+
+// The tip tells a person what to run; a renamed verb or flag would leave
+// it reading perfectly and pointing nowhere.
+#[test]
+fn the_first_time_tip_only_names_commands_pando_has() {
+    let fx = fixture();
+    let (_, said) = tip_lines(&fx, &fx.config, true);
+    assert_every_command_is_real("the first-time tip", &said.join("\n"));
+}
+
+// A developer who pressed esc on the setup screen skipped that screen, not
+// the tip.
+#[test]
+fn the_first_time_tip_is_said_after_the_setup_screen_was_skipped() {
+    let fx = fixture();
+    crate::setup::SetupMemory {
+        skipped_at: Some(Utc::now()),
+        ..Default::default()
+    }
+    .save(&fx.paths)
+    .unwrap();
+    assert!(tip_lines(&fx, &fx.config, true).0);
+    let memory = crate::setup::SetupMemory::load(&fx.paths);
+    assert!(memory.skipped_at.is_some(), "the skip is kept: {memory:?}");
+    assert!(memory.tip_shown_at.is_some(), "{memory:?}");
+}
+
+#[test]
+fn the_first_time_tip_is_never_said_on_a_pipe_and_writes_nothing() {
+    let fx = fixture();
+    assert_eq!(tip_lines(&fx, &fx.config, false), (false, Vec::new()));
+    assert!(!fx.paths.setup_file().exists());
+    assert!(!fx.paths.project_dir().exists());
+    // Not used up by the script, either: the person gets it later.
+    assert!(tip_lines(&fx, &fx.config, true).0);
+}
+
+#[test]
+fn the_first_time_tip_is_not_said_for_a_project_with_something_to_run() {
+    let fx = fixture();
+    assert_eq!(
+        tip_lines(&fx, &with_dev(&fx.config), true),
+        (false, Vec::new())
+    );
+    assert!(!fx.paths.setup_file().exists());
+}
+
+// A tip that cannot be remembered would be said on every run, so it is
+// not said at all.
+#[test]
+fn the_first_time_tip_is_not_said_when_it_cannot_be_remembered() {
+    let fx = fixture();
+    std::fs::create_dir_all(fx.paths.setup_file()).unwrap();
+    assert_eq!(tip_lines(&fx, &fx.config, true), (false, Vec::new()));
+}
+
+// The tip is advice, never a gate: `new` and `start` on a new project take
+// pando's first choices exactly as they did before it.
+#[test]
+fn new_and_start_still_work_on_a_new_project_after_the_tip() {
+    let fx = fixture();
+    std::fs::write(fx.root.join("Makefile"), "dev:\n\t@sleep 30\n").unwrap();
+    git(&fx.root, &["add", "."]);
+    git(&fx.root, &["commit", "--quiet", "-m", "makefile"]);
+    assert!(tip_lines(&fx, &fx.config, true).0);
+
+    let yes = super::prompt::asker(true);
+    let config = actions::resolve_for_new(&fx.paths, &fx.config, &yes, &quiet).unwrap();
+    let name = actions::new(&fx.paths, &config, "feat/tip", None, &quiet).unwrap();
+    // The start that follows still loads a project with nothing to run,
+    // and says nothing: the tip was said once.
+    assert!(!tip_lines(&fx, &fx.config, true).0);
+    let config = actions::resolve_for_start(
+        &fx.paths,
+        &config,
+        &name,
+        actions::Mode::of(false, false, false),
+        &yes,
+        &quiet,
+    )
+    .unwrap();
+    // The Makefile's one-line recipe, run as itself: no make needed.
+    assert_eq!(config.processes["dev"].cmd, "sleep 30");
+    let report = actions::start(
+        &fx.paths,
+        &config,
+        &name,
+        None,
+        actions::Mode::of(false, false, false),
+        &quiet,
+    )
+    .unwrap();
+    actions::stop(&fx.paths, &name, None, &quiet).unwrap();
+    assert!(!report.started_nothing());
+}

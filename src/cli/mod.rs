@@ -21,6 +21,7 @@ mod open;
 mod prompt;
 mod signals;
 mod status;
+mod tip;
 mod wait;
 
 use self::answers::init_asker;
@@ -611,6 +612,7 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
     let mut out = Stdout;
     match command {
         Command::New { branch, base, yes } => {
+            tip::first_time_tip(paths, config, stderr_is_terminal(), &notice);
             let config = &actions::resolve_for_new(paths, config, &everyday_asker(yes), &notice)?;
             let name = actions::new(paths, config, &branch, base.as_deref(), &notice)
                 .map_err(|e| with_a_way_past(paths, e))?;
@@ -664,6 +666,9 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             // for a start that is refused is a cost with nothing for it.
             actions::refuse_only_on_a_mode_change(paths, config, &name, only.as_deref(), mode)
                 .map_err(|e| with_a_way_past(paths, named.reword(e)))?;
+            // After the refusals, which say nothing unless the start is
+            // not going to happen, and before the first question.
+            tip::first_time_tip(paths, config, stderr_is_terminal(), &notice);
             let config = &actions::resolve_for_start(
                 paths,
                 config,
@@ -1023,8 +1028,13 @@ fn hint(message: &str) {
 /// keeps the old contract, returning once everything is spawned, because
 /// scripts and agents were written against it.
 fn waits(wait: bool, no_wait: bool) -> bool {
+    waits_on(wait, no_wait, stderr_is_terminal())
+}
+
+/// Whether a person is watching what pando narrates.
+fn stderr_is_terminal() -> bool {
     use std::io::IsTerminal;
-    waits_on(wait, no_wait, std::io::stderr().is_terminal())
+    std::io::stderr().is_terminal()
 }
 
 fn waits_on(wait: bool, no_wait: bool, terminal: bool) -> bool {
