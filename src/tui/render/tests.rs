@@ -3974,6 +3974,21 @@ fn finished(app: &mut App, state: SetupState, outcome: CheckOutcome, ran_by: Ran
 // The screen as the plan draws it: header, the three lines, the prompt
 // on a row of its own with no border either side, the steps, the live
 // line and the keys.
+// A terminal of the classic 80 columns — and a little less — still has
+// the prompt whole on one row, so a mouse selection carries no line
+// break into the agent.
+#[test]
+fn the_prompt_is_one_row_on_an_eighty_column_terminal() {
+    assert!(SETUP_PROMPT.chars().count() <= 72, "{SETUP_PROMPT}");
+    for width in [80, 76] {
+        let (_dir, mut app) = app_on_setup_screen(false);
+        let text = text_of(&draw(&mut app, width, 30));
+        let prompt = rows_with(&text, SETUP_PROMPT);
+        assert_eq!(prompt.len(), 1, "{width} columns, one row, whole:\n{text}");
+        assert_eq!(prompt[0].trim(), SETUP_PROMPT, "nothing beside it");
+    }
+}
+
 #[test]
 fn the_setup_screen_draws_the_prompt_without_side_borders() {
     let (_dir, mut app) = app_on_setup_screen(false);

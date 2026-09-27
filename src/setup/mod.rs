@@ -24,7 +24,7 @@ pub use state::{Setup, SetupState, check_running, decide, read};
 /// in the README. The rules live in the job `pando init --agent` prints,
 /// so the prompt never changes with them.
 pub const SETUP_PROMPT: &str =
-    "Set up pando for this project: run `pando init --agent` and follow what it says.";
+    "Set up pando here: run `pando init --agent` and follow what it says.";
 
 #[cfg(test)]
 mod tests;

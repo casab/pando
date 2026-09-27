@@ -73,7 +73,7 @@ coding agent look at it. Press `a` to copy this one line, and paste it
 into Claude Code or Codex, opened in the project:
 
 ```
-Set up pando for this project: run `pando init --agent` and follow what it says.
+Set up pando here: run `pando init --agent` and follow what it says.
 ```
 
 `pando init --agent` prints the job for this project and this version of
