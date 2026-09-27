@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand};
 use std::io::Write;
 
 mod answers;
+mod check;
 mod completion;
 mod doctor;
 mod logs;
@@ -54,6 +55,7 @@ Examples:
   pando open feat/login            its URL in the browser
   pando logs -f                    follow the log of the worktree you are in
   pando ls                         every worktree: status, URL, ports, git
+  pando check                      test the setup in a throwaway worktree
 
 A worktree is named by its branch (feat/login) or its directory (feat+login).
 Inside a worktree, start, stop, restart, logs, open, share and unshare need
@@ -256,18 +258,39 @@ Examples:
         #[arg(long)]
         dry_run: bool,
     },
+    /// Test the setup: start it all in a throwaway worktree, then remove it.
+    ///
+    /// Makes a worktree of the commit `new` would fork from, with no
+    /// branch, and runs it as a first shared start does: the install,
+    /// every process until it is ready, and the page the browser's app
+    /// serves. Then stops and removes all of it, keeps its logs, and
+    /// records the result. Hooks after `services`
+    /// are skipped: on the shared services they would run against your
+    /// own data. Exits 0 when it passed, 1 when it failed — the settings'
+    /// or the machine's, `--json` says which — and 3 when a question is
+    /// still open.
+    #[command(after_help = "\
+Examples:
+  pando check           test it, and say what went wrong
+  pando check --json    the documented machine-readable result")]
+    #[command(display_order = 14)]
+    Check {
+        /// The result as one JSON object, whatever it is.
+        #[arg(long)]
+        json: bool,
+    },
     /// What the repository says about how to run itself, as JSON.
     ///
     /// Read-only, and identical on two runs: the input an agent reads
     /// before deciding anything.
-    #[command(display_order = 15)]
+    #[command(display_order = 16)]
     Signals,
     /// What pando found, from where, and what is wrong.
     ///
     /// Read-only. Problems and notes come first, each with what to do
     /// about it, then the facts section by section. Exits 0 when nothing
     /// found will break a command and 1 when something will.
-    #[command(display_order = 14)]
+    #[command(display_order = 15)]
     Doctor {
         /// Move a moved repository's project folder under its current id.
         ///
@@ -449,7 +472,7 @@ Examples:
   pando completions zsh > ~/.zfunc/_pando      then `fpath+=~/.zfunc` in .zshrc
   pando completions bash > ~/.local/share/bash-completion/completions/pando
   pando completions fish > ~/.config/fish/completions/pando.fish")]
-    #[command(display_order = 16)]
+    #[command(display_order = 17)]
     Completions {
         /// The shell to complete for.
         shell: clap_complete::Shell,
@@ -489,6 +512,8 @@ impl Command {
                 // and patching on top of one it could not parse would
                 // lose whatever is in it.
                 | Command::Init { .. }
+                // It starts the project, on the settings a start would use.
+                | Command::Check { .. }
                 // `--env` renders templates, which only config holds. Plain
                 // `status` still runs on whatever is left.
                 | Command::Status { env: true, .. }
@@ -699,6 +724,7 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             to_stderr(&render_init(&report, "would write"));
             Ok(())
         }
+        Command::Check { json } => check::check(paths, config, json, &mut out),
         Command::Signals => signals_json(paths, config, &mut out),
         // Deliberately not given the config `main` loaded: the one thing
         // worth reporting about a project layer pando cannot read is the

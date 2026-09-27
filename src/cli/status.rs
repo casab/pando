@@ -150,7 +150,8 @@ pub fn status_json<W: Write>(paths: &PandoPaths, only: Option<&str>, out: &mut W
     // The listing alone: the shape has no git fields, and enriching would
     // be a `git status` in every worktree for nothing.
     let mut worktrees = crate::worktree::discover(&paths.project)?;
-    worktrees.retain(|w| only.is_none_or(|name| w.name == name));
+    worktrees
+        .retain(|w| !crate::worktree::is_check(&w.name) && only.is_none_or(|name| w.name == name));
     if let Some(name) = only
         && worktrees.is_empty()
     {
@@ -330,7 +331,7 @@ fn status_lines<W: Write>(
     let config = crate::config::load(paths).ok().map(|loaded| loaded.config);
     // The listing alone, as for the JSON: nothing here reads a git field.
     let mut shown = crate::worktree::discover(&paths.project)?;
-    shown.retain(|w| only.is_none_or(|name| w.name == name));
+    shown.retain(|w| !crate::worktree::is_check(&w.name) && only.is_none_or(|name| w.name == name));
     if shown.is_empty() {
         if let Some(name) = only {
             return Err(not_listed(name, refreshed.state.worktrees.get(name)));

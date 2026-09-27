@@ -43,6 +43,10 @@ pub struct CheckRecord {
     /// One entry per process the check started, in start order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub processes: Vec<ProcessResult>,
+    /// The process, or the hook (`install`), whose failure ended the
+    /// check, when one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_process: Option<String>,
     /// The failed process's last lines, already redacted by whoever wrote
     /// the record: this file is read into the agent's job.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -129,6 +133,7 @@ impl CheckRecord {
             base_ref: None,
             outcome: CheckOutcome::Running,
             processes: Vec::new(),
+            failed_process: None,
             failed_tail: Vec::new(),
             progress: Vec::new(),
             ran_by,

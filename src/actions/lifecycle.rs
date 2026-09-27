@@ -216,6 +216,28 @@ struct Preflight {
     /// This start is a `restart --only`: the process it names is replaced
     /// even while it runs, rather than reported as already up.
     restarting: bool,
+    /// This start is `pando check`'s: the hooks after `services` and after
+    /// `dev` are not run. On the shared services they would run against
+    /// the developer's own data — a migration marked `on = "always"`, or
+    /// any such hook in a project with no services pando runs — and a
+    /// test must not change what it tests on. The check says so itself.
+    skip_after_services: bool,
+}
+
+/// [`start`] for `pando check`: every process of `name`, on the shared
+/// services, with the hooks after services left out — see
+/// [`Preflight::skip_after_services`].
+pub(super) fn start_for_check(
+    paths: &PandoPaths,
+    config: &Config,
+    name: &str,
+    progress: &dyn Fn(&str),
+) -> Result<StartReport> {
+    let preflight = Preflight {
+        skip_after_services: true,
+        ..Preflight::default()
+    };
+    start_checked(paths, config, name, None, Mode::Shared, preflight, progress)
 }
 
 fn start_checked(
@@ -231,6 +253,7 @@ fn start_checked(
         isolation: mut preflighted,
         namespaces: mut ready,
         restarting,
+        skip_after_services,
     } = preflight;
     let worktree = find_live_worktree(paths, name)?;
     // Before anything is installed, signalled or spawned: a `--only` naming
@@ -871,14 +894,16 @@ fn start_checked(
     }
 
     if !everything_up {
-        run_hooks(
-            paths,
-            config,
-            config::HookPoint::Services,
-            &hook_ctx,
-            progress,
-        )
-        .map_err(undo)?;
+        if !skip_after_services {
+            run_hooks(
+                paths,
+                config,
+                config::HookPoint::Services,
+                &hook_ctx,
+                progress,
+            )
+            .map_err(undo)?;
+        }
         // The last gate before anything is spawned: a probe that
         // recognises the failure stops the start and says how to fix it,
         // rather than letting the dev server die of it thirty seconds
@@ -1119,7 +1144,7 @@ fn start_checked(
     // Outside the lock, because a `dev` hook is a command like any other
     // and holding the lock through it would freeze the TUI's tick.
     drop(_lock);
-    if !everything_up {
+    if !everything_up && !skip_after_services {
         run_hooks(paths, config, config::HookPoint::Dev, &hook_ctx, progress)?;
     }
     // From the record, through the one function every read path uses, so
@@ -1706,6 +1731,7 @@ pub fn restart(
             isolation: preflighted,
             namespaces,
             restarting: only.is_some(),
+            skip_after_services: false,
         },
         progress,
     )

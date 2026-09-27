@@ -168,6 +168,190 @@ pub fn something_is_serving(port: u16) -> bool {
     false
 }
 
+/// Whether `host`, as an env file names a server, is this machine: the
+/// name `localhost`, an IPv4 loopback, or `::1`. The only hosts pando asks
+/// anything of on its own — a server elsewhere is not the machine's to
+/// answer for, and a name that has to be resolved has no bound on how long
+/// that takes.
+pub fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// What a local server said when asked for its first page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PageAnswer {
+    /// An HTTP response, by its status code.
+    Status(u16),
+    /// Bytes, and not HTTP's: a TLS alert from a server that wants HTTPS,
+    /// or another protocol altogether. It answers; its page is not known.
+    NotHttp,
+    /// Nothing accepted a connection, on either loopback.
+    Refused,
+    /// Something accepted the connection and said nothing before the wait
+    /// was over, or closed it without a byte every time.
+    Silent,
+}
+
+/// How long `pando check` waits for a dev server's first page. A framework
+/// that compiles a page on its first request — Next.js does — can take a
+/// minute and more on a cold cache, and that is a server working, not one
+/// that failed.
+pub const PAGE_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// How often a page wait looks up from its socket: to try again after a
+/// refusal, and to let its caller end it.
+const PAGE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+thread_local! {
+    static PAGE_WAIT_HERE: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// [`PAGE_WAIT`], unless [`with_page_wait`] is running on this thread.
+pub fn page_wait() -> std::time::Duration {
+    PAGE_WAIT_HERE.with(|t| t.get()).unwrap_or(PAGE_WAIT)
+}
+
+/// Runs `f` with [`page_wait`] at `wait` on this thread. For tests: a
+/// server that never answers is waited out for the whole of it, and a
+/// minute and a half of that is not a test anyone runs. Per thread, so the
+/// tests beside it keep the real wait.
+#[doc(hidden)]
+pub fn with_page_wait<R>(wait: std::time::Duration, f: impl FnOnce() -> R) -> R {
+    let before = PAGE_WAIT_HERE.with(|t| t.replace(Some(wait)));
+    struct Restore(Option<std::time::Duration>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PAGE_WAIT_HERE.with(|t| t.set(self.0));
+        }
+    }
+    let _restore = Restore(before);
+    f()
+}
+
+/// Asks the server on `port` for `/`, as a browser at
+/// `http://localhost:<port>` would — `Host: localhost:<port>`, since a dev
+/// server that checks the host refuses any other — and says what came
+/// back, waiting up to `wait` for it.
+///
+/// A refusal, or a connection closed without a byte, is tried again until
+/// the wait is over: a dev server restarts itself while it starts. A
+/// connection that stays silent is waited on, because that is a page being
+/// compiled. `keep_waiting` is asked about every quarter second with the
+/// time spent so far, and ends the wait when it says no. Written over a
+/// plain socket: one request and one status line are not worth a client.
+pub fn ask_for_page(
+    port: u16,
+    wait: std::time::Duration,
+    keep_waiting: &mut dyn FnMut(std::time::Duration) -> bool,
+) -> PageAnswer {
+    let began = std::time::Instant::now();
+    let mut last;
+    loop {
+        match connect_loopback(port, CONNECT_TIMEOUT) {
+            Err(_) => last = PageAnswer::Refused,
+            Ok(stream) => match read_page(stream, port, began, wait, keep_waiting) {
+                Reading::Answered(answer) => return answer,
+                Reading::GaveUp => return PageAnswer::Silent,
+                Reading::Closed => last = PageAnswer::Silent,
+            },
+        }
+        if began.elapsed() >= wait || !keep_waiting(began.elapsed()) {
+            return last;
+        }
+        std::thread::sleep(PAGE_POLL);
+    }
+}
+
+/// How one connection of [`ask_for_page`] ended.
+enum Reading {
+    Answered(PageAnswer),
+    /// Closed, or broken, before a single byte: worth another try.
+    Closed,
+    /// The wait was over, or its caller ended it, with nothing said.
+    GaveUp,
+}
+
+fn read_page(
+    mut stream: std::net::TcpStream,
+    port: u16,
+    began: std::time::Instant,
+    wait: std::time::Duration,
+    keep_waiting: &mut dyn FnMut(std::time::Duration) -> bool,
+) -> Reading {
+    use std::io::{Read, Write};
+    let request = format!(
+        "GET / HTTP/1.1\r\nHost: localhost:{port}\r\nUser-Agent: pando-check\r\n\
+         Accept: */*\r\nConnection: close\r\n\r\n"
+    );
+    if stream.write_all(request.as_bytes()).is_err()
+        || stream.set_read_timeout(Some(PAGE_POLL)).is_err()
+    {
+        return Reading::Closed;
+    }
+    let mut got: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 512];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) if got.is_empty() => return Reading::Closed,
+            Ok(0) => {
+                return Reading::Answered(page_answer(&got, true).unwrap_or(PageAnswer::NotHttp));
+            }
+            Ok(n) => {
+                got.extend_from_slice(&buf[..n]);
+                if let Some(answer) = page_answer(&got, false) {
+                    return Reading::Answered(answer);
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if began.elapsed() >= wait || !keep_waiting(began.elapsed()) {
+                    return Reading::GaveUp;
+                }
+            }
+            Err(_) if got.is_empty() => return Reading::Closed,
+            Err(_) => {
+                return Reading::Answered(page_answer(&got, true).unwrap_or(PageAnswer::NotHttp));
+            }
+        }
+    }
+}
+
+/// What the bytes a server sent so far say, or `None` while they could
+/// still be the start of an HTTP status line. `ended` is whether no more
+/// are coming.
+pub fn page_answer(got: &[u8], ended: bool) -> Option<PageAnswer> {
+    const PREFIX: &[u8] = b"HTTP/";
+    let shared = got.len().min(PREFIX.len());
+    if got[..shared] != PREFIX[..shared] {
+        return Some(PageAnswer::NotHttp);
+    }
+    let line_end = got.iter().position(|b| *b == b'\n');
+    // `HTTP/1.1 200` is the shortest line that says a status.
+    if line_end.is_none() && got.len() < 12 && !ended {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&got[..line_end.unwrap_or(got.len())]);
+    let status = line
+        .split_whitespace()
+        .nth(1)
+        .filter(|code| code.len() == 3 && code.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|code| code.parse().ok());
+    match status {
+        Some(code) => Some(PageAnswer::Status(code)),
+        None if line_end.is_none() && !ended && got.len() < 64 => None,
+        None => Some(PageAnswer::NotHttp),
+    }
+}
+
 /// The base port for a worktree, before any occupancy probing.
 pub fn derive_base(project_id: &str, name: &str) -> u16 {
     let mut input = Vec::with_capacity(project_id.len() + name.len() + 1);
@@ -1317,5 +1501,142 @@ mod tests {
         );
         assert!(!is_port_free(port), "but the port is in use");
         drop(listener);
+    }
+
+    // The page probe of `pando check`.
+
+    /// A server on a free loopback port that takes one connection, hands
+    /// back what it was sent, and replies `reply` — or, with `None`, holds
+    /// the connection and says nothing.
+    fn one_answer(reply: Option<&'static [u8]>) -> (u16, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+            match reply {
+                Some(bytes) => {
+                    let _ = stream.write_all(bytes);
+                }
+                None => std::thread::sleep(std::time::Duration::from_secs(3)),
+            }
+        });
+        (port, rx)
+    }
+
+    fn ask(port: u16, wait_ms: u64) -> PageAnswer {
+        ask_for_page(port, std::time::Duration::from_millis(wait_ms), &mut |_| {
+            true
+        })
+    }
+
+    #[test]
+    fn a_page_answer_is_its_status_whatever_the_status_is() {
+        let (port, sent) = one_answer(Some(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"));
+        assert_eq!(ask(port, 5_000), PageAnswer::Status(404));
+        let request = sent.recv().unwrap();
+        assert!(request.starts_with("GET / HTTP/1.1\r\n"), "{request}");
+        assert!(
+            request.contains(&format!("\r\nHost: localhost:{port}\r\n")),
+            "asked as the browser at localhost asks: {request}"
+        );
+
+        let (port, _) = one_answer(Some(b"HTTP/1.0 500 Internal Server Error\r\n\r\n"));
+        assert_eq!(ask(port, 5_000), PageAnswer::Status(500));
+    }
+
+    #[test]
+    fn a_port_nothing_listens_on_is_refused_once_the_wait_is_over() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let began = std::time::Instant::now();
+        assert_eq!(ask(port, 300), PageAnswer::Refused);
+        assert!(began.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_tls_alert_answers_but_is_not_http() {
+        // What a server that wants TLS sends back to a plain request.
+        let (port, _) = one_answer(Some(b"\x15\x03\x01\x00\x02\x02\x46"));
+        assert_eq!(ask(port, 5_000), PageAnswer::NotHttp);
+    }
+
+    #[test]
+    fn a_server_that_says_nothing_is_silent_and_the_caller_can_end_the_wait() {
+        let (port, _) = one_answer(None);
+        assert_eq!(ask(port, 400), PageAnswer::Silent);
+
+        let (port, _) = one_answer(None);
+        let began = std::time::Instant::now();
+        let mut asked = 0;
+        let answer = ask_for_page(port, std::time::Duration::from_secs(60), &mut |_| {
+            asked += 1;
+            asked < 2
+        });
+        assert_eq!(answer, PageAnswer::Silent);
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(5),
+            "a caller that says stop is not made to sit out the wait"
+        );
+    }
+
+    #[test]
+    fn the_first_bytes_decide_a_page_answer_only_once_they_can() {
+        assert_eq!(page_answer(b"", false), None);
+        assert_eq!(page_answer(b"HTT", false), None);
+        assert_eq!(page_answer(b"HTTP/1.1 2", false), None);
+        assert_eq!(
+            page_answer(b"HTTP/1.1 204", false),
+            Some(PageAnswer::Status(204))
+        );
+        assert_eq!(
+            page_answer(b"HTTP/1.1 301 Moved\r\n", false),
+            Some(PageAnswer::Status(301))
+        );
+        assert_eq!(page_answer(b"HTTP/1.1 2", true), Some(PageAnswer::NotHttp));
+        assert_eq!(
+            page_answer(b"SSH-2.0-OpenSSH\r\n", false),
+            Some(PageAnswer::NotHttp)
+        );
+        assert_eq!(
+            page_answer(b"HTTP/1.1 abc\r\n", false),
+            Some(PageAnswer::NotHttp)
+        );
+    }
+
+    #[test]
+    fn only_this_machine_is_a_loopback_host() {
+        for host in [
+            "localhost",
+            "LOCALHOST",
+            "127.0.0.1",
+            "127.1.2.3",
+            "::1",
+            "[::1]",
+        ] {
+            assert!(is_loopback_host(host), "{host}");
+        }
+        for host in ["db", "db.example.com", "10.0.0.5", "0.0.0.0", ""] {
+            assert!(!is_loopback_host(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn a_page_wait_is_shortened_on_this_thread_alone() {
+        assert_eq!(page_wait(), PAGE_WAIT);
+        let short = std::time::Duration::from_millis(5);
+        let inside = with_page_wait(short, || {
+            let other = std::thread::spawn(page_wait).join().unwrap();
+            (page_wait(), other)
+        });
+        assert_eq!(inside, (short, PAGE_WAIT));
+        assert_eq!(page_wait(), PAGE_WAIT);
     }
 }

@@ -6,7 +6,7 @@ the contract. Everything in it is covered by the compatibility statement
 below; anything pando prints that is *not* in here is a human-readable
 convenience and may change without notice.
 
-Five shapes are published:
+Six shapes are published:
 
 | Command | Shape | Read it for |
 |---|---|---|
@@ -15,6 +15,7 @@ Five shapes are published:
 | `pando status --json` | one object | what is running, on which ports, with which URL |
 | `pando ls --json` | one object | the worktrees and their git state |
 | `pando logs <name> --json` | one object **per line** | a log, with a level and a timestamp per line |
+| `pando check --json` | one object | whether the setup works: a test run in a throwaway worktree, and why it failed |
 
 There is one write path, and it is not JSON output: `pando init --answers`.
 It is documented in [The answers file](#the-answers-file) below.
@@ -56,8 +57,8 @@ carrying `tool`, `prereqs` and `recipe`. The old shape was not merely
 narrower, it was wrong: one line of a recipe is not the command a target
 runs, and pando proposed such a line as a dev command on a real project.
 
-One coarseness worth knowing: `signals`, `doctor`, `status` and `logs` share
-a single version, so a break in one bumps all four. Nothing about `doctor`,
+One coarseness worth knowing: `signals`, `doctor`, `check`, `status` and
+`logs` share a single version, so a break in one bumps all five. Nothing about `doctor`,
 `status` or `logs` changed in 2. Splitting them so a program can pin what it
 actually parses is recorded as a follow-up, not done here.
 
@@ -427,6 +428,69 @@ the default.
 Every command that takes a worktree name also takes its branch: `feat/one`
 and `feat+one` name the same worktree. The JSON always carries the
 directory form, `feat+one`, in `name`.
+
+## `pando check --json`
+
+The result of one `pando check`: it makes a worktree of the commit a new
+worktree would fork from, with no branch, installs it and starts every
+process on the shared services, waits until each one is ready, asks the
+process that owns the worktree's URL for `/`, then stops and removes all
+of it. Hooks after `services` and after `dev` are not run, and `notes`
+says which. It writes under pando's home and, for the throwaway worktree
+it removes again, inside `.git`; never into the repository. Printed
+whatever the result — a pass, a failure, a question still open, an
+interruption — as the one object on stdout.
+
+```jsonc
+{
+  "version": 2,
+  "project": { "id": "...", "root": "...", "name": "..." },
+  "result": "passed|failed|not_set_up|interrupted",
+  "kind": "settings|machine",      // whose the failure is; null unless "failed"
+  "reason": "web exited with status 1 — ...", // null when "passed"
+  "slot": "dev_cmd",               // the open question; null unless "not_set_up"
+  "commit": "a1b2c3d4…",           // the full sha tested, or null
+  "base_ref": "origin/main",       // the ref it was read from; null for HEAD
+  "processes": [
+    { "name": "web", "ready": true, "port": 17008,
+      "http_status": 200,          // the page's status; null for every other process
+      "secs": 4.2 }                // how long it took to be ready, or to fail
+  ],
+  "failed_process": "web",         // or "install"; null when nothing failed
+  "failed_tail": ["..."],          // its last lines, with secrets hidden
+  "notes": ["skipped the hooks that run after services (migrate): ..."],
+  "ran_by": "tui|terminal|program",
+  "pando_version": "0.5.0",
+  "started_at": "2026-09-27T10:00:00Z",
+  "finished_at": "2026-09-27T10:01:12Z",
+  "settings_changed": false        // the settings changed while it ran
+}
+```
+
+`kind` says who fixes a failure. `settings` is pando's settings for the
+project — a dev command that exits, an install that fails, a page that
+answers `5xx` — and is fixed through `pando init --answers -`, then
+checked again. `machine` is this machine: a shared service nothing
+answers on, found before anything was made. `reason` then carries the
+command that starts it, and no setting changes it.
+
+A page answers when its status is below 500; a server that answers in
+something other than plain HTTP — TLS, say — passes with a note, since
+it answers. No answer within 90 seconds fails: a dev server compiling
+its first page gets that long.
+
+Exit codes: `0` passed, `1` failed or interrupted, `3` a question is still
+open. On exit 3 the object has `"result": "not_set_up"`, `slot` naming the
+question, `reason` and `commit` null and `processes` empty, and the
+question itself is on stderr, as every exit 3 puts it; nothing was made.
+When another check of the same project is running, it exits 1 with
+nothing on stdout: that check's result is the one to read.
+
+`failed_tail` has at most ten lines. Passwords in URLs, the values of keys
+named like a secret, and bearer tokens read `(hidden)`: this list is
+meant to be pasted into a conversation. `settings_changed` true means the
+project's run settings were edited while the check ran, so the result
+speaks for neither the old ones nor the new.
 
 ## The decisions log
 

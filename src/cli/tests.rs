@@ -3364,3 +3364,185 @@ fn three_flags_mean_three_modes_and_none_is_the_remembered_one() {
     assert_eq!(Mode::of(false, true, false), Mode::Namespaced);
     assert_eq!(Mode::of(false, false, true), Mode::Shared);
 }
+
+// `pando check --json`.
+
+/// The `pando check --json` section of the contract.
+fn check_section() -> String {
+    let doc = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("agent/json.md"),
+    )
+    .unwrap();
+    doc.split("## `pando check --json`")
+        .nth(1)
+        .expect("the check section")
+        .split("\n## ")
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+/// A finished check with every field the shape has filled in.
+fn full_check_record() -> crate::setup::CheckRecord {
+    use crate::setup::{CheckOutcome, CheckRecord, FailureKind, ProcessResult, RanBy};
+    let mut record = CheckRecord::begin("a".to_string(), RanBy::Program);
+    record.finished_at = Some(Utc::now());
+    record.fingerprint_after = Some("b".to_string());
+    record.commit = Some("a1b2c3d4e5".to_string());
+    record.base_ref = Some("origin/main".to_string());
+    record.outcome = CheckOutcome::Failed {
+        kind: FailureKind::Settings,
+        reason: "web answered its first page with HTTP 500".to_string(),
+    };
+    record.processes = vec![ProcessResult {
+        name: "web".to_string(),
+        ready: false,
+        port: Some(17008),
+        http_status: Some(500),
+        secs: 1.25,
+    }];
+    record.failed_process = Some("web".to_string());
+    record.failed_tail = vec!["Error: boom".to_string()];
+    record.notes = vec!["skipped the hooks that run after services (migrate)".to_string()];
+    record
+}
+
+// Every key `check --json` prints is one a program reads, so the contract
+// names each of them, the process entries' too.
+#[test]
+fn agent_json_documents_every_check_key() {
+    let fx = fixture();
+    let section = check_section();
+    let record = full_check_record();
+    let printed = serde_json::to_value(super::check::check_json(&fx.paths, &record)).unwrap();
+    let process = printed["processes"][0].clone();
+    for object in [&printed, &process] {
+        for key in object.as_object().unwrap().keys() {
+            assert!(
+                section.contains(&format!("\"{key}\"")),
+                "agent/json.md never documents check.{key}"
+            );
+        }
+    }
+    assert_eq!(printed["version"], JSON_VERSION);
+    assert_eq!(printed["result"], "failed");
+    assert_eq!(printed["kind"], "settings");
+    assert_eq!(printed["settings_changed"], true, "a != b");
+    assert_eq!(process["secs"], 1.3, "tenths of a second");
+    // The wait it documents is the one the probe waits.
+    let wait = format!("{} seconds", crate::ports::PAGE_WAIT.as_secs());
+    assert!(section.contains(&wait), "the section says {wait}");
+}
+
+// The words `result`, `kind` and `ran_by` take in the check's section are
+// the ones the binary prints, and no others.
+#[test]
+fn every_check_value_agent_json_documents_is_one_the_binary_prints() {
+    use crate::setup::{CheckOutcome, FailureKind, RanBy};
+    let section = check_section();
+    let fx = fixture();
+    let mut record = full_check_record();
+    let mut results: Vec<String> = Vec::new();
+    for outcome in [
+        CheckOutcome::Passed,
+        CheckOutcome::Failed {
+            kind: FailureKind::Machine,
+            reason: String::new(),
+        },
+        CheckOutcome::NotSetUp {
+            slot: "dev_cmd".to_string(),
+        },
+        CheckOutcome::Interrupted,
+        CheckOutcome::Running,
+    ] {
+        record.outcome = outcome;
+        let printed = serde_json::to_value(super::check::check_json(&fx.paths, &record)).unwrap();
+        let result = printed["result"].as_str().unwrap().to_string();
+        if !results.contains(&result) {
+            results.push(result);
+        }
+    }
+    results.sort();
+    let mut known: Vec<String> = super::check::RESULTS
+        .iter()
+        .map(|r| r.to_string())
+        .collect();
+    known.sort();
+    assert_eq!(results, known);
+    assert_eq!(documented(&section, "result"), known);
+    let kinds = [FailureKind::Settings, FailureKind::Machine];
+    let mut kinds: Vec<String> = kinds.into_iter().map(serde_word).collect();
+    kinds.sort();
+    assert_eq!(documented(&section, "kind"), kinds);
+    let mut ran_by: Vec<String> = [RanBy::Tui, RanBy::Terminal, RanBy::Program]
+        .into_iter()
+        .map(serde_word)
+        .collect();
+    ran_by.sort();
+    assert_eq!(documented(&section, "ran_by"), ran_by);
+}
+
+// The check's throwaway worktree is hidden where worktrees are listed for
+// a person, and a name cannot reach it; `doctor` still sees it.
+#[test]
+fn a_checks_worktree_is_in_no_list_and_answers_to_no_name() {
+    let fx = fixture();
+    let name = actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
+    let check = fx.config.check_worktree_path(&fx.paths);
+    git(
+        &fx.root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            check.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    let listed = crate::worktree::discover(&fx.paths.project).unwrap();
+    assert!(
+        listed.iter().any(|w| crate::worktree::is_check(&w.name)),
+        "discovery still finds it: a start needs it"
+    );
+
+    let ls: Vec<String> = actions::ls(&fx.paths)
+        .unwrap()
+        .into_iter()
+        .map(|w| w.name)
+        .collect();
+    assert_eq!(ls, vec![name.clone()]);
+    let names = capture(|b| super::completion::names(&fx.paths, b));
+    assert!(!names.contains(crate::paths::CHECK_WORKTREE), "{names}");
+    assert!(names.contains("feat/one"), "{names}");
+    let status = capture(|b| status_json(&fx.paths, None, b));
+    assert!(!status.contains(crate::paths::CHECK_WORKTREE), "{status}");
+    let text = capture(|b| status_text(&fx.paths, None, b));
+    assert!(!text.contains(crate::paths::CHECK_WORKTREE), "{text}");
+
+    let err = super::names::resolve(&fx.paths, crate::paths::CHECK_WORKTREE).unwrap_err();
+    assert!(
+        format!("{err:#}").starts_with("no worktree named"),
+        "{err:#}"
+    );
+    // Nor by its logs, which the check keeps.
+    std::fs::create_dir_all(fx.paths.logs_dir(crate::paths::CHECK_WORKTREE)).unwrap();
+    assert!(super::names::resolve(&fx.paths, crate::paths::CHECK_WORKTREE).is_err());
+
+    let finds_nothing = |_: &str| None;
+    let report = crate::doctor::run_on(
+        &fx.paths,
+        &crate::actions::Machine {
+            shell: &finds_nothing,
+            home: fx.root.join("no-such-home"),
+        },
+    );
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| f.message.contains("a `pando check` that did not finish")),
+        "{:?}",
+        report.findings
+    );
+}

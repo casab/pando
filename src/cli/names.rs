@@ -30,12 +30,7 @@ const LIST_ALL_UP_TO: usize = 6;
 /// one to delete by.
 pub(super) fn resolve(paths: &PandoPaths, typed: &str) -> Result<String> {
     refuse_empty(typed)?;
-    resolve_listed(
-        paths,
-        &worktree::discover_all(&paths.project)?,
-        typed,
-        false,
-    )
+    resolve_listed(paths, &discover_listed(paths)?, typed, false)
 }
 
 /// The path of what `typed` names, where the main checkout is a place too:
@@ -44,9 +39,18 @@ pub(super) fn resolve(paths: &PandoPaths, typed: &str) -> Result<String> {
 /// looked up in one listing of the worktrees.
 pub(super) fn path(paths: &PandoPaths, typed: &str) -> Result<PathBuf> {
     refuse_empty(typed)?;
-    let discovery = worktree::discover_all(&paths.project)?;
+    let discovery = discover_listed(paths)?;
     let name = resolve_listed(paths, &discovery, typed, true)?;
     crate::actions::path_in(discovery, &name)
+}
+
+/// The worktrees a name can mean: every one git lists but a check's
+/// throwaway worktree, which comes and goes on its own and is no
+/// command's to act on by name — see [`worktree::is_check`].
+fn discover_listed(paths: &PandoPaths) -> Result<Discovery> {
+    let mut discovery = worktree::discover_all(&paths.project)?;
+    discovery.worktrees.retain(|w| !worktree::is_check(&w.name));
+    Ok(discovery)
 }
 
 /// Every name starts with "", so the suggestions for it were every
@@ -102,6 +106,11 @@ fn resolve_listed(
     if let Some(w) = by_branch(&discovery.worktrees, typed) {
         return Ok(w.name.clone());
     }
+    // Nor is the check's by what pando still has of it: its record while
+    // it runs, and the logs it keeps.
+    if worktree::is_check(typed) {
+        anyhow::bail!("{}", unknown(typed, &discovery.worktrees));
+    }
     // Read without the lock: this only asks whether the name is known.
     let recorded: Vec<String> = crate::state::load(&paths.state_file())
         .map(|s| s.worktrees.into_keys().collect())
@@ -139,7 +148,7 @@ fn ambiguous(typed: &str, dir: &Worktree, branch: &Worktree) -> UsageError {
 /// directory was named for it. For messages only — stdout lines and JSON
 /// carry `name` itself. The directory name when discovery cannot say.
 pub(super) fn shown(paths: &PandoPaths, name: &str) -> String {
-    match worktree::discover_all(&paths.project) {
+    match discover_listed(paths) {
         Ok(discovery) => shown_in(&discovery, name),
         Err(_) => name.to_string(),
     }
@@ -314,7 +323,7 @@ pub(super) use crate::config::edit_distance;
 /// The worktree `dir` is inside, if any — the one a command run with no
 /// name from within a worktree means.
 pub(super) fn containing(paths: &PandoPaths, dir: &Path) -> Result<Option<String>> {
-    Ok(containing_in(&worktree::discover_all(&paths.project)?, dir))
+    Ok(containing_in(&discover_listed(paths)?, dir))
 }
 
 /// [`containing`], against a listing already made.
@@ -344,7 +353,7 @@ pub(super) fn target_named(paths: &PandoPaths, typed: Option<&str>, verb: &str) 
     if let Some(typed) = typed {
         refuse_empty(typed)?;
     }
-    let discovery = worktree::discover_all(&paths.project)?;
+    let discovery = discover_listed(paths)?;
     let dir = match typed {
         Some(typed) => resolve_listed(paths, &discovery, typed, false)?,
         None => {

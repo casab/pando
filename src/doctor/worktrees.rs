@@ -25,6 +25,24 @@ pub(super) fn worktrees_report(
     }
     let listed = crate::worktree::discover(&paths.project).unwrap_or_default();
     let declared = declared_services(config);
+    if let Some(left) = actions::leftover_check(paths, config) {
+        findings.push(Finding::problem(
+            Section::Worktrees,
+            format!(
+                "a `pando check` that did not finish left its test worktree at {} — its \
+                 processes may still be running",
+                left.path.display()
+            ),
+            match left.elsewhere {
+                false => "`pando check` sweeps it before it tests again".to_string(),
+                true => format!(
+                    "it is not where this project's checks go now, so `pando check` leaves it \
+                     alone: `pando stop --all`, then `git worktree remove --force {}`",
+                    left.path.display()
+                ),
+            },
+        ));
+    }
 
     let mut out = Vec::new();
     for (name, record) in &view.state.worktrees {

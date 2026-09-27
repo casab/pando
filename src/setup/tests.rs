@@ -309,6 +309,7 @@ fn a_check_record_round_trips_with_every_field() {
                 secs: 0.8,
             },
         ],
+        failed_process: Some("web".to_string()),
         failed_tail: vec!["Error: Cannot find module 'dotenv'".to_string()],
         progress: vec!["made a test worktree".to_string(), "installing".to_string()],
         ran_by: RanBy::Terminal,
@@ -585,4 +586,59 @@ fn provisioning_nothing_is_one_fingerprint_whether_said_or_not() {
 #[test]
 fn the_fingerprint_of_fixed_settings_is_pinned() {
     assert_eq!(fp(WEB), "66d7d532acc452209922970af945ea3b");
+}
+
+// What a check keeps of a failed process's log.
+
+#[test]
+fn a_failed_processs_lines_keep_what_failed_and_lose_every_secret() {
+    let hidden = crate::config::HIDDEN;
+    let cases = [
+        (
+            "Error: connect ECONNREFUSED postgres://app:s3cret@localhost:5432/shop",
+            format!("Error: connect ECONNREFUSED postgres://app:{hidden}@localhost:5432/shop"),
+        ),
+        (
+            "DATABASE_PASSWORD=hunter2 PORT=3000",
+            format!("DATABASE_PASSWORD={hidden} PORT=3000"),
+        ),
+        (
+            r#"config: {"apiToken": "tok_123", "port": 3000}"#,
+            format!(r#"config: {{"apiToken": "{hidden}", "port": 3000}}"#),
+        ),
+        (
+            "Authorization: Bearer eyJhbGciOi.abc.def",
+            format!("Authorization: Bearer {hidden}"),
+        ),
+        (
+            "authorization: Basic dXNlcjpwYXNz",
+            format!("authorization: Basic {hidden}"),
+        ),
+        (
+            "curl -H 'x: Bearer abc123' failed",
+            format!("curl -H 'x: Bearer {hidden}' failed"),
+        ),
+        (
+            "stripe_secret_key: sk_live_42",
+            format!("stripe_secret_key: {hidden}"),
+        ),
+        (
+            "AWS_ACCESS_KEY_ID=AKIA123 region=eu",
+            format!("AWS_ACCESS_KEY_ID={hidden} region=eu"),
+        ),
+        ("Cookie: session=abc123", format!("Cookie: {hidden}")),
+        ("PASSWD=x", format!("PASSWD={hidden}")),
+        // Nothing secret, nothing changed.
+        (
+            "Error: Cannot find module 'dotenv' at http://localhost:3000/x?a=1",
+            "Error: Cannot find module 'dotenv' at http://localhost:3000/x?a=1".to_string(),
+        ),
+        (
+            "redis://localhost:6379 and mysql://root@db/x",
+            "redis://localhost:6379 and mysql://root@db/x".to_string(),
+        ),
+    ];
+    for (line, want) in cases {
+        assert_eq!(redact_line(line), want, "{line}");
+    }
 }

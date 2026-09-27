@@ -1702,3 +1702,84 @@ fn stamped(root: &Path) -> BTreeMap<String, (Entry, Option<std::time::SystemTime
         })
         .collect()
 }
+
+// ---- pando check ----------------------------------------------------------
+
+/// What `pando check` may leave changed in pando's home, relative to the
+/// project's own directory: its record and its lock, the logs it keeps,
+/// and the state file it recorded its worktree in and dropped it from.
+/// Nothing in the repository, and nothing else in the home.
+fn a_check_may_change(relative: &str, project: &str) -> bool {
+    let Some(inside) = relative
+        .strip_prefix("projects/")
+        .and_then(|rest| rest.strip_prefix(project))
+        .map(|rest| rest.trim_start_matches('/'))
+    else {
+        return relative == "projects";
+    };
+    inside.is_empty()
+        || matches!(
+            inside,
+            "check.json" | "check.lock" | "state.json" | "state.lock" | "logs"
+        )
+        || inside.ends_with(".lock")
+        || inside.starts_with("logs/.pando-check")
+}
+
+#[test]
+fn a_check_leaves_the_repository_untouched_and_the_home_changed_only_where_it_records() {
+    if !common::python3_available() {
+        eprintln!("skipped: python3 is not available");
+        return;
+    }
+    // A server that answers 404 to everything: a page, served.
+    let server = "python3 -u -c \"import http.server as h,os;C=type('C',(h.BaseHTTPRequestHandler,),\
+                  dict(do_GET=lambda s:(s.send_response(404),s.end_headers())));\
+                  h.HTTPServer(('127.0.0.1',int(os.environ['PORT'])),C).serve_forever()\"";
+    let h = harness_with(&format!(
+        "[project]\nprovision = [\".env\", \".env.local\"]\ninstall = \"true\"\n\n\
+         [dev]\ncmd = '''{server}'''\nports = {{ PORT = \"web\" }}\n"
+    ));
+    std::fs::write(h.home.join("config.toml"), "[runtime]\nprelude = \"\"\n").unwrap();
+    let project = h.paths.project.id.clone();
+
+    for (step, cmd, code) in [
+        ("a check that passes", server.to_string(), 0),
+        ("a check that fails", "echo no; exit 1".to_string(), 1),
+    ] {
+        std::fs::write(
+            h.paths.config_file(),
+            format!(
+                "[project]\nprovision = [\".env\", \".env.local\"]\ninstall = \"true\"\n\n\
+                 [dev]\ncmd = '''{cmd}'''\nports = {{ PORT = \"web\" }}\n"
+            ),
+        )
+        .unwrap();
+        let before = stamped(&h.home);
+        let out = pando(&h, &["check"]);
+        assert_eq!(
+            out.status.code(),
+            Some(code),
+            "{step}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        h.assert_untouched(step, None);
+        let after = stamped(&h.home);
+        let changed = before
+            .keys()
+            .chain(after.keys())
+            .filter(|path| before.get(*path) != after.get(*path));
+        for path in changed {
+            assert!(
+                a_check_may_change(path, &project),
+                "after {step}: {path} changed in pando's home"
+            );
+        }
+        let store = state::load(&h.paths.state_file()).unwrap();
+        assert!(
+            store.worktrees.is_empty(),
+            "after {step}: the state keeps no record of the check: {:?}",
+            store.worktrees.keys().collect::<Vec<_>>()
+        );
+    }
+}

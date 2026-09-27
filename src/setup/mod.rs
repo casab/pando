@@ -6,14 +6,18 @@
 //! repository. [`read`] decides one of seven [`SetupState`]s, in order:
 //! a check running, the last one interrupted, nothing to run yet, then the
 //! last check against today's run settings, compared by [`fingerprint`].
+//! What a check stores of a failed process's log goes through
+//! [`redact_line`] first.
 
 mod fingerprint;
 mod record;
+mod redact;
 mod state;
 
 pub use fingerprint::{FINGERPRINT_VERSION, fingerprint};
 pub use record::{CheckOutcome, CheckRecord, FailureKind, ProcessResult, RanBy, SetupMemory};
-pub use state::{Setup, SetupState, decide, read};
+pub use redact::redact_line;
+pub use state::{Setup, SetupState, check_running, decide, read};
 
 /// The prompt a developer pastes into their coding agent: one line,
 /// identical on the setup screen, in the header hint, in the CLI tip and

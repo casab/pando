@@ -10,6 +10,7 @@
 mod common;
 
 mod agent;
+mod check;
 mod cli;
 mod detect;
 mod docker;

@@ -111,7 +111,7 @@ pub fn decide(
 /// the file before it holds it, so no file means no check. A lock that
 /// cannot be asked about reads as free, which at worst shows the last
 /// record rather than a live one.
-fn check_running(paths: &PandoPaths) -> bool {
+pub fn check_running(paths: &PandoPaths) -> bool {
     let lock = paths.check_lock_file();
     if !lock.exists() {
         return false;

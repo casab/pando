@@ -41,6 +41,9 @@ enum CreateSource {
     Remote,
     /// A new branch, forked from `base` and deliberately not tracking it.
     Fork { base: String },
+    /// No branch at all: `commit` checked out detached. Only `pando check`
+    /// makes one, for a worktree it removes again.
+    Detached { commit: String },
 }
 
 /// Creates a worktree for `branch`, returning its directory name.
@@ -65,6 +68,37 @@ pub fn new(
     validate_branch_name(&root, branch)?;
 
     let dir_name = sanitize_branch_to_dir(branch);
+    let target = refuse_taken_target(paths, config, &dir_name)?;
+    let source = resolve_create_source(&root, branch, base, config, progress)?;
+    create(paths, config, &dir_name, &target, branch, &source, progress)
+}
+
+/// Creates the worktree `pando check` tests in, at [`crate::paths::CHECK_WORKTREE`]
+/// under the worktrees directory, with `commit` checked out detached:
+/// through `new`'s own steps — the refusals, the provisioning, the state
+/// record and the install — less the branch, which a check never makes,
+/// and the fetch, which the commit it was handed does not need.
+pub(super) fn new_detached(
+    paths: &PandoPaths,
+    config: &Config,
+    commit: &str,
+    progress: &dyn Fn(&str),
+) -> Result<String> {
+    let dir_name = crate::paths::CHECK_WORKTREE.to_string();
+    let target = refuse_taken_target(paths, config, &dir_name)?;
+    let short: String = commit.chars().take(7).collect();
+    let source = CreateSource::Detached {
+        commit: commit.to_string(),
+    };
+    create(paths, config, &dir_name, &target, &short, &source, progress)
+}
+
+/// Where a worktree called `dir_name` goes, once nothing is in the way:
+/// no worktree git lists under that name, no provisioned path the main
+/// checkout does not ignore, and nothing on disk there yet. Asks git
+/// nothing that writes.
+fn refuse_taken_target(paths: &PandoPaths, config: &Config, dir_name: &str) -> Result<PathBuf> {
+    let root = paths.root();
     let existing = worktree::discover_all(&paths.project)?;
     if existing.main.name == dir_name {
         bail!("{dir_name:?} is the main checkout's directory name");
@@ -96,16 +130,32 @@ pub fn new(
     // worktree gets asked again once it exists, because it may have a
     // different `.gitignore` checked out.
     for rel in config.project.provision_paths() {
-        ensure_gitignored(&root, rel)?;
+        ensure_gitignored(root, rel)?;
     }
 
-    let worktrees_dir = config.worktrees_dir(paths);
-    let target = worktrees_dir.join(&dir_name);
+    let target = config.worktrees_dir(paths).join(dir_name);
     if target.exists() {
         bail!("{} already exists", target.display());
     }
+    Ok(target)
+}
 
-    let source = resolve_create_source(&root, branch, base, config, progress)?;
+/// `new` from the checkout on: git makes the worktree at `target` from
+/// `source`, and it is provisioned, recorded and installed. `branch` is
+/// what the messages call it — the short commit for a detached one.
+fn create(
+    paths: &PandoPaths,
+    config: &Config,
+    dir_name: &str,
+    target: &Path,
+    branch: &str,
+    source: &CreateSource,
+    progress: &dyn Fn(&str),
+) -> Result<String> {
+    let root = paths.root().to_path_buf();
+    let dir_name = dir_name.to_string();
+    let target = target.to_path_buf();
+    let worktrees_dir = config.worktrees_dir(paths);
 
     paths.ensure_home()?;
     // State is locked and read *before* git creates anything: a state file
@@ -142,9 +192,12 @@ pub fn new(
     let target_str = target.to_str().context("worktree path is not utf-8")?;
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(&root).args(["worktree", "add"]);
-    match &source {
+    match source {
         CreateSource::Local => {
             cmd.args([target_str, branch]);
+        }
+        CreateSource::Detached { commit } => {
+            cmd.args(["--detach", target_str, commit]);
         }
         CreateSource::Remote => {
             cmd.args([
@@ -179,7 +232,7 @@ pub fn new(
     // runs with the lock still held: let go first, a `start` waiting on it
     // could record a dev server in the worktree the undo then removes, and
     // the next sweep drops that record as stale with the server running.
-    let undo = |e| unwind_new(&root, &target, branch, &source, e);
+    let undo = |e| unwind_new(&root, &target, branch, source, e);
     let lock = state::lock(&paths.lock_file()).map_err(undo)?;
     let mut store = state::load(&paths.state_file()).map_err(undo)?;
     // A `start` from another terminal can find the worktree while git is
@@ -226,7 +279,10 @@ pub fn new(
     let no_services: BTreeMap<String, String> = BTreeMap::new();
     let ctx = HookContext {
         name: &dir_name,
-        branch: Some(branch),
+        branch: match source {
+            CreateSource::Detached { .. } => None,
+            _ => Some(branch),
+        },
         worktree: &target,
         ports: &no_ports,
         service_env: &no_services,
@@ -447,7 +503,7 @@ fn unwind_new(
             target.display()
         );
     }
-    if matches!(source, CreateSource::Local) {
+    if matches!(source, CreateSource::Local | CreateSource::Detached { .. }) {
         return anyhow::anyhow!("{err:#} — the partial worktree was removed");
     }
     if !git_succeeds(root, &["branch", "-D", branch]) {
@@ -778,9 +834,11 @@ pub fn guard_write_locations(paths: &PandoPaths, config: &Config) -> Result<()> 
     )
 }
 
-/// Every managed worktree, enriched with git metadata.
+/// Every managed worktree, enriched with git metadata. A check's
+/// throwaway worktree is not one: see [`worktree::is_check`].
 pub fn ls(paths: &PandoPaths) -> Result<Vec<Worktree>> {
     let mut worktrees = worktree::discover(&paths.project)?;
+    worktrees.retain(|w| !worktree::is_check(&w.name));
     worktree::enrich_from_git(&mut worktrees, paths.root()).ok();
     Ok(worktrees)
 }
@@ -1057,7 +1115,7 @@ pub(super) fn fetch_branch(
 /// everything merged since. A name already qualified with its remote is
 /// used untouched; that is told from the refs, not from a slash, because
 /// `release/1.2` is a branch name too.
-fn resolve_create_base(root: &Path, base: &str) -> String {
+pub(super) fn resolve_create_base(root: &Path, base: &str) -> String {
     if base.contains('/') && ref_exists(root, &format!("refs/remotes/{base}")) {
         return base.to_string();
     }

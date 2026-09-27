@@ -1,0 +1,647 @@
+//! The check: settle the settings, make a throwaway worktree of the
+//! commit a new one would fork from, install and start it on the shared
+//! services, wait until every process is ready and the browser's app
+//! serves a page, take it all down, and record what happened.
+
+use anyhow::{Result, bail};
+use chrono::Utc;
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use crate::config::{self, Config, HookPoint};
+use crate::detect::Slot;
+use crate::paths::{CHECK_WORKTREE, PandoPaths};
+use crate::ports::{self, PageAnswer};
+use crate::setup::{
+    CheckOutcome, CheckRecord, FailureKind, ProcessResult, RanBy, fingerprint, redact_line,
+};
+use crate::state::{self, WorktreeRecord};
+use crate::worktree;
+
+use super::super::lifecycle::start_for_check;
+use super::super::questions::{Answer, NeedsAnswer, Question, resolve_for_new, resolve_process};
+use super::super::readiness::{ReadyVerdict, ready_limit, ready_line, ready_verdict};
+use super::super::refresh::{failure_tail, refresh};
+use super::super::services::{observed_port_for_role, url_role};
+use super::super::worktree::{
+    CREATED_BUT_INSTALL_FAILED, new_detached, ref_exists, resolve_create_base,
+};
+use super::super::{INSTALL_HOOK, Mode};
+use super::interrupt::interrupted;
+use super::machine::first_down;
+use super::teardown::{sweep_leftover_check, tear_down};
+
+/// The environment variable that says who started a check, when stderr
+/// cannot: the TUI sets it to `tui` on the `pando check` it spawns.
+pub const CHECK_RAN_BY_ENV: &str = "PANDO_CHECK_RAN_BY";
+
+/// How often a wait looks at the processes again: the cadence `start
+/// --wait` and `logs -f` use.
+const POLL: Duration = Duration::from_millis(250);
+
+/// How long a dev server may sit on its first request before the check
+/// says why it is waiting.
+const SLOW_PAGE: Duration = Duration::from_secs(3);
+
+/// Who ran this check, from [`CHECK_RAN_BY_ENV`]'s value and whether
+/// stderr is a terminal: the TUI when it says so, a person at a terminal,
+/// or else a program.
+pub fn ran_by(env: Option<&str>, stderr_is_terminal: bool) -> RanBy {
+    match (env, stderr_is_terminal) {
+        (Some("tui"), _) => RanBy::Tui,
+        (_, true) => RanBy::Terminal,
+        (_, false) => RanBy::Program,
+    }
+}
+
+/// Where a check says what it is doing.
+pub struct Narration<'a> {
+    /// A step, in the words the record keeps for the screen that watches
+    /// it: "installing", "starting web, api".
+    pub step: &'a dyn Fn(&str),
+    /// What the commands under it say along the way — the checkout, the
+    /// files linked in, the install's command line.
+    pub detail: &'a dyn Fn(&str),
+}
+
+/// What a check ended with.
+#[derive(Debug)]
+pub struct Checked {
+    /// As it was saved to `check.json`.
+    pub record: CheckRecord,
+    /// The question a run slot still has open, when the check could not
+    /// start for want of an answer.
+    pub unanswered: Option<NeedsAnswer>,
+}
+
+/// Runs `pando check`, each of its steps said through `say.step` and kept
+/// in `check.json` as it happens, so a screen watching that file sees the
+/// check move.
+///
+/// Refuses, with nothing recorded, only when another check holds the lock
+/// or pando's own files cannot be used. Everything else — a question still
+/// open, a stopped server, a process that dies, a page that fails — is a
+/// result, recorded and returned. Once the throwaway worktree exists, every
+/// way out goes through its teardown.
+pub fn check(
+    paths: &PandoPaths,
+    config: &Config,
+    ran_by: RanBy,
+    say: &Narration<'_>,
+) -> Result<Checked> {
+    paths.ensure_home()?;
+    // One at a time, for the whole run.
+    let Some(_lock) = state::try_lock(&paths.check_lock_file())? else {
+        bail!(
+            "a check is already running for this project — its progress is in {}; wait for it \
+             to finish",
+            paths.check_file().display()
+        );
+    };
+    // What a killed check left, before anything else is made.
+    sweep_leftover_check(paths, config, say)?;
+    // The last check's logs are kept until this one needs the place.
+    let _ = std::fs::remove_dir_all(paths.logs_dir(CHECK_WORKTREE));
+
+    // The settings a start would run on, with no question put to
+    // anybody: a slot the rules cannot settle alone is an answer the
+    // check does not have.
+    let unasked = |question: &Question| -> Result<Answer> {
+        Err(anyhow::Error::new(NeedsAnswer {
+            question: question.clone(),
+        }))
+    };
+    let resolved = resolve_for_new(paths, config, &unasked, say.detail)
+        .and_then(|config| resolve_process(paths, &config, Mode::Shared, &unasked, say.detail));
+    let config = match resolved {
+        Ok(config) => config,
+        Err(e) => match e.downcast::<NeedsAnswer>() {
+            Ok(needs) => return Ok(not_set_up(paths, config, ran_by, needs)),
+            Err(e) => return Err(e),
+        },
+    };
+
+    let mut run = Run::begin(paths, &config, ran_by, say);
+    if config.runnable_processes().next().is_none() {
+        return Ok(run.end(
+            failed(
+                FailureKind::Settings,
+                "nothing to run: this project configures no process, and pando found no dev \
+                 command to offer — answer `dev_cmd` with `pando init --answers -`",
+            ),
+            None,
+        ));
+    }
+    // The commit a new worktree would fork from.
+    let Some((commit, base_ref)) = commit_to_test(paths.root(), &config) else {
+        return Ok(run.end(
+            failed(
+                FailureKind::Settings,
+                "no commit to test yet: this repository has no commit for a worktree to check \
+                 out",
+            ),
+            None,
+        ));
+    };
+    let short: String = commit.chars().take(7).collect();
+    run.record.commit = Some(commit.clone());
+    run.record.base_ref = base_ref.clone();
+    run.step(&format!(
+        "testing {}'s setup at {short} ({}), in a throwaway worktree (no branch)",
+        paths.project.display_name,
+        base_ref.as_deref().unwrap_or("HEAD")
+    ));
+    // The machine, before anything is made.
+    if let Some(down) = first_down(paths, &config, say.detail) {
+        return Ok(run.end(failed(FailureKind::Machine, &down.reason), None));
+    }
+    if interrupted() {
+        return Ok(run.end(CheckOutcome::Interrupted, None));
+    }
+    // The hooks a check does not run, said before it runs anything.
+    let skipped = hooks_after_services(&config);
+    if !skipped.is_empty() {
+        let line = format!(
+            "skipped the hooks that run after services ({}): on the shared services they would \
+             run against your own data",
+            skipped.join(", ")
+        );
+        run.record.notes.push(line.clone());
+        run.step(&line);
+    }
+
+    // From here the worktree may exist, so every way out tears it down.
+    // The worktrees directory goes too when this check made it, empty.
+    let worktrees_dir = config.worktrees_dir(paths);
+    let made_dir = !worktrees_dir.exists();
+    let outcome = run.test(&config, &commit);
+    let outcome = match tear_down(paths, &config, say.detail) {
+        Ok(()) => {
+            if made_dir {
+                let _ = std::fs::remove_dir(&worktrees_dir);
+            }
+            run.step("removed the test worktree; nothing left behind");
+            outcome
+        }
+        Err(e) => {
+            let line = format!(
+                "the test worktree could not all be removed: {e:#} — the next `pando check` \
+                 sweeps it, and `pando doctor` reports it until then"
+            );
+            run.record.notes.push(line.clone());
+            (say.detail)(&line);
+            outcome
+        }
+    };
+    let after = config::load(paths)
+        .map(|loaded| fingerprint(&loaded.config))
+        .unwrap_or_else(|e| format!("unreadable: {e:#}"));
+    Ok(run.end(outcome, Some(after)))
+}
+
+/// The run settings' fingerprint as the files say them now — the same
+/// read the setup state compares with — or, when they cannot be read,
+/// the settings this check runs on.
+fn settings_fingerprint(paths: &PandoPaths, config: &Config) -> String {
+    config::load(paths)
+        .map(|loaded| fingerprint(&loaded.config))
+        .unwrap_or_else(|_| fingerprint(config))
+}
+
+/// A check that stopped before it made anything, for want of an answer:
+/// recorded with the slot that is open, and the question handed back for
+/// the front end to put.
+fn not_set_up(paths: &PandoPaths, config: &Config, ran_by: RanBy, needs: NeedsAnswer) -> Checked {
+    // What the resolve pass wrote before it reached the open slot is on
+    // disk now; the record is of the settings as they stand.
+    let mut record = CheckRecord::begin(settings_fingerprint(paths, config), ran_by);
+    record.outcome = CheckOutcome::NotSetUp {
+        slot: slot_name(needs.question.slot),
+    };
+    record.fingerprint_after = Some(record.fingerprint_before.clone());
+    record.finished_at = Some(Utc::now());
+    let _ = record.save(paths);
+    Checked {
+        record,
+        unanswered: Some(needs),
+    }
+}
+
+/// A slot's published name, as `pando signals` and the answers file spell
+/// it.
+fn slot_name(slot: Slot) -> String {
+    serde_json::to_value(slot)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{slot:?}"))
+}
+
+fn failed(kind: FailureKind, reason: &str) -> CheckOutcome {
+    CheckOutcome::Failed {
+        kind,
+        reason: reason.to_string(),
+    }
+}
+
+/// The commit `new` would fork a branch from, and the ref it was read
+/// from: the project's `base`, else the repository's default branch, else
+/// whatever HEAD is. `None` in a repository with no commit at all.
+pub(super) fn commit_to_test(root: &Path, config: &Config) -> Option<(String, Option<String>)> {
+    let base = config
+        .project
+        .base
+        .as_deref()
+        .map(|base| resolve_create_base(root, base))
+        .filter(|base| ref_exists(root, base))
+        .or_else(|| worktree::resolve_base_branch(root));
+    base.into_iter().map(Some).chain([None]).find_map(|base| {
+        let refname = base.as_deref().unwrap_or("HEAD");
+        let out = crate::project::git(
+            root,
+            [
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{refname}^{{commit}}"),
+            ],
+        )
+        .ok()
+        .filter(|out| out.status.success())?;
+        let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!sha.is_empty()).then_some((sha, base))
+    })
+}
+
+/// The names of the hooks a check leaves out: every one after `services`
+/// and after `dev`.
+fn hooks_after_services(config: &Config) -> Vec<String> {
+    config
+        .hooks
+        .iter()
+        .filter(|hook| matches!(hook.after, HookPoint::Services | HookPoint::Dev))
+        .map(|hook| hook.name.clone())
+        .collect()
+}
+
+/// A check under way, and its record, saved at every step.
+struct Run<'a> {
+    paths: &'a PandoPaths,
+    say: &'a Narration<'a>,
+    record: CheckRecord,
+    /// Whether a save has failed already, so it is said once.
+    save_failed: std::cell::Cell<bool>,
+}
+
+/// How the processes' wait ended.
+enum Waited {
+    Ready(Box<WorktreeRecord>),
+    Failed {
+        process: String,
+        reason: String,
+        log: std::path::PathBuf,
+    },
+    Interrupted,
+}
+
+impl<'a> Run<'a> {
+    fn begin(
+        paths: &'a PandoPaths,
+        config: &Config,
+        ran_by: RanBy,
+        say: &'a Narration<'a>,
+    ) -> Run<'a> {
+        let run = Run {
+            paths,
+            say,
+            record: CheckRecord::begin(settings_fingerprint(paths, config), ran_by),
+            save_failed: std::cell::Cell::new(false),
+        };
+        run.save();
+        run
+    }
+
+    fn save(&self) {
+        if let Err(e) = self.record.save(self.paths)
+            && !self.save_failed.replace(true)
+        {
+            (self.say.detail)(&format!("could not record the check's progress: {e:#}"));
+        }
+    }
+
+    /// A step said, and kept in the record for whoever watches it.
+    fn step(&mut self, line: &str) {
+        (self.say.step)(line);
+        self.record.progress.push(line.to_string());
+        self.save();
+    }
+
+    /// The check's result, saved; `after` is the settings' fingerprint
+    /// taken again at the end, when the check got that far.
+    fn end(mut self, outcome: CheckOutcome, after: Option<String>) -> Checked {
+        self.record.outcome = outcome;
+        self.record.fingerprint_after =
+            Some(after.unwrap_or_else(|| self.record.fingerprint_before.clone()));
+        self.record.finished_at = Some(Utc::now());
+        self.save();
+        Checked {
+            record: self.record,
+            unanswered: None,
+        }
+    }
+
+    /// The test itself: make the worktree, install, start, wait, and ask for
+    /// a page. Whatever it returns, the caller tears the worktree down.
+    fn test(&mut self, config: &Config, commit: &str) -> CheckOutcome {
+        let installs = config
+            .project
+            .install
+            .as_deref()
+            .is_some_and(|install| !install.trim().is_empty())
+            || config
+                .hooks
+                .iter()
+                .any(|hook| hook.after == HookPoint::Create);
+        if installs {
+            self.step("installing");
+        }
+        let began = Instant::now();
+        if let Err(e) = new_detached(self.paths, config, commit, self.say.detail) {
+            let text = format!("{e:#}");
+            if text.contains(CREATED_BUT_INSTALL_FAILED) {
+                self.failed_in(
+                    INSTALL_HOOK,
+                    &self.paths.log_file(CHECK_WORKTREE, INSTALL_HOOK),
+                );
+                return failed(
+                    FailureKind::Settings,
+                    &format!("the install step failed: {}", strip_created(&text)),
+                );
+            }
+            return failed(
+                FailureKind::Settings,
+                &format!("the test worktree could not be made: {text}"),
+            );
+        }
+        let installed = began.elapsed();
+        if interrupted() {
+            return CheckOutcome::Interrupted;
+        }
+
+        let names: Vec<&str> = config
+            .runnable_processes()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        self.step(&format!("starting {}", names.join(", ")));
+        let started = Instant::now();
+        if let Err(e) = start_for_check(self.paths, config, CHECK_WORKTREE, self.say.detail) {
+            return failed(FailureKind::Settings, &format!("{e:#}"));
+        }
+        // Every process ready, judged as `start --wait` judges it.
+        self.step(&format!("waiting for {} to be ready", names.join(", ")));
+        let mut ready_at: BTreeMap<String, f64> = BTreeMap::new();
+        let record = match self.wait_ready(started, &mut ready_at) {
+            Waited::Ready(record) => record,
+            Waited::Interrupted => return CheckOutcome::Interrupted,
+            Waited::Failed {
+                process,
+                reason,
+                log,
+            } => {
+                self.failed_in(&process, &log);
+                return failed(FailureKind::Settings, &format!("{process} {reason}"));
+            }
+        };
+        // The page the browser would get.
+        let page = self.ask_for_page(&record);
+        if let Some(outcome) = page {
+            return outcome;
+        }
+        let mut summary: Vec<String> = Vec::new();
+        if installs {
+            summary.push(format!("installed {:.1}s", installed.as_secs_f64()));
+        }
+        for p in &self.record.processes {
+            let mut line = format!("{} ready", p.name);
+            if let Some(port) = p.port {
+                line.push_str(&format!(" :{port}"));
+            }
+            if let Some(status) = p.http_status {
+                line.push_str(&format!(" (HTTP {status})"));
+            }
+            summary.push(line);
+        }
+        self.step(&summary.join(" · "));
+        CheckOutcome::Passed
+    }
+
+    /// The failed process's closing lines, redacted, and its name.
+    fn failed_in(&mut self, process: &str, log: &Path) {
+        self.record.failed_process = Some(process.to_string());
+        self.record.failed_tail = failure_tail(log).iter().map(|l| redact_line(l)).collect();
+    }
+
+    /// Waits until every process of the check's worktree is ready, one of
+    /// them fails, or the wait is stopped: by a signal, or by a `stop` of
+    /// the worktree from elsewhere, which leaves nothing to wait on.
+    fn wait_ready(&mut self, began: Instant, ready_at: &mut BTreeMap<String, f64>) -> Waited {
+        loop {
+            if interrupted() {
+                return Waited::Interrupted;
+            }
+            let refreshed = refresh(self.paths);
+            let Some(record) = refreshed.state.worktrees.get(CHECK_WORKTREE) else {
+                return Waited::Interrupted;
+            };
+            let now = Utc::now();
+            let elapsed = began.elapsed().as_secs_f64();
+            for (process, p) in &record.processes {
+                if ready_line(process, p, now, began.elapsed()).is_some() {
+                    ready_at.entry(process.clone()).or_insert(elapsed);
+                }
+            }
+            // Each process as it stands: ready, and when; or not yet, and
+            // for how long — which is how long a failed one lasted.
+            self.record.processes = record
+                .processes
+                .iter()
+                .map(|(name, p)| ProcessResult {
+                    name: name.clone(),
+                    ready: ready_at.contains_key(name),
+                    port: p.ready_port,
+                    http_status: None,
+                    secs: ready_at.get(name).copied().unwrap_or(elapsed),
+                })
+                .collect();
+            match ready_verdict(record, None, now) {
+                ReadyVerdict::Ready => return Waited::Ready(Box::new(record.clone())),
+                ReadyVerdict::Gone => return Waited::Interrupted,
+                ReadyVerdict::Failed {
+                    process,
+                    reason,
+                    log,
+                } => {
+                    return Waited::Failed {
+                        process,
+                        reason: format!("failed: {reason}"),
+                        log,
+                    };
+                }
+                ReadyVerdict::Waiting => {}
+            }
+            if began.elapsed() > ready_limit(record, None) {
+                let (process, p) = record
+                    .processes
+                    .iter()
+                    .find(|(name, _)| !ready_at.contains_key(*name))
+                    .or_else(|| record.processes.iter().next())
+                    .expect("a record with no processes is Gone above");
+                return Waited::Failed {
+                    process: process.clone(),
+                    reason: format!("was still starting after {}s", began.elapsed().as_secs()),
+                    log: p.log_path.clone(),
+                };
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+
+    /// Asks the process that owns the worktree's URL for its first page.
+    /// `None` when the page passes; the outcome otherwise.
+    fn ask_for_page(&mut self, record: &WorktreeRecord) -> Option<CheckOutcome> {
+        let Some(role) = url_role(record) else {
+            let note = "no process has a port, so there was no page to ask for".to_string();
+            self.record.notes.push(note);
+            return None;
+        };
+        let owner = record
+            .roles
+            .iter()
+            .find(|(_, roles)| roles.contains(&role))
+            .map(|(process, _)| process.clone())?;
+        let port =
+            observed_port_for_role(record, &role).or_else(|| record.ports.get(&role).copied())?;
+        self.step(&format!("asking {owner} for its first page on :{port}"));
+        let wait = ports::page_wait();
+        let paths = self.paths;
+        let mut said_slow = false;
+        let mut looks = 0u32;
+        let mut stopped: Option<Waited> = None;
+        let say = self.say;
+        let answer = ports::ask_for_page(port, wait, &mut |elapsed| {
+            if interrupted() {
+                stopped = Some(Waited::Interrupted);
+                return false;
+            }
+            if !said_slow && elapsed >= SLOW_PAGE {
+                said_slow = true;
+                (say.step)(&format!(
+                    "{owner} has not answered yet — a dev server may compile a page on its first \
+                     request; waiting up to {}s",
+                    wait.as_secs()
+                ));
+            }
+            // Once a second, whether the owner is still up to answer.
+            looks += 1;
+            if !looks.is_multiple_of(4) {
+                return true;
+            }
+            let refreshed = refresh(paths);
+            let Some(now) = refreshed.state.worktrees.get(CHECK_WORKTREE) else {
+                stopped = Some(Waited::Interrupted);
+                return false;
+            };
+            match ready_verdict(now, Some(&owner), Utc::now()) {
+                ReadyVerdict::Gone => {
+                    stopped = Some(Waited::Interrupted);
+                    false
+                }
+                ReadyVerdict::Failed {
+                    process,
+                    reason,
+                    log,
+                } => {
+                    stopped = Some(Waited::Failed {
+                        process,
+                        reason: format!("failed: {reason}"),
+                        log,
+                    });
+                    false
+                }
+                _ => true,
+            }
+        });
+        let log = self.paths.log_file(CHECK_WORKTREE, &owner);
+        match stopped {
+            Some(Waited::Interrupted) => return Some(CheckOutcome::Interrupted),
+            Some(Waited::Failed {
+                process,
+                reason,
+                log,
+            }) => {
+                self.failed_in(&process, &log);
+                return Some(failed(
+                    FailureKind::Settings,
+                    &format!("{process} {reason}"),
+                ));
+            }
+            _ => {}
+        }
+        let (outcome, status) = match answer {
+            PageAnswer::Status(status) if status >= 500 => (
+                Some(failed(
+                    FailureKind::Settings,
+                    &format!("{owner} answered its first page with HTTP {status}"),
+                )),
+                Some(status),
+            ),
+            PageAnswer::Status(status) => (None, Some(status)),
+            PageAnswer::NotHttp => {
+                self.record.notes.push(format!(
+                    "{owner} answers on :{port}, but not in plain HTTP (TLS, or another \
+                     protocol), so its page was not checked"
+                ));
+                (None, None)
+            }
+            PageAnswer::Refused => (
+                Some(failed(
+                    FailureKind::Settings,
+                    &format!(
+                        "nothing answered on :{port}, where {owner} was ready — it may listen on \
+                         another address than localhost"
+                    ),
+                )),
+                None,
+            ),
+            PageAnswer::Silent => (
+                Some(failed(
+                    FailureKind::Settings,
+                    &format!(
+                        "{owner} did not answer its first page within {}s",
+                        wait.as_secs()
+                    ),
+                )),
+                None,
+            ),
+        };
+        if let Some(result) = self.record.processes.iter_mut().find(|p| p.name == owner) {
+            result.http_status = status;
+            if outcome.is_some() {
+                result.ready = false;
+            }
+        }
+        if outcome.is_some() {
+            self.failed_in(&owner, &log);
+        }
+        outcome
+    }
+}
+
+/// An install failure as `new` words it, less the part that says the
+/// worktree was kept: the check removes it.
+fn strip_created(text: &str) -> String {
+    match text.split_once(CREATED_BUT_INSTALL_FAILED) {
+        Some((_, rest)) => rest.trim_start_matches([':', ' ']).to_string(),
+        None => text.to_string(),
+    }
+}

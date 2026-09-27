@@ -1779,25 +1779,53 @@ pub fn shared_service_env(paths: &PandoPaths, config: &Config) -> BTreeMap<Strin
 }
 
 pub fn shared_service_statuses(paths: &PandoPaths, config: &Config) -> Vec<ServiceStatus> {
-    let mut out: Vec<ServiceStatus> = Vec::new();
-    let mut add = |key: &str, service: &str| {
-        if out.iter().any(|status| status.name == service) {
+    let mut out: Vec<ServiceStatus> = shared_service_keys(paths, config)
+        .into_iter()
+        .map(|shared| {
+            let port = services::port_in_env(paths.root(), &shared.key);
+            ServiceStatus {
+                name: shared.service,
+                port,
+                up: port.map(ports::something_is_listening) == Some(true),
+                // Shared services are the developer's own `docker compose
+                // up` or their own `brew services start`; pando runs no
+                // pump in front of anything it did not start.
+                logging: false,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// One of the project's services as a shared start finds it: the env key
+/// the main checkout's files name it by, and the compose file it comes
+/// from when it is a compose one.
+pub(super) struct SharedKey {
+    pub(super) key: String,
+    pub(super) service: String,
+    pub(super) compose_file: Option<String>,
+}
+
+/// Every service a shared start points its processes at, once each, by
+/// the first key that maps to it: the compose entries' keys, then the
+/// native ones'. What the header chip probes, and what `pando check`
+/// probes before it starts anything.
+pub(super) fn shared_service_keys(paths: &PandoPaths, config: &Config) -> Vec<SharedKey> {
+    let mut out: Vec<SharedKey> = Vec::new();
+    let mut add = |key: &str, service: &str, compose_file: Option<&str>| {
+        if out.iter().any(|shared| shared.service == service) {
             return;
         }
-        let port = services::port_in_env(paths.root(), key);
-        out.push(ServiceStatus {
-            name: service.to_string(),
-            port,
-            up: port.map(ports::something_is_listening) == Some(true),
-            // Shared services are the developer's own `docker compose up`
-            // or their own `brew services start`; pando runs no pump in
-            // front of anything it did not start.
-            logging: false,
+        out.push(SharedKey {
+            key: key.to_string(),
+            service: service.to_string(),
+            compose_file: compose_file.map(str::to_string),
         });
     };
     for entry in compose_entries(config) {
         for (key, service) in entry.env {
-            add(key, service);
+            add(key, service, Some(entry.file));
         }
     }
     let native = native::Entry::all(config);
@@ -1807,11 +1835,10 @@ pub fn shared_service_statuses(paths: &PandoPaths, config: &Config) -> Vec<Servi
             let recipe = native::resolve(&recipes, entry).ok().map(|r| r.recipe);
             let (mapping, _) = entry.env_map(recipe.as_ref());
             for (key, service) in &mapping {
-                add(key, service);
+                add(key, service, None);
             }
         }
     }
-    out.sort_by(|a, b| a.name.cmp(&b.name));
     out
 }
 

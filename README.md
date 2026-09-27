@@ -119,6 +119,7 @@ pando logs <name>     tail its logs; --json for machines
 pando status          what runs where, per process; --json
 pando path <name>     print the worktree's path
 pando init            answer every setup question now instead of as you go
+pando check           test the setup in a throwaway worktree, then remove it
 pando doctor          explain what was detected, why, and what is missing
 pando signals         dump detection signals as JSON, for humans or agents
 pando completions     print a completion script for bash, zsh, fish…

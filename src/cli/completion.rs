@@ -30,7 +30,11 @@ const ZSH_FUNCTION: &str = "_pando_worktrees";
 /// otherwise — one per line, the main checkout included.
 pub(super) fn names<W: Write>(paths: &PandoPaths, out: &mut W) -> Result<()> {
     let discovery = worktree::discover_all(&paths.project)?;
-    for w in std::iter::once(&discovery.main).chain(&discovery.worktrees) {
+    let listed = discovery
+        .worktrees
+        .iter()
+        .filter(|w| !worktree::is_check(&w.name));
+    for w in std::iter::once(&discovery.main).chain(listed) {
         writeln!(out, "{}", w.display_name())?;
     }
     Ok(())

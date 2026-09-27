@@ -7,8 +7,9 @@
 //!
 //! One file per concern: worktrees, hooks, questions, `init`, the runtime
 //! check, start/stop/restart, when a start is ready, private services,
-//! namespaced starts, share, and reading state.
+//! namespaced starts, share, reading state, and `pando check`.
 
+mod check;
 mod hooks;
 mod init;
 mod lifecycle;
@@ -21,6 +22,10 @@ mod services;
 mod share;
 mod worktree;
 
+pub use check::{
+    CHECK_RAN_BY_ENV, Checked, LeftoverCheck, Narration, catch_check_interrupts, check,
+    leftover_check, ran_by,
+};
 pub use hooks::{
     HookContext, INSTALL_HOOK, hook_scope, install_remedy, matched_nothing, run_hooks, runs_again,
 };

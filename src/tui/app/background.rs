@@ -160,7 +160,10 @@ pub fn snapshot(paths: &PandoPaths, known_base: Option<String>, scan: bool) -> R
         let resolving = known_base
             .is_none()
             .then(|| scope.spawn(|| worktree::resolve_base_branch(paths.root())));
-        let discovery = worktree::discover_all(&paths.project)?;
+        let mut discovery = worktree::discover_all(&paths.project)?;
+        // A check's throwaway worktree is not a row: it comes and goes on
+        // its own, and nothing a row offers is for it.
+        discovery.worktrees.retain(|w| !worktree::is_check(&w.name));
         // One read of state for both answers, so the list's ownership dots
         // and its status column cannot come from two different moments.
         let refreshed = if scan {

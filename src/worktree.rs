@@ -43,6 +43,17 @@ pub struct Worktree {
     pub ahead_behind: Option<(u32, u32)>,
 }
 
+/// Whether `name` is the throwaway worktree `pando check` makes and
+/// removes, [`crate::paths::CHECK_WORKTREE`].
+///
+/// Hidden where worktrees are listed for a person — `ls`, `status`, the
+/// TUI's rows, completion and the names a command takes — and nowhere
+/// else: discovery still finds it, because the check's own start, `new`
+/// and `rm` need what git lists, and `doctor` shows it.
+pub fn is_check(name: &str) -> bool {
+    name == crate::paths::CHECK_WORKTREE
+}
+
 /// Directory name for a branch: `feat/checkout` becomes `feat+checkout`.
 /// Slashes are the only thing that cannot appear in a directory name, and a
 /// plus reads as a join rather than an escape.
