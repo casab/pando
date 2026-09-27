@@ -1,12 +1,102 @@
-# pando
+<h1 align="center">pando, the worktree tool</h1>
 
-**One repo. Every branch alive.**
+<p align="center"><b>One repo. Every branch alive.</b></p>
+
+<p align="center">
+  <img src="assets/pando.svg" width="760" alt="The pando setup screen: the PANDO wordmark in gold over a grove of aspens whose stems share one root system. The leaves quake, and the roots light up green when the setup check passes.">
+</p>
+
+<p align="center">
+  <a href="LICENSE"><img alt="License: AGPL-3.0-only" src="https://img.shields.io/badge/license-AGPL--3.0--only-ebc34b?style=flat-square"></a>
+  <a href="https://github.com/mertkaradayi/pando/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/mertkaradayi/pando/ci.yml?branch=main&style=flat-square&label=ci"></a>
+  <img alt="Rust 2024 edition" src="https://img.shields.io/badge/rust-2024_edition-e6963c?style=flat-square&logo=rust">
+  <img alt="Platform: macOS" src="https://img.shields.io/badge/platform-macOS-6e9beb?style=flat-square&logo=apple">
+  <img alt="Version 0.4.0, pre-release" src="https://img.shields.io/badge/version-0.4.0_pre--release-b482e6?style=flat-square">
+  <a href="CONTRIBUTING.md"><img alt="PRs welcome" src="https://img.shields.io/badge/PRs-welcome-50c878?style=flat-square"></a>
+</p>
+
+<p align="center">
+  <a href="#sixty-seconds">Quick start</a> ·
+  <a href="#your-first-run">First run</a> ·
+  <a href="#commands">Commands</a> ·
+  <a href="#shared-namespaced-isolated">Modes</a> ·
+  <a href="#for-agents">For agents</a> ·
+  <a href="#contributing">Contributing</a> ·
+  <a href="#status">Status</a>
+</p>
 
 > Pando is a forest that is one tree. Your repo is too. `pando` checks out every
 > branch you are working on side by side, gives each one a running dev server,
 > its own database, and a shareable URL, and never writes a byte into your repo.
 
 Created by [Mert Karadayi](https://github.com/mertkaradayi).
+
+## Why
+
+You are halfway through `feat/checkout`. A review lands on `fix/login-loop`.
+Someone asks for a link to `feat/search`, and an agent in another terminal
+wants a branch of its own to break things in.
+
+Without pando, that is a stash, a checkout, a reinstall, a restart, a
+reseeded database, and a port that is already taken, three times over.
+With pando, every branch is its own checkout, already running:
+
+```text
+                             your repository
+             one object store, one history, one root system
+                                    ┃
+    ┏━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━┻━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━┓
+    ┃                    ┃                    ┃                    ┃
+  ⌂ main               ● feat/checkout      ● fix/login-loop     ○ feat/search
+    your checkout,       web  :22809          web  :22815          stopped, one
+    your servers         api  :22808          api  :22814          keypress from
+                         shared database      its own postgres     running
+                         ◈ public URL         in a container
+```
+
+Each stem is a [git worktree](https://git-scm.com/docs/git-worktree) with its
+own processes, ports, dependencies and logs. What it runs on is your choice
+per branch: your main checkout's database, a database of its own inside your
+server, or private copies of every service. All of it on one terminal screen,
+for people and for the coding agents working beside them.
+
+## Sixty seconds
+
+```bash
+git clone https://github.com/mertkaradayi/pando && cd pando
+cargo install --path .              # pando lands in ~/.cargo/bin
+
+cd ~/code/your-project
+pando                               # the TUI; the first time, the setup screen
+```
+
+Or straight from the shell. This is a real run, trimmed a little, on one of
+the fixture repositories pando's tests are built on — a workspace with a
+web app, an API and a Postgres in its compose file:
+
+```console
+$ pando new feat/checkout
+pando: checking out feat/checkout
+pando: provisioning
+pando: installing
+created feat+checkout at ~/.pando/projects/mono-web-api-3cb31588/worktrees/feat+checkout
+
+$ pando start feat/checkout
+pando: using postgres as this project's services (detected: docker-compose.yml, postgres:16 → DATABASE_URL)
+pando: starting api
+pando: starting web
+started feat+checkout — http://localhost:22809
+
+$ pando ls
+NAME            STATUS   URL                     PORTS                GIT
+main            stopped  -                       -                    clean main checkout
+fix/login-loop  stopped  -                       -                    clean
+feat/checkout   running  http://localhost:22809  api:22808 web:22809  clean
+```
+
+Nothing was configured by hand: pando read the lockfile, the dev scripts, the
+env example and the compose file, and chose. `pando doctor` says what it
+detected and from where.
 
 ## The story
 
@@ -51,7 +141,19 @@ Built for people, and for agents, who work on several branches at once.
 
 pando never writes into your repository. Not a config file, not a gitignore
 line, not a lockfile change. Everything it learns and everything it runs lives
-under `~/.pando`.
+under `~/.pando`:
+
+```text
+~/.pando/
+├── config.toml                  your choices: theme, appearance
+├── recipes/  themes/            your own native-service recipes and colour themes
+└── projects/<project>-<id>/
+    ├── pando.toml               the whole configuration for one project
+    ├── worktrees/feat+checkout/ a stem: the branch's own checkout
+    ├── logs/feat+checkout/      every process's log, for the log viewer
+    ├── data/feat+checkout/      its private services' data, when isolated
+    └── state.json               what runs where, on which ports
+```
 
 One mode writes somewhere that is yours all the same: a namespaced
 worktree gets a database of its own in your own database server. That is
@@ -62,8 +164,6 @@ grant you give once to that prefix and nothing else, and dropped only by
 
 ## Your first run
 
-Install pando (see [Install](#install)), then:
-
 ```bash
 cd your-project
 pando
@@ -71,8 +171,32 @@ pando
 
 The first time, pando opens its setup screen instead of the list, on a
 grove of its own: Pando, the aspen that is one tree with 47,000 stems,
-drawn in dithered blocks, its leaves quaking. It comes alive when the
-setup passes. Every project is a little different, so the surest start is to let your own
+drawn in dithered blocks, its leaves quaking. Each project gets its own
+grove, grown from its name:
+
+```text
+        ██████████    ██████    ██      ██  ████████      ██████
+        ██░▒░▒░▒██░ ██ ▒░▒░▒██  ████    ██░ ██░▒░▒░▒██  ██ ▒░▒░▒██
+        ██████████▒ ██████████▒ ██▒░██  ██▒ ██▒     ██▒ ██▒     ██▒
+        ██░▒░▒░▒░▒░ ██░▒░▒░▒██░ ██░  ▒████░ ██░     ██░ ██░     ██░
+        ██▒         ██▒     ██▒ ██▒    ░██▒ ████████ ░▒  ░██████ ░▒
+         ▒░          ▒░      ▒░  ▒░      ▒░  ▒░▒░▒░▒░      ▒░▒░▒░
+
+            ░         ▓▒▓▒▒   ░░░        ▒▓▒
+         ░▓███▒  ▒▒▒ ▒████▓░ ░▓█▓   ░    ███   ▓▒▒       ▒▒▓▒░  ▒█▒░
+     ░▒░ ░▒▓█▓▓ ░▓██▓░████▓░ ▒███░▒▓█▓▒ ▒███▒ ▒███▒   ░  ▓███▓ ▒███▒
+    ░███░   █   ░▓██▒  ░█░   ░▒█▓░▓███▒  ▒▓▒  ░███░ ░███▒▓████ ▓███▓
+    ░▓█▓░   ▓    ░█░    ▓      █  ▓██▓▒   █    ░█▒  ▒███▓ ▒█▒░ ▒██▒
+      ▓     ▓     █     █      █    █     ▓     █     █    ▓     █
+      █     █     █     █      █    ▓     █     ▓     █    █     █
+  ░░░░█░░░░░█░░░░░█░░░░░█░░░░░░█░░░░█░░░░░█░░░░░█░░░░░█░░░░█░░░░░█░░░░░░░░
+      ┃     ┃     ┃     ┃      ┃    ┃     ┃     ┃     ┃    ┃     ┃
+  ╺━━━┻━━━━━┻━━━━━┻━━━━━┻━━━━━━┻━━━━┻━━━━━┻━━━━━┻━━━━━┻━━━━┻━━━━━┻━━━━━━━╸
+      main  feat/checkout      fix/login-loop   feat/search
+```
+
+The roots stay dark until the setup passes; then they light up. Every
+project is a little different, so the surest start is to let your own
 coding agent look at it. Press `a` to copy this one line, and paste it
 into Claude Code or Codex, opened in the project:
 
@@ -115,25 +239,6 @@ a default. `pando doctor` says what was detected and from where, and
 `pando check` tests the setup again at any time. A question pando has no
 option for at all is still asked, and so is the one real choice
 isolation brings — which services to run private copies of.
-
-## For agents
-
-pando publishes what it knows as JSON so a program can read it instead of
-parsing English, and answers come back through one validated write path.
-
-- [`agent/json.md`](agent/json.md) — every machine-readable shape,
-  versioned, with the exit codes. `3` means pando has a question and the
-  question is on stderr.
-- [`agent/brief.md`](agent/brief.md) — the procedure for turning that
-  evidence into answers: read before asking, write only through
-  `pando init --answers`, never a byte in the repository.
-- [`agent/`](agent/README.md) — a Claude Code plugin and Codex skills, both
-  thin over that one brief.
-
-The binary carries the brief and the shapes too: `pando init --agent`
-prints the setup job for the project you are in, and
-`pando init --agent --reference brief` or `--reference json` prints either
-document whole.
 
 ## Commands
 
@@ -191,8 +296,14 @@ t        share it publicly, or stop sharing
 n d      new worktree, remove one (never the main checkout, ⌂)
 p        open pull requests: ⏎ makes a worktree for one
 a v      copy the setup prompt, or test the setup (pando check)
+T        colour themes, previewed live
 m ?      what pando said in full, and every key
 ```
+
+<details>
+<summary><b>More on the TUI</b>: the chooser, confirmations, the list, pull requests, the log viewer</summary>
+
+<br>
 
 Enter opens the mode chooser on every worktree. On a stopped one the
 mode it last ran in is under the cursor and marked `last used`, so
@@ -212,11 +323,12 @@ The list is a table with a header row: `branch`, then `changes`
 (`uncommitted` when there are uncommitted changes), `port`, `public` (`◈`
 while it is shared), `mode` (`isolated` when it runs private copies of
 the services, `namespaced` when it runs on a database and a slot of its
-own in the main checkout's servers, each in its own colour), `git` (commits ahead of and behind the base branch), `PR`
-and `status` (`failed`, or what is being done to it). A column shows
-only when some row has something in it. The glyph before the branch
-says whether it runs: `●` running, `◌` starting, `✗` failed, `○`
-stopped. The full URL and the rest are in the detail pane beside it.
+own in the main checkout's servers, each in its own colour), `git`
+(commits ahead of and behind the base branch), `PR` and `status`
+(`failed`, or what is being done to it). A column shows only when some
+row has something in it. The glyph before the branch says whether it
+runs: `●` running, `◌` starting, `✗` failed, `○` stopped. The full URL
+and the rest are in the detail pane beside it.
 
 `p` lists the repository's open pull requests through the GitHub CLI
 (`gh`, signed in); typing narrows them by number, title, branch or
@@ -231,24 +343,27 @@ The log viewer has a tab per log, led by an `all` tab that merges every
 process's when there are several. `1`–`9` switch tabs, `/` searches, `f`
 filters by level, and `e`/`E` jump between errors.
 
+</details>
+
 ### Shared, namespaced, isolated
 
 A worktree's code, processes, dependencies, ports and logs are its own
 whatever it runs on. Its mode decides what happens to its data:
 
-- **shared** — the main checkout's database and cache, data and all. The
-  default, and the way back from the other two: `start --shared`, or `S`.
-- **namespaced** (experimental) — the main checkout's servers, with a
-  database and a Redis slot of the worktree's own in them: `shop__feat_x`
-  beside `shop`, slot 3 beside slot 0. The database is built by the
-  branch's own schema step, never copied from main's, and both are kept
-  through a switch to another mode until `rm` drops them.
-  `start --namespaced`, or the chooser on enter.
-- **isolated** — servers of its own on ports of its own: containers from
-  your compose file, or native engines from a recipe. `start --isolated`,
-  or `i`.
+| Mode | Its data lives in | Start it with |
+|---|---|---|
+| **shared** | the main checkout's database and cache, data and all. The default, and the way back from the other two | `start --shared`, or `S` |
+| **namespaced** *(experimental)* | the main checkout's servers, with a database and a Redis slot of the worktree's own in them: `shop__feat_x` beside `shop`, slot 3 beside slot 0 | `start --namespaced`, or the chooser on enter |
+| **isolated** | servers of its own on ports of its own: containers from your compose file, or native engines from a recipe | `start --isolated`, or `i` |
 
-A namespaced start writes into a server you own, so it is careful:
+A namespaced database is built by the branch's own schema step, never
+copied from main's, and both it and the slot are kept through a switch to
+another mode until `rm` drops them.
+
+<details>
+<summary><b>How a namespaced start stays careful</b> in a server you own</summary>
+
+<br>
 
 - It logs in as your app does, with the user and password beside the
   address in the main checkout's `.env`. Where there are none it asks
@@ -277,6 +392,8 @@ every other service stays shared, and a namespaced start says so for each.
 What a namespace is on an engine is a recipe's `[namespace]` table, so
 another engine is a recipe rather than a release.
 
+</details>
+
 ### Themes
 
 `T` in the TUI lists the colour themes, each with a swatch of its
@@ -285,6 +402,11 @@ esc puts the old one back. The built-ins are pando's own, Catppuccin,
 Flexoki, GitHub (default, dimmed, high contrast, colorblind), Gruvbox,
 Kanagawa, Monokai Pro, One Dark, Rosé Pine, Tokyo Night, VS Code and
 Zenwritten, each with a dark and a light half that follows the system.
+
+<details>
+<summary><b>Configuring and writing themes</b></summary>
+
+<br>
 
 A choice is saved in `~/.pando/config.toml`:
 
@@ -305,10 +427,31 @@ accents for each half, and every other colour is derived from them. One
 in `~/.pando/themes/<name>.toml` is listed beside the built-ins, and
 replaces the built-in of the same name.
 
+</details>
+
+## For agents
+
+pando publishes what it knows as JSON so a program can read it instead of
+parsing English, and answers come back through one validated write path.
+
+- [`agent/json.md`](agent/json.md) — every machine-readable shape,
+  versioned, with the exit codes. `3` means pando has a question and the
+  question is on stderr.
+- [`agent/brief.md`](agent/brief.md) — the procedure for turning that
+  evidence into answers: read before asking, write only through
+  `pando init --answers`, never a byte in the repository.
+- [`agent/`](agent/README.md) — a Claude Code plugin and Codex skills, both
+  thin over that one brief.
+
+The binary carries the brief and the shapes too: `pando init --agent`
+prints the setup job for the project you are in, and
+`pando init --agent --reference brief` or `--reference json` prints either
+document whole.
+
 ## Install
 
 There is no published binary yet. Build it from source with a Rust
-toolchain (edition 2024):
+toolchain, recent and stable (pando is developed on 1.90):
 
 ```bash
 cargo install --path .        # puts `pando` in ~/.cargo/bin
@@ -316,23 +459,41 @@ cargo install --path .        # puts `pando` in ~/.cargo/bin
 cargo build --release         # the binary is target/release/pando
 ```
 
-`pando --version` says which version you have.
+`pando --version` says which version you have, and `pando completions zsh`
+(or bash, fish…) prints a completion script. Worktrees need `git`; isolated
+services need Docker or the native engine a recipe names; sharing needs
+`cloudflared`; the pull request picker needs `gh`. `pando doctor` checks
+all of them.
 
-## Working on pando
+## Contributing
 
-`src/lib.rs` is the map: the dependency direction between modules, how a
-module that grew past one concern is laid out as a directory, and a table
-of where to add a package manager, a framework, a service image, a
-language, a native service recipe, a CLI verb, a question, a `doctor`
-section or a TUI key.
+pando is small enough to read and strict about how it grows, which makes
+it a good project to contribute to. Most of what it knows about the
+ecosystem is data, so many useful changes are a single row or a single
+TOML file:
 
-What pando knows about the ecosystem lives in `src/catalog/` as data, one
-row per fact, and every module that needs a fact reads that row. The
-built-in service recipes are TOML files in `src/recipes/builtin/`, in
-the same format as a recipe you drop into `~/.pando/recipes/`.
+| You know… | Your contribution is | Where |
+|---|---|---|
+| a database or cache pando should run natively | a service recipe | `src/recipes/builtin/*.toml` |
+| a framework pando misreads | a detection rule | `src/catalog/frameworks.rs` |
+| a package manager or lockfile | a row | `src/catalog/package_managers.rs` |
+| a language or version manager | a row | `src/runtime/languages.rs` |
+| a colour scheme you love | a theme | `src/theme/builtin/*.toml` |
+| a project shape pando breaks on | a fixture and a failing test | `tests/common/mod.rs` |
 
-Before every commit: `cargo test`, `cargo clippy --all-targets -- -D
-warnings`, and `cargo fmt --check`.
+Try pando without pointing it at anything real:
+
+```bash
+scripts/fixture-repo.sh --list                  # the fixture shapes the tests use
+scripts/fixture-repo.sh mono-web-api --listener # build one, and print how to run pando in it
+```
+
+Every change passes `cargo test`, `cargo clippy --all-targets -- -D warnings`
+and `cargo fmt --check`. [CONTRIBUTING.md](CONTRIBUTING.md) has the map of
+the code, the testing rules, and how a pull request goes. Bugs and ideas go
+in [issues](https://github.com/mertkaradayi/pando/issues); security problems
+go through [SECURITY.md](SECURITY.md), never a public issue. Everyone
+taking part follows the [code of conduct](CODE_OF_CONDUCT.md).
 
 ## Status
 
@@ -348,11 +509,12 @@ database and a Redis slot of their own in the main checkout's servers,
 tested against throwaway MariaDB and Redis servers the tests start
 themselves. 0.4.0 adds no command: it is all of that after a review of
 the whole project and the fixes it found, with a test suite that reads
-no developer's shell profile and needs none of their tools.
+no developer's shell profile and needs none of their tools. What changed
+in each version is in the [changelog](CHANGELOG.md).
 
 macOS is what it is developed and tested on. The Unix-only parts have
-Linux branches written and no CI, so Linux is intended rather than
-demonstrated: nobody has yet compiled it there, let alone run it.
+Linux branches written, and CI now builds them on Linux, but Linux is
+intended rather than demonstrated: nobody has run it there yet.
 
 What that does not mean: there is no crate, no release binary and no
 package to install, and almost every worktree pando has created has been
@@ -362,4 +524,18 @@ read down to its first line, a failure that left an empty log and no
 explanation, and a backgrounded server reported as dead. All three are
 fixed, and the count is the point: a tool this heavily tested against
 situations it invented still breaks on first contact with one it did
-not.
+not. If pando breaks on yours, that is the most useful issue you can open.
+
+Next, roughly in order: a published crate and release binaries, a
+Homebrew tap, Linux proven in CI, a JSON schema for `pando.toml`, and a
+recipe directory with its own contribution guide.
+
+## License
+
+pando is free software under the [GNU Affero General Public License v3.0
+only](LICENSE) (`AGPL-3.0-only`). You may use, study, change and share it.
+If you distribute pando, or a program built from it, or let people use a
+modified version over a network, you must offer them its complete source
+under the same licence. Contributions are accepted under the same terms.
+
+<p align="center"><sub>One root system. Forty-seven thousand stems. Every branch alive.</sub></p>
