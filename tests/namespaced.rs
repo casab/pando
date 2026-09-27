@@ -564,3 +564,96 @@ fn a_real_namespaced_start_gives_each_worktree_a_redis_slot_of_its_own() {
         "main"
     );
 }
+
+// `pando check` against a real server: a project whose schema step builds
+// a table is checked in a database of the check's own, made under the
+// grant, and when the check has passed that database is gone again and
+// main's is as it was — the proof the maintainer's first namespaced start
+// was missing.
+#[test]
+fn a_real_namespaced_check_proves_the_schema_step_and_leaves_only_main() {
+    if skip(&["mariadb-install-db", "mariadbd", "mariadb", "python3"]) {
+        return;
+    }
+    let db = mariadb();
+    root_sql(&db, "GRANT ALL ON `shop\\_\\_%`.* TO 'app'@'localhost'").unwrap();
+    root_sql(&db, "CREATE TABLE shop.main_only (x int)").unwrap();
+
+    let dir = TempDir::new().unwrap();
+    let root = common::fixture_repo(dir.path());
+    std::fs::write(
+        root.join(".env"),
+        format!(
+            "DATABASE_HOST=127.0.0.1\nDATABASE_PORT={}\nDATABASE_NAME=shop\n\
+             DATABASE_USER=app\nDATABASE_PASSWORD={APP_PASSWORD}\n",
+            db.port
+        ),
+    )
+    .unwrap();
+    let home = dir.path().join("pando-home");
+    let paths = common::paths_for(&home, &root);
+    paths.ensure_home().unwrap();
+    std::fs::write(home.join("config.toml"), "[runtime]\nprelude = \"\"\n").unwrap();
+    // A dev server that answers every request, brace-free: `{` is pando's
+    // template syntax. The schema step reads the password the way an app
+    // would, from the main checkout's env file, and builds its table in
+    // whichever database it is given.
+    let answering = "python3 -u -c \"import http.server as h,os;\
+                     C=type('C',(h.BaseHTTPRequestHandler,),dict(do_GET=lambda s:\
+                     (s.send_response(200),s.end_headers())));\
+                     h.HTTPServer(('127.0.0.1',int(os.environ['PORT'])),C).serve_forever()\"";
+    std::fs::write(
+        paths.config_file(),
+        format!(
+            "[project]\ninstall = \"true\"\n\n\
+             [dev]\ncmd = '''{answering}'''\nports = {{ PORT = \"web\" }}\n\n\
+             [[services]]\nkind = \"native\"\nname = \"mariadb\"\n\
+             env = {{ DATABASE_PORT = \"mariadb\" }}\n\n\
+             [[hooks]]\nname = \"schema\"\nafter = \"services\"\n\
+             cmd = '''export MYSQL_PWD=\"$(sed -n 's/^DATABASE_PASSWORD=//p' \"$PANDO_ROOT/.env\")\"; \
+             mariadb --protocol=tcp -h 127.0.0.1 -P \"$DATABASE_PORT\" -u app \"$DATABASE_NAME\" \
+             -e 'CREATE TABLE worktree_only (id varchar(255) PRIMARY KEY)' '''\n"
+        ),
+    )
+    .unwrap();
+    let config = pando::config::load(&paths).unwrap().config;
+    let _started = Started(paths.clone());
+
+    let said = std::cell::RefCell::new(Vec::<String>::new());
+    let step = |line: &str| said.borrow_mut().push(line.to_string());
+    let say = pando::actions::Narration {
+        step: &step,
+        detail: &step,
+    };
+    let checked =
+        pando::actions::check(&paths, &config, pando::setup::RanBy::Program, &say).unwrap();
+    let said = said.into_inner();
+    assert_eq!(
+        checked.record.outcome,
+        pando::setup::CheckOutcome::Passed,
+        "{:?}\n{said:#?}",
+        checked.record
+    );
+    assert_eq!(checked.record.mode, pando::setup::CheckMode::Namespaced);
+    assert!(
+        said.iter()
+            .any(|l| l == "mariadb: own database shop__pando_check, made just now"),
+        "{said:#?}"
+    );
+    assert!(
+        said.iter()
+            .any(|l| l == "mariadb: dropped database shop__pando_check"),
+        "{said:#?}"
+    );
+    assert_eq!(
+        root_sql(&db, "SHOW DATABASES LIKE 'shop%'").unwrap(),
+        "shop",
+        "the check's database is gone, and main's is there"
+    );
+    assert_eq!(
+        root_sql(&db, "SHOW TABLES FROM shop").unwrap(),
+        "main_only",
+        "main never saw the schema step"
+    );
+    assert!(said.iter().all(|l| !l.contains("p@ss")), "{said:#?}");
+}

@@ -30,10 +30,21 @@ pub(super) fn worktrees_report(
             Section::Worktrees,
             format!(
                 "a `pando check` that did not finish left its test worktree at {} — its \
-                 processes may still be running",
-                left.path.display()
+                 processes may still be running{}",
+                left.path.display(),
+                match left.namespaces.is_empty() {
+                    true => String::new(),
+                    false => format!(
+                        ", and the {} pando made for it in your servers",
+                        left.namespaces.join(", ")
+                    ),
+                }
             ),
             match left.elsewhere {
+                false if !left.namespaces.is_empty() => {
+                    "`pando check` sweeps it, and drops what it made, before it tests again"
+                        .to_string()
+                }
                 false => "`pando check` sweeps it before it tests again".to_string(),
                 true => format!(
                     "it is not where this project's checks go now, so `pando check` leaves it \

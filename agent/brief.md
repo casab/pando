@@ -47,7 +47,10 @@ is done.
    throwaway worktree of the commit a new branch would fork from, runs the
    install, starts every app, checks the one the browser opens really
    answers, and removes it all. The prompt the developer pasted is their
-   consent to this test.
+   consent to this test. When namespaced mode already has a login, the
+   check also runs the schema step, in a database of its own in the
+   developer's server that it drops again; otherwise its notes say the
+   schema step was not tested, and why.
 5. **When the check fails, fix, then rerun; never rerun unchanged.**
    - A settings failure is yours: correct the answer with
      `pando init --answers - --replace`, which replaces a slot that is
@@ -65,6 +68,10 @@ is done.
 
    > pando is set up and tested for <project>.
    > You're ready: run `pando`.
+
+   When the check's notes say the schema step was not tested, add one
+   line: it is untested until namespaced mode is set up, which the first
+   `pando start --namespaced` does by asking for its login once.
 
 The rest of this brief is for when a failure needs it
 (`pando init --agent --reference brief`); a first run that passes never

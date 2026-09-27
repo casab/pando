@@ -5,7 +5,7 @@ use super::ls::ProjectOut;
 use crate::actions::{self, Checked, Narration};
 use crate::config::Config;
 use crate::paths::PandoPaths;
-use crate::setup::{CheckOutcome, CheckRecord, FailureKind, RanBy};
+use crate::setup::{CheckMode, CheckOutcome, CheckRecord, FailureKind, RanBy};
 use anyhow::Result;
 use serde::Serialize;
 use std::io::{IsTerminal, Write};
@@ -137,6 +137,7 @@ pub(super) struct CheckOut<'a> {
     version: u32,
     project: ProjectOut,
     result: &'static str,
+    mode: CheckMode,
     kind: Option<FailureKind>,
     reason: Option<&'a str>,
     slot: Option<&'a str>,
@@ -183,6 +184,7 @@ pub(super) fn check_json<'a>(paths: &PandoPaths, record: &'a CheckRecord) -> Che
             name: paths.project.display_name.clone(),
         },
         result,
+        mode: record.mode,
         kind,
         reason,
         slot,

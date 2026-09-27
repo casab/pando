@@ -10,7 +10,7 @@ use crate::paths::PandoPaths;
 use crate::recipes::NamespaceRecipe;
 use crate::state::NamespaceKind;
 
-use super::questions::{Answer, Ask, Question, answered_by};
+use super::questions::{Answer, Ask, NeedsAnswer, Question, answered_by};
 
 /// The login a namespaced start makes and drops `service`'s namespaces
 /// with, asked for when nothing says.
@@ -221,6 +221,70 @@ impl Plan {
 /// that stays on main's read as data of its own.
 pub fn namespaced_not_own_data(paths: &PandoPaths, config: &Config) -> Option<String> {
     plan(paths, config).not_own_data()
+}
+
+/// Why `pando check` cannot run the steps after the services in
+/// namespaces of its own, or `None` when it can: the plan a namespaced
+/// start makes gives it a database of its own with nothing left on the
+/// main checkout's data, and that start would put no question — every
+/// login it needs is written down somewhere, and no slot has to be
+/// chosen to free.
+///
+/// The check never asks and never answers for anybody, so a login that
+/// is not there yet is a reason, not a question. Asks a server only when
+/// every slot of it is held, which is when a start would ask too.
+pub(super) fn check_stays_shared(paths: &PandoPaths, config: &Config) -> Option<String> {
+    let plan = plan(paths, config);
+    if plan.targets.is_empty() {
+        return Some("this project has no server pando can make a database in".to_string());
+    }
+    if let Some(why) = plan.not_own_data() {
+        return Some(format!(
+            "a namespaced start here would not be on data of its own: {why}"
+        ));
+    }
+    let file = paths.config_file();
+    for target in &plan.targets {
+        match namespace::find_login(
+            paths.root(),
+            config,
+            &target.service,
+            &target.keys,
+            target.namespace.user,
+            &file,
+        ) {
+            Ok(Some(_)) => {}
+            Ok(None) if !target.namespace.user => {}
+            Ok(None) => {
+                return Some(format!(
+                    "namespaced mode has no login for {} yet — the first `pando start \
+                     --namespaced` asks for one",
+                    target.service
+                ));
+            }
+            Err(unresolved) => {
+                return Some(format!(
+                    "{:#}",
+                    unreadable_login(&target.service, &file, unresolved)
+                ));
+            }
+        }
+    }
+    let unasked = |question: &Question| -> Result<Answer> {
+        Err(anyhow::Error::new(NeedsAnswer {
+            question: question.clone(),
+        }))
+    };
+    let check = crate::paths::CHECK_WORKTREE;
+    match free_slots_if_full(paths, config, check, &unasked, &|_| {}) {
+        Ok(()) => None,
+        Err(e) if e.is::<NeedsAnswer>() => Some(
+            "every slot a namespaced start could use is held, and which one to free is a \
+             question the check does not answer"
+                .to_string(),
+        ),
+        Err(e) => Some(format!("{e:#}")),
+    }
 }
 
 /// Which of the project's services a namespaced start gives the worktree a
@@ -1864,18 +1928,28 @@ pub fn namespaces_rm_drops(record: &crate::state::WorktreeRecord) -> Vec<String>
 /// again, a number with nothing of the project in it, so its line says
 /// this is the last pando says of it — unless another record still names
 /// it, and pando goes on showing it as that one's.
+///
+/// Returns the lines about the ones it left, for a caller that keeps
+/// them beside its result: `pando check` does.
 pub(super) fn drop_namespaces(
     paths: &PandoPaths,
     store: &crate::state::State,
     name: &str,
     progress: &dyn Fn(&str),
-) {
+) -> Vec<String> {
+    let mut left: Vec<String> = Vec::new();
     let Some(record) = store.worktrees.get(name) else {
-        return;
+        return left;
     };
     if record.namespaces.is_empty() {
-        return;
+        return left;
     }
+    let mut progress = |line: &str, dropped: bool| {
+        if !dropped {
+            left.push(line.to_string());
+        }
+        progress(line);
+    };
     // `rm` works with a config that does not load; the logins it might
     // hold are only a fallback to the main checkout's own.
     let config = config::load(paths)
@@ -1910,17 +1984,21 @@ pub(super) fn drop_namespaces(
             false => " — nothing records it after this, so pando will not mention it again",
         };
         if let Err(e) = namespace::may_drop(store, name, ns, &main_now, &others) {
-            progress(&format!(
-                "{}: {what} is left as it is — {e:#}{last}",
-                ns.service
-            ));
+            progress(
+                &format!("{}: {what} is left as it is — {e:#}{last}", ns.service),
+                false,
+            );
             continue;
         }
         let Some(recipe) = recipe else {
-            progress(&format!(
-                "{}: {what} is left as it is — the recipe {:?} no longer says how to drop it{last}",
-                ns.service, ns.recipe
-            ));
+            progress(
+                &format!(
+                    "{}: {what} is left as it is — the recipe {:?} no longer says how to drop \
+                     it{last}",
+                    ns.service, ns.recipe
+                ),
+                false,
+            );
             continue;
         };
         let keys = match (&ns.keys[..], target) {
@@ -1950,24 +2028,31 @@ pub(super) fn drop_namespaces(
             bin_dir: paths.home.join("bin"),
         };
         match server.drop(&ns.name, &ns.main) {
-            Ok(()) => progress(&format!(
-                "{}: {}",
-                ns.service,
-                match ns.kind {
-                    NamespaceKind::Database => format!("dropped database {}", ns.name),
-                    NamespaceKind::Slot => format!("emptied slot {}", ns.name),
-                }
-            )),
-            Err(e) => progress(&format!(
-                "{}: {what} could not be dropped — {e:#}{}{last}",
-                ns.service,
-                server
-                    .by_hand(&ns.name)
-                    .map(|command| format!(" — `{command}` drops it by hand"))
-                    .unwrap_or_default()
-            )),
+            Ok(()) => progress(
+                &format!(
+                    "{}: {}",
+                    ns.service,
+                    match ns.kind {
+                        NamespaceKind::Database => format!("dropped database {}", ns.name),
+                        NamespaceKind::Slot => format!("emptied slot {}", ns.name),
+                    }
+                ),
+                true,
+            ),
+            Err(e) => progress(
+                &format!(
+                    "{}: {what} could not be dropped — {e:#}{}{last}",
+                    ns.service,
+                    server
+                        .by_hand(&ns.name)
+                        .map(|command| format!(" — `{command}` drops it by hand"))
+                        .unwrap_or_default()
+                ),
+                false,
+            ),
         }
     }
+    left
 }
 
 /// Whether a record other than `name`'s names this namespace: another
@@ -2019,7 +2104,8 @@ pub struct Leftover {
 
 /// Every leftover database of this project on the servers it namespaces
 /// in, as far as each server says — asked only of a project that runs
-/// namespaced worktrees, because asking is a login to a server.
+/// namespaced worktrees, or whose last `pando check` ran namespaced,
+/// because asking is a login to a server.
 ///
 /// Read-only: a listing, never a drop. A server that does not answer, or
 /// a login nothing gives, is skipped rather than reported: this is a look
@@ -2036,7 +2122,8 @@ pub fn namespace_leftovers(
 ) -> Vec<Leftover> {
     let namespaced = store.worktrees.values().any(|record| {
         !record.namespaces.is_empty() || record.mode == Some(crate::state::ServiceMode::Namespaced)
-    });
+    }) || crate::setup::CheckRecord::load(paths)
+        .is_some_and(|check| check.mode == crate::setup::CheckMode::Namespaced);
     if !namespaced {
         return Vec::new();
     }

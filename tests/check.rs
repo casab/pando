@@ -581,3 +581,316 @@ fn a_killed_checks_leftover_is_hidden_reported_and_swept() {
         "nothing left to report"
     );
 }
+
+// ---- the schema step, proved in namespaces of the check's own ----------------------
+
+/// A project whose main checkout's MariaDB holds `shop`, on a port the
+/// test keeps a listener on so the check finds the server up, with a fake
+/// client in pando's own `bin` — no server anywhere. `login` puts the
+/// app's login in the main checkout's env files; `hooks` goes after the
+/// dev process and the service.
+struct WithDb {
+    e: Env,
+    fake: PathBuf,
+    /// Where the schema hook below writes the database it was given.
+    marker: PathBuf,
+    _server: std::net::TcpListener,
+}
+
+fn with_db(login: bool, hooks: &str) -> WithDb {
+    with_db_running(&answering(200), login, hooks)
+}
+
+fn with_db_running(cmd: &str, login: bool, hooks: &str) -> WithDb {
+    let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = server.local_addr().unwrap().port();
+    let e = env("");
+    let marker = e.home.parent().unwrap().join("schema-ran-on");
+    let hooks = hooks.replace("MARKER", &marker.display().to_string());
+    e.write_config(&config_running(
+        cmd,
+        &format!(
+            "[[services]]\nkind = \"native\"\nname = \"mariadb\"\n\
+             env = {{ DATABASE_PORT = \"mariadb\" }}\n\n{hooks}"
+        ),
+    ));
+    let mut dotenv = format!("DATABASE_HOST=127.0.0.1\nDATABASE_PORT={port}\nDATABASE_NAME=shop\n");
+    if login {
+        dotenv.push_str("DATABASE_USER=app\nDATABASE_PASSWORD=check-secret-pw\n");
+    }
+    std::fs::write(e.root.join(".env"), dotenv).unwrap();
+    let fake = common::fake_mariadb(&e.home);
+    WithDb {
+        e,
+        fake,
+        marker,
+        _server: server,
+    }
+}
+
+/// A schema step that writes down the database it was pointed at.
+const SCHEMA_HOOK: &str = "[[hooks]]\nname = \"schema\"\nafter = \"services\"\n\
+                           cmd = '''echo \"$DATABASE_NAME\" >> 'MARKER' '''\n";
+
+impl WithDb {
+    fn fake(&self, file: &str) -> String {
+        std::fs::read_to_string(self.fake.join(file)).unwrap_or_default()
+    }
+
+    /// The databases the fake server holds now.
+    fn databases(&self) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(self.fake.join("dbs"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+}
+
+// The maintainer's report: a check that passed on the shared services had
+// never run the schema step, and the first namespaced start failed on it.
+// With a login already there, the check is that namespaced start: the
+// schema step runs in a database of the check's own — never main's — and
+// the database is dropped with the worktree.
+#[test]
+fn a_check_with_a_schema_step_and_a_login_runs_it_in_its_own_database_and_drops_it() {
+    if skip_without_python() {
+        return;
+    }
+    let db = with_db(true, SCHEMA_HOOK);
+    let branches = db.e.git(&["branch", "--list"]);
+    let out = db.e.pando(&["check", "--json"]);
+    let err = stderr(&out);
+    assert!(out.status.success(), "{err}");
+    assert!(
+        err.contains("in a throwaway worktree (no branch), namespaced"),
+        "{err}"
+    );
+    let v = json(&out);
+    assert_eq!(v["result"], "passed");
+    assert_eq!(v["mode"], "namespaced");
+    assert!(
+        v["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n.as_str().unwrap().starts_with(
+                "running the hooks after services (schema) in a database of the check's own"
+            )),
+        "{v}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&db.marker).unwrap(),
+        "shop__pando_check\n",
+        "the schema step ran, on the check's own database"
+    );
+    assert_eq!(db.fake("created"), "shop__pando_check\n");
+    assert_eq!(
+        db.fake("dropped"),
+        "shop__pando_check\n",
+        "exactly what the check made was dropped, and nothing else"
+    );
+    assert!(db.databases().is_empty(), "{:?}", db.databases());
+    assert!(!err.contains("check-secret-pw"), "{err}");
+    db.e.assert_nothing_left(&branches);
+    let record = db.e.record().unwrap();
+    assert_eq!(record.mode, pando::setup::CheckMode::Namespaced);
+    assert_eq!(db.e.setup_state(), SetupState::Ready);
+    let doctor = db.e.pando(&["doctor", "--json"]);
+    assert!(
+        !String::from_utf8_lossy(&doctor.stdout).contains("shop__pando_check"),
+        "nothing of the check is left to report"
+    );
+}
+
+// Where the check cannot be that start, it runs shared as it always has,
+// and says what that left untested and why — or says nothing when there
+// was nothing to prove.
+#[test]
+fn a_check_that_cannot_namespace_runs_shared_and_says_the_schema_step_was_untested() {
+    if skip_without_python() {
+        return;
+    }
+    let note = |v: &serde_json::Value| -> String {
+        v["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    // No login: namespaced mode would ask for one, and the check asks
+    // nothing.
+    let db = with_db(false, SCHEMA_HOOK);
+    let out = db.e.pando(&["check", "--json"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let v = json(&out);
+    assert_eq!(v["mode"], "shared");
+    let notes = note(&v);
+    assert!(
+        notes.contains(
+            "skipped the hooks that run after services (schema): on the shared services they \
+             would run against your own data, so the schema step was not tested — namespaced \
+             mode has no login for mariadb yet"
+        ),
+        "{notes}"
+    );
+    assert!(!db.marker.exists(), "the schema step ran on shared data");
+    assert_eq!(db.fake("created"), "", "nothing was made");
+    assert_eq!(db.e.record().unwrap().mode, pando::setup::CheckMode::Shared);
+
+    // A login, and nothing after the services to prove: shared, and
+    // nothing to say.
+    let db = with_db(true, "");
+    let out = db.e.pando(&["check", "--json"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let v = json(&out);
+    assert_eq!(v["mode"], "shared");
+    assert!(!note(&v).contains("not tested"), "{v}");
+    assert_eq!(db.fake("argv"), "", "the server was asked nothing");
+
+    // No server pando can make a database in.
+    let e = env(&config_running(
+        &answering(200),
+        "[[hooks]]\nname = \"migrate\"\nafter = \"services\"\ncmd = \"true\"\n",
+    ));
+    let out = e.pando(&["check", "--json"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let v = json(&out);
+    assert_eq!(v["mode"], "shared");
+    assert!(
+        note(&v).contains(
+            "so the schema step was not tested — this project has no server pando can make a \
+             database in"
+        ),
+        "{v}"
+    );
+}
+
+// A schema step that fails in the check's own database is the settings'
+// to fix, named with its log's last lines, as a process is — and what the
+// check made is dropped all the same.
+#[test]
+fn a_schema_step_that_fails_in_a_namespaced_check_fails_it_as_settings() {
+    if skip_without_python() {
+        return;
+    }
+    let db = with_db(
+        true,
+        "[[hooks]]\nname = \"schema\"\nafter = \"services\"\n\
+         cmd = '''echo \"ERROR 1071: key too long in $DATABASE_NAME\"; exit 1'''\n",
+    );
+    let branches = db.e.git(&["branch", "--list"]);
+    let out = db.e.pando(&["check", "--json"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let v = json(&out);
+    assert_eq!(v["result"], "failed");
+    assert_eq!(v["mode"], "namespaced");
+    assert_eq!(v["kind"], "settings");
+    assert_eq!(v["failed_process"], "schema");
+    assert!(
+        v["reason"]
+            .as_str()
+            .unwrap()
+            .contains("the schema hook failed"),
+        "{v}"
+    );
+    assert!(
+        v["failed_tail"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l == "ERROR 1071: key too long in shop__pando_check"),
+        "{v}"
+    );
+    assert!(
+        stderr(&out).contains("the last lines of the schema log:"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(db.fake("dropped"), "shop__pando_check\n");
+    assert!(db.databases().is_empty());
+    db.e.assert_nothing_left(&branches);
+}
+
+// A login the server will not let make a database is the machine's: the
+// check says the grant that fixes it, and nothing was made.
+#[test]
+fn a_login_with_no_grant_fails_a_namespaced_check_as_the_machines() {
+    if skip_without_python() {
+        return;
+    }
+    let db = with_db(true, SCHEMA_HOOK);
+    std::fs::write(db.fake.join("deny"), "").unwrap();
+    let branches = db.e.git(&["branch", "--list"]);
+    let out = db.e.pando(&["check", "--json"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let v = json(&out);
+    assert_eq!(v["mode"], "namespaced");
+    assert_eq!(v["kind"], "machine");
+    let reason = v["reason"].as_str().unwrap();
+    assert!(reason.contains("GRANT"), "{reason}");
+    assert!(!reason.contains("check-secret-pw"), "{reason}");
+    assert_eq!(db.fake("created"), "");
+    assert_eq!(
+        db.fake("dropped"),
+        "",
+        "nothing was made, so nothing is dropped"
+    );
+    assert!(!db.marker.exists());
+    db.e.assert_nothing_left(&branches);
+}
+
+// A namespaced check killed mid-run leaves its database recorded as the
+// check's: `doctor` names it, and the next check drops it before it makes
+// its own.
+#[test]
+fn a_killed_namespaced_checks_database_is_reported_and_dropped_by_the_next_check() {
+    if skip_without_python() {
+        return;
+    }
+    let db = with_db_running(&common::listener_on_port_env(), true, SCHEMA_HOOK);
+    let branches = db.e.git(&["branch", "--list"]);
+    let mut child = db.e.spawn(&["check"]);
+    db.e.wait_for_step("asking dev for its first page");
+    signal(&child, nix::sys::signal::Signal::SIGKILL);
+    child.wait().unwrap();
+    assert_eq!(db.databases(), vec!["shop__pando_check".to_string()]);
+
+    let doctor = db.e.pando(&["doctor", "--json"]);
+    let report = json(&doctor);
+    assert!(
+        report["findings"].as_array().unwrap().iter().any(|f| {
+            f["message"]
+                .as_str()
+                .unwrap()
+                .contains("and the database shop__pando_check pando made for it")
+                && f["fix"].as_str().unwrap().contains("drops what it made")
+        }),
+        "{report}"
+    );
+
+    db.e.write_config(
+        &std::fs::read_to_string(db.e.paths.config_file())
+            .unwrap()
+            .replace(&common::listener_on_port_env(), &answering(200)),
+    );
+    let out = db.e.pando(&["check"]);
+    let err = stderr(&out);
+    assert!(out.status.success(), "{err}");
+    assert!(
+        err.contains(
+            "left its worktree and its database shop__pando_check behind — sweeping them first"
+        ),
+        "{err}"
+    );
+    assert_eq!(
+        db.fake("dropped"),
+        "shop__pando_check\nshop__pando_check\n",
+        "the leftover by the sweep, then this check's own"
+    );
+    assert!(db.databases().is_empty());
+    db.e.assert_nothing_left(&branches);
+}

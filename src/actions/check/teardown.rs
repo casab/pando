@@ -1,5 +1,7 @@
 //! Taking a check's worktree down: at the end of every check, and at the
-//! start of the next one for what a killed check left behind.
+//! start of the next one for what a killed check left behind. A
+//! namespaced check's database and slot go with it, through the same
+//! drop `rm` makes.
 
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
@@ -10,6 +12,7 @@ use crate::state;
 use crate::worktree;
 
 use super::super::lifecycle::stop;
+use super::super::namespaced::drop_namespaces;
 use super::run::Narration;
 
 /// What a check that did not finish left behind: its worktree, its
@@ -22,6 +25,10 @@ pub struct LeftoverCheck {
     /// made before `worktrees_dir` changed. The sweep leaves such a one to
     /// the developer: it removes nothing it cannot prove is the check's.
     pub elsewhere: bool,
+    /// What its record says pando made for it in the main checkout's
+    /// servers — `database shop__pando_check`, `redis slot 3` — which the
+    /// sweep drops with it.
+    pub namespaces: Vec<String>,
 }
 
 /// A worktree or a record of a check that is not running: what a check
@@ -40,6 +47,14 @@ pub fn leftover_check(paths: &PandoPaths, config: &Config) -> Option<LeftoverChe
 /// [`leftover_check`], for a caller that holds the check lock itself.
 fn leftover(paths: &PandoPaths, config: &Config) -> Option<LeftoverCheck> {
     let expected = config.check_worktree_path(paths);
+    let record = state::load(&paths.state_file())
+        .ok()
+        .and_then(|mut store| store.worktrees.remove(CHECK_WORKTREE));
+    let namespaces: Vec<String> = record
+        .iter()
+        .flat_map(|record| &record.namespaces)
+        .map(crate::namespace::describe)
+        .collect();
     let listed = worktree::discover(&paths.project)
         .unwrap_or_default()
         .into_iter()
@@ -48,20 +63,20 @@ fn leftover(paths: &PandoPaths, config: &Config) -> Option<LeftoverCheck> {
         return Some(LeftoverCheck {
             elsewhere: !same_path(&listed.path, &expected),
             path: listed.path,
+            namespaces,
         });
     }
-    let recorded = state::load(&paths.state_file())
-        .ok()
-        .and_then(|store| store.worktrees.get(CHECK_WORKTREE).map(|r| r.path.clone()));
-    if let Some(path) = recorded {
+    if let Some(record) = record {
         return Some(LeftoverCheck {
-            elsewhere: !same_path(&path, &expected),
-            path,
+            elsewhere: !same_path(&record.path, &expected),
+            path: record.path,
+            namespaces,
         });
     }
     is_real_dir(&expected).then_some(LeftoverCheck {
         path: expected,
         elsewhere: false,
+        namespaces,
     })
 }
 
@@ -91,31 +106,49 @@ pub(super) fn sweep_leftover_check(
         ));
         return Ok(());
     }
-    progress("a check that did not finish left its worktree behind — sweeping it first");
-    tear_down(paths, config, say.detail).context("sweeping what the last check left")
+    progress(&match found.namespaces.is_empty() {
+        true => {
+            "a check that did not finish left its worktree behind — sweeping it first".to_string()
+        }
+        false => format!(
+            "a check that did not finish left its worktree and its {} behind — sweeping them \
+             first",
+            found.namespaces.join(", ")
+        ),
+    });
+    for line in tear_down(paths, config, say.detail).context("sweeping what the last check left")? {
+        progress(&line);
+    }
+    Ok(())
 }
 
 /// Stops everything the check's worktree runs, removes the worktree and
-/// prunes git's entry for it, and drops its state record. Its logs stay:
-/// they are what a failed check is read from afterwards.
+/// prunes git's entry for it, drops the namespaces its record says pando
+/// made for it, and drops the record. Its logs stay: they are what a
+/// failed check is read from afterwards.
 ///
 /// Touches one path, the configured check directory, canonicalised and
 /// compared before anything is removed. The record goes only once its
 /// processes are stopped: a record dropped over a live group is a process
-/// nothing can find again.
+/// nothing can find again. Its namespaces go the way `rm` drops a
+/// worktree's, once the worktree is gone, each through the guard
+/// `namespace::may_drop` holds every drop to — never the main checkout's,
+/// never one pando has no record of making for the check. Returns what
+/// could not be dropped, each with the command that drops it by hand.
 pub(super) fn tear_down(
     paths: &PandoPaths,
     config: &Config,
     progress: &dyn Fn(&str),
-) -> Result<()> {
+) -> Result<Vec<String>> {
     stop(paths, CHECK_WORKTREE, None, progress).context("stopping the test worktree")?;
     remove_worktree(paths, config)?;
     let _lock = state::lock(&paths.lock_file())?;
     let mut store = state::load(&paths.state_file())?;
+    let left = drop_namespaces(paths, &store, CHECK_WORKTREE, progress);
     if store.worktrees.remove(CHECK_WORKTREE).is_some() {
         state::save(&paths.state_file(), &store)?;
     }
-    Ok(())
+    Ok(left)
 }
 
 /// `git worktree remove --force` on the check's worktree, then `git

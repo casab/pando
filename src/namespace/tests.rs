@@ -8,6 +8,18 @@ fn names(main: &str, worktree: &str) -> [String; 2] {
     database_names(main, "acme-0000beef", worktree).unwrap()
 }
 
+// `pando check`'s worktree is `.pando-check`, a name no branch can have.
+// Its leading dot is dropped like any other character a database name
+// cannot hold, so the check's own database is a plain one under the
+// prefix a grant covers, and still never main's.
+#[test]
+fn the_checks_database_is_a_plain_name_under_the_marker() {
+    let [readable, hashed] = names("shop", crate::paths::CHECK_WORKTREE);
+    assert_eq!(readable, "shop__pando_check");
+    assert!(is_plain(&readable) && is_plain(&hashed), "{hashed}");
+    assert!(hashed.starts_with("shop__pando_check_"), "{hashed}");
+}
+
 #[test]
 fn a_worktrees_database_is_the_main_one_the_marker_and_its_own_name() {
     let [readable, hashed] = names("northwind_traders", "feat+x");

@@ -1,7 +1,9 @@
-//! The check: settle the settings, make a throwaway worktree of the
-//! commit a new one would fork from, install and start it on the shared
-//! services, wait until every process is ready and the browser's app
-//! serves a page, take it all down, and record what happened.
+//! The check: settle the settings, choose where its data runs, make a
+//! throwaway worktree of the commit a new one would fork from, install
+//! and start it — on the shared services, or in namespaces of its own
+//! where the schema step can be proved — wait until every process is
+//! ready and the browser's app serves a page, take it all down, and
+//! record what happened.
 
 use anyhow::{Result, bail};
 use chrono::Utc;
@@ -14,12 +16,15 @@ use crate::detect::Slot;
 use crate::paths::{CHECK_WORKTREE, PandoPaths};
 use crate::ports::{self, PageAnswer};
 use crate::setup::{
-    CheckOutcome, CheckRecord, FailureKind, ProcessResult, RanBy, fingerprint, redact_line,
+    CheckMode, CheckOutcome, CheckRecord, FailureKind, ProcessResult, RanBy, fingerprint,
+    redact_line,
 };
 use crate::state::{self, WorktreeRecord};
 use crate::worktree;
 
+use super::super::hooks::{failed_words, hook_scope};
 use super::super::lifecycle::start_for_check;
+use super::super::namespaced::{check_stays_shared, prepare};
 use super::super::questions::{Answer, NeedsAnswer, Question, resolve_for_new, resolve_process};
 use super::super::readiness::{ReadyVerdict, ready_limit, ready_line, ready_verdict};
 use super::super::refresh::{failure_tail, refresh};
@@ -147,10 +152,28 @@ pub fn check(
     let short: String = commit.chars().take(7).collect();
     run.record.commit = Some(commit.clone());
     run.record.base_ref = base_ref.clone();
+    // Where the data runs. The hooks after the services — the schema
+    // step, a seed — are the one part of a setup a shared check cannot
+    // run, because there they would run against the developer's own
+    // data. So when there are some to prove, and a namespaced start of
+    // the check's worktree could happen without a question, the check is
+    // that start: they run in a database of the check's own, which goes
+    // with its worktree. Otherwise it is shared, and says what that left
+    // untested, and why.
+    let after = hooks_after_services(&config);
+    let proving = !to_prove(&config).is_empty();
+    let shared_because = proving
+        .then(|| check_stays_shared(paths, &config))
+        .flatten();
+    let namespaced = proving && shared_because.is_none();
+    if namespaced {
+        run.record.mode = CheckMode::Namespaced;
+    }
     run.step(&format!(
-        "testing {}'s setup at {short} ({}), in a throwaway worktree (no branch)",
+        "testing {}'s setup at {short} ({}), in a throwaway worktree (no branch){}",
         paths.project.display_name,
-        base_ref.as_deref().unwrap_or("HEAD")
+        base_ref.as_deref().unwrap_or("HEAD"),
+        if namespaced { ", namespaced" } else { "" }
     ));
     // The machine, before anything is made.
     if let Some(down) = first_down(paths, &config, say.detail) {
@@ -159,14 +182,25 @@ pub fn check(
     if interrupted() {
         return Ok(run.end(CheckOutcome::Interrupted, None));
     }
-    // The hooks a check does not run, said before it runs anything.
-    let skipped = hooks_after_services(&config);
-    if !skipped.is_empty() {
+    // What the check does with the hooks after the services, said before
+    // it runs anything.
+    if namespaced {
         let line = format!(
+            "running the hooks after services ({}) in a database of the check's own, dropped \
+             with its worktree",
+            after.join(", ")
+        );
+        run.record.notes.push(line.clone());
+        run.step(&line);
+    } else if !after.is_empty() {
+        let mut line = format!(
             "skipped the hooks that run after services ({}): on the shared services they would \
              run against your own data",
-            skipped.join(", ")
+            after.join(", ")
         );
+        if let Some(why) = &shared_because {
+            line.push_str(&format!(", so the schema step was not tested — {why}"));
+        }
         run.record.notes.push(line.clone());
         run.step(&line);
     }
@@ -175,13 +209,19 @@ pub fn check(
     // The worktrees directory goes too when this check made it, empty.
     let worktrees_dir = config.worktrees_dir(paths);
     let made_dir = !worktrees_dir.exists();
-    let outcome = run.test(&config, &commit);
+    let outcome = run.test(&config, &commit, namespaced);
     let outcome = match tear_down(paths, &config, say.detail) {
-        Ok(()) => {
+        Ok(left) => {
             if made_dir {
                 let _ = std::fs::remove_dir(&worktrees_dir);
             }
-            run.step("removed the test worktree; nothing left behind");
+            match left.is_empty() {
+                true => run.step("removed the test worktree; nothing left behind"),
+                false => {
+                    run.step("removed the test worktree, but not everything it made");
+                    run.record.notes.extend(left);
+                }
+            }
             outcome
         }
         Err(e) => {
@@ -273,14 +313,27 @@ pub(super) fn commit_to_test(root: &Path, config: &Config) -> Option<(String, Op
     })
 }
 
-/// The names of the hooks a check leaves out: every one after `services`
-/// and after `dev`.
+/// The names of the hooks a shared check leaves out: every one after
+/// `services` and after `dev`.
 fn hooks_after_services(config: &Config) -> Vec<String> {
     config
         .hooks
         .iter()
         .filter(|hook| matches!(hook.after, HookPoint::Services | HookPoint::Dev))
         .map(|hook| hook.name.clone())
+        .collect()
+}
+
+/// Of those, the ones a start on data of its own would run: what a
+/// namespaced check is there to prove. One set to `on = "never"` runs
+/// nowhere, and is nothing to prove.
+fn to_prove(config: &Config) -> Vec<&str> {
+    config
+        .hooks
+        .iter()
+        .filter(|hook| matches!(hook.after, HookPoint::Services | HookPoint::Dev))
+        .filter(|hook| hook_scope(config, hook) != config::HookScope::Never)
+        .map(|hook| hook.name.as_str())
         .collect()
 }
 
@@ -350,9 +403,11 @@ impl<'a> Run<'a> {
         }
     }
 
-    /// The test itself: make the worktree, install, start, wait, and ask for
-    /// a page. Whatever it returns, the caller tears the worktree down.
-    fn test(&mut self, config: &Config, commit: &str) -> CheckOutcome {
+    /// The test itself: make the worktree, install, make its namespaces
+    /// when it runs namespaced, start, wait, and ask for a page. Whatever
+    /// it returns, the caller tears the worktree down, and its namespaces
+    /// with it.
+    fn test(&mut self, config: &Config, commit: &str, namespaced: bool) -> CheckOutcome {
         let installs = config
             .project
             .install
@@ -388,14 +443,49 @@ impl<'a> Run<'a> {
             return CheckOutcome::Interrupted;
         }
 
+        // The check's own database, and slot, in the main checkout's
+        // servers, made before anything starts, as a namespaced start makes
+        // them. Nothing here is the settings' doing: a server that refuses
+        // the login, or a login with no grant to make a database, is the
+        // machine's to fix, and the error says how.
+        let namespaces = match namespaced {
+            false => None,
+            true => {
+                self.step("making the check's own database in your servers");
+                match prepare(self.paths, config, CHECK_WORKTREE, self.say.detail) {
+                    Ok(ready) => Some(ready),
+                    Err(e) => return failed(FailureKind::Machine, &format!("{e:#}")),
+                }
+            }
+        };
+        if interrupted() {
+            return CheckOutcome::Interrupted;
+        }
+
         let names: Vec<&str> = config
             .runnable_processes()
             .map(|(name, _)| name.as_str())
             .collect();
         self.step(&format!("starting {}", names.join(", ")));
         let started = Instant::now();
-        if let Err(e) = start_for_check(self.paths, config, CHECK_WORKTREE, self.say.detail) {
-            return failed(FailureKind::Settings, &format!("{e:#}"));
+        if let Err(e) = start_for_check(
+            self.paths,
+            config,
+            CHECK_WORKTREE,
+            namespaces,
+            self.say.detail,
+        ) {
+            let text = format!("{e:#}");
+            // A hook after the services that failed is the settings' — the
+            // schema step `init --answers -` sets — and its log says why.
+            if let Some(hook) = config.hooks.iter().find(|hook| {
+                matches!(hook.after, HookPoint::Services | HookPoint::Dev)
+                    && text.contains(&failed_words(&hook.name))
+            }) {
+                let log = self.paths.log_file(CHECK_WORKTREE, &hook.name);
+                self.failed_in(&hook.name, &log);
+            }
+            return failed(FailureKind::Settings, &text);
         }
         // Every process ready, judged as `start --wait` judges it.
         self.step(&format!("waiting for {} to be ready", names.join(", ")));

@@ -3530,6 +3530,7 @@ fn agent_json_documents_every_check_key() {
     assert_eq!(printed["result"], "failed");
     assert_eq!(printed["kind"], "settings");
     assert_eq!(printed["settings_changed"], true, "a != b");
+    assert_eq!(printed["mode"], "shared");
     assert_eq!(process["secs"], 1.3, "tenths of a second");
     // The wait it documents is the one the probe waits.
     let wait = format!("{} seconds", crate::ports::PAGE_WAIT.as_secs());
@@ -3540,7 +3541,7 @@ fn agent_json_documents_every_check_key() {
 // the ones the binary prints, and no others.
 #[test]
 fn every_check_value_agent_json_documents_is_one_the_binary_prints() {
-    use crate::setup::{CheckOutcome, FailureKind, RanBy};
+    use crate::setup::{CheckMode, CheckOutcome, FailureKind, RanBy};
     let section = check_section();
     let fx = fixture();
     let mut record = full_check_record();
@@ -3582,6 +3583,18 @@ fn every_check_value_agent_json_documents_is_one_the_binary_prints() {
         .collect();
     ran_by.sort();
     assert_eq!(documented(&section, "ran_by"), ran_by);
+    let modes = [CheckMode::Shared, CheckMode::Namespaced];
+    for m in modes {
+        match m {
+            CheckMode::Shared | CheckMode::Namespaced => {}
+        }
+    }
+    let mut modes: Vec<String> = modes.into_iter().map(serde_word).collect();
+    modes.sort();
+    assert_eq!(documented(&section, "mode"), modes);
+    record.mode = CheckMode::Namespaced;
+    let printed = serde_json::to_value(super::check::check_json(&fx.paths, &record)).unwrap();
+    assert_eq!(printed["mode"], "namespaced");
 }
 
 // The check's throwaway worktree is hidden where worktrees are listed for

@@ -1311,7 +1311,8 @@ pub fn wait_until(timeout: std::time::Duration, ready: impl Fn() -> bool) -> boo
 /// finds first on PATH: its databases are files under `dbs/` of the
 /// directory returned, and `created` and `dropped` record what it did.
 /// Enough of the client for a namespaced start and an `rm`, and no server
-/// anywhere.
+/// anywhere. A file `deny` beside `dbs/` refuses every CREATE the way a
+/// login with no grant is refused.
 pub fn fake_mariadb(home: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let state = home.join("fake-mariadb");
@@ -1327,6 +1328,9 @@ case "$*" in
   *"CURRENT_USER()"*) echo "app@localhost" ;;
   *"CREATE DATABASE"*)
     db=$(printf '%s' "$*" | sed -n 's/.*CREATE DATABASE `\([^`]*\)`.*/\1/p')
+    if [ -f "$state/deny" ]; then
+      echo "ERROR 1044 (42000) at line 1: Access denied for user 'app'@'localhost' to database '$db'" >&2; exit 1
+    fi
     if [ -f "$state/dbs/$db" ]; then echo "ERROR 1007 (HY000): database exists" >&2; exit 1; fi
     touch "$state/dbs/$db"; echo "$db" >> "$state/created" ;;
   *"LIKE"*) ;;

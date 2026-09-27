@@ -57,6 +57,11 @@ pub struct CheckRecord {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub progress: Vec<String>,
     pub ran_by: RanBy,
+    /// Where the check ran the project's data: on the shared services,
+    /// with the hooks after them left out, or in namespaces of its own,
+    /// where they ran. A record from before there was a choice was shared.
+    #[serde(default)]
+    pub mode: CheckMode,
     /// Anything the check wants said beside its result, such as the hooks
     /// it skipped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -80,6 +85,22 @@ pub enum CheckOutcome {
     /// Stopped before it finished: a signal, or a `stop` of the check's
     /// own worktree.
     Interrupted,
+}
+
+/// Where a check ran the project's data.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CheckMode {
+    /// On the main checkout's own services, as a plain start runs: the
+    /// hooks after the services are not run, because they would run
+    /// against the developer's own data.
+    #[default]
+    Shared,
+    /// In a database, and a Redis slot, of the check's own in the main
+    /// checkout's servers, as `start --namespaced` runs: the hooks after
+    /// the services run there, and the namespaces are dropped with the
+    /// check's worktree.
+    Namespaced,
 }
 
 /// Whose a failure is to fix.
@@ -137,6 +158,7 @@ impl CheckRecord {
             failed_tail: Vec::new(),
             progress: Vec::new(),
             ran_by,
+            mode: CheckMode::Shared,
             notes: Vec::new(),
         }
     }

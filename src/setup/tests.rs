@@ -313,6 +313,7 @@ fn a_check_record_round_trips_with_every_field() {
         failed_tail: vec!["Error: Cannot find module 'dotenv'".to_string()],
         progress: vec!["made a test worktree".to_string(), "installing".to_string()],
         ran_by: RanBy::Terminal,
+        mode: CheckMode::Namespaced,
         notes: vec!["hooks after services were skipped".to_string()],
     };
     record.save(&f.paths).unwrap();
@@ -367,6 +368,11 @@ fn a_minimal_record_with_a_key_from_a_later_pando_still_reads() {
     );
     assert_eq!(record.fingerprint(), "abc");
     assert!(record.processes.is_empty());
+    assert_eq!(
+        record.mode,
+        CheckMode::Shared,
+        "a record from before the choice"
+    );
 }
 
 #[test]

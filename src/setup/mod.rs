@@ -15,7 +15,9 @@ mod redact;
 mod state;
 
 pub use fingerprint::{FINGERPRINT_VERSION, fingerprint};
-pub use record::{CheckOutcome, CheckRecord, FailureKind, ProcessResult, RanBy, SetupMemory};
+pub use record::{
+    CheckMode, CheckOutcome, CheckRecord, FailureKind, ProcessResult, RanBy, SetupMemory,
+};
 pub use redact::redact_line;
 pub use state::{Setup, SetupState, check_running, decide, read};
 

@@ -216,28 +216,37 @@ struct Preflight {
     /// This start is a `restart --only`: the process it names is replaced
     /// even while it runs, rather than reported as already up.
     restarting: bool,
-    /// This start is `pando check`'s: the hooks after `services` and after
-    /// `dev` are not run. On the shared services they would run against
-    /// the developer's own data — a migration marked `on = "always"`, or
-    /// any such hook in a project with no services pando runs — and a
-    /// test must not change what it tests on. The check says so itself.
+    /// This start is `pando check`'s on the shared services: the hooks
+    /// after `services` and after `dev` are not run. There they would run
+    /// against the developer's own data — a migration marked `on =
+    /// "always"`, or any such hook in a project with no services pando
+    /// runs — and a test must not change what it tests on. The check says
+    /// so itself.
     skip_after_services: bool,
 }
 
-/// [`start`] for `pando check`: every process of `name`, on the shared
-/// services, with the hooks after services left out — see
-/// [`Preflight::skip_after_services`].
+/// [`start`] for `pando check`: every process of `name`. With no
+/// namespaces, on the shared services, with the hooks after services left
+/// out — see [`Preflight::skip_after_services`]. With the namespaces the
+/// check made first, namespaced, and those hooks run in them: that is the
+/// schema step proved on data that is the check's own.
 pub(super) fn start_for_check(
     paths: &PandoPaths,
     config: &Config,
     name: &str,
+    namespaces: Option<Ready>,
     progress: &dyn Fn(&str),
 ) -> Result<StartReport> {
+    let mode = match namespaces {
+        Some(_) => Mode::Namespaced,
+        None => Mode::Shared,
+    };
     let preflight = Preflight {
-        skip_after_services: true,
+        skip_after_services: namespaces.is_none(),
+        namespaces,
         ..Preflight::default()
     };
-    start_checked(paths, config, name, None, Mode::Shared, preflight, progress)
+    start_checked(paths, config, name, None, mode, preflight, progress)
 }
 
 fn start_checked(

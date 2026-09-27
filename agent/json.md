@@ -433,19 +433,30 @@ directory form, `feat+one`, in `name`.
 
 The result of one `pando check`: it makes a worktree of the commit a new
 worktree would fork from, with no branch, installs it and starts every
-process on the shared services, waits until each one is ready, asks the
-process that owns the worktree's URL for `/`, then stops and removes all
-of it. Hooks after `services` and after `dev` are not run, and `notes`
-says which. It writes under pando's home and, for the throwaway worktree
-it removes again, inside `.git`; never into the repository. Printed
-whatever the result — a pass, a failure, a question still open, an
-interruption — as the one object on stdout.
+process, waits until each one is ready, asks the process that owns the
+worktree's URL for `/`, then stops and removes all of it. It writes under
+pando's home and, for the throwaway worktree it removes again, inside
+`.git`; never into the repository. Printed whatever the result — a pass,
+a failure, a question still open, an interruption — as the one object on
+stdout.
+
+`mode` says where it ran the project's data. `namespaced` when the
+project has hooks after `services` or after `dev` to prove — a schema
+step — and a `start --namespaced` of the check's worktree could run
+without a question: a database, and a Redis slot, of the check's own are
+made in the main checkout's servers, those hooks run there, and all of it
+is dropped with the worktree, never the main checkout's own. `shared`
+otherwise, as a plain start runs: those hooks are not run, since there
+they would run against the developer's own data, and `notes` says which,
+and — when there were some to prove — that the schema step was not
+tested, and why.
 
 ```jsonc
 {
   "version": 2,
   "project": { "id": "...", "root": "...", "name": "..." },
   "result": "passed|failed|not_set_up|interrupted",
+  "mode": "shared|namespaced",     // where its data ran: see below
   "kind": "settings|machine",      // whose the failure is; null unless "failed"
   "reason": "web exited with status 1 — ...", // null when "passed"
   "slot": "dev_cmd",               // the open question; null unless "not_set_up"
@@ -470,11 +481,14 @@ interruption — as the one object on stdout.
 ```
 
 `kind` says who fixes a failure. `settings` is pando's settings for the
-project — a dev command that exits, an install that fails, a page that
-answers `5xx` — and is fixed through `pando init --answers -`, then
-checked again. `machine` is this machine: a shared service nothing
-answers on, found before anything was made. `reason` then carries the
-command that starts it, and no setting changes it.
+project — a dev command that exits, an install that fails, a schema step
+that fails in a namespaced check, a page that answers `5xx` — and is
+fixed through `pando init --answers -`, then checked again; a failed hook
+is `failed_process`, by its name. `machine` is this machine: a shared
+service nothing answers on, found before anything was made, or in a
+namespaced check a server that refuses the login or a login with no grant
+to make a database. `reason` then carries the command that fixes it, and
+no setting changes it.
 
 `ready` is about the process alone, judged as `start --wait` judges it.
 The page is judged apart: a process can be `ready` with a page that
