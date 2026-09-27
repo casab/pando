@@ -11,6 +11,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use crate::art::WordmarkSize;
 use crate::setup::SETUP_PROMPT;
 use crate::theme::{green, orange, red, surface, text, text_dim, text_muted, yellow};
 use crate::tui::app::{App, SetupLine, SetupScreen, Trying};
@@ -27,19 +28,35 @@ struct Block {
 }
 
 const BLANK: u8 = 0;
-/// The grove: the first thing a short screen gives up, after blank rows.
-const GROVE: u8 = 1;
-const EXPLANATION: u8 = 2;
-const STEPS: u8 = 3;
-const HEADING: u8 = 4;
-const STEP_ONE: u8 = 5;
-const LIVE: u8 = 6;
-const PROMPT: u8 = 7;
+/// The wordmark, then the grove: the first things a short screen gives
+/// up, after blank rows. They are sized to the rows there are, so a
+/// screen only drops them when even their smallest does not fit.
+const WORDMARK: u8 = 1;
+const GROVE: u8 = 2;
+const EXPLANATION: u8 = 3;
+/// The prompt card's top and bottom edges.
+const CARD_EDGE: u8 = 4;
+const STEPS: u8 = 5;
+const HEADING: u8 = 6;
+const STEP_ONE: u8 = 7;
+const LIVE: u8 = 8;
+const PROMPT: u8 = 9;
 
 /// The tallest and widest the grove is drawn: past these it is a forest
 /// that crowds out what the screen is for.
 const GROVE_ROWS: usize = 11;
 const GROVE_WIDTH: usize = 100;
+
+/// Rows the grove's block has besides the picture: the names under the
+/// stems, the caption, and a blank row under them.
+const GROVE_EXTRA_ROWS: usize = 3;
+
+/// The smallest grove worth the big wordmark over it.
+const GROVE_ROWS_UNDER_BIG_MARK: usize = 8;
+
+/// What `a` says once it has copied: the flash the copy leaves, which the
+/// key cap reads to turn into "✓ copied" while it shows.
+const COPIED: &str = "copied the setup prompt";
 
 pub(super) fn render_setup(f: &mut Frame, area: Rect, app: &App) {
     let Some(screen) = app.setup_screen.as_ref() else {
@@ -58,7 +75,7 @@ pub(super) fn render_setup(f: &mut Frame, area: Rect, app: &App) {
     } else {
         setup_blocks(app, screen, width)
     };
-    let blocks = with_grove(blocks, app, width, body.height as usize, screen.is_ready());
+    let blocks = with_art(blocks, app, width, body.height as usize, screen.is_ready());
     let mut lines = fit(blocks, body.height as usize);
     // A little lower than the top on a tall screen, so it does not sit in
     // a corner over an empty half.
@@ -174,34 +191,16 @@ fn setup_blocks(app: &App, screen: &SetupScreen, width: usize) -> Vec<Block> {
     blocks.push(blank());
     blocks.push(Block {
         priority: STEP_ONE,
-        lines: vec![step_one(pad, room)],
+        lines: vec![step_one(app, pad, room)],
     });
-    blocks.push(blank());
-    // No border either side: selected over SSH, the text is all that
-    // comes with it.
-    // Set in from the steps where it still fits on one row that way;
-    // a row of its own matters more than the indent.
-    let prompt_pad = if width >= text_width(SETUP_PROMPT) + pad * 2 + 5 {
-        pad + 5
-    } else {
-        pad
-    };
-    blocks.push(Block {
-        priority: PROMPT,
-        lines: wrapped(
-            SETUP_PROMPT,
-            prompt_pad,
-            width.saturating_sub(prompt_pad + pad).max(1),
-            Style::new().fg(text()).add_modifier(Modifier::BOLD),
-        ),
-    });
+    blocks.extend(prompt_card(pad, room));
     blocks.push(blank());
     let root = home_relative(app.paths.root());
     blocks.push(Block {
         priority: STEPS,
         lines: step(
             "2",
-            &format!("paste it into Claude Code or Codex, opened in {root}"),
+            &format!("Paste it into Claude Code or Codex, opened in {root}"),
             pad,
             room,
         ),
@@ -210,7 +209,7 @@ fn setup_blocks(app: &App, screen: &SetupScreen, width: usize) -> Vec<Block> {
         priority: STEPS,
         lines: step(
             "3",
-            "come back here: this screen turns green by itself when it's done",
+            "Come back here: this screen turns green by itself when it's done",
             pad,
             room,
         ),
@@ -268,8 +267,11 @@ fn ready_blocks(screen: &SetupScreen, app: &App, width: usize) -> Vec<Block> {
     blocks.push(Block {
         priority: STEP_ONE,
         lines: margin(vec![Line::from(vec![
-            Span::styled("⏎", Style::new().fg(orange()).add_modifier(Modifier::BOLD)),
-            Span::styled(" open pando", Style::new().fg(text())),
+            key_cap("⏎"),
+            Span::styled(
+                " open pando",
+                Style::new().fg(text()).add_modifier(Modifier::BOLD),
+            ),
         ])]),
     });
     blocks
@@ -407,27 +409,88 @@ fn blank() -> Block {
     }
 }
 
-/// `1  copy this prompt`, with `a copies it` at the right edge when it
-/// fits there and after it otherwise.
-fn step_one(pad: usize, room: usize) -> Line<'static> {
-    let what = "copy this prompt";
-    let key_hint = "a copies it";
-    let used = 3 + what.len() + key_hint.len();
-    let gap = if room > used + 2 { room - used } else { 3 };
-    truncate_line(
-        Line::from(vec![
-            Span::raw(" ".repeat(pad)),
-            Span::styled(
-                "1  ",
-                Style::new().fg(orange()).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(what, Style::new().fg(text())),
-            Span::raw(" ".repeat(gap)),
-            Span::styled("a", Style::new().fg(orange()).add_modifier(Modifier::BOLD)),
-            Span::styled(" copies it", Style::new().fg(text_muted())),
-        ]),
-        pad + room,
+/// `1  Copy this prompt:` and, right after it, the key that does it as a
+/// key cap — or, just after it was pressed, "✓ copied" in its place.
+fn step_one(app: &App, pad: usize, room: usize) -> Line<'static> {
+    let copied = app
+        .flash()
+        .is_some_and(|status| status.message.starts_with(COPIED));
+    let mut spans = vec![
+        Span::raw(" ".repeat(pad)),
+        Span::styled(
+            "1  ",
+            Style::new().fg(orange()).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "Copy this prompt:",
+            Style::new().fg(text()).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+    ];
+    match copied {
+        true => spans.push(Span::styled(
+            "✓ copied",
+            Style::new().fg(green()).add_modifier(Modifier::BOLD),
+        )),
+        false => {
+            spans.push(key_cap("a"));
+            spans.push(Span::styled(" copy", Style::new().fg(text_dim())));
+        }
+    }
+    truncate_line(Line::from(spans), pad + room)
+}
+
+/// A key, drawn as a key cap: the one thing on the screen to press.
+fn key_cap(key: &str) -> Span<'static> {
+    Span::styled(
+        format!(" {key} "),
+        Style::new()
+            .fg(surface())
+            .bg(orange())
+            .add_modifier(Modifier::BOLD),
     )
+}
+
+/// The prompt, on a panel of its own under step one: a top and a bottom
+/// edge in half blocks, and the prompt's rows on the panel's colour
+/// between them.
+///
+/// No character either side of the prompt: selected with a mouse over
+/// SSH, the row brings the prompt and spaces, nothing else. The edges
+/// are rows of their own, and a short screen gives them up before the
+/// prompt.
+fn prompt_card(pad: usize, room: usize) -> Vec<Block> {
+    let inner = text_width(SETUP_PROMPT);
+    let card = room.min(inner + 4);
+    let rows = wrap_text(SETUP_PROMPT, card.saturating_sub(4).max(1));
+    let edge = |ch: &str| Block {
+        priority: CARD_EDGE,
+        lines: vec![Line::from(vec![
+            Span::raw(" ".repeat(pad)),
+            Span::styled(ch.repeat(card), Style::new().fg(surface())),
+        ])],
+    };
+    let panel = Style::new().bg(surface());
+    let body = rows
+        .into_iter()
+        .map(|row| {
+            let fill = card.saturating_sub(text_width(&row) + 2);
+            Line::from(vec![
+                Span::raw(" ".repeat(pad)),
+                Span::styled("  ", panel),
+                Span::styled(row, panel.fg(text()).add_modifier(Modifier::BOLD)),
+                Span::styled(" ".repeat(fill), panel),
+            ])
+        })
+        .collect();
+    vec![
+        edge("▄"),
+        Block {
+            priority: PROMPT,
+            lines: body,
+        },
+        edge("▀"),
+    ]
 }
 
 /// A numbered step, its text wrapped under itself.
@@ -489,79 +552,154 @@ fn marked(
         .collect()
 }
 
-/// `blocks` with the grove above them, in the rows they leave over: as
-/// tall as [`GROVE_ROWS`] where there is room, shorter where there is
-/// less, and not at all where it would not read as a grove.
+/// `blocks` with the first run's pictures above them, in the rows they
+/// leave over: the PANDO wordmark, big where there is room for it and a
+/// grove under it, compact where there is less, and the grove, as tall
+/// as [`GROVE_ROWS`] where there is room and never shorter than a grove
+/// reads. On a classic 80×24 a blank row or two between the steps is a
+/// fair price for the smallest grove, and `fit` pays blank rows first.
 ///
-/// The picture is pando's namesake — one aspen, thousands of stems, one
-/// root system — seeded by the project, so each project has its own
-/// grove. While pando is being set up its leaves are gold and its roots
-/// dark; once the check passes, the grove comes alive: green leaves, and
-/// the roots lit, joining every stem.
-fn with_grove(
+/// The grove is pando's namesake — one aspen, thousands of stems, one
+/// root system — seeded by the project, so each project has its own, and
+/// its stems carry branch names, `main` first: each stem a branch in a
+/// worktree of its own. The leaves are gold; the roots are dark while
+/// pando is being set up, and light up once the check passes.
+fn with_art(
     mut blocks: Vec<Block>,
     app: &App,
     width: usize,
     height: usize,
     alive: bool,
 ) -> Vec<Block> {
+    use crate::art::{COMPACT_WIDTH, GROVE_MIN_HEIGHT, WORDMARK_HEIGHT, WORDMARK_WIDTH};
     let used: usize = blocks.iter().map(|b| b.lines.len()).sum();
-    // A caption under the picture, and a blank row under that. At least
-    // the smallest grove: on a classic 80×24 a blank row or two between
-    // the steps is a fair price for it, and `fit` pays blank rows first.
-    let rows = height
-        .saturating_sub(used + 2)
-        .clamp(crate::grove::MIN_HEIGHT, GROVE_ROWS);
+    let spare = height.saturating_sub(used);
     let pad = indent(width);
     let room = width.saturating_sub(pad * 2);
     let art_width = room.min(GROVE_WIDTH);
-    let picture = crate::grove::grove(
-        art_width,
-        rows,
-        u64::from(app.tick),
-        crate::grove::seed_of(&app.paths.project.id),
-    );
-    if picture.is_empty() {
-        return blocks;
-    }
     let left = pad + (room - art_width) / 2;
-    let mut lines: Vec<Line<'static>> = picture
-        .iter()
-        .map(|row| grove_line(row, left, alive))
-        .collect();
-    let caption = match alive {
-        true => "one root, every branch alive",
-        false => "Pando: one aspen, 47,000 stems, one root. Your repo, every branch alive.",
-    };
-    lines.push(Line::from(vec![
-        Span::raw(" ".repeat(left)),
-        Span::styled(
-            truncate(caption, art_width),
-            Style::new()
-                .fg(if alive { green() } else { text_muted() })
-                .add_modifier(Modifier::ITALIC),
-        ),
-    ]));
-    // Under the blank the screen opens with.
-    let at = usize::from(blocks.first().is_some_and(|b| b.priority == BLANK));
-    blocks.insert(
-        at,
-        Block {
+    let grove_rows = |rows: usize| rows.saturating_sub(GROVE_EXTRA_ROWS).min(GROVE_ROWS);
+    // The wordmark, the credit under it, and a blank row.
+    let big = WORDMARK_HEIGHT + 2;
+    let compact = 2 + 2;
+    let (mark, rows) =
+        if room >= WORDMARK_WIDTH && spare >= big + GROVE_ROWS_UNDER_BIG_MARK + GROVE_EXTRA_ROWS {
+            (Some(WordmarkSize::Big), grove_rows(spare - big))
+        } else if room >= COMPACT_WIDTH && spare >= compact + GROVE_MIN_HEIGHT + GROVE_EXTRA_ROWS {
+            (Some(WordmarkSize::Compact), grove_rows(spare - compact))
+        } else {
+            // The smallest grove does not fit as the screen stands: the
+            // explanation gives way to it first, then blank rows, so the
+            // steps still read as steps.
+            if spare < GROVE_MIN_HEIGHT + GROVE_EXTRA_ROWS
+                && let Some(i) = blocks.iter().position(|b| b.priority == EXPLANATION)
+            {
+                let after = usize::from(blocks.get(i + 1).is_some_and(|b| b.priority == BLANK));
+                blocks.drain(i..=i + after);
+            }
+            let used: usize = blocks.iter().map(|b| b.lines.len()).sum();
+            (
+                None,
+                grove_rows(height.saturating_sub(used)).max(GROVE_MIN_HEIGHT),
+            )
+        };
+    let seed = crate::art::seed_of(&app.paths.project.id);
+    let frame = u64::from(app.tick);
+    let grove = crate::art::grove(art_width, rows, frame, seed);
+    let mut art = Vec::new();
+    if let Some(size) = mark {
+        // Centred on the screen, with the credit centred under it.
+        let mark_width = match size {
+            WordmarkSize::Big => WORDMARK_WIDTH,
+            WordmarkSize::Compact => COMPACT_WIDTH,
+        };
+        let centre = |w: usize| width.saturating_sub(w) / 2;
+        let mut lines: Vec<Line<'static>> = crate::art::wordmark(size, frame)
+            .iter()
+            .map(|row| art_line(row, centre(mark_width), alive))
+            .collect();
+        let credit = truncate(&crate::art::credit(), width);
+        lines.push(Line::from(vec![
+            Span::raw(" ".repeat(centre(text_width(&credit)))),
+            Span::styled(credit, Style::new().fg(text_muted())),
+        ]));
+        art.push(Block {
+            priority: WORDMARK,
+            lines,
+        });
+        art.push(blank());
+    }
+    if !grove.is_empty() {
+        let mut lines: Vec<Line<'static>> = grove
+            .cells
+            .iter()
+            .map(|row| art_line(row, left, alive))
+            .collect();
+        lines.push(stem_names(&grove.stems, left, art_width));
+        let caption = match alive {
+            true => "one root, every branch alive",
+            false => "Pando: one aspen, 47,000 stems, one root. Your repo, every branch alive.",
+        };
+        lines.push(Line::from(vec![
+            Span::raw(" ".repeat(left)),
+            Span::styled(
+                truncate(caption, art_width),
+                Style::new()
+                    .fg(if alive { green() } else { text_muted() })
+                    .add_modifier(Modifier::ITALIC),
+            ),
+        ]));
+        art.push(Block {
             priority: GROVE,
             lines,
-        },
-    );
-    blocks.insert(at + 1, blank());
+        });
+        art.push(blank());
+    }
+    // Under the blank the screen opens with.
+    let at = usize::from(blocks.first().is_some_and(|b| b.priority == BLANK));
+    blocks.splice(at..at, art);
     blocks
 }
 
-/// One row of the grove as spans, a run of one material at a time.
-fn grove_line(row: &[crate::grove::Cell], left: usize, alive: bool) -> Line<'static> {
+/// Branch names for the stems: the picture's, not the project's. Each
+/// stem is a branch living in a worktree of its own, and a name under it
+/// says so; a real branch there would put a project's work in a picture
+/// meant for any project.
+const STEM_NAMES: [&str; 7] = [
+    "main",
+    "feat/checkout",
+    "fix/login-loop",
+    "feat/search",
+    "chore/deps",
+    "feat/dark-mode",
+    "fix/typo",
+];
+
+/// The row under the root line: a branch name under each stem there is
+/// room for, left to right, `main` first.
+fn stem_names(stems: &[usize], left: usize, width: usize) -> Line<'static> {
+    let labels: Vec<String> = STEM_NAMES.iter().map(|n| n.to_string()).collect();
+    let mut spans = vec![Span::raw(" ".repeat(left))];
+    let mut at = 0;
+    for (x, label) in crate::art::label_stems(stems, &labels, width) {
+        spans.push(Span::raw(" ".repeat(x - at)));
+        let style = match label == STEM_NAMES[0] {
+            true => Style::new().fg(text()).add_modifier(Modifier::BOLD),
+            false => Style::new().fg(text_dim()),
+        };
+        at = x + text_width(&label);
+        spans.push(Span::styled(label, style));
+    }
+    Line::from(spans)
+}
+
+/// One row of a picture as spans, a run of one colour at a time.
+fn art_line(row: &[crate::art::Cell], left: usize, alive: bool) -> Line<'static> {
     let mut spans = vec![Span::raw(" ".repeat(left))];
     let mut run = String::new();
     let mut style = Style::new();
     for cell in row {
-        let next = grove_style(cell, alive);
+        let next = art_style(cell, alive);
         if next != style && !run.is_empty() {
             spans.push(Span::styled(std::mem::take(&mut run), style));
         }
@@ -574,19 +712,20 @@ fn grove_line(row: &[crate::grove::Cell], left: usize, alive: bool) -> Line<'sta
     Line::from(spans)
 }
 
-/// A grove cell's colour: gold leaves and dark roots while pando is being
-/// set up; green leaves flecked with gold, and roots lit, once it is ready.
-fn grove_style(cell: &crate::grove::Cell, alive: bool) -> Style {
-    use crate::grove::Material;
+/// A picture cell's colour: gold letters and leaves, white stems, and
+/// roots dark while pando is being set up and lit once it is ready.
+fn art_style(cell: &crate::art::Cell, alive: bool) -> Style {
+    use crate::art::Material;
     let fg = match (cell.material, alive) {
         (Material::Sky, _) => return Style::new(),
-        (Material::Canopy, false) => yellow(),
-        (Material::Canopy, true) if cell.ch == '█' => yellow(),
-        (Material::Canopy, true) => green(),
+        (Material::Letter, _) => {
+            return Style::new().fg(yellow()).add_modifier(Modifier::BOLD);
+        }
+        (Material::Canopy, _) => yellow(),
         (Material::Trunk, _) => text(),
-        (Material::Eye, _) | (Material::Ground, _) => text_muted(),
-        (Material::Root, false) => text_muted(),
-        (Material::Root, true) => orange(),
+        (Material::Eye | Material::Ground | Material::Shadow, _) => text_muted(),
+        (Material::Root, false) => text_dim(),
+        (Material::Root, true) => green(),
     };
     Style::new().fg(fg)
 }

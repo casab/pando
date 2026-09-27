@@ -4001,16 +4001,16 @@ fn the_setup_screen_draws_the_prompt_without_side_borders() {
         text.contains("It never changes a file in your project."),
         "{text}"
     );
-    assert!(text.contains("1  copy this prompt"), "{text}");
-    assert!(text.contains("a copies it"), "{text}");
+    assert!(text.contains("1  Copy this prompt"), "{text}");
+    assert!(text.contains(" a  copy"), "{text}");
     let prompt = rows_with(&text, SETUP_PROMPT);
     assert_eq!(prompt.len(), 1, "one row, whole:\n{text}");
     assert_eq!(prompt[0].trim(), SETUP_PROMPT, "nothing beside it");
     assert!(
-        text.contains("2  paste it into Claude Code or Codex"),
+        text.contains("2  Paste it into Claude Code or Codex"),
         "{text}"
     );
-    assert!(text.contains("3  come back here"), "{text}");
+    assert!(text.contains("3  Come back here"), "{text}");
     assert!(text.contains("reading acme-shop…"), "{text}");
     let footer = text.lines().last().unwrap();
     assert!(footer.contains("a copy the prompt"), "{footer}");
@@ -4064,8 +4064,8 @@ fn a_short_setup_screen_drops_the_explanation_first() {
     let text = text_of(&draw(&mut app, 120, 9));
     assert!(text.contains(SETUP_PROMPT), "{text}");
     assert!(text.contains("reading acme-shop"), "{text}");
-    assert!(text.contains("1  copy this prompt"), "{text}");
-    assert!(text.contains("3  come back here"), "{text}");
+    assert!(text.contains("1  Copy this prompt"), "{text}");
+    assert!(text.contains("3  Come back here"), "{text}");
     assert!(
         !text.contains("Every project is a little different"),
         "{text}"
@@ -4685,7 +4685,7 @@ fn the_setup_screen_opens_on_a_grove_above_the_prompt() {
         let grove = grove_rows(&buf, WAITING_CAPTION);
         // Its top row may be all sky, which reads as blank here.
         assert!(
-            grove.len() >= crate::grove::MIN_HEIGHT - 1,
+            grove.len() >= crate::art::GROVE_MIN_HEIGHT - 1,
             "{width}×{height}: a grove of {} rows\n{text}",
             grove.len()
         );
@@ -4720,20 +4720,31 @@ fn a_short_screen_gives_the_grove_up_first() {
     assert!(text.contains("reading acme-shop"), "{text}");
 }
 
-// While pando is being set up the leaves are gold and the roots dark;
-// once the check passes the grove comes alive: green leaves flecked with
-// gold, and the roots lit, joining every stem.
+// The leaves are gold, like Pando's in the fall, and the stems white.
+// The root line is dark while pando is being set up; once the check
+// passes it lights up green, joining every stem.
 #[test]
-fn the_grove_comes_alive_when_the_setup_is_ready() {
-    use crate::theme::{green, orange, text, text_muted, yellow};
+fn the_roots_light_up_when_the_setup_is_ready() {
+    use crate::theme::{green, text, text_dim, yellow};
+    let roots = |cells: &[(char, ratatui::style::Color)]| -> Vec<ratatui::style::Color> {
+        cells
+            .iter()
+            .filter(|(ch, _)| "┃┻━╺╸".contains(*ch))
+            .map(|(_, fg)| *fg)
+            .collect()
+    };
     let (_dir, mut app) = app_on_setup_screen(false);
     let buf = draw(&mut app, 100, 40);
     let waiting = colours_in(&buf, grove_rows(&buf, WAITING_CAPTION));
     let colours: Vec<_> = waiting.iter().map(|(_, fg)| *fg).collect();
     assert!(colours.contains(&yellow()), "gold leaves");
     assert!(colours.contains(&text()), "white stems");
-    assert!(colours.contains(&text_muted()), "dark roots");
-    assert!(!colours.contains(&green()) && !colours.contains(&orange()));
+    assert!(
+        !colours.contains(&green()),
+        "nothing green before it is ready"
+    );
+    let dark = roots(&waiting);
+    assert!(!dark.is_empty() && dark.iter().all(|fg| *fg == text_dim()));
 
     let (_dir, mut app) = ready_screen(
         vec![ProcessResult {
@@ -4747,16 +4758,14 @@ fn the_grove_comes_alive_when_the_setup_is_ready() {
     );
     let buf = draw(&mut app, 100, 40);
     let alive = colours_in(&buf, grove_rows(&buf, ALIVE_CAPTION));
-    let colours: Vec<_> = alive.iter().map(|(_, fg)| *fg).collect();
-    assert!(colours.contains(&green()), "green leaves");
-    assert!(colours.contains(&orange()), "the roots lit");
-    // Gold only where the leaves are densest.
     assert!(
-        alive
-            .iter()
-            .filter(|(_, fg)| *fg == yellow())
-            .all(|(ch, _)| *ch == '█'),
-        "gold flecks only on solid leaves"
+        alive.iter().any(|(_, fg)| *fg == yellow()),
+        "still gold leaves"
+    );
+    let lit = roots(&alive);
+    assert!(
+        !lit.is_empty() && lit.iter().all(|fg| *fg == green()),
+        "the roots lit"
     );
 }
 
@@ -4789,4 +4798,123 @@ fn the_grove_quakes_on_the_tick_and_nothing_else_moves() {
         moved += 1;
     }
     assert!(moved > 0, "the grove did not quake");
+}
+
+// Copying is the one thing the screen asks for, so it looks like it: a
+// key cap for `a` beside step one, and the prompt on a panel of its own
+// — edges above and below, the panel's colour behind it, and nothing
+// either side on its row, so a mouse selection is the prompt alone. Once
+// `a` is pressed, the key cap says it worked.
+#[test]
+fn the_prompt_is_a_card_with_a_key_that_says_when_it_copied() {
+    use crate::theme::{green, orange, surface};
+    let (_dir, mut app) = app_on_setup_screen(false);
+    let buf = draw(&mut app, 100, 40);
+    let text = text_of(&buf);
+    let rows: Vec<&str> = text.lines().collect();
+    let step = rows
+        .iter()
+        .position(|r| r.contains("1  Copy this prompt"))
+        .unwrap();
+    let prompt = rows.iter().position(|r| r.contains(SETUP_PROMPT)).unwrap();
+    assert_eq!(
+        prompt,
+        step + 2,
+        "the card sits right under step one\n{text}"
+    );
+    assert!(rows[prompt - 1].trim().chars().all(|c| c == '▄'), "{text}");
+    assert!(rows[prompt + 1].trim().chars().all(|c| c == '▀'), "{text}");
+    assert_eq!(rows[prompt].trim(), SETUP_PROMPT, "nothing beside it");
+    // The panel's colour is behind the prompt, not a character.
+    let at = rows[prompt].find("Set up").unwrap() as u16;
+    let cell = buf.cell((at, prompt as u16)).unwrap();
+    assert_eq!(cell.bg, surface());
+    // The key cap: `a` on the accent, right after the words, not off at
+    // the far edge.
+    assert!(
+        rows[step]
+            .trim_end()
+            .ends_with("Copy this prompt:   a  copy"),
+        "{}",
+        rows[step]
+    );
+    let key = rows[step].rfind(" a ").unwrap() as u16 + 1;
+    let cap = buf.cell((key, step as u16)).unwrap();
+    assert_eq!((cap.symbol(), cap.bg), ("a", orange()), "{}", rows[step]);
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+    let buf = draw(&mut app, 100, 40);
+    let text = text_of(&buf);
+    let row = text
+        .lines()
+        .find(|r| r.contains("1  Copy this prompt"))
+        .unwrap();
+    assert!(
+        row.trim_end().ends_with("Copy this prompt:  ✓ copied"),
+        "{row}"
+    );
+    let y = text
+        .lines()
+        .position(|r| r.contains("1  Copy this prompt"))
+        .unwrap() as u16;
+    let x = row.find('✓').map(|b| row[..b].chars().count()).unwrap() as u16;
+    assert_eq!(buf.cell((x, y)).unwrap().fg, green());
+}
+
+// The stems carry branch names, `main` first: the picture's own names,
+// never the project's — a real branch there would show a project's work
+// in a picture meant for any project.
+#[test]
+fn the_stems_carry_branch_names_of_the_pictures_own() {
+    let (_dir, mut app) = app_on_setup_screen(false);
+    let text = text_of(&draw(&mut app, 100, 40));
+    let names = text
+        .lines()
+        .find(|r| r.contains("feat/checkout"))
+        .unwrap_or_else(|| panic!("no names under the stems\n{text}"));
+    let main = names.find("main").expect("main first");
+    assert!(main < names.find("feat/checkout").unwrap(), "{names}");
+    // The fixture's own worktree is `feat/one`: not in the picture.
+    assert!(!text.contains("feat/one"), "{text}");
+    // Each name stands under a stem: the root line has a joint above it.
+    let rows: Vec<&str> = text.lines().collect();
+    let at = rows.iter().position(|r| *r == names).unwrap();
+    let line: Vec<char> = rows[at - 1].chars().collect();
+    for name in ["main", "feat/checkout"] {
+        let x = names[..names.find(name).unwrap()].chars().count();
+        assert_eq!(
+            line[x],
+            '┻',
+            "{name} is not under a stem\n{}\n{names}",
+            rows[at - 1]
+        );
+    }
+}
+
+// PANDO, in block letters, over the grove where the screen has room for
+// both; a smaller screen gets the compact wordmark, then none.
+#[test]
+fn the_wordmark_heads_the_screen_where_it_fits() {
+    let big = crate::art::to_text(&crate::art::wordmark(crate::art::WordmarkSize::Big, 0));
+    let first_row = big.lines().next().unwrap().trim_end().to_string();
+    let (_dir, mut app) = app_on_setup_screen(false);
+    let text = text_of(&draw(&mut app, 100, 40));
+    assert!(text.contains(&first_row), "{text}");
+    let at = text.lines().position(|r| r.contains(&first_row)).unwrap();
+    let grove = text.lines().position(|r| r.contains('┻')).unwrap();
+    assert!(at < grove, "the wordmark heads the grove\n{text}");
+    // Centred, with who made it centred under it.
+    let row = text.lines().nth(at).unwrap();
+    let left = row.find(&first_row).unwrap();
+    assert_eq!(left, (100 - crate::art::WORDMARK_WIDTH) / 2, "{row}");
+    let credit = crate::art::credit();
+    let under = text.lines().nth(at + crate::art::WORDMARK_HEIGHT).unwrap();
+    assert_eq!(under.trim(), credit, "{text}");
+    let credit_left = under.find(&credit).unwrap();
+    assert_eq!(credit_left, (100 - credit.chars().count()) / 2, "{under}");
+
+    let (_dir, mut app) = app_on_setup_screen(false);
+    let text = text_of(&draw(&mut app, 60, 40));
+    assert!(!text.contains(&first_row), "{text}");
+    assert!(text.contains("█▀█ ▄▀█ █▄ █ █▀▄ █▀█"), "{text}");
 }

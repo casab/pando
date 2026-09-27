@@ -26,9 +26,9 @@ use crate::setup::{self, SETUP_PROMPT, SetupState};
 /// Not on a terminal nothing is read or written: a script or an agent
 /// never sees the tip, and its runs do not use it up.
 ///
-/// Above the three lines, through `draw`, the project's grove — the
-/// picture the setup screen opens on — so a first run from the CLI
-/// starts on the same moment as one from the TUI.
+/// Above the three lines, through `draw`, the PANDO wordmark over the
+/// project's grove — the pictures the setup screen opens on — so a first
+/// run from the CLI starts on the same moment as one from the TUI.
 pub(super) fn first_time_tip(
     paths: &PandoPaths,
     config: &Config,
@@ -48,14 +48,14 @@ pub(super) fn first_time_tip(
     if memory.save(paths).is_err() {
         return false;
     }
-    let grove = super::art::grove_lines(
+    let banner = super::art::banner_lines(
         super::art::stderr_columns(),
-        crate::grove::seed_of(&paths.project.id),
+        crate::art::seed_of(&paths.project.id),
         false,
         &crate::term::Style::for_stderr(),
     );
-    if !grove.is_empty() {
-        for line in &grove {
+    if !banner.is_empty() {
+        for line in &banner {
             draw(line);
         }
         draw("");

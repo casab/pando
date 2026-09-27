@@ -6,6 +6,8 @@
 > branch you are working on side by side, gives each one a running dev server,
 > its own database, and a shareable URL, and never writes a byte into your repo.
 
+Created by [Mert Karadayi](https://github.com/mertkaradayi).
+
 ## The story
 
 Pando is a single quaking aspen in Fishlake National Forest, Utah. It looks like

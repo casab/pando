@@ -2557,6 +2557,28 @@ fn the_readme_carries_the_setup_prompt_as_it_is() {
     assert_every_command_is_real("README.md's setup prompt", crate::setup::SETUP_PROMPT);
 }
 
+// Who made pando is one fact: the wordmark's credit, the README and
+// Cargo.toml say the same name and the same link.
+#[test]
+fn the_creator_is_credited_the_same_everywhere() {
+    use crate::art::{CREATOR, CREATOR_URL};
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
+    assert!(
+        readme.contains(&format!("Created by [{CREATOR}]({CREATOR_URL})")),
+        "README.md does not credit {CREATOR}"
+    );
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    assert!(
+        manifest.contains(&format!("authors = [\"{CREATOR} <{CREATOR_URL}>\"]")),
+        "Cargo.toml's authors"
+    );
+    assert_eq!(
+        crate::art::credit(),
+        format!("created by {CREATOR} · github.com/mertkaradayi")
+    );
+}
+
 // The job an agent follows lists the commands it will run; the same
 // rename would rot it.
 #[test]
@@ -3896,33 +3918,37 @@ fn tip_with_picture(fx: &Fx, config: &Config, terminal: bool) -> (bool, Vec<Stri
     (shown, said.into_inner(), drawn.into_inner())
 }
 
-// The CLI's grove is the TUI's in sixteen colours: gold leaves while the
-// setup waits, green ones once a check passed, plain text with colour
-// off, and nothing on a terminal too narrow for it.
+// The CLI's banner is the TUI's pictures in sixteen colours: the PANDO
+// wordmark over the grove, gold letters and leaves, the roots dark while
+// the setup waits and lit green once a check passed; plain text with
+// colour off, and nothing on a terminal too narrow for it.
 #[test]
-fn the_cli_grove_is_painted_for_its_moment() {
-    let seed = crate::grove::seed_of("acme-shop");
+fn the_cli_banner_is_painted_for_its_moment() {
+    let seed = crate::art::seed_of("acme-shop");
     let colour = crate::term::Style::with(true, None);
-    let waiting = super::art::grove_lines(80, seed, false, &colour).concat();
-    let alive = super::art::grove_lines(80, seed, true, &colour).concat();
-    assert!(waiting.contains("\x1b[33m"), "gold leaves");
+    let waiting = super::art::banner_lines(80, seed, false, &colour).concat();
+    let alive = super::art::banner_lines(80, seed, true, &colour).concat();
+    assert!(waiting.contains("\x1b[33m"), "gold letters and leaves");
     assert!(!waiting.contains("\x1b[32m"), "no green before it is ready");
-    assert!(alive.contains("\x1b[32m"), "green leaves once it is");
-    let plain = super::art::grove_lines(80, seed, true, &crate::term::Style::plain());
+    assert!(alive.contains("\x1b[32m"), "the roots lit once it is");
+    let plain = super::art::banner_lines(80, seed, true, &crate::term::Style::plain());
     assert!(plain.iter().all(|l| !l.contains('\x1b')));
+    // The big wordmark, the credit, a blank row, then the grove.
+    let mark = crate::art::to_text(&crate::art::wordmark(crate::art::WordmarkSize::Big, 0));
+    for (line, row) in plain.iter().zip(mark.lines()) {
+        assert_eq!(line, &format!("  {row}").trim_end().to_string());
+    }
+    // Who made it, under the wordmark, then a blank row.
     assert_eq!(
-        plain,
-        crate::grove::grove(64, 7, 0, seed)
-            .iter()
-            .map(
-                |row| format!("  {}", row.iter().map(|c| c.ch).collect::<String>())
-                    .trim_end()
-                    .to_string()
-            )
-            .collect::<Vec<_>>(),
-        "the same picture, colour aside"
+        plain[crate::art::WORDMARK_HEIGHT],
+        format!("  {}", crate::art::credit())
     );
-    assert!(super::art::grove_lines(20, seed, false, &colour).is_empty());
+    assert_eq!(plain[crate::art::WORDMARK_HEIGHT + 1], "");
+    assert!(plain.last().unwrap().contains('┻'), "{plain:?}");
+    // Narrower: the compact wordmark; too narrow: nothing.
+    let narrow = super::art::banner_lines(40, seed, false, &crate::term::Style::plain());
+    assert!(narrow[0].contains("█▀█ ▄▀█"), "{narrow:?}");
+    assert!(super::art::banner_lines(20, seed, false, &colour).is_empty());
 }
 
 // A first run from the CLI opens on the same picture as one from the
@@ -3934,7 +3960,7 @@ fn the_first_time_tip_opens_on_the_projects_grove() {
     assert!(shown);
     assert_eq!(said.len(), 3, "{said:?}");
     let picture: Vec<&String> = drawn.iter().filter(|l| !l.is_empty()).collect();
-    assert!(picture.len() >= crate::grove::MIN_HEIGHT, "{drawn:?}");
+    assert!(picture.len() >= crate::art::GROVE_MIN_HEIGHT, "{drawn:?}");
     let all = picture.iter().map(|l| l.as_str()).collect::<String>();
     for shade in ['█', '░'] {
         assert!(all.contains(shade), "{drawn:?}");

@@ -70,13 +70,13 @@ pub(super) fn check<W: Write>(
     match &record.outcome {
         CheckOutcome::Passed => {
             if !json {
-                // A person watching sees the grove come alive — the
-                // setup screen's picture, turned green — and the line in
-                // colour. A program reads the same line, plain.
+                // A person watching sees the setup screen's pictures,
+                // the grove's roots lit, and the line in colour. A
+                // program reads the same line, plain.
                 if terminal {
-                    for line in super::art::grove_lines(
+                    for line in super::art::banner_lines(
                         super::art::stderr_columns(),
-                        crate::grove::seed_of(&paths.project.id),
+                        crate::art::seed_of(&paths.project.id),
                         true,
                         &crate::term::Style::for_stderr(),
                     ) {
