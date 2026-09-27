@@ -251,6 +251,47 @@ pub const LOG_KEYS: &[KeyHelp] = &[
     key("ctrl-c", &[], "quit from anywhere"),
 ];
 
+/// Every key the setup screen and its ready view answer to, shown instead
+/// of the list's while either is up.
+pub const SETUP_KEYS: &[KeyHelp] = &[
+    key(
+        "a",
+        &[KeyCode::Char('a')],
+        "copy the setup prompt, for your coding agent",
+    ),
+    key(
+        "v",
+        &[KeyCode::Char('v')],
+        "test the settings with `pando check`, once there are some",
+    ),
+    key(
+        "⏎",
+        &[KeyCode::Enter],
+        "open pando with the settings as they are now",
+    ),
+    key(
+        "esc",
+        &[KeyCode::Esc],
+        "just manage worktrees: skip the setup, and don't show it again",
+    ),
+    key("?", &[KeyCode::Char('?')], "this help"),
+    key("q", &[KeyCode::Char('q')], "quit"),
+    key("ctrl-c", &[], "quit from anywhere"),
+];
+
+/// What the marks on the setup screen's live line mean.
+pub const SETUP_LEGEND: &[(&str, &str)] = &[
+    (
+        "⠋",
+        "waiting on the setup: the screen follows pando's own files, no restart needed",
+    ),
+    ("✓", "settings saved, or the test passed"),
+    (
+        "✗",
+        "the test failed — a copies the prompt, which now includes why",
+    ),
+];
+
 /// The keys that scroll help and messages rather than closing them. Any
 /// other key closes either; the footer of each says so.
 pub const OVERLAY_KEYS: &[KeyHelp] = &[

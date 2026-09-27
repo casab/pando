@@ -5,13 +5,14 @@
 //! width, and text truncates rather than clipping at a pane edge.
 //!
 //! The frame layout and the text helpers every part shares live here; the
-//! list, the detail pane, the log viewer and the header and footer each
-//! have their own file.
+//! list, the detail pane, the log viewer, the setup screen and the header
+//! and footer each have their own file.
 
 mod chrome;
 mod detail;
 mod list;
 mod log_viewer;
+mod setup;
 mod welcome;
 
 use ratatui::Frame;
@@ -25,6 +26,7 @@ use detail::render_detail;
 use list::render_list;
 pub(super) use list::run_marker;
 use log_viewer::{render_inspect, render_log_viewer};
+use setup::render_setup;
 use welcome::render_welcome;
 
 /// Below this the list and the detail pane stop both being readable side by
@@ -64,6 +66,14 @@ pub fn render(f: &mut Frame, app: &mut App) {
         if app.inspect.is_some() {
             render_inspect(f, f.area(), app);
         }
+        paint_modal(f, app);
+        return;
+    }
+    // So does the setup screen, which has a header and a footer of its
+    // own, and is up whatever git lists.
+    if app.setup_screen.is_some() {
+        app.list_area = None;
+        render_setup(f, f.area(), app);
         paint_modal(f, app);
         return;
     }

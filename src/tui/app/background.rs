@@ -57,6 +57,12 @@ pub enum AppEvent {
     /// The theme to paint with changed: the terminal's theme switcher
     /// wrote a new name, or the system went dark or light.
     Theme(Box<crate::theme::Resolved>),
+    /// What pando's own detection proposes for the project, for the setup
+    /// screen.
+    SetupDetected(Box<Vec<crate::detect::Proposal>>),
+    /// The setup screen's re-read after a config file changed: the config
+    /// as it loads now and the setup against it, or why it does not load.
+    SetupRead(Box<Result<(Config, crate::setup::Setup), String>>),
 }
 
 /// One consistent read of the repository, taken off the UI thread.

@@ -15,7 +15,7 @@ use super::App;
 use super::background::{AppEvent, ask_through_ui, config_now};
 use super::dialogs::Modal;
 
-const SPINNER_FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+pub(super) const SPINNER_FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
 /// What a start says when the config names no process. Matched loosely:
 /// the wording after it may change, and a miss only means the TUI learns

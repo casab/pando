@@ -14,7 +14,7 @@ use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph};
 
 use super::app::{
     App, BranchLoadState, CreateRow, INSPECT_LEGEND, KeyHelp, LIST_KEYS, LIST_LEGEND, LOG_KEYS,
-    Modal, RemoveBlocker, StatusKind, create_rows, pr_rows,
+    Modal, RemoveBlocker, SETUP_KEYS, SETUP_LEGEND, StatusKind, create_rows, pr_rows,
 };
 use super::render::{centered_box, chunk_cells, text_width, truncate, truncate_middle, wrap_text};
 use crate::state::ServiceMode;
@@ -87,7 +87,9 @@ pub fn render_modal(f: &mut Frame, area: Rect, modal: &Modal, app: &App) -> Opti
         ),
         Modal::Help => {
             let (keys, legend_title, legend): (&[KeyHelp], &str, &[(&str, &str)]) =
-                if app.log_view().is_some() {
+                if app.setup_screen.is_some() {
+                    (SETUP_KEYS, "on the setup screen", SETUP_LEGEND)
+                } else if app.log_view().is_some() {
                     (LOG_KEYS, "in the inspect overlay", INSPECT_LEGEND)
                 } else {
                     (LIST_KEYS, "in the list", LIST_LEGEND)

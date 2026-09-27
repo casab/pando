@@ -23,6 +23,7 @@ mod merged;
 mod operations;
 mod pending;
 mod remedies;
+mod setup;
 mod tails;
 mod themes;
 
@@ -31,7 +32,10 @@ pub use background::{AppEvent, Snapshot, snapshot};
 pub use dialogs::{
     BranchLoadState, CreateRow, Modal, RemoveBlocker, base_choices, create_rows, pr_rows,
 };
-pub use keymap::{INSPECT_LEGEND, KeyHelp, LIST_KEYS, LIST_LEGEND, LOG_KEYS, OVERLAY_KEYS};
+pub use keymap::{
+    INSPECT_LEGEND, KeyHelp, LIST_KEYS, LIST_LEGEND, LOG_KEYS, OVERLAY_KEYS, SETUP_KEYS,
+    SETUP_LEGEND,
+};
 pub use launch::{
     Launch, LaunchEnv, LaunchRequest, is_terminal_editor, plan_editor, plan_shell, said_after,
 };
@@ -39,6 +43,7 @@ pub use log_view::{LOG_VIEWER_CAPACITY, LineInspect, LogFilter, LogView, SearchM
 pub use merged::{ALL_SOURCE, MergedTail, SOURCE_SEPARATOR, ViewTail, strip_source};
 pub use pending::{AwaitingReady, PendingAction, PendingKind, PendingOutcome};
 pub use remedies::as_tui_remedy;
+pub use setup::{SetupLine, SetupScreen, has_settings};
 pub use tails::LogTails;
 pub use themes::ThemeState;
 
@@ -303,6 +308,14 @@ pub struct App {
     pub launch: Option<LaunchRequest>,
     /// The colour theme in force, every theme there is, and what chose it.
     pub theme: ThemeState,
+    /// The setup screen, while it is up: from the first `pando` in a new
+    /// project until the developer leaves it, whatever the setup does
+    /// meanwhile.
+    pub setup_screen: Option<SetupScreen>,
+    /// The checks `v` asked for, counted instead of started when tests
+    /// drive the app.
+    #[cfg(test)]
+    pub checks_started: usize,
     /// Set instead of touching the terminal when tests drive the app.
     #[cfg(test)]
     pub clipboard: Option<String>,
@@ -372,6 +385,9 @@ impl App {
             launch_env: LaunchEnv::from_env(),
             launch: None,
             theme: ThemeState::new(theme_settings, &themes_dir),
+            setup_screen: None,
+            #[cfg(test)]
+            checks_started: 0,
             #[cfg(test)]
             clipboard: None,
             #[cfg(test)]
@@ -381,6 +397,8 @@ impl App {
         // disk cache so those rows already carry sha, age, and dirty state.
         app.apply_snapshot(snapshot(&app.paths, None, false)?);
         app.hydrate_from_cache();
+        // Whatever git lists: a new project is new with worktrees too.
+        app.open_setup_if_new();
         app.spawn_enrichment(None, false);
         app.spawn_pr_fetch();
         app.spawn_gh_account_check();
@@ -404,6 +422,7 @@ impl App {
             AppEvent::Tick => {
                 self.tick = self.tick.wrapping_add(1);
                 let spinning = self.pending.is_some();
+                let setup = self.poll_setup();
                 self.poll_pending();
                 let grew = self.poll_logs();
                 if self.tick.is_multiple_of(SLOW_TICK_EVERY) {
@@ -421,7 +440,7 @@ impl App {
                 }
                 let clock =
                     self.tick.is_multiple_of(CLOCK_EVERY) && matches!(self.view, View::List);
-                spinning || grew || self.expire_status() || clock
+                spinning || setup || grew || self.expire_status() || clock
             }
             AppEvent::FsChange => {
                 self.spawn_discovery();
@@ -542,21 +561,14 @@ impl App {
                 true
             }
             AppEvent::ConfigResolved(config) => {
-                // The one place the session's config changes while it runs.
                 // Without it the modal reopens on the next `s`, with the
                 // rule's first candidate preselected rather than the answer
                 // just given.
-                self.config = *config;
-                self.namespace_shared = std::cell::OnceCell::new();
-                // Only ever cleared here, never concluded: a config file
-                // with no process in it is what `new` writes, and a start
-                // is what asks for the command. `nothing_to_run` is set by
-                // a start that failed for want of one, and nothing else.
-                if !self.config.processes.is_empty() {
-                    self.nothing_to_run = false;
-                }
+                self.adopt_config(*config);
                 false
             }
+            AppEvent::SetupDetected(proposals) => self.setup_detected(*proposals),
+            AppEvent::SetupRead(result) => self.setup_read(*result),
             AppEvent::AskQuestion(boxed) => {
                 // Somebody typing — a branch name, a filter, a search —
                 // would otherwise have their next keystrokes answer it:
@@ -570,6 +582,21 @@ impl App {
                 self.open_question(*boxed);
                 true
             }
+        }
+    }
+
+    /// Replaces the session's config: a worker resolved something, or the
+    /// setup screen hands over what its files say now. The two places the
+    /// session's config changes while it runs.
+    pub(super) fn adopt_config(&mut self, config: Config) {
+        self.config = config;
+        self.namespace_shared = std::cell::OnceCell::new();
+        // Only ever cleared here, never concluded: a config file with no
+        // process in it is what `new` writes, and a start is what asks for
+        // the command. `nothing_to_run` is set by a start that failed for
+        // want of one, and nothing else.
+        if !self.config.processes.is_empty() {
+            self.nothing_to_run = false;
         }
     }
 
@@ -736,6 +763,12 @@ impl App {
                 return;
             }
             None => {}
+        }
+        // The setup screen owns the whole screen until it is left, and
+        // only its own keys mean anything on it.
+        if self.setup_screen.is_some() {
+            self.handle_setup_key(key);
+            return;
         }
         // The viewer owns the whole screen and the whole keyboard, so it
         // comes before the list's keys — but after the modals, because a
@@ -1431,6 +1464,8 @@ impl App {
             launch_env: LaunchEnv::default(),
             launch: None,
             theme: ThemeState::new(theme_settings, &themes_dir),
+            setup_screen: None,
+            checks_started: 0,
             clipboard: None,
             opened: None,
         };

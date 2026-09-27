@@ -3950,3 +3950,258 @@ fn the_detail_pane_says_what_each_service_holds_for_the_worktree() {
         "{rendered}"
     );
 }
+
+// ---- the setup screen ---------------------------------------------------
+
+use crate::setup::{CheckOutcome, CheckRecord, FailureKind, RanBy, SETUP_PROMPT, SetupState};
+use crate::tui::app::tests::app_on_setup_screen;
+
+/// The rows that show `needle`.
+fn rows_with<'a>(text: &'a str, needle: &str) -> Vec<&'a str> {
+    text.lines().filter(|l| l.contains(needle)).collect()
+}
+
+/// The setup screen with a check's finished record behind it.
+fn finished(app: &mut App, state: SetupState, outcome: CheckOutcome, ran_by: RanBy) {
+    let screen = app.setup_screen.as_mut().unwrap();
+    let mut record = CheckRecord::begin(screen.setup.fingerprint.clone(), ran_by);
+    record.outcome = outcome;
+    record.finished_at = Some(chrono::Utc::now());
+    screen.setup.last_check = Some(record);
+    screen.setup.state = state;
+}
+
+// The screen as the plan draws it: header, the three lines, the prompt
+// on a row of its own with no border either side, the steps, the live
+// line and the keys.
+#[test]
+fn the_setup_screen_draws_the_prompt_without_side_borders() {
+    let (_dir, mut app) = app_on_setup_screen(false);
+    let text = text_of(&draw(&mut app, 120, 30));
+    let header = text.lines().next().unwrap();
+    assert!(header.contains("pando — acme-shop"), "{header}");
+    assert!(header.contains("first time here"), "{header}");
+    assert!(text.contains("Let's set pando up for acme-shop."), "{text}");
+    assert!(
+        text.contains("It never changes a file in your project."),
+        "{text}"
+    );
+    assert!(text.contains("1  copy this prompt"), "{text}");
+    assert!(text.contains("a copies it"), "{text}");
+    let prompt = rows_with(&text, SETUP_PROMPT);
+    assert_eq!(prompt.len(), 1, "one row, whole:\n{text}");
+    assert_eq!(prompt[0].trim(), SETUP_PROMPT, "nothing beside it");
+    assert!(
+        text.contains("2  paste it into Claude Code or Codex"),
+        "{text}"
+    );
+    assert!(text.contains("3  come back here"), "{text}");
+    assert!(text.contains("reading acme-shop…"), "{text}");
+    let footer = text.lines().last().unwrap();
+    assert!(footer.contains("a copy the prompt"), "{footer}");
+    assert!(footer.contains("esc just manage worktrees"), "{footer}");
+    assert!(!footer.contains("v test"), "nothing to test yet: {footer}");
+    assert!(
+        !text.contains("worktrees ("),
+        "no dashboard behind it:\n{text}"
+    );
+}
+
+// Every size a tmux split can be: no panic, and the prompt and the live
+// line are the last things to go.
+#[test]
+fn the_setup_screen_fits_every_size() {
+    for (width, height) in [
+        (160, 50),
+        (120, 30),
+        (80, 24),
+        (60, 16),
+        (40, 12),
+        (30, 8),
+        (20, 6),
+        (12, 4),
+        (5, 3),
+        (1, 1),
+    ] {
+        let (_dir, mut app) = app_on_setup_screen(false);
+        let text = text_of(&draw(&mut app, width, height));
+        if width >= 80 && height >= 12 {
+            // Wrapped at 80, whole above it; every word of it either way.
+            let shown: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(shown.contains(SETUP_PROMPT), "{width}×{height}:\n{text}");
+            assert!(
+                text.contains("reading acme-shop"),
+                "{width}×{height}:\n{text}"
+            );
+        }
+        if width >= 40 && height >= 12 {
+            assert!(text.contains("Set up pando"), "{width}×{height}:\n{text}");
+            assert!(text.contains("a copy"), "{width}×{height}:\n{text}");
+        }
+    }
+}
+
+// Short but wide: the explanation gives way before the prompt, the steps
+// and the live line do.
+#[test]
+fn a_short_setup_screen_drops_the_explanation_first() {
+    let (_dir, mut app) = app_on_setup_screen(false);
+    let text = text_of(&draw(&mut app, 120, 9));
+    assert!(text.contains(SETUP_PROMPT), "{text}");
+    assert!(text.contains("reading acme-shop"), "{text}");
+    assert!(text.contains("1  copy this prompt"), "{text}");
+    assert!(text.contains("3  come back here"), "{text}");
+    assert!(
+        !text.contains("Every project is a little different"),
+        "{text}"
+    );
+}
+
+// Once settings exist, `v` is on the screen, so it never waits forever on
+// an agent that saved and never tested.
+#[test]
+fn saved_settings_offer_v() {
+    let (_dir, mut app) = app_on_setup_screen(true);
+    app.setup_screen.as_mut().unwrap().detected = Some(Vec::new());
+    let text = text_of(&draw(&mut app, 120, 30));
+    assert!(text.contains("✓ settings saved · v tests them"), "{text}");
+    assert!(text.lines().last().unwrap().contains("v test it"), "{text}");
+}
+
+#[test]
+fn a_failed_check_names_the_reason_and_says_the_agent_is_on_it_only_for_a_program() {
+    for (ran_by, on_it) in [(RanBy::Program, true), (RanBy::Tui, false)] {
+        let (_dir, mut app) = app_on_setup_screen(true);
+        let failed = CheckOutcome::Failed {
+            kind: FailureKind::Settings,
+            reason: "web exited after 0.8s".into(),
+        };
+        finished(&mut app, SetupState::Failing, failed, ran_by);
+        let text = text_of(&draw(&mut app, 140, 30));
+        assert!(
+            text.contains(
+                "✗ the test failed: web exited after 0.8s · a copies the prompt, which now \
+                 includes this"
+            ),
+            "{text}"
+        );
+        assert_eq!(
+            text.contains("Your agent is probably on it"),
+            on_it,
+            "{ran_by:?}:\n{text}"
+        );
+    }
+}
+
+#[test]
+fn an_interrupted_or_unfinished_setup_says_what_to_press() {
+    let (_dir, mut app) = app_on_setup_screen(true);
+    finished(
+        &mut app,
+        SetupState::Interrupted,
+        CheckOutcome::Running,
+        RanBy::Tui,
+    );
+    let text = text_of(&draw(&mut app, 120, 30));
+    assert!(
+        text.contains("the last test was interrupted · v tests again"),
+        "{text}"
+    );
+
+    let open = CheckOutcome::NotSetUp {
+        slot: "dev_cmd".into(),
+    };
+    finished(&mut app, SetupState::Failing, open, RanBy::Program);
+    let text = text_of(&draw(&mut app, 120, 30));
+    assert!(
+        text.contains("not set up: dev_cmd is open · a copies the prompt"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_running_check_shows_its_own_lines() {
+    let (_dir, mut app) = app_on_setup_screen(true);
+    let screen = app.setup_screen.as_mut().unwrap();
+    let mut record = CheckRecord::begin(screen.setup.fingerprint.clone(), RanBy::Program);
+    record.progress = vec!["made a test worktree".into(), "installing".into()];
+    screen.setup.last_check = Some(record);
+    screen.setup.state = SetupState::Testing;
+    let text = text_of(&draw(&mut app, 120, 30));
+    assert!(
+        text.contains("testing: made a test worktree · installing…"),
+        "{text}"
+    );
+    assert!(!text.lines().last().unwrap().contains("v test"), "{text}");
+}
+
+// The check passed: the screen turns green by itself, and ⏎ opens pando.
+#[test]
+fn a_passed_check_turns_the_screen_into_the_ready_view() {
+    for (width, height) in [(120, 30), (80, 24), (40, 10), (20, 5), (1, 1)] {
+        let (_dir, mut app) = app_on_setup_screen(true);
+        finished(
+            &mut app,
+            SetupState::Ready,
+            CheckOutcome::Passed,
+            RanBy::Program,
+        );
+        let text = text_of(&draw(&mut app, width, height));
+        if width >= 80 {
+            assert!(
+                text.contains("✓ You're ready to use pando in acme-shop"),
+                "{text}"
+            );
+            assert!(text.contains("set up and tested just now"), "{text}");
+            assert!(!text.contains("first time here"), "{text}");
+            assert!(!text.contains(SETUP_PROMPT), "{text}");
+            let footer = text.lines().last().unwrap();
+            assert!(footer.contains("⏎ open pando"), "{footer}");
+        }
+    }
+}
+
+// What a key said goes where the screen can show it: its own header.
+#[test]
+fn the_setup_screen_header_carries_the_flash() {
+    let (_dir, mut app) = app_on_setup_screen(false);
+    app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+    let text = text_of(&draw(&mut app, 120, 30));
+    let header = text.lines().next().unwrap();
+    assert!(header.contains("✓ copied the setup prompt"), "{header}");
+}
+
+// Help on the setup screen is the setup screen's keys, not the list's.
+#[test]
+fn help_on_the_setup_screen_shows_its_keys() {
+    let (_dir, mut app) = app_on_setup_screen(false);
+    app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+    let text = text_of(&draw(&mut app, 120, 40));
+    assert!(text.contains("copy the setup prompt"), "{text}");
+    assert!(text.contains("just manage worktrees"), "{text}");
+    assert!(!text.contains("new worktree"), "{text}");
+    app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+    assert!(app.modal.is_none(), "any key closes it");
+    assert!(app.setup_screen.is_some(), "and the screen is still there");
+}
+
+// The footer names only keys the setup screen's help documents.
+#[test]
+fn every_setup_footer_hint_is_a_key_help_documents() {
+    use crate::tui::app::SETUP_KEYS;
+    let keys: Vec<&str> = SETUP_KEYS.iter().flat_map(|k| k.keys.split(' ')).collect();
+    for (settings, state) in [
+        (false, SetupState::New { skipped: false }),
+        (true, SetupState::Untested),
+        (true, SetupState::Ready),
+    ] {
+        let (_dir, mut app) = app_on_setup_screen(settings);
+        app.setup_screen.as_mut().unwrap().setup.state = state;
+        for (key, _, _) in super::setup::setup_hints(app.setup_screen.as_ref().unwrap()) {
+            assert!(
+                keys.contains(&key),
+                "{key} is not in the setup screen's help"
+            );
+        }
+    }
+}

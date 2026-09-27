@@ -3676,9 +3676,10 @@ fn a_busy_log() -> Vec<String> {
 }
 
 // The other half of the rule: a child that inherits the terminal paints
-// over the alternate screen. The two commands the TUI is allowed to run
-// are the browser opener and `pbcopy`, both on a worker thread with
-// every stream redirected.
+// over the alternate screen. The commands the TUI is allowed to run are
+// the browser opener and `pbcopy`, both on a worker thread with every
+// stream redirected, the hand-offs, and `pando check`, detached into a
+// session of its own with its streams on a log.
 #[test]
 fn the_tui_spawns_nothing_that_could_paint_over_the_screen() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -3690,13 +3691,17 @@ fn the_tui_spawns_nothing_that_could_paint_over_the_screen() {
         // `c` and `e`: one hand-off (tmux, a GUI editor) on a worker
         // thread, and one suspend.
         "src/tui/handoff.rs" => 2,
+        // `v` on the setup screen: `pando check`, detached.
+        "src/tui/app/setup.rs" => 1,
         _ => 0,
     };
     // The suspend is the one child the UI thread waits on, on purpose:
     // the TUI has left the screen and stopped reading keys first, and
-    // there is nothing else for it to do until the shell exits.
+    // there is nothing else for it to do until the shell exits. The
+    // detached check is reaped by a thread of its own.
     let allowed_waits = |file: &str| match file {
         "src/tui/handoff.rs" => 1,
+        "src/tui/app/setup.rs" => 1,
         _ => 0,
     };
     let mut files: Vec<String> = Vec::new();
@@ -6894,4 +6899,413 @@ fn the_free_slot_question_takes_a_choice_and_nothing_typed() {
     press(&mut app, KeyCode::Char('j'));
     press(&mut app, KeyCode::Enter);
     assert_eq!(answers.try_recv().unwrap(), Ok(actions::Answer::Choice(1)));
+}
+
+// ---- the setup screen ---------------------------------------------------
+
+use crate::setup::{CheckOutcome, CheckRecord, FailureKind, RanBy, SetupMemory, SetupState};
+
+/// A new project's TUI with the setup screen up: a real repository with a
+/// worktree listed, a real pando home, nothing configured. The receiver
+/// is the test's, so the workers' answers are handed over by `settle`.
+fn setup_app() -> (tempfile::TempDir, App, Receiver<AppEvent>) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("acme-shop");
+    crate::testutil::init_repo(&root);
+    let paths = PandoPaths::new(
+        dir.path().join("pando-home"),
+        ProjectRef::from_root(&root).unwrap(),
+    );
+    let mut app = App::new_for_test(paths, Config::default(), vec![wt("feat+one")]);
+    let rx = app.event_rx.take().expect("the app owns its receiver");
+    app.open_setup_if_new();
+    assert!(app.setup_screen.is_some(), "a new project gets the screen");
+    (dir, app, rx)
+}
+
+fn screen(app: &App) -> &SetupScreen {
+    app.setup_screen.as_ref().expect("the setup screen is up")
+}
+
+/// Ticks, handing the workers' answers to the app, until `done`.
+fn tick_until(app: &mut App, rx: &Receiver<AppEvent>, what: &str, done: impl Fn(&App) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        app.handle_event(AppEvent::Tick);
+        while let Ok(event) = rx.recv_timeout(Duration::from_millis(20)) {
+            app.handle_event(event);
+        }
+        if done(app) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "never saw {what}");
+    }
+}
+
+/// Writes a file and gives it a modification time no earlier write had,
+/// so a filesystem that keeps whole seconds cannot hide the change.
+fn write_seen(path: &std::path::Path, text: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1_000_000);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, text).unwrap();
+    let at = std::time::UNIX_EPOCH + Duration::from_secs(NEXT.fetch_add(1, Ordering::SeqCst));
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(at)
+        .unwrap();
+}
+
+/// What `init --answers` leaves: a process to run.
+fn save_settings(app: &mut App, rx: &Receiver<AppEvent>) {
+    write_seen(
+        &app.paths.config_file(),
+        "[processes.web]\ncmd = \"pnpm dev\"\n",
+    );
+    tick_until(app, rx, "the settings", |app| {
+        has_settings(&screen(app).config)
+    });
+}
+
+/// A check's record, against the settings the screen has now.
+fn record(app: &App, outcome: CheckOutcome, ran_by: RanBy) -> CheckRecord {
+    let fingerprint = crate::setup::fingerprint(&screen(app).config);
+    let mut record = CheckRecord::begin(fingerprint.clone(), ran_by);
+    if outcome != CheckOutcome::Running {
+        record.fingerprint_after = Some(fingerprint);
+        record.finished_at = Some(Utc::now());
+    }
+    record.outcome = outcome;
+    record
+}
+
+fn save_record(app: &App, record: &CheckRecord) {
+    write_seen(
+        &app.paths.check_file(),
+        &serde_json::to_string(record).unwrap(),
+    );
+}
+
+// The first `pando` in a new project is the setup screen, even when git
+// already lists worktrees; the dashboard's welcome needed none.
+#[test]
+fn a_new_project_opens_the_setup_screen_whatever_git_lists() {
+    let (_dir, mut app, rx) = setup_app();
+    assert_eq!(app.worktrees.len(), 1);
+    assert_eq!(screen(&app).line(), SetupLine::Reading);
+    tick_until(&mut app, &rx, "detection", |app| {
+        screen(app).detected.is_some()
+    });
+    assert_eq!(screen(&app).line(), SetupLine::Waiting);
+}
+
+// A project that has something to run is untested, never new: it is
+// never sent back to the setup screen.
+#[test]
+fn a_configured_project_never_sees_the_setup_screen() {
+    let (_dir, mut app) = a_setup_screen_every_key_can_act_on();
+    app.setup_screen = None;
+    app.open_setup_if_new();
+    assert!(app.setup_screen.is_none());
+}
+
+// The screen moves with pando's own files: the agent's `init --answers`
+// is a changed pando.toml, seen on the tick.
+#[test]
+fn saved_settings_show_on_the_next_tick_and_offer_a_test() {
+    let (_dir, mut app, rx) = setup_app();
+    assert!(!screen(&app).may_test(), "nothing to test yet");
+    save_settings(&mut app, &rx);
+    assert_eq!(screen(&app).line(), SetupLine::SettingsSaved);
+    assert_eq!(screen(&app).setup.state, SetupState::Untested);
+    assert!(screen(&app).may_test());
+}
+
+// A committed pando.toml is one of the four files: a teammate's settings
+// arriving with a pull is a setup too.
+#[test]
+fn a_committed_config_is_watched_too() {
+    let (_dir, mut app, rx) = setup_app();
+    write_seen(
+        &app.paths.root().join("pando.toml"),
+        "[processes.web]\ncmd = \"pnpm dev\"\n",
+    );
+    tick_until(&mut app, &rx, "the committed settings", |app| {
+        screen(app).line() == SetupLine::SettingsSaved
+    });
+}
+
+// While a check holds the lock, the screen shows the check's own lines,
+// and it stays up as the check passes: the ready view, not the dashboard.
+#[test]
+fn a_running_check_shows_its_lines_and_a_pass_turns_the_screen_ready() {
+    let (_dir, mut app, rx) = setup_app();
+    save_settings(&mut app, &rx);
+    let held = crate::state::lock(&app.paths.check_lock_file()).unwrap();
+    let mut running = record(&app, CheckOutcome::Running, RanBy::Program);
+    running.progress = vec!["made a test worktree".into(), "installing".into()];
+    save_record(&app, &running);
+    tick_until(&mut app, &rx, "the check running", |app| {
+        matches!(screen(app).line(), SetupLine::Testing(_))
+    });
+    assert_eq!(
+        screen(&app).line(),
+        SetupLine::Testing(vec!["made a test worktree".into(), "installing".into()])
+    );
+    assert!(!screen(&app).may_test(), "no second check while one runs");
+
+    save_record(&app, &record(&app, CheckOutcome::Passed, RanBy::Program));
+    drop(held);
+    tick_until(&mut app, &rx, "the pass", |app| screen(app).is_ready());
+    assert_eq!(screen(&app).line(), SetupLine::Passed);
+}
+
+// `⏎` on the ready view opens the dashboard on the settings the files
+// hold now, and forgets what a start concluded from the old ones.
+#[test]
+fn enter_on_the_ready_view_opens_pando_with_the_settings_read_since() {
+    let (_dir, mut app, rx) = setup_app();
+    app.nothing_to_run = true;
+    save_settings(&mut app, &rx);
+    save_record(&app, &record(&app, CheckOutcome::Passed, RanBy::Program));
+    tick_until(&mut app, &rx, "the pass", |app| screen(app).is_ready());
+    assert!(
+        app.config.processes.is_empty(),
+        "adopted on leaving, not before"
+    );
+    press(&mut app, KeyCode::Enter);
+    assert!(app.setup_screen.is_none());
+    assert!(app.config.processes.contains_key("web"));
+    assert!(!app.nothing_to_run);
+}
+
+// A failure says why. "Your agent is probably on it" only when a program
+// ran the check.
+#[test]
+fn a_failed_check_says_why_and_whether_an_agent_ran_it() {
+    for (ran_by, by_program) in [(RanBy::Program, true), (RanBy::Terminal, false)] {
+        let (_dir, mut app, rx) = setup_app();
+        save_settings(&mut app, &rx);
+        let failed = CheckOutcome::Failed {
+            kind: FailureKind::Settings,
+            reason: "web exited after 0.8s".into(),
+        };
+        save_record(&app, &record(&app, failed, ran_by));
+        tick_until(&mut app, &rx, "the failure", |app| {
+            matches!(screen(app).line(), SetupLine::Failed { .. })
+        });
+        assert_eq!(
+            screen(&app).line(),
+            SetupLine::Failed {
+                reason: "web exited after 0.8s".into(),
+                by_program,
+            }
+        );
+        assert!(app.setup_screen.is_some(), "the screen stays up");
+    }
+}
+
+// A check killed outright only lets go of its lock: its record still says
+// running. The lock is asked on the tick, so the screen says interrupted
+// without the record changing.
+#[test]
+fn a_check_that_lets_go_of_its_lock_unfinished_is_interrupted() {
+    let (_dir, mut app, rx) = setup_app();
+    save_settings(&mut app, &rx);
+    let held = crate::state::lock(&app.paths.check_lock_file()).unwrap();
+    save_record(&app, &record(&app, CheckOutcome::Running, RanBy::Tui));
+    tick_until(&mut app, &rx, "the check running", |app| {
+        matches!(screen(app).line(), SetupLine::Testing(_))
+    });
+    drop(held);
+    tick_until(&mut app, &rx, "the interruption", |app| {
+        screen(app).line() == SetupLine::Interrupted
+    });
+    assert!(screen(&app).may_test(), "v tests again");
+}
+
+// A check that exits 3 names the question still open.
+#[test]
+fn a_check_with_a_question_open_names_it() {
+    let (_dir, mut app, rx) = setup_app();
+    save_settings(&mut app, &rx);
+    let open = CheckOutcome::NotSetUp {
+        slot: "dev_cmd".into(),
+    };
+    save_record(&app, &record(&app, open, RanBy::Program));
+    tick_until(&mut app, &rx, "the open question", |app| {
+        matches!(screen(app).line(), SetupLine::NotSetUp { .. })
+    });
+    assert_eq!(
+        screen(&app).line(),
+        SetupLine::NotSetUp {
+            slot: "dev_cmd".into()
+        }
+    );
+}
+
+// A settings file somebody is halfway through writing does not load: the
+// last good settings stay, and `m` has why.
+#[test]
+fn settings_that_do_not_load_keep_the_last_good_ones() {
+    let (_dir, mut app, rx) = setup_app();
+    save_settings(&mut app, &rx);
+    write_seen(&app.paths.config_file(), "[processes.web\n");
+    tick_until(&mut app, &rx, "the error", |app| {
+        app.flash().is_some_and(|s| s.is_error())
+    });
+    assert!(has_settings(&screen(&app).config));
+    assert!(
+        app.active_status()
+            .unwrap()
+            .0
+            .contains("the settings do not read"),
+        "{:?}",
+        app.active_status()
+    );
+}
+
+// `esc` is the skip, remembered in setup.json: the next `pando` in the
+// project opens the dashboard.
+#[test]
+fn esc_is_remembered_and_the_screen_never_comes_back() {
+    let (_dir, mut app, _rx) = setup_app();
+    press(&mut app, KeyCode::Esc);
+    assert!(app.setup_screen.is_none(), "straight to the dashboard");
+    assert!(!app.should_quit);
+    assert!(SetupMemory::load(&app.paths).skipped_at.is_some());
+
+    let mut next = App::new_for_test(app.paths.clone(), Config::default(), Vec::new());
+    next.open_setup_if_new();
+    assert!(
+        next.setup_screen.is_none(),
+        "a skipped project is not asked again"
+    );
+}
+
+// A library has nothing to run and never will: every way off the screen
+// still works, and nothing offers to test it.
+#[test]
+fn a_library_is_never_stuck() {
+    let (_dir, mut app, _rx) = setup_app();
+    press(&mut app, KeyCode::Char('v'));
+    assert_eq!(app.checks_started, 0, "nothing to test");
+    assert!(app.flash().is_some_and(|s| s.is_error()));
+    press(&mut app, KeyCode::Enter);
+    assert!(app.setup_screen.is_none(), "⏎ opens the dashboard");
+
+    let (_dir, mut app, _rx) = setup_app();
+    press(&mut app, KeyCode::Char('q'));
+    assert!(app.should_quit, "q quits");
+}
+
+// `v` starts `pando check` apart from the TUI, once there is something
+// to test, and not a second one while the first is on its way. The
+// single action slot is never the check's.
+#[test]
+fn v_starts_one_check_once_settings_exist() {
+    let (_dir, mut app, rx) = setup_app();
+    save_settings(&mut app, &rx);
+    press(&mut app, KeyCode::Char('v'));
+    assert_eq!(app.checks_started, 1);
+    assert!(app.pending.is_none(), "the action slot stays free");
+    assert_eq!(screen(&app).line(), SetupLine::Starting);
+    press(&mut app, KeyCode::Char('v'));
+    assert_eq!(app.checks_started, 1, "one at a time");
+
+    // The check's record, once written, is what the screen shows.
+    let _held = crate::state::lock(&app.paths.check_lock_file()).unwrap();
+    save_record(&app, &record(&app, CheckOutcome::Running, RanBy::Tui));
+    tick_until(&mut app, &rx, "the check running", |app| {
+        matches!(screen(app).line(), SetupLine::Testing(_))
+    });
+    assert!(screen(&app).check_requested.is_none());
+}
+
+#[test]
+fn a_copies_the_setup_prompt() {
+    let (_dir, mut app, _rx) = setup_app();
+    press(&mut app, KeyCode::Char('a'));
+    assert_eq!(app.clipboard.as_deref(), Some(crate::setup::SETUP_PROMPT));
+    assert!(app.setup_screen.is_some(), "copying leaves the screen up");
+}
+
+/// A setup screen every one of its keys can act on: settings saved and
+/// no check running.
+fn a_setup_screen_every_key_can_act_on() -> (tempfile::TempDir, App) {
+    app_on_setup_screen(true)
+}
+
+/// An app with the setup screen up, with a process to run or with none.
+/// No repository: nothing here reads git, and the detection it starts
+/// finds an empty directory.
+pub fn app_on_setup_screen(settings: bool) -> (tempfile::TempDir, App) {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = PandoPaths::new(
+        dir.path().join("home"),
+        ProjectRef {
+            id: "acme-shop-3f9a2c1d".into(),
+            root: dir.path().join("acme-shop"),
+            display_name: "acme-shop".into(),
+        },
+    );
+    let mut config = Config::default();
+    if settings {
+        config.processes.insert(
+            "web".into(),
+            crate::config::ProcessConfig {
+                cmd: "pnpm dev".into(),
+                ..Default::default()
+            },
+        );
+    }
+    let mut app = App::new_for_test(paths, config, vec![wt("feat+one")]);
+    let setup = crate::setup::read(&app.paths, &app.config);
+    app.open_setup(setup);
+    (dir, app)
+}
+
+fn setup_fingerprint(app: &App) -> String {
+    format!(
+        "{}|{:?}|{:?}|{:?}|{}|{}",
+        app.setup_screen.is_some(),
+        app.modal.as_ref().map(std::mem::discriminant),
+        app.status.as_ref().map(|s| s.message.clone()),
+        app.clipboard,
+        app.checks_started,
+        app.should_quit,
+    )
+}
+
+// Help on the setup screen lists its own keys: exactly the ones it
+// answers, and none of the dashboard's.
+#[test]
+fn help_lists_exactly_the_keys_the_setup_screen_answers() {
+    let documented: Vec<KeyCode> = SETUP_KEYS
+        .iter()
+        .flat_map(|k| k.codes.iter().copied())
+        .collect();
+    let mut answered = Vec::new();
+    for code in candidate_keys() {
+        let (_dir, mut app) = a_setup_screen_every_key_can_act_on();
+        let before = setup_fingerprint(&app);
+        press(&mut app, code);
+        if setup_fingerprint(&app) != before {
+            answered.push(code);
+        }
+    }
+    for code in &answered {
+        assert!(
+            documented.contains(code),
+            "{code:?} does something on the setup screen, and help does not say so"
+        );
+    }
+    for code in &documented {
+        assert!(
+            answered.contains(code),
+            "help lists {code:?}, and pressing it on the setup screen does nothing"
+        );
+    }
 }
