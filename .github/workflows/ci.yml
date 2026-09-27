@@ -1,9 +1,34 @@
 name: ci
 
+# The paths below are ones no test reads: a change to them alone runs nothing.
+# README.md, CLAUDE.md, agent/ and assets/ are not among them, because tests
+# hold those to the code. The two lists are the same; keep them so.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "site/**"
+      - "CHANGELOG.md"
+      - "CODE_OF_CONDUCT.md"
+      - "CONTRIBUTING.md"
+      - "SECURITY.md"
+      - "LICENSE"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/PULL_REQUEST_TEMPLATE.md"
+      - ".github/dependabot.yml"
+      - ".github/workflows/pages.yml"
   pull_request:
+    paths-ignore:
+      - "site/**"
+      - "CHANGELOG.md"
+      - "CODE_OF_CONDUCT.md"
+      - "CONTRIBUTING.md"
+      - "SECURITY.md"
+      - "LICENSE"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/PULL_REQUEST_TEMPLATE.md"
+      - ".github/dependabot.yml"
+      - ".github/workflows/pages.yml"
   workflow_dispatch:
 
 concurrency:
@@ -32,7 +57,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest]
+        # While the repository is private every minute is paid and macOS's
+        # count ten times, so a pull request runs Linux only and macOS runs on
+        # main. Once it is public both run everywhere again.
+        os: ${{ fromJSON(github.event_name == 'pull_request' && github.event.repository.private && '["ubuntu-latest"]' || '["macos-latest", "ubuntu-latest"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
