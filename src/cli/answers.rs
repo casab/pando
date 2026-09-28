@@ -665,22 +665,30 @@ fn how_to_answer(question: &actions::Question, rerun: Rerun) -> String {
     if actions::ALL_SLOTS.contains(&question.slot) {
         // `check` is run by agents, which answer through stdin: a file
         // of answers in the project would be a file in the repository.
-        let program = match rerun {
-            Rerun::WithYes => "`pando init --answers <file.json>` with",
-            Rerun::InitThenCheck => "`pando init --answers -` with, on stdin,",
-        };
-        out.push_str(&format!(
-            "  or from a program: {program} {{\"{}\": {value}}}{}\n",
-            slot_name(question.slot),
-            rerun.then()
-        ));
+        let program = "`pando init --answers -` with, on stdin,";
+        // A process list held open because an app has nothing to start it
+        // is not answered by its own option: that is the list without the
+        // app. Only the object form covers every process.
+        let open_list =
+            question.slot == crate::detect::Slot::Processes && question.preselect.is_none();
+        if !open_list {
+            out.push_str(&format!(
+                "  or from a program: {program} {{\"{}\": {value}}}{}\n",
+                slot_name(question.slot),
+                rerun.then()
+            ));
+        }
         // With nothing on offer the project may well be several apps, and
         // one command of one's own is the wrong answer for those.
-        if question.slot == crate::detect::Slot::DevCmd && question.options.is_empty() {
-            out.push_str(
-                "  or, for several processes, `processes` with an object of process tables: \
-                 {\"processes\": {\"<name>\": {\"cmd\": \"…\", \"cwd\": \"…\"}, …}}\n",
-            );
+        if open_list
+            || (question.slot == crate::detect::Slot::DevCmd && question.options.is_empty())
+        {
+            out.push_str(&format!(
+                "  or from a program, for several processes: {program} an object of process \
+                 tables for every one, {{\"processes\": {{\"<name>\": {{\"cmd\": \"…\", \"cwd\": \
+                 \"…\"}}, …}}}}{}\n",
+                rerun.then()
+            ));
         }
     }
     out
@@ -740,10 +748,10 @@ pando: answer it in {file} — nothing pando can accept for you exists here{}
         return out;
     }
     if needs.question.preselect.is_none() {
-        // There are options, and none of them is one a flag may take: this
-        // slot's answer would have pando create a file out of contents it
-        // did not write. Pointing at `--yes` here is an instruction to run
-        // the same failure again.
+        // There are options, and none of them is one a flag may take: the
+        // answer would have pando create a file out of contents it did not
+        // write, or run a process list that leaves an app out. Pointing at
+        // `--yes` here is an instruction to run the same failure again.
         out.push_str(&format!(
             "pando: answer it in {file} — none of these is an option --yes may take for you{}
 ",
