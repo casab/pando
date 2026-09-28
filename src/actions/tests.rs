@@ -14394,7 +14394,8 @@ fn written_by_a_guess(fx: &Fx) -> Vec<PathBuf> {
 }
 
 // The slots the guess settles are the ones `new` and a start settle, and
-// never the prelude, which is about the machine.
+// never the prelude, which is about the machine, nor the base, which only
+// `init` asks.
 #[test]
 fn trying_on_its_own_settles_the_create_and_start_slots_only() {
     let tried = super::trying::tried_slots();
@@ -14406,10 +14407,13 @@ fn trying_on_its_own_settles_the_create_and_start_slots_only() {
         .collect();
     assert_eq!(tried, expected);
     assert!(!tried.contains(&Slot::Prelude));
+    // The base is `init`'s alone: with none named, `new` forks from
+    // origin/HEAD as it always has, so a guess has nothing to settle there.
+    assert!(!tried.contains(&Slot::Base));
     assert!(
         ALL_SLOTS
             .iter()
-            .all(|slot| *slot == Slot::Prelude || tried.contains(slot))
+            .all(|slot| matches!(slot, Slot::Prelude | Slot::Base) || tried.contains(slot))
     );
 }
 
@@ -14553,12 +14557,22 @@ fn drifted_fixture() -> Fx {
     crate::testutil::drifted_repo(&root, worktree::FAR_AHEAD, worktree::STALE_DAYS, None);
     let project = ProjectRef::from_root(&root).unwrap();
     let paths = PandoPaths::new(dir.path().join("pando-home"), project);
-    Fx {
+    runnable(Fx {
         root: paths.root().to_path_buf(),
         paths,
         config: Config::default(),
         _dir: dir,
-    }
+    })
+}
+
+/// `fx` with a dev process configured, so the only question `init` has
+/// left for it is the base: a project that would run nothing is asked its
+/// dev command first.
+fn runnable(mut fx: Fx) -> Fx {
+    std::fs::create_dir_all(fx.paths.config_file().parent().unwrap()).unwrap();
+    std::fs::write(fx.paths.config_file(), "[dev]\ncmd = \"./serve.sh\"\n").unwrap();
+    fx.config = crate::config::load(&fx.paths).unwrap().config;
+    fx
 }
 
 fn base_of(fx: &Fx) -> Option<String> {
@@ -14569,7 +14583,7 @@ fn base_of(fx: &Fx) -> Option<String> {
 // branch first, and written as `[project] base` with the evidence.
 #[test]
 fn init_asks_the_base_only_where_origin_head_is_far_behind_the_main_checkout() {
-    let fx = fixture();
+    let fx = runnable(fixture());
     init(&fx.paths, &fx.config, &Answering::asking(&refuse), &noop).unwrap();
     assert_eq!(
         base_of(&fx),
@@ -14631,7 +14645,7 @@ fn a_programs_base_is_written_when_the_branch_exists_and_refused_when_not() {
     );
 
     // With nothing proposed, the same answer is still taken.
-    let fx = fixture();
+    let fx = runnable(fixture());
     git(&fx.root, &["branch", "release"]);
     init_with_answers(
         &fx,
