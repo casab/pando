@@ -138,17 +138,22 @@ intelligible. Never as a substitute for `signals`.
 
 ## 1. The question budget
 
-> On a first run (the section above): **zero** questions, always.
+> On a first run (the section above): **zero** questions the rules or the
+> project's docs answer.
 > On a project the rules fully understand: **zero** questions.
 > On a project they half understand: **one**.
 
-Two things, and only two, are genuinely a human's:
+Three things, and only three, are genuinely a human's:
 
 1. **Which mechanism runs private services on this laptop** — containers or
    engines installed on the machine. It is a preference about their
    computer, not a fact about their repository. See §5.
 2. **Which apps of a monorepo they want running.** It is a preference about
    their work this week.
+3. **Which branch work starts from**, when origin/HEAD is far behind the
+   branch the main checkout is on. It is how their team works, which the
+   repository does not say: see the `base` row in §3, and step 5 of the
+   first run for the check that fails on it.
 
 Everything else — the install command, what pins the runtime, the dev
 command, how the port reaches it, the schema step, which local files a
@@ -206,8 +211,9 @@ Four more facts that are not visible in the shape:
   `{"prelude": "<the line>"}` is how it goes in, and `{"prelude": null}`
   is "this machine needs nothing". Never install a runtime to make the
   question go away.
-- **Answering `processes` with the per-app form settles `dev_cmd` and
-  `port_env` too** — every app gets its command and its port. Answers you
+- **Answering `processes` with the per-app form, or with an object of
+  process tables, settles `dev_cmd` and `port_env` too** — every process
+  gets its command and its port. Answers you
   sent for those two are then reported as unused, which is correct and not
   an error.
 - **Two slots take no answer when nothing was proposed.** `services` is a
@@ -231,8 +237,8 @@ Four more facts that are not visible in the shape:
 | `install` | rules, then you | a frozen install; the plain one where the project gitignores its lockfile; or silence — and silence is a slot you may fill from what the project's own docs say. Never a non-frozen one of your own |
 | `version_files` | rules | which file pins the runtime |
 | `prelude` | machine → human | only when the machine does not resolve the pin. `doctor` gives the exact line; the human decides whether to run it |
-| `processes` | **human** | one process, or one per app of a workspace |
-| `dev_cmd` | rules | ask only when several scripts are plausible dev servers |
+| `processes` | **human** | one process, or one per app: of a workspace, or of the app directories below a root with no manifest. When no option runs every app — one has no dev script — answer with an object of process tables (§4, §9) |
+| `dev_cmd` | rules | ask only when several scripts are plausible dev servers. When nothing would run at all, `init` asks it with no options and `--yes` exits 3: answer with the project's own command, or `processes` with an object |
 | `port_env` | rules | which variables carry the ports. The env example beats a framework convention |
 | `services` | rules + **human** | which services get a private copy — see §5 for the mechanism |
 | `schema_hook` | rules + **human** | the command that brings a fresh database to the schema. Always a question — it touches data — and only an isolated or namespaced start asks it. The hook runs on those starts only unless its entry says `on = "always"`; `null` answers "no" and writes it with `on = "never"` |
@@ -423,8 +429,8 @@ yours to fix:
   changed in. Show them the finding, let them change it, and do not "fix"
   it by loosening anything. Never write one yourself — see §8.
 
-Do not claim a project starts unless you started it. If you did not run
-`pando start`, say that you did not.
+Do not claim a project starts unless you started it: `pando check` starts
+it, and so does `pando start`. If you ran neither, say so.
 
 ### Prove it by running, when the developer agrees
 
@@ -461,13 +467,13 @@ Read what came back, not what you expected:
   table** — a service is not running, or the schema step is missing.
   That is the `services` and `schema_hook` questions, not a retry.
 
-A fix that is one of the ten answers goes through `init --answers`, and
-you start the scratch worktree again. A fix that is not — a variable one
-process needs, an app whose own config pins a port — is the developer's:
-name the process, what it did, and the line that would fix it, and write
-nothing. Stop the scratch worktree when you are done and tell the
-developer its name; removing it is theirs, as removing anything is. §9
-has the shape that line takes.
+A fix that is one of the ten answers goes through `init --answers`, a
+variable one process needs included (§9), and you start the scratch
+worktree again. A fix that is not — an app whose own config pins a port —
+is the developer's: name the process, what it did, and the line that
+would fix it, and write nothing. Stop the scratch worktree when you are
+done and tell the developer its name; removing it is theirs, as removing
+anything is.
 
 ## 7. What pando records about you
 
@@ -534,13 +540,22 @@ Absolute. None of these has an exception worth taking.
   a grant only they can give, and `rm` of a namespaced worktree drops its
   database.
 
-## 9. The process table, for what the answers cannot say
+## 9. The process table: what a `processes` object writes
 
-When a project needs what no answer writes — a process with an `env` of
-its own, a readiness wait, a port another process has to know — you
-still write nothing. You give the developer the exact lines to add to
-pando's config for the project, the project layer `pando doctor` names,
-and `pando check` proves them once they have. The shape:
+A process with an `env` of its own, a readiness wait, a port another
+process has to know: each is a key of a process table, and an object at
+`processes` writes the tables whole through `pando init --answers -`,
+with `--replace` when the slot is already answered. Each key of the
+object is a process, and each value takes the keys below: `cmd`, `cwd`,
+`ports`, `env` and `ready`. The first table below, as an answer, is
+`{"processes": {"api": {"cmd": "…", "cwd": "backend", "ports": ["api"]},
+…}}`, and every process the project runs is one key of it. `pando
+check` proves them.
+
+The one case you write nothing is a committed `pando.toml`, or the
+machine-wide config, that declares processes: pando never writes those
+files, so `--replace` refuses there. Give the developer the exact lines
+to change in the file `pando doctor` names instead. The shape, as TOML:
 
 ```toml
 [processes.api]                       # one table per process; [dev] is one called dev

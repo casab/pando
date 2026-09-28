@@ -181,18 +181,20 @@ in a makefile or `{{` in a justfile, no `-` or `+` prefix, and nothing at the
 top of the file that every recipe runs with — make's `export` or `include`,
 a justfile's `set` or `export`.
 
-A repository whose root is not an app — `backend/` beside `frontend/`,
-and nothing at the root that says how to build either — is read one level
+A repository whose root is not an app — `backend/` beside `frontend/`, and
+nothing at the root that says how to build either — is read one level
 down. `app_dirs` lists what was found there, and the proposals come from
 it: the install is each app's own, run in its directory, and the
 `processes` answer has one process per app with a dev script, each with
-its `cwd`, even when only one app has one. Its version files join
-`version_files` under its path, `backend/.nvmrc`, and once that answer is
-written a start checks the runtime there, in the directory its
-processes run in. Each app's env example joins
-`env_example`, and its local env files (`backend/.env`, never a cache or
-a coverage file) join `ignored_present` and `provision_seeds` under its
-path.
+its `cwd`, even when only one app has one. An app with no dev script gets
+no process and is in no option, and `processes` stays open for it: answer
+it with an object of process tables that covers every app (see "The
+answers file"). An app's version files join `version_files` under its
+path, `backend/.nvmrc`, and once that answer is written a start checks the
+runtime there, in the directory its processes run in. Each app's env
+example joins `env_example`, and its local env files (`backend/.env`,
+never a cache or a coverage file) join `ignored_present` and
+`provision_seeds` under its path.
 
 A compose file one directory down, `docker/compose.yml`, is listed in
 `compose_files` and read under `compose` when the root has none of its
@@ -284,7 +286,8 @@ Four more facts about `slots` that are not visible in the shape:
   `[project] base`, and one this repository has no branch for, here or on
   origin, is refused with exit 2.
 - **Answering one slot can settle another.** Taking the per-app form at
-  `processes` fills the dev command and its ports for every app, so
+  `processes`, or answering it with an object of process tables, fills
+  the dev command and its ports for every process, so
   `dev_cmd` and `port_env` are never asked and an answer sent for them is
   reported as unused. That is correct, not an error.
 

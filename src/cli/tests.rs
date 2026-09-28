@@ -2947,7 +2947,7 @@ fn the_brief_teaches_the_things_only_it_teaches() {
         ),
         ("exit 3", "the code that means a question is open"),
         ("--json", "never parse human-readable output"),
-        ("[processes.", "the process table an answer cannot write"),
+        ("[processes.", "the process table a processes object writes"),
         ("{port:<role>}", "how one process finds another's port"),
         ("`http_status: null`", "that a role need not serve a page"),
         (
