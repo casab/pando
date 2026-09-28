@@ -1,0 +1,101 @@
+name: release-smoke
+
+# Proves a published release installs the way the README says and runs.
+#
+# dist calls this after it announces a release (post-announce-jobs in
+# Cargo.toml), because a release published with a workflow's GITHUB_TOKEN
+# triggers no other workflow: `on: release` would never fire. It can also
+# be run by hand for any tag. Each leg installs through the shell installer
+# of *that* tag — never releases/latest, which skips pre-releases — checks
+# the version, and runs pando on a generated fixture repository.
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The release tag to test, e.g. v0.5.1"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: install and run (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-latest, macos-15-intel, ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    env:
+      PLAN: ${{ inputs.plan }}
+      DISPATCH_TAG: ${{ inputs.tag }}
+    steps:
+      - name: Which release
+        id: release
+        shell: bash
+        run: |
+          if [ -n "$PLAN" ]; then
+            tag=$(jq -r '.announcement_tag' <<<"$PLAN")
+            prerelease=$(jq -r '.announcement_is_prerelease' <<<"$PLAN")
+          else
+            tag="$DISPATCH_TAG"
+            prerelease=$([[ "$tag" == *-* ]] && echo true || echo false)
+          fi
+          {
+            echo "tag=$tag"
+            echo "version=${tag#v}"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+          echo "testing $tag (prerelease: $prerelease)"
+
+      - name: Install with the release's shell installer
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            "https://github.com/${{ github.repository }}/releases/download/${{ steps.release.outputs.tag }}/pando-cli-installer.sh" | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: The installed pando is the release's
+        shell: bash
+        run: |
+          set -x
+          [ "$(command -v pando)" = "$HOME/.local/bin/pando" ]
+          [ "$(pando --version)" = "pando ${{ steps.release.outputs.version }}" ]
+
+      # The fixture script builds its repository with pando's own test
+      # helpers, so it needs the release's source and a Rust toolchain.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.release.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Run pando on a fixture repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo=$(scripts/fixture-repo.sh plain --listener 2> fixture.log)
+          cat fixture.log
+          PANDO_HOME="$(dirname "$repo")/pando-home"
+          export PANDO_HOME
+          cd "$repo"
+          set -x
+          pando doctor --json > /dev/null
+          pando new smoke
+          pando start smoke --wait
+          pando status smoke --json
+          pando stop smoke
+          pando rm smoke
+
+      - name: Install with Homebrew
+        if: runner.os == 'macOS' && steps.release.outputs.prerelease == 'false'
+        shell: bash
+        run: |
+          brew install mertkaradayi/tap/pando
+          [ "$("$(brew --prefix)/bin/pando" --version)" = "pando ${{ steps.release.outputs.version }}" ]
