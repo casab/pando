@@ -36,6 +36,18 @@ may change behaviour.
 - A check that fails because the tested commit lacks a file the main
   checkout's branch has, such as a lockfile, fails with `kind: "base"`
   and names both refs, instead of asking for other settings ([#4]).
+  A `check --base` of another branch is a probe: it never replaces the
+  last result at the project's own base. With the `base` question still
+  open, `pando check` asks it instead of testing origin/HEAD.
+- `pando status` gives the command that opens an Expo app on the iOS
+  simulator (`xcrun simctl openurl booted exp://127.0.0.1:<port>`), and
+  `status --json` carries it as `app`, with the development build's
+  link beside it ([#5]).
+- When `bash -lc` resolves the wrong runtime version, the prelude
+  question also offers a line that puts a matching binary first on PATH,
+  from where your own shell finds it or a well-known place such as
+  Homebrew's. Such a line is offered and never taken for you, because
+  it changes every project on the machine.
 - `doctor` notes a queue worker (ARQ, Celery, RQ, Sidekiq, BullMQ)
   whose Redis every worktree shares: a job queued in one worktree can
   run on another's code ([#4]).
@@ -71,7 +83,12 @@ may change behaviour.
   `POSTGRES_SERVER` and `POSTGRES_PORT`, are read as a service's
   address, like a URL ([#4]).
 - A version file in an app directory (`backend/.nvmrc`) counts:
-  `doctor` and `start` check it where that app's processes run ([#5]).
+  `doctor` and `start` check it where that app's processes run, and
+  `init` raises the runtime prelude for it rather than leaving it to the
+  first `check` ([#5]).
+- `doctor` no longer says no version manager is installed while listing
+  nvm: a manager that lacks the pinned version is named with its install
+  command.
 - A program's answer that config would refuse exits 2, as the other
   refusals do.
 - The setup screen says "your agent is probably on it" only after a
