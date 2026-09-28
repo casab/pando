@@ -2697,7 +2697,7 @@ fn the_setup_job_only_names_commands_pando_has() {
 #[test]
 fn the_memory_block_names_the_project_its_root_and_only_real_commands() {
     let fx = fixture();
-    let block = crate::setup::memory_block(&fx.paths);
+    let block = crate::setup::memory_block(&fx.paths, None);
     assert_every_command_is_real("init --agent --reference memory", &block);
     assert!(
         block.starts_with(&format!(
@@ -2746,7 +2746,7 @@ fn the_memory_block_names_the_project_its_root_and_only_real_commands() {
 #[test]
 fn reference_memory_prints_the_block_the_job_ends_with() {
     let fx = fixture();
-    let block = crate::setup::memory_block(&fx.paths);
+    let block = crate::setup::memory_block(&fx.paths, None);
     let mut out = Vec::new();
     super::agent::agent(&fx.paths, Some(super::agent::Reference::Memory), &mut out).unwrap();
     assert_eq!(String::from_utf8(out).unwrap(), block);
@@ -2762,6 +2762,44 @@ fn reference_memory_prints_the_block_the_job_ends_with() {
     assert!(
         section.contains("save it only if the developer says yes"),
         "{section}"
+    );
+}
+
+// A passing setup never meets a phone, so for an app a device runs the job
+// says the LAN address once in its list and once in the block, and
+// `--reference memory` prints the same block. For any other app, neither.
+#[test]
+fn the_job_says_a_devices_address_only_for_an_app_a_device_runs() {
+    let fx = fixture();
+    let job = super::agent::job(&fx.paths);
+    assert!(!job.contains("REACT_NATIVE_PACKAGER_HOSTNAME"), "{job}");
+
+    std::fs::write(
+        fx.root.join("package.json"),
+        r#"{ "scripts": { "start": "expo start" }, "dependencies": { "expo": "~57.0.0" } }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        fx.root.join("app.json"),
+        r#"{ "expo": { "name": "mobile" } }"#,
+    )
+    .unwrap();
+    let job = super::agent::job(&fx.paths);
+    let (list, block) = job
+        .split_once("\n## Remember how to run acme-shop\n")
+        .expect("the job has a section for the block");
+    assert!(
+        list.contains("\n- a phone or tablet reaches Metro"),
+        "{list}"
+    );
+    assert!(list.contains("never guess the address"), "{list}");
+    assert!(block.contains("REACT_NATIVE_PACKAGER_HOSTNAME"), "{block}");
+    let mut out = Vec::new();
+    super::agent::agent(&fx.paths, Some(super::agent::Reference::Memory), &mut out).unwrap();
+    let memory = String::from_utf8(out).unwrap();
+    assert!(
+        block.ends_with(&format!("```markdown\n{memory}```\n")),
+        "{block}"
     );
 }
 

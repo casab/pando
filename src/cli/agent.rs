@@ -62,7 +62,11 @@ pub fn agent<W: Write>(
     let text = match reference {
         Some(Reference::Brief) => BRIEF.to_string(),
         Some(Reference::Json) => JSON_CONTRACT.to_string(),
-        Some(Reference::Memory) => crate::setup::memory_block(paths),
+        Some(Reference::Memory) => {
+            let (config, _) = load(paths);
+            let proposals = proposals(paths);
+            crate::setup::memory_block(paths, crate::setup::device_note(&config, &proposals))
+        }
         None => job(paths),
     };
     out.write_all(text.as_bytes())?;
@@ -86,16 +90,7 @@ pub(super) fn job(paths: &PandoPaths) -> String {
          {project}. You're ready: run `pando`.\"\n"
     );
 
-    // Its own load, as doctor does: `main` keeps the error to itself and
-    // hands a command whatever layers are left, and the error is the fact
-    // worth putting first.
-    let (config, error) = match crate::config::load(paths) {
-        Ok(loaded) => (loaded.config, None),
-        Err(e) => (
-            crate::config::load_without_home(paths).config,
-            Some(format!("{e:#}")),
-        ),
-    };
+    let (config, error) = load(paths);
     if let Some(error) = &error {
         let _ = writeln!(
             out,
@@ -107,28 +102,52 @@ pub(super) fn job(paths: &PandoPaths) -> String {
     if let Some(lead) = last_check(&crate::setup::read(paths, &config)) {
         out.push_str(&lead);
     }
-    out.push_str(&project_now(paths, &config));
+    let proposals = proposals(paths);
+    let device_note = crate::setup::device_note(&config, &proposals);
+    out.push_str(&project_now(paths, &config, &proposals, device_note));
     out.push_str(&writes(paths));
     out.push_str(first_run_section().trim_end());
     out.push_str(
         "\n\nFor the full procedure: `pando init --agent --reference brief`.\n\
          For every JSON shape: `pando init --agent --reference json`.\n",
     );
-    out.push_str(&remember(paths));
+    out.push_str(&remember(paths, device_note));
     out
+}
+
+/// Config as the job reads it, with the error that kept a layer out.
+///
+/// Its own load, as doctor does: `main` keeps the error to itself and
+/// hands a command whatever layers are left, and the error is the fact
+/// worth putting first.
+fn load(paths: &PandoPaths) -> (Config, Option<String>) {
+    match crate::config::load(paths) {
+        Ok(loaded) => (loaded.config, None),
+        Err(e) => (
+            crate::config::load_without_home(paths).config,
+            Some(format!("{e:#}")),
+        ),
+    }
+}
+
+/// What the rules propose for the project, from the same places `signals`
+/// reads, with no process spawned.
+fn proposals(paths: &PandoPaths) -> Vec<detect::Proposal> {
+    let root = paths.root();
+    detect::propose(root, &detect::signals(root))
 }
 
 /// The job's last section: the block an agent saves once the developer
 /// says yes, fenced, so what it saves is exactly what `--reference
 /// memory` prints.
-fn remember(paths: &PandoPaths) -> String {
+fn remember(paths: &PandoPaths, device_note: Option<&str>) -> String {
     format!(
         "\n## Remember how to run {project}\n\n\
          Once the check passes, offer to save this in your own memory, and save it only if \
          the developer says yes, as \"Remember how to run it\" says:\n\n\
          ```markdown\n{block}```\n",
         project = paths.project.display_name,
-        block = crate::setup::memory_block(paths),
+        block = crate::setup::memory_block(paths, device_note),
     )
 }
 
@@ -229,7 +248,12 @@ pub(super) fn failure(reason: &str, tail: &[String], whose: &str) -> String {
 /// process spawned, and `settled` for whether config already answers a
 /// slot. The one thing this adds is a connect to each shared service's
 /// port, bounded as every readiness probe is.
-fn project_now(paths: &PandoPaths, config: &Config) -> String {
+fn project_now(
+    paths: &PandoPaths,
+    config: &Config,
+    proposals: &[detect::Proposal],
+    device_note: Option<&str>,
+) -> String {
     let mut out = String::from("## This project, as pando sees it now\n\n");
     let root = paths.root();
     let branch = crate::worktree::discover_all(&paths.project)
@@ -257,9 +281,14 @@ fn project_now(paths: &PandoPaths, config: &Config) -> String {
     if !runs.is_empty() {
         let _ = writeln!(out, "- runs: {}", runs.join(" · "));
     }
+    // A passing setup never meets a device, so nothing else would say it.
+    if let Some(note) = device_note {
+        let _ = writeln!(
+            out,
+            "- {note}. Tell the developer when you are done, and never guess the address."
+        );
+    }
 
-    let signals = detect::signals(root);
-    let proposals = detect::propose(root, &signals);
     let proposal = |slot: Slot| proposals.iter().find(|p| p.slot == slot);
 
     out.push_str("\nEach question, as it stands (`pando signals` has the evidence):\n\n");
@@ -268,7 +297,7 @@ fn project_now(paths: &PandoPaths, config: &Config) -> String {
     // `init` asks the dev command with no options, and "Open questions:
     // none" above a setup that starts nothing sent an agent to a check
     // that could only fail.
-    let nothing_to_run = actions::runs_nothing(config, &proposals);
+    let nothing_to_run = actions::runs_nothing(config, proposals);
     let dev_cmd = detect::Proposal::of(Slot::DevCmd, Vec::new(), false);
     for slot in actions::ALL_SLOTS {
         let name = slot_name(slot);

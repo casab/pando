@@ -21,7 +21,7 @@ pub use record::{
     CheckMode, CheckOutcome, CheckRecord, FailureKind, ProcessResult, RanBy, SetupMemory,
 };
 pub use redact::redact_line;
-pub use remember::{MEMORY_FILE_HEADER, memory_block, write_memory_files};
+pub use remember::{MEMORY_FILE_HEADER, device_note, memory_block, write_memory_files};
 pub use state::{Setup, SetupState, check_running, decide, read};
 
 /// The prompt a developer pastes into their coding agent: one line,

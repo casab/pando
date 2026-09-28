@@ -667,3 +667,59 @@ fn a_failed_processs_lines_keep_what_failed_and_lose_every_secret() {
         assert_eq!(redact_line(line), want, "{line}");
     }
 }
+
+// ---- the device line ------------------------------------------------
+
+/// An Expo app at the project's root, as its template makes one.
+fn expo_app(f: &Fixture) {
+    let root = f.paths.root();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "scripts": { "start": "expo start" }, "dependencies": { "expo": "~57.0.0" } }"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("app.json"), r#"{ "expo": { "name": "mobile" } }"#).unwrap();
+}
+
+fn proposals(f: &Fixture) -> Vec<crate::detect::Proposal> {
+    let root = f.paths.root();
+    crate::detect::propose(root, &crate::detect::signals(root))
+}
+
+// Metro's port variable, in the map form `[dev]` gets or as the template
+// a workspace app gets in `env`: either way a device runs the app.
+#[test]
+fn a_process_on_metros_port_variable_has_the_device_line() {
+    let f = fixture();
+    for text in [
+        "[dev]\ncmd = \"npm run start\"\nports = { RCT_METRO_PORT = \"web\" }\n",
+        "[processes.mobile]\ncmd = \"npm run start\"\ncwd = \"apps/mobile\"\n\
+         ports = [\"mobile\"]\nenv = { RCT_METRO_PORT = \"{port:mobile}\" }\n",
+    ] {
+        let note = device_note(&configure(&f, text), &[]).unwrap_or_else(|| panic!("{text}"));
+        assert!(note.contains("REACT_NATIVE_PACKAGER_HOSTNAME"), "{note}");
+        assert!(note.contains("EXPO_PUBLIC_*"), "{note}");
+        let block = memory_block(&f.paths, Some(note));
+        assert!(block.contains(note), "{block}");
+        assert!(block.contains("never guess it"), "{block}");
+    }
+}
+
+#[test]
+fn a_web_app_has_no_device_line() {
+    let f = fixture();
+    assert_eq!(device_note(&configure(&f, WEB), &[]), None);
+    let block = memory_block(&f.paths, None);
+    assert!(!block.contains("127.0.0.1"), "{block}");
+}
+
+// Before anything is configured, what the rules propose decides; once
+// config runs something, config does, whatever the rules would propose.
+#[test]
+fn the_device_line_follows_what_runs_proposed_or_configured() {
+    let f = fixture();
+    expo_app(&f);
+    let proposed = proposals(&f);
+    assert!(device_note(&Config::default(), &proposed).is_some());
+    assert_eq!(device_note(&configure(&f, WEB), &proposed), None);
+}

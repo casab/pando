@@ -11,11 +11,16 @@
 //!
 //! Only the project's name and root, and the commands: nothing that
 //! changes with the settings, so a copy an agent saved once stays true.
+//! The one line more is a fact about the project's app rather than its
+//! settings: [`device_note`], for an app a phone or a tablet runs.
 
 use std::fmt::Write as _;
 
 use anyhow::{Context, Result};
 
+use crate::catalog::frameworks;
+use crate::config::{Config, ProcessConfig};
+use crate::detect::{self, Slot};
 use crate::paths::PandoPaths;
 
 /// The line above the block in the files pando writes: they are pando's,
@@ -23,10 +28,55 @@ use crate::paths::PandoPaths;
 pub const MEMORY_FILE_HEADER: &str = "<!-- pando wrote this file and rewrites it each time it makes a worktree: \
      edits here are lost. -->";
 
+/// What the developer has to be told about the device the project's app
+/// runs on, when a phone or a tablet runs it: the processes config runs,
+/// or, when it runs none yet, the ones the rules propose, take their port
+/// the way a framework whose app a device reaches does.
+///
+/// Every address pando gives is this machine's `127.0.0.1`, which a
+/// device cannot reach, and nothing else in a passing setup says so.
+pub fn device_note(config: &Config, proposals: &[detect::Proposal]) -> Option<&'static str> {
+    // A port reaches a process through the map form of `ports`, or as a
+    // `{port:<role>}` in `env`, which is how a workspace app gets it.
+    let of = |process: &ProcessConfig| {
+        let mapped = process.port_env();
+        let templated = process
+            .env
+            .iter()
+            .filter(|(_, value)| value.contains("{port"))
+            .map(|(key, _)| key);
+        let vars: Vec<&str> = mapped.keys().chain(templated).map(String::as_str).collect();
+        frameworks::device_note(&vars, &process.cmd)
+    };
+    if config.runnable_processes().next().is_some() {
+        return config
+            .runnable_processes()
+            .find_map(|(_, process)| of(process));
+    }
+    proposals
+        .iter()
+        .flat_map(|proposal| proposal.candidates.iter().map(move |c| (proposal.slot, c)))
+        .find_map(|(slot, candidate)| match slot {
+            Slot::Processes => candidate
+                .processes
+                .iter()
+                .flat_map(|tables| tables.values())
+                .find_map(of),
+            Slot::DevCmd => frameworks::device_note(&[], &candidate.value),
+            // The option naming several variables is one string of them.
+            Slot::PortEnv => {
+                let vars: Vec<&str> = candidate.value.split(',').map(str::trim).collect();
+                frameworks::device_note(&vars, "")
+            }
+            _ => None,
+        })
+}
+
 /// How to run this project's worktrees, and its main checkout, with pando:
 /// a markdown section headed with the project's name and root, which is
 /// how an agent tells an earlier copy for the same project to replace.
-pub fn memory_block(paths: &PandoPaths) -> String {
+/// `device_note` is [`device_note`]'s, one line more when there is one.
+pub fn memory_block(paths: &PandoPaths, device_note: Option<&str>) -> String {
     let name = &paths.project.display_name;
     let root = paths.root().display();
     let mut out = String::new();
@@ -48,9 +98,15 @@ pub fn memory_block(paths: &PandoPaths) -> String {
          - logs: `pando logs <name>`, `--follow` to follow, `--source <process>` for one process\n\
          - a new branch: `pando new <branch>`, then `pando start <branch> --wait`\n\
          - every worktree: `pando ls --json`\n\
-         - exit 3: pando has a question, on stderr. Put it to the developer; never add `--yes`.\n\
-         - the rest: `pando init --agent --reference brief`\n",
+         - exit 3: pando has a question, on stderr. Put it to the developer; never add `--yes`.\n",
     );
+    if let Some(note) = device_note {
+        let _ = writeln!(
+            out,
+            "- {note}. Ask the developer for the address; never guess it."
+        );
+    }
+    out.push_str("- the rest: `pando init --agent --reference brief`\n");
     out
 }
 
@@ -58,9 +114,12 @@ pub fn memory_block(paths: &PandoPaths) -> String {
 /// [`PandoPaths::agent_memory_files`], replacing what was there. A file
 /// that already says exactly this is left alone, so an agent watching it
 /// is not told it changed.
-pub fn write_memory_files(paths: &PandoPaths) -> Result<()> {
+pub fn write_memory_files(paths: &PandoPaths, device_note: Option<&str>) -> Result<()> {
     paths.ensure_home()?;
-    let text = format!("{MEMORY_FILE_HEADER}\n\n{}", memory_block(paths));
+    let text = format!(
+        "{MEMORY_FILE_HEADER}\n\n{}",
+        memory_block(paths, device_note)
+    );
     for path in paths.agent_memory_files() {
         if std::fs::read_to_string(&path).is_ok_and(|existing| existing == text) {
             continue;

@@ -163,8 +163,10 @@ fn create(
     // than where config is written: a project whose config is committed,
     // or was set up by an older pando, never writes config again, and
     // every worktree pando makes, `check`'s own included, comes through
-    // here. A convenience, so a `new` is never failed over it.
-    let _ = crate::setup::write_memory_files(paths);
+    // here. A convenience, so a `new` is never failed over it. The device
+    // line comes from what config runs: by now it runs what `new` will.
+    let device_note = crate::setup::device_note(config, &[]);
+    let _ = crate::setup::write_memory_files(paths, device_note);
     // State is locked and read *before* git creates anything: a state file
     // pando cannot use has to refuse while there is still nothing to undo.
     // Not held through the checkout, which runs the repository's filters

@@ -57,6 +57,11 @@ pub struct FrameworkRule {
     /// start is known to outlast pando's default wait. `None` keeps the
     /// default.
     pub ready_timeout_s: Option<u64>,
+    /// What the developer has to be told when this framework's app runs
+    /// on a phone or a tablet rather than in a browser on this machine:
+    /// every address pando gives is `127.0.0.1`, which a device cannot
+    /// reach. `None` for every framework a browser here opens.
+    pub device_note: Option<&'static str>,
 }
 
 /// What a marker match must also pass, for a marker file that more than
@@ -101,6 +106,7 @@ pub const RULES: [FrameworkRule; 13] = [
         build_markers: &[],
         env: &[],
         ready_timeout_s: None,
+        device_note: None,
     },
     FrameworkRule {
         name: "Nuxt",
@@ -115,6 +121,7 @@ pub const RULES: [FrameworkRule; 13] = [
         build_markers: &[],
         env: &[],
         ready_timeout_s: None,
+        device_note: None,
     },
     // Astro sits on Vite but has its own CLI, its own default port and its
     // own command, so it comes before the Vite row that would claim it.
@@ -131,6 +138,7 @@ pub const RULES: [FrameworkRule; 13] = [
         build_markers: &[],
         env: &[],
         ready_timeout_s: None,
+        device_note: None,
     },
     FrameworkRule {
         name: "Angular",
@@ -146,13 +154,15 @@ pub const RULES: [FrameworkRule; 13] = [
         build_markers: &["ng build"],
         env: &[],
         ready_timeout_s: None,
+        device_note: None,
     },
     // Expo, React Native's dev server. Metro serves a bundle to a device
     // or a simulator, not a page. Its CLI reads `--port`, then
     // `RCT_METRO_PORT`, then falls back to 8081, and never `PORT`. Its
     // template names the dev script `start`, not `dev`. On a terminal it
     // waits on keypresses, which `CI=1` turns off, and a cold Metro cache
-    // can take well past pando's default wait to bind.
+    // can take well past pando's default wait to bind. The app runs on a
+    // device, which reaches this machine only at its LAN address.
     FrameworkRule {
         name: "Expo",
         markers: &["app.json", "app.config.js", "app.config.ts"],
@@ -169,6 +179,11 @@ pub const RULES: [FrameworkRule; 13] = [
         build_markers: &["expo export", "expo prebuild"],
         env: &[("CI", "1")],
         ready_timeout_s: Some(90),
+        device_note: Some(
+            "a phone or tablet reaches Metro, and the app reaches its backend, at this \
+             machine's LAN address, not 127.0.0.1: REACT_NATIVE_PACKAGER_HOSTNAME and the \
+             EXPO_PUBLIC_* backend URL need it",
+        ),
     },
     // The app servers come before the Vite row: a Laravel app has a
     // vite.config.js and a `dev: vite` script, and so do Django and Rails
@@ -186,6 +201,7 @@ pub const RULES: [FrameworkRule; 13] = [
         build_markers: &[],
         env: &[],
         ready_timeout_s: None,
+        device_note: None,
     },
     FrameworkRule {
         name: "Rails",
@@ -202,6 +218,7 @@ pub const RULES: [FrameworkRule; 13] = [
         build_markers: &[],
         env: &[],
         ready_timeout_s: None,
+        device_note: None,
     },
     FrameworkRule {
         name: "Phoenix",
@@ -218,6 +235,7 @@ pub const RULES: [FrameworkRule; 13] = [
         build_markers: &[],
         env: &[],
         ready_timeout_s: None,
+        device_note: None,
     },
     FrameworkRule {
         name: "Laravel",
@@ -232,6 +250,7 @@ pub const RULES: [FrameworkRule; 13] = [
         build_markers: &[],
         env: &[],
         ready_timeout_s: None,
+        device_note: None,
     },
     FrameworkRule {
         name: "Vite",
@@ -263,6 +282,7 @@ pub const RULES: [FrameworkRule; 13] = [
         build_markers: &["vite build"],
         env: &[],
         ready_timeout_s: None,
+        device_note: None,
     },
     FrameworkRule {
         name: "Go",
@@ -280,6 +300,7 @@ pub const RULES: [FrameworkRule; 13] = [
         build_markers: &[],
         env: &[],
         ready_timeout_s: None,
+        device_note: None,
     },
     FrameworkRule {
         name: "Rust",
@@ -296,6 +317,7 @@ pub const RULES: [FrameworkRule; 13] = [
         build_markers: &[],
         env: &[],
         ready_timeout_s: None,
+        device_note: None,
     },
     FrameworkRule {
         name: "Node",
@@ -310,8 +332,25 @@ pub const RULES: [FrameworkRule; 13] = [
         build_markers: &[],
         env: &[],
         ready_timeout_s: None,
+        device_note: None,
     },
 ];
+
+/// The note for a process that runs the app of a framework a device
+/// reaches, [`FrameworkRule::device_note`]: one that takes its port from
+/// that framework's variable, one of `port_vars`, or whose command runs
+/// the framework's server by name.
+pub fn device_note(port_vars: &[&str], cmd: &str) -> Option<&'static str> {
+    RULES.iter().find_map(|rule| {
+        let note = rule.device_note?;
+        let by_port = matches!(rule.port, PortMechanism::Env(var) if port_vars.contains(&var));
+        let by_cmd = rule
+            .script_markers
+            .iter()
+            .any(|marker| cmd.contains(marker));
+        (by_port || by_cmd).then_some(note)
+    })
+}
 
 /// Files that say something about the project's toolchain without
 /// identifying a framework. Listed with the framework markers in
@@ -343,6 +382,28 @@ mod tests {
                 assert!(markers.contains(marker), "{} marker {marker}", rule.name);
             }
         }
+    }
+
+    // A device note is found through the rule's port variable, so a rule
+    // that takes its port some other way could never print its note.
+    #[test]
+    fn a_rule_with_a_device_note_takes_its_port_from_a_variable() {
+        for rule in RULES.iter().filter(|rule| rule.device_note.is_some()) {
+            assert!(
+                matches!(rule.port, PortMechanism::Env(_)),
+                "{} has a device note and no port variable",
+                rule.name
+            );
+        }
+    }
+
+    #[test]
+    fn a_device_note_is_expos_alone() {
+        let expo = device_note(&["RCT_METRO_PORT"], "npm run start").expect("Expo's note");
+        assert!(expo.contains("REACT_NATIVE_PACKAGER_HOSTNAME"), "{expo}");
+        assert_eq!(device_note(&[], "npx expo start"), Some(expo));
+        assert_eq!(device_note(&["PORT"], "npm run dev"), None);
+        assert_eq!(device_note(&[], "npx next dev"), None);
     }
 
     #[test]
