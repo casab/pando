@@ -69,7 +69,8 @@ own, inside `.git`, removed when it is done.
      setting to get past it, and never drop a frozen install's flag.
      Which branch work starts from is the developer's: tell them both
      refs from `reason`, answer `base` with the one they name, and check
-     again. `pando check --base <branch>` tests one without saving it.
+     again. `pando check --base <branch>` tests one without saving it as
+     the base, and without replacing the last result.
    - Exit 3 is not a failure: a question is still open, and the check
      started nothing. Answer it, then run the check again.
    - Stop after three changed attempts, and tell the developer what is

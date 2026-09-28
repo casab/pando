@@ -508,9 +508,11 @@ stdout.
 `pando check --base <branch>` tests the commit that branch is at, for that
 run only, looked up as `new --base` looks one up; `base_ref` says which ref
 it read. A base the repository does not have exits 1 with nothing tested.
-`new` still forks from the project's own base, or origin/HEAD, so a pass
-at another one is the setup's only once `base` is answered with it: until
-then `notes` says so and the setup reads as untested.
+`new` still forks from the project's own base, or origin/HEAD, so a run at
+another one is a probe: its result is printed in full and never saved, and
+the last check at the project's own base still says where the setup
+stands. `notes` says so. A pass at another base is the setup's once
+`base` is answered with it and `pando check` passes again.
 
 `mode` says where it ran the project's data. `namespaced` when the
 project has hooks after `services` or after `dev` to prove — a schema

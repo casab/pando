@@ -152,22 +152,62 @@ fn a_check_whose_settings_changed_while_it_ran_is_stale_even_matching_today() {
     assert_eq!(state_of(&f), SetupState::Stale);
 }
 
-// A pass at a base `--base` gave is the setup's once the settings name
-// that base, and not before: until then `new` forks from another commit.
+// A check speaks for the base the settings named when it ran: answered
+// or changed since, `new` forks from another commit, and the base is not
+// in the fingerprint. A record from before pando kept it is compared with
+// nothing, so an upgrade does not undo a test.
 #[test]
-fn a_check_at_a_given_base_speaks_for_the_settings_only_once_they_name_it() {
+fn a_check_speaks_for_the_settings_only_while_they_name_the_base_it_ran_at() {
     let f = fixture();
     let config = configure(&f, WEB);
     let mut record = finished(CheckOutcome::Passed, &fingerprint(&config));
-    record.base_given = Some("work".to_string());
+    record.settings_base = Some(None);
     record.save(&f.paths).unwrap();
-    assert_eq!(state_of(&f), SetupState::Stale);
+    assert_eq!(state_of(&f), SetupState::Ready, "no base, then and now");
 
+    configure(&f, &format!("[project]\nbase = \"work\"\n{WEB}"));
+    assert_eq!(state_of(&f), SetupState::Stale, "a base answered since");
+
+    record.settings_base = Some(Some("work".to_string()));
+    record.save(&f.paths).unwrap();
+    assert_eq!(state_of(&f), SetupState::Ready, "the same base");
     configure(&f, &format!("[project]\nbase = \"develop\"\n{WEB}"));
     assert_eq!(state_of(&f), SetupState::Stale, "another base");
 
-    configure(&f, &format!("[project]\nbase = \"work\"\n{WEB}"));
-    assert_eq!(state_of(&f), SetupState::Ready);
+    // The same for a question the check found open: once `base` is
+    // answered, it no longer says the base is open.
+    let mut record = finished(
+        CheckOutcome::NotSetUp {
+            slot: "base".to_string(),
+        },
+        &fingerprint(&load(&f)),
+    );
+    record.settings_base = Some(None);
+    record.save(&f.paths).unwrap();
+    assert_eq!(state_of(&f), SetupState::Stale);
+
+    finished(CheckOutcome::Passed, &fingerprint(&load(&f)))
+        .save(&f.paths)
+        .unwrap();
+    assert_eq!(state_of(&f), SetupState::Ready, "an older record");
+}
+
+// `Some(None)` — no base named — survives the file, and a record that
+// never had the field reads as one that says nothing about it.
+#[test]
+fn the_base_a_check_ran_at_round_trips_named_or_not_and_an_older_record_has_none() {
+    let f = fixture();
+    let mut record = finished(CheckOutcome::Passed, "fp");
+    for base in [Some(None), Some(Some("work".to_string()))] {
+        record.settings_base = base.clone();
+        record.save(&f.paths).unwrap();
+        assert_eq!(CheckRecord::load(&f.paths).unwrap().settings_base, base);
+    }
+    record.settings_base = None;
+    record.save(&f.paths).unwrap();
+    let text = std::fs::read_to_string(f.paths.check_file()).unwrap();
+    assert!(!text.contains("settings_base"), "{text}");
+    assert_eq!(CheckRecord::load(&f.paths).unwrap().settings_base, None);
 }
 
 #[test]
@@ -310,7 +350,7 @@ fn a_check_record_round_trips_with_every_field() {
         fingerprint_after: Some("b".to_string()),
         commit: Some("a1b2c3d4e5f6".to_string()),
         base_ref: Some("main".to_string()),
-        base_given: Some("main".to_string()),
+        settings_base: Some(Some("main".to_string())),
         outcome: failed(),
         processes: vec![
             ProcessResult {

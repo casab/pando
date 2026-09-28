@@ -50,7 +50,11 @@ pub(super) fn check<W: Write>(
         step: &step,
         detail: &detail,
     };
-    let Checked { record, unanswered } = actions::check_at(paths, config, base, ran_by, &say)?;
+    let Checked {
+        record,
+        unanswered,
+        probe,
+    } = actions::check_at(paths, config, base, ran_by, &say)?;
     if json {
         serde_json::to_writer_pretty(&mut *out, &check_json(paths, &record))?;
         writeln!(out)?;
@@ -85,10 +89,10 @@ pub(super) fn check<W: Write>(
                     }
                 }
                 let style = crate::term::Style::for_stdout();
-                // A pass at a base the settings do not name proves that
+                // A pass at a base the settings do not choose proves that
                 // base, not the setup `new` forks worktrees from.
-                let said = match record.base_given.as_deref() {
-                    Some(given) if config.project.base.as_deref() != Some(given) => format!(
+                let said = match probe.as_deref() {
+                    Some(given) => format!(
                         "{} passes at {given}: answer `base` with it to make that the setup's",
                         paths.project.display_name
                     ),

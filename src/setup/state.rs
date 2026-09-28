@@ -94,15 +94,13 @@ pub fn decide(
     if record.changed_while_running() || record.fingerprint() != today {
         return SetupState::Stale;
     }
-    // A check at a base `--base` gave speaks for these settings once they
-    // name that base too: until then `new` forks from another commit. The
-    // base stays out of the fingerprint, which is of how the project runs;
-    // this is the one record that tested a commit the settings did not
-    // choose.
+    // A check speaks for the base the settings named when it ran: once
+    // they name another, `new` forks from another commit. The base stays
+    // out of the fingerprint, which is of how the project runs.
     if record
-        .base_given
-        .as_deref()
-        .is_some_and(|given| config.project.base.as_deref() != Some(given))
+        .settings_base
+        .as_ref()
+        .is_some_and(|tested| tested.as_deref() != config.project.base.as_deref())
     {
         return SetupState::Stale;
     }

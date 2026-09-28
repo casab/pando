@@ -39,11 +39,17 @@ pub struct CheckRecord {
     /// The ref that commit was taken from; none when it fell back to HEAD.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_ref: Option<String>,
-    /// The base `check --base` named for this run, as it was typed; none
-    /// when the settings chose it. A result for a base the settings do not
-    /// name is not the setup's, because `new` forks from theirs.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base_given: Option<String>,
+    /// The base the project's settings named when the check ran:
+    /// `Some(None)` when they named none, and `new` forked from
+    /// origin/HEAD. Its result speaks for the settings only while they
+    /// name the same one. `None` in a record from before pando kept it,
+    /// which is compared with nothing.
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub settings_base: Option<Option<String>>,
     pub outcome: CheckOutcome,
     /// One entry per process the check started, in start order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -162,7 +168,7 @@ impl CheckRecord {
             fingerprint_after: None,
             commit: None,
             base_ref: None,
-            base_given: None,
+            settings_base: None,
             outcome: CheckOutcome::Running,
             processes: Vec::new(),
             failed_process: None,
@@ -225,6 +231,14 @@ impl SetupMemory {
     pub fn save(&self, paths: &PandoPaths) -> Result<()> {
         write_json(&paths.setup_file(), self)
     }
+}
+
+/// A field that is there, `null` included, as `Some`: serde reads a
+/// `null` as a missing one otherwise, and `Some(None)` is an answer.
+fn present<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {

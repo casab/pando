@@ -319,13 +319,27 @@ fn an_install_that_fails_for_a_file_the_base_lacks_is_the_bases_and_base_tests_a
     assert_eq!(v["failed_process"], "dev");
     assert!(
         v["notes"][0].as_str().unwrap().contains(
-            "testing work for this run only, because --base named it: `pando new` still \
-                 forks from origin/main; to make work the base, answer `base` with it through \
-                 `pando init --answers -`"
+            "testing work for this run only, because --base named it, and keeping the last \
+             check's result: `pando new` still forks from origin/main; to make work the base, \
+             answer `base` with it through `pando init --answers -`"
         ),
         "{v}"
     );
     e.assert_nothing_left(&branches);
+    // A probe: the last check at the settings' own base is still the
+    // setup's.
+    let record = e.record().unwrap();
+    assert_eq!(record.base_ref.as_deref(), Some("origin/main"));
+    assert!(
+        matches!(
+            record.outcome,
+            CheckOutcome::Failed {
+                kind: FailureKind::Base,
+                ..
+            }
+        ),
+        "{record:?}"
+    );
 
     // A base already answered is changed only by `--replace`, and the
     // note names the command that would not be refused.
@@ -352,6 +366,72 @@ fn an_install_that_fails_for_a_file_the_base_lacks_is_the_bases_and_base_tests_a
         "{}",
         stderr(&out)
     );
+}
+
+// Issue #4's role-play: a check passed at the project's base, then a
+// probe of another base failed and replaced it, and the setup read as
+// changed when nothing had. A probe prints its whole result and saves
+// none of it; a `--base` naming the settings' own is an ordinary check.
+#[test]
+fn a_probe_of_another_base_never_replaces_the_last_check_at_the_settings_own() {
+    if skip_without_python() {
+        return;
+    }
+    let e = env(&config_running(&answering(200), "")
+        .replace("install = \"true\"", "install = \"cat app.lock\""));
+    e.git(&["branch", "old"]);
+    std::fs::write(e.root.join("app.lock"), "locked\n").unwrap();
+    e.git(&["add", "app.lock"]);
+    e.git(&["commit", "--quiet", "-m", "lock"]);
+    let branches = e.git(&["branch", "--list"]);
+
+    let out = e.pando(&["check"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let passed = e.record().unwrap();
+    assert_eq!(passed.outcome, CheckOutcome::Passed);
+    assert_eq!(passed.settings_base, Some(None));
+    assert_eq!(e.setup_state(), SetupState::Ready);
+
+    let out = e.pando(&["check", "--json", "--base", "old"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let v = json(&out);
+    assert_eq!(v["result"], "failed", "{v}");
+    assert_eq!(v["kind"], "base", "{v}");
+    assert_eq!(v["base_ref"], "old");
+    assert_eq!(v["failed_process"], "install");
+    assert_eq!(v["commit"], e.git(&["rev-parse", "old"]).trim());
+    assert!(
+        v["notes"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("testing old for this run only"),
+        "{v}"
+    );
+    e.assert_nothing_left(&branches);
+    assert_eq!(e.record(), Some(passed.clone()), "the probe saved nothing");
+    assert_eq!(e.setup_state(), SetupState::Ready);
+
+    // A pass at another base says it is not the setup's, and is not.
+    e.write_config(&config_running(&answering(200), ""));
+    let out = e.pando(&["check", "--base", "old"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "✓ plain passes at old: answer `base` with it to make that the setup's\n"
+    );
+    assert_eq!(e.record().unwrap().started_at, passed.started_at);
+
+    // The settings' own base, named: an ordinary check, saved.
+    let out = e.pando(&["check", "--base", "main"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "✓ plain is ready: `pando` opens it\n"
+    );
+    let record = e.record().unwrap();
+    assert_ne!(record.started_at, passed.started_at);
+    assert!(record.notes.is_empty(), "{:?}", record.notes);
+    e.assert_nothing_left(&branches);
 }
 
 #[test]

@@ -74,11 +74,16 @@ pub struct Narration<'a> {
 /// What a check ended with.
 #[derive(Debug)]
 pub struct Checked {
-    /// As it was saved to `check.json`.
+    /// As it was saved to `check.json`, or, for a probe, as it would have
+    /// been.
     pub record: CheckRecord,
     /// The question a run slot still has open, when the check could not
     /// start for want of an answer.
     pub unanswered: Option<NeedsAnswer>,
+    /// The base `--base` named, when the run was a probe of it: a base
+    /// the settings do not choose. Its record was not saved, so the last
+    /// check at the project's own base still says where the setup stands.
+    pub probe: Option<String>,
 }
 
 /// Runs `pando check`, each of its steps said through `say.step` and kept
@@ -105,10 +110,11 @@ pub fn check(
 /// before anything is made or recorded — tested at origin/HEAD instead,
 /// the run would say it tested what was asked when it had not.
 ///
-/// The record keeps the base it was given. Its result speaks for the
-/// settings only while they name that base too, because until they do
-/// `new` forks from another commit: the setup reads as stale then, and the
-/// check says so.
+/// A base that is not the one the settings choose makes the run a probe:
+/// its result is returned and printed, never saved, because `new` forks
+/// from another commit, and the setup is what the last check at the
+/// settings' own base says it is. A `--base` naming the settings' own is
+/// an ordinary check.
 pub fn check_at(
     paths: &PandoPaths,
     config: &Config,
@@ -121,6 +127,7 @@ pub fn check_at(
     {
         bail!("base {base:?} does not exist in this repository — nothing was tested");
     }
+    let probe = probe_of(paths.root(), config, base);
     paths.ensure_home()?;
     // One at a time, for the whole run.
     let Some(_lock) = state::try_lock(&paths.check_lock_file())? else {
@@ -149,11 +156,11 @@ pub fn check_at(
         Ok(config) => config,
         Err(e) => {
             let needs = e.downcast::<NeedsAnswer>()?;
-            return Ok(not_set_up(paths, config, ran_by, needs));
+            return Ok(not_set_up(paths, config, ran_by, needs, probe));
         }
     };
 
-    let mut run = Run::begin(paths, &config, ran_by, say);
+    let mut run = Run::begin(paths, &config, ran_by, say, probe);
     if config.runnable_processes().next().is_none() {
         return Ok(run.end(
             failed(
@@ -165,7 +172,6 @@ pub fn check_at(
         ));
     }
     // The commit a new worktree would fork from, or the one asked for.
-    run.record.base_given = base.map(str::to_string);
     let Some((commit, base_ref)) = commit_to_test(paths.root(), &config, base) else {
         return Ok(run.end(
             failed(
@@ -202,12 +208,10 @@ pub fn check_at(
         base_ref.as_deref().unwrap_or("HEAD"),
         if namespaced { ", namespaced" } else { "" }
     ));
-    // A base given for this run that the settings do not name is one
+    // A base given for this run that the settings do not choose is one
     // `new` does not fork from: said now, so a pass is not read as the
     // setup's.
-    if let Some(given) = base
-        && config.project.base.as_deref() != Some(given)
-    {
+    if let Some(given) = run.probe.clone() {
         let default = commit_to_test(paths.root(), &config, None)
             .and_then(|(_, base_ref)| base_ref)
             .unwrap_or_else(|| "HEAD".to_string());
@@ -217,9 +221,9 @@ pub fn check_at(
             None => "pando init --answers -",
         };
         let line = format!(
-            "testing {given} for this run only, because --base named it: `pando new` still \
-             forks from {default}; to make {given} the base, answer `base` with it through \
-             `{answer}`"
+            "testing {given} for this run only, because --base named it, and keeping the last \
+             check's result: `pando new` still forks from {default}; to make {given} the base, \
+             answer `base` with it through `{answer}`"
         );
         run.record.notes.push(line.clone());
         run.step(&line);
@@ -312,22 +316,42 @@ fn settings_fingerprint(paths: &PandoPaths, config: &Config) -> String {
 }
 
 /// A check that stopped before it made anything, for want of an answer:
-/// recorded with the slot that is open, and the question handed back for
-/// the front end to put.
-fn not_set_up(paths: &PandoPaths, config: &Config, ran_by: RanBy, needs: NeedsAnswer) -> Checked {
+/// recorded with the slot that is open, unless the run was a probe, and
+/// the question handed back for the front end to put.
+fn not_set_up(
+    paths: &PandoPaths,
+    config: &Config,
+    ran_by: RanBy,
+    needs: NeedsAnswer,
+    probe: Option<String>,
+) -> Checked {
     // What the resolve pass wrote before it reached the open slot is on
     // disk now; the record is of the settings as they stand.
     let mut record = CheckRecord::begin(settings_fingerprint(paths, config), ran_by);
+    record.settings_base = Some(config.project.base.clone());
     record.outcome = CheckOutcome::NotSetUp {
         slot: slot_name(needs.question.slot),
     };
     record.fingerprint_after = Some(record.fingerprint_before.clone());
     record.finished_at = Some(Utc::now());
-    let _ = record.save(paths);
+    if probe.is_none() {
+        let _ = record.save(paths);
+    }
     Checked {
         record,
         unanswered: Some(needs),
+        probe,
     }
+}
+
+/// The base `given` names, when a run at it is a probe: the ref it
+/// resolves to is not the one the settings choose. A `--base` naming the
+/// settings' own, however it is spelled, is no probe.
+fn probe_of(root: &Path, config: &Config, given: Option<&str>) -> Option<String> {
+    let given = given?;
+    let tested = commit_to_test(root, config, Some(given)).and_then(|(_, base_ref)| base_ref);
+    let chosen = commit_to_test(root, config, None).and_then(|(_, base_ref)| base_ref);
+    (tested != chosen).then(|| given.to_string())
 }
 
 /// A slot's published name, as `pando signals` and the answers file spell
@@ -402,11 +426,14 @@ fn to_prove(config: &Config) -> Vec<&str> {
         .collect()
 }
 
-/// A check under way, and its record, saved at every step.
+/// A check under way, and its record, saved at every step — unless it
+/// is a probe, whose record is never saved.
 struct Run<'a> {
     paths: &'a PandoPaths,
     say: &'a Narration<'a>,
     record: CheckRecord,
+    /// The base a probe tests; see [`Checked::probe`].
+    probe: Option<String>,
     /// Whether a save has failed already, so it is said once.
     save_failed: std::cell::Cell<bool>,
 }
@@ -428,11 +455,15 @@ impl<'a> Run<'a> {
         config: &Config,
         ran_by: RanBy,
         say: &'a Narration<'a>,
+        probe: Option<String>,
     ) -> Run<'a> {
+        let mut record = CheckRecord::begin(settings_fingerprint(paths, config), ran_by);
+        record.settings_base = Some(config.project.base.clone());
         let run = Run {
             paths,
             say,
-            record: CheckRecord::begin(settings_fingerprint(paths, config), ran_by),
+            record,
+            probe,
             save_failed: std::cell::Cell::new(false),
         };
         run.save();
@@ -440,6 +471,9 @@ impl<'a> Run<'a> {
     }
 
     fn save(&self) {
+        if self.probe.is_some() {
+            return;
+        }
         if let Err(e) = self.record.save(self.paths)
             && !self.save_failed.replace(true)
         {
@@ -465,6 +499,7 @@ impl<'a> Run<'a> {
         Checked {
             record: self.record,
             unanswered: None,
+            probe: self.probe,
         }
     }
 
