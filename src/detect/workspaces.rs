@@ -11,8 +11,10 @@ use crate::catalog::package_managers::{self, Ecosystem};
 use crate::config::{PortsSpec, ProcessConfig, ReadySpec};
 
 use super::apply::DEV;
-use super::dev::{flag_reaches_server, is_multiplexer, own_port, script_args, script_runner};
-use super::frameworks::script_framework;
+use super::dev::{
+    dev_script, flag_reaches_server, is_multiplexer, own_port, rule_env, script_args, script_runner,
+};
+use super::frameworks::{only_builds, runs, script_framework};
 use super::proposal::{Candidate, Proposal, Slot};
 use super::signals::{Signals, parse_scripts, present};
 
@@ -35,6 +37,11 @@ pub struct WorkspaceApp {
     /// move: `next dev --port 3000` binds 3000 whatever `PORT` says, and
     /// so does `PORT=3000 next dev`. Such an app owns no role.
     pub fixed_port: Option<u16>,
+    /// The environment its framework's rule proposes for its server, and
+    /// the readiness wait: Expo's `CI = "1"` and 90 seconds. Empty and
+    /// `None` for an app whose script runs no rule's server.
+    pub env: BTreeMap<String, String>,
+    pub ready_timeout_s: Option<u64>,
 }
 
 /// Fewer than this is not a workspace worth splitting up: one app with a
@@ -229,7 +236,7 @@ pub fn workspace_apps(root: &Path, signals: &Signals) -> Vec<WorkspaceApp> {
         for dir in expand_glob(root, &glob) {
             let path = root.join(&dir);
             let app = app_signals(&path);
-            let Some(script) = app.scripts.get("dev") else {
+            let Some((script_name, script)) = dev_script(&path, &app) else {
                 continue;
             };
             // Not the production check: a script named `dev` is the one the
@@ -243,7 +250,10 @@ pub fn workspace_apps(root: &Path, signals: &Signals) -> Vec<WorkspaceApp> {
             let (runner, args) = own_runner(signals, &app).unwrap_or((runner, args));
             let rule = script_framework(&path, &app, script);
             let fixed = own_port(script, rule);
-            let mut cmd = format!("{runner}dev");
+            // The rule whose server the script runs, for what that rule
+            // proposes beside the command.
+            let serves = rule.filter(|rule| runs(rule, script) && !only_builds(rule, script));
+            let mut cmd = format!("{runner}{script_name}");
             // A framework that takes its port on the command line gets the
             // flag appended to its own script: `pnpm dev --port 1234`, or
             // `npm run dev -- --port 1234`, runs what the app already runs,
@@ -276,6 +286,8 @@ pub fn workspace_apps(root: &Path, signals: &Signals) -> Vec<WorkspaceApp> {
                     None => PortMechanism::Ask,
                 },
                 fixed_port: fixed,
+                env: serves.map(rule_env).unwrap_or_default(),
+                ready_timeout_s: serves.and_then(|rule| rule.ready_timeout_s),
                 name: name.to_string(),
                 dir,
                 cmd,
@@ -574,6 +586,11 @@ pub(super) fn processes_proposal(root: &Path, signals: &Signals) -> Option<Propo
             env.entry(var.clone())
                 .or_insert_with(|| format!("{{port:{target}}}"));
         }
+        // Last, and never over anything above: a variable the project's own
+        // env example gives a meaning wins over a framework's default.
+        for (var, value) in &app.env {
+            env.entry(var.clone()).or_insert_with(|| value.clone());
+        }
         let roles = if *owns_role {
             vec![app.name.clone()]
         } else {
@@ -588,7 +605,7 @@ pub(super) fn processes_proposal(root: &Path, signals: &Signals) -> Option<Propo
                 env,
                 ready: owns_role.then(|| ReadySpec {
                     role: Some(app.name.clone()),
-                    timeout_s: None,
+                    timeout_s: app.ready_timeout_s,
                 }),
             },
         );

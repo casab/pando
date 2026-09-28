@@ -1172,6 +1172,16 @@ fn write_answer(
     {
         edits.retain(|edit| edit.key != "ports");
     }
+    // And for the same reason an `env` or a `ready` they wrote: the rule's
+    // `CI = "1"` written whole over their `env` would lose every key of it.
+    if slot == Slot::DevCmd
+        && let Some(process) = config.processes.get(detect::DEV)
+    {
+        edits.retain(|edit| {
+            !(edit.key == "env" && !process.env.is_empty()
+                || edit.key == "ready" && process.ready.is_some())
+        });
+    }
     if slot == Slot::Processes {
         // A whole process table is one answer to one question, so the
         // note goes on the table's header rather than on each of its

@@ -220,7 +220,8 @@ install  version_files  prelude  processes  dev_cmd  port_env  services  schema_
         "preselected": false,
         "needs_a_human": false,            // --yes may not take this; a file naming it may
         "ports": null,
-        "processes": null,                 // the whole [processes] table a workspace answer is
+        "processes": null,                 // the whole [processes] table a workspace answer is,
+                                           // or the env and ready a dev_cmd option brings to [dev]
         "service": null,                   // { "file": "...", "recipe": "...", "env_key": "..." }
         "hook": null,                      // the whole [[hooks]] entry this option is
         "provision_from": {}               // which paths would be copied from an example

@@ -48,6 +48,15 @@ pub struct FrameworkRule {
     /// not its server: a library's `vite build --watch` binds no port, and
     /// its CLI refuses the `--port` a server would be given.
     pub build_markers: &'static [&'static str],
+    /// Environment a process running this framework's server is proposed
+    /// with, beside its port: what keeps a CLI that would otherwise wait
+    /// on a keypress from waiting on one. Empty for almost every rule.
+    pub env: &'static [(&'static str, &'static str)],
+    /// How long a process running this framework's server is proposed to
+    /// get before its port has to be bound, for a framework whose cold
+    /// start is known to outlast pando's default wait. `None` keeps the
+    /// default.
+    pub ready_timeout_s: Option<u64>,
 }
 
 /// What a marker match must also pass, for a marker file that more than
@@ -73,7 +82,7 @@ pub enum Guard {
 /// The rules pando ships with. Order matters: the first match wins, so the
 /// specific frameworks come before the conventions they are built on, and
 /// an app server before the asset pipeline it builds with.
-pub const RULES: [FrameworkRule; 12] = [
+pub const RULES: [FrameworkRule; 13] = [
     FrameworkRule {
         name: "Next.js",
         markers: &[
@@ -90,6 +99,8 @@ pub const RULES: [FrameworkRule; 12] = [
         guard: Guard::Marker,
         scripts_build_assets: false,
         build_markers: &[],
+        env: &[],
+        ready_timeout_s: None,
     },
     FrameworkRule {
         name: "Nuxt",
@@ -102,6 +113,8 @@ pub const RULES: [FrameworkRule; 12] = [
         guard: Guard::Marker,
         scripts_build_assets: false,
         build_markers: &[],
+        env: &[],
+        ready_timeout_s: None,
     },
     // Astro sits on Vite but has its own CLI, its own default port and its
     // own command, so it comes before the Vite row that would claim it.
@@ -116,6 +129,8 @@ pub const RULES: [FrameworkRule; 12] = [
         guard: Guard::Marker,
         scripts_build_assets: false,
         build_markers: &[],
+        env: &[],
+        ready_timeout_s: None,
     },
     FrameworkRule {
         name: "Angular",
@@ -129,6 +144,31 @@ pub const RULES: [FrameworkRule; 12] = [
         scripts_build_assets: false,
         // A library's `ng build --watch`.
         build_markers: &["ng build"],
+        env: &[],
+        ready_timeout_s: None,
+    },
+    // Expo, React Native's dev server. Metro serves a bundle to a device
+    // or a simulator, not a page. Its CLI reads `--port`, then
+    // `RCT_METRO_PORT`, then falls back to 8081, and never `PORT`. Its
+    // template names the dev script `start`, not `dev`. On a terminal it
+    // waits on keypresses, which `CI=1` turns off, and a cold Metro cache
+    // can take well past pando's default wait to bind.
+    FrameworkRule {
+        name: "Expo",
+        markers: &["app.json", "app.config.js", "app.config.ts"],
+        script_markers: &["expo start"],
+        port: PortMechanism::Env("RCT_METRO_PORT"),
+        default_port: 8081,
+        command: Some("npx expo start"),
+        port_flag: Some("--port {port}"),
+        // `app.json` is every Heroku app's too: only one that has an
+        // `expo` key, or a manifest that depends on `expo`, is Expo.
+        guard: Guard::Mentions(&["package.json", "app.json"], "\"expo\""),
+        scripts_build_assets: false,
+        // A static export, or the native projects generated for a build.
+        build_markers: &["expo export", "expo prebuild"],
+        env: &[("CI", "1")],
+        ready_timeout_s: Some(90),
     },
     // The app servers come before the Vite row: a Laravel app has a
     // vite.config.js and a `dev: vite` script, and so do Django and Rails
@@ -144,6 +184,8 @@ pub const RULES: [FrameworkRule; 12] = [
         guard: Guard::Marker,
         scripts_build_assets: true,
         build_markers: &[],
+        env: &[],
+        ready_timeout_s: None,
     },
     FrameworkRule {
         name: "Rails",
@@ -158,6 +200,8 @@ pub const RULES: [FrameworkRule; 12] = [
         guard: Guard::Marker,
         scripts_build_assets: true,
         build_markers: &[],
+        env: &[],
+        ready_timeout_s: None,
     },
     FrameworkRule {
         name: "Phoenix",
@@ -172,6 +216,8 @@ pub const RULES: [FrameworkRule; 12] = [
         guard: Guard::Mentions(&["mix.exs", "mix.lock"], ":phoenix,"),
         scripts_build_assets: true,
         build_markers: &[],
+        env: &[],
+        ready_timeout_s: None,
     },
     FrameworkRule {
         name: "Laravel",
@@ -184,6 +230,8 @@ pub const RULES: [FrameworkRule; 12] = [
         guard: Guard::Marker,
         scripts_build_assets: true,
         build_markers: &[],
+        env: &[],
+        ready_timeout_s: None,
     },
     FrameworkRule {
         name: "Vite",
@@ -213,6 +261,8 @@ pub const RULES: [FrameworkRule; 12] = [
         // Library mode's `vite build --watch`. Not `vite preview`, which
         // serves the build and takes `--port`.
         build_markers: &["vite build"],
+        env: &[],
+        ready_timeout_s: None,
     },
     FrameworkRule {
         name: "Go",
@@ -228,6 +278,8 @@ pub const RULES: [FrameworkRule; 12] = [
         guard: Guard::GoMain,
         scripts_build_assets: false,
         build_markers: &[],
+        env: &[],
+        ready_timeout_s: None,
     },
     FrameworkRule {
         name: "Rust",
@@ -242,6 +294,8 @@ pub const RULES: [FrameworkRule; 12] = [
         guard: Guard::BinaryCrate,
         scripts_build_assets: false,
         build_markers: &[],
+        env: &[],
+        ready_timeout_s: None,
     },
     FrameworkRule {
         name: "Node",
@@ -254,6 +308,8 @@ pub const RULES: [FrameworkRule; 12] = [
         guard: Guard::Marker,
         scripts_build_assets: false,
         build_markers: &[],
+        env: &[],
+        ready_timeout_s: None,
     },
 ];
 

@@ -180,6 +180,17 @@ pub fn apply(slot: Slot, candidate: &Candidate, config: &mut Config) {
             {
                 process.ports = Some(ports.clone());
             }
+            // What the framework's rule brings besides the command, on the
+            // same terms: an `env` or a `ready` the developer wrote is
+            // theirs, and one written whole over it would lose their keys.
+            if let Some(rule) = candidate.processes.as_ref().and_then(|p| p.get(DEV)) {
+                if process.env.is_empty() {
+                    process.env = rule.env.clone();
+                }
+                if process.ready.is_none() {
+                    process.ready = rule.ready.clone();
+                }
+            }
         }
         Slot::PortEnv => {
             let process = config.processes.entry(DEV.to_string()).or_default();
@@ -382,6 +393,16 @@ pub fn edits(slot: Slot, candidate: &Candidate) -> Vec<Edit> {
                     toml_edit::Value::Array(toml_edit::Array::from_iter(roles.iter().cloned())),
                 ));
             }
+            // The rest of `[dev]` a framework's rule proposes with its
+            // command: Expo's `CI` and its longer wait.
+            if let Some(rule) = candidate.processes.as_ref().and_then(|p| p.get(DEV)) {
+                if !rule.env.is_empty() {
+                    out.push(single(&["dev"], "env", env_value(&rule.env)));
+                }
+                if let Some(ready) = &rule.ready {
+                    out.push(single(&["dev"], "ready", ready_value(ready)));
+                }
+            }
             out
         }
         Slot::VersionFiles => {
@@ -490,24 +511,34 @@ fn process_edits(candidate: &Candidate) -> Vec<Edit> {
             None => {}
         }
         if !process.env.is_empty() {
-            let mut inline = toml_edit::InlineTable::new();
-            for (var, value) in &process.env {
-                inline.insert(var, value.as_str().into());
-            }
-            push("env", toml_edit::Value::InlineTable(inline));
+            push("env", env_value(&process.env));
         }
         if let Some(ready) = &process.ready {
-            let mut inline = toml_edit::InlineTable::new();
-            if let Some(role) = &ready.role {
-                inline.insert("role", role.as_str().into());
-            }
-            if let Some(timeout) = ready.timeout_s {
-                inline.insert("timeout_s", (timeout as i64).into());
-            }
-            push("ready", toml_edit::Value::InlineTable(inline));
+            push("ready", ready_value(ready));
         }
     }
     out
+}
+
+/// A process's `env`, as the inline table it is written as.
+fn env_value(env: &BTreeMap<String, String>) -> toml_edit::Value {
+    let mut inline = toml_edit::InlineTable::new();
+    for (var, value) in env {
+        inline.insert(var, value.as_str().into());
+    }
+    toml_edit::Value::InlineTable(inline)
+}
+
+/// A process's `ready`, as the inline table it is written as.
+fn ready_value(ready: &crate::config::ReadySpec) -> toml_edit::Value {
+    let mut inline = toml_edit::InlineTable::new();
+    if let Some(role) = &ready.role {
+        inline.insert("role", role.as_str().into());
+    }
+    if let Some(timeout) = ready.timeout_s {
+        inline.insert("timeout_s", (timeout as i64).into());
+    }
+    toml_edit::Value::InlineTable(inline)
 }
 
 /// The roles a command asks for by carrying `{port:<role>}`.

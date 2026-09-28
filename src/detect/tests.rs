@@ -3668,3 +3668,193 @@ fn an_app_directorys_env_example_seeds_its_missing_env_file() {
         .collect();
     assert_eq!(ports, ["4000"]);
 }
+
+// ---- Expo ------------------------------------------------------------
+
+/// An Expo app as its template makes one: `expo start` under `start`, no
+/// `dev` script, and `expo` among its dependencies.
+fn expo_app(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{ "main": "expo-router/entry",
+             "scripts": { "start": "expo start", "android": "expo run:android",
+                          "web": "expo start --web", "lint": "expo lint" },
+             "dependencies": { "expo": "~57.0.0", "expo-router": "~6.0.0" } }"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join("app.json"), r#"{ "expo": { "name": "mobile" } }"#).unwrap();
+}
+
+// The whole `[dev]` an Expo app at the root gets with nobody asked: its own
+// `start` script, Metro's port variable, `CI` so it never waits on a key,
+// and the longer wait a cold Metro needs.
+#[test]
+fn an_expo_app_at_the_root_is_started_by_its_start_script() {
+    let dir = tempdir().unwrap();
+    expo_app(dir.path());
+    std::fs::write(dir.path().join("package-lock.json"), "{}\n").unwrap();
+    let signals = signals(dir.path());
+    let rule = framework(dir.path(), &signals).map(|rule| rule.name);
+    assert_eq!(rule, Some("Expo"));
+
+    let dev = dev_in(dir.path(), &signals);
+    assert!(dev.decided, "{dev:?}");
+    assert_eq!(values(&dev), vec!["npm run start"]);
+    let port = port_proposal(&signals, framework(dir.path(), &signals)).unwrap();
+    assert!(port.decided);
+    assert_eq!(values(&port), vec!["RCT_METRO_PORT"]);
+
+    let mut config = Config::default();
+    apply(Slot::DevCmd, &dev.candidates[0], &mut config);
+    apply(Slot::PortEnv, &port.candidates[0], &mut config);
+    let process = &config.processes[DEV];
+    assert_eq!(process.cmd, "npm run start");
+    assert_eq!(
+        process.ports,
+        Some(PortsSpec::Map(BTreeMap::from([(
+            "RCT_METRO_PORT".to_string(),
+            "web".to_string()
+        )])))
+    );
+    assert_eq!(
+        process.env,
+        BTreeMap::from([("CI".to_string(), "1".to_string())])
+    );
+    assert_eq!(process.ready.as_ref().and_then(|r| r.timeout_s), Some(90));
+    assert_eq!(process.ready.as_ref().and_then(|r| r.role.clone()), None);
+
+    // And written to the file as it was applied.
+    let written = snippet(Slot::DevCmd, &[&dev.candidates[0]]);
+    assert!(written.contains(r#"cmd = "npm run start""#), "{written}");
+    assert!(written.contains(r#"env = { CI = "1" }"#), "{written}");
+    assert!(written.contains("ready = { timeout_s = 90 }"), "{written}");
+}
+
+#[test]
+fn an_expo_app_with_no_script_is_started_by_the_expo_cli() {
+    let dir = tempdir().unwrap();
+    expo_app(dir.path());
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{ "dependencies": { "expo": "~57.0.0" } }"#,
+    )
+    .unwrap();
+    let dev = dev_in(dir.path(), &signals(dir.path()));
+    assert_eq!(values(&dev), vec!["npx expo start"]);
+    let process = &dev.candidates[0].processes.as_ref().unwrap()[DEV];
+    assert_eq!(process.env["CI"], "1");
+    assert_eq!(process.ready.as_ref().and_then(|r| r.timeout_s), Some(90));
+}
+
+// `app.json` is also Heroku's: one with no `expo` in it, beside a manifest
+// that does not depend on Expo, is some other app.
+#[test]
+fn an_app_json_that_is_not_expos_is_no_expo_app() {
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("app.json"),
+        r#"{ "name": "shop", "env": { "EXPORT_DIR": { "value": "out" } } }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{ "exports": "./index.js", "scripts": { "dev": "node server.js" } }"#,
+    )
+    .unwrap();
+    let signals = signals(dir.path());
+    assert_eq!(
+        framework(dir.path(), &signals).map(|rule| rule.name),
+        Some("Node")
+    );
+    let dev = dev_in(dir.path(), &signals);
+    assert_eq!(dev.candidates[0].processes, None, "Node proposes no env");
+}
+
+// A `[dev]` the developer wrote an `env` or a `ready` into keeps them: the
+// rule's own would replace the whole table, not add a key to it.
+#[test]
+fn a_rules_env_and_wait_never_replace_the_developers_own() {
+    let dir = tempdir().unwrap();
+    expo_app(dir.path());
+    let dev = dev_in(dir.path(), &signals(dir.path()));
+    let mut config = Config::default();
+    let written = config.processes.entry(DEV.to_string()).or_default();
+    written.env = BTreeMap::from([("EXPO_OFFLINE".to_string(), "1".to_string())]);
+    written.ready = Some(crate::config::ReadySpec {
+        role: None,
+        timeout_s: Some(300),
+    });
+    apply(Slot::DevCmd, &dev.candidates[0], &mut config);
+    let process = &config.processes[DEV];
+    assert_eq!(process.cmd, "npm run start");
+    assert_eq!(
+        process.env,
+        BTreeMap::from([("EXPO_OFFLINE".to_string(), "1".to_string())])
+    );
+    assert_eq!(process.ready.as_ref().and_then(|r| r.timeout_s), Some(300));
+}
+
+/// An Expo app in `apps/mobile` beside a Fastify api in `apps/api`.
+fn expo_workspace(dir: &Path) {
+    std::fs::write(dir.join("package.json"), r#"{ "workspaces": ["apps/*"] }"#).unwrap();
+    std::fs::write(dir.join("package-lock.json"), "{}\n").unwrap();
+    expo_app(&dir.join("apps/mobile"));
+    std::fs::create_dir_all(dir.join("apps/api")).unwrap();
+    std::fs::write(
+        dir.join("apps/api/package.json"),
+        r#"{ "scripts": { "dev": "tsx watch src/index.ts" } }"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn an_expo_app_in_a_workspace_is_a_process_of_its_own() {
+    let dir = tempdir().unwrap();
+    expo_workspace(dir.path());
+    let proposal = proposed_processes(dir.path());
+    let processes = proposal.candidates[0].processes.clone().unwrap();
+    assert_eq!(
+        processes.keys().cloned().collect::<Vec<_>>(),
+        vec!["api", "mobile"]
+    );
+
+    let mobile = &processes["mobile"];
+    assert_eq!(mobile.cwd.as_deref(), Some("apps/mobile"));
+    assert_eq!(
+        mobile.cmd, "npm run start",
+        "its own script, by its own name"
+    );
+    assert_eq!(mobile.roles(), vec!["mobile"]);
+    assert_eq!(mobile.env["RCT_METRO_PORT"], "{port:mobile}");
+    assert!(!mobile.env.contains_key("PORT"), "Expo never reads PORT");
+    assert_eq!(mobile.env["CI"], "1");
+    let ready = mobile.ready.clone().unwrap();
+    assert_eq!(ready.role.as_deref(), Some("mobile"));
+    assert_eq!(ready.timeout_s, Some(90));
+
+    let api = &processes["api"];
+    assert_eq!(api.cmd, "npm run dev");
+    assert_eq!(api.env["PORT"], "{port:api}");
+    assert!(!api.env.contains_key("CI"), "only Expo's rule proposes it");
+    assert_eq!(api.ready.clone().unwrap().timeout_s, None);
+}
+
+// Only a framework pando knows how to start is found under `start`: a
+// `start: node server.js` is as often production as development.
+#[test]
+fn a_workspace_apps_plain_start_script_is_still_no_dev_script() {
+    let dir = tempdir().unwrap();
+    expo_workspace(dir.path());
+    std::fs::create_dir_all(dir.path().join("apps/worker")).unwrap();
+    std::fs::write(
+        dir.path().join("apps/worker/package.json"),
+        r#"{ "scripts": { "start": "node server.js" } }"#,
+    )
+    .unwrap();
+    let apps = workspace_apps(dir.path(), &signals(dir.path()));
+    assert_eq!(
+        apps.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+        vec!["api", "mobile"]
+    );
+}

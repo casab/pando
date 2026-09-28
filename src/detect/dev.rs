@@ -6,10 +6,10 @@ use std::path::Path;
 
 use crate::catalog::frameworks::{FrameworkRule, Guard, PortMechanism};
 use crate::catalog::package_managers::{self, Ecosystem};
-use crate::config::PortsSpec;
+use crate::config::{PortsSpec, ProcessConfig, ReadySpec};
 
-use super::apply::dedup_by_value;
-use super::frameworks::{go_commands, only_builds, runs, several_binaries};
+use super::apply::{DEV, dedup_by_value};
+use super::frameworks::{framework, go_commands, only_builds, runs, several_binaries};
 use super::proposal::{Candidate, Proposal, Slot};
 use super::signals::{AppDir, Signals};
 
@@ -336,6 +336,57 @@ pub(super) fn lockfiles(signals: &Signals) -> impl Iterator<Item = &str> {
     signals.lockfiles.iter().map(String::as_str)
 }
 
+/// The script an app develops with, as `(name, body)`: its `dev`, or,
+/// with none, a `start` or `serve` that runs its own framework's dev
+/// server. Expo's template names it `start`, and `expo start` is that
+/// server as surely as `next dev` is Next's.
+///
+/// Only a framework pando knows how to start counts. A `start: node
+/// server.js` is as often the production entry as the dev one, and
+/// nothing in it says which, so an app with only that is still no app.
+pub(super) fn dev_script<'a>(root: &Path, signals: &'a Signals) -> Option<(&'a str, &'a str)> {
+    if let Some(body) = signals.scripts.get("dev") {
+        return Some(("dev", body));
+    }
+    let rule = framework(root, signals).filter(|rule| rule.command.is_some())?;
+    ["start", "serve"].into_iter().find_map(|name| {
+        let (name, body) = signals.scripts.get_key_value(name)?;
+        (runs(rule, body) && !only_builds(rule, body) && !is_production(body))
+            .then_some((name.as_str(), body.as_str()))
+    })
+}
+
+/// The environment a rule proposes for a process that runs its server.
+pub(super) fn rule_env(rule: &FrameworkRule) -> BTreeMap<String, String> {
+    rule.env
+        .iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
+
+/// The keys besides `cmd` and `ports` that the one `[dev]` process a
+/// `dev_cmd` answer fills is proposed with, when it runs `rule`'s server:
+/// the rule's environment and its readiness wait. `None` for a rule that
+/// brings neither, which is nearly every rule, so an answer writes nothing
+/// it does not need.
+fn rule_process(rule: &FrameworkRule, cmd: &str) -> Option<BTreeMap<String, ProcessConfig>> {
+    if rule.env.is_empty() && rule.ready_timeout_s.is_none() {
+        return None;
+    }
+    Some(BTreeMap::from([(
+        DEV.to_string(),
+        ProcessConfig {
+            cmd: cmd.to_string(),
+            env: rule_env(rule),
+            ready: rule.ready_timeout_s.map(|timeout| ReadySpec {
+                role: None,
+                timeout_s: Some(timeout),
+            }),
+            ..ProcessConfig::default()
+        },
+    )]))
+}
+
 /// Scripts that could be a dev server, best first.
 ///
 /// Exact `dev` wins; then `serve`, then `start` unless its body is the
@@ -430,6 +481,7 @@ pub(super) fn dev_cmd_proposal(
         go_commands_offered = rule.guard == Guard::GoMain && !named.is_empty();
         let own: Vec<Candidate> = match named.is_empty() {
             true => vec![Candidate {
+                processes: rule_process(rule, &value),
                 value,
                 why,
                 ports,
@@ -438,6 +490,7 @@ pub(super) fn dev_cmd_proposal(
             false => named
                 .into_iter()
                 .map(|(value, why)| Candidate {
+                    processes: rule_process(rule, &value),
                     value,
                     why,
                     ports: ports.clone(),
@@ -495,6 +548,9 @@ fn script_candidate(
 ) -> Candidate {
     let value = format!("{}{name}", script_runner(signals));
     let why = format!("package.json scripts.{name}");
+    // A script that runs the framework's own server gets what the rule
+    // proposes for one, whatever the script is called.
+    let serves = rule.filter(|rule| runs(rule, body) && !only_builds(rule, body));
     let flagged = rule.filter(|rule| {
         rule.port == PortMechanism::InCommand
             && !rule.scripts_build_assets
@@ -504,18 +560,21 @@ fn script_candidate(
     });
     let Some((rule, flag)) = flagged.and_then(|rule| Some((rule, rule.port_flag?))) else {
         return Candidate {
+            processes: serves.and_then(|rule| rule_process(rule, &value)),
             value,
             why,
             ..Candidate::default()
         };
     };
     let role = crate::config::WEB_ROLE;
+    let value = format!(
+        "{value} {}{}",
+        script_args(signals),
+        flag.replace("{port}", &format!("{{port:{role}}}"))
+    );
     Candidate {
-        value: format!(
-            "{value} {}{}",
-            script_args(signals),
-            flag.replace("{port}", &format!("{{port:{role}}}"))
-        ),
+        processes: rule_process(rule, &value),
+        value,
         why: format!("{why}, told its port with the {} flag", rule.name),
         ports: Some(PortsSpec::List(vec![role.to_string()])),
         ..Candidate::default()
