@@ -34,7 +34,7 @@ fn sha(root: &std::path::Path, refname: &str) -> String {
 #[test]
 fn the_commit_tested_is_the_one_new_would_fork_from_not_head() {
     let (_dir, root) = repo_ahead_of_main();
-    let (commit, base) = commit_to_test(&root, &Config::default()).unwrap();
+    let (commit, base) = commit_to_test(&root, &Config::default(), None).unwrap();
     assert_eq!(base.as_deref(), Some("main"));
     assert_eq!(commit, sha(&root, "main"));
     assert_ne!(commit, sha(&root, "HEAD"));
@@ -42,9 +42,42 @@ fn the_commit_tested_is_the_one_new_would_fork_from_not_head() {
     // The project's own base wins, as it does for `new`.
     let mut config = Config::default();
     config.project.base = Some("feat/wip".to_string());
-    let (commit, base) = commit_to_test(&root, &config).unwrap();
+    let (commit, base) = commit_to_test(&root, &config, None).unwrap();
     assert_eq!(base.as_deref(), Some("feat/wip"));
     assert_eq!(commit, sha(&root, "HEAD"));
+
+    // And a base given for the run wins over both.
+    let (commit, base) = commit_to_test(&root, &config, Some("main")).unwrap();
+    assert_eq!(base.as_deref(), Some("main"));
+    assert_eq!(commit, sha(&root, "main"));
+}
+
+// A base the repository does not have is refused before anything is made
+// or recorded: tested at origin/HEAD instead, the run would claim a commit
+// it never tested.
+#[test]
+fn a_base_the_repository_does_not_have_is_refused_with_nothing_recorded() {
+    let (dir, root) = repo_ahead_of_main();
+    let project = crate::project::ProjectRef::from_root(&root).unwrap();
+    let paths = crate::paths::PandoPaths::new(dir.path().join("pando-home"), project);
+    let quiet = |_: &str| {};
+    let say = Narration {
+        step: &quiet,
+        detail: &quiet,
+    };
+    let err = check_at(
+        &paths,
+        &Config::default(),
+        Some("nope"),
+        RanBy::Program,
+        &say,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("base \"nope\" does not exist"),
+        "{err:#}"
+    );
+    assert!(!paths.check_file().exists());
 }
 
 #[test]
@@ -53,10 +86,10 @@ fn with_no_default_branch_the_commit_is_head_and_with_no_commit_there_is_none() 
     let root = dir.path().join("repo");
     std::fs::create_dir_all(&root).unwrap();
     git(&root, &["init", "--quiet", "--initial-branch=trunk"]);
-    assert_eq!(commit_to_test(&root, &Config::default()), None);
+    assert_eq!(commit_to_test(&root, &Config::default(), None), None);
 
     git(&root, &["commit", "--quiet", "--allow-empty", "-m", "root"]);
-    let (commit, base) = commit_to_test(&root, &Config::default()).unwrap();
+    let (commit, base) = commit_to_test(&root, &Config::default(), None).unwrap();
     assert_eq!(base, None, "HEAD is said as HEAD");
     assert_eq!(commit, sha(&root, "HEAD"));
 }

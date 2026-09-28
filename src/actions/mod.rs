@@ -25,7 +25,7 @@ mod trying;
 mod worktree;
 
 pub use check::{
-    CHECK_RAN_BY_ENV, Checked, LeftoverCheck, Narration, catch_check_interrupts, check,
+    CHECK_RAN_BY_ENV, Checked, LeftoverCheck, Narration, catch_check_interrupts, check, check_at,
     leftover_check, ran_by,
 };
 pub use hooks::{

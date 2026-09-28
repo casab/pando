@@ -318,13 +318,21 @@ Examples:
     /// still open.
     #[command(after_help = "\
 Examples:
-  pando check           test it, and say what went wrong
-  pando check --json    the documented machine-readable result")]
+  pando check                 test it, and say what went wrong
+  pando check --json          the documented machine-readable result
+  pando check --base dev      test the commit dev is at, this once")]
     #[command(display_order = 14)]
     Check {
         /// The result as one JSON object, whatever it is.
         #[arg(long)]
         json: bool,
+        /// Test the commit this branch is at, for this run only.
+        ///
+        /// Looked up as `new --base` looks one up. The settings' own base,
+        /// or origin/HEAD, is what `new` forks from, so a result at another
+        /// one is the setup's only once the project's `base` names it.
+        #[arg(long)]
+        base: Option<String>,
     },
     /// What the repository says about how to run itself, as JSON.
     ///
@@ -785,7 +793,9 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             to_stderr(&render_init(&report, "would write"));
             Ok(())
         }
-        Command::Check { json } => check::check(paths, config, json, &mut out),
+        Command::Check { json, base } => {
+            check::check(paths, config, json, base.as_deref(), &mut out)
+        }
         Command::Signals => signals_json(paths, config, &mut out),
         // Deliberately not given the config `main` loaded: the one thing
         // worth reporting about a project layer pando cannot read is the

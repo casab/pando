@@ -4247,6 +4247,25 @@ fn init_agent_runs_on_a_config_pando_cannot_read() {
     assert!(command(&["pando", "init", "--answers", "-", "--dry-run"]).needs_config());
 }
 
+// `check --base` is a flag of its own, beside `--json`, as `new --base`
+// is; the base names a branch, so it takes a value.
+#[test]
+fn check_takes_a_base_for_the_one_run() {
+    let command = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
+    assert!(matches!(
+        command(&["pando", "check", "--base", "dev", "--json"]),
+        Command::Check { json: true, base: Some(ref base) } if base == "dev"
+    ));
+    assert!(matches!(
+        command(&["pando", "check"]),
+        Command::Check {
+            json: false,
+            base: None
+        }
+    ));
+    assert!(Cli::try_parse_from(["pando", "check", "--base"]).is_err());
+}
+
 /// What the first-time tip said, line by line, and whether it said it.
 fn tip_lines(fx: &Fx, config: &Config, terminal: bool) -> (bool, Vec<String>) {
     let (shown, said, _) = tip_with_picture(fx, config, terminal);

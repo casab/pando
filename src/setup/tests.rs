@@ -152,6 +152,24 @@ fn a_check_whose_settings_changed_while_it_ran_is_stale_even_matching_today() {
     assert_eq!(state_of(&f), SetupState::Stale);
 }
 
+// A pass at a base `--base` gave is the setup's once the settings name
+// that base, and not before: until then `new` forks from another commit.
+#[test]
+fn a_check_at_a_given_base_speaks_for_the_settings_only_once_they_name_it() {
+    let f = fixture();
+    let config = configure(&f, WEB);
+    let mut record = finished(CheckOutcome::Passed, &fingerprint(&config));
+    record.base_given = Some("work".to_string());
+    record.save(&f.paths).unwrap();
+    assert_eq!(state_of(&f), SetupState::Stale);
+
+    configure(&f, &format!("[project]\nbase = \"develop\"\n{WEB}"));
+    assert_eq!(state_of(&f), SetupState::Stale, "another base");
+
+    configure(&f, &format!("[project]\nbase = \"work\"\n{WEB}"));
+    assert_eq!(state_of(&f), SetupState::Ready);
+}
+
 #[test]
 fn a_check_changed_after_it_ran_is_stale() {
     let f = fixture();
@@ -292,6 +310,7 @@ fn a_check_record_round_trips_with_every_field() {
         fingerprint_after: Some("b".to_string()),
         commit: Some("a1b2c3d4e5f6".to_string()),
         base_ref: Some("main".to_string()),
+        base_given: Some("main".to_string()),
         outcome: failed(),
         processes: vec![
             ProcessResult {

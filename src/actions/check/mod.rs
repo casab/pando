@@ -14,7 +14,7 @@ mod run;
 mod teardown;
 
 pub use interrupt::catch_check_interrupts;
-pub use run::{CHECK_RAN_BY_ENV, Checked, Narration, check, ran_by};
+pub use run::{CHECK_RAN_BY_ENV, Checked, Narration, check, check_at, ran_by};
 pub use teardown::{LeftoverCheck, leftover_check};
 
 #[cfg(test)]

@@ -39,6 +39,11 @@ pub struct CheckRecord {
     /// The ref that commit was taken from; none when it fell back to HEAD.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_ref: Option<String>,
+    /// The base `check --base` named for this run, as it was typed; none
+    /// when the settings chose it. A result for a base the settings do not
+    /// name is not the setup's, because `new` forks from theirs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_given: Option<String>,
     pub outcome: CheckOutcome,
     /// One entry per process the check started, in start order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -152,6 +157,7 @@ impl CheckRecord {
             fingerprint_after: None,
             commit: None,
             base_ref: None,
+            base_given: None,
             outcome: CheckOutcome::Running,
             processes: Vec::new(),
             failed_process: None,

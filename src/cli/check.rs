@@ -21,6 +21,7 @@ pub(super) fn check<W: Write>(
     paths: &PandoPaths,
     config: &Config,
     json: bool,
+    base: Option<&str>,
     out: &mut W,
 ) -> Result<()> {
     actions::catch_check_interrupts();
@@ -49,7 +50,7 @@ pub(super) fn check<W: Write>(
         step: &step,
         detail: &detail,
     };
-    let Checked { record, unanswered } = actions::check(paths, config, ran_by, &say)?;
+    let Checked { record, unanswered } = actions::check_at(paths, config, base, ran_by, &say)?;
     if json {
         serde_json::to_writer_pretty(&mut *out, &check_json(paths, &record))?;
         writeln!(out)?;
@@ -84,14 +85,20 @@ pub(super) fn check<W: Write>(
                     }
                 }
                 let style = crate::term::Style::for_stdout();
+                // A pass at a base the settings do not name proves that
+                // base, not the setup `new` forks worktrees from.
+                let said = match record.base_given.as_deref() {
+                    Some(given) if config.project.base.as_deref() != Some(given) => format!(
+                        "{} passes at {given}: answer `base` with it to make that the setup's",
+                        paths.project.display_name
+                    ),
+                    _ => format!("{} is ready: `pando` opens it", paths.project.display_name),
+                };
                 writeln!(
                     out,
                     "{} {}",
                     style.paint("✓", crate::term::Paint::Good),
-                    style.paint(
-                        &format!("{} is ready: `pando` opens it", paths.project.display_name),
-                        crate::term::Paint::Heading
-                    )
+                    style.paint(&said, crate::term::Paint::Heading)
                 )?;
             }
             Ok(())

@@ -95,6 +95,31 @@ pub fn check(
     ran_by: RanBy,
     say: &Narration<'_>,
 ) -> Result<Checked> {
+    check_at(paths, config, None, ran_by, say)
+}
+
+/// [`check`], at `base` for this run when one is given, as `new --base`
+/// forks one worktree from it: a branch, or any ref, looked up the way
+/// `new` looks a base up. A base the repository does not have is refused
+/// before anything is made or recorded — tested at origin/HEAD instead,
+/// the run would say it tested what was asked when it had not.
+///
+/// The record keeps the base it was given. Its result speaks for the
+/// settings only while they name that base too, because until they do
+/// `new` forks from another commit: the setup reads as stale then, and the
+/// check says so.
+pub fn check_at(
+    paths: &PandoPaths,
+    config: &Config,
+    base: Option<&str>,
+    ran_by: RanBy,
+    say: &Narration<'_>,
+) -> Result<Checked> {
+    if let Some(base) = base
+        && !ref_exists(paths.root(), &resolve_create_base(paths.root(), base))
+    {
+        bail!("base {base:?} does not exist in this repository — nothing was tested");
+    }
     paths.ensure_home()?;
     // One at a time, for the whole run.
     let Some(_lock) = state::try_lock(&paths.check_lock_file())? else {
@@ -138,8 +163,9 @@ pub fn check(
             None,
         ));
     }
-    // The commit a new worktree would fork from.
-    let Some((commit, base_ref)) = commit_to_test(paths.root(), &config) else {
+    // The commit a new worktree would fork from, or the one asked for.
+    run.record.base_given = base.map(str::to_string);
+    let Some((commit, base_ref)) = commit_to_test(paths.root(), &config, base) else {
         return Ok(run.end(
             failed(
                 FailureKind::Settings,
@@ -175,6 +201,23 @@ pub fn check(
         base_ref.as_deref().unwrap_or("HEAD"),
         if namespaced { ", namespaced" } else { "" }
     ));
+    // A base given for this run that the settings do not name is one
+    // `new` does not fork from: said now, so a pass is not read as the
+    // setup's.
+    if let Some(given) = base
+        && config.project.base.as_deref() != Some(given)
+    {
+        let default = commit_to_test(paths.root(), &config, None)
+            .and_then(|(_, base_ref)| base_ref)
+            .unwrap_or_else(|| "HEAD".to_string());
+        let line = format!(
+            "testing {given} because --base named it: `pando new` forks from {default} until \
+             this project's base is {given} — answer `base` with it through \
+             `pando init --answers -`"
+        );
+        run.record.notes.push(line.clone());
+        run.step(&line);
+    }
     // The machine, before anything is made.
     if let Some(down) = first_down(paths, &config, say.detail) {
         return Ok(run.end(failed(FailureKind::Machine, &down.reason), None));
@@ -285,13 +328,16 @@ fn failed(kind: FailureKind, reason: &str) -> CheckOutcome {
 }
 
 /// The commit `new` would fork a branch from, and the ref it was read
-/// from: the project's `base`, else the repository's default branch, else
-/// whatever HEAD is. `None` in a repository with no commit at all.
-pub(super) fn commit_to_test(root: &Path, config: &Config) -> Option<(String, Option<String>)> {
-    let base = config
-        .project
-        .base
-        .as_deref()
+/// from: `given` for this run, else the project's `base`, else the
+/// repository's default branch, else whatever HEAD is. `None` in a
+/// repository with no commit at all.
+pub(super) fn commit_to_test(
+    root: &Path,
+    config: &Config,
+    given: Option<&str>,
+) -> Option<(String, Option<String>)> {
+    let base = given
+        .or(config.project.base.as_deref())
         .map(|base| resolve_create_base(root, base))
         .filter(|base| ref_exists(root, base))
         .or_else(|| worktree::resolve_base_branch(root));
