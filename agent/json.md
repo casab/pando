@@ -168,7 +168,9 @@ a justfile's `set` or `export`.
 A repository whose root is not an app — `backend/` beside `frontend/`,
 and nothing at the root that says how to build either — is read one level
 down. `app_dirs` lists what was found there, and the proposals come from
-it: the install is each app's own, run in its directory.
+it: the install is each app's own, run in its directory, and the
+`processes` answer has one process per app with a dev script, each with
+its `cwd`, even when only one app has one.
 
 `extends`, `include` and `error` are why a services proposal can be missing
 or under-ticked: they are the parts of a compose file this build did not

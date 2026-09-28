@@ -1,10 +1,13 @@
-//! Workspaces: the apps of a monorepo, each with its own dev script.
+//! Workspaces: the apps of a monorepo, each with its own dev script — a
+//! workspace's members, or the app directories below a root that is not
+//! an app.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::catalog::frameworks;
 use crate::catalog::frameworks::{FrameworkRule, PortMechanism};
+use crate::catalog::package_managers::{self, Ecosystem};
 use crate::config::{PortsSpec, ProcessConfig, ReadySpec};
 
 use super::apply::DEV;
@@ -178,12 +181,41 @@ fn app_signals(dir: &Path) -> Signals {
     let manifest = std::fs::read_to_string(dir.join("package.json")).unwrap_or_default();
     Signals {
         scripts: parse_scripts(&manifest),
+        lockfiles: present(dir, &package_managers::lockfiles()),
         markers: present(dir, &frameworks::marker_files()),
         ..Default::default()
     }
 }
 
-/// Every app of the workspace that has a dev script of its own.
+/// Where the apps are: a workspace's own globs, or, below a root that is
+/// not an app, each app directory `signals` found there, as a literal
+/// path. The two never meet: a root with a workspace marker or a
+/// `package.json` has no app directories.
+fn member_globs(root: &Path, signals: &Signals) -> Vec<String> {
+    match signals.app_dirs.is_empty() {
+        true => workspace_globs(root),
+        false => signals.app_dirs.iter().map(|app| app.dir.clone()).collect(),
+    }
+}
+
+/// The runner of an app directory below a root that is not an app, and
+/// what goes before the arguments handed on to it: its own lockfile's,
+/// the way it would run at a root of its own. `None` for a workspace
+/// member, whose scripts run under the root's package manager, and for an
+/// app directory with no lockfile to say.
+fn own_runner(signals: &Signals, app: &Signals) -> Option<(&'static str, &'static str)> {
+    let lockfiles = || app.lockfiles.iter().map(String::as_str);
+    if signals.app_dirs.is_empty() {
+        return None;
+    }
+    Some((
+        package_managers::run_prefix(lockfiles(), Ecosystem::JavaScript)?,
+        package_managers::script_args(lockfiles(), Ecosystem::JavaScript)?,
+    ))
+}
+
+/// Every app of the workspace that has a dev script of its own — or, below
+/// a root that is not an app, every app directory that has one.
 ///
 /// The name is the directory's, which is also the role its port is
 /// reserved under — so two apps with the same directory name would claim
@@ -193,7 +225,7 @@ pub fn workspace_apps(root: &Path, signals: &Signals) -> Vec<WorkspaceApp> {
     let runner = script_runner(signals);
     let args = script_args(signals);
     let mut apps: Vec<WorkspaceApp> = Vec::new();
-    for glob in workspace_globs(root) {
+    for glob in member_globs(root, signals) {
         for dir in expand_glob(root, &glob) {
             let path = root.join(&dir);
             let app = app_signals(&path);
@@ -208,6 +240,7 @@ pub fn workspace_apps(root: &Path, signals: &Signals) -> Vec<WorkspaceApp> {
             let Some(name) = Path::new(&dir).file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
+            let (runner, args) = own_runner(signals, &app).unwrap_or((runner, args));
             let rule = script_framework(&path, &app, script);
             let fixed = own_port(script, rule);
             let mut cmd = format!("{runner}dev");
@@ -489,7 +522,15 @@ pub(super) fn root_orchestrates(signals: &Signals) -> bool {
 /// project's apps read from the env example, so it needs nothing else.
 pub(super) fn processes_proposal(root: &Path, signals: &Signals) -> Option<Proposal> {
     let apps = workspace_apps(root, signals);
-    if apps.len() < MIN_WORKSPACE_APPS {
+    // Below a root that is not an app, one is enough: there is no root
+    // command for the single-process form to run, so the per-app form,
+    // with the directory it runs in, is the only way to say how it starts.
+    let below_root = !signals.app_dirs.is_empty();
+    let least = match below_root {
+        true => 1,
+        false => MIN_WORKSPACE_APPS,
+    };
+    if apps.len() < least {
         return None;
     }
     // A role is a port, and a port is only worth giving an app that has
@@ -565,7 +606,13 @@ pub(super) fn processes_proposal(root: &Path, signals: &Signals) -> Option<Propo
         .map(|app| app_port_var(&app.name))
         .filter(|key| signals.env_keys().any(|k| k == key))
         .collect();
-    let mut why = format!("a dev script in each of {} workspace apps", apps.len());
+    let mut why = match below_root {
+        true => format!(
+            "a dev script in {}",
+            super::dev::listed(&apps.iter().map(|app| app.dir.as_str()).collect::<Vec<_>>())
+        ),
+        false => format!("a dev script in each of {} workspace apps", apps.len()),
+    };
     if !declared.is_empty() {
         why.push_str(&format!("; {} in the env example", declared.join(" and ")));
     }

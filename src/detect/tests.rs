@@ -3492,3 +3492,60 @@ fn an_app_directorys_install_follows_the_root_rules() {
     );
     assert!(!proposal.decided, "api has two lockfiles to choose between");
 }
+
+// The frontend's dev script is proposed as a process of its own, run in
+// its directory by its own package manager. The Python API has no script
+// to run, and a rule never invents one, so it is left for the developer.
+#[test]
+fn an_app_directory_with_a_dev_script_is_a_process_of_its_own() {
+    let dir = polyglot_siblings();
+    let proposal = processes_proposal(dir.path(), &signals(dir.path())).unwrap();
+    assert!(!proposal.decided, "the shape of the processes is asked");
+    let [only] = proposal.candidates.as_slice() else {
+        panic!("one form, and no root script beside it: {proposal:?}");
+    };
+    assert_eq!(only.value, "frontend: npm run dev in frontend");
+    assert_eq!(only.why, "a dev script in frontend");
+    let processes = only.processes.as_ref().unwrap();
+    assert_eq!(processes.keys().collect::<Vec<_>>(), ["frontend"]);
+    let frontend = &processes["frontend"];
+    assert_eq!(frontend.cwd.as_deref(), Some("frontend"));
+    assert_eq!(
+        frontend.env["PORT"], "{port:frontend}",
+        "the Nuxt convention"
+    );
+    assert_eq!(
+        frontend.ports,
+        Some(PortsSpec::List(vec!["frontend".to_string()]))
+    );
+}
+
+// Each app runs under its own package manager: pnpm's `pnpm dev` in one,
+// npm's `npm run dev` in the other, whatever the other one uses.
+#[test]
+fn each_app_directory_runs_under_its_own_package_manager() {
+    let dir = tree(&[
+        (
+            "api/package.json",
+            r#"{ "scripts": { "dev": "tsx watch src/index.ts" } }"#,
+        ),
+        ("api/pnpm-lock.yaml", ""),
+        ("web/package.json", r#"{ "scripts": { "dev": "vite" } }"#),
+        ("web/package-lock.json", "{}"),
+        ("web/vite.config.ts", "export default {}\n"),
+    ]);
+    let apps = workspace_apps(dir.path(), &signals(dir.path()));
+    let cmds: Vec<(&str, &str)> = apps
+        .iter()
+        .map(|app| (app.dir.as_str(), app.cmd.as_str()))
+        .collect();
+    assert_eq!(
+        cmds,
+        [
+            ("api", "pnpm dev"),
+            ("web", "npm run dev -- --port {port:web}")
+        ]
+    );
+    let proposal = processes_proposal(dir.path(), &signals(dir.path())).unwrap();
+    assert_eq!(proposal.candidates[0].why, "a dev script in api and web");
+}
