@@ -41,15 +41,17 @@ own, inside `.git`, removed when it is done.
    ```bash
    pando init --answers - --dry-run    # one JSON object on stdin; writes nothing
    pando init --answers -              # the same object, written
+   pando init --yes                    # then pando's choice for the rest
    ```
 
    When `signals` lists `app_dirs` that no process covers, such as an app
    with no dev script, pando leaves `processes` open. Answer it with an
    object of process tables, one per process the project runs, from its
-   README or docs: `{"api": {"cmd": "…", "cwd": "backend", "ports":
-   ["api"]}, "web": {…}}`. A process that needs another's address gets it
-   in `env` as `{port:<role>}`. Ask the developer only what the docs do
-   not say.
+   README or docs: `{"processes": {"api": {"cmd": "…", "cwd": "backend",
+   "ports": {"API_PORT": "api"}}, "worker": {…, "ports": []}}}`. A
+   process gets its own port through the variable it reads, mapped in
+   `ports`, and another's address in `env` as `{port:<role>}`. Ask the
+   developer only what the docs do not say.
 4. **Run `pando check`, with a timeout of at least 10 minutes.** It makes a
    throwaway worktree of the commit a new branch would fork from, runs the
    install, starts every process, checks the one the browser opens really
