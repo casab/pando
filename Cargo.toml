@@ -65,6 +65,11 @@ tempfile = "3.27.0"
 [profile.dev.package."*"]
 opt-level = 2
 
+# The profile release binaries are built with (`dist`).
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
 # No debug info in a dev build. On macOS, rustc leaves a debug build's
 # object files in target/debug/deps for the debugger to read, and every
 # incremental rebuild names them afresh, so each edit left about 1,500
@@ -74,3 +79,39 @@ opt-level = 2
 # debugger, build with CARGO_PROFILE_DEV_DEBUG=true.
 [profile.dev]
 debug = false
+
+# How a release is built and published: `dist` (cargo-dist) reads this
+# and generates .github/workflows/release.yml from it. Never edit that file
+# by hand: change this, then run `dist generate`. A pushed `vX.Y.Z` tag
+# builds the four targets (no Windows: pando is Unix-only), publishes a
+# GitHub Release with checksums, attestations and a shell installer that
+# installs into ~/.local/bin (it is for people without Rust), and pushes the
+# `pando` formula to mertkaradayi/homebrew-tap. release-smoke.yml then
+# installs that release the way the README says and runs it on a fixture.
+[workspace.metadata.dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.33.0"
+# CI backends to support
+ci = "github"
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-musl", "x86_64-apple-darwin", "x86_64-unknown-linux-musl"]
+# The installers to generate for each app
+installers = ["shell", "homebrew"]
+# A GitHub repo to push Homebrew formulas to
+tap = "mertkaradayi/homebrew-tap"
+# Customize the Homebrew formula name
+formula = "pando"
+# Publish jobs to run in CI
+publish-jobs = ["homebrew"]
+# Post-announce jobs to run in CI
+post-announce-jobs = ["./release-smoke"]
+# Checksums to generate for each App
+checksum = "sha256"
+# Whether to enable GitHub Attestations
+github-attestations = true
+# Path that installers should place binaries in
+install-path = ["$XDG_BIN_HOME/", "$XDG_DATA_HOME/../bin", "~/.local/bin"]
+# Whether to install an updater program
+install-updater = false
+# Which actions to run on pull requests
+pr-run-mode = "plan"
