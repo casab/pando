@@ -318,10 +318,29 @@ fn an_install_that_fails_for_a_file_the_base_lacks_is_the_bases_and_base_tests_a
     assert_eq!(v["kind"], "settings", "{v}");
     assert_eq!(v["failed_process"], "dev");
     assert!(
+        v["notes"][0].as_str().unwrap().contains(
+            "testing work for this run only, because --base named it: `pando new` still \
+                 forks from origin/main; to make work the base, answer `base` with it through \
+                 `pando init --answers -`"
+        ),
+        "{v}"
+    );
+    e.assert_nothing_left(&branches);
+
+    // A base already answered is changed only by `--replace`, and the
+    // note names the command that would not be refused.
+    std::fs::write(
+        e.paths.config_file(),
+        "[project]\ninstall = \"cat app.lock\"\nbase = \"origin/main\"\n\n\
+         [dev]\ncmd = \"echo up; exit 3\"\nports = []\n",
+    )
+    .unwrap();
+    let v = json(&e.pando(&["check", "--json", "--base", "work"]));
+    assert!(
         v["notes"][0]
             .as_str()
             .unwrap()
-            .contains("`pando new` forks from origin/main until this project's base is work"),
+            .contains("answer `base` with it through `pando init --answers - --replace`"),
         "{v}"
     );
     e.assert_nothing_left(&branches);

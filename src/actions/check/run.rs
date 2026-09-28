@@ -211,10 +211,15 @@ pub fn check_at(
         let default = commit_to_test(paths.root(), &config, None)
             .and_then(|(_, base_ref)| base_ref)
             .unwrap_or_else(|| "HEAD".to_string());
+        // A base already answered is one only `--replace` changes.
+        let answer = match config.project.base {
+            Some(_) => "pando init --answers - --replace",
+            None => "pando init --answers -",
+        };
         let line = format!(
-            "testing {given} because --base named it: `pando new` forks from {default} until \
-             this project's base is {given} — answer `base` with it through \
-             `pando init --answers -`"
+            "testing {given} for this run only, because --base named it: `pando new` still \
+             forks from {default}; to make {given} the base, answer `base` with it through \
+             `{answer}`"
         );
         run.record.notes.push(line.clone());
         run.step(&line);
