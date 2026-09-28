@@ -7,6 +7,69 @@ may change behaviour.
 
 ## Unreleased
 
+### Added
+
+- **Apps below a root with no manifest** ([#4], [#5]). A repository
+  whose root has no manifest, lockfile or marker is read one level
+  down, and also under `apps/*` and `packages/*`. pando proposes each
+  app's frozen install in its own directory, e.g.
+  `(cd backend && uv sync --frozen) && (cd frontend && npm ci)`, and a
+  `[processes.<app>]` with a `cwd` for every app with a dev script.
+  It also proposes the apps' gitignored env files for `provision`,
+  their version files, and their env examples. `pando signals` lists
+  the directories as `app_dirs`, and a compose file one directory
+  down, such as `docker/compose.yml`.
+- **Expo** is a framework rule ([#5]). An app whose `start` script
+  runs `expo start` is proposed with `RCT_METRO_PORT` (Expo ignores
+  `PORT`), `CI=1` so it never waits on a key, and 90 seconds to get
+  ready. A workspace app with only a `start` or `serve` script that
+  runs a framework's server is an app too. An app's own
+  `.env.example`, such as `EXPO_PUBLIC_API_URL=http://127.0.0.1:3000`,
+  gives it `{port:<role>}` env for the app it points at.
+- `--answers` takes `processes` as an object of process tables (`cmd`,
+  `cwd`, `ports`, `env`, `ready`), checked as a detected option is, so
+  an agent can describe a multi-process app ([#4]).
+- A `base` question, asked only where origin/HEAD is at least 100
+  commits and 30 days behind the main checkout's branch, which it
+  offers first. `pando check --base <branch>` tests another base for
+  one run, and `doctor` notes a far-behind origin/HEAD ([#4]).
+- A check that fails because the tested commit lacks a file the main
+  checkout's branch has, such as a lockfile, fails with `kind: "base"`
+  and names both refs, instead of asking for other settings ([#4]).
+- `doctor` notes a queue worker (ARQ, Celery, RQ, Sidekiq, BullMQ)
+  whose Redis every worktree shares: a job queued in one worktree can
+  run on another's code ([#4]).
+- The agent brief documents the `[processes]` table, `{port:<role>}`
+  in `env`, and that a phone needs the machine's LAN address ([#4],
+  [#5]).
+
+### Changed
+
+- A project that would run nothing is an open question: `init --agent`
+  lists the dev command, and `init --yes` exits 3 instead of writing a
+  config that starts nothing ([#4]).
+- A typed `port_env` answer such as `PORT, API_PORT` is split into its
+  variables, and a name that is not an environment variable is
+  refused ([#4]).
+- Split `*_HOST`/`*_PORT` pairs in an env example, such as
+  `POSTGRES_SERVER` and `POSTGRES_PORT`, are read as a service's
+  address, like a URL ([#4]).
+- A version file in an app directory (`backend/.nvmrc`) counts:
+  `doctor` and `start` check it where that app's processes run ([#5]).
+- A program's answer that config would refuse exits 2, as the other
+  refusals do.
+- The setup screen says "your agent is probably on it" only after a
+  settings failure. A machine or base failure is the developer's to
+  fix, and the screen says so ([#4]).
+
+### Fixed
+
+- `provision` no longer offers tool caches and artifacts such as
+  `.coverage`, `.pytest_cache` or `.venv` ([#4]).
+
+[#4]: https://github.com/mertkaradayi/pando/issues/4
+[#5]: https://github.com/mertkaradayi/pando/issues/5
+
 ## 0.5.1 — 2026-09-28
 
 ### Added
