@@ -132,6 +132,12 @@ pub fn recommended(question: &Question) -> Option<(Answer, String)> {
     if question.multi || question.options.is_empty() || question.slot.takes_a_person() {
         return None;
     }
+    // A machine-wide answer is never a guess: with nothing preselected,
+    // every option there is one the developer has to pick, and what it
+    // would change reaches every project on the machine.
+    if question.preselect.is_none() && question.slot.layer() == crate::config::Layer::User {
+        return None;
+    }
     let index = question.preselect.unwrap_or(0);
     let (value, why) = question.options.get(index)?;
     let why = match why.is_empty() {

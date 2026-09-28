@@ -436,6 +436,11 @@ pub struct Offer {
     /// requirement the project states. Only such a line is one `--yes`
     /// may take.
     pub works: bool,
+    /// Whether the line reorders PATH rather than asking a version
+    /// manager. It works, but it also changes which `npm`, `pnpm` or
+    /// `python` every project on the machine runs, so it is offered and
+    /// never taken for the developer.
+    pub reorders_path: bool,
 }
 
 /// The lines that would make this machine resolve what `check` found it
@@ -490,6 +495,7 @@ pub fn prelude_offers(
                 line: fix.line,
                 why: fix.why,
                 works: true,
+                reorders_path: false,
             });
             continue;
         }
@@ -509,6 +515,7 @@ pub fn prelude_offers(
             line: fix.line,
             why,
             works: false,
+            reorders_path: false,
         });
     }
     // Not the directory `bash -lc` already takes it from: that is the one
@@ -544,6 +551,7 @@ pub fn prelude_offers(
                 line,
                 why,
                 works: true,
+                reorders_path: true,
             });
         }
     }
@@ -552,7 +560,9 @@ pub fn prelude_offers(
 }
 
 /// The prelude question's options: every line [`prelude_offers`] tried,
-/// and only the ones that work are lines `--yes` may take.
+/// and only a version manager's line that works is one `--yes` may take.
+/// A PATH line works as well, but it reorders every project's tools, so
+/// the developer picks it.
 pub(super) fn prelude_proposal(
     paths: &PandoPaths,
     config: &Config,
@@ -565,7 +575,7 @@ pub(super) fn prelude_proposal(
         .map(|offer| detect::Candidate {
             value: offer.line,
             why: offer.why,
-            needs_a_human: !offer.works,
+            needs_a_human: !offer.works || offer.reorders_path,
             ..detect::Candidate::default()
         })
         .collect();

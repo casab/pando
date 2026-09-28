@@ -10058,9 +10058,10 @@ fn a_managers_line_that_does_not_work_yet_is_offered_but_never_preselected() {
 // A node the pin accepts, where Homebrew puts one, is a line on offer:
 // that directory first on PATH, tried before it is offered, saying the
 // version it gives and that it runs in every project on this machine.
-// `--yes` takes it, and checking it again once taken costs no shell.
+// It reorders every project's tools, so `--yes` never takes it: the
+// developer picks it, and checking it again once picked costs no shell.
 #[test]
-fn a_matching_node_in_a_well_known_place_is_offered_and_taken() {
+fn a_matching_node_in_a_well_known_place_is_offered_for_the_developer_to_pick() {
     let fx = fixture_pinning(".nvmrc", "25");
     let home = tempdir().unwrap();
     let brew = home.path().join("opt/homebrew/bin");
@@ -10071,7 +10072,7 @@ fn a_matching_node_in_a_well_known_place_is_offered_and_taken() {
         asked: Default::default(),
     };
     let shell = machine.shell("24.21.0", "opt/homebrew/bin", "25.8.2");
-    let (ask, asked) = scripted(vec![Answer::Auto(0)]);
+    let (ask, asked) = scripted(vec![Answer::Choice(0)]);
 
     let config = resolve_runtime_slot(&fx, &fx.config, &ask, &shell, machine.home.path()).unwrap();
 
@@ -10082,13 +10083,20 @@ fn a_matching_node_in_a_well_known_place_is_offered_and_taken() {
     assert_eq!(offered, &line);
     assert!(why.contains("node 25.8.2 is in"), "{why}");
     assert!(why.contains("every project on this machine"), "{why}");
-    assert_eq!(question.preselect, Some(0));
+    assert_eq!(
+        question.preselect, None,
+        "a PATH line is the developer's pick"
+    );
+    assert!(
+        super::recommended(question).is_none(),
+        "nor is it a first choice a start takes on its own"
+    );
     assert_eq!(config.runtime.prelude.as_deref(), Some(line.as_str()));
     assert!(user_config(&fx).contains(&brew.display().to_string()));
     assert_eq!(
         machine.probes(),
         2,
-        "the mismatch, then the line: taken, it is checked from the cache"
+        "the mismatch, then the line: picked, it is checked from the cache"
     );
 }
 
