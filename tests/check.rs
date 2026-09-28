@@ -461,6 +461,39 @@ fn a_stopped_shared_service_fails_as_the_machines_before_anything_is_made() {
     e.assert_nothing_left(&branches);
 }
 
+// A service whose port only the env file beside a process's app says is
+// still found, and the reason names that file: without it, nothing was
+// probed and the check went on to fail on the app instead.
+#[test]
+fn a_stopped_shared_service_is_found_through_an_app_directorys_env_file() {
+    let e = env(
+        "[processes.api]\ncmd = \"sleep 600\"\ncwd = \"backend\"\nports = { PORT = \"api\" }\n\n\
+         [[services]]\nkind = \"native\"\nname = \"postgres\"\nenv = { POSTGRES_PORT = \"postgres\" }\n",
+    );
+    let port = free_port();
+    std::fs::create_dir_all(e.root.join("backend")).unwrap();
+    std::fs::write(
+        e.root.join("backend/.env"),
+        format!("POSTGRES_SERVER=localhost\nPOSTGRES_PORT={port}\n"),
+    )
+    .unwrap();
+    let branches = e.git(&["branch", "--list"]);
+
+    let out = e.pando(&["check", "--json"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let v = json(&out);
+    assert_eq!(v["kind"], "machine", "{v}");
+    let reason = v["reason"].as_str().unwrap();
+    assert!(
+        reason.contains(&format!(
+            "nothing answers on localhost:{port}, where POSTGRES_PORT in the main checkout's \
+             backend/.env puts postgres"
+        )),
+        "{reason}"
+    );
+    e.assert_nothing_left(&branches);
+}
+
 // A question the rules cannot settle alone is exit 3, as everywhere, with
 // the result still one object on stdout.
 #[test]

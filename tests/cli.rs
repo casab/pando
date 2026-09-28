@@ -3253,6 +3253,46 @@ fn an_app_directory_nothing_starts_holds_the_process_list_open() {
     );
 }
 
+// The job said "postgres: no port in the main checkout's env files" of a
+// backend whose own `.env` has it. The app directory's files are read,
+// and the job names the one the port came from.
+#[test]
+fn init_agent_reads_a_services_port_beside_the_app() {
+    let e = env();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    for (rel, contents) in [
+        ("backend/pyproject.toml", "[project]\nname = \"api\"\n"),
+        ("backend/uv.lock", "version = 1\n"),
+        (
+            "backend/.env.example",
+            "POSTGRES_SERVER=localhost\nPOSTGRES_PORT=5432\n",
+        ),
+    ] {
+        let path = e.root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+    git(&e.root, &["add", "."]);
+    git(&e.root, &["commit", "--quiet", "-m", "api"]);
+    std::fs::write(
+        e.root.join("backend/.env"),
+        format!("POSTGRES_SERVER=localhost\nPOSTGRES_PORT={port}\n"),
+    )
+    .unwrap();
+
+    let out = e.pando(&["init", "--agent"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    let job = stdout(&out);
+    assert!(
+        job.contains(&format!("- postgres :{port} in backend/.env (not running)")),
+        "{job}"
+    );
+}
+
 // Re-running is safe: the answers for slots that already have one are
 // reported and left alone, comment and all.
 #[test]

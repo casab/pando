@@ -7,7 +7,7 @@ use crate::paths::PandoPaths;
 use crate::ports;
 use crate::services;
 
-use super::super::services::shared_service_keys;
+use super::super::services::{env_dirs, shared_service_keys};
 
 /// A shared service the check found not answering, and what starts it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,7 +17,8 @@ pub(super) struct Down {
 }
 
 /// The first of the project's shared services that nothing answers for on
-/// this machine, where the main checkout's env files say it is. Each one
+/// this machine, where the main checkout's env files say it is: the
+/// root's, then those of the directories the processes run in. Each one
 /// is asked once, with the bounded connect readiness uses, over both
 /// loopbacks: `localhost` is `[::1]` first for some servers.
 ///
@@ -29,17 +30,18 @@ pub(super) fn first_down(
     config: &Config,
     progress: &dyn Fn(&str),
 ) -> Option<Down> {
+    let dirs = env_dirs(config);
     for shared in shared_service_keys(paths, config) {
-        let Some(port) = services::port_in_env(paths.root(), &shared.key) else {
+        let Some((file, value)) = services::env_value_below(paths.root(), &dirs, &shared.key)
+        else {
+            continue;
+        };
+        let Some(port) = services::port_of_value(&value) else {
             continue;
         };
         // A bare port, or a URL whose login holds a reference, is on this
         // machine as far as anything written says.
-        let host = services::value_in_env(paths.root(), &shared.key)
-            .ok()
-            .flatten()
-            .and_then(|value| services::url_host(&value))
-            .unwrap_or_else(|| "localhost".to_string());
+        let host = services::url_host(&value).unwrap_or_else(|| "localhost".to_string());
         if !ports::is_loopback_host(&host) {
             progress(&format!(
                 "{} is on {host}, not this machine — not checked",
@@ -52,7 +54,7 @@ pub(super) fn first_down(
         }
         return Some(Down {
             reason: format!(
-                "nothing answers on {host}:{port}, where {} in the main checkout's env files puts \
+                "nothing answers on {host}:{port}, where {} in the main checkout's {file} puts \
                  {} — the check runs on your own services, as a shared start does, so start it \
                  first: {}",
                 shared.key,

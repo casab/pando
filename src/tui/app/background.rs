@@ -436,7 +436,11 @@ impl App {
             // per service, and it has no business on the UI thread or in
             // a paint.
             let health = ServiceHealth {
-                shared: actions::shared_service_statuses(&paths, &config),
+                shared: actions::shared_service_statuses(
+                    &paths,
+                    &config,
+                    &actions::env_dirs(&config),
+                ),
                 worktrees: selected
                     .and_then(|name| {
                         let record = quick.refreshed.state.worktrees.get(&name)?;

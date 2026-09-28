@@ -6428,6 +6428,40 @@ fn init_with_every_app_directory_started_takes_the_process_list() {
     );
 }
 
+// The directories a shared service's port is looked for in besides the
+// root: each one a process runs in, once, and never the root again.
+#[test]
+fn a_shared_services_port_is_read_where_the_processes_run() {
+    let fx = fixture();
+    let mut config = Config::default();
+    for (name, cwd) in [
+        ("api", Some("backend")),
+        ("worker", Some("./backend/")),
+        ("web", Some("frontend")),
+        ("root", Some(".")),
+        ("dev", None),
+    ] {
+        config.processes.insert(
+            name.to_string(),
+            ProcessConfig {
+                cmd: "sleep 1".into(),
+                cwd: cwd.map(str::to_string),
+                ..Default::default()
+            },
+        );
+    }
+    let dirs = super::env_dirs(&config);
+    assert_eq!(dirs, ["backend", "frontend"]);
+
+    std::fs::create_dir_all(fx.root.join("backend")).unwrap();
+    std::fs::write(fx.root.join("backend/.env"), "POSTGRES_PORT=1\n").unwrap();
+    let status = super::shared_service_status(&fx.paths, &dirs, "POSTGRES_PORT", "postgres");
+    assert_eq!(status.port, Some(1));
+    assert_eq!(status.env_file.as_deref(), Some("backend/.env"));
+    let status = super::shared_service_status(&fx.paths, &[], "POSTGRES_PORT", "postgres");
+    assert_eq!((status.port, status.env_file), (None, None));
+}
+
 // Only `init` asks it: `start` and `new` never put a question nobody can
 // pick an option at to a developer who only wanted to start something.
 #[test]

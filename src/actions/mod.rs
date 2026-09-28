@@ -55,7 +55,7 @@ pub use readiness::{
 pub use refresh::{FAILURE_SHOWN_LINES, Refreshed, failure_tail, inspect, refresh};
 pub use runtime::{Machine, runs_through_runner, runtime_shell, user_home, with_prelude};
 pub use services::{
-    ServiceStatus, export_lines, recorded_service_statuses, resolved_env, service_roles,
+    ServiceStatus, env_dirs, export_lines, recorded_service_statuses, resolved_env, service_roles,
     service_statuses, shared_service_status, shared_service_statuses, url_owner_not_running,
     worktree_url,
 };

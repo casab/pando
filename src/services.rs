@@ -832,6 +832,38 @@ pub fn port_in_env(dir: &Path, key: &str) -> Option<u16> {
     port_of_value(value)
 }
 
+/// Where an env key is set in the main checkout: its root's env files,
+/// then those of each of `dirs` below it, in that order, and the first
+/// file that sets it wins. The file, relative to `root` — `.env`,
+/// `backend/.env` — and the value as written.
+///
+/// A project whose root has no manifest keeps its env files beside its
+/// apps: the database an api reads from `backend/.env` is where that file
+/// says, and a status that looked at the root alone said it had no port.
+pub fn env_value_below(root: &Path, dirs: &[String], key: &str) -> Option<(String, String)> {
+    std::iter::once("")
+        .chain(dirs.iter().map(String::as_str))
+        .find_map(|dir| {
+            read_env_files(&root.join(dir))
+                .into_iter()
+                .find_map(|(name, mut env)| {
+                    let value = env.values.remove(key)?;
+                    let file = match dir {
+                        "" => name,
+                        dir => format!("{}/{name}", dir.trim_end_matches('/')),
+                    };
+                    Some((file, value))
+                })
+        })
+}
+
+/// [`port_in_env`] over [`env_value_below`]'s files: the port, and the
+/// file it was read from.
+pub fn port_in_env_below(root: &Path, dirs: &[String], key: &str) -> Option<(u16, String)> {
+    let (file, value) = env_value_below(root, dirs, key)?;
+    Some((port_of_value(&value)?, file))
+}
+
 /// The value an env key has in this directory's env files, in lookup order.
 ///
 /// [`Unresolved`] when the value holds a reference nothing sets: handed on
@@ -2252,6 +2284,36 @@ mod tests {
         assert!(
             sibling_value(dir.path(), ["DB_PORT"], &["_PASSWORD", "_PASS"]).is_err(),
             "the first spelling set is the one read"
+        );
+    }
+
+    // A project whose root has no manifest keeps its env files beside its
+    // apps. The root still comes first, and the file a port was read from
+    // is named, relative to the root.
+    #[test]
+    fn a_port_is_read_below_the_root_and_its_file_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for sub in ["backend", "frontend"] {
+            std::fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        std::fs::write(root.join("frontend/.env"), "POSTGRES_PORT=6000\n").unwrap();
+        std::fs::write(root.join("backend/.env.example"), "POSTGRES_PORT=5432\n").unwrap();
+        std::fs::write(root.join("backend/.env"), "POSTGRES_PORT=5433\n").unwrap();
+        let dirs = ["backend".to_string(), "frontend".to_string()];
+        assert_eq!(port_in_env(root, "POSTGRES_PORT"), None);
+        assert_eq!(
+            port_in_env_below(root, &dirs, "POSTGRES_PORT"),
+            Some((5433, "backend/.env".to_string())),
+            "the first directory's local file, over its example and the next directory"
+        );
+        assert_eq!(port_in_env_below(root, &[], "POSTGRES_PORT"), None);
+
+        std::fs::write(root.join(".env"), "POSTGRES_PORT=5434\n").unwrap();
+        assert_eq!(
+            port_in_env_below(root, &dirs, "POSTGRES_PORT"),
+            Some((5434, ".env".to_string())),
+            "the root's own first, as it always was"
         );
     }
 

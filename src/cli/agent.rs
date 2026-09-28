@@ -308,7 +308,17 @@ fn project_now(paths: &PandoPaths, config: &Config) -> String {
         let _ = writeln!(out, "- {name}: {line}");
     }
 
-    let services = services_now(paths, config, proposal(Slot::Services));
+    // Where the services' ports are read: the root, then each directory a
+    // process runs in, then each app directory detection read, so a
+    // project whose env files sit beside its apps is probed before any
+    // process is configured.
+    let mut dirs = actions::env_dirs(config);
+    for app in &signals.app_dirs {
+        if !dirs.contains(&app.dir) {
+            dirs.push(app.dir.clone());
+        }
+    }
+    let services = services_now(paths, config, &dirs, proposal(Slot::Services));
     if !services.is_empty() {
         out.push_str(
             "\nServices, the main checkout's own, which `pando check` uses (the port from its \
@@ -410,14 +420,16 @@ fn open_question(paths: &PandoPaths, proposal: &detect::Proposal) -> String {
 
 /// Each shared service and whether it answers: the ones config names, or,
 /// before the services question is answered, the ones detection proposes,
-/// found through the same env key a shared start reads.
+/// found through the same env key a shared start reads, each with the env
+/// file its port came from.
 fn services_now(
     paths: &PandoPaths,
     config: &Config,
+    dirs: &[String],
     proposal: Option<&detect::Proposal>,
 ) -> Vec<String> {
     let statuses = match config.services.is_empty() {
-        false => actions::shared_service_statuses(paths, config),
+        false => actions::shared_service_statuses(paths, config, dirs),
         true => {
             let mut statuses = Vec::new();
             for candidate in proposal
@@ -429,14 +441,18 @@ fn services_now(
                     .as_ref()
                     .and_then(|hint| hint.env_key.as_deref())
                 {
-                    Some(key) => {
-                        statuses.push(actions::shared_service_status(paths, key, &candidate.value))
-                    }
+                    Some(key) => statuses.push(actions::shared_service_status(
+                        paths,
+                        dirs,
+                        key,
+                        &candidate.value,
+                    )),
                     None => statuses.push(actions::ServiceStatus {
                         name: candidate.value.clone(),
                         port: None,
                         up: false,
                         logging: false,
+                        env_file: None,
                     }),
                 }
             }
@@ -447,8 +463,13 @@ fn services_now(
         .iter()
         .map(|status| match status.port {
             Some(port) => format!(
-                "{} :{port} ({})",
+                "{} :{port}{} ({})",
                 status.name,
+                status
+                    .env_file
+                    .as_deref()
+                    .map(|file| format!(" in {file}"))
+                    .unwrap_or_default(),
                 match status.up {
                     true => "running",
                     false => "not running",

@@ -1680,6 +1680,10 @@ pub struct ServiceStatus {
     /// next `start` or `restart`, and nothing that merely looks at state
     /// is allowed to spawn a process.
     pub logging: bool,
+    /// For a shared service, the main checkout's env file its port was
+    /// read from, relative to the root: `.env`, `backend/.env`. `None`
+    /// for a worktree's own service, whose port pando chose.
+    pub env_file: Option<String>,
 }
 
 /// Every service a worktree owns, with whether it is answering.
@@ -1730,6 +1734,7 @@ pub fn recorded_service_statuses(record: &WorktreeRecord) -> Vec<ServiceStatus> 
             port: service.port,
             up: service.port.map(ports::something_is_listening) == Some(true),
             logging: service.pid.is_some_and(proc::is_alive),
+            env_file: None,
         })
         .collect()
 }
@@ -1778,10 +1783,14 @@ pub fn shared_service_env(paths: &PandoPaths, config: &Config) -> BTreeMap<Strin
         .collect()
 }
 
-pub fn shared_service_statuses(paths: &PandoPaths, config: &Config) -> Vec<ServiceStatus> {
+pub fn shared_service_statuses(
+    paths: &PandoPaths,
+    config: &Config,
+    dirs: &[String],
+) -> Vec<ServiceStatus> {
     let mut out: Vec<ServiceStatus> = shared_service_keys(paths, config)
         .into_iter()
-        .map(|shared| shared_service_status(paths, &shared.key, &shared.service))
+        .map(|shared| shared_service_status(paths, dirs, &shared.key, &shared.service))
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
@@ -1838,8 +1847,19 @@ pub(super) fn shared_service_keys(paths: &PandoPaths, config: &Config) -> Vec<Sh
 ///
 /// Also what `init --agent` reports for a service detection proposes and
 /// nobody has answered yet, so the two say the same thing about it.
-pub fn shared_service_status(paths: &PandoPaths, key: &str, service: &str) -> ServiceStatus {
-    let port = services::port_in_env(paths.root(), key);
+///
+/// The root's env files first, then those of `dirs` below it — the
+/// directories the processes run in, [`env_dirs`] — and the status names
+/// the file the port came from, so a service found not running is the
+/// machine's to start rather than a setting to guess at.
+pub fn shared_service_status(
+    paths: &PandoPaths,
+    dirs: &[String],
+    key: &str,
+    service: &str,
+) -> ServiceStatus {
+    let found = services::port_in_env_below(paths.root(), dirs, key);
+    let port = found.as_ref().map(|(port, _)| *port);
     ServiceStatus {
         name: service.to_string(),
         port,
@@ -1848,7 +1868,25 @@ pub fn shared_service_status(paths: &PandoPaths, key: &str, service: &str) -> Se
         // their own `brew services start`; pando runs no pump in front of
         // anything it did not start.
         logging: false,
+        env_file: found.map(|(_, file)| file),
     }
+}
+
+/// The directories below the root whose env files say where the shared
+/// services are, besides the root's own: each one a configured process
+/// runs in, once, in name order.
+pub fn env_dirs(config: &Config) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for process in config.processes.values() {
+        let Some(cwd) = process.cwd.as_deref().map(str::trim) else {
+            continue;
+        };
+        let cwd = cwd.trim_start_matches("./").trim_end_matches('/');
+        if !cwd.is_empty() && cwd != "." && !out.iter().any(|held| held == cwd) {
+            out.push(cwd.to_string());
+        }
+    }
+    out
 }
 
 /// The environment a command run by hand inside a worktree needs, so that

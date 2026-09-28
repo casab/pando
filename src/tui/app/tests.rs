@@ -393,6 +393,7 @@ fn service_health_reaches_the_app_off_the_ui_thread() {
             port: Some(5432),
             up: false,
             logging: false,
+            env_file: None,
         }],
         worktrees: BTreeMap::from([(
             "feat+one".to_string(),
@@ -401,6 +402,7 @@ fn service_health_reaches_the_app_off_the_ui_thread() {
                 port: Some(17_004),
                 up: true,
                 logging: false,
+                env_file: None,
             }],
         )]),
     };
