@@ -98,12 +98,26 @@ pub(super) fn job(paths: &PandoPaths) -> String {
              `pando init --answers -` refuses until it is fixed. Do not edit the file yourself.\n"
         );
     }
-    if let Some(lead) = last_check(&crate::setup::read(paths, &config)) {
+    let setup = crate::setup::read(paths, &config);
+    if let Some(lead) = last_check(&setup) {
         out.push_str(&lead);
     }
-    let proposals = proposals(paths);
+    // Read once: the proposals come from these, and the services section
+    // reads the app directories they list.
+    let signals = detect::signals(paths.root());
+    let proposals = proposals_from(paths, &signals);
     let device_note = crate::setup::device_note(&config, &proposals);
-    out.push_str(&project_now(paths, &config, &proposals, device_note));
+    // The lead has said there is nothing left to set up; a line telling
+    // the agent to save choices and check again contradicted it.
+    let passing = setup.state == crate::setup::SetupState::Ready && setup.last_check.is_some();
+    out.push_str(&project_now(
+        paths,
+        &config,
+        &signals,
+        &proposals,
+        device_note,
+        passing,
+    ));
     out.push_str(&writes(paths));
     out.push_str(first_run_section().trim_end());
     out.push_str(
@@ -132,8 +146,11 @@ fn load(paths: &PandoPaths) -> (Config, Option<String>) {
 /// What the rules propose for the project, from the same places `signals`
 /// reads, with no process spawned.
 fn proposals(paths: &PandoPaths) -> Vec<detect::Proposal> {
-    let root = paths.root();
-    detect::propose(root, &detect::signals(root))
+    proposals_from(paths, &detect::signals(paths.root()))
+}
+
+fn proposals_from(paths: &PandoPaths, signals: &detect::Signals) -> Vec<detect::Proposal> {
+    detect::propose(paths.root(), signals)
 }
 
 /// The job's last section: the block an agent saves once the developer
@@ -247,11 +264,17 @@ pub(super) fn failure(reason: &str, tail: &[String], whose: &str) -> String {
 /// process spawned, and `settled` for whether config already answers a
 /// slot. The one thing this adds is a connect to each shared service's
 /// port, bounded as every readiness probe is.
+///
+/// `passing` is a last check that passed on these settings: with nothing
+/// open, the line that sends an agent to `init --yes` and a check is left
+/// out then.
 fn project_now(
     paths: &PandoPaths,
     config: &Config,
+    signals: &detect::Signals,
     proposals: &[detect::Proposal],
     device_note: Option<&str>,
+    passing: bool,
 ) -> String {
     let mut out = String::from("## This project, as pando sees it now\n\n");
     let root = paths.root();
@@ -307,6 +330,14 @@ fn project_now(
             }
             (true, _) => match actions::slot_value(config, slot) {
                 Some(value) => format!("set: `{value}`"),
+                // The dev command and its ports, settled by process
+                // tables that name no `dev`: "set" sent an agent looking
+                // for keys pando.toml does not have.
+                None if !config.processes.is_empty()
+                    && matches!(slot, Slot::DevCmd | Slot::PortEnv) =>
+                {
+                    "covered by processes".to_string()
+                }
                 None => "set".to_string(),
             },
             (false, Some(p)) if !p.decided => {
@@ -358,6 +389,7 @@ fn project_now(
     }
 
     match open.is_empty() {
+        true if passing => out.push('\n'),
         true => out.push_str(
             "\nOpen questions: none. `pando init --yes` saves pando's choices; then \
              `pando check`.\n\n",

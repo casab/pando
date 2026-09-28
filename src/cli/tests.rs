@@ -2755,6 +2755,44 @@ fn the_job_says_what_doctor_tells_about_the_prelude() {
     );
 }
 
+// After a passing check the job says nothing is left, and nothing below
+// sends the agent back to `init --yes` and a check. Process tables that
+// name no `dev` settle the dev command and its ports without either key
+// being written, and the lines say so rather than "set".
+#[test]
+fn the_job_after_a_passing_check_has_nothing_left_to_do() {
+    let fx = fixture();
+    std::fs::write(
+        fx.root.join("pando.toml"),
+        "[processes.web]\ncmd = \"npm run web\"\nports = [\"web\"]\n\n\
+         [processes.api]\ncmd = \"npm run api\"\nports = [\"api\"]\n",
+    )
+    .unwrap();
+    let config = crate::config::load(&fx.paths).unwrap().config;
+    let before = super::agent::job(&fx.paths);
+    assert!(before.contains("Open questions: none."), "{before}");
+
+    let mut record = crate::setup::CheckRecord::begin(
+        crate::setup::fingerprint(&config),
+        crate::setup::RanBy::Program,
+    );
+    record.finished_at = Some(chrono::Utc::now());
+    record.outcome = crate::setup::CheckOutcome::Passed;
+    record.save(&fx.paths).unwrap();
+
+    let job = super::agent::job(&fx.paths);
+    assert!(job.contains("there is nothing left to set up"), "{job}");
+    assert!(!job.contains("Open questions"), "{job}");
+    assert!(!job.contains("`pando init --yes` saves"), "{job}");
+    for name in ["dev_cmd", "port_env"] {
+        assert!(
+            job.contains(&format!("- {name}: covered by processes\n")),
+            "{job}"
+        );
+    }
+    assert!(job.contains("- processes: set: `api, web`"), "{job}");
+}
+
 // `--reference memory` prints the block and nothing else, and the job's
 // last section is the same block, fenced, so what an agent saves from
 // either is the same text.
