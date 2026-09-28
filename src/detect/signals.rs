@@ -32,16 +32,19 @@ pub struct Signals {
     pub runtime_requirements: Vec<crate::runtime::Requirement>,
     /// `.env.example` entries, in file order. The values matter as well as
     /// the keys: a value that is a localhost URL is how one app says where
-    /// another one listens.
+    /// another one listens. Below a root that is not an app, each app
+    /// directory's example follows, for keys the ones before it lack.
     pub env_example: Vec<(String, String)>,
     /// Framework marker files that exist.
     pub markers: Vec<String>,
     pub compose_files: Vec<String>,
     /// Root-level files that are gitignored and present — what a new
-    /// worktree would be missing.
+    /// worktree would be missing — then each app directory's local env
+    /// files, under its path: `backend/.env`.
     pub ignored_present: Vec<String>,
     /// Local files the repository does not have but ships an example of:
-    /// `(destination, source)`, sorted by destination.
+    /// `(destination, source)`, sorted by destination, the root's first and
+    /// then each app directory's.
     ///
     /// A fresh clone is the case. `.env` is gitignored, so it never arrives
     /// with the clone, and there is nothing for a worktree to be given a
@@ -150,8 +153,49 @@ pub fn signals(root: &Path) -> Signals {
     signals.workspace_env_links = super::workspaces::workspace_env_links(root, &signals);
     if !has_manifest(root, &signals) {
         signals.app_dirs = app_dirs(root);
+        read_app_dirs(root, &mut signals);
     }
     signals
+}
+
+/// What the app directories add to the root's own signals, each path
+/// under its directory: their env examples, their local env files, and
+/// the examples of the ones a fresh clone lacks.
+///
+/// An env example's keys join the root's, the first spelling of a key
+/// winning, which is the root's own rule for one file: it is how the
+/// services an app talks to are found. Of the gitignored files present in
+/// an app directory only the env files are taken — `backend/.env` is the
+/// file a worktree is missing, and everything else an app directory
+/// ignores is the output of its own tools.
+fn read_app_dirs(root: &Path, signals: &mut Signals) {
+    let dirs: Vec<String> = signals.app_dirs.iter().map(|app| app.dir.clone()).collect();
+    for dir in dirs {
+        let path = root.join(&dir);
+        let under = |name: &str| format!("{dir}/{name}");
+        for (key, value) in env_example(&path) {
+            if !signals.env_example.iter().any(|(held, _)| *held == key) {
+                signals.env_example.push((key, value));
+            }
+        }
+        signals.ignored_present.extend(
+            ignored_present(&path)
+                .iter()
+                .filter(|name| is_local_env(name))
+                .map(|name| under(name)),
+        );
+        signals.provision_seeds.extend(
+            provision_seeds(&path)
+                .iter()
+                .map(|(destination, source)| (under(destination), under(source))),
+        );
+    }
+}
+
+/// Whether a file name is an env file an app reads, `.env` or `.env.local`,
+/// rather than the example of one.
+fn is_local_env(name: &str) -> bool {
+    name.starts_with(".env") && !EXAMPLE_SUFFIXES.iter().any(|s| name.ends_with(s))
 }
 
 /// Whether the root says anything about how the project is built: a

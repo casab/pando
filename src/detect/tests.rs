@@ -3328,7 +3328,9 @@ fn the_root_env_is_given_only_where_the_repository_ignores_the_path() {
 
 // ---- app directories below a root that is not an app ------------------
 
-/// A repository with `files` written at their paths, directories and all.
+/// A repository with `files` written at their paths, directories and all,
+/// and every one git does not ignore committed: git only looks inside a
+/// directory it tracks for the ignored files in it.
 fn tree(files: &[(&str, &str)]) -> TempDir {
     let dir = tempdir().unwrap();
     crate::testutil::git(dir.path(), &["init", "--quiet", "--initial-branch=main"]);
@@ -3337,6 +3339,8 @@ fn tree(files: &[(&str, &str)]) -> TempDir {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, contents).unwrap();
     }
+    crate::testutil::git(dir.path(), &["add", "-A"]);
+    crate::testutil::git(dir.path(), &["commit", "--quiet", "-m", "fixture"]);
     dir
 }
 
@@ -3548,4 +3552,58 @@ fn each_app_directory_runs_under_its_own_package_manager() {
     );
     let proposal = processes_proposal(dir.path(), &signals(dir.path())).unwrap();
     assert_eq!(proposal.candidates[0].why, "a dev script in api and web");
+}
+
+// The files a worktree is missing are the apps' own `.env`s, and the
+// coverage database the root holds is not one of them.
+#[test]
+fn an_app_directorys_local_env_file_is_a_provision_file() {
+    let dir = polyglot_siblings();
+    let found = signals(dir.path());
+    assert_eq!(found.ignored_present, ["backend/.env", "frontend/.env"]);
+    let proposal = provision_proposal(&found).unwrap();
+    assert_eq!(values(&proposal), ["backend/.env,frontend/.env"]);
+    assert!(proposal.decided);
+    // And the backend's env example is read, so the database it names is
+    // one a services proposal can see.
+    assert!(
+        found
+            .env_example
+            .iter()
+            .any(|(key, _)| key == "DATABASE_URL"),
+        "{:?}",
+        found.env_example
+    );
+}
+
+// A fresh clone has no `.env` in an app directory either; its example is
+// offered the way the root's is, under the app's path.
+#[test]
+fn an_app_directorys_env_example_seeds_its_missing_env_file() {
+    let dir = tree(&[
+        (".gitignore", ".env\n"),
+        ("api/package.json", "{}"),
+        ("api/.env.example", "PORT=4000\n"),
+        ("web/package.json", "{}"),
+        (
+            "web/.env.example",
+            "PORT=3000\nAPI_URL=http://localhost:4000\n",
+        ),
+    ]);
+    let found = signals(dir.path());
+    assert_eq!(
+        found.provision_seeds,
+        [
+            ("api/.env".to_string(), "api/.env.example".to_string()),
+            ("web/.env".to_string(), "web/.env.example".to_string()),
+        ]
+    );
+    // One key, one value: the first app's spelling of it wins.
+    let ports: Vec<&str> = found
+        .env_example
+        .iter()
+        .filter(|(key, _)| key == "PORT")
+        .map(|(_, value)| value.as_str())
+        .collect();
+    assert_eq!(ports, ["4000"]);
 }
