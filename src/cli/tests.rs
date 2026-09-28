@@ -2740,18 +2740,79 @@ fn the_memory_block_names_the_project_its_root_and_only_real_commands() {
     );
 }
 
-// A prelude nobody has answered is a question about this machine, and the
-// line says where the answer to it is, as a whole sentence.
+/// A login shell that resolves node `version`, from `/n/bin/node`, and
+/// counts how often it was asked.
+fn node_shell(
+    version: &'static str,
+    asked: std::rc::Rc<std::cell::Cell<usize>>,
+) -> impl Fn(&str) -> Option<String> {
+    move |_: &str| {
+        asked.set(asked.get() + 1);
+        Some(crate::runtime::probe_reply("/n/bin/node", version))
+    }
+}
+
+// A project that pins nothing needs no prelude, and the job says so in a
+// few words without asking a shell anything.
 #[test]
-fn the_job_says_what_doctor_tells_about_the_prelude() {
+fn the_job_says_a_project_that_pins_nothing_needs_no_prelude() {
     let fx = fixture();
-    let job = super::agent::job(&fx.paths);
+    let asked = std::rc::Rc::new(std::cell::Cell::new(0));
+    let shell = node_shell("24.21.0", asked.clone());
+    let home = fx.root.join("no-such-home");
+    let job = super::agent::job_on(&fx.paths, &crate::actions::Machine::at(&shell, home));
+    assert!(
+        job.contains("- prelude: not needed: the project pins no runtime\n"),
+        "{job}"
+    );
+    assert_eq!(asked.get(), 0, "nothing pinned, nothing to ask a shell");
+}
+
+// The job asks what `init` would: the pin in an app directory, from the
+// version files `init --yes` would write, against what `bash -lc`
+// resolves here. When they differ the line says so, and that the answer
+// is this machine's; when they agree it stays short. Nothing is written,
+// the probe cache included.
+#[test]
+fn the_job_says_when_this_machine_needs_a_prelude() {
+    let fx = fixture();
+    std::fs::create_dir_all(fx.root.join("backend")).unwrap();
+    std::fs::write(
+        fx.root.join("backend/package.json"),
+        r#"{ "scripts": { "dev": "tsx watch src/index.ts" } }"#,
+    )
+    .unwrap();
+    std::fs::write(fx.root.join("backend/.nvmrc"), "25\n").unwrap();
+    let home = fx.root.join("no-such-home");
+    let asked = std::rc::Rc::new(std::cell::Cell::new(0));
+
+    let shell = node_shell("24.21.0", asked.clone());
+    let job = super::agent::job_on(
+        &fx.paths,
+        &crate::actions::Machine::at(&shell, home.clone()),
+    );
     assert!(
         job.contains(
-            "- prelude: asked only if this machine needs one; `pando doctor --json`'s runtime \
-             section says whether it does\n"
+            "- prelude: open: node 25 asked (backend/.nvmrc), `bash -lc` resolves 24.21.0. \
+             `pando init --yes` takes a line that fixes it, or exits 3 with the options; the \
+             line is this machine's, run in every project, so tell the developer which\n"
         ),
         "{job}"
+    );
+
+    let shell = node_shell("25.8.2", asked.clone());
+    let job = super::agent::job_on(&fx.paths, &crate::actions::Machine::at(&shell, home));
+    assert!(
+        job.contains(
+            "- prelude: not asked on this machine: `bash -lc` here resolves what the project \
+             pins\n"
+        ),
+        "{job}"
+    );
+    assert_eq!(asked.get(), 2, "one probe each time");
+    assert!(
+        !fx.paths.home.exists(),
+        "the job writes nothing, not even pando's home"
     );
 }
 

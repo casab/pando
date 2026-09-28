@@ -834,10 +834,15 @@ fn resolve_pass(
     // set and still does not work" is exactly the case worth reporting.
     // It is also read-only unless it has something to say, so a project
     // that pins nothing pays one directory read for it.
-    let (prelude_details, prelude_proposal) = match slots.contains(&Slot::Prelude) {
+    let (mut prelude_details, prelude_proposal) = match slots.contains(&Slot::Prelude) {
         true => raise_prelude(paths, &config, machine)?,
         false => (Vec::new(), None),
     };
+    // Which version files the runtime was checked against. `init` answers
+    // them earlier in this same pass, and a project whose only pin is in
+    // an app directory — `backend/.nvmrc` — has nothing to check until
+    // they are written.
+    let checked_with = config.runtime.version_files.clone();
     // Of the config as loaded, so [`settled`]'s answer holds: nothing in
     // this run has changed it yet.
     if prelude_proposal.is_none()
@@ -912,6 +917,17 @@ fn resolve_pass(
         // the port question has been asked, skipped or answered by now.
         if !matches!(slot, Slot::Processes | Slot::DevCmd | Slot::PortEnv) {
             flush(paths, &mut deferred, progress)?;
+        }
+        // The runtime again, against the version files an earlier slot of
+        // this pass wrote: checked only against the ones loaded, `init
+        // --yes` passed a machine that `check` then stopped on.
+        if *slot == Slot::Prelude
+            && config.runtime.version_files != checked_with
+            && !proposals.iter().any(|p| p.slot == Slot::Prelude)
+        {
+            let (details, proposal) = raise_prelude(paths, &config, machine)?;
+            prelude_details = details;
+            proposals.extend(proposal);
         }
         // A replacement is a program saying the answer config has is
         // wrong, so the answer being there is no reason to skip it.

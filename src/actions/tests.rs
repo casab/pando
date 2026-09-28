@@ -9970,6 +9970,65 @@ fn the_slots_new_fills_never_probe_the_runtime() {
     drop(shell);
 }
 
+/// A fixture whose only pin is an app directory's: `backend/.nvmrc`,
+/// the shape of a node backend beside an Expo app.
+fn fixture_pinning_in_backend(spec: &str) -> Fx {
+    let fx = fixture();
+    std::fs::create_dir_all(fx.root.join("backend")).unwrap();
+    std::fs::write(
+        fx.root.join("backend/package.json"),
+        r#"{ "scripts": { "dev": "node server.js" } }"#,
+    )
+    .unwrap();
+    std::fs::write(fx.root.join("backend/.nvmrc"), format!("{spec}\n")).unwrap();
+    fx
+}
+
+// `init` answers the version files and then the prelude in one pass. A
+// pin only an app directory states is read once the first is written, so
+// the prelude is asked in that same pass — and says whose answer it is.
+// Nothing here fixes it, so there is no option, and none for `--yes`.
+#[test]
+fn a_pin_the_same_pass_just_wrote_is_checked_before_the_prelude_is_passed() {
+    let fx = fixture_pinning_in_backend("25");
+    let machine = FakeMachine::with_nvm();
+    let shell = machine.shell("24.21.0", "", "");
+    let m = Machine::at(&shell, machine.home.path().to_path_buf());
+    let (ask, asked) = scripted(vec![Answer::None]);
+
+    let config = resolve_on(
+        &fx.paths,
+        &fx.config,
+        &[Slot::VersionFiles, Slot::Prelude],
+        &[],
+        &Answering::asking(&ask),
+        &noop,
+        &m,
+    )
+    .unwrap();
+
+    assert_eq!(config.runtime.version_files, ["backend/.nvmrc"]);
+    let asked = asked.borrow();
+    let [question] = asked.as_slice() else {
+        panic!("one question, the prelude: {asked:?}");
+    };
+    assert_eq!(question.slot, Slot::Prelude);
+    let report = question.details.join("\n");
+    assert!(report.contains("node 25 (backend/.nvmrc)"), "{report}");
+    assert!(report.contains(MACHINE_WIDE), "{report}");
+    assert!(
+        question.prompt.contains("every project"),
+        "{}",
+        question.prompt
+    );
+    assert_eq!(
+        question.preselect, None,
+        "no line works here, so `--yes` has nothing to take: {:?}",
+        question.options
+    );
+    assert_eq!(config.runtime.prelude.as_deref(), Some(""));
+}
+
 // A manager's line that does not give the pinned version is still on
 // offer, saying what would make it work, but never one `--yes` takes: it
 // used to be the first option, and taking it failed its own check.

@@ -2604,6 +2604,37 @@ fn a_program_supplied_prelude_that_fails_its_probe_exits_as_a_usage_error() {
     );
 }
 
+// A pin only an app directory states is read once `init` has answered the
+// version files, in the same pass: `init --yes` used to check the runtime
+// before that, find nothing pinned, and exit 0, and only the first `check`
+// raised the prelude. No machine has node 99, so no line fixes it here and
+// `--yes` has nothing to take.
+#[test]
+fn init_yes_raises_the_prelude_for_a_pin_in_an_app_directory() {
+    let e = env();
+    e.unanswer_the_runtime();
+    std::fs::create_dir_all(e.root.join("backend")).unwrap();
+    std::fs::write(
+        e.root.join("backend/package.json"),
+        r#"{ "scripts": { "dev": "node server.js" } }"#,
+    )
+    .unwrap();
+    std::fs::write(e.root.join("backend/.nvmrc"), "99\n").unwrap();
+
+    let out = e.pando(&["init", "--yes"]);
+    assert_eq!(code(&out), EXIT_NEEDS_ANSWER, "stderr: {}", stderr(&out));
+    let printed = stderr(&out);
+    assert!(printed.contains("node 99 (backend/.nvmrc)"), "{printed}");
+    assert!(
+        printed.contains("every project on this machine"),
+        "the question says the answer is the machine's: {printed}"
+    );
+    assert!(
+        !e.home.join("config.toml").exists(),
+        "nothing is written to the machine-wide file"
+    );
+}
+
 // ---- init -----------------------------------------------------------------
 
 // The batch form of every question, in one pass, through the same paths

@@ -75,6 +75,12 @@ pub fn agent<W: Write>(
 
 /// The job, for this project as pando sees it now.
 pub(super) fn job(paths: &PandoPaths) -> String {
+    let shell = actions::runtime_shell(paths.root());
+    job_on(paths, &actions::Machine::here(&shell))
+}
+
+/// [`job`] on a machine a test describes.
+pub(super) fn job_on(paths: &PandoPaths, machine: &actions::Machine<'_>) -> String {
     let project = &paths.project.display_name;
     let mut out = String::new();
     let _ = writeln!(
@@ -117,6 +123,7 @@ pub(super) fn job(paths: &PandoPaths) -> String {
         &proposals,
         device_note,
         passing,
+        machine,
     ));
     out.push_str(&writes(paths));
     out.push_str(first_run_section().trim_end());
@@ -260,10 +267,12 @@ pub(super) fn failure(reason: &str, tail: &[String], whose: &str) -> String {
 /// Where the project is, what each question stands at, the services the
 /// check will use, and the questions still open with pando's options.
 ///
-/// From the same places `signals` reads: detection's proposals, with no
-/// process spawned, and `settled` for whether config already answers a
-/// slot. The one thing this adds is a connect to each shared service's
-/// port, bounded as every readiness probe is.
+/// From the same places `signals` reads: detection's proposals, and
+/// `settled` for whether config already answers a slot. Two things are
+/// added: a connect to each shared service's port, bounded as every
+/// readiness probe is, and, while nobody has answered the prelude, the
+/// runtime probe `init` makes — a login shell per pinned language, none
+/// for one the probe cache already holds as a pass.
 ///
 /// `passing` is a last check that passed on these settings: with nothing
 /// open, the line that sends an agent to `init --yes` and a check is left
@@ -275,6 +284,7 @@ fn project_now(
     proposals: &[detect::Proposal],
     device_note: Option<&str>,
     passing: bool,
+    machine: &actions::Machine<'_>,
 ) -> String {
     let mut out = String::from("## This project, as pando sees it now\n\n");
     let root = paths.root();
@@ -355,9 +365,7 @@ fn project_now(
                 chosen => format!("pando's guess: {}", candidates(chosen)),
             },
             (false, None) if slot == Slot::Prelude => {
-                "asked only if this machine needs one; `pando doctor --json`'s runtime \
-                 section says whether it does"
-                    .to_string()
+                prelude_line(paths, config, proposal(Slot::VersionFiles), machine)
             }
             // No proposal here is no gap: origin/HEAD is close enough to
             // the main checkout's branch to be where work starts.
@@ -407,6 +415,46 @@ fn project_now(
         }
     }
     out
+}
+
+/// The prelude's line in the job, while nobody has answered it: whether
+/// `init` will ask it on this machine, which is whether `bash -lc` here
+/// resolves what the project pins — in the version files config names,
+/// or, while those are open, the ones `init --yes` would write.
+fn prelude_line(
+    paths: &PandoPaths,
+    config: &Config,
+    version_files: Option<&detect::Proposal>,
+    machine: &actions::Machine<'_>,
+) -> String {
+    let mut after_init = config.clone();
+    if !actions::settled(Slot::VersionFiles, config)
+        && let Some(candidate) =
+            version_files.and_then(|p| p.candidates.iter().find(|c| !c.needs_a_human))
+    {
+        detect::apply(Slot::VersionFiles, candidate, &mut after_init);
+    }
+    let files = after_init.runtime.version_files.clone();
+    if crate::runtime::requirements_for(paths.root(), &files).is_empty() {
+        return "not needed: the project pins no runtime".to_string();
+    }
+    let Some(check) = actions::prelude_needed(paths, &after_init, &files, machine) else {
+        return "not asked on this machine: `bash -lc` here resolves what the project pins"
+            .to_string();
+    };
+    let requirement = &check.requirement;
+    let language = &requirement.language;
+    let resolved = match (&check.resolved.version, &check.resolved.path) {
+        (Some(version), _) => format!("`bash -lc` resolves {version}"),
+        (None, Some(path)) => format!("`bash -lc` finds {path}, and it fails"),
+        (None, None) => format!("`bash -lc` has no {language}"),
+    };
+    format!(
+        "open: {language} {} asked ({}), {resolved}. `pando init --yes` takes a line that \
+         fixes it, or exits 3 with the options; the line is this machine's, run in every \
+         project, so tell the developer which",
+        requirement.spec, requirement.source
+    )
 }
 
 /// Candidates as a list of their values, each with the signal that found

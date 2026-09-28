@@ -159,6 +159,29 @@ pub(super) fn resolve_runtime(
     }
 }
 
+/// The requirement this machine does not meet with no prelude in front of
+/// it, when nobody has answered the prelude question: what a start would
+/// ask it for. `version_files` stands in for config's, so a caller can
+/// ask about the ones `init --yes` would write.
+///
+/// Writes nothing, not even the probe cache: `init --agent` asks this,
+/// and it writes nothing anywhere. A pass the cache already holds costs
+/// no shell.
+pub fn prelude_needed(
+    paths: &PandoPaths,
+    config: &Config,
+    version_files: &[String],
+    machine: &Machine<'_>,
+) -> Option<crate::runtime::Check> {
+    if config.runtime.prelude.is_some() {
+        return None;
+    }
+    let requirements = crate::runtime::requirements_for(paths.root(), version_files);
+    walk(paths, config, &requirements, "", machine.shell, false)
+        .ok()?
+        .mismatch
+}
+
 /// What one walk over the requirements found.
 struct Walk {
     /// The first requirement this machine definitely does not meet.
