@@ -585,10 +585,7 @@ fn guess(paths: &PandoPaths, progress: &dyn Fn(&str)) -> Result<Tried, String> {
         OwnGuess::NoOption(_) | OwnGuess::NothingToRun => Tried::CannotTell,
         OwnGuess::NeedsPrelude(report) => {
             let shell = actions::runtime_shell(paths.root());
-            let machine = actions::Machine {
-                shell: &shell,
-                home: actions::user_home(),
-            };
+            let machine = actions::Machine::here(&shell);
             match doctor::runtime_findings(paths, &config, &machine)
                 .into_iter()
                 .next()

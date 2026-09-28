@@ -16,7 +16,7 @@ use super::lifecycle::{
 };
 use super::namespaced::{ask_for_logins, free_slots_if_full};
 use super::runtime::{
-    Machine, RuntimeOutcome, answer_prelude, resolve_runtime, runtime_shell, user_home,
+    Machine, RuntimeOutcome, answer_prelude, prelude_proposal, resolve_runtime, runtime_shell,
 };
 use super::services::{backends_reachable, placeholder_ports, service_roles};
 use super::worktree::{find_checkout, ref_exists, refuse_a_gone_directory, resolve_create_base};
@@ -662,10 +662,7 @@ pub fn resolve_for_new(
     progress: &dyn Fn(&str),
 ) -> Result<Config> {
     let shell = runtime_shell(paths.root());
-    let machine = Machine {
-        shell: &shell,
-        home: user_home(),
-    };
+    let machine = Machine::here(&shell);
     resolve_for_new_on(paths, config, ask, progress, &machine)
 }
 
@@ -742,10 +739,7 @@ pub fn resolve_silencing(
     progress: &dyn Fn(&str),
 ) -> Result<Config> {
     let shell = runtime_shell(paths.root());
-    let machine = Machine {
-        shell: &shell,
-        home: user_home(),
-    };
+    let machine = Machine::here(&shell);
     resolve_on(paths, config, slots, silent, answers, progress, &machine)
 }
 
@@ -782,11 +776,32 @@ pub(super) fn resolve_for_init(
     progress: &dyn Fn(&str),
 ) -> Result<Config> {
     let shell = runtime_shell(paths.root());
-    let machine = Machine {
-        shell: &shell,
-        home: user_home(),
-    };
+    let machine = Machine::here(&shell);
     resolve_pass(paths, config, slots, &[], answers, progress, &machine, true)
+}
+
+/// The prelude question, when this machine needs one: the report that
+/// makes it answerable, and the lines tried on it. Refused outright when
+/// a prelude is set and still does not work, since only the developer
+/// can say what should replace it; nothing is spawned, which is the
+/// point.
+fn raise_prelude(
+    paths: &PandoPaths,
+    config: &Config,
+    machine: &Machine<'_>,
+) -> Result<(Vec<String>, Option<detect::Proposal>)> {
+    match resolve_runtime(paths, config, machine)? {
+        RuntimeOutcome::Broken(report) => bail!("{report}"),
+        RuntimeOutcome::Ask {
+            check,
+            requirements,
+            report,
+        } => {
+            let proposal = prelude_proposal(paths, config, &requirements, &check, machine)?;
+            Ok((report, Some(proposal)))
+        }
+        RuntimeOutcome::Fine => Ok((Vec::new(), None)),
+    }
 }
 
 /// One resolution pass. `needs_a_process` is [`resolve_for_init`]'s.
@@ -819,23 +834,10 @@ fn resolve_pass(
     // set and still does not work" is exactly the case worth reporting.
     // It is also read-only unless it has something to say, so a project
     // that pins nothing pays one directory read for it.
-    let runtime = if slots.contains(&Slot::Prelude) {
-        resolve_runtime(paths, &config, machine)?
-    } else {
-        RuntimeOutcome::Fine
+    let (prelude_details, prelude_proposal) = match slots.contains(&Slot::Prelude) {
+        true => raise_prelude(paths, &config, machine)?,
+        false => (Vec::new(), None),
     };
-    let mut prelude_details: Vec<String> = Vec::new();
-    let mut prelude_proposal: Option<detect::Proposal> = None;
-    match runtime {
-        // The prelude is not working, and only the developer can say what
-        // should replace it. Nothing is spawned, which is the point.
-        RuntimeOutcome::Broken(report) => bail!("{report}"),
-        RuntimeOutcome::Ask { proposal, report } => {
-            prelude_details = report;
-            prelude_proposal = Some(proposal);
-        }
-        RuntimeOutcome::Fine => {}
-    }
     // Of the config as loaded, so [`settled`]'s answer holds: nothing in
     // this run has changed it yet.
     if prelude_proposal.is_none()

@@ -15,13 +15,65 @@ use super::questions::{
 };
 
 /// What the runtime check needs from outside this process: a shell to ask,
-/// and the home directory version managers install themselves into.
+/// the home directory version managers install themselves into, and the
+/// places a runtime may sit that the shell does not put first.
 ///
 /// Injected rather than read, so a test can answer for a machine it does
 /// not have.
 pub struct Machine<'a> {
     pub shell: crate::runtime::Shell<'a>,
     pub home: PathBuf,
+    /// Where the absolute places pando knows about are read: a manager's
+    /// system-wide marker, a language's install directories. `/` on a
+    /// real machine, and a directory of the test's own in a test, so that
+    /// what this laptop has in /opt/homebrew decides nothing there.
+    pub system: PathBuf,
+    /// The PATH pando was started with, which is the developer's own
+    /// shell's: where the binary they get by hand is, learnt without
+    /// reading their profile. Empty in a test.
+    pub path: Vec<PathBuf>,
+}
+
+impl<'a> Machine<'a> {
+    /// This machine, asked through `shell`.
+    ///
+    /// Under `cargo test` it is one with nothing on it: the empty HOME
+    /// every login shell under test gets, nothing under `/` and no PATH,
+    /// so a test that reaches it through a command's own entry point
+    /// reads nothing of the laptop it runs on.
+    pub fn here(shell: crate::runtime::Shell<'a>) -> Machine<'a> {
+        #[cfg(test)]
+        {
+            let empty = crate::testutil::shell_home().to_path_buf();
+            Machine {
+                shell,
+                home: empty.clone(),
+                system: empty,
+                path: Vec::new(),
+            }
+        }
+        #[cfg(not(test))]
+        Machine {
+            shell,
+            home: user_home(),
+            system: PathBuf::from("/"),
+            path: std::env::var_os("PATH")
+                .map(|path| std::env::split_paths(&path).collect())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// A machine a test describes: its home, with the absolute places
+    /// read under the same directory, and no PATH of its own.
+    #[cfg(test)]
+    pub fn at(shell: crate::runtime::Shell<'a>, home: PathBuf) -> Machine<'a> {
+        Machine {
+            shell,
+            system: home.clone(),
+            home,
+            path: Vec::new(),
+        }
+    }
 }
 
 /// How long one probe gets. It is a login shell that may source a version
@@ -54,10 +106,13 @@ pub(super) enum RuntimeOutcome {
     /// Nothing to say: nothing pinned, a match, or something this build
     /// cannot judge. Silence is the common case and the right one.
     Fine,
-    /// A mismatch with no prelude set: a question, with the lines that
-    /// would fix it and the report that makes it answerable.
+    /// A mismatch with no prelude set: a question, with the report that
+    /// makes it answerable. The lines that would fix it are tried on this
+    /// machine, which costs a shell each, so [`prelude_proposal`] builds
+    /// them only for a pass that is going to ask.
     Ask {
-        proposal: detect::Proposal,
+        check: Box<crate::runtime::Check>,
+        requirements: Vec<crate::runtime::Requirement>,
         report: Vec<String>,
     },
     /// A mismatch with a prelude already set. The prelude is not working,
@@ -86,43 +141,58 @@ pub(super) fn resolve_runtime(
     };
     let requirements =
         crate::runtime::requirements_for(paths.root(), &config.runtime.version_files);
-    let Some(check) = first_mismatch(paths, config, &requirements, prelude, machine.shell)? else {
+    let walked = walk(paths, config, &requirements, prelude, machine.shell, true)?;
+    let Some(check) = walked.mismatch else {
         return Ok(RuntimeOutcome::Fine);
     };
     if prelude.is_empty() {
-        let report = runtime_report(&check, &requirements, prelude, &machine.home, None);
+        let report = runtime_report(&check, &requirements, prelude, machine, None);
         Ok(RuntimeOutcome::Ask {
-            proposal: prelude_proposal(&check, &machine.home),
+            check: Box::new(check),
+            requirements,
             report,
         })
     } else {
         let origin = config::prelude_origin(paths);
-        let report = runtime_report(&check, &requirements, prelude, &machine.home, origin);
+        let report = runtime_report(&check, &requirements, prelude, machine, origin);
         Ok(RuntimeOutcome::Broken(report.join("\n  ")))
     }
 }
 
+/// What one walk over the requirements found.
+struct Walk {
+    /// The first requirement this machine definitely does not meet.
+    mismatch: Option<crate::runtime::Check>,
+    /// Every requirement that passed, by its fingerprint, with the version
+    /// that passed it: probed now, or remembered from before.
+    satisfied: std::collections::BTreeMap<String, String>,
+}
+
 /// The first language whose requirement this machine definitely does not
-/// meet, probing at most once per language and directory and remembering
-/// the ones that passed.
+/// meet, probing at most once per language and directory and, when
+/// `remember` says so, remembering the ones that passed.
 ///
 /// Only passes are remembered: a cached failure would go on reporting a
 /// problem the developer has just fixed, and a failure stops the start
 /// anyway, so there is no spawn to save by keeping it.
-fn first_mismatch(
+fn walk(
     paths: &PandoPaths,
     config: &Config,
     requirements: &[crate::runtime::Requirement],
     prelude: &str,
     shell: crate::runtime::Shell<'_>,
-) -> Result<Option<crate::runtime::Check>> {
+    remember: bool,
+) -> Result<Walk> {
+    let mut walked = Walk {
+        mismatch: None,
+        satisfied: Default::default(),
+    };
     if requirements.is_empty() {
-        return Ok(None);
+        return Ok(walked);
     }
     let cache_file = paths.runtime_cache_file();
     let mut cache = crate::runtime::load_cache(&cache_file);
     let mut learned = false;
-    let mut mismatch = None;
     // The pin if the project has one, else whatever range it stated: that
     // is what `for_language` sorted to the front — at the root, and in each
     // app directory whose version file config names.
@@ -131,7 +201,8 @@ fn first_mismatch(
             continue;
         };
         let fingerprint = crate::runtime::fingerprint(requirement, prelude);
-        if cache.holds(&fingerprint) {
+        if let Some(version) = cache.satisfied.get(&fingerprint) {
+            walked.satisfied.insert(fingerprint, version.clone());
             continue;
         }
         // Where its processes run, which is where a runner's lockfile is.
@@ -145,14 +216,15 @@ fn first_mismatch(
         let check = crate::runtime::check(requirement, prelude, shell);
         match check.verdict {
             crate::runtime::Verdict::Satisfied => {
-                cache.remember(
-                    fingerprint,
-                    check.resolved.version.clone().unwrap_or_default(),
-                );
+                let version = check.resolved.version.clone().unwrap_or_default();
+                walked
+                    .satisfied
+                    .insert(fingerprint.clone(), version.clone());
+                cache.remember(fingerprint, version);
                 learned = true;
             }
             crate::runtime::Verdict::Mismatch => {
-                mismatch = Some(check);
+                walked.mismatch = Some(check);
                 break;
             }
             // A spec this build cannot evaluate, a probe that could not
@@ -161,7 +233,7 @@ fn first_mismatch(
             crate::runtime::Verdict::Unknown => {}
         }
     }
-    if learned {
+    if learned && remember {
         // The home is created through the one function that makes it 0700
         // and refuses it inside the repository, rather than by a cache
         // write that would know neither rule.
@@ -171,7 +243,7 @@ fn first_mismatch(
         // not fail the start that learnt what it would have saved.
         let _ = crate::runtime::save_cache(&cache_file, &cache);
     }
-    Ok(mismatch)
+    Ok(walked)
 }
 
 /// Whether every command this project runs in `language` goes through a
@@ -239,7 +311,7 @@ fn runtime_report(
     check: &crate::runtime::Check,
     requirements: &[crate::runtime::Requirement],
     prelude: &str,
-    home: &Path,
+    machine: &Machine<'_>,
     origin: Option<PathBuf>,
 ) -> Vec<String> {
     let requirement = &check.requirement;
@@ -292,7 +364,7 @@ fn runtime_report(
     let Some(entry) = crate::runtime::language(language) else {
         return lines;
     };
-    let installed = crate::runtime::installed(entry, home);
+    let installed = crate::runtime::installed(entry, &machine.home, &machine.system);
     lines.push(match installed.as_slice() {
         [] => format!("no version manager pando knows about is installed for {language}"),
         managers => format!(
@@ -315,26 +387,169 @@ fn runtime_report(
             requirement.spec
         ));
     }
+    // The question is about this laptop, and the answer to it outlives
+    // this project: say so before anybody picks a line.
+    if prelude.is_empty() {
+        lines.push(MACHINE_WIDE.to_string());
+    }
     lines
 }
 
-/// The prelude lines worth offering, for the managers this machine has.
-fn prelude_proposal(check: &crate::runtime::Check, home: &Path) -> detect::Proposal {
+/// What the prelude is, in one line, wherever it is asked for.
+pub const MACHINE_WIDE: &str = "a prelude is this machine's, not this project's: pando runs it in \
+                                front of every command, in every project on this machine";
+
+/// How many directories outside the managers the prelude question tries.
+/// Each costs a login shell, and past a handful the question is a list
+/// nobody reads.
+const MAX_PATH_OFFERS: usize = 6;
+
+/// One line the prelude question offers, tried on this machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Offer {
+    pub line: String,
+    pub why: String,
+    /// Whether, with this line in front, `bash -lc` resolves every
+    /// requirement the project states. Only such a line is one `--yes`
+    /// may take.
+    pub works: bool,
+}
+
+/// The lines that would make this machine resolve what `check` found it
+/// does not, each tried on it.
+///
+/// First the installed managers' lines that work, in the table's order;
+/// then the directories that hold a version the project accepts — where
+/// the developer's own shell finds the binary, then the language's
+/// install directories; last the managers' lines that do not work yet,
+/// each with the command that would install the version under it. A
+/// directory whose line does not work is not offered at all: nothing but
+/// that directory would make it.
+///
+/// A line works when the pin itself is met, not a range beside it: the
+/// requirement compared is the pin whenever the project states one, so a
+/// directory holding node 24 is never offered for an `.nvmrc` of 25 on
+/// the strength of an `engines` range that 24 would satisfy.
+///
+/// `remember` is whether a line that works is written to the probe
+/// cache, which is what makes checking it again, once it is picked, cost
+/// nothing. `doctor` writes nothing, and passes false.
+pub fn prelude_offers(
+    paths: &PandoPaths,
+    config: &Config,
+    requirements: &[crate::runtime::Requirement],
+    check: &crate::runtime::Check,
+    machine: &Machine<'_>,
+    remember: bool,
+) -> Result<Vec<Offer>> {
     let requirement = &check.requirement;
-    let candidates = crate::runtime::language(&requirement.language)
-        .map(|language| crate::runtime::fixes(language, home, requirement))
-        .unwrap_or_default()
+    let Some(language) = crate::runtime::language(&requirement.language) else {
+        return Ok(Vec::new());
+    };
+    let (name, spec) = (&requirement.language, &requirement.spec);
+    // The version a line gives the requirement it is for, when it leaves
+    // no requirement unmet.
+    let tried = |line: &str| -> Result<Option<String>> {
+        let walked = walk(paths, config, requirements, line, machine.shell, remember)?;
+        if walked.mismatch.is_some() {
+            return Ok(None);
+        }
+        Ok(walked
+            .satisfied
+            .get(&crate::runtime::fingerprint(requirement, line))
+            .cloned())
+    };
+    let mut working: Vec<Offer> = Vec::new();
+    let mut not_yet: Vec<Offer> = Vec::new();
+    for fix in crate::runtime::fixes(language, &machine.home, &machine.system, requirement) {
+        if tried(&fix.line)?.is_some() {
+            working.push(Offer {
+                line: fix.line,
+                why: fix.why,
+                works: true,
+            });
+            continue;
+        }
+        let install = language
+            .managers
+            .iter()
+            .find(|manager| manager.name == fix.manager)
+            .and_then(|manager| manager.install_command(language, spec));
+        let why = match install {
+            Some(command) => format!(
+                "{}; it gives `bash -lc` no {name} {spec} yet: `{command}` first",
+                fix.why
+            ),
+            None => format!("{}; it gives `bash -lc` no {name} {spec} yet", fix.why),
+        };
+        not_yet.push(Offer {
+            line: fix.line,
+            why,
+            works: false,
+        });
+    }
+    // Not the directory `bash -lc` already takes it from: that is the one
+    // that gave the wrong answer.
+    let resolved_dir = check
+        .resolved
+        .path
+        .as_deref()
+        .and_then(|path| Path::new(path).parent())
+        .map(Path::to_path_buf);
+    for dir in crate::runtime::binary_dirs(language, &machine.system, &machine.path)
         .into_iter()
-        .map(|fix| detect::Candidate {
-            value: fix.line,
-            why: fix.why,
+        .filter(|dir| Some(dir) != resolved_dir.as_ref())
+        .take(MAX_PATH_OFFERS)
+    {
+        let Some(line) = crate::runtime::path_line(&dir) else {
+            continue;
+        };
+        if working
+            .iter()
+            .chain(&not_yet)
+            .any(|offer| offer.line == line)
+        {
+            continue;
+        }
+        if let Some(version) = tried(&line)? {
+            let why = format!(
+                "{name} {version} is in {}; this puts it first on PATH, in every project on \
+                 this machine",
+                dir.display()
+            );
+            working.push(Offer {
+                line,
+                why,
+                works: true,
+            });
+        }
+    }
+    working.extend(not_yet);
+    Ok(working)
+}
+
+/// The prelude question's options: every line [`prelude_offers`] tried,
+/// and only the ones that work are lines `--yes` may take.
+pub(super) fn prelude_proposal(
+    paths: &PandoPaths,
+    config: &Config,
+    requirements: &[crate::runtime::Requirement],
+    check: &crate::runtime::Check,
+    machine: &Machine<'_>,
+) -> Result<detect::Proposal> {
+    let candidates = prelude_offers(paths, config, requirements, check, machine, true)?
+        .into_iter()
+        .map(|offer| detect::Candidate {
+            value: offer.line,
+            why: offer.why,
+            needs_a_human: !offer.works,
             ..detect::Candidate::default()
         })
         .collect();
     // Never decided. What one machine needs is not something a rule gets to
     // settle on a developer's behalf, and the answer lands in a file every
     // project on that machine shares.
-    detect::Proposal::of(Slot::Prelude, candidates, false)
+    Ok(detect::Proposal::of(Slot::Prelude, candidates, false))
 }
 
 /// Asks the prelude question, checks the answer, and writes it to the user

@@ -77,10 +77,7 @@ use worktrees::worktrees_report;
 /// have found.
 pub fn run(paths: &PandoPaths) -> Report {
     let shell = actions::runtime_shell(paths.root());
-    let machine = Machine {
-        shell: &shell,
-        home: actions::user_home(),
-    };
+    let machine = Machine::here(&shell);
     run_on(paths, &machine)
 }
 

@@ -101,13 +101,7 @@ fn no_tools(script: &str) -> Option<String> {
 }
 
 fn report_of(fx: &Fx, shell: &dyn Fn(&str) -> Option<String>) -> Report {
-    run_on(
-        &fx.paths,
-        &Machine {
-            shell,
-            home: fx.machine_home.clone(),
-        },
-    )
+    run_on(&fx.paths, &Machine::at(shell, fx.machine_home.clone()))
 }
 
 fn report(fx: &Fx) -> Report {

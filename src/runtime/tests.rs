@@ -643,12 +643,12 @@ fn nvmrc() -> Requirement {
 // A shim manager resolves per directory by itself. When it fails it is
 // a PATH problem in a login bash shell, and a `use` line would be the
 // wrong fix.
-/// Only the fixes that came from the injected home. A manager can also
-/// be installed system-wide — Homebrew puts nvm in its own prefix —
-/// and whether this machine has one is not something a test decides.
+/// The fixes a machine offers whose home is `home`, and whose system-wide
+/// places — Homebrew puts nvm in its own prefix — are read under it too,
+/// so what this laptop has installed decides nothing here.
 fn from_home(language: &Language, home: &TempDir, requirement: &Requirement) -> Vec<Fix> {
     let home_path = home.path().display().to_string();
-    fixes(language, home.path(), requirement)
+    fixes(language, home.path(), home.path(), requirement)
         .into_iter()
         .filter(|fix| fix.line.contains(&home_path))
         .collect()
@@ -656,7 +656,7 @@ fn from_home(language: &Language, home: &TempDir, requirement: &Requirement) -> 
 
 /// One installed manager, by name.
 fn manager_named(language: &Language, home: &Path, name: &str) -> &'static Manager {
-    installed(language, home)
+    installed(language, home, home)
         .into_iter()
         .find(|manager| manager.name == name)
         .unwrap_or_else(|| panic!("{name} is installed in this home"))
@@ -716,6 +716,76 @@ fn an_install_command_uses_the_name_the_manager_itself_uses() {
         volta.install_command(node(), "v22").as_deref(),
         Some("volta install node@22")
     );
+}
+
+// ---- binaries outside the managers ------------------------------------
+
+/// A machine root holding a `node` in each of `dirs`, relative to it.
+fn system_with_node_in(dirs: &[&str]) -> TempDir {
+    let system = TempDir::new().unwrap();
+    for dir in dirs {
+        let dir = system.path().join(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("node"), "#!/bin/sh\n").unwrap();
+    }
+    system
+}
+
+// Homebrew's three prefixes, and a versioned keg under each, read under
+// the machine root a test hands in — so what this laptop has in
+// /opt/homebrew decides nothing. Kegs come highest version first, by
+// number rather than by name.
+#[test]
+fn install_dirs_are_read_under_the_machine_root_highest_keg_first() {
+    let system = system_with_node_in(&[
+        "opt/homebrew/bin",
+        "opt/homebrew/opt/node@9/bin",
+        "opt/homebrew/opt/node@22/bin",
+        "home/linuxbrew/.linuxbrew/bin",
+    ]);
+    let root = system.path();
+    assert_eq!(
+        node().install_dirs_under(root),
+        [
+            root.join("opt/homebrew/bin"),
+            root.join("home/linuxbrew/.linuxbrew/bin"),
+            root.join("opt/homebrew/opt/node@22/bin"),
+            root.join("opt/homebrew/opt/node@9/bin"),
+        ]
+    );
+    let empty = TempDir::new().unwrap();
+    assert!(node().install_dirs_under(empty.path()).is_empty());
+}
+
+// The PATH the developer's own shell had comes first, in its order, then
+// the install directories; only a directory that holds the binary, once.
+#[test]
+fn binary_dirs_put_the_developers_path_first_and_hold_the_binary() {
+    let system = system_with_node_in(&["opt/homebrew/bin", "own/bin"]);
+    let root = system.path();
+    std::fs::create_dir_all(root.join("empty/bin")).unwrap();
+    let path = [
+        root.join("empty/bin"),
+        root.join("own/bin"),
+        root.join("opt/homebrew/bin"),
+    ];
+    assert_eq!(
+        binary_dirs(node(), root, &path),
+        [root.join("own/bin"), root.join("opt/homebrew/bin")]
+    );
+}
+
+// The line puts the directory first, quoted; a directory whose name a
+// double-quoted word would change is never made into one.
+#[test]
+fn a_path_line_is_only_made_of_a_name_quotes_keep_as_it_is() {
+    assert_eq!(
+        path_line(Path::new("/opt/homebrew/bin")).as_deref(),
+        Some("export PATH=\"/opt/homebrew/bin:$PATH\"")
+    );
+    for odd in ["/a/$HOME/bin", "/a/\"b\"/bin", "/a/`x`/bin", "/a\\b"] {
+        assert_eq!(path_line(Path::new(odd)), None, "{odd}");
+    }
 }
 
 // ---- the probe cache --------------------------------------------------

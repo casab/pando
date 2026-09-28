@@ -15,7 +15,7 @@ use super::questions::{
     Answer, Answering, NEW_SLOTS, NeedsAnswer, Question, SILENT_UNLESS_ISOLATED, START_SLOTS,
     recommended, resolve_on,
 };
-use super::runtime::{Machine, RuntimeOutcome, resolve_runtime, runtime_shell, user_home};
+use super::runtime::{Machine, RuntimeOutcome, resolve_runtime, runtime_shell};
 
 /// What pando's own guess came to.
 #[derive(Debug)]
@@ -44,10 +44,7 @@ pub fn try_on_its_own(
     progress: &dyn Fn(&str),
 ) -> Result<OwnGuess> {
     let shell = runtime_shell(paths.root());
-    let machine = Machine {
-        shell: &shell,
-        home: user_home(),
-    };
+    let machine = Machine::here(&shell);
     try_on_its_own_on(paths, config, progress, &machine)
 }
 

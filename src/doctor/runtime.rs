@@ -38,11 +38,11 @@ pub(super) fn runtime_report(
         // problems would be the kind of report this command exists to
         // replace.
         let check = runtime::check(requirement, effective, machine.shell);
-        let managers: Vec<&'static str> = runtime::installed(entry, &machine.home)
+        let managers: Vec<&'static str> = runtime::installed(entry, &machine.home, &machine.system)
             .into_iter()
             .map(|manager| manager.name)
             .collect();
-        let fixes: Vec<String> = runtime::fixes(entry, &machine.home, requirement)
+        let fixes: Vec<String> = runtime::fixes(entry, &machine.home, &machine.system, requirement)
             .into_iter()
             .map(|fix| format!("{}  ({})", fix.line, fix.why))
             .collect();

@@ -7369,10 +7369,7 @@ fn new_resolves_install_version_files_and_provision() {
     // install to run, `new` checks the runtime, and this one needs nothing.
     let machine = FakeMachine::with_nvm();
     let shell = machine.shell("22.11.0", "", "");
-    let m = Machine {
-        shell: &shell,
-        home: machine.home.path().to_path_buf(),
-    };
+    let m = Machine::at(&shell, machine.home.path().to_path_buf());
     let config =
         super::questions::resolve_for_new_on(&fx.paths, &fx.config, &refuse, &noop, &m).unwrap();
     assert_eq!(
@@ -9631,10 +9628,7 @@ fn resolve_runtime_slot(
     shell: &dyn Fn(&str) -> Option<String>,
     home: &Path,
 ) -> Result<Config> {
-    let machine = Machine {
-        shell,
-        home: home.to_path_buf(),
-    };
+    let machine = Machine::at(shell, home.to_path_buf());
     resolve_on(
         &fx.paths,
         config,
@@ -9962,10 +9956,7 @@ fn the_slots_new_fills_never_probe_the_runtime() {
     let machine = FakeMachine::with_nvm();
     let shell = machine.shell("24.21.0", "", "");
     let panicking = |_: &str| -> Option<String> { panic!("new must not probe a runtime") };
-    let m = Machine {
-        shell: &panicking,
-        home: machine.home.path().to_path_buf(),
-    };
+    let m = Machine::at(&panicking, machine.home.path().to_path_buf());
     resolve_on(
         &fx.paths,
         &fx.config,
@@ -9977,6 +9968,125 @@ fn the_slots_new_fills_never_probe_the_runtime() {
     )
     .unwrap();
     drop(shell);
+}
+
+// A manager's line that does not give the pinned version is still on
+// offer, saying what would make it work, but never one `--yes` takes: it
+// used to be the first option, and taking it failed its own check.
+#[test]
+fn a_managers_line_that_does_not_work_yet_is_offered_but_never_preselected() {
+    let fx = fixture_pinning(".nvmrc", "25");
+    let machine = FakeMachine::with_nvm();
+    let shell = machine.shell("24.21.0", "", "");
+    let (ask, asked) = scripted(vec![Answer::None]);
+
+    resolve_runtime_slot(&fx, &fx.config, &ask, &shell, machine.home.path()).unwrap();
+
+    let question = &asked.borrow()[0];
+    let (line, why) = question
+        .options
+        .iter()
+        .find(|(line, _)| line.contains("nvm.sh"))
+        .expect("nvm's line is on offer");
+    assert!(line.ends_with("nvm use >/dev/null"), "{line}");
+    assert!(
+        why.contains("it gives `bash -lc` no node 25 yet: `nvm install 25` first"),
+        "{why}"
+    );
+    assert_eq!(question.preselect, None);
+}
+
+// A node the pin accepts, where Homebrew puts one, is a line on offer:
+// that directory first on PATH, tried before it is offered, saying the
+// version it gives and that it runs in every project on this machine.
+// `--yes` takes it, and checking it again once taken costs no shell.
+#[test]
+fn a_matching_node_in_a_well_known_place_is_offered_and_taken() {
+    let fx = fixture_pinning(".nvmrc", "25");
+    let home = tempdir().unwrap();
+    let brew = home.path().join("opt/homebrew/bin");
+    std::fs::create_dir_all(&brew).unwrap();
+    std::fs::write(brew.join("node"), "#!/bin/sh\n").unwrap();
+    let machine = FakeMachine {
+        home,
+        asked: Default::default(),
+    };
+    let shell = machine.shell("24.21.0", "opt/homebrew/bin", "25.8.2");
+    let (ask, asked) = scripted(vec![Answer::Auto(0)]);
+
+    let config = resolve_runtime_slot(&fx, &fx.config, &ask, &shell, machine.home.path()).unwrap();
+
+    let line = format!("export PATH=\"{}:$PATH\"", brew.display());
+    let question = &asked.borrow()[0];
+    assert_eq!(question.options.len(), 1, "{:?}", question.options);
+    let (offered, why) = &question.options[0];
+    assert_eq!(offered, &line);
+    assert!(why.contains("node 25.8.2 is in"), "{why}");
+    assert!(why.contains("every project on this machine"), "{why}");
+    assert_eq!(question.preselect, Some(0));
+    assert_eq!(config.runtime.prelude.as_deref(), Some(line.as_str()));
+    assert!(user_config(&fx).contains(&brew.display().to_string()));
+    assert_eq!(
+        machine.probes(),
+        2,
+        "the mismatch, then the line: taken, it is checked from the cache"
+    );
+}
+
+// The binary the developer's own shell finds is found through the PATH
+// pando was started with, before any well-known place, and a directory
+// that holds only a version the pin rejects is not offered at all.
+#[test]
+fn the_developers_own_node_leads_and_a_wrong_one_is_left_out() {
+    let fx = fixture_pinning(".nvmrc", "25");
+    let home = tempdir().unwrap();
+    let own = home.path().join("own/bin");
+    let brew = home.path().join("opt/homebrew/bin");
+    let old = home.path().join("old/bin");
+    for dir in [&own, &brew, &old] {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("node"), "#!/bin/sh\n").unwrap();
+    }
+    let shell = |command: &str| {
+        let version = if command.contains("own/bin") {
+            "25.1.0"
+        } else if command.contains("opt/homebrew/bin") {
+            "25.8.2"
+        } else {
+            "24.21.0"
+        };
+        Some(crate::runtime::probe_reply(
+            &format!("/somewhere/{version}/node"),
+            version,
+        ))
+    };
+    let mut m = Machine::at(&shell, home.path().to_path_buf());
+    m.path = vec![old.clone(), own.clone()];
+    let (ask, asked) = scripted(vec![Answer::None]);
+
+    resolve_on(
+        &fx.paths,
+        &fx.config,
+        &[Slot::Prelude],
+        &[],
+        &Answering::asking(&ask),
+        &noop,
+        &m,
+    )
+    .unwrap();
+
+    let options: Vec<String> = asked.borrow()[0]
+        .options
+        .iter()
+        .map(|(line, _)| line.clone())
+        .collect();
+    assert_eq!(
+        options,
+        [
+            format!("export PATH=\"{}:$PATH\"", own.display()),
+            format!("export PATH=\"{}:$PATH\"", brew.display()),
+        ]
+    );
 }
 
 // ---- which URL a native service's create step reads --------------------
@@ -11041,10 +11151,7 @@ fn new_asks_the_runtime_question_before_an_install_runs() {
     std::fs::write(fx.root.join("package-lock.json"), "{}\n").unwrap();
     let machine = FakeMachine::with_nvm();
     let shell = machine.shell("24.21.0", "nvm use", "22.11.0");
-    let m = Machine {
-        shell: &shell,
-        home: machine.home.path().to_path_buf(),
-    };
+    let m = Machine::at(&shell, machine.home.path().to_path_buf());
     let (ask, asked) = scripted(vec![Answer::Choice(0)]);
     let config =
         super::questions::resolve_for_new_on(&fx.paths, &fx.config, &ask, &noop, &m).unwrap();
@@ -14559,10 +14666,7 @@ fn trying_on_its_own_writes_first_choices_and_remembers_whose_they_were() {
     git(&fx.root, &["commit", "--quiet", "-m", "prisma"]);
     let machine = FakeMachine::with_nvm();
     let shell = machine.shell("22.11.0", "", "");
-    let m = Machine {
-        shell: &shell,
-        home: machine.home.path().to_path_buf(),
-    };
+    let m = Machine::at(&shell, machine.home.path().to_path_buf());
 
     let (said, progress) = collecting();
     let guessed = try_on_its_own_on(&fx.paths, &fx.config, &progress, &m).unwrap();
@@ -14622,10 +14726,7 @@ fn a_dev_command_with_no_option_stops_the_guess_with_nothing_written() {
     std::fs::write(fx.root.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
     let machine = FakeMachine::with_nvm();
     let shell = machine.shell("22.11.0", "", "");
-    let m = Machine {
-        shell: &shell,
-        home: machine.home.path().to_path_buf(),
-    };
+    let m = Machine::at(&shell, machine.home.path().to_path_buf());
     let guessed = try_on_its_own_on(&fx.paths, &fx.config, &noop, &m).unwrap();
     assert!(
         matches!(guessed, OwnGuess::NoOption(Slot::DevCmd)),
@@ -14641,10 +14742,7 @@ fn a_project_with_nothing_to_run_writes_nothing() {
     let fx = detectable_fixture(r#"{ "build": "tsc" }"#, "");
     let machine = FakeMachine::with_nvm();
     let shell = machine.shell("22.11.0", "", "");
-    let m = Machine {
-        shell: &shell,
-        home: machine.home.path().to_path_buf(),
-    };
+    let m = Machine::at(&shell, machine.home.path().to_path_buf());
     let guessed = try_on_its_own_on(&fx.paths, &fx.config, &noop, &m).unwrap();
     assert!(matches!(guessed, OwnGuess::NothingToRun), "{guessed:?}");
     assert_eq!(written_by_a_guess(&fx), Vec::<PathBuf>::new());
@@ -14660,10 +14758,7 @@ fn a_needed_prelude_is_never_taken_and_nothing_is_written() {
     std::fs::write(fx.root.join(".nvmrc"), "22\n").unwrap();
     let machine = FakeMachine::with_nvm();
     let shell = machine.shell("18.20.0", "nvm", "22.11.0");
-    let m = Machine {
-        shell: &shell,
-        home: machine.home.path().to_path_buf(),
-    };
+    let m = Machine::at(&shell, machine.home.path().to_path_buf());
     let guessed = try_on_its_own_on(&fx.paths, &fx.config, &noop, &m).unwrap();
     let OwnGuess::NeedsPrelude(report) = guessed else {
         panic!("the prelude is the developer's: {guessed:?}");

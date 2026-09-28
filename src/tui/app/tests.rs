@@ -7708,10 +7708,7 @@ fn a_needed_prelude_shows_doctors_line_and_writes_nothing() {
     };
     let config = crate::config::load(&app.paths).unwrap().config;
     let shell = actions::runtime_shell(app.paths.root());
-    let machine = actions::Machine {
-        shell: &shell,
-        home: actions::user_home(),
-    };
+    let machine = actions::Machine::here(&shell);
     let doctor = crate::doctor::runtime_findings(&app.paths, &config, &machine);
     assert_eq!(
         Some(&line),

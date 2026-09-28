@@ -3641,10 +3641,7 @@ fn every_enum_value_agent_json_documents_is_one_the_binary_prints() {
     let finds_nothing = |_: &str| None;
     let report = crate::doctor::run_on(
         &fx.paths,
-        &crate::actions::Machine {
-            shell: &finds_nothing,
-            home: fx.root.join("no-such-home"),
-        },
+        &crate::actions::Machine::at(&finds_nothing, fx.root.join("no-such-home")),
     );
     let report = serde_json::to_value(&report).unwrap();
     let layers = report["config"]["layers"]
@@ -4150,10 +4147,7 @@ fn a_checks_worktree_is_in_no_list_and_answers_to_no_name() {
     let finds_nothing = |_: &str| None;
     let report = crate::doctor::run_on(
         &fx.paths,
-        &crate::actions::Machine {
-            shell: &finds_nothing,
-            home: fx.root.join("no-such-home"),
-        },
+        &crate::actions::Machine::at(&finds_nothing, fx.root.join("no-such-home")),
     );
     assert!(
         report

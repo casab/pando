@@ -1,11 +1,12 @@
 //! The prelude lines that would make this machine resolve what the
-//! project asks for, from the managers it has installed.
+//! project asks for: from the managers it has installed, and from the
+//! directories a binary of the language sits in outside them.
 
 use super::Requirement;
 use super::languages::Family;
 use super::languages::Language;
 use super::languages::Manager;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A prelude line that would make this machine resolve what the project
 /// asks for, and why it is on offer.
@@ -29,12 +30,17 @@ pub struct Fix {
 /// A manager whose init line switches to nothing on its own, and whose
 /// `use` line cannot read the requirement, is not offered at all: its line
 /// could never change what resolves.
-pub fn fixes(language: &Language, home: &Path, requirement: &Requirement) -> Vec<Fix> {
+pub fn fixes(
+    language: &Language,
+    home: &Path,
+    system: &Path,
+    requirement: &Requirement,
+) -> Vec<Fix> {
     language
         .managers
         .iter()
         .filter_map(|manager| {
-            let path = manager.installed_at(home)?;
+            let path = manager.installed_at(home, system)?;
             let mut line = manager.init.replace("{path}", &path.display().to_string());
             let use_line = manager
                 .use_line
@@ -64,10 +70,43 @@ pub fn fixes(language: &Language, home: &Path, requirement: &Requirement) -> Vec
 }
 
 /// Every manager for this language that this machine has.
-pub fn installed(language: &Language, home: &Path) -> Vec<&'static Manager> {
+pub fn installed(language: &Language, home: &Path, system: &Path) -> Vec<&'static Manager> {
     language
         .managers
         .iter()
-        .filter(|manager| manager.installed_at(home).is_some())
+        .filter(|manager| manager.installed_at(home, system).is_some())
         .collect()
+}
+
+/// Directories that hold one of the language's binaries: each directory
+/// on `path` in its order, then the language's install directories.
+///
+/// `path` is the PATH pando was started with, which is the developer's own
+/// shell's: the binary they get by hand is found there without reading
+/// their profile. Whether a directory holds a version the project accepts
+/// is the probe's to say, through the line [`path_line`] makes of it.
+pub fn binary_dirs(language: &Language, system: &Path, path: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let installs = language.install_dirs_under(system);
+    for dir in path.iter().chain(installs.iter()) {
+        let holds = language
+            .binaries
+            .iter()
+            .any(|binary| dir.join(binary).is_file());
+        if holds && dir.is_absolute() && !out.contains(dir) {
+            out.push(dir.clone());
+        }
+    }
+    out
+}
+
+/// The prelude line that puts `dir` first on PATH, for a directory whose
+/// name survives double quotes as it is. `None` for one that does not: a
+/// line pando would have to escape is not one to hand a developer.
+pub fn path_line(dir: &Path) -> Option<String> {
+    let dir = dir.to_str()?;
+    if dir.contains(['"', '$', '`', '\\', '\n']) {
+        return None;
+    }
+    Some(format!("export PATH=\"{dir}:$PATH\""))
 }

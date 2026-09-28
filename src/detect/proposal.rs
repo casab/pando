@@ -194,8 +194,8 @@ impl Slot {
             Slot::Install => "Which command installs this project's dependencies?",
             Slot::VersionFiles => "Which file pins this project's runtime version?",
             Slot::Prelude => {
-                "Which line should pando run first, so this shell resolves the \
-                              runtime the project asks for?"
+                "Which line should pando run first on this machine, in every project, \
+                 so its shell resolves the runtime this project asks for?"
             }
             Slot::Processes => "Run these as separate processes?",
             Slot::DevCmd => "Which command starts the local development server?",
@@ -283,6 +283,10 @@ pub struct Candidate {
     /// Nor is a process list that leaves an app directory with nothing to
     /// start it: taken, it passes a check with that app never run, and
     /// how the app runs is something no rule found.
+    ///
+    /// Nor a prelude line that does not work on this machine yet: a
+    /// manager's, with the version not installed under it. It stays on
+    /// offer, saying what would make it work.
     pub needs_a_human: bool,
 }
 

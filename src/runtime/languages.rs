@@ -3,7 +3,7 @@
 //! an entry here.
 
 use super::normalize_spec;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// How the spec is dug out of a file that pins one language.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +53,13 @@ pub struct Language {
     /// installs that Python, so a project run through it needs no prelude
     /// whatever `bash -lc` resolves on its own.
     pub runners: &'static [&'static str],
+    /// Where an installer other than a version manager puts this
+    /// language's binaries: a package manager's own directory, or an
+    /// official installer's. `{brew}` stands for each of
+    /// [`HOMEBREW_PREFIXES`], and one path component may carry a `*`, for
+    /// a versioned keg such as `node@22`. The prelude question offers the
+    /// ones that hold a version the project accepts.
+    pub install_dirs: &'static [&'static str],
 }
 
 impl Language {
@@ -88,6 +95,7 @@ pub const LANGUAGES: [Language; 6] = [
         version_flag: "-v",
         managers: &[VOLTA, MISE, ASDF, NVM, FNM],
         runners: &[],
+        install_dirs: &["{brew}/bin", "{brew}/opt/node@*/bin"],
     },
     Language {
         name: "python",
@@ -101,6 +109,11 @@ pub const LANGUAGES: [Language; 6] = [
         version_flag: "-V",
         managers: &[PYENV, MISE, ASDF],
         runners: &["uv"],
+        install_dirs: &[
+            "{brew}/bin",
+            "{brew}/opt/python@*/libexec/bin",
+            "/Library/Frameworks/Python.framework/Versions/*/bin",
+        ],
     },
     Language {
         name: "ruby",
@@ -114,6 +127,8 @@ pub const LANGUAGES: [Language; 6] = [
         version_flag: "-v",
         managers: &[RBENV, MISE, ASDF, RVM],
         runners: &[],
+        // Homebrew's ruby is keg-only: macOS has one of its own in /usr/bin.
+        install_dirs: &["{brew}/opt/ruby/bin", "{brew}/opt/ruby@*/bin"],
     },
     Language {
         name: "rust",
@@ -127,6 +142,7 @@ pub const LANGUAGES: [Language; 6] = [
         version_flag: "-V",
         managers: &[RUSTUP, MISE, ASDF],
         runners: &[],
+        install_dirs: &["{brew}/bin"],
     },
     Language {
         name: "go",
@@ -137,6 +153,8 @@ pub const LANGUAGES: [Language; 6] = [
         version_flag: "version",
         managers: &[MISE, ASDF],
         runners: &[],
+        // The official installer's, then Homebrew's.
+        install_dirs: &["/usr/local/go/bin", "{brew}/bin", "{brew}/opt/go@*/bin"],
     },
     Language {
         name: "java",
@@ -147,6 +165,8 @@ pub const LANGUAGES: [Language; 6] = [
         version_flag: "-version",
         managers: &[JENV, MISE, ASDF, SDKMAN],
         runners: &[],
+        // Keg-only, like ruby: macOS's /usr/bin/java is a stub.
+        install_dirs: &["{brew}/opt/openjdk/bin", "{brew}/opt/openjdk@*/bin"],
     },
 ];
 
@@ -164,6 +184,87 @@ impl Language {
                 .filter(|row| row.lockfiles.iter().any(|l| root.join(l).is_file()))
         })
     }
+
+    /// The directories [`install_dirs`](Language::install_dirs) names that
+    /// exist, read under `system`, which is `/` everywhere but in a test.
+    /// A `*` expands to every entry it matches, the highest version first.
+    pub fn install_dirs_under(&self, system: &Path) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = Vec::new();
+        for pattern in self.install_dirs {
+            let patterns: Vec<String> = match pattern.strip_prefix("{brew}") {
+                Some(rest) => HOMEBREW_PREFIXES
+                    .iter()
+                    .map(|prefix| format!("{prefix}{rest}"))
+                    .collect(),
+                None => vec![pattern.to_string()],
+            };
+            for pattern in patterns {
+                for dir in expand(system, &pattern) {
+                    if !out.contains(&dir) {
+                        out.push(dir);
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Where Homebrew lives: on Apple silicon, on an Intel Mac, and on Linux.
+pub const HOMEBREW_PREFIXES: [&str; 3] =
+    ["/opt/homebrew", "/usr/local", "/home/linuxbrew/.linuxbrew"];
+
+/// The directories an absolute pattern names under `system`, where one
+/// component may hold a `*` that matches any run of characters.
+fn expand(system: &Path, pattern: &str) -> Vec<PathBuf> {
+    let relative = pattern.trim_start_matches('/');
+    let Some((before, after)) = relative.split_once('*') else {
+        let dir = system.join(relative);
+        return match dir.is_dir() {
+            true => vec![dir],
+            false => Vec::new(),
+        };
+    };
+    // `opt/node@*/bin` is the directory `opt`, names that start `node@`
+    // and end with nothing, and `bin` below each.
+    let (parent, head) = before.rsplit_once('/').unwrap_or(("", before));
+    let (tail, below) = match after.split_once('/') {
+        Some((tail, below)) => (tail, Some(below)),
+        None => (after, None),
+    };
+    let Ok(entries) = std::fs::read_dir(system.join(parent)) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter(|name| {
+            name.len() >= head.len() + tail.len() && name.starts_with(head) && name.ends_with(tail)
+        })
+        .collect();
+    // The highest version first, by number: `node@9` sorts after
+    // `node@22`, which a plain sort of the names would not do.
+    let key = |name: &str| -> Vec<u64> {
+        super::first_version(name)
+            .map(|version| {
+                version
+                    .split('.')
+                    .map(|part| part.parse().unwrap_or(0))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    names.sort_by(|a, b| key(b).cmp(&key(a)).then_with(|| a.cmp(b)));
+    names
+        .into_iter()
+        .map(|name| {
+            let dir = system.join(parent).join(name);
+            match below {
+                Some(below) => dir.join(below),
+                None => dir,
+            }
+        })
+        .filter(|dir| dir.is_dir())
+        .collect()
 }
 
 /// The table entry for a language, by name.
@@ -221,16 +322,14 @@ pub struct Manager {
 }
 
 impl Manager {
-    /// Where it is installed, if it is.
-    pub fn installed_at(&self, home: &Path) -> Option<std::path::PathBuf> {
+    /// Where it is installed, if it is. An absolute marker is read under
+    /// `system`, which is `/` everywhere but in a test.
+    pub fn installed_at(&self, home: &Path, system: &Path) -> Option<PathBuf> {
         self.markers
             .iter()
-            .map(|marker| {
-                if marker.starts_with('/') {
-                    std::path::PathBuf::from(marker)
-                } else {
-                    home.join(marker)
-                }
+            .map(|marker| match marker.strip_prefix('/') {
+                Some(absolute) => system.join(absolute),
+                None => home.join(marker),
             })
             .find(|path| path.exists())
     }
