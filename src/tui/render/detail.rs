@@ -90,7 +90,31 @@ fn detail_row<'a>(label: &str, value: Vec<Span<'a>>) -> Line<'a> {
 /// value's column.
 fn wrapped_rows<'a>(label: &str, value: &str, style: Style, width: usize) -> Vec<Line<'a>> {
     let room = width.saturating_sub(LABEL_WIDTH).max(1);
-    chunk_cells(value, room)
+    labelled_rows(label, chunk_cells(value, room), style)
+}
+
+/// [`wrapped_rows`] for a command: what does not fit carries on at a
+/// space where it can, so a copied URL is not cut in two, and anywhere
+/// only when one word is wider than the row.
+fn command_rows<'a>(label: &str, command: &str, style: Style, width: usize) -> Vec<Line<'a>> {
+    let room = width.saturating_sub(LABEL_WIDTH).max(1);
+    let mut pieces: Vec<String> = Vec::new();
+    for word in command.split(' ') {
+        match pieces.last_mut() {
+            Some(last) if text_width(last) + 1 + text_width(word) <= room => {
+                last.push(' ');
+                last.push_str(word);
+            }
+            _ => pieces.extend(chunk_cells(word, room)),
+        }
+    }
+    labelled_rows(label, pieces, style)
+}
+
+/// `pieces` under `label`, each after the first indented to the value's
+/// column.
+fn labelled_rows<'a>(label: &str, pieces: Vec<String>, style: Style) -> Vec<Line<'a>> {
+    pieces
         .into_iter()
         .enumerate()
         .map(|(i, piece)| {
@@ -209,6 +233,13 @@ pub(super) fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
         for line in wrapped_rows("public", &public, style, width) {
             rows.push((KEEP_URL, line));
         }
+    }
+    // And, for a running bundler whose app a device runs, the command that
+    // opens it on the simulator, whole for the same reason: Expo's own
+    // keypress for it is gone with no terminal. `pando status` also gives
+    // a development build's link.
+    for line in app_rows(app, &name, width) {
+        rows.push((KEEP_URL, line));
     }
     if let Some(ports) = ports_row(app, &name, width) {
         rows.push((KEEP_URL, ports));
@@ -779,6 +810,26 @@ fn phase_as_aggregate(process: &str, record: &ProcessRecord) -> Aggregate {
             reason: reason.clone(),
         },
     }
+}
+
+/// The simulator's command for each running process whose app a device
+/// runs, never cut. From the settings and the record alone: no reads.
+fn app_rows<'a>(app: &App, name: &str, width: usize) -> Vec<Line<'a>> {
+    let Some(record) = app.record_for(name) else {
+        return Vec::new();
+    };
+    crate::actions::app_links(&app.config, record)
+        .into_iter()
+        .filter(|(process, _)| {
+            record
+                .processes
+                .get(process)
+                .is_some_and(|p| matches!(p.phase, Phase::Running { .. }))
+        })
+        .flat_map(|(_, links)| {
+            command_rows("app", &links.simulator, Style::new().fg(text()), width)
+        })
+        .collect()
 }
 
 fn ports_row<'a>(app: &App, name: &str, width: usize) -> Option<Line<'a>> {

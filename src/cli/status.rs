@@ -31,6 +31,23 @@ struct ProcessOut {
     /// `null` unless the phase is `failed`.
     reason: Option<String>,
     log: String,
+    /// How the app it serves is opened on a simulator or a device, for a
+    /// process that runs a framework whose app runs on one; `null` for
+    /// every other process.
+    app: Option<AppOut>,
+}
+
+/// A process's app, opened on a simulator or a device: Expo's.
+#[derive(Serialize)]
+struct AppOut {
+    /// The URL its framework's own client opens it at: `exp://…` in Expo
+    /// Go.
+    url: String,
+    /// The command that opens `url` on the booted iOS simulator.
+    simulator: String,
+    /// The URL a development build opens it at. `<scheme>` is the app's
+    /// own, from its manifest, which pando does not read.
+    development_build: String,
 }
 
 #[derive(Serialize)]
@@ -157,6 +174,11 @@ pub fn status_json<W: Write>(paths: &PandoPaths, only: Option<&str>, out: &mut W
     {
         return Err(not_listed(name, refreshed.state.worktrees.get(name)));
     }
+    // For the processes whose app a device runs; a config that does not
+    // load only costs their links.
+    let config = crate::config::load(paths)
+        .map(|loaded| loaded.config)
+        .unwrap_or_default();
     let output = StatusOutput {
         version: JSON_VERSION,
         project: ProjectOut {
@@ -170,6 +192,7 @@ pub fn status_json<W: Write>(paths: &PandoPaths, only: Option<&str>, out: &mut W
                 let record = refreshed.state.worktrees.get(&w.name);
                 let empty = WorktreeRecord::new(&w.path, false);
                 let record = record.unwrap_or(&empty);
+                let mut apps = actions::app_links(&config, record);
                 StatusWorktreeOut {
                     name: w.name.clone(),
                     main: w.name == main_name,
@@ -217,6 +240,11 @@ pub fn status_json<W: Write>(paths: &PandoPaths, only: Option<&str>, out: &mut W
                                     since: phase_since(&p.phase),
                                     reason: phase_reason(&p.phase),
                                     log: p.log_path.display().to_string(),
+                                    app: apps.remove(name).map(|links| AppOut {
+                                        url: links.url,
+                                        simulator: links.simulator,
+                                        development_build: links.development_build,
+                                    }),
                                 },
                             )
                         })
@@ -365,6 +393,10 @@ fn status_lines<W: Write>(
         // One line per process under it, so a worktree that is `failed`
         // says which of its processes is, and each one's pid is reachable.
         let Some(record) = record else { continue };
+        let apps = config
+            .as_ref()
+            .map(|config| actions::app_links(config, record))
+            .unwrap_or_default();
         let process_width = record
             .processes
             .keys()
@@ -377,6 +409,23 @@ fn status_lines<W: Write>(
             // allowed to wrap the row under it.
             let row = format!("  {}  {}", pad(name, process_width), process_line(p));
             writeln!(out, "{}", ellipsize_end(&row, width))?;
+            // Under a running bundler whose app a device runs, the command
+            // that opens it on the simulator, first, so a narrow terminal
+            // cuts the development build's form rather than the command.
+            if matches!(p.phase, Phase::Running { .. })
+                && let Some(links) = apps.get(name)
+            {
+                let row = format!(
+                    "  {}  {:<PHASE_CELL$}  {} — opens it in {} on the simulator; for a \
+                     development build, open {}",
+                    pad(name, process_width),
+                    "app",
+                    links.simulator,
+                    links.client,
+                    links.development_build,
+                );
+                writeln!(out, "{}", ellipsize_end(&row, width))?;
+            }
         }
         // A port the worktree's processes were given and nothing listens
         // on: the api half of a root script whose web half is up.

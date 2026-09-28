@@ -36,16 +36,9 @@ pub const MEMORY_FILE_HEADER: &str = "<!-- pando wrote this file and rewrites it
 /// Every address pando gives is this machine's `127.0.0.1`, which a
 /// device cannot reach, and nothing else in a passing setup says so.
 pub fn device_note(config: &Config, proposals: &[detect::Proposal]) -> Option<&'static str> {
-    // A port reaches a process through the map form of `ports`, or as a
-    // `{port:<role>}` in `env`, which is how a workspace app gets it.
     let of = |process: &ProcessConfig| {
-        let mapped = process.port_env();
-        let templated = process
-            .env
-            .iter()
-            .filter(|(_, value)| value.contains("{port"))
-            .map(|(key, _)| key);
-        let vars: Vec<&str> = mapped.keys().chain(templated).map(String::as_str).collect();
+        let vars = process.port_vars();
+        let vars: Vec<&str> = vars.keys().map(String::as_str).collect();
         frameworks::device_note(&vars, &process.cmd)
     };
     if config.runnable_processes().next().is_some() {

@@ -7,10 +7,12 @@
 //!
 //! One file per concern: worktrees, hooks, questions, `init`, the runtime
 //! check, start/stop/restart, when a start is ready, private services,
-//! namespaced starts, share, reading state, `pando check`, and trying
-//! pando's own guess for the setup screen.
+//! namespaced starts, share, reading state, how an app on a device is
+//! opened, `pando check`, and trying pando's own guess for the setup
+//! screen.
 
 mod check;
+mod device;
 mod hooks;
 mod init;
 mod lifecycle;
@@ -28,6 +30,7 @@ pub use check::{
     CHECK_RAN_BY_ENV, Checked, LeftoverCheck, Narration, catch_check_interrupts, check, check_at,
     leftover_check, ran_by,
 };
+pub use device::app_links;
 pub use hooks::{
     HookContext, INSTALL_HOOK, hook_scope, install_remedy, matched_nothing, run_hooks, runs_again,
 };

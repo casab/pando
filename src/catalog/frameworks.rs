@@ -57,11 +57,59 @@ pub struct FrameworkRule {
     /// start is known to outlast pando's default wait. `None` keeps the
     /// default.
     pub ready_timeout_s: Option<u64>,
-    /// What the developer has to be told when this framework's app runs
-    /// on a phone or a tablet rather than in a browser on this machine:
-    /// every address pando gives is `127.0.0.1`, which a device cannot
-    /// reach. `None` for every framework a browser here opens.
-    pub device_note: Option<&'static str>,
+    /// How this framework's app is reached when it runs on a phone, a
+    /// tablet or a simulator rather than in a browser on this machine.
+    /// `None` for every framework a browser here opens.
+    pub device: Option<Device>,
+}
+
+/// A framework whose app runs on a device: what the developer has to be
+/// told about reaching it, and how it is opened. The addresses are
+/// templates, `{host}` and `{port}` the bundler's, which only a running
+/// worktree knows.
+#[derive(Debug, Clone, Copy)]
+pub struct Device {
+    /// What the developer has to be told: every address pando gives is
+    /// `127.0.0.1`, which a phone or a tablet cannot reach.
+    pub note: &'static str,
+    /// The app that opens [`Device::url`]: the framework's own client.
+    pub client: &'static str,
+    /// The URL the client opens the app at.
+    pub url: &'static str,
+    /// The URL a development build of the app opens it at. Its scheme is
+    /// the app's own, in a manifest the runtime never reads, so it stays a
+    /// placeholder for the developer or their agent to fill.
+    pub development_build: &'static str,
+    /// The command that opens a URL, `{url}`, on the booted iOS
+    /// simulator, which shares this machine's `127.0.0.1`.
+    pub simulator: &'static str,
+}
+
+/// A [`Device`]'s addresses for one running bundler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppLinks {
+    pub client: &'static str,
+    pub url: String,
+    pub development_build: String,
+    pub simulator: String,
+}
+
+impl Device {
+    /// The addresses of the app a bundler on `host` and `port` serves.
+    pub fn links(&self, host: &str, port: u16) -> AppLinks {
+        let fill = |template: &str| {
+            template
+                .replace("{host}", host)
+                .replace("{port}", &port.to_string())
+        };
+        let url = fill(self.url);
+        AppLinks {
+            client: self.client,
+            simulator: self.simulator.replace("{url}", &url),
+            development_build: fill(self.development_build),
+            url,
+        }
+    }
 }
 
 /// What a marker match must also pass, for a marker file that more than
@@ -106,7 +154,7 @@ pub const RULES: [FrameworkRule; 13] = [
         build_markers: &[],
         env: &[],
         ready_timeout_s: None,
-        device_note: None,
+        device: None,
     },
     FrameworkRule {
         name: "Nuxt",
@@ -121,7 +169,7 @@ pub const RULES: [FrameworkRule; 13] = [
         build_markers: &[],
         env: &[],
         ready_timeout_s: None,
-        device_note: None,
+        device: None,
     },
     // Astro sits on Vite but has its own CLI, its own default port and its
     // own command, so it comes before the Vite row that would claim it.
@@ -138,7 +186,7 @@ pub const RULES: [FrameworkRule; 13] = [
         build_markers: &[],
         env: &[],
         ready_timeout_s: None,
-        device_note: None,
+        device: None,
     },
     FrameworkRule {
         name: "Angular",
@@ -154,7 +202,7 @@ pub const RULES: [FrameworkRule; 13] = [
         build_markers: &["ng build"],
         env: &[],
         ready_timeout_s: None,
-        device_note: None,
+        device: None,
     },
     // Expo, React Native's dev server. Metro serves a bundle to a device
     // or a simulator, not a page. Its CLI reads `--port`, then
@@ -179,11 +227,16 @@ pub const RULES: [FrameworkRule; 13] = [
         build_markers: &["expo export", "expo prebuild"],
         env: &[("CI", "1")],
         ready_timeout_s: Some(90),
-        device_note: Some(
-            "a phone or tablet reaches Metro, and the app reaches its backend, at this \
-             machine's LAN address, not 127.0.0.1: REACT_NATIVE_PACKAGER_HOSTNAME and the \
-             EXPO_PUBLIC_* backend URL need it",
-        ),
+        device: Some(Device {
+            note: "a phone or tablet reaches Metro, and the app reaches its backend, at this \
+                   machine's LAN address, not 127.0.0.1: REACT_NATIVE_PACKAGER_HOSTNAME and the \
+                   EXPO_PUBLIC_* backend URL need it",
+            client: "Expo Go",
+            url: "exp://{host}:{port}",
+            // Expo's own form: Metro's URL, encoded, as the query value.
+            development_build: "exp+<scheme>://expo-development-client/?url=http%3A%2F%2F{host}%3A{port}",
+            simulator: "xcrun simctl openurl booted {url}",
+        }),
     },
     // The app servers come before the Vite row: a Laravel app has a
     // vite.config.js and a `dev: vite` script, and so do Django and Rails
@@ -201,7 +254,7 @@ pub const RULES: [FrameworkRule; 13] = [
         build_markers: &[],
         env: &[],
         ready_timeout_s: None,
-        device_note: None,
+        device: None,
     },
     FrameworkRule {
         name: "Rails",
@@ -218,7 +271,7 @@ pub const RULES: [FrameworkRule; 13] = [
         build_markers: &[],
         env: &[],
         ready_timeout_s: None,
-        device_note: None,
+        device: None,
     },
     FrameworkRule {
         name: "Phoenix",
@@ -235,7 +288,7 @@ pub const RULES: [FrameworkRule; 13] = [
         build_markers: &[],
         env: &[],
         ready_timeout_s: None,
-        device_note: None,
+        device: None,
     },
     FrameworkRule {
         name: "Laravel",
@@ -250,7 +303,7 @@ pub const RULES: [FrameworkRule; 13] = [
         build_markers: &[],
         env: &[],
         ready_timeout_s: None,
-        device_note: None,
+        device: None,
     },
     FrameworkRule {
         name: "Vite",
@@ -282,7 +335,7 @@ pub const RULES: [FrameworkRule; 13] = [
         build_markers: &["vite build"],
         env: &[],
         ready_timeout_s: None,
-        device_note: None,
+        device: None,
     },
     FrameworkRule {
         name: "Go",
@@ -300,7 +353,7 @@ pub const RULES: [FrameworkRule; 13] = [
         build_markers: &[],
         env: &[],
         ready_timeout_s: None,
-        device_note: None,
+        device: None,
     },
     FrameworkRule {
         name: "Rust",
@@ -317,7 +370,7 @@ pub const RULES: [FrameworkRule; 13] = [
         build_markers: &[],
         env: &[],
         ready_timeout_s: None,
-        device_note: None,
+        device: None,
     },
     FrameworkRule {
         name: "Node",
@@ -332,24 +385,32 @@ pub const RULES: [FrameworkRule; 13] = [
         build_markers: &[],
         env: &[],
         ready_timeout_s: None,
-        device_note: None,
+        device: None,
     },
 ];
 
-/// The note for a process that runs the app of a framework a device
-/// reaches, [`FrameworkRule::device_note`]: one that takes its port from
-/// that framework's variable, one of `port_vars`, or whose command runs
-/// the framework's server by name.
-pub fn device_note(port_vars: &[&str], cmd: &str) -> Option<&'static str> {
+/// The [`FrameworkRule::device`] of a process that runs the app of a
+/// framework a device reaches, with that framework's port variable: one
+/// that takes its port from the variable, one of `port_vars`, or whose
+/// command runs the framework's server by name.
+pub fn device(port_vars: &[&str], cmd: &str) -> Option<(&'static Device, &'static str)> {
     RULES.iter().find_map(|rule| {
-        let note = rule.device_note?;
-        let by_port = matches!(rule.port, PortMechanism::Env(var) if port_vars.contains(&var));
+        let device = rule.device.as_ref()?;
+        let PortMechanism::Env(var) = rule.port else {
+            return None;
+        };
+        let by_port = port_vars.contains(&var);
         let by_cmd = rule
             .script_markers
             .iter()
             .any(|marker| cmd.contains(marker));
-        (by_port || by_cmd).then_some(note)
+        (by_port || by_cmd).then_some((device, var))
     })
+}
+
+/// [`Device::note`], for a process [`device`] recognises.
+pub fn device_note(port_vars: &[&str], cmd: &str) -> Option<&'static str> {
+    device(port_vars, cmd).map(|(device, _)| device.note)
 }
 
 /// Files that say something about the project's toolchain without
@@ -384,11 +445,12 @@ mod tests {
         }
     }
 
-    // A device note is found through the rule's port variable, so a rule
-    // that takes its port some other way could never print its note.
+    // A device is found through the rule's port variable, so a rule that
+    // takes its port some other way could never print its note or give
+    // its app's links.
     #[test]
-    fn a_rule_with_a_device_note_takes_its_port_from_a_variable() {
-        for rule in RULES.iter().filter(|rule| rule.device_note.is_some()) {
+    fn a_rule_with_a_device_takes_its_port_from_a_variable() {
+        for rule in RULES.iter().filter(|rule| rule.device.is_some()) {
             assert!(
                 matches!(rule.port, PortMechanism::Env(_)),
                 "{} has a device note and no port variable",
@@ -404,6 +466,33 @@ mod tests {
         assert_eq!(device_note(&[], "npx expo start"), Some(expo));
         assert_eq!(device_note(&["PORT"], "npm run dev"), None);
         assert_eq!(device_note(&[], "npx next dev"), None);
+    }
+
+    // Expo's app opens in Expo Go at `exp://`, on the simulator through
+    // `simctl`, and in a development build through the app's own scheme,
+    // with Metro's URL encoded as the query value Expo's CLI writes.
+    #[test]
+    fn expos_app_is_opened_by_its_links() {
+        let (expo, var) = device(&["RCT_METRO_PORT"], "").expect("Expo's device");
+        assert_eq!(var, "RCT_METRO_PORT");
+        let links = expo.links("127.0.0.1", 8123);
+        assert_eq!(links.client, "Expo Go");
+        assert_eq!(links.url, "exp://127.0.0.1:8123");
+        assert_eq!(
+            links.simulator,
+            "xcrun simctl openurl booted exp://127.0.0.1:8123"
+        );
+        assert_eq!(
+            links.development_build,
+            "exp+<scheme>://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A8123"
+        );
+        // Every placeholder of every row is filled.
+        for rule in RULES.iter().filter_map(|rule| rule.device.as_ref()) {
+            let links = rule.links("127.0.0.1", 1);
+            for filled in [&links.url, &links.simulator, &links.development_build] {
+                assert!(!filled.contains('{'), "{filled}");
+            }
+        }
     }
 
     #[test]

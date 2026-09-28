@@ -245,6 +245,32 @@ impl ProcessConfig {
             .map(PortsSpec::env_templates)
             .unwrap_or_default()
     }
+
+    /// Each variable a port reaches this process through: the map form of
+    /// `ports`, or a `{port:<role>}` in `env`, which is how a workspace
+    /// app gets one. With the role, when the variable holds that role's
+    /// port and nothing else; an address around a port, such as a
+    /// backend's URL, has none.
+    pub fn port_vars(&self) -> BTreeMap<String, Option<String>> {
+        let own_port = |value: &str| {
+            value
+                .trim()
+                .strip_prefix("{port:")
+                .and_then(|rest| rest.strip_suffix('}'))
+                .filter(|role| !role.is_empty() && !role.contains(['{', '}']))
+                .map(str::to_string)
+        };
+        let templated = self
+            .env
+            .iter()
+            .filter(|(_, value)| value.contains("{port"))
+            .map(|(var, value)| (var.clone(), own_port(value)));
+        let mapped = self
+            .port_env()
+            .into_iter()
+            .map(|(var, value)| (var, own_port(&value)));
+        templated.chain(mapped).collect()
+    }
 }
 
 impl PortsSpec {

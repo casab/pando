@@ -1006,6 +1006,41 @@ fn the_detail_pane_shows_the_url_ports_and_uptime_of_a_running_worktree() {
     assert!(rendered.contains("pid 4242"), "{rendered}");
 }
 
+// Expo's "press i" is gone with no terminal, so the pane gives the
+// command that opens a running Metro's app on the simulator, whole; and
+// none once Metro is down, or for a process whose app a browser opens.
+#[test]
+fn the_detail_pane_gives_the_simulator_command_for_a_running_expo_app() {
+    let mut app = test_app(&["feat+one"]);
+    with_process(&mut app, "feat+one", running_phase());
+    with_second_process(&mut app, "feat+one", "mobile", running_phase());
+    app.config = toml::from_str(
+        "[processes.dev]\ncmd = \"npm run dev\"\nports = { PORT = \"web\" }\n\n\
+         [processes.mobile]\ncmd = \"npx expo start\"\nports = [\"mobile\"]\n",
+    )
+    .unwrap();
+    // The pane is too narrow for the whole command on one row: it carries
+    // on under itself at a space, so the URL is never cut in two.
+    let rendered = text_of(&draw(&mut app, 100, 30));
+    assert!(
+        rendered.contains(" app    xcrun simctl openurl booted"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("        exp://127.0.0.1:17344"),
+        "{rendered}"
+    );
+    assert_eq!(rendered.matches("simctl").count(), 1, "{rendered}");
+
+    let record = app.state.worktrees.get_mut("feat+one").unwrap();
+    record.processes.get_mut("mobile").unwrap().phase = crate::state::Phase::Failed {
+        at: chrono::Utc::now(),
+        reason: "process exited".into(),
+    };
+    let rendered = text_of(&draw(&mut app, 200, 30));
+    assert!(!rendered.contains("simctl"), "{rendered}");
+}
+
 // The api of a root script that runs web and api died behind the web
 // server: the only line on the pane that says so is never cut at its
 // edge, however many ports come before it.

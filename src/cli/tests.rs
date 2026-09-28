@@ -1552,6 +1552,148 @@ fn status_json_reports_a_worktree_that_was_never_started() {
     assert_eq!(wt["isolated"], false);
 }
 
+/// A worktree running an Expo app beside its backend, as the settings in
+/// `config` say: `mobile` owning `mobile` on 18081, `api` owning `web`.
+fn with_mobile_app(fx: &Fx, config: &str) -> String {
+    let name = actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
+    std::fs::write(fx.paths.config_file(), config).unwrap();
+    let mut store = crate::state::load(&fx.paths.state_file()).unwrap();
+    let record = store.worktrees.get_mut(&name).unwrap();
+    for (process, role, port) in [("api", "web", 17_342), ("mobile", "mobile", 18_081)] {
+        record.ports.insert(role.to_string(), port);
+        record
+            .roles
+            .insert(process.to_string(), vec![role.to_string()]);
+        record
+            .processes
+            .insert(process.to_string(), listening(999_998, &[]));
+    }
+    crate::state::save(&fx.paths.state_file(), &store).unwrap();
+    name
+}
+
+const MOBILE_BY_VARIABLE: &str = "[processes.api]\ncmd = \"npm run dev\"\n\
+     ports = { PORT = \"web\" }\n\n\
+     [processes.mobile]\ncmd = \"npm run start\"\ncwd = \"apps/mobile\"\n\
+     ports = [\"mobile\"]\nenv = { RCT_METRO_PORT = \"{port:mobile}\", \
+     EXPO_PUBLIC_API_URL = \"http://127.0.0.1:{port:web}\" }\n";
+
+// Expo's "press i" is gone under pando, which runs it with no terminal,
+// so `status` says how its app is opened on the simulator: the process is
+// known from the settings alone, by Metro's port variable, and its link
+// names the port the worktree gave it. Nothing else gets one.
+#[test]
+fn status_gives_the_link_that_opens_an_expo_app_on_the_simulator() {
+    let fx = fixture();
+    with_mobile_app(&fx, MOBILE_BY_VARIABLE);
+    let text = capture(|b| status_json(&fx.paths, None, b));
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let processes = &v["worktrees"][0]["processes"];
+    assert_eq!(
+        processes["mobile"]["app"],
+        serde_json::json!({
+            "url": "exp://127.0.0.1:18081",
+            "simulator": "xcrun simctl openurl booted exp://127.0.0.1:18081",
+            "development_build":
+                "exp+<scheme>://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A18081",
+        })
+    );
+    assert_eq!(processes["api"]["app"], serde_json::Value::Null);
+    // Published: the contract names the key and each key under it.
+    let doc = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("agent/json.md"),
+    )
+    .unwrap();
+    let section = doc
+        .split("## `pando status --json`")
+        .nth(1)
+        .expect("the status section")
+        .split("\n## ")
+        .next()
+        .unwrap();
+    let app = processes["mobile"]["app"].as_object().unwrap();
+    for key in std::iter::once(&"app".to_string()).chain(app.keys()) {
+        assert!(
+            section.contains(&format!("\"{key}\"")),
+            "agent/json.md never documents status's process {key}"
+        );
+    }
+
+    let text = capture(|b| status_text_at(&fx.paths, None, b, usize::MAX));
+    let apps: Vec<&str> = text
+        .lines()
+        .filter(|line| line.contains("simctl"))
+        .collect();
+    assert_eq!(apps.len(), 1, "{text}");
+    assert!(apps[0].trim_start().starts_with("mobile  app"), "{text}");
+    assert!(
+        apps[0].contains(
+            "xcrun simctl openurl booted exp://127.0.0.1:18081 — opens it in Expo Go on the \
+             simulator; for a development build, open exp+<scheme>://expo-development-client/"
+        ),
+        "{text}"
+    );
+    // A narrow terminal cuts the development build's form, never the
+    // command in front of it.
+    let narrow = capture(|b| status_text_at(&fx.paths, None, b, 80));
+    assert!(
+        narrow.contains("xcrun simctl openurl booted exp://127.0.0.1:18081"),
+        "{narrow}"
+    );
+}
+
+// A command that runs Expo's server by name is known the same way, and
+// its link takes the port of the one role the process owns.
+#[test]
+fn status_knows_an_expo_app_by_its_command_too() {
+    let fx = fixture();
+    with_mobile_app(
+        &fx,
+        "[processes.api]\ncmd = \"npm run dev\"\nports = { PORT = \"web\" }\n\n\
+         [processes.mobile]\ncmd = \"npx expo start --port {port:mobile}\"\n\
+         ports = [\"mobile\"]\n",
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&capture(|b| status_json(&fx.paths, None, b))).unwrap();
+    assert_eq!(
+        v["worktrees"][0]["processes"]["mobile"]["app"]["url"],
+        "exp://127.0.0.1:18081"
+    );
+}
+
+// With no process a device runs, there is no link, in either shape; and
+// none while the bundler is not running, since nothing would answer it.
+#[test]
+fn status_gives_no_app_link_for_a_browser_app_or_a_stopped_bundler() {
+    let fx = fixture();
+    let name = with_mobile_app(
+        &fx,
+        "[processes.api]\ncmd = \"npm run dev\"\nports = { PORT = \"web\" }\n\n\
+         [processes.mobile]\ncmd = \"npm run dev\"\nports = { PORT = \"mobile\" }\n",
+    );
+    let json = capture(|b| status_json(&fx.paths, None, b));
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    for process in ["api", "mobile"] {
+        assert_eq!(
+            v["worktrees"][0]["processes"][process]["app"],
+            serde_json::Value::Null
+        );
+    }
+    let text = capture(|b| status_text_at(&fx.paths, None, b, usize::MAX));
+    assert!(!text.contains("simctl"), "{text}");
+
+    std::fs::write(fx.paths.config_file(), MOBILE_BY_VARIABLE).unwrap();
+    let mut store = crate::state::load(&fx.paths.state_file()).unwrap();
+    let record = store.worktrees.get_mut(&name).unwrap();
+    record.processes.get_mut("mobile").unwrap().phase = Phase::Failed {
+        at: Utc::now(),
+        reason: "process exited".to_string(),
+    };
+    crate::state::save(&fx.paths.state_file(), &store).unwrap();
+    let text = capture(|b| status_text_at(&fx.paths, None, b, usize::MAX));
+    assert!(!text.contains("simctl"), "{text}");
+}
+
 // `mode` came after `isolated`, which programs already read: the new
 // word is added beside it, and the old flag stays true for isolated alone.
 #[test]
