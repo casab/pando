@@ -6078,6 +6078,71 @@ fn a_dry_run_prints_a_namespace_login_without_its_password() {
     );
 }
 
+/// A program's answer to one slot, for a pass that asks it or volunteers
+/// it: the same answer whichever way the rules left the slot.
+fn program_answering(slot: Slot, answer: Answer) -> impl Fn(&Question) -> Option<Result<Answer>> {
+    move |q: &Question| (q.slot == slot).then(|| Ok(Answer::Program(Box::new(answer.clone()))))
+}
+
+// A typed `port_env` of several variables was written as one variable
+// called "PORT, API_PORT". It is split the way the option naming several
+// is joined, and each owns the role its name says.
+#[test]
+fn a_typed_list_of_port_variables_is_split_into_roles() {
+    let fx = detectable_fixture(
+        r#"{ "dev": "node server.js" }"#,
+        "WEB_PORT=3000\nADMIN_PORT=3001\n",
+    );
+    let program = program_answering(Slot::PortEnv, Answer::Custom("PORT, API_PORT".into()));
+    let ask = |q: &Question| program(q).unwrap_or_else(|| refuse(q));
+    init(
+        &fx.paths,
+        &fx.config,
+        &Answering::by_program(&ask, &program),
+        &noop,
+    )
+    .unwrap();
+
+    let config = crate::config::load(&fx.paths).unwrap().config;
+    assert_eq!(
+        config.processes["dev"].ports,
+        Some(PortsSpec::Map(BTreeMap::from([
+            ("API_PORT".to_string(), "api".to_string()),
+            ("PORT".to_string(), "web".to_string()),
+        ])))
+    );
+}
+
+#[test]
+fn a_typed_port_variable_that_is_no_variable_name_is_refused_as_a_usage_error() {
+    for typed in ["PORT; API_PORT", "API-PORT", "2PORT", "PORT, APP_HOST"] {
+        let fx = detectable_fixture(
+            r#"{ "dev": "node server.js" }"#,
+            "WEB_PORT=3000\nADMIN_PORT=3001\n",
+        );
+        let program = program_answering(Slot::PortEnv, Answer::Custom(typed.into()));
+        let ask = |q: &Question| program(q).unwrap_or_else(|| refuse(q));
+        let e = init(
+            &fx.paths,
+            &fx.config,
+            &Answering::by_program(&ask, &program),
+            &noop,
+        )
+        .unwrap_err();
+        assert!(
+            e.downcast_ref::<RefusedAnswer>().is_some(),
+            "{typed:?}: a program's bad value is exit 2, not a failure: {e:#}"
+        );
+        let e = format!("{e:#}");
+        assert!(
+            e.contains("port variable") && e.contains("nothing was written"),
+            "{e}"
+        );
+        let written = std::fs::read_to_string(fx.paths.config_file()).unwrap_or_default();
+        assert!(!written.contains("ports"), "{typed:?}: {written}");
+    }
+}
+
 #[test]
 fn init_takes_every_slot_a_rule_decided_and_asks_nothing() {
     let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");

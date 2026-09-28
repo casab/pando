@@ -36,8 +36,8 @@ mod workspaces;
 
 pub use apply::{
     DEV, Edit, apply, apply_native_services, apply_services, array_edits, custom, edits,
-    fills_one_dev_process, join_list, may_fill_dev, native_entry, roles_in, service_entry, snippet,
-    still_needed,
+    fills_one_dev_process, is_env_name, join_list, may_fill_dev, native_entry, roles_in,
+    service_entry, snippet, still_needed, typed_ports,
 };
 pub use dev::unlocked_command;
 pub use frameworks::framework;

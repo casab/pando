@@ -293,6 +293,35 @@ impl Answerer {
             Answerer::Program => config::Note::Program,
         }
     }
+
+    /// An answer this answerer gave that pando refuses: the usage-error
+    /// shape for a program, whose file is what has to change, and an
+    /// ordinary error for a person, who has no file to fix.
+    pub(super) fn refuse(self, message: String) -> anyhow::Error {
+        match self {
+            Answerer::Program => anyhow::Error::new(RefusedAnswer(message)),
+            Answerer::Human => anyhow::anyhow!(message),
+        }
+    }
+}
+
+/// A typed answer, as the candidate it becomes — or refused, with nothing
+/// written, when it cannot be an answer to this slot at all.
+///
+/// The one door both callers go through, the question loop and
+/// [`volunteer`], so a value is held to the same rules whether a rule had
+/// options for its slot or not.
+fn typed(slot: Slot, value: &str, by: Answerer) -> Result<detect::Candidate> {
+    let value = value.trim();
+    if slot == Slot::PortEnv
+        && let Err(why) = detect::typed_ports(value)
+    {
+        return Err(by.refuse(format!(
+            "{value:?} cannot be this project's {}: {why} — nothing was written",
+            slot_label(slot)
+        )));
+    }
+    Ok(detect::custom(slot, value))
 }
 
 /// Peels [`Answer::Program`] off the shape underneath it, so one match
@@ -1001,10 +1030,9 @@ pub fn resolve_on(
                     (candidate, by.note(config::Note::Detected(why)))
                 }
                 Answer::Auto(index) => (pick(proposal, index)?, config::Note::TookFirst(offered)),
-                Answer::Custom(value) => (
-                    detect::custom(*slot, value.trim()),
-                    by.note(config::Note::Answered),
-                ),
+                Answer::Custom(value) => {
+                    (typed(*slot, &value, by)?, by.note(config::Note::Answered))
+                }
                 // Only the multi-select slot has a set for an answer, and
                 // it never reaches here.
                 Answer::Many(_) => bail!(
@@ -1297,7 +1325,7 @@ fn volunteer(
     }
     match answer {
         Answer::Custom(value) => {
-            let candidate = detect::custom(slot, value.trim());
+            let candidate = typed(slot, &value, by)?;
             let note = by.note(config::Note::Answered);
             write_answer(paths, config, slot, &candidate, note, pending, progress)?;
         }

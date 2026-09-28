@@ -728,6 +728,19 @@ fn port_role(key: &str) -> Option<String> {
         .then_some(role)
 }
 
+/// Several port variables, each owning the role its own name says:
+/// `WEB_PORT` owns `web`, `API_PORT` owns `api`, a bare `PORT` owns `web`.
+///
+/// One function for the option a rule builds out of the env example and
+/// for the same list typed as an answer, so `WEB_PORT, API_PORT` means one
+/// map whichever way it arrived. `Err` names the first variable whose name
+/// says no role.
+pub(super) fn roles_named_by<'a>(vars: &[&'a str]) -> Result<BTreeMap<String, String>, &'a str> {
+    vars.iter()
+        .map(|key| Ok(((*key).to_string(), port_role(key).ok_or(*key)?)))
+        .collect()
+}
+
 /// `a`, `a and b`, `a, b and c` — a list in a sentence.
 pub(super) fn listed<S: AsRef<str>>(names: &[S]) -> String {
     match names.split_last() {
@@ -829,10 +842,7 @@ fn roles_from_env(declared: &[&str], framework: Option<&str>) -> Option<Candidat
     if declared.len() < 2 || declared.contains(&"PORT") {
         return None;
     }
-    let mut map: BTreeMap<String, String> = BTreeMap::new();
-    for key in declared {
-        map.insert((*key).to_string(), port_role(key)?);
-    }
+    let map = roles_named_by(declared).ok()?;
     let names = listed(declared);
     Some(Candidate {
         value: declared.join(", "),

@@ -633,7 +633,11 @@ env key, the hook entry.
 Refusals, all exit 2 and all naming the key: a name that is not a question;
 a shape the question cannot take; a value that is not one of the options at
 a question that has them; an empty string; a `prelude` that fails its own
-probe on this machine, which is never written down. An answer for a slot that was
+probe on this machine, which is never written down; a `port_env` of your
+own that is not environment variable names. Several of them are one string
+separated by commas, `"PORT, API_PORT"`, the way the option naming several
+is written, and each owns the role its name says: `PORT` owns `web`,
+`API_PORT` owns `api`. One variable owns `web` whatever it is called. An answer for a slot that was
 already answered (without `--replace`), or that nothing asked about, is
 **reported on stderr and not applied** — it is not an error, and the run
 still exits 0. A slot with no proposal at all is not "nothing asked about":

@@ -92,8 +92,13 @@ pub fn fills_one_dev_process(config: &Config) -> bool {
 /// question that would have followed is already answered.
 pub fn custom(slot: Slot, value: &str) -> Candidate {
     let roles = roles_in(value);
-    let ports = (matches!(slot, Slot::DevCmd | Slot::Processes) && !roles.is_empty())
-        .then_some(PortsSpec::List(roles));
+    let ports = match slot {
+        Slot::DevCmd | Slot::Processes => (!roles.is_empty()).then_some(PortsSpec::List(roles)),
+        // What cannot be a list of variables is refused before it gets
+        // here; [`port_spec`]'s single variable is the fallback for it.
+        Slot::PortEnv => typed_ports(value).ok(),
+        _ => None,
+    };
     Candidate {
         value: value.to_string(),
         why: String::new(),
@@ -135,6 +140,49 @@ pub fn custom(slot: Slot, value: &str) -> Candidate {
         }),
         ports,
     }
+}
+
+/// The `ports` a typed answer to the port slot writes, or why it cannot be
+/// one.
+///
+/// Split exactly as the option that names several variables is joined —
+/// `WEB_PORT, API_PORT` — so the same text is the same map whether it
+/// matched that option or was typed in another order. One variable owns
+/// `web` whatever it is called, as a typed answer always has; several each
+/// own the role their own name says, which is how the option reads them.
+/// Anything that is not an environment variable name is refused: a
+/// variable called `PORT, API_PORT` is one nothing will ever read.
+pub fn typed_ports(value: &str) -> Result<PortsSpec, String> {
+    let vars = split_list(value);
+    if let Some(bad) = vars.iter().find(|var| !is_env_name(var)) {
+        return Err(format!(
+            "{bad:?} is not an environment variable name — letters, digits and `_`, not \
+             starting with a digit, and several of them separated by commas"
+        ));
+    }
+    let vars: Vec<&str> = vars.iter().map(String::as_str).collect();
+    match vars.as_slice() {
+        [] => Err("it names no variable".to_string()),
+        [one] => Ok(PortsSpec::Map(BTreeMap::from([(
+            one.to_string(),
+            crate::config::WEB_ROLE.to_string(),
+        )]))),
+        several => super::dev::roles_named_by(several)
+            .map(PortsSpec::Map)
+            .map_err(|unnamed| {
+                format!(
+                    "{unnamed} says no role — with several variables each one names its own, \
+                     as `PORT` (the web role) or `<ROLE>_PORT` does"
+                )
+            }),
+    }
+}
+
+/// Whether a name is one a shell can export: letters, digits and `_`, and
+/// not a digit first.
+pub fn is_env_name(name: &str) -> bool {
+    name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// The `ports` an answer to the port slot writes: the whole map a candidate

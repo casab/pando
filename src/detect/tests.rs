@@ -535,6 +535,54 @@ fn port_variables_named_by_role_become_several_roles() {
     );
 }
 
+// The option's text, typed in another order, is the same answer: one
+// function splits a typed list and reads each variable's role, and it is
+// the one the option is built with.
+#[test]
+fn a_typed_list_of_port_variables_is_the_map_the_option_would_be() {
+    let signals = Signals {
+        env_example: env_pairs(&["WEB_PORT", "API_PORT"]),
+        ..Default::default()
+    };
+    let proposal = port_proposal(&signals, None).unwrap();
+    let option = proposal.preferred().unwrap();
+    assert_eq!(typed_ports(&option.value).ok(), option.ports);
+    assert_eq!(typed_ports("API_PORT,WEB_PORT").ok(), option.ports);
+    let typed = custom(Slot::PortEnv, "API_PORT , WEB_PORT");
+    assert_eq!(typed.ports, option.ports);
+
+    // One variable owns `web` whatever it is called, as it always has.
+    assert_eq!(
+        typed_ports("LISTEN").unwrap(),
+        PortsSpec::Map(BTreeMap::from([("LISTEN".to_string(), "web".to_string())]))
+    );
+    // And a bare `PORT` among several is the web role, as the rules read it.
+    assert_eq!(
+        typed_ports("PORT, API_PORT").unwrap().roles(),
+        vec!["api".to_string(), "web".to_string()]
+    );
+}
+
+#[test]
+fn a_typed_port_variable_must_be_a_variable_name() {
+    for bad in [
+        "PORT API_PORT",
+        "API-PORT",
+        "9PORT",
+        "PORT;API_PORT",
+        "",
+        " , ",
+    ] {
+        assert!(typed_ports(bad).is_err(), "{bad:?}");
+    }
+    // Several variables each say their own role, or none of them does.
+    let e = typed_ports("PORT, LISTEN").unwrap_err();
+    assert!(e.contains("LISTEN") && e.contains("<ROLE>_PORT"), "{e}");
+    for good in ["PORT", "_PORT", "api_port", "WEB_PORT, API_PORT"] {
+        assert!(typed_ports(good).is_ok(), "{good:?}");
+    }
+}
+
 // The project's own declaration beats the convention pando brought with
 // it — and says so, because the note in the file is the only place a
 // developer sees which of the two won.
