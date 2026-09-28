@@ -50,7 +50,9 @@ own, inside `.git`, removed when it is done.
    README or docs: `{"processes": {"api": {"cmd": "…", "cwd": "backend",
    "ports": {"API_PORT": "api"}}, "worker": {…, "ports": []}}}`. A
    process gets its own port through the variable it reads, mapped in
-   `ports`, and another's address in `env` as `{port:<role>}`. Ask the
+   `ports`, and another's address in `env` as `{port:<role>}`. Give the
+   role a person opens in a browser the name `web`: the URL and the
+   page the check asks for are its, else the first role by name. Ask the
    developer only what the docs do not say.
 4. **Run `pando check`, with a timeout of at least 10 minutes.** It makes a
    throwaway worktree of the commit a new branch would fork from, runs the
