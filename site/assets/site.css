@@ -662,6 +662,7 @@ pre.wrap-cmd { white-space: pre-wrap; overflow-wrap: anywhere; }
 .install-steps .demo-hint { margin-top: 10px; }
 pre.run-cmd { display: inline-block; padding: 12px 22px; font-size: 15px; margin-bottom: 4px; }
 .is-note { color: var(--dim); font-size: 13.5px; margin: -4px 0 10px; }
+.term + .is-note { margin-top: 18px; }
 /* the hero's two steps, in the film's own terminal language */
 .hero-steps { position: relative; margin-top: 22px; width: min(100%, 880px); text-align: left; padding: 4px 8px;
   background: rgba(8, 7, 5, 0.8); border: 1px solid rgba(242, 184, 75, 0.38); border-radius: 12px;

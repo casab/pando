@@ -65,19 +65,14 @@
         <a class="btn" href="#try">Try it here <span class="kbd">↓</span></a>
         <a class="btn ghost" href="#install">Install</a>
       </div>
-      <div class="hero-steps" role="group" aria-label="Get Rust if you need it, install pando, then run it in your project">
+      <div class="hero-steps" role="group" aria-label="Install pando, then run it in your project">
         <div class="hs-row">
           <span class="hs-n" aria-hidden="true">1</span>
-          <code class="hs-cmd"><span class="p">$</span> curl --proto &#39;=https&#39; --tlsv1.2 -sSf https://sh.rustup.rs | sh</code>
-          <span class="hs-c">only without Rust 1.88+</span>
+          <code class="hs-cmd"><span class="p">$</span> brew install mertkaradayi/tap/pando</code>
+          <button class="copy hs-copy" type="button" data-copy="brew install mertkaradayi/tap/pando" aria-label="Copy the install command">copy</button>
         </div>
         <div class="hs-row">
           <span class="hs-n" aria-hidden="true">2</span>
-          <code class="hs-cmd"><span class="p">$</span> git clone https://github.com/mertkaradayi/pando &amp;&amp; cd pando &amp;&amp; cargo install --locked --path .</code>
-          <button class="copy hs-copy" type="button" data-copy="git clone https://github.com/mertkaradayi/pando &amp;&amp; cd pando &amp;&amp; cargo install --locked --path ." aria-label="Copy the install command">copy</button>
-        </div>
-        <div class="hs-row">
-          <span class="hs-n" aria-hidden="true">3</span>
           <code class="hs-cmd"><span class="p">$</span> pando<span class="cur" aria-hidden="true"></span></code>
           <span class="hs-c">then, in any project you work on</span>
         </div>
@@ -962,45 +957,44 @@ theme = <span class="s">"catppuccin"</span>
 </section>
 
 <!-- ============ 10 · install ============ -->
-<section class="chapter" id="install" data-chapter="10" data-name="Install" data-beat0="from source">
+<section class="chapter" id="install" data-chapter="10" data-name="Install" data-beat0="one line">
   <div class="wrap">
-    <div class="eyebrow rv"><span class="n">10</span><span class="dot">·</span><span class="nm">Install</span><span class="bt">// from source</span></div>
-    <h2 class="headline" data-type><span class="chev" aria-hidden="true">›</span><span class="txt">Build it. Run it.</span><span class="cur" aria-hidden="true"></span></h2>
-    <p class="sub rv">no published binary yet: build it from source with Rust 1.88 or newer</p>
+    <div class="eyebrow rv"><span class="n">10</span><span class="dot">·</span><span class="nm">Install</span><span class="bt">// one line</span></div>
+    <h2 class="headline" data-type><span class="chev" aria-hidden="true">›</span><span class="txt">Install it. Run it.</span><span class="cur" aria-hidden="true"></span></h2>
+    <p class="sub rv">a ready-made binary for macOS (Apple silicon and Intel) and Linux (x86_64 and arm64): no Rust needed</p>
     <div class="split wide-left">
       <ol class="install-steps rv">
         <li>
-          <div class="is-h"><span class="hs-n">1</span>No Rust yet?</div>
-          <p class="is-note">Skip this if <code>cargo --version</code> says 1.88 or newer. Otherwise <a href="https://rustup.rs">rustup</a> installs the current stable Rust; open a new terminal afterwards so it has <code>cargo</code>.</p>
+          <div class="is-h"><span class="hs-n">1</span>Install it</div>
+          <p class="is-note">With Homebrew, on macOS or Linux:</p>
           <div class="term">
-            <div class="term-bar"><span class="dots"><i></i><i></i><i></i></span><span class="grow">rustup, Rust's own installer</span><button class="copy hs-copy" type="button" data-copy="curl --proto &#39;=https&#39; --tlsv1.2 -sSf https://sh.rustup.rs | sh" aria-label="Copy the rustup command">copy</button></div>
-<pre class="wrap-cmd"><span class="p">$</span> curl --proto &#39;=https&#39; --tlsv1.2 -sSf https://sh.rustup.rs | sh</pre>
+            <div class="term-bar"><span class="dots"><i></i><i></i><i></i></span><span class="grow">Homebrew</span><button class="copy hs-copy" type="button" data-copy="brew install mertkaradayi/tap/pando" aria-label="Copy the Homebrew command">copy</button></div>
+<pre class="wrap-cmd"><span class="p">$</span> brew install mertkaradayi/tap/pando</pre>
           </div>
-          <p class="demo-hint">On a new Mac, <code>git</code> comes with the Xcode Command Line Tools: <code>xcode-select --install</code>.</p>
+          <p class="is-note">Or with nothing else installed, the install script:</p>
+          <div class="term">
+            <div class="term-bar"><span class="dots"><i></i><i></i><i></i></span><span class="grow">the install script</span><button class="copy hs-copy" type="button" data-copy="curl --proto &#39;=https&#39; --tlsv1.2 -LsSf https://github.com/mertkaradayi/pando/releases/latest/download/pando-cli-installer.sh | sh" aria-label="Copy the install script command">copy</button></div>
+<pre class="wrap-cmd"><span class="p">$</span> curl --proto &#39;=https&#39; --tlsv1.2 -LsSf https://github.com/mertkaradayi/pando/releases/latest/download/pando-cli-installer.sh | sh</pre>
+          </div>
+          <p class="demo-hint">The script puts <code>pando</code> in <code>~/.local/bin</code> and adds it to your PATH; run it with <code>PANDO_CLI_NO_MODIFY_PATH=1</code> to leave your shell files alone. Every download has a checksum and a GitHub attestation. <code>pando --version</code> says which version you have.</p>
         </li>
         <li>
-          <div class="is-h"><span class="hs-n">2</span>Install it</div>
-          <p class="is-note">It needs <code>git</code> and Rust 1.88 or newer.</p>
-          <div class="term">
-            <div class="term-bar"><span class="dots"><i></i><i></i><i></i></span><span class="grow">one line: copy, paste, done</span><button class="copy hs-copy" type="button" data-copy="git clone https://github.com/mertkaradayi/pando &amp;&amp; cd pando &amp;&amp; cargo install --locked --path ." aria-label="Copy the install command">copy</button></div>
-<pre class="wrap-cmd"><span class="p">$</span> git clone https://github.com/mertkaradayi/pando &amp;&amp; cd pando &amp;&amp; cargo install --locked --path .</pre>
-          </div>
-          <p class="demo-hint">It clones pando, builds it, and puts the <code>pando</code> command in <code>~/.cargo/bin</code>. <code>--locked</code> builds with the dependency versions CI tested. <code>pando --version</code> says which version you have.</p>
-        </li>
-        <li>
-          <div class="is-h"><span class="hs-n">3</span>Run it in your project</div>
+          <div class="is-h"><span class="hs-n">2</span>Run it in your project</div>
           <p>Open a terminal in any git repository you work on, your own project, not pando's, and type:</p>
 <pre class="code run-cmd"><span class="p">$</span> pando</pre>
           <p class="demo-hint">The first time, it opens the <a href="#first-run">setup screen</a>. After that, the list of every worktree. There's nothing to configure first, and nothing is written into your checkout. <code>pando completions zsh</code> (or bash, fish…) prints a completion script.</p>
         </li>
       </ol>
       <div class="rv">
-        <p>Want to see it before you point it at your own project? From the pando checkout you just cloned, its test suite can build repositories of every shape it knows. One of them is a good place to start:</p>
+        <p>Building it yourself? It needs Rust 1.88 or newer; with no Rust on the machine, <a href="https://rustup.rs">rustup</a> installs it first:</p>
+<pre class="code wrap-cmd"><span class="p">$</span> curl --proto &#39;=https&#39; --tlsv1.2 -sSf https://sh.rustup.rs | sh
+<span class="p">$</span> cargo install --locked --git https://github.com/mertkaradayi/pando pando-cli</pre>
+        <p>Want to see it before you point it at your own project? In a clone of pando's repository, its test suite can build repositories of every shape it knows. One of them is a good place to start:</p>
 <pre class="code"><span class="p">$</span> scripts/fixture-repo.sh --list
 <span class="p">$</span> scripts/fixture-repo.sh mono-web-api --listener
 <span class="c"># builds one in a temporary directory,
 # and prints how to run pando in it</span></pre>
-        <p class="demo-hint">pando needs Rust 1.88 or newer. There is no published binary, crate or Homebrew tap yet.</p>
+        <p class="demo-hint">There is no crate on crates.io yet.</p>
       </div>
     </div>
 
@@ -1017,14 +1011,14 @@ theme = <span class="s">"catppuccin"</span>
       <div class="panel rv">
         <h4>What there is not, yet</h4>
         <ul class="no">
-          <li>No crate on crates.io, no release binary, no Homebrew tap</li>
+          <li>No crate on crates.io yet (the binaries, the install script and the Homebrew tap are here)</li>
           <li>Nobody has used pando on Linux for real work yet: the suite that passes there runs on fixtures. Windows is not a target</li>
           <li>Almost every worktree pando has made was in a generated fixture. The one real project it met found three bugs in an afternoon, all fixed since</li>
           <li>Namespaced mode is experimental</li>
         </ul>
       </div>
     </div>
-    <div class="callout rv"><p>A tool this heavily tested against situations it invented still breaks on first contact with one it did not. <strong>If pando breaks on your project, that is the most useful issue you can open.</strong> Next, roughly in order: a published crate and release binaries, a Homebrew tap, a JSON schema for <code>pando.toml</code>, and a recipe directory.</p></div>
+    <div class="callout rv"><p>A tool this heavily tested against situations it invented still breaks on first contact with one it did not. <strong>If pando breaks on your project, that is the most useful issue you can open.</strong> Next, roughly in order: a published crate, a JSON schema for <code>pando.toml</code>, and a recipe directory.</p></div>
 
     <h3 class="rv" data-beat="contribute">Contributing</h3>
     <div class="split">

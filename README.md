@@ -67,16 +67,20 @@ for people and for the coding agents working beside them.
 
 ## Sixty seconds
 
-No Rust yet? `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`,
-then open a new terminal. pando needs Rust 1.88 or newer.
-
 ```bash
-git clone https://github.com/mertkaradayi/pando && cd pando
-cargo install --locked --path .     # pando lands in ~/.cargo/bin
+brew install mertkaradayi/tap/pando
 
 cd ~/code/your-project
 pando                               # the TUI; the first time, the setup screen
 ```
+
+No Homebrew? One line installs it on macOS or Linux:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/mertkaradayi/pando/releases/latest/download/pando-cli-installer.sh | sh
+```
+
+No Rust needed for either; [Install](#install) has the other ways.
 
 Or straight from the shell. This is a real run, trimmed a little, on one of
 the fixture repositories pando's tests are built on — a workspace with a
@@ -459,25 +463,40 @@ document whole.
 
 ## Install
 
-There is no published binary yet. Build it from source: it needs `git`
-and Rust 1.88 or newer. With no Rust on the machine, rustup installs the
-current stable toolchain, and a new terminal then has `cargo`:
+pando runs on macOS (Apple silicon and Intel) and Linux (x86_64 and
+arm64). Each release ships a ready-made binary for all four, so none of
+these needs Rust.
+
+**Homebrew**, on macOS or Linux:
+
+```bash
+brew install mertkaradayi/tap/pando        # later: brew upgrade pando
+```
+
+**The install script**, with nothing else installed:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/mertkaradayi/pando/releases/latest/download/pando-cli-installer.sh | sh
+```
+
+It puts `pando` in `~/.local/bin` and adds that directory to your PATH in
+your shell's startup files; to leave those alone, run the script with
+`PANDO_CLI_NO_MODIFY_PATH=1`. Every download has a checksum and a GitHub
+attestation, so `gh attestation verify <file> -R mertkaradayi/pando`
+proves it was built here. Rerun the line to update.
+
+**From source**, with Rust 1.88 or newer. With no Rust on the machine,
+rustup installs the current stable toolchain, and a new terminal then has
+`cargo`:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
-On a new Mac, `git` comes with the Xcode Command Line Tools
-(`xcode-select --install`). Then, from a clone of this repository:
-
-```bash
-cargo install --locked --path .   # puts `pando` in ~/.cargo/bin
-# or
-cargo build --release             # the binary is target/release/pando
+cargo install --locked --git https://github.com/mertkaradayi/pando pando-cli
 ```
 
 `--locked` builds with the exact dependency versions CI tested; without
-it cargo may pick newer ones that need a newer Rust.
+it cargo may pick newer ones that need a newer Rust. On a new Mac, `git`
+comes with the Xcode Command Line Tools (`xcode-select --install`).
 
 `pando --version` says which version you have, and `pando completions zsh`
 (or bash, fish…) prints a completion script. Worktrees need `git`; isolated
@@ -541,9 +560,9 @@ macOS is what it is developed on. CI runs the whole test suite on macOS
 and on Linux for every change, and both pass — but the suite runs on
 fixtures, and nobody has yet used pando on Linux for real work.
 
-What that does not mean: there is no crate, no release binary and no
-package to install, and almost every worktree pando has created has been
-inside a generated fixture repository. It has been pointed at exactly one
+What that does not mean: there is no crate on crates.io yet, and almost
+every worktree pando has created has been inside a generated fixture
+repository. It has been pointed at exactly one
 real project, which found three bugs in an afternoon — a Makefile target
 read down to its first line, a failure that left an empty log and no
 explanation, and a backgrounded server reported as dead. All three are
@@ -551,9 +570,8 @@ fixed, and the count is the point: a tool this heavily tested against
 situations it invented still breaks on first contact with one it did
 not. If pando breaks on yours, that is the most useful issue you can open.
 
-Next, roughly in order: a published crate and release binaries, a
-Homebrew tap, a JSON schema for `pando.toml`, and a
-recipe directory with its own contribution guide.
+Next, roughly in order: a published crate, a JSON schema for
+`pando.toml`, and a recipe directory with its own contribution guide.
 
 ## License
 

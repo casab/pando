@@ -158,3 +158,36 @@ fn a_stated_version_is_read_whole() {
     );
     assert_eq!(stated_rust_versions("only without Rust 1.88+"), ["1.88"]);
 }
+
+/// The ways in the README and the website lead with, built from what the
+/// release publishes: `[workspace.metadata.dist]` names the Homebrew tap
+/// and formula, and dist names the install script after the package. A
+/// renamed package, tap or formula must not leave the docs pointing at a
+/// 404.
+#[test]
+fn the_docs_install_what_the_release_publishes() {
+    let manifest: toml::Table = read("Cargo.toml").parse().expect("Cargo.toml parses");
+    let package = &manifest["package"];
+    let name = package["name"].as_str().unwrap();
+    let repository = package["repository"].as_str().unwrap();
+    let dist = &manifest["workspace"]["metadata"]["dist"];
+    let tap = dist["tap"].as_str().expect("dist has a Homebrew tap");
+    let formula = dist["formula"].as_str().expect("dist names the formula");
+
+    // brew spells mertkaradayi/homebrew-tap as mertkaradayi/tap.
+    let (owner, tap_repo) = tap.split_once('/').unwrap();
+    let tap_name = tap_repo.strip_prefix("homebrew-").unwrap_or(tap_repo);
+    let brew = format!("brew install {owner}/{tap_name}/{formula}");
+    let script = format!("{repository}/releases/latest/download/{name}-installer.sh");
+    let from_source = format!("cargo install --locked --git {repository} {name}");
+
+    for doc in ["README.md", "site/index.html"] {
+        let text = read(doc);
+        for wanted in [&brew, &script, &from_source] {
+            assert!(
+                text.contains(wanted.as_str()),
+                "{doc} does not say `{wanted}`"
+            );
+        }
+    }
+}
