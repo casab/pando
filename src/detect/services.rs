@@ -25,6 +25,13 @@ use super::signals::Signals;
 /// a port is a number pando can simply replace.
 const ADDRESS_SUFFIXES: [&str; 3] = ["_URL", "_DSN", "_PORT"];
 
+/// Key suffixes that hold the host half of a split address, beside a
+/// `_PORT` of the same stem: `POSTGRES_SERVER=localhost` with
+/// `POSTGRES_PORT=5432` is `postgres://localhost:5432` in two keys. Never
+/// a candidate themselves, for the reason `_HOST` is not an address
+/// suffix; only evidence that the port beside them is a service's.
+const HOST_SUFFIXES: [&str; 3] = ["_HOST", "_HOSTNAME", "_SERVER"];
+
 /// What a rule can say about which env key names one compose service.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EnvKey {
@@ -180,6 +187,31 @@ pub(super) fn recipe_for_address(value: &str) -> Option<&'static str> {
         .map(|(recipe, _, _)| *recipe)
 }
 
+/// The host key that makes a `<STEM>_PORT` one half of a split address,
+/// as `(key, value)`: a `<STEM>_HOST`, `_HOSTNAME` or `_SERVER` with a
+/// value, in [`HOST_SUFFIXES`] order.
+fn paired_host<'a>(env: &'a [(String, String)], port_key: &str) -> Option<&'a (String, String)> {
+    let stem = port_key.strip_suffix("_PORT")?;
+    HOST_SUFFIXES.iter().find_map(|suffix| {
+        let host = format!("{stem}{suffix}");
+        env.iter()
+            .find(|(key, value)| *key == host && !value.trim().is_empty())
+    })
+}
+
+/// The recipe a split address names by its stem, where the stem's first
+/// word is an engine's own URL scheme: `POSTGRES_PORT`, `REDIS_QUEUE_PORT`.
+/// The stem is to the pair what the scheme is to a URL. A family word
+/// such as `DATABASE` or `DB` names no engine, as it does not in a URL's
+/// key either.
+fn recipe_for_stem(port_key: &str) -> Option<&'static str> {
+    let word = port_key.split('_').next()?.to_ascii_lowercase();
+    SERVICE_ADDRESSES
+        .iter()
+        .find(|(_, schemes, _)| schemes.contains(&word.as_str()))
+        .map(|(recipe, _, _)| *recipe)
+}
+
 fn port_of(value: &str) -> Option<u16> {
     let value = value.trim();
     if let Ok(port) = value.parse::<u16>() {
@@ -195,32 +227,45 @@ fn port_of(value: &str) -> Option<u16> {
 ///
 /// One candidate per recipe, not per key: two keys naming the same engine
 /// are one server. Sorted by the recipe name so two runs agree.
+///
+/// An address split over two keys, `REDIS_QUEUE_HOST=localhost` and
+/// `REDIS_QUEUE_PORT=6379`, is the same evidence a URL is: the port key
+/// is the candidate's key, as a bare `_PORT` is, and the stem names the
+/// engine where the port is not its default, as a scheme would.
 pub(super) fn native_candidates(signals: &Signals, evidence: &MachineEvidence) -> Vec<Candidate> {
     let mut by_recipe: BTreeMap<&str, (String, String)> = BTreeMap::new();
-    for (key, value) in &signals.env_example {
+    let env = &signals.env_example;
+    for (key, value) in env {
         if !ADDRESS_SUFFIXES.iter().any(|s| key.ends_with(s)) {
             continue;
         }
-        let Some(recipe) = recipe_for_address(value) else {
+        let host = paired_host(env, key);
+        let Some(recipe) =
+            recipe_for_address(value).or_else(|| host.and_then(|_| recipe_for_stem(key)))
+        else {
             continue;
+        };
+        let said = match host {
+            Some((host_key, host)) => format!("{host_key}={host} and {key}={value}"),
+            None => format!("{key}={value}"),
         };
         // The first key wins, which is file order: a project that names
         // a database twice means one database.
         by_recipe
             .entry(recipe)
-            .or_insert_with(|| (key.clone(), value.clone()));
+            .or_insert_with(|| (key.clone(), said));
     }
     by_recipe
         .into_iter()
-        .map(|(recipe, (key, value))| {
+        .map(|(recipe, (key, said))| {
             let runnable = evidence.can_run(recipe);
             let why = match runnable {
-                Some(true) => format!(".env.example {key}={value}; {recipe} is on this machine"),
+                Some(true) => format!(".env.example {said}; {recipe} is on this machine"),
                 Some(false) => format!(
-                    ".env.example {key}={value}; {recipe} is not installed here, so starting \
+                    ".env.example {said}; {recipe} is not installed here, so starting \
                      it will say what to install"
                 ),
-                None => format!(".env.example {key}={value}"),
+                None => format!(".env.example {said}"),
             };
             Candidate {
                 value: recipe.to_string(),

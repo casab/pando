@@ -2896,6 +2896,70 @@ fn a_quoted_address_in_the_env_example_still_names_its_engine() {
     assert_eq!(values_of(&native), vec!["postgres"]);
 }
 
+// A backend that splits each address over a host and a port key names its
+// services as surely as one that writes URLs: the port key is what a
+// worktree's own service is pointed at, the host beside it says so.
+#[test]
+fn a_host_and_port_pair_names_a_service_as_a_url_does() {
+    let (dir, signals) = project(
+        &[
+            ("POSTGRES_SERVER", "localhost"),
+            ("POSTGRES_PORT", "5432"),
+            ("POSTGRES_DB", "app"),
+            ("REDIS_QUEUE_HOST", "localhost"),
+            ("REDIS_QUEUE_PORT", "6379"),
+        ],
+        None,
+    );
+    let native = native_candidates(&signals, &MachineEvidence::unknown());
+    assert_eq!(values_of(&native), vec!["postgres", "redis"]);
+    let keys: Vec<Option<&str>> = native
+        .iter()
+        .map(|c| c.service.as_ref().and_then(|h| h.env_key.as_deref()))
+        .collect();
+    assert_eq!(keys, vec![Some("POSTGRES_PORT"), Some("REDIS_QUEUE_PORT")]);
+    assert_eq!(
+        native[0].why,
+        ".env.example POSTGRES_SERVER=localhost and POSTGRES_PORT=5432"
+    );
+    let _ = dir;
+}
+
+// Off its default port, a pair's stem names the engine the way a URL's
+// scheme does. A bare port on its own, or a stem that names no engine,
+// still says nothing.
+#[test]
+fn a_pairs_stem_names_its_engine_off_the_default_port() {
+    for (env, expected) in [
+        (
+            &[("POSTGRES_HOST", "localhost"), ("POSTGRES_PORT", "5433")][..],
+            vec!["postgres"],
+        ),
+        (
+            &[
+                ("REDIS_CACHE_HOSTNAME", "127.0.0.1"),
+                ("REDIS_CACHE_PORT", "6380"),
+            ][..],
+            vec!["redis"],
+        ),
+        (&[("POSTGRES_PORT", "5433")][..], vec![]),
+        (
+            &[("POSTGRES_HOST", ""), ("POSTGRES_PORT", "5433")][..],
+            vec![],
+        ),
+        (
+            &[("DATABASE_HOST", "localhost"), ("DATABASE_PORT", "5433")][..],
+            vec![],
+        ),
+        (&[("API_HOST", "0.0.0.0"), ("API_PORT", "8000")][..], vec![]),
+    ] {
+        let (dir, signals) = project(env, None);
+        let native = native_candidates(&signals, &MachineEvidence::unknown());
+        assert_eq!(values_of(&native), expected, "{env:?}");
+        let _ = dir;
+    }
+}
+
 fn values_of(candidates: &[Candidate]) -> Vec<&str> {
     candidates.iter().map(|c| c.value.as_str()).collect()
 }
