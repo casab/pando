@@ -7,6 +7,17 @@ may change behaviour.
 
 ## Unreleased
 
+## 0.5.1 — 2026-09-28
+
+### Added
+
+- Binaries for macOS (Apple silicon and Intel) and Linux (x86_64 and
+  arm64, static) with every release, so installing pando needs no Rust:
+  `brew install mertkaradayi/tap/pando`, or one install script that puts
+  it in `~/.local/bin`. Every download has a checksum and a GitHub
+  attestation, and every release is installed and run on all four
+  before it counts as done.
+
 ### Changed
 
 - pando states the oldest Rust it builds with, 1.88, in `Cargo.toml`
