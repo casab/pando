@@ -7,6 +7,8 @@ may change behaviour.
 
 ## Unreleased
 
+## 0.6.0 — 2026-09-29
+
 ### Added
 
 - **Apps below a root with no manifest** ([#4], [#5]). A repository
