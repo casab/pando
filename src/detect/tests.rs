@@ -3611,7 +3611,8 @@ fn an_app_directorys_install_follows_the_root_rules() {
 
 // The frontend's dev script is proposed as a process of its own, run in
 // its directory by its own package manager. The Python API has no script
-// to run, and a rule never invents one, so it is left for the developer.
+// to run, and a rule never invents one, so it is left for the developer:
+// the option says so, and a flag may not take it.
 #[test]
 fn an_app_directory_with_a_dev_script_is_a_process_of_its_own() {
     let dir = polyglot_siblings();
@@ -3621,7 +3622,16 @@ fn an_app_directory_with_a_dev_script_is_a_process_of_its_own() {
         panic!("one form, and no root script beside it: {proposal:?}");
     };
     assert_eq!(only.value, "frontend: npm run dev in frontend");
-    assert_eq!(only.why, "a dev script in frontend");
+    assert_eq!(
+        only.why,
+        format!("a dev script in frontend; backend has uv.lock but no dev script: {UNSTARTED}")
+    );
+    assert!(only.needs_a_human, "a check of it would never run backend");
+    assert_eq!(
+        crate::actions::question_for(&proposal, &[]).preselect,
+        None,
+        "nothing for --yes to take"
+    );
     let processes = only.processes.as_ref().unwrap();
     assert_eq!(processes.keys().collect::<Vec<_>>(), ["frontend"]);
     let frontend = &processes["frontend"];
@@ -3633,6 +3643,53 @@ fn an_app_directory_with_a_dev_script_is_a_process_of_its_own() {
     assert_eq!(
         frontend.ports,
         Some(PortsSpec::List(vec!["frontend".to_string()]))
+    );
+}
+
+// Every app directory started is the first choice, as it always was: an
+// api and an Expo app, each with its own script.
+#[test]
+fn a_process_list_that_starts_every_app_directory_is_preselected() {
+    let dir = api_and_mobile_app();
+    let proposal = processes_proposal(dir.path(), &signals(dir.path())).unwrap();
+    assert!(!proposal.candidates[0].needs_a_human, "{proposal:?}");
+    assert!(!proposal.candidates[0].why.contains(UNSTARTED));
+    assert_eq!(
+        crate::actions::question_for(&proposal, &[]).preselect,
+        Some(0)
+    );
+}
+
+// A library under `packages/` is read, and never asked to be started:
+// nothing runs one on its own. A directory whose dev script fans out
+// over its own parts is, since the per-app form leaves it out.
+#[test]
+fn only_an_unstarted_app_outside_packages_holds_the_process_list_open() {
+    let dir = tree(&[
+        ("web/package.json", r#"{ "scripts": { "dev": "vite" } }"#),
+        ("web/package-lock.json", "{}"),
+        ("packages/ui/package.json", r#"{ "name": "ui" }"#),
+    ]);
+    let found = signals(dir.path());
+    assert_eq!(found.app_dirs.len(), 2, "{:?}", found.app_dirs);
+    let proposal = processes_proposal(dir.path(), &found).unwrap();
+    assert!(!proposal.candidates[0].needs_a_human, "{proposal:?}");
+
+    let dir = tree(&[
+        ("web/package.json", r#"{ "scripts": { "dev": "vite" } }"#),
+        ("web/package-lock.json", "{}"),
+        (
+            "admin/package.json",
+            r#"{ "scripts": { "dev": "concurrently \"vite\" \"tsc -w\"" } }"#,
+        ),
+    ]);
+    let proposal = processes_proposal(dir.path(), &signals(dir.path())).unwrap();
+    assert!(proposal.candidates[0].needs_a_human, "{proposal:?}");
+    assert!(
+        proposal.candidates[0].why.ends_with(&format!(
+            "; admin's dev script starts several things at once: {UNSTARTED}"
+        )),
+        "{proposal:?}"
     );
 }
 

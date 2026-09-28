@@ -89,6 +89,13 @@ and `init --agent` lists it open. Answer it with a command of your own, or
 `processes` with an object of process tables (see the answers file below).
 `new` and `start` never ask it.
 
+One exit 3 has options and nothing preferred: `processes` below a root
+with no manifest, when an app directory outside `packages/` has nothing in
+the per-app option to start it. The option's `why` names it — `backend has
+uv.lock but no dev script: nothing here starts it` — and its
+`needs_a_human` is true. Answer `processes` with an object of process
+tables covering every process. `new` and `start` take the option.
+
 Two traps worth knowing:
 
 - `pando doctor` exits **1** when it found something that will break a

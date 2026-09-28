@@ -3205,6 +3205,54 @@ fn a_project_that_would_run_nothing_has_the_dev_command_open() {
     assert_eq!(code(&e.pando(&["init", "--yes"])), EXIT_OK);
 }
 
+// A Python api with no script beside a frontend with one: the job marked
+// the frontend alone as pando's choice, `init --yes` took it, and the
+// check passed with the api never run. The process list is open, says
+// which directory nothing starts, and `--yes` has nothing to take.
+#[test]
+fn an_app_directory_nothing_starts_holds_the_process_list_open() {
+    let e = env();
+    for (rel, contents) in [
+        ("backend/pyproject.toml", "[project]\nname = \"api\"\n"),
+        ("backend/uv.lock", "version = 1\n"),
+        (
+            "frontend/package.json",
+            r#"{ "scripts": { "dev": "nuxt dev" } }"#,
+        ),
+        ("frontend/package-lock.json", "{}"),
+    ] {
+        let path = e.root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+    git(&e.root, &["add", "."]);
+    git(&e.root, &["commit", "--quiet", "-m", "apps"]);
+
+    let out = e.pando(&["init", "--agent"]);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    let job = stdout(&out);
+    assert!(out.stdout.len() < JOB_LIMIT, "{} bytes", out.stdout.len());
+    assert!(job.contains("- processes: open, below"), "{job}");
+    assert!(
+        job.contains("backend has uv.lock but no dev script: nothing here starts it"),
+        "{job}"
+    );
+    assert!(!job.contains("← pando's choice"), "{job}");
+    let flat = job.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("only the project's docs or the developer know how each directory"),
+        "{job}"
+    );
+
+    let out = e.pando(&["init", "--yes"]);
+    assert_eq!(code(&out), EXIT_NEEDS_ANSWER, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("Run these as separate processes?"),
+        "{}",
+        stderr(&out)
+    );
+}
+
 // Re-running is safe: the answers for slots that already have one are
 // reported and left alone, comment and all.
 #[test]

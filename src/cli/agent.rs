@@ -353,14 +353,15 @@ fn candidates(chosen: &[&detect::Candidate]) -> String {
 }
 
 /// One open question: its prompt and its options, the one pando takes on
-/// its own marked — the option `recommended` gives `new` and `start`, or
-/// the ticked ones of a set question.
+/// its own marked — the option `init --yes` takes, or the ticked ones of a
+/// set question. An option `--yes` may not take is never marked, even
+/// where `new` and `start` would take it: the job says the marked one is
+/// what `--yes` takes.
 fn open_question(paths: &PandoPaths, proposal: &detect::Proposal) -> String {
     let question = actions::question_for(proposal, &[]).at(paths);
-    let taken: Vec<usize> = match (question.multi, actions::recommended(&question)) {
-        (true, _) => question.checked.clone(),
-        (false, Some((actions::Answer::Choice(index), _))) => vec![index],
-        (false, _) => Vec::new(),
+    let taken: Vec<usize> = match question.multi {
+        true => question.checked.clone(),
+        false => question.preselect.into_iter().collect(),
     };
     let mut out = String::new();
     let _ = writeln!(
@@ -391,6 +392,17 @@ fn open_question(paths: &PandoPaths, proposal: &detect::Proposal) -> String {
              a command of your own from the project's docs, or, for several processes, \
              `processes` with an object of process tables (`--reference json`, \"The answers \
              file\")."
+        );
+    }
+    // A process list that leaves an app directory unstarted: its evidence
+    // above says which, and taken, it passes a check with that app never
+    // run.
+    if proposal.slot == Slot::Processes && question.preselect.is_none() {
+        let _ = writeln!(
+            out,
+            "  None is marked: only the project's docs or the developer know how each directory \
+             named above runs. Answer `processes` with an object of process tables covering \
+             every process."
         );
     }
     out

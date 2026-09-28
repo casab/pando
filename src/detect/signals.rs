@@ -225,7 +225,12 @@ fn has_manifest(root: &Path, signals: &Signals) -> bool {
 /// directory directly below it, and each one below `apps` and `packages`,
 /// the two conventional homes. One level, on purpose: a deeper walk finds
 /// vendored copies and fixtures as readily as apps.
-const APP_PARENTS: [&str; 2] = ["apps", "packages"];
+const APP_PARENTS: [&str; 2] = ["apps", LIBRARY_PARENT];
+
+/// The conventional home of the libraries a project's apps build on: read
+/// like the others, and never asked to be started, since nothing runs a
+/// library on its own.
+pub(super) const LIBRARY_PARENT: &str = "packages";
 
 /// The app directories below `root`, sorted by path.
 ///

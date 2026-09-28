@@ -1825,7 +1825,8 @@ pub fn question_for(proposal: &detect::Proposal, details: &[String]) -> Question
         // The first option a flag may take on a developer's behalf, which
         // is the first one for every slot but provisioning: `--yes` takes
         // the preselection, and an option that copies a file pando did not
-        // write is not one it may accept unattended. `None` means there is
+        // write, or a process list that leaves an app unstarted, is not
+        // one it may accept unattended. `None` means there is
         // nothing here `--yes` can take, and the question is printed
         // instead — "agents never hang" is about failing loudly, not about
         // accepting anything rather than stopping.

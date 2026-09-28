@@ -827,6 +827,31 @@ fn the_contract_documents_the_exit_3_for_a_project_that_would_run_nothing() {
     );
 }
 
+/// The exit 3 at `processes` for an app directory nothing starts is
+/// documented beside it, quoting the words its evidence ends with.
+#[test]
+fn the_contract_documents_the_exit_3_for_an_app_directory_nothing_starts() {
+    let doc = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("agent/json.md"),
+    )
+    .expect("read agent/json.md");
+    let flat = doc.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(&format!(
+            "One exit 3 has options and nothing preferred: `{}`",
+            slot_name(crate::detect::Slot::Processes)
+        )),
+        "{flat}"
+    );
+    assert!(
+        flat.contains(&format!(
+            "`backend has uv.lock but no dev script: {}`",
+            crate::detect::UNSTARTED
+        )),
+        "{flat}"
+    );
+}
+
 #[test]
 fn help_documents_the_needs_answer_exit_code() {
     let help = Cli::command().render_help().to_string();

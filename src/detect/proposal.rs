@@ -279,6 +279,10 @@ pub struct Candidate {
     /// developer's behalf, so it is never preselected: `--yes` falls
     /// through to the first option that is, and prints the question when
     /// there is none.
+    ///
+    /// Nor is a process list that leaves an app directory with nothing to
+    /// start it: taken, it passes a check with that app never run, and
+    /// how the app runs is something no rule found.
     pub needs_a_human: bool,
 }
 

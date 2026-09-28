@@ -16,7 +16,7 @@ use super::dev::{
 };
 use super::frameworks::{only_builds, runs, script_framework};
 use super::proposal::{Candidate, Proposal, Slot};
-use super::signals::{Signals, parse_scripts, present};
+use super::signals::{AppDir, LIBRARY_PARENT, Signals, parse_scripts, present};
 
 /// One app of a workspace: a directory with its own manifest and its own
 /// dev script.
@@ -527,6 +527,54 @@ pub(super) fn root_orchestrates(signals: &Signals) -> bool {
     signals.scripts.contains_key("predev") || runs_a_file
 }
 
+/// How the reason an app directory is left out of the per-app form ends:
+/// the words `agent/json.md` quotes.
+pub const UNSTARTED: &str = "nothing here starts it";
+
+/// The app directories below a root that is not an app that no process of
+/// the per-app form runs in, each as the reason it has none: `backend has
+/// uv.lock but no dev script: nothing here starts it`.
+///
+/// The rules never invent a command, so a directory whose manifest names
+/// no dev script — a Python api and its worker, a Go service — has no
+/// process here, and a check of the others passes with it never run. Only
+/// the project's docs or the developer know how it runs. The libraries
+/// under `packages/` are left out: nothing runs one on its own.
+fn unstarted(root: &Path, signals: &Signals, apps: &[WorkspaceApp]) -> Vec<String> {
+    let library = format!("{LIBRARY_PARENT}/");
+    signals
+        .app_dirs
+        .iter()
+        .filter(|dir| !dir.dir.starts_with(&library))
+        .filter(|dir| !apps.iter().any(|app| app.dir == dir.dir))
+        .map(|dir| {
+            let path = root.join(&dir.dir);
+            match dev_script(&path, &app_signals(&path)) {
+                // A fan-out over its own parts, which the per-app form
+                // leaves out.
+                Some(_) => format!(
+                    "{}'s dev script starts several things at once: {UNSTARTED}",
+                    dir.dir
+                ),
+                None => format!(
+                    "{} has {} but no dev script: {UNSTARTED}",
+                    dir.dir,
+                    evidence(dir)
+                ),
+            }
+        })
+        .collect()
+}
+
+/// What makes a directory an app, named as its file: its lockfile, else
+/// its marker, else its manifest.
+fn evidence(dir: &AppDir) -> &str {
+    dir.lockfiles
+        .first()
+        .or(dir.markers.first())
+        .map_or("a package.json", String::as_str)
+}
+
 /// The multi-process form, for a workspace whose apps each have a dev
 /// script — and the root script as the one-process form beside it.
 ///
@@ -536,6 +584,13 @@ pub(super) fn root_orchestrates(signals: &Signals) -> bool {
 /// unless the root script is the project's own orchestration of its apps
 /// (see [`root_orchestrates`]), which then leads — with the ports the
 /// project's apps read from the env example, so it needs nothing else.
+///
+/// Below a root that is not an app, a per-app form that leaves an app
+/// directory unstarted is offered and never preselected: its evidence
+/// names the directory ([`unstarted`]), `init --yes` has nothing to take
+/// and exits 3, and only an answer that covers every process settles it.
+/// `new` and `start` still take it, and say so, as they take any first
+/// option.
 pub(super) fn processes_proposal(root: &Path, signals: &Signals) -> Option<Proposal> {
     let apps = workspace_apps(root, signals);
     // Below a root that is not an app, one is enough: there is no root
@@ -549,6 +604,7 @@ pub(super) fn processes_proposal(root: &Path, signals: &Signals) -> Option<Propo
     if apps.len() < least {
         return None;
     }
+    let unstarted = unstarted(root, signals, &apps);
     // A role is a port, and a port is only worth giving an app that has
     // some way of being told which one it got: its framework reads one
     // from the environment, or takes it on the command line (the flag is
@@ -657,10 +713,14 @@ pub(super) fn processes_proposal(root: &Path, signals: &Signals) -> Option<Propo
             ));
         }
     }
+    for reason in &unstarted {
+        why.push_str(&format!("; {reason}"));
+    }
     let mut candidates = vec![Candidate {
         value: summary,
         why,
         processes: Some(processes),
+        needs_a_human: !unstarted.is_empty(),
         ..Candidate::default()
     }];
     // The root script, as one process. Written as `[dev]`, because one

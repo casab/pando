@@ -6333,6 +6333,101 @@ fn a_dry_run_of_a_project_that_would_run_nothing_shows_the_dev_command_open() {
     );
 }
 
+/// The same siblings with what each app really has: a Python api with a
+/// lockfile and no script, and a Nuxt frontend with a dev script; or,
+/// with `api_script`, a Node backend with one beside an Expo app.
+fn sibling_apps_with_manifests(api_script: bool) -> Fx {
+    let fx = fixture();
+    let files: &[(&str, &str)] = match api_script {
+        false => &[
+            ("backend/pyproject.toml", "[project]\nname = \"api\"\n"),
+            ("backend/uv.lock", "version = 1\n"),
+            (
+                "frontend/package.json",
+                r#"{ "scripts": { "dev": "nuxt dev" } }"#,
+            ),
+            ("frontend/package-lock.json", "{}"),
+        ],
+        true => &[
+            (
+                "backend/package.json",
+                r#"{ "scripts": { "dev": "node server.js" } }"#,
+            ),
+            ("backend/package-lock.json", "{}"),
+            (
+                "apps/mobile/package.json",
+                r#"{ "main": "expo-router/entry", "scripts": { "start": "expo start" },
+                     "dependencies": { "expo": "~57.0.0" } }"#,
+            ),
+            ("apps/mobile/package-lock.json", "{}"),
+        ],
+    };
+    for (rel, contents) in files {
+        let path = fx.root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+    git(&fx.root, &["add", "."]);
+    git(&fx.root, &["commit", "--quiet", "-m", "apps"]);
+    fx
+}
+
+// `init --yes` took "frontend: npm run dev in frontend" as pando's choice,
+// and the check passed with the api never run. The process list is a
+// question there, and `--yes` has nothing it may take for it.
+#[test]
+fn init_with_an_app_directory_nothing_starts_asks_for_the_process_list() {
+    let fx = sibling_apps_with_manifests(false);
+    let e = init(
+        &fx.paths,
+        &fx.config,
+        &Answering::asking(&take_the_first),
+        &noop,
+    )
+    .unwrap_err();
+    let needs = e.downcast_ref::<NeedsAnswer>().expect("exit 3, not exit 0");
+    assert_eq!(needs.question.slot, Slot::Processes);
+    assert_eq!(needs.question.preselect, None);
+    let (value, why) = &needs.question.options[0];
+    assert_eq!(value, "frontend: npm run dev in frontend");
+    assert!(
+        why.contains("backend has uv.lock but no dev script: nothing here starts it"),
+        "{why}"
+    );
+
+    // `start` still takes it, and says so, as it takes any first option.
+    let take = |q: &Question| -> Result<Answer> {
+        let (answer, line) = recommended(q).expect("an option start may take");
+        assert!(line.contains("nothing here starts it"), "{line}");
+        Ok(answer)
+    };
+    let config = resolve_process(&fx.paths, &fx.config, &take, &noop).unwrap();
+    assert_eq!(
+        config.processes.keys().collect::<Vec<_>>(),
+        ["frontend"],
+        "{config:?}"
+    );
+}
+
+// Where every app directory has a process, nothing changes: the per-app
+// form is the first choice, and `--yes` takes it.
+#[test]
+fn init_with_every_app_directory_started_takes_the_process_list() {
+    let fx = sibling_apps_with_manifests(true);
+    init(
+        &fx.paths,
+        &fx.config,
+        &Answering::asking(&take_the_first),
+        &noop,
+    )
+    .unwrap();
+    let config = crate::config::load(&fx.paths).unwrap().config;
+    assert_eq!(
+        config.processes.keys().collect::<Vec<_>>(),
+        ["backend", "mobile"]
+    );
+}
+
 // Only `init` asks it: `start` and `new` never put a question nobody can
 // pick an option at to a developer who only wanted to start something.
 #[test]
