@@ -3,7 +3,7 @@
 
 use super::Requirement;
 use super::languages::language;
-use super::probe::probe_command;
+use super::probe::probe_for;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -56,7 +56,7 @@ impl Default for ProbeCache {
 /// the prelude in front of it, and the command that would be run.
 pub fn fingerprint(requirement: &Requirement, prelude: &str) -> String {
     let probe = language(&requirement.language)
-        .map(|language| probe_command(language, prelude))
+        .map(|language| probe_for(requirement, language, prelude))
         .unwrap_or_default();
     let mut context = md5::Context::new();
     for part in [

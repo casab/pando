@@ -84,7 +84,8 @@ pub(super) fn resolve_runtime(
         Some(prelude) => prelude.trim(),
         None => "",
     };
-    let requirements = crate::runtime::requirements(paths.root());
+    let requirements =
+        crate::runtime::requirements_for(paths.root(), &config.runtime.version_files);
     let Some(check) = first_mismatch(paths, config, &requirements, prelude, machine.shell)? else {
         return Ok(RuntimeOutcome::Fine);
     };
@@ -102,8 +103,8 @@ pub(super) fn resolve_runtime(
 }
 
 /// The first language whose requirement this machine definitely does not
-/// meet, probing at most once per language and remembering the ones that
-/// passed.
+/// meet, probing at most once per language and directory and remembering
+/// the ones that passed.
 ///
 /// Only passes are remembered: a cached failure would go on reporting a
 /// problem the developer has just fixed, and a failure stops the start
@@ -122,17 +123,23 @@ fn first_mismatch(
     let mut cache = crate::runtime::load_cache(&cache_file);
     let mut learned = false;
     let mut mismatch = None;
-    for language in crate::runtime::LANGUAGES {
-        // The pin if the project has one, else whatever range it stated:
-        // that is what `for_language` sorted to the front.
-        let Some(requirement) = crate::runtime::for_language(requirements, language.name) else {
+    // The pin if the project has one, else whatever range it stated: that
+    // is what `for_language` sorted to the front — at the root, and in each
+    // app directory whose version file config names.
+    for requirement in crate::runtime::to_compare(requirements) {
+        let Some(language) = crate::runtime::language(&requirement.language) else {
             continue;
         };
         let fingerprint = crate::runtime::fingerprint(requirement, prelude);
         if cache.holds(&fingerprint) {
             continue;
         }
-        if runs_through_runner(paths.root(), config, &language, prelude, shell) {
+        // Where its processes run, which is where a runner's lockfile is.
+        let dir = match &requirement.dir {
+            Some(dir) => paths.root().join(dir),
+            None => paths.root().to_path_buf(),
+        };
+        if runs_through_runner(&dir, config, language, prelude, shell) {
             continue;
         }
         let check = crate::runtime::check(requirement, prelude, shell);

@@ -20,12 +20,17 @@ pub(super) fn runtime_report(
     let effective = prelude.clone().unwrap_or_default();
     let effective = effective.trim();
     let prelude_from = config::prelude_origin(paths).map(|p| p.display().to_string());
-    let requirements = runtime::requirements(paths.root());
+    let requirements = runtime::requirements_for(paths.root(), &config.runtime.version_files);
 
     let mut languages = Vec::new();
-    for entry in &runtime::LANGUAGES {
-        let Some(requirement) = runtime::for_language(&requirements, entry.name) else {
+    for requirement in runtime::to_compare(&requirements) {
+        let Some(entry) = runtime::language(&requirement.language) else {
             continue;
+        };
+        // Where its processes run, which is where a runner's lockfile is.
+        let dir = match &requirement.dir {
+            Some(dir) => paths.root().join(dir),
+            None => paths.root().to_path_buf(),
         };
         // `runtime::check`, never `actions`' own first-mismatch walk: that
         // one remembers what passed, and doctor writes nothing. It also
@@ -70,7 +75,7 @@ pub(super) fn runtime_report(
         // interpreter itself, such as `uv run`: a start skips the check
         // there, so what the shell resolves on its own breaks nothing.
         if check.verdict == Verdict::Mismatch
-            && !actions::runs_through_runner(paths.root(), config, entry, effective, machine.shell)
+            && !actions::runs_through_runner(&dir, config, entry, effective, machine.shell)
         {
             findings.push(mismatch_finding(&report, prelude.as_deref(), &prelude_from));
         }

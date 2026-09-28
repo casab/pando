@@ -173,6 +173,16 @@ fn read_app_dirs(root: &Path, signals: &mut Signals) {
     for dir in dirs {
         let path = root.join(&dir);
         let under = |name: &str| format!("{dir}/{name}");
+        // After the root's, which keeps the root's own order the one a
+        // config written before this compares against.
+        signals.version_files.extend(
+            present(&path, &VERSION_FILES)
+                .iter()
+                .map(|name| under(name)),
+        );
+        signals
+            .runtime_requirements
+            .extend(crate::runtime::requirements_in(root, &dir));
         for (key, value) in env_example(&path) {
             if !signals.env_example.iter().any(|(held, _)| *held == key) {
                 signals.env_example.push((key, value));

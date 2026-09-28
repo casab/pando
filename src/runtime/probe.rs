@@ -82,7 +82,7 @@ pub fn check(requirement: &Requirement, prelude: &str, shell: Shell<'_>) -> Chec
             verdict: Verdict::Unknown,
         };
     };
-    let Some(output) = shell(&probe_command(language, prelude)) else {
+    let Some(output) = shell(&probe_for(requirement, language, prelude)) else {
         return Check {
             requirement: requirement.clone(),
             resolved: Resolved::default(),
@@ -120,6 +120,29 @@ pub fn check(requirement: &Requirement, prelude: &str, shell: Shell<'_>) -> Chec
         resolved,
         verdict,
     }
+}
+
+/// The probe for one requirement, run where a process that needs it runs.
+///
+/// A requirement an app directory states is asked in that directory, in a
+/// login shell started there: that is what a process whose `cwd` it is
+/// gets, and a version manager reads the directory it starts in — a shim
+/// at exec time, an activation in the profile when the shell starts. A
+/// `cd` alone would miss the second, and call a directory that resolves
+/// its own version a mismatch. The shell the probe is handed runs at the
+/// root, so the one started there is nested inside it.
+pub(super) fn probe_for(requirement: &Requirement, language: &Language, prelude: &str) -> String {
+    let probe = probe_command(language, prelude);
+    match requirement.dir.as_deref() {
+        None | Some("") => probe,
+        Some(dir) => format!("cd {} && exec bash -lc {}", quoted(dir), quoted(&probe)),
+    }
+}
+
+/// One single-quoted shell word, the way `process::shell_quote` writes
+/// one: a quote inside it closed, escaped and reopened.
+fn quoted(word: &str) -> String {
+    format!("'{}'", word.replace('\'', "'\\''"))
 }
 
 /// The shell line the probe runs: the first of the language's binaries

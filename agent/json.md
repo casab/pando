@@ -113,7 +113,9 @@ repository, which is what makes it safe to read before deciding anything.
     "workspace_markers": [],    // pnpm-workspace.yaml, turbo.json, …
     "version_files": [],        // .nvmrc, .python-version, mise.toml, …
     "runtime_requirements": [   // what those files and `engines` ask for
-      { "language": "node", "spec": "22", "source": ".nvmrc", "pinned": true }
+      { "language": "node", "spec": "22", "source": ".nvmrc", "pinned": true },
+      { "language": "node", "spec": "20", "source": "backend/.nvmrc", "pinned": true,
+        "dir": "backend" }      // an app directory's: only there is `dir` set
     ],
     "env_example": [],          // [key, value] pairs from the env example
     "markers": [],              // framework and toolchain markers
@@ -170,7 +172,10 @@ and nothing at the root that says how to build either — is read one level
 down. `app_dirs` lists what was found there, and the proposals come from
 it: the install is each app's own, run in its directory, and the
 `processes` answer has one process per app with a dev script, each with
-its `cwd`, even when only one app has one. Each app's env example joins
+its `cwd`, even when only one app has one. Its version files join
+`version_files` under its path, `backend/.nvmrc`, and once that answer is
+written a start checks the runtime there, in the directory its
+processes run in. Each app's env example joins
 `env_example`, and its local env files (`backend/.env`, never a cache or
 a coverage file) join `ignored_present` and `provision_seeds` under its
 path.

@@ -45,6 +45,12 @@ pub struct Requirement {
     /// a range when a project states both, which is why this is recorded
     /// rather than worked out again at every call site.
     pub pinned: bool,
+    /// The app directory that states it, relative to the root, for a
+    /// requirement below it: `backend`. It is where the probe asks, since
+    /// that is where the processes that need it run. Absent for the root's
+    /// own, which is every requirement a root that is an app states.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
 }
 
 impl Requirement {
@@ -54,6 +60,7 @@ impl Requirement {
             spec: spec.to_string(),
             source,
             pinned: is_pin(spec),
+            dir: None,
         }
     }
 }
@@ -135,6 +142,74 @@ pub fn requirements(root: &Path) -> Vec<Requirement> {
                 spec,
                 format!("{MANIFEST} engines.{key}"),
             ));
+        }
+    }
+    out
+}
+
+/// What an app directory below the root says about the runtimes it needs:
+/// [`requirements`] read in `root/dir`, each source under its path
+/// (`backend/.nvmrc`) and each requirement carrying its directory.
+pub fn requirements_in(root: &Path, dir: &str) -> Vec<Requirement> {
+    requirements(&root.join(dir))
+        .into_iter()
+        .map(|requirement| Requirement {
+            source: format!("{dir}/{}", requirement.source),
+            dir: Some(dir.to_string()),
+            ..requirement
+        })
+        .collect()
+}
+
+/// What the project needs, as config names it: the root's own
+/// requirements, and those of each version file `runtime.version_files`
+/// names in an app directory.
+///
+/// The root is read whatever config says, as it always was. Below it only
+/// the files config names are read, because config is what the runtime
+/// reads: detection proposes `backend/.nvmrc`, and once it is written the
+/// start checks it, in `backend`, where the processes that need it run.
+pub fn requirements_for(root: &Path, version_files: &[String]) -> Vec<Requirement> {
+    let mut out = requirements(root);
+    let mut dirs: Vec<&str> = version_files
+        .iter()
+        .filter_map(|file| file.rsplit_once('/').map(|(dir, _)| dir))
+        // Inside the repository only: config is a file a human edits, and
+        // `../` or an absolute path would have a start read a file of
+        // somebody else's.
+        .filter(|dir| {
+            !dir.is_empty()
+                && Path::new(dir)
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)))
+        })
+        .collect();
+    dirs.sort_unstable();
+    dirs.dedup();
+    for dir in dirs {
+        out.extend(
+            requirements_in(root, dir)
+                .into_iter()
+                .filter(|requirement| version_files.contains(&requirement.source)),
+        );
+    }
+    out
+}
+
+/// The requirements to compare this machine against: for each language in
+/// the table, the one [`for_language`] would take, at the root and in
+/// each app directory that states its own. Two directories may pin two
+/// versions, and a report that checked one of them would miss the other.
+pub fn to_compare(requirements: &[Requirement]) -> Vec<&Requirement> {
+    let mut out: Vec<&Requirement> = Vec::new();
+    for language in &LANGUAGES {
+        for requirement in requirements.iter().filter(|r| r.language == language.name) {
+            if !out
+                .iter()
+                .any(|held| held.language == requirement.language && held.dir == requirement.dir)
+            {
+                out.push(requirement);
+            }
         }
     }
     out

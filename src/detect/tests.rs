@@ -3576,6 +3576,24 @@ fn an_app_directorys_local_env_file_is_a_provision_file() {
     );
 }
 
+// An app directory's version file is proposed under its path, which is
+// the form the runtime reads it back in.
+#[test]
+fn an_app_directorys_version_file_is_proposed_under_its_path() {
+    let dir = api_and_mobile_app();
+    let found = signals(dir.path());
+    assert_eq!(found.version_files, ["backend/.nvmrc"]);
+    let [node] = found.runtime_requirements.as_slice() else {
+        panic!("{:?}", found.runtime_requirements);
+    };
+    assert_eq!(
+        (node.source.as_str(), node.dir.as_deref()),
+        ("backend/.nvmrc", Some("backend"))
+    );
+    let proposal = version_files_proposal(&found).unwrap();
+    assert_eq!(values(&proposal), ["backend/.nvmrc"]);
+}
+
 // A fresh clone has no `.env` in an app directory either; its example is
 // offered the way the root's is, under the app's path.
 #[test]

@@ -106,6 +106,86 @@ fn a_pin_and_a_range_are_both_recorded_with_the_pin_first() {
     assert!(for_language(&all, "elixir").is_none());
 }
 
+// An app directory's requirements carry its path and its directory, and
+// the runtime reads only the ones config names, never outside the root.
+#[test]
+fn an_app_directorys_version_file_counts_once_config_names_it() {
+    let dir = repo(&[
+        (".nvmrc", "22\n"),
+        ("backend/.nvmrc", "20\n"),
+        ("backend/package.json", r#"{"engines":{"node":">=18"}}"#),
+        ("web/.nvmrc", "18\n"),
+    ]);
+    let below = requirements_in(dir.path(), "backend");
+    let sources: Vec<&str> = below.iter().map(|r| r.source.as_str()).collect();
+    assert_eq!(
+        sources,
+        ["backend/.nvmrc", "backend/package.json engines.node"]
+    );
+    assert!(below.iter().all(|r| r.dir.as_deref() == Some("backend")));
+
+    let named = |files: &[&str]| -> Vec<String> {
+        let files: Vec<String> = files.iter().map(|f| f.to_string()).collect();
+        requirements_for(dir.path(), &files)
+            .into_iter()
+            .map(|r| r.source)
+            .collect()
+    };
+    assert_eq!(named(&[]), [".nvmrc"], "the root is read as it always was");
+    assert_eq!(
+        named(&[".nvmrc", "backend/.nvmrc"]),
+        [".nvmrc", "backend/.nvmrc"],
+        "only the file config names, not the engines beside it"
+    );
+    assert_eq!(named(&["../outside/.nvmrc", "/etc/.nvmrc"]), [".nvmrc"]);
+
+    // One requirement per language and directory is compared.
+    let all = requirements_for(
+        dir.path(),
+        &["backend/.nvmrc".to_string(), "web/.nvmrc".to_string()],
+    );
+    let compared: Vec<&str> = to_compare(&all)
+        .into_iter()
+        .map(|r| r.spec.as_str())
+        .collect();
+    assert_eq!(compared, ["22", "20", "18"]);
+}
+
+// A requirement of an app directory is asked about there, in a login
+// shell started in it, the way a process whose `cwd` it is starts.
+#[test]
+fn an_app_directorys_requirement_is_probed_in_that_directory() {
+    let asked = std::cell::RefCell::new(String::new());
+    let shell = |script: &str| -> Option<String> {
+        *asked.borrow_mut() = script.to_string();
+        Some(probe_reply("/usr/bin/node", "v20.3.0"))
+    };
+    let mut requirement = nvmrc();
+    requirement.dir = Some("apps/my api".to_string());
+    requirement.source = "apps/my api/.nvmrc".to_string();
+    let found = check(&requirement, "", &shell);
+    assert_eq!(found.verdict, Verdict::Mismatch);
+    let script = asked.borrow().clone();
+    assert!(
+        script.starts_with("cd 'apps/my api' && exec bash -lc '"),
+        "{script}"
+    );
+    // And a root requirement's probe is the one it always was.
+    check(&nvmrc(), "", &shell);
+    assert_eq!(*asked.borrow(), probe_command(node(), ""));
+    assert_ne!(
+        fingerprint(&requirement, ""),
+        fingerprint(
+            &Requirement {
+                dir: None,
+                ..requirement.clone()
+            },
+            ""
+        ),
+        "a pass in one directory says nothing about another"
+    );
+}
+
 // Even when the range is written first, because the file order is not
 // the project's opinion about which one is more specific.
 #[test]

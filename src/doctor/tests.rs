@@ -1395,6 +1395,54 @@ fn a_requirement_with_no_language_behind_it_is_still_reported() {
     assert!(report.healthy(), "{:?}", report.findings);
 }
 
+// `version_files = ["backend/.nvmrc"]` was written and never read: doctor
+// said the repository pinned nothing. The file config names counts, and
+// it is asked about in the directory its processes run in.
+#[test]
+fn a_version_file_config_names_in_an_app_directory_is_checked_there() {
+    let fx = fixture();
+    std::fs::create_dir_all(fx.root.join("backend")).expect("mkdir backend");
+    std::fs::write(fx.root.join("backend/.nvmrc"), "22\n").expect("write .nvmrc");
+    let asked: std::cell::RefCell<Vec<String>> = Default::default();
+    let shell = |script: &str| -> Option<String> {
+        if script.contains(TOOL_DONE_MARK) {
+            return every_tool(script);
+        }
+        asked.borrow_mut().push(script.to_string());
+        Some(crate::runtime::probe_reply("/usr/bin/node", "v20.1.0"))
+    };
+
+    // Not named: a file below the root is config's to name, not doctor's
+    // to find.
+    let report = report_of(&fx, &shell);
+    assert!(report.runtime.requirements.is_empty());
+    assert!(report.render().contains("states no runtime"));
+
+    write_project_config(
+        &fx,
+        "[runtime]\nversion_files = [\"backend/.nvmrc\"]\n\n[dev]\ncmd = \"npm run dev\"\n",
+    );
+    let report = report_of(&fx, &shell);
+    let [node] = report.runtime.languages.as_slice() else {
+        panic!("one language: {:?}", report.runtime.languages);
+    };
+    assert_eq!(node.source, "backend/.nvmrc");
+    assert_eq!(node.verdict, "mismatch");
+    assert!(
+        asked
+            .borrow()
+            .iter()
+            .any(|script| script.starts_with("cd 'backend' && exec bash -lc ")),
+        "{:?}",
+        asked.borrow()
+    );
+    assert!(
+        !report.render().contains("states no runtime"),
+        "{}",
+        report.render()
+    );
+}
+
 #[test]
 fn a_repository_that_pins_nothing_says_so_and_probes_no_language() {
     let fx = fixture();
