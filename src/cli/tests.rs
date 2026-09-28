@@ -4564,6 +4564,36 @@ fn check_takes_a_base_for_the_one_run() {
     assert!(Cli::try_parse_from(["pando", "check", "--base"]).is_err());
 }
 
+// With the base open, `check` exits 3 with that question, through `init`
+// and back, and `--json` still prints the result: `not_set_up`, at
+// `base`.
+#[test]
+fn check_with_the_base_open_exits_with_the_base_question() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("acme-shop");
+    crate::testutil::drifted_repo(
+        &root,
+        crate::worktree::FAR_AHEAD,
+        crate::worktree::STALE_DAYS,
+        None,
+    );
+    let project = ProjectRef::from_root(&root).unwrap();
+    let paths = PandoPaths::new(dir.path().join("pando-home"), project);
+    std::fs::create_dir_all(paths.project_dir()).unwrap();
+    std::fs::write(paths.config_file(), "[dev]\ncmd = \"exit 3\"\nports = []\n").unwrap();
+    let config = crate::config::load(&paths).unwrap().config;
+
+    let mut out = Vec::new();
+    let err = check::check(&paths, &config, true, None, &mut out).unwrap_err();
+    let needs = err.downcast_ref::<CheckNeedsAnswer>().expect("exit 3");
+    assert_eq!(needs.0.question.slot, crate::detect::Slot::Base);
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["result"], "not_set_up");
+    assert_eq!(v["slot"], "base");
+    let text = render_needs_answer_for(&needs.0, Rerun::InitThenCheck);
+    assert!(text.contains("then run `pando check` again"), "{text}");
+}
+
 /// What the first-time tip said, line by line, and whether it said it.
 fn tip_lines(fx: &Fx, config: &Config, terminal: bool) -> (bool, Vec<String>) {
     let (shown, said, _) = tip_with_picture(fx, config, terminal);

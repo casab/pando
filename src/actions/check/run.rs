@@ -25,7 +25,9 @@ use crate::worktree;
 use super::super::hooks::{failed_words, hook_scope};
 use super::super::lifecycle::start_for_check;
 use super::super::namespaced::{check_stays_shared, prepare};
-use super::super::questions::{Answer, NeedsAnswer, Question, resolve_for_new, resolve_process};
+use super::super::questions::{
+    Answer, Answering, NeedsAnswer, Question, resolve_for_new, resolve_process, resolve_silencing,
+};
 use super::super::readiness::{ReadyVerdict, ready_limit, ready_line, ready_verdict};
 use super::super::refresh::{failure_tail, refresh};
 use super::super::services::{observed_port_for_role, url_role};
@@ -127,7 +129,7 @@ pub fn check_at(
     {
         bail!("base {base:?} does not exist in this repository — nothing was tested");
     }
-    let probe = probe_of(paths.root(), config, base);
+    let mut probe = probe_of(paths.root(), config, base);
     paths.ensure_home()?;
     // One at a time, for the whole run.
     let Some(_lock) = state::try_lock(&paths.check_lock_file())? else {
@@ -159,6 +161,29 @@ pub fn check_at(
             return Ok(not_set_up(paths, config, ran_by, needs, probe));
         }
     };
+    // The base, last, as `init` asks it: open only where origin/HEAD is
+    // far behind the main checkout's branch, and only while the settings
+    // name none. Tested at origin/HEAD then, the check would test the
+    // commit the question doubts. A `--base` answers it for this run,
+    // which makes the run a probe: the settings still choose no base.
+    if config.project.base.is_none() && crate::worktree::base_drift(paths.root()).is_some() {
+        let silent = [Slot::Services];
+        let asked = resolve_silencing(
+            paths,
+            &config,
+            &[Slot::Base],
+            &silent,
+            &Answering::asking(&unasked),
+            say.detail,
+        );
+        if let Err(e) = asked {
+            let needs = e.downcast::<NeedsAnswer>()?;
+            match base {
+                Some(given) => probe = Some(given.to_string()),
+                None => return Ok(not_set_up(paths, &config, ran_by, needs, None)),
+            }
+        }
+    }
 
     let mut run = Run::begin(paths, &config, ran_by, say, probe);
     if config.runnable_processes().next().is_none() {

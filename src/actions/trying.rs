@@ -1,6 +1,7 @@
 //! Trying on its own: the setup screen's `⏎` with no agent. pando settles
-//! what `new` and a shared start settle, with its own first choices, and
-//! nothing more — or, where it cannot, writes nothing at all.
+//! what `new` and a shared start settle, and the base a check asks for, with
+//! its own first choices, and nothing more — or, where it cannot, writes
+//! nothing at all.
 
 use anyhow::Result;
 use chrono::Utc;
@@ -48,8 +49,9 @@ pub fn try_on_its_own(
     try_on_its_own_on(paths, config, progress, &machine)
 }
 
-/// Settles the slots `new` and a shared start settle, each with pando's
-/// first choice, so `pando check` has something to test.
+/// Settles the slots `new` and a shared start settle, and the base the
+/// check asks for, each with pando's first choice, so `pando check` has
+/// something to test.
 ///
 /// Only those: the services and the schema step are silenced as a shared
 /// start silences them, and the prelude is never answered here. It is
@@ -128,13 +130,16 @@ pub fn try_on_its_own_on(
     Ok(OwnGuess::Saved(Box::new(config)))
 }
 
-/// `new`'s slots, then a start's, without the prelude.
+/// `new`'s slots, then a start's, without the prelude, then the base: a
+/// check stops at an open one, so a guess that left it would hand the
+/// check a question nobody is there to answer.
 pub(super) fn tried_slots() -> Vec<Slot> {
     NEW_SLOTS
         .iter()
         .chain(START_SLOTS.iter())
         .copied()
         .filter(|slot| *slot != Slot::Prelude)
+        .chain([Slot::Base])
         .collect()
 }
 

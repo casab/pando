@@ -512,7 +512,10 @@ it read. A base the repository does not have exits 1 with nothing tested.
 another one is a probe: its result is printed in full and never saved, and
 the last check at the project's own base still says where the setup
 stands. `notes` says so. A pass at another base is the setup's once
-`base` is answered with it and `pando check` passes again.
+`base` is answered with it and `pando check` passes again. While the
+`base` question is open, a plain `pando check` tests nothing and exits 3
+with it (`not_set_up`, `slot: "base"`); with `--base` the run is a probe
+of the base it names.
 
 `mode` says where it ran the project's data. `namespaced` when the
 project has hooks after `services` or after `dev` to prove — a schema

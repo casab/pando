@@ -14689,26 +14689,24 @@ fn written_by_a_guess(fx: &Fx) -> Vec<PathBuf> {
 }
 
 // The slots the guess settles are the ones `new` and a start settle, and
-// never the prelude, which is about the machine, nor the base, which only
-// `init` asks.
+// the base a check asks for, and never the prelude, which is about the
+// machine.
 #[test]
-fn trying_on_its_own_settles_the_create_and_start_slots_only() {
+fn trying_on_its_own_settles_the_create_start_and_base_slots_only() {
     let tried = super::trying::tried_slots();
     let expected: Vec<Slot> = NEW_SLOTS
         .iter()
         .chain(START_SLOTS.iter())
         .copied()
         .filter(|slot| *slot != Slot::Prelude)
+        .chain([Slot::Base])
         .collect();
     assert_eq!(tried, expected);
     assert!(!tried.contains(&Slot::Prelude));
-    // The base is `init`'s alone: with none named, `new` forks from
-    // origin/HEAD as it always has, so a guess has nothing to settle there.
-    assert!(!tried.contains(&Slot::Base));
     assert!(
         ALL_SLOTS
             .iter()
-            .all(|slot| matches!(slot, Slot::Prelude | Slot::Base) || tried.contains(slot))
+            .all(|slot| *slot == Slot::Prelude || tried.contains(slot))
     );
 }
 
@@ -14938,4 +14936,113 @@ fn a_programs_base_is_written_when_the_branch_exists_and_refused_when_not() {
     )
     .unwrap();
     assert_eq!(base_of(&fx).as_deref(), Some("release"));
+}
+
+/// A check of `fx`, said to nobody.
+fn quiet_check(fx: &Fx, base: Option<&str>) -> Checked {
+    let quiet = |_: &str| {};
+    let say = Narration {
+        step: &quiet,
+        detail: &quiet,
+    };
+    let config = crate::config::load(&fx.paths).unwrap().config;
+    check_at(&fx.paths, &config, base, crate::setup::RanBy::Program, &say).unwrap()
+}
+
+// With the base open, a plain check asks it, as it asks any open run
+// question, instead of testing origin/HEAD without a word: nothing is
+// made, and the record says `base` is open. A `--base` answers it for the
+// run, and a run at a base the settings do not choose is a probe, which
+// saves nothing. Once `base` is answered, the record that said it was
+// open speaks for nothing.
+#[test]
+fn a_check_with_the_base_open_asks_it_and_a_given_base_answers_it_for_the_run() {
+    let fx = drifted_fixture();
+    let run = "[dev]\ncmd = \"exit 3\"\nports = []\n";
+    std::fs::write(fx.paths.config_file(), run).unwrap();
+
+    let checked = quiet_check(&fx, None);
+    let needs = checked.unanswered.expect("the base is asked");
+    assert_eq!(needs.question.slot, Slot::Base);
+    let values: Vec<&str> = needs
+        .question
+        .options
+        .iter()
+        .map(|(v, _)| v.as_str())
+        .collect();
+    assert_eq!(values, ["work", "develop"]);
+    let open = crate::setup::CheckOutcome::NotSetUp {
+        slot: "base".to_string(),
+    };
+    assert_eq!(checked.record.outcome, open);
+    assert_eq!(checked.probe, None);
+    let saved = crate::setup::CheckRecord::load(&fx.paths).expect("recorded");
+    assert_eq!(saved.outcome, open);
+    assert!(fx.names().is_empty(), "nothing is made");
+    assert_eq!(base_of(&fx), None, "and nothing is answered");
+
+    for given in ["work", "develop"] {
+        let checked = quiet_check(&fx, Some(given));
+        assert!(checked.unanswered.is_none(), "{given}");
+        assert_eq!(checked.probe.as_deref(), Some(given));
+        assert!(
+            matches!(
+                checked.record.outcome,
+                crate::setup::CheckOutcome::Failed { .. }
+            ),
+            "{given}: it ran, and `exit 3` failed it: {:?}",
+            checked.record.outcome
+        );
+        assert_eq!(
+            crate::setup::CheckRecord::load(&fx.paths).as_ref(),
+            Some(&saved),
+            "{given}: a probe saves nothing"
+        );
+    }
+
+    std::fs::write(
+        fx.paths.config_file(),
+        format!("[project]\nbase = \"work\"\n\n{run}"),
+    )
+    .unwrap();
+    // Decided with the lock free: in this test binary a child another
+    // test forks holds the check lock's descriptor until it execs.
+    let config = crate::config::load(&fx.paths).unwrap().config;
+    let setup = crate::setup::read(&fx.paths, &config);
+    assert_eq!(
+        crate::setup::decide(
+            false,
+            setup.last_check.as_ref(),
+            &setup.memory,
+            &config,
+            &setup.fingerprint
+        ),
+        crate::setup::SetupState::Stale,
+        "the base is answered now"
+    );
+    let checked = quiet_check(&fx, Some("work"));
+    assert_eq!(checked.probe, None, "the settings' own base is no probe");
+    assert_eq!(
+        crate::setup::CheckRecord::load(&fx.paths),
+        Some(checked.record)
+    );
+}
+
+// pando's own guess on the setup screen settles the base as well, with
+// its first choice, so the check it starts has nothing left to ask.
+#[test]
+fn trying_on_its_own_takes_the_first_base_so_the_check_has_nothing_to_ask() {
+    let fx = drifted_fixture();
+    let machine = FakeMachine::with_nvm();
+    let shell = machine.shell("22.11.0", "", "");
+    let m = Machine {
+        shell: &shell,
+        home: machine.home.path().to_path_buf(),
+    };
+    let guessed = super::trying::try_on_its_own_on(&fx.paths, &fx.config, &noop, &m).unwrap();
+    assert!(
+        matches!(guessed, super::trying::OwnGuess::Saved(_)),
+        "{guessed:?}"
+    );
+    assert_eq!(base_of(&fx).as_deref(), Some("work"));
 }

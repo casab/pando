@@ -41,7 +41,8 @@ pub const ALL_SLOTS: [Slot; 10] = [
     Slot::SchemaHook,
     Slot::Provision,
     // Last: which commit the rest is tested on. A question only where
-    // origin/HEAD is far behind the main checkout, and only here: with no
+    // origin/HEAD is far behind the main checkout, and asked here and by
+    // `check`, which would otherwise test the commit it doubts: with no
     // base named, `new` forks from origin/HEAD as it always has.
     Slot::Base,
 ];
