@@ -35,7 +35,7 @@ use super::super::worktree::{
     CREATED_BUT_INSTALL_FAILED, new_detached, ref_exists, resolve_create_base,
 };
 use super::super::{INSTALL_HOOK, Mode};
-use super::base::on_the_base;
+use super::base::{Standing, on_the_base};
 use super::interrupt::interrupted;
 use super::logs;
 use super::machine::first_down;
@@ -304,6 +304,13 @@ pub fn check_at(
         base_ref.as_deref(),
         &run.record.failed_tail,
         install,
+        run.probe
+            .as_ref()
+            .and(config.project.base.as_deref())
+            .map(|base| Standing {
+                base,
+                checked: CheckRecord::load(paths).is_some(),
+            }),
     );
     let outcome = match tear_down(paths, &config, say.detail) {
         Ok(left) => {

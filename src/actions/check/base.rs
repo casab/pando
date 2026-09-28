@@ -11,6 +11,13 @@ use std::path::Path;
 use crate::catalog::package_managers::PACKAGE_MANAGERS;
 use crate::setup::{CheckOutcome, FailureKind};
 
+/// What a probe leaves as it was, when the project's base is answered:
+/// that base, and whether a check at it has a result.
+pub(super) struct Standing<'a> {
+    pub(super) base: &'a str,
+    pub(super) checked: bool,
+}
+
 /// A failure of the settings the base explains instead, as a base
 /// failure naming both refs; any other outcome as it was.
 ///
@@ -19,6 +26,10 @@ use crate::setup::{CheckOutcome, FailureKind};
 /// lockfile of a manager the install runs, that the main checkout's
 /// branch has and the commit tested does not. One `git diff` over the
 /// two, and nothing when they are the same commit.
+///
+/// It ends on the way past it: another base to test or to answer — or,
+/// for a probe of another base while the project's is answered
+/// (`standing`), that the project's base is untouched by it.
 pub(super) fn on_the_base(
     root: &Path,
     outcome: CheckOutcome,
@@ -26,6 +37,7 @@ pub(super) fn on_the_base(
     base_ref: Option<&str>,
     tail: &[String],
     install: Option<&str>,
+    standing: Option<Standing<'_>>,
 ) -> CheckOutcome {
     let CheckOutcome::Failed {
         kind: FailureKind::Settings,
@@ -43,12 +55,30 @@ pub(super) fn on_the_base(
     };
     let short: String = commit.chars().take(7).collect();
     let tested = base_ref.unwrap_or("HEAD");
+    let past = match standing {
+        None => {
+            format!(": test {branch} with `pando check --base {branch}`, or answer `base` with it")
+        }
+        Some(Standing {
+            base,
+            checked: true,
+        }) => format!(
+            ". The project's base, {base}, is unaffected by this run, and its last check's \
+             result stands"
+        ),
+        Some(Standing {
+            base,
+            checked: false,
+        }) => format!(
+            ". The project's base, {base}, is unaffected by this run, and has no check result \
+             yet: `pando check` tests it"
+        ),
+    };
     CheckOutcome::Failed {
         kind: FailureKind::Base,
         reason: format!(
             "{reason} — {file} is on {branch}, the main checkout's branch, but not at {tested} \
-             ({short}), the commit this check tested. No setting fixes that: test {branch} with \
-             `pando check --base {branch}`, or answer `base` with it"
+             ({short}), the commit this check tested. No setting fixes that{past}"
         ),
     }
 }

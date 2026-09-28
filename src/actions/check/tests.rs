@@ -1,4 +1,4 @@
-use super::base::{names, on_the_base};
+use super::base::{Standing, names, on_the_base};
 use super::run::commit_to_test;
 use super::*;
 use crate::config::Config;
@@ -124,6 +124,7 @@ fn a_failure_for_a_file_only_the_main_checkouts_branch_has_is_the_bases() {
         Some("origin/develop"),
         &tail,
         None,
+        None,
     );
     let CheckOutcome::Failed { kind, reason } = outcome else {
         panic!("still a failure");
@@ -139,9 +140,45 @@ fn a_failure_for_a_file_only_the_main_checkouts_branch_has_is_the_bases() {
         "{reason}"
     );
     assert!(
-        reason.contains("`pando check --base work`, or answer `base`"),
+        reason.ends_with(
+            "No setting fixes that: test work with `pando check --base work`, or answer `base` \
+             with it"
+        ),
         "{reason}"
     );
+
+    // A probe of another base while the project's is answered says the
+    // project's is untouched, not how to test or answer it again.
+    for (checked, end) in [
+        (
+            true,
+            "No setting fixes that. The project's base, work, is unaffected by this run, and \
+             its last check's result stands",
+        ),
+        (
+            false,
+            "No setting fixes that. The project's base, work, is unaffected by this run, and \
+             has no check result yet: `pando check` tests it",
+        ),
+    ] {
+        let outcome = on_the_base(
+            &root,
+            settings_failure(failed),
+            &tested,
+            Some("origin/develop"),
+            &tail,
+            None,
+            Some(Standing {
+                base: "work",
+                checked,
+            }),
+        );
+        let CheckOutcome::Failed { kind, reason } = outcome else {
+            panic!("still a failure");
+        };
+        assert_eq!(kind, FailureKind::Base);
+        assert!(reason.ends_with(end), "{reason}");
+    }
 
     // A lockfile of a manager the install runs counts unnamed.
     let outcome = on_the_base(
@@ -151,6 +188,7 @@ fn a_failure_for_a_file_only_the_main_checkouts_branch_has_is_the_bases() {
         Some("origin/develop"),
         &[],
         Some("cd backend && uv sync --frozen"),
+        None,
     );
     assert!(matches!(
         outcome,
@@ -177,7 +215,15 @@ fn a_failure_for_a_file_only_the_main_checkouts_branch_has_is_the_bases() {
         (settings_failure(failed), head.as_str(), tail.to_vec()),
     ] {
         assert_eq!(
-            on_the_base(&root, outcome.clone(), commit, None, &tail, Some("npm ci")),
+            on_the_base(
+                &root,
+                outcome.clone(),
+                commit,
+                None,
+                &tail,
+                Some("npm ci"),
+                None
+            ),
             outcome
         );
     }

@@ -359,6 +359,27 @@ fn an_install_that_fails_for_a_file_the_base_lacks_is_the_bases_and_base_tests_a
     );
     e.assert_nothing_left(&branches);
 
+    // A probe that fails on its base while the project's is answered
+    // leaves that base as it was, and says so rather than naming it again
+    // as the way past.
+    std::fs::write(
+        e.paths.config_file(),
+        "[project]\ninstall = \"cat app.lock\"\nbase = \"work\"\n\n\
+         [dev]\ncmd = \"echo up; exit 3\"\nports = []\n",
+    )
+    .unwrap();
+    let v = json(&e.pando(&["check", "--json", "--base", "origin/main"]));
+    assert_eq!(v["kind"], "base", "{v}");
+    let reason = v["reason"].as_str().unwrap();
+    assert!(
+        reason.ends_with(
+            "No setting fixes that. The project's base, work, is unaffected by this run, and \
+             its last check's result stands"
+        ),
+        "{reason}"
+    );
+    e.assert_nothing_left(&branches);
+
     let out = e.pando(&["check", "--base", "nope"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(
