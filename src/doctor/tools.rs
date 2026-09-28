@@ -412,7 +412,18 @@ fn project_programs(paths: &PandoPaths, config: &Config) -> Vec<ProjectProgram> 
         }
     }
     let signals = detect::signals(paths.root());
-    for lockfile in &signals.lockfiles {
+    // The root's lockfiles, then each app directory's under its path.
+    let app_lockfiles = signals.app_dirs.iter().flat_map(|app| {
+        app.lockfiles
+            .iter()
+            .map(move |lockfile| (lockfile, format!("{}/{lockfile}", app.dir)))
+    });
+    let lockfiles = signals
+        .lockfiles
+        .iter()
+        .map(|lockfile| (lockfile, lockfile.clone()))
+        .chain(app_lockfiles);
+    for (lockfile, path) in lockfiles {
         let Some(manager) = package_managers::for_lockfile(lockfile) else {
             continue;
         };
@@ -422,7 +433,7 @@ fn project_programs(paths: &PandoPaths, config: &Config) -> Vec<ProjectProgram> 
         }
         out.push((
             program.to_string(),
-            format!("{lockfile} is in this repository"),
+            format!("{path} is in this repository"),
             None,
         ));
     }

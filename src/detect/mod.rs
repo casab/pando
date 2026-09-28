@@ -13,7 +13,8 @@
 //!
 //! **Where things are.** `signals` reads the repository: manifests,
 //! scripts, make targets, version files, env examples and what is
-//! gitignored. `frameworks` picks the framework rule those signals match;
+//! gitignored — at the root, and in the app directories below a root that
+//! has no manifest of its own. `frameworks` picks the framework rule those signals match;
 //! the rules themselves live in `catalog::frameworks`. `proposal` holds
 //! the types a proposal is made of and [`propose`], which asks every slot;
 //! `dev` has the per-slot proposals for install, version files, the dev
@@ -47,5 +48,5 @@ pub use services::{
     MachineEvidence, NO_PREFERENCE_EVIDENCE, SCHEMA_HOOK, ServiceChoice, ServiceSource,
     service_choice, service_choice_for,
 };
-pub use signals::{Signals, Target, is_gitignored, signals};
+pub use signals::{AppDir, Signals, Target, is_gitignored, signals};
 pub use workspaces::{WorkspaceApp, workspace_apps};

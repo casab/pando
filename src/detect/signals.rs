@@ -66,6 +66,34 @@ pub struct Signals {
     /// checkout. Defaulted so an older dump still deserialises.
     #[serde(default)]
     pub workspace_env_links: Vec<(String, String)>,
+    /// The apps below a root that is not one: sibling directories such as
+    /// `backend` and `frontend`, and the conventional `apps/*` and
+    /// `packages/*`, each with a manifest or a lockfile of its own.
+    ///
+    /// Read only when the root has no manifest, no lockfile, no workspace
+    /// marker and no framework marker — a polyglot repository whose apps
+    /// each keep their own toolchain, where reading the root alone finds
+    /// nothing at all. Everywhere else it is empty, and the root is what
+    /// pando reads. Defaulted so an older dump still deserialises.
+    #[serde(default)]
+    pub app_dirs: Vec<AppDir>,
+}
+
+/// One app directory below a root that has no manifest: what detection
+/// reads there to propose its install and its process.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppDir {
+    /// Relative to the repository root: `backend`, `apps/mobile`.
+    pub dir: String,
+    /// Its lockfiles, in the order pando checks them.
+    #[serde(default)]
+    pub lockfiles: Vec<String>,
+    /// Its own `package.json` scripts.
+    #[serde(default)]
+    pub scripts: BTreeMap<String, String>,
+    /// Its framework and toolchain markers.
+    #[serde(default)]
+    pub markers: Vec<String>,
 }
 
 const WORKSPACE_MARKERS: [&str; 3] = ["pnpm-workspace.yaml", "turbo.json", "nx.json"];
@@ -115,11 +143,102 @@ pub fn signals(root: &Path) -> Signals {
         ignored_present: ignored_present(root),
         provision_seeds: provision_seeds(root),
         workspace_env_links: Vec::new(),
+        app_dirs: Vec::new(),
     };
     // Last, because which directories are apps is itself read from the
     // signals above.
     signals.workspace_env_links = super::workspaces::workspace_env_links(root, &signals);
+    if !has_manifest(root, &signals) {
+        signals.app_dirs = app_dirs(root);
+    }
     signals
+}
+
+/// Whether the root says anything about how the project is built: a
+/// `package.json`, a lockfile, a workspace marker, or a framework or
+/// toolchain marker. A root with none of them is not an app, and its apps
+/// are in the directories below it.
+fn has_manifest(root: &Path, signals: &Signals) -> bool {
+    root.join("package.json").is_file()
+        || !signals.lockfiles.is_empty()
+        || !signals.workspace_markers.is_empty()
+        || !signals.markers.is_empty()
+}
+
+/// Where the apps of a root with no manifest are looked for: each
+/// directory directly below it, and each one below `apps` and `packages`,
+/// the two conventional homes. One level, on purpose: a deeper walk finds
+/// vendored copies and fixtures as readily as apps.
+const APP_PARENTS: [&str; 2] = ["apps", "packages"];
+
+/// The app directories below `root`, sorted by path.
+///
+/// A hidden directory, a cache or dependency tree
+/// ([`artifacts::is_artifact`]) and anything the project gitignores is
+/// skipped, and so is a directory with nothing pando recognises in it:
+/// `docker/`, `docs/` and `scripts/` are not apps.
+pub(super) fn app_dirs(root: &Path) -> Vec<AppDir> {
+    let children = |parent: &str| -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(root.join(parent)) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+            .filter(|name| !name.starts_with('.') && !artifacts::is_artifact(name))
+            .map(|name| match parent {
+                "" => name,
+                parent => format!("{parent}/{name}"),
+            })
+            .collect()
+    };
+    let mut dirs: Vec<String> = children("");
+    for parent in APP_PARENTS {
+        dirs.extend(children(parent));
+    }
+    let ignored = gitignored(root, &dirs);
+    let mut out: Vec<AppDir> = dirs
+        .into_iter()
+        .filter(|dir| !ignored.contains(dir))
+        .filter_map(|dir| app_dir(root, dir))
+        .collect();
+    out.sort_by(|a, b| a.dir.cmp(&b.dir));
+    out
+}
+
+/// What one directory holds, when it is an app: a manifest or a lockfile
+/// pando knows.
+fn app_dir(root: &Path, dir: String) -> Option<AppDir> {
+    let path = root.join(&dir);
+    let manifest = std::fs::read_to_string(path.join("package.json")).ok();
+    let app = AppDir {
+        lockfiles: present(&path, &package_managers::lockfiles()),
+        scripts: parse_scripts(manifest.as_deref().unwrap_or_default()),
+        markers: present(&path, &frameworks::marker_files()),
+        dir,
+    };
+    (manifest.is_some() || !app.lockfiles.is_empty() || !app.markers.is_empty()).then_some(app)
+}
+
+/// Which of `paths` the project gitignores, in one `git check-ignore`
+/// rather than one per directory. A git that could not run ignores
+/// nothing, which is the answer that reads more rather than less.
+fn gitignored(root: &Path, paths: &[String]) -> Vec<String> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    let args = ["check-ignore", "--"]
+        .into_iter()
+        .map(str::to_string)
+        .chain(paths.iter().cloned());
+    let Ok(out) = crate::project::git(root, args) else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|line| line.trim_end_matches('/').to_string())
+        .collect()
 }
 
 pub(super) fn present(root: &Path, names: &[&str]) -> Vec<String> {

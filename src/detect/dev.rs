@@ -11,7 +11,7 @@ use crate::config::PortsSpec;
 use super::apply::dedup_by_value;
 use super::frameworks::{go_commands, only_builds, runs, several_binaries};
 use super::proposal::{Candidate, Proposal, Slot};
-use super::signals::Signals;
+use super::signals::{AppDir, Signals};
 
 /// Lockfile to frozen install command.
 ///
@@ -22,12 +22,25 @@ use super::signals::Signals;
 /// gitignored, as [`unlocked_command`] asks — the file it writes is one
 /// git ignores, or none, so it cannot change the repository.
 pub(super) fn install_proposal(root: &Path, signals: &Signals) -> Option<Proposal> {
+    if !signals.app_dirs.is_empty() {
+        return app_install_proposal(root, &signals.app_dirs);
+    }
+    let candidates = installs_in(root, &signals.lockfiles);
+    if candidates.is_empty() {
+        return None;
+    }
+    let decided = candidates.len() == 1;
+    Some(Proposal::of(Slot::Install, candidates, decided))
+}
+
+/// The installs the lockfiles of one directory propose, in lockfile order.
+fn installs_in(dir: &Path, lockfiles: &[String]) -> Vec<Candidate> {
     let mut candidates: Vec<Candidate> = Vec::new();
-    for lock in &signals.lockfiles {
+    for lock in lockfiles {
         let Some((cmd, why)) = package_managers::install_for(lock) else {
             continue;
         };
-        let candidate = match unlocked_install(root, package_managers::for_lockfile(lock)) {
+        let candidate = match unlocked_install(dir, package_managers::for_lockfile(lock)) {
             Some(unlocked) => unlocked,
             None => Candidate {
                 value: cmd.to_string(),
@@ -37,19 +50,59 @@ pub(super) fn install_proposal(root: &Path, signals: &Signals) -> Option<Proposa
         };
         candidates.push(candidate);
     }
-    if signals.lockfiles.is_empty() && root.join("package.json").is_file() {
-        let manifest = std::fs::read_to_string(root.join("package.json")).unwrap_or_default();
+    if lockfiles.is_empty() && dir.join("package.json").is_file() {
+        let manifest = std::fs::read_to_string(dir.join("package.json")).unwrap_or_default();
         candidates.extend(unlocked_install(
-            root,
+            dir,
             Some(package_managers::declared_javascript(&manifest)),
         ));
     }
     dedup_by_value(&mut candidates);
-    if candidates.is_empty() {
+    candidates
+}
+
+/// The install of a root that is not an app: each app directory's own,
+/// run in that directory, one after the other in path order —
+/// `(cd backend && uv sync --frozen) && (cd frontend && npm ci)`.
+///
+/// Each app is installed the way it would be at a root of its own, with
+/// the same rules for a gitignored lockfile. One candidate, made of every
+/// app's first; decided only when no app had a choice to make, because
+/// an app with two lockfiles is the same question it is at the root.
+fn app_install_proposal(root: &Path, apps: &[AppDir]) -> Option<Proposal> {
+    let mut steps: Vec<String> = Vec::new();
+    let mut why: Vec<String> = Vec::new();
+    let mut sure = true;
+    for app in apps {
+        let candidates = installs_in(&root.join(&app.dir), &app.lockfiles);
+        let Some(first) = candidates.first() else {
+            continue;
+        };
+        sure &= candidates.len() == 1;
+        steps.push(format!("(cd {} && {})", shell_word(&app.dir), first.value));
+        why.push(format!("{}: {}", app.dir, first.why));
+    }
+    if steps.is_empty() {
         return None;
     }
-    let decided = candidates.len() == 1;
-    Some(Proposal::of(Slot::Install, candidates, decided))
+    let candidate = Candidate {
+        value: steps.join(" && "),
+        why: why.join("; "),
+        ..Candidate::default()
+    };
+    Some(Proposal::of(Slot::Install, vec![candidate], sure))
+}
+
+/// A relative path as one shell word: bare when it is plain, as nearly
+/// every directory name is, and quoted otherwise.
+fn shell_word(path: &str) -> String {
+    let plain = path
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'));
+    match plain && !path.is_empty() {
+        true => path.to_string(),
+        false => crate::process::shell_quote(path),
+    }
 }
 
 /// The unlocked install of `manager`, when its lockfiles are gitignored.

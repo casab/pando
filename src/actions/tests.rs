@@ -4948,6 +4948,11 @@ fn a_plain_install_is_keyed_on_the_manifests_and_a_frozen_one_on_the_lockfiles()
             .fingerprint
             .contains(&"package-lock.json".to_string())
     );
+    // An app directory's lockfile keys it too: a root that is not an app
+    // installs each one in its own directory.
+    for glob in ["*/uv.lock", "*/*/package-lock.json"] {
+        assert!(frozen.fingerprint.contains(&glob.to_string()), "{glob}");
+    }
 }
 
 #[test]

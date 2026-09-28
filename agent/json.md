@@ -120,7 +120,15 @@ repository, which is what makes it safe to read before deciding anything.
     "compose_files": [],
     "ignored_present": [],      // gitignored files that exist in the checkout
     "provision_seeds": [],      // examples a worktree file could be copied from
-    "workspace_env_links": []   // [app/.env, .env]: the root .env for apps with none
+    "workspace_env_links": [],  // [app/.env, .env]: the root .env for apps with none
+    "app_dirs": [               // only when the root has no manifest, lockfile or marker:
+      {                         //   the apps below it, directly or in apps/* and packages/*
+        "dir": "backend",
+        "lockfiles": ["uv.lock"],
+        "scripts": {},
+        "markers": ["pyproject.toml"]
+      }
+    ]
   },
   "compose": [                  // one entry per compose file, as pando's own reader sees it
     {
@@ -156,6 +164,11 @@ itself when the target *is* that line: no prerequisites, one command, no `$`
 in a makefile or `{{` in a justfile, no `-` or `+` prefix, and nothing at the
 top of the file that every recipe runs with — make's `export` or `include`,
 a justfile's `set` or `export`.
+
+A repository whose root is not an app — `backend/` beside `frontend/`,
+and nothing at the root that says how to build either — is read one level
+down. `app_dirs` lists what was found there, and the proposals come from
+it: the install is each app's own, run in its directory.
 
 `extends`, `include` and `error` are why a services proposal can be missing
 or under-ticked: they are the parts of a compose file this build did not

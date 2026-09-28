@@ -3325,3 +3325,170 @@ fn the_root_env_is_given_only_where_the_repository_ignores_the_path() {
     std::fs::remove_file(dir.path().join(".env")).unwrap();
     assert!(signals(dir.path()).workspace_env_links.is_empty());
 }
+
+// ---- app directories below a root that is not an app ------------------
+
+/// A repository with `files` written at their paths, directories and all.
+fn tree(files: &[(&str, &str)]) -> TempDir {
+    let dir = tempdir().unwrap();
+    crate::testutil::git(dir.path(), &["init", "--quiet", "--initial-branch=main"]);
+    for (rel, contents) in files {
+        let path = dir.path().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+    dir
+}
+
+/// A Python API and a Nuxt frontend in sibling directories, each with its
+/// own lockfile, a deployment compose file beside them, and nothing at the
+/// root but a gitignore and what a test run left there.
+fn polyglot_siblings() -> TempDir {
+    tree(&[
+        (".gitignore", ".env\n.coverage\n"),
+        (".coverage", "sqlite"),
+        (
+            "backend/pyproject.toml",
+            "[project]\nname = \"api\"\nrequires-python = \">=3.13\"\n",
+        ),
+        ("backend/uv.lock", "version = 1\n"),
+        (
+            "backend/.env.example",
+            "DATABASE_URL=postgres://app@localhost:5432/app\nAPI_KEY=\n",
+        ),
+        (
+            "backend/.env",
+            "DATABASE_URL=postgres://me@localhost:5432/app\n",
+        ),
+        (
+            "frontend/package.json",
+            r#"{ "scripts": { "dev": "nuxt dev", "build": "nuxt build" } }"#,
+        ),
+        ("frontend/package-lock.json", "{}"),
+        ("frontend/nuxt.config.ts", "export default {}\n"),
+        ("frontend/.env", "NUXT_API_URL=http://localhost:8000\n"),
+        (
+            "docker/compose.yml",
+            "services:\n  db:\n    image: postgres:16\n",
+        ),
+    ])
+}
+
+/// A Node API beside a mobile app under `apps/`, each with its own
+/// package manager, and no `package.json` at the root.
+fn api_and_mobile_app() -> TempDir {
+    tree(&[
+        (".gitignore", ".env\n"),
+        (
+            "backend/package.json",
+            r#"{ "scripts": { "dev": "tsx watch src/index.ts" } }"#,
+        ),
+        ("backend/pnpm-lock.yaml", "lockfileVersion: '9.0'\n"),
+        ("backend/.nvmrc", "22\n"),
+        (
+            "apps/mobile/package.json",
+            r#"{ "main": "expo-router/entry", "scripts": { "start": "expo start" } }"#,
+        ),
+        ("apps/mobile/package-lock.json", "{}"),
+    ])
+}
+
+// A root with nothing to build is read one level down: each directory
+// with a manifest or a lockfile is an app, and one with neither — the
+// deployment's compose directory — is not.
+#[test]
+fn a_root_with_no_manifest_is_read_one_level_down() {
+    let dir = polyglot_siblings();
+    let found = signals(dir.path());
+    let dirs: Vec<&str> = found.app_dirs.iter().map(|a| a.dir.as_str()).collect();
+    assert_eq!(dirs, ["backend", "frontend"]);
+    assert_eq!(found.app_dirs[0].lockfiles, ["uv.lock"]);
+    assert_eq!(found.app_dirs[0].markers, ["pyproject.toml"]);
+    assert_eq!(found.app_dirs[1].scripts["dev"], "nuxt dev");
+    assert!(
+        found.lockfiles.is_empty(),
+        "the root's own list stays the root's"
+    );
+
+    let dir = api_and_mobile_app();
+    let dirs: Vec<String> = signals(dir.path())
+        .app_dirs
+        .into_iter()
+        .map(|a| a.dir)
+        .collect();
+    assert_eq!(dirs, ["apps/mobile", "backend"]);
+}
+
+// Hidden directories, dependency trees and anything gitignored are never
+// apps, whatever manifest they hold.
+#[test]
+fn a_hidden_ignored_or_vendored_directory_is_not_an_app() {
+    let dir = tree(&[
+        (".gitignore", "vendor/\n"),
+        (".tools/package.json", "{}"),
+        ("node_modules/package.json", "{}"),
+        ("vendor/package.json", "{}"),
+        ("packages/sdk/package.json", "{}"),
+        ("api/go.mod", "module api\n"),
+    ]);
+    let dirs: Vec<String> = signals(dir.path())
+        .app_dirs
+        .into_iter()
+        .map(|a| a.dir)
+        .collect();
+    assert_eq!(dirs, ["api", "packages/sdk"]);
+}
+
+// A root that is an app is read as one, as it always was: its
+// subdirectories are its own business.
+#[test]
+fn a_root_with_a_manifest_reads_no_app_directories() {
+    for marker in ["package.json", "uv.lock", "turbo.json", "pyproject.toml"] {
+        let dir = tree(&[(marker, "{}"), ("backend/package.json", "{}")]);
+        assert!(signals(dir.path()).app_dirs.is_empty(), "{marker}");
+    }
+}
+
+// Each app installs from its own lockfile, in its own directory, the way
+// it would at a root of its own.
+#[test]
+fn each_app_directory_installs_from_its_own_lockfile() {
+    let dir = polyglot_siblings();
+    let proposal = install_proposal(dir.path(), &signals(dir.path())).unwrap();
+    assert_eq!(
+        values(&proposal),
+        ["(cd backend && uv sync --frozen) && (cd frontend && npm ci)"]
+    );
+    assert!(proposal.decided);
+    assert_eq!(
+        proposal.candidates[0].why,
+        "backend: uv.lock; frontend: package-lock.json"
+    );
+
+    let dir = api_and_mobile_app();
+    let proposal = install_proposal(dir.path(), &signals(dir.path())).unwrap();
+    assert_eq!(
+        values(&proposal),
+        ["(cd apps/mobile && npm ci) && (cd backend && pnpm install --frozen-lockfile)"]
+    );
+}
+
+// An app that gitignores its lockfile gets the plain install there, as a
+// root would; an app with two lockfiles makes the whole answer a question.
+#[test]
+fn an_app_directorys_install_follows_the_root_rules() {
+    let dir = tree(&[
+        (".gitignore", "web/package-lock.json\n"),
+        ("web/package.json", "{}"),
+        ("web/package-lock.json", "{}"),
+        ("api/package.json", "{}"),
+        ("api/pnpm-lock.yaml", ""),
+        ("api/yarn.lock", ""),
+    ]);
+    let proposal = install_proposal(dir.path(), &signals(dir.path())).unwrap();
+    assert_eq!(
+        values(&proposal),
+        ["(cd api && pnpm install --frozen-lockfile) && (cd web && npm install)"]
+    );
+    assert!(!proposal.decided, "api has two lockfiles to choose between");
+}

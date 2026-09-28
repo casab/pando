@@ -42,11 +42,15 @@ pub(super) fn install_hook(config: &Config) -> Option<config::HookConfig> {
     if install.is_empty() {
         return None;
     }
+    // The root's lockfiles, and an app directory's one or two levels down:
+    // a repository whose root is not an app installs each app in its own
+    // directory, `backend/uv.lock` and `apps/mobile/package-lock.json`,
+    // and keyed on the root alone it would install again on every start.
     let fingerprint = match crate::catalog::package_managers::is_unlocked_install(install) {
         true => vec![UNLOCKED_INSTALL_KEY.to_string()],
         false => crate::catalog::package_managers::lockfiles()
             .iter()
-            .map(|l| l.to_string())
+            .flat_map(|l| [l.to_string(), format!("*/{l}"), format!("*/*/{l}")])
             .collect(),
     };
     Some(config::HookConfig {
