@@ -619,8 +619,8 @@ nothing else. Nothing was made.</span></pre>
     <div class="split">
       <div class="rv">
         <p class="lede">You do not write a config file to start. Before it asks anything, pando reads the main checkout: <code>package.json</code> scripts, Makefile and justfile targets, lockfiles, workspace markers, version files, the first env example, framework markers, compose files, and the gitignored files at the root. Nothing starts while it reads.</p>
-        <p>From that it proposes answers to nine questions, always in the same order, each with the evidence behind it:</p>
-        <p class="slots"><code>install</code> <code>version_files</code> <code>prelude</code> <code>processes</code> <code>dev_cmd</code> <code>port_env</code> <code>services</code> <code>schema_hook</code> <code>provision</code></p>
+        <p>From that it proposes answers to ten questions, always in the same order, each with the evidence behind it:</p>
+        <p class="slots"><code>install</code> <code>version_files</code> <code>prelude</code> <code>processes</code> <code>dev_cmd</code> <code>port_env</code> <code>services</code> <code>schema_hook</code> <code>provision</code> <code>base</code></p>
         <p>On a terminal, <code>new</code>, <code>start</code> and the TUI take the rules' first choice for anything they have one for, and print what they took:</p>
       </div>
       <div class="rv">

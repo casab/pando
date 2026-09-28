@@ -694,6 +694,83 @@ pub fn resolve_base_branch(root: &Path) -> Option<String> {
     None
 }
 
+/// How many commits the main checkout's branch must have that origin/HEAD
+/// lacks before [`base_drift`] says origin/HEAD is not where work starts.
+///
+/// A feature branch rarely carries a hundred commits of its own; a branch
+/// a team merges into, beside a default branch nobody moves, soon does.
+pub const FAR_AHEAD: u32 = 100;
+
+/// How many days older origin/HEAD's last commit must be than the main
+/// checkout's. Both have to hold: a long feature branch on a repository
+/// whose default branch is alive, or a quiet repository whose branches all
+/// sit still, never raises it.
+pub const STALE_DAYS: i64 = 30;
+
+/// origin/HEAD, far behind the branch the main checkout is on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseDrift {
+    /// origin/HEAD as git spells it short: `origin/develop`.
+    pub default: String,
+    /// The branch it points at, as a base is written: `develop`.
+    pub default_branch: String,
+    /// The main checkout's branch.
+    pub current: String,
+    /// Commits on `current` that `default` does not have.
+    pub ahead: u32,
+    /// How many days before `current`'s last commit `default`'s was made.
+    pub days_older: i64,
+}
+
+/// origin/HEAD and the main checkout's branch, when origin/HEAD is so far
+/// behind — [`FAR_AHEAD`] commits and [`STALE_DAYS`] days — that it is
+/// unlikely to be the branch work starts from, though `new` and `check`
+/// fork from it. `None` when it is not, when there is no origin/HEAD, and
+/// when the main checkout is on that branch or on none.
+///
+/// Read from the repository alone, with no clock: the same refs give the
+/// same answer on any day, which is what lets `signals` publish it.
+pub fn base_drift(root: &Path) -> Option<BaseDrift> {
+    let default = origin_head(root)?;
+    let default_branch = default.strip_prefix("origin/")?.to_string();
+    let current = checked_out_branch(root)?;
+    if current == default_branch {
+        return None;
+    }
+    let count = crate::project::git(
+        root,
+        ["rev-list", "--count", &format!("{default}..HEAD"), "--"],
+    )
+    .ok()
+    .filter(|out| out.status.success())?;
+    let ahead: u32 = String::from_utf8_lossy(&count.stdout).trim().parse().ok()?;
+    let times = crate::project::git(root, ["show", "-s", "--format=%ct", &default, "HEAD", "--"])
+        .ok()
+        .filter(|out| out.status.success())?;
+    let times: Vec<i64> = String::from_utf8_lossy(&times.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect();
+    let [default_at, head_at] = times[..] else {
+        return None;
+    };
+    let days_older = (head_at - default_at) / 86_400;
+    (ahead >= FAR_AHEAD && days_older >= STALE_DAYS).then_some(BaseDrift {
+        default,
+        default_branch,
+        current,
+        ahead,
+        days_older,
+    })
+}
+
+/// The branch a checkout is on; `None` when its HEAD is detached.
+pub fn checked_out_branch(root: &Path) -> Option<String> {
+    let out = crate::project::git(root, ["symbolic-ref", "--short", "--quiet", "HEAD"]).ok()?;
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !name.is_empty()).then_some(name)
+}
+
 fn origin_head(root: &Path) -> Option<String> {
     let out = crate::project::git(
         root,
@@ -1609,6 +1686,44 @@ bare
             &["commit", "--quiet", "--allow-empty", "-m", "root"],
         );
         assert_eq!(resolve_base_branch(&empty), None);
+    }
+
+    // Far behind is both at once: a hundred commits, and a month. Either
+    // alone is a long feature branch, or a quiet repository.
+    #[test]
+    fn origin_head_is_far_behind_only_by_both_measures_at_once() {
+        let dir = tempdir().unwrap();
+        let far = dir.path().join("far");
+        crate::testutil::drifted_repo(&far, FAR_AHEAD, STALE_DAYS, None);
+        assert_eq!(
+            base_drift(&far),
+            Some(BaseDrift {
+                default: "origin/develop".to_string(),
+                default_branch: "develop".to_string(),
+                current: "work".to_string(),
+                ahead: FAR_AHEAD,
+                days_older: STALE_DAYS,
+            })
+        );
+
+        let few = dir.path().join("few");
+        crate::testutil::drifted_repo(&few, FAR_AHEAD - 1, 400, None);
+        assert_eq!(base_drift(&few), None, "a long feature branch");
+
+        let recent = dir.path().join("recent");
+        crate::testutil::drifted_repo(&recent, 500, STALE_DAYS - 1, None);
+        assert_eq!(base_drift(&recent), None, "a default branch still moving");
+
+        // On origin/HEAD's own branch, or on none, there is nothing to say.
+        git(&far, &["checkout", "--quiet", "develop"]);
+        assert_eq!(base_drift(&far), None);
+        git(&far, &["checkout", "--quiet", "--detach", "work"]);
+        assert_eq!(base_drift(&far), None);
+
+        // And with no origin/HEAD at all.
+        let local = dir.path().join("local");
+        init_repo(&local);
+        assert_eq!(base_drift(&local), None);
     }
 
     #[test]

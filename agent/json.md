@@ -197,13 +197,13 @@ development one.
 or under-ticked: they are the parts of a compose file this build did not
 follow, published rather than papered over.
 
-### The nine questions
+### The ten questions
 
 `slots` has one entry per question pando can ask, in the order it asks
 them. The names are frozen — they are the same strings `--answers` takes:
 
 ```
-install  version_files  prelude  processes  dev_cmd  port_env  services  schema_hook  provision
+install  version_files  prelude  processes  dev_cmd  port_env  services  schema_hook  provision  base
 ```
 
 ```jsonc
@@ -257,7 +257,7 @@ program filled still has no proposal — nothing about the rules changed —
 so a reader that watches `proposal` alone will answer it again on every
 run. Watch `answered`.
 
-Three more facts about `slots` that are not visible in the shape:
+Four more facts about `slots` that are not visible in the shape:
 
 - **`prelude` is never proposed here.** It is the one question about this
   laptop rather than this repository, it costs a `bash -lc` probe, and
@@ -269,6 +269,13 @@ Three more facts about `slots` that are not visible in the shape:
   is verified against this machine before it is written, and the check only
   exists behind the proposal that raises the question. A value for either
   is reported as unused.
+- **`base` is proposed only when origin/HEAD is far behind** the branch
+  the main checkout is on: a hundred commits and thirty days. Its options
+  are that branch, then origin/HEAD's; `"proposal": null` means origin/HEAD
+  is where `new` forks from and `check` tests, as it is for most
+  repositories. Either way it takes a branch name of your own, written as
+  `[project] base`, and one this repository has no branch for, here or on
+  origin, is refused with exit 2.
 - **Answering one slot can settle another.** Taking the per-app form at
   `processes` fills the dev command and its ports for every app, so
   `dev_cmd` and `port_env` are never asked and an answer sent for them is

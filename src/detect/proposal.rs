@@ -7,6 +7,7 @@ use std::path::Path;
 
 use crate::config::{PortsSpec, ProcessConfig};
 
+use super::base::base_proposal;
 use super::dev::{
     dev_cmd_proposal, install_proposal, port_proposal, provision_proposal, version_files_proposal,
 };
@@ -42,6 +43,12 @@ pub enum Slot {
     /// and the files whose change means it has to run again.
     SchemaHook,
     Provision,
+    /// The branch `new` forks a worktree from, and the commit `check`
+    /// tests: `[project] base`. Proposed only when origin/HEAD is far
+    /// behind the branch the main checkout is on, which is when "the
+    /// repository's default branch" may not be where work starts;
+    /// otherwise origin/HEAD is the answer, and nothing is asked.
+    Base,
     /// The login that may create and drop a worktree's namespaces in one
     /// service, when the main checkout's env files carry none. No rule
     /// proposes it and `init` never asks it: a namespaced start does, the
@@ -159,6 +166,7 @@ impl Slot {
             Slot::DevCmd => (&["dev"], "cmd"),
             Slot::PortEnv => (&["dev"], "ports"),
             Slot::Provision => (&["project"], "provision"),
+            Slot::Base => (&["project"], "base"),
             // One table per service, which only the question knows — or,
             // for a slot to free, nothing written at all.
             Slot::Processes | Slot::Services | Slot::SchemaHook | Slot::Login | Slot::FreeSlot => {
@@ -175,6 +183,7 @@ impl Slot {
             Slot::VersionFiles | Slot::Provision => "file names",
             Slot::Prelude => "shell line",
             Slot::Login => "login, as user:password",
+            Slot::Base => "branch",
             _ => "command",
         }
     }
@@ -196,6 +205,7 @@ impl Slot {
             Slot::Services => "Run private copies of these services for each worktree?",
             Slot::SchemaHook => "Which command brings a fresh database up to the schema?",
             Slot::Provision => "Which local files should each worktree get a copy of?",
+            Slot::Base => "Which branch do new worktrees, and the check, start from?",
             Slot::Login => "Which login may create and drop this worktree's own databases?",
             Slot::FreeSlot => "Which stopped worktree gives up its slot?",
         }
@@ -388,6 +398,9 @@ pub fn propose_with(
         services_proposal(root, signals, resolve, evidence, prefer),
         schema_hook_proposal(root, signals),
         provision_proposal(signals),
+        // Last, as it is asked: which commit all of the above is tested
+        // on, read from the refs rather than from the files.
+        base_proposal(root),
     ]
     .into_iter()
     .flatten()

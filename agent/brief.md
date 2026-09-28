@@ -162,7 +162,7 @@ If you must ask, ask **once**, with the options pando published and the
 
 ## 2. Reading `signals`: three states, three behaviours
 
-`slots` has nine entries, one per question pando can ask, in the order it
+`slots` has ten entries, one per question pando can ask, in the order it
 asks them. Each has a `proposal`, and its state decides what you do:
 
 | State | Means | You |
@@ -222,7 +222,7 @@ Four more facts that are not visible in the shape:
   write, so nobody's flag gets to decide it. If you name it, you are
   answering for the developer — be sure they want it.
 
-## 3. The nine questions, and who answers each
+## 3. The ten questions, and who answers each
 
 | Question | Who | Notes |
 |---|---|---|
@@ -235,6 +235,7 @@ Four more facts that are not visible in the shape:
 | `services` | rules + **human** | which services get a private copy — see §5 for the mechanism |
 | `schema_hook` | rules + **human** | the command that brings a fresh database to the schema. Always a question — it touches data — and only an isolated or namespaced start asks it. The hook runs on those starts only unless its entry says `on = "always"`; `null` answers "no" and writes it with `on = "never"` |
 | `provision` | rules, mostly | which local files a worktree needs. Seeding from an example needs a human |
+| `base` | rules, then **human** | the branch `new` forks from and `check` tests. Asked only when origin/HEAD is far behind the main checkout's branch; otherwise origin/HEAD, and nothing to answer |
 
 ## 4. Writing: `pando init --answers`, and nothing else
 
@@ -296,7 +297,7 @@ engine installed on the machine, and it is **machine-wide**. Not
 per-project, not per-worktree: one line, and it governs **every repository
 this developer opens with pando**, including the ones you have never seen
 and the ones they have not written yet. That is why it is not one of the
-nine questions and why `--answers` has no key for it — an answer inferred
+ten questions and why `--answers` has no key for it — an answer inferred
 from the evidence in front of you would quietly settle a question about
 projects that evidence says nothing about.
 
@@ -458,7 +459,7 @@ Read what came back, not what you expected:
   table** — a service is not running, or the schema step is missing.
   That is the `services` and `schema_hook` questions, not a retry.
 
-A fix that is one of the nine answers goes through `init --answers`, and
+A fix that is one of the ten answers goes through `init --answers`, and
 you start the scratch worktree again. A fix that is not — a variable one
 process needs, an app whose own config pins a port — is the developer's:
 name the process, what it did, and the line that would fix it, and write

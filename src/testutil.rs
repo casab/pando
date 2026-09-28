@@ -109,6 +109,63 @@ pub fn init_repo(path: &Path) {
     git(path, &["commit", "--quiet", "--allow-empty", "-m", "root"]);
 }
 
+/// A repository whose origin/HEAD, `origin/develop`, is one commit made
+/// `days` before the branch the main checkout is on, `work`, which has
+/// `ahead` commits it lacks. `file`, when named, is committed on `work`
+/// only, with the dirs it names.
+///
+/// Written by one `git fast-import`, so a hundred commits cost one
+/// process, and with no remote at all: origin/HEAD is only a symbolic ref.
+pub fn drifted_repo(path: &Path, ahead: u32, days: i64, file: Option<&str>) {
+    use std::fmt::Write as _;
+    use std::io::Write as _;
+    std::fs::create_dir_all(path).unwrap();
+    git(path, &["init", "--quiet", "--initial-branch=main"]);
+    let then: i64 = 1_700_000_000;
+    let now = then + days * 86_400;
+    let mut stream = format!(
+        "commit refs/heads/develop\nmark :1\ncommitter t <t@t> {then} +0000\ndata 4\nroot\n\
+         M 644 inline README\ndata 2\nr\n\n\
+         reset refs/remotes/origin/develop\nfrom :1\n\n"
+    );
+    for n in 0..ahead {
+        let _ = write!(
+            stream,
+            "commit refs/heads/work\ncommitter t <t@t> {now} +0000\ndata 2\nc\n"
+        );
+        if n == 0 {
+            stream.push_str("from :1\n");
+            if let Some(file) = file {
+                let _ = write!(stream, "M 644 inline {file}\ndata 2\nl\n");
+            }
+        }
+        stream.push('\n');
+    }
+    let mut child = Command::new("git")
+        .args(["fast-import", "--quiet"])
+        .current_dir(path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("spawn git fast-import");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stream.as_bytes())
+        .unwrap();
+    assert!(child.wait().unwrap().success(), "git fast-import failed");
+    git(
+        path,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/develop",
+        ],
+    );
+    git(path, &["checkout", "--quiet", "work"]);
+}
+
 /// A detached child that is always stopped, even when a test fails partway
 /// through. Every test in this crate that forks a real process holds one of
 /// these: an assertion that panics mid-test must not leave a `sleep` or a

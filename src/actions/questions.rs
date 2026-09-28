@@ -19,7 +19,7 @@ use super::runtime::{
     Machine, RuntimeOutcome, answer_prelude, resolve_runtime, runtime_shell, user_home,
 };
 use super::services::{backends_reachable, placeholder_ports, service_roles};
-use super::worktree::{find_checkout, refuse_a_gone_directory};
+use super::worktree::{find_checkout, ref_exists, refuse_a_gone_directory, resolve_create_base};
 use crate::state::ServiceMode;
 
 /// Something pando needs to know and cannot work out on its own.
@@ -1245,6 +1245,9 @@ fn write_answer(
     if candidate.value.trim().is_empty() {
         bail!("an empty answer is not a {}", slot_label(slot));
     }
+    if slot == Slot::Base {
+        refuse_missing_base(paths, &candidate.value, pending.is_some())?;
+    }
     let replaces = pending.as_ref().is_some_and(|pending| pending.replaces);
     // A config read back from disk still has the answer being replaced.
     if replaces {
@@ -1315,6 +1318,28 @@ fn write_answer(
     detect::apply(slot, candidate, config);
     record_decision(paths, pending, progress);
     Ok(())
+}
+
+/// A base this repository has no branch for is not an answer: written, it
+/// would have `new` refuse every branch it forks, and the check test
+/// origin/HEAD without a word, which is what the answer was given to
+/// stop. Looked up as `new` looks a base up, so a branch only on origin
+/// counts. From a program it is a refused answer, exit 2 like any other
+/// bad value it sent.
+fn refuse_missing_base(paths: &PandoPaths, base: &str, by_program: bool) -> Result<()> {
+    let root = paths.root();
+    if ref_exists(root, &resolve_create_base(root, base)) {
+        return Ok(());
+    }
+    let message = format!(
+        "{base:?} cannot be this project's {}: this repository has no such branch, here or on \
+         origin — nothing was written",
+        slot_label(Slot::Base)
+    );
+    match by_program {
+        true => Err(anyhow::Error::new(RefusedAnswer(message))),
+        false => bail!(message),
+    }
 }
 
 /// Writes "none of them" as the empty form of the slot's own value.
@@ -1829,6 +1854,7 @@ pub(super) fn slot_label(slot: Slot) -> &'static str {
         Slot::Services => "service list",
         Slot::SchemaHook => "schema command",
         Slot::Provision => "provision list",
+        Slot::Base => "base branch",
         Slot::Login => "namespace login",
         Slot::FreeSlot => "slot to free",
     }
@@ -1870,6 +1896,7 @@ fn already_answered(slot: Slot, config: &Config) -> bool {
         // worktree needs a local file of theirs, and an answer nothing
         // records is asked again on every `new`.
         Slot::Provision => config.project.provision.is_some(),
+        Slot::Base => config.project.base.is_some(),
         // `[isolation] none` included: it is how the native half records
         // "none of them", and a reader that missed it published the slot
         // open for good and probed the machine on every isolated start.

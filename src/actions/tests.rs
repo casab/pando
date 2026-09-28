@@ -14542,3 +14542,103 @@ fn a_needed_prelude_is_never_taken_and_nothing_is_written() {
     assert_eq!(written_by_a_guess(&fx), Vec::<PathBuf>::new());
     assert_eq!(user_config(&fx), "");
 }
+
+// ---- the base question -------------------------------------------------
+
+/// A project with nothing to run whose origin/HEAD, `develop`, is far
+/// behind `work`, the branch the main checkout is on.
+fn drifted_fixture() -> Fx {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("acme-shop");
+    crate::testutil::drifted_repo(&root, worktree::FAR_AHEAD, worktree::STALE_DAYS, None);
+    let project = ProjectRef::from_root(&root).unwrap();
+    let paths = PandoPaths::new(dir.path().join("pando-home"), project);
+    Fx {
+        root: paths.root().to_path_buf(),
+        paths,
+        config: Config::default(),
+        _dir: dir,
+    }
+}
+
+fn base_of(fx: &Fx) -> Option<String> {
+    crate::config::load(&fx.paths).unwrap().config.project.base
+}
+
+// Asked only where origin/HEAD is far behind, with the main checkout's
+// branch first, and written as `[project] base` with the evidence.
+#[test]
+fn init_asks_the_base_only_where_origin_head_is_far_behind_the_main_checkout() {
+    let fx = fixture();
+    init(&fx.paths, &fx.config, &Answering::asking(&refuse), &noop).unwrap();
+    assert_eq!(
+        base_of(&fx),
+        None,
+        "a repository with no drift is not asked"
+    );
+
+    let fx = drifted_fixture();
+    let asked = std::cell::RefCell::new(Vec::new());
+    let ask = |q: &Question| -> Result<Answer> {
+        assert_eq!(q.slot, Slot::Base, "only the base is asked here");
+        asked.borrow_mut().push(q.clone());
+        Ok(Answer::Choice(1))
+    };
+    init(&fx.paths, &fx.config, &Answering::asking(&ask), &noop).unwrap();
+    let question = asked.borrow()[0].clone();
+    let values: Vec<&str> = question.options.iter().map(|(v, _)| v.as_str()).collect();
+    assert_eq!(values, ["work", "develop"]);
+    assert_eq!(question.preselect, Some(0));
+    assert!(question.allow_custom && !question.allow_none);
+    assert_eq!(base_of(&fx).as_deref(), Some("develop"));
+    let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+    assert!(
+        written.contains(&format!(
+            "base = \"develop\"  # detected: origin/HEAD, last committed {} days before work",
+            worktree::STALE_DAYS
+        )),
+        "{written}"
+    );
+}
+
+// A program may name the base, proposed or not, and only a branch the
+// repository has: a base `new` cannot find is refused as a bad answer.
+#[test]
+fn a_programs_base_is_written_when_the_branch_exists_and_refused_when_not() {
+    let fx = drifted_fixture();
+    let err = init_with_answers(
+        &fx,
+        &[(Slot::Base, Answer::Custom("saas".to_string()))],
+        &[],
+        &noop,
+    )
+    .unwrap_err();
+    assert!(err.downcast_ref::<RefusedAnswer>().is_some(), "{err:#}");
+    assert!(format!("{err:#}").contains("no such branch"), "{err:#}");
+    assert_eq!(base_of(&fx), None, "nothing was written");
+
+    init_with_answers(
+        &fx,
+        &[(Slot::Base, Answer::Custom("work".to_string()))],
+        &[],
+        &noop,
+    )
+    .unwrap();
+    let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+    assert!(
+        written.contains("base = \"work\"  # answered: a program,"),
+        "{written}"
+    );
+
+    // With nothing proposed, the same answer is still taken.
+    let fx = fixture();
+    git(&fx.root, &["branch", "release"]);
+    init_with_answers(
+        &fx,
+        &[(Slot::Base, Answer::Custom("release".to_string()))],
+        &[],
+        &noop,
+    )
+    .unwrap();
+    assert_eq!(base_of(&fx).as_deref(), Some("release"));
+}

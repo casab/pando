@@ -38,6 +38,8 @@ pub fn still_needed(slot: Slot, config: &Config) -> bool {
         // And again: `provision = []` is "no worktree needs a local file
         // of mine", which a developer may have said by declining.
         Slot::Provision => config.project.provision.is_none(),
+        // Set to a branch, or not set: origin/HEAD is the answer then.
+        Slot::Base => config.project.base.is_none(),
         // Anything already in `[[services]]` is an answer about every
         // service: a developer who listed two has said the third is not
         // wanted, and a second run must not offer it again. So is
@@ -204,6 +206,7 @@ pub fn apply(slot: Slot, candidate: &Candidate, config: &mut Config) {
         Slot::Install => config.project.install = Some(candidate.value.clone()),
         Slot::VersionFiles => config.runtime.version_files = split_list(&candidate.value),
         Slot::Prelude => config.runtime.prelude = Some(candidate.value.clone()),
+        Slot::Base => config.project.base = Some(candidate.value.clone()),
         Slot::Provision => {
             config.project.provision = Some(split_list(&candidate.value));
             // Only what this answer brought: an answer with no seeds in it
@@ -427,7 +430,7 @@ pub fn edits(slot: Slot, candidate: &Candidate) -> Vec<Edit> {
     };
     let keyed = slot.key();
     match slot {
-        Slot::Prelude => {
+        Slot::Prelude | Slot::Base => {
             let (table, key) = keyed.expect("this slot writes one key");
             vec![single(table, key, candidate.value.clone().into())]
         }

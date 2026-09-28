@@ -20,11 +20,13 @@
 //! `dev` has the per-slot proposals for install, version files, the dev
 //! command, make targets, ports and provision, `workspaces` the apps of a
 //! monorepo, and `services` the services a project talks to and its schema
-//! hook. `apply` turns a chosen candidate into config and into edits.
+//! hook. `base` asks which branch work starts from, from the refs alone.
+//! `apply` turns a chosen candidate into config and into edits.
 
 pub use crate::catalog::frameworks::{FrameworkRule, PortMechanism, RULES};
 
 mod apply;
+mod base;
 mod dev;
 mod frameworks;
 mod proposal;

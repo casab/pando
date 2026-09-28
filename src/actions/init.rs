@@ -25,7 +25,7 @@ use super::questions::resolve;
 /// questions, not a second set of them: one implementation of each
 /// question, or the two drift and a developer gets a different config
 /// depending on which command reached the slot first.
-pub const ALL_SLOTS: [Slot; 9] = [
+pub const ALL_SLOTS: [Slot; 10] = [
     Slot::Install,
     Slot::VersionFiles,
     Slot::Prelude,
@@ -40,6 +40,10 @@ pub const ALL_SLOTS: [Slot; 9] = [
     Slot::Services,
     Slot::SchemaHook,
     Slot::Provision,
+    // Last: which commit the rest is tested on. A question only where
+    // origin/HEAD is far behind the main checkout, and only here: with no
+    // base named, `new` forks from origin/HEAD as it always has.
+    Slot::Base,
 ];
 
 /// Whether this project would run nothing: no process that config
@@ -486,6 +490,7 @@ pub fn slot_value(config: &Config, slot: Slot) -> Option<String> {
                 true => "none".to_string(),
                 false => paths.join(", "),
             }),
+        Slot::Base => config.project.base.clone(),
         // Nothing config holds.
         Slot::FreeSlot => None,
         // Which services have one, and never what it is.
