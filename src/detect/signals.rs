@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::catalog::artifacts;
 use crate::catalog::frameworks;
 use crate::catalog::package_managers;
 
@@ -399,17 +400,6 @@ pub(super) fn env_example(root: &Path) -> Vec<(String, String)> {
     Vec::new()
 }
 
-/// Build output and editor noise: present and ignored, but nothing a new
-/// worktree needs a copy of.
-const PROVISION_DENYLIST: [&str; 6] = [
-    ".DS_Store",
-    "Thumbs.db",
-    "npm-debug.log",
-    "yarn-error.log",
-    "pnpm-debug.log",
-    "tsconfig.tsbuildinfo",
-];
-
 /// Root-level files that git ignores and that exist — the local files a
 /// fresh worktree would be missing.
 ///
@@ -438,7 +428,7 @@ pub(super) fn ignored_present(root: &Path) -> Vec<String> {
         .split('\0')
         .filter(|p| !p.is_empty())
         .filter(|p| !p.contains('/'))
-        .filter(|p| !PROVISION_DENYLIST.contains(p))
+        .filter(|p| !artifacts::is_artifact(p))
         .filter(|p| root.join(p).is_file())
         .map(str::to_string)
         .collect();
@@ -479,7 +469,7 @@ pub(super) fn provision_seeds(root: &Path) -> Vec<(String, String)> {
             continue;
         };
         if destination.is_empty()
-            || PROVISION_DENYLIST.contains(&destination)
+            || artifacts::is_artifact(destination)
             || root.join(destination).exists()
             || !is_gitignored(root, destination)
         {

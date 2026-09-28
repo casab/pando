@@ -13,6 +13,8 @@
 //! - a service image compose files use: a row in [`images::IMAGES`];
 //! - a dev server that refuses unknown hosts: a row in
 //!   [`host_checks::HOST_CHECKS`];
+//! - a tool cache or build artifact no worktree needs a copy of: a row in
+//!   [`artifacts::ARTIFACTS`];
 //! - a language or version manager: `runtime::languages`, which the
 //!   runtime probe reads directly;
 //! - a native service (postgres, redis…): a recipe file, see `recipes`.
@@ -21,6 +23,7 @@
 //! the lookups over it; the modules that act on the data stay where they
 //! are.
 
+pub mod artifacts;
 pub mod frameworks;
 pub mod host_checks;
 pub mod images;

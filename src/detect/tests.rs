@@ -2640,6 +2640,21 @@ fn only_root_level_ignored_files_are_present_ones() {
     assert_eq!(ignored_present(dir.path()), [".env", "debug.log"]);
 }
 
+// A test run leaves a coverage database at the root, gitignored and
+// present, and it is not a local setting: taking it was a first run's
+// only provision answer, and `--yes` took it.
+#[test]
+fn a_tool_artifact_is_never_a_provision_file() {
+    let dir = seed_fixture(&[
+        (".gitignore", ".coverage*\n.env\n.eslintcache\n"),
+        (".coverage", "sqlite"),
+        (".coverage.laptop.1.2", "sqlite"),
+        (".eslintcache", "{}"),
+        (".env", "PORT=3000\n"),
+    ]);
+    assert_eq!(ignored_present(dir.path()), [".env"]);
+}
+
 // The fresh-clone case: `.env` is gitignored so it never arrives, and
 // the example beside it is the only thing that says what it looks like.
 #[test]
