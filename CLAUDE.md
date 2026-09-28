@@ -94,6 +94,14 @@ word the repository was made public and GitHub Pages switched on:
 `.github/workflows/pages.yml` republishes it on every push that changes
 it.
 
+Later on 2026-09-28 the first two outside issues were fixed (#4, a
+polyglot monorepo whose root has no manifest; #5, an Expo app beside a
+backend), unreleased: detection reads app directories below such a
+root, Expo is a framework rule, `processes` takes an object of process
+tables through `--answers`, a project that would run nothing is an open
+question, and `base` is a question, a `check --base` flag and a check
+failure kind of its own. What they left is in `plans/open-follow-ups.md`.
+
 What is left is not a phase. `plans/open-follow-ups.md` carries the known
 edges, each with who found it and where it belongs, and the rest of the
 launch checklist in `docs/08-roadmap.md` is open: no published crate, no
