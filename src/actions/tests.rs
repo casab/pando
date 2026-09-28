@@ -15035,10 +15035,7 @@ fn trying_on_its_own_takes_the_first_base_so_the_check_has_nothing_to_ask() {
     let fx = drifted_fixture();
     let machine = FakeMachine::with_nvm();
     let shell = machine.shell("22.11.0", "", "");
-    let m = Machine {
-        shell: &shell,
-        home: machine.home.path().to_path_buf(),
-    };
+    let m = Machine::at(&shell, machine.home.path().to_path_buf());
     let guessed = super::trying::try_on_its_own_on(&fx.paths, &fx.config, &noop, &m).unwrap();
     assert!(
         matches!(guessed, super::trying::OwnGuess::Saved(_)),
