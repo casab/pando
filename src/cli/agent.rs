@@ -85,9 +85,8 @@ pub(super) fn job(paths: &PandoPaths) -> String {
     let _ = writeln!(
         out,
         "pando runs each git branch of this repository in its own worktree, with its own\n\
-         ports, logs and services. You are done when `pando check` passes and you have saved\n\
-         the block at the end; then tell the developer: \"pando is set up and tested for\n\
-         {project}. You're ready: run `pando`.\"\n"
+         ports, logs and services. You are done when `pando check` passes and you have told\n\
+         the developer so, as the steps below say.\n"
     );
 
     let (config, error) = load(paths);

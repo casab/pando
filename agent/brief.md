@@ -16,79 +16,74 @@ nothing except through `pando init --answers`.**
 ## First run: set pando up, then prove it with `pando check`
 
 The developer pasted one line: run `pando init --agent` and follow what it
-says. That command printed pando's view of this project and this section.
-You are done when `pando check` passes and you have offered to remember
+says. You are done when `pando check` passes and you have offered to remember
 how to run the project. Change no file in the developer's repository, and
-none of theirs outside it without a yes: every setting goes
-through `pando init --answers -`, and the worktree `pando check` makes is
-pando's own, inside `.git`, removed when it is done.
+none of theirs outside it without a yes: every setting goes through
+`pando init --answers -`, and the worktree `pando check` makes is pando's
+own, inside `.git`, removed when it is done.
 
-1. **Ask the developer nothing.** A first run is the fast path: pando's
-   rules have a first choice for almost everything, and taking it gets the
-   developer to ready soonest. They change any of it later. The one
-   question a first run asks comes at the very end, in step 7, and it is
-   about a file of theirs, not about the setup.
+1. **Ask the developer nothing that pando or the project's docs answer.**
+   Taking pando's first choices gets them to ready soonest, and they
+   change any of it later. The one question a first run always asks
+   comes at the end, in step 7.
 2. **Save pando's choices in one step: `pando init --yes`.** It takes
    pando's first choice for every open question and writes it under
-   `~/.pando`, never into the repository. That settles the two choices
-   §1 calls the developer's as well: every app of a monorepo runs, and
-   how private services would run does not matter to the check, which
-   uses the developer's own services as the main checkout does.
-3. **A question with no option is yours to answer, not theirs.** When
+   `~/.pando`, never into the repository. pando runs every app it found a
+   command for. The check uses the developer's own services, as the main
+   checkout does, so how private ones would run does not matter to it.
+3. **A question with no option is yours to answer.** When
    `pando init --yes` leaves one open (exit 3, the question on stderr),
-   answer it from the repository's own evidence: `pando signals` and
-   `pando doctor --json` have it. Do not re-derive what they report
-   (§0). Answer through stdin, never an answers file, which in the
-   project would be a file in the developer's repository:
+   answer it from `pando signals` and `pando doctor --json`. Do not
+   re-derive what they report. Answer through stdin, never an answers
+   file, which in the project would be a file in the developer's
+   repository:
 
    ```bash
-   pando init --answers - --dry-run    # the answers as one JSON object on stdin; writes nothing
+   pando init --answers - --dry-run    # one JSON object on stdin; writes nothing
    pando init --answers -              # the same object, written
    ```
 
+   When `signals` lists `app_dirs` that no process covers, such as an app
+   with no dev script, pando leaves `processes` open. Answer it with an
+   object of process tables, one per process the project runs, from its
+   README or docs: `{"api": {"cmd": "…", "cwd": "backend", "ports":
+   ["api"]}, "web": {…}}`. A process that needs another's address gets it
+   in `env` as `{port:<role>}`. Ask the developer only what the docs do
+   not say.
 4. **Run `pando check`, with a timeout of at least 10 minutes.** It makes a
    throwaway worktree of the commit a new branch would fork from, runs the
-   install, starts every app, checks the one the browser opens really
+   install, starts every process, checks the one the browser opens really
    answers, and removes it all. The prompt the developer pasted is their
-   consent to this test. When namespaced mode already has a login, the
-   check also runs the schema step, in a database of its own in the
-   developer's server that it drops again; otherwise its notes say the
-   schema step was not tested, and why.
+   consent to this test. Its notes say whether the schema step was tested:
+   only namespaced mode with a login runs it.
 5. **When the check fails, fix, then rerun; never rerun unchanged.**
    - A settings failure is yours: correct the answer with
-     `pando init --answers - --replace`, which replaces a slot that is
-     already answered, then run the check again.
+     `pando init --answers - --replace`, then run the check again.
    - A machine failure (`kind: "machine"`: a server not running, Docker
-     stopped, a runtime missing) is the developer's, and the one thing to
-     tell them before you are done: the command pando printed. Change no
-     setting for it.
-   - A base failure (`kind: "base"`) means the tested commit lacks a
-     file the setup needs, often a lockfile, that the main checkout's
-     branch has. Change no setting to get past it, and never drop a frozen
-     install's flag: that passes on the wrong commit. The branch work
-     starts from is the developer's: tell them both refs from `reason`,
-     answer `base` with the one they name, and check again. `pando check
-     --base <branch>` tests one without saving it.
+     stopped, a runtime missing) is the developer's: tell them the
+     command pando printed, and change no setting for it.
+   - A base failure (`kind: "base"`): the tested commit lacks a file,
+     often a lockfile, that the main checkout's branch has. Change no
+     setting to get past it, and never drop a frozen install's flag.
+     Which branch work starts from is the developer's: tell them both
+     refs from `reason`, answer `base` with the one they name, and check
+     again. `pando check --base <branch>` tests one without saving it.
    - Exit 3 is not a failure: a question is still open, and the check
-     started nothing. Answer it with `pando init --answers -`, then run
-     the check again.
+     started nothing. Answer it, then run the check again.
    - Stop after three changed attempts, and tell the developer what is
      wrong in pando's own words.
-6. **Remember how to run it, only if the developer says yes.** The job
-   ends with a block that says how this project's worktrees, and its main
-   checkout, run with pando; `pando init --agent --reference memory`
-   prints it alone. It belongs in your own persistent memory — Claude
-   Code: `~/.claude/CLAUDE.md`; Codex: `~/.codex/AGENTS.md`; any other
-   agent: its own memory — so a later session in any worktree starts,
-   stops and reads it through pando. That file is the developer's, read
-   in every session of every project, so write nothing to it without
-   their yes: ask with the done message in step 7. On a yes, save the
-   block there, replacing an earlier pando block for the same project
-   root (its heading names the root) rather than adding a second. On a
-   no, or no answer, write nothing, and give them the block to keep
-   wherever they like. Never a `CLAUDE.md`, `AGENTS.md` or any other file
-   inside the repository. If a sandbox will not let you write the file
-   after a yes, give the developer the block and the file's name instead.
+6. **Remember how to run it, only if the developer says yes.** The block
+   at the end of the job says how the project runs with pando;
+   `pando init --agent --reference memory` prints it alone. It belongs in
+   your own persistent memory — Claude Code: `~/.claude/CLAUDE.md`;
+   Codex: `~/.codex/AGENTS.md`; any other agent: its own. That file is
+   the developer's, read in every session of every project, so write
+   nothing to it without their yes. On a yes, save the block there,
+   replacing an earlier pando block for the same project root (its
+   heading names the root). On a no, or no answer, write nothing, and
+   give them the block to keep. Never a `CLAUDE.md`, `AGENTS.md` or any
+   other file inside the repository. If a sandbox will not let you write
+   the file, give them the block and its name.
 7. **Tell the developer you're done, in two lines, then ask step 6's
    question:**
 
@@ -98,14 +93,14 @@ pando's own, inside `.git`, removed when it is done.
    > Want me to remember how to run it with pando? I'd add a short block
    > to `~/.claude/CLAUDE.md`, which I read in every session.
 
-   Name your own memory file in the question. When the check's notes say
-   the schema step was not tested, add one line before the question: it
-   is untested until namespaced mode is set up, which the first
-   `pando start --namespaced` does by asking for its login once.
+   Name your own memory file in the question. Before it, add one line
+   for each of these that applies: the schema step is untested until the
+   first `pando start --namespaced` asks for its login; the job's line
+   about a phone or tablet; the line `pando doctor` notes about a queue
+   worker on a shared Redis.
 
-The rest of this brief is for when a failure needs it
-(`pando init --agent --reference brief`); a first run that passes never
-does.
+The rest of this brief is for a failure that needs it; a first run that
+passes never does.
 
 ---
 

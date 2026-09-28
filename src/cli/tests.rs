@@ -4113,8 +4113,23 @@ fn the_job_carries_the_briefs_first_run_section_and_only_that() {
         ),
         ("`pando init --yes`", "pando's choices saved in one step"),
         (
-            "every app of a monorepo runs",
+            "pando runs every app it found a command for",
             "the apps question settled, not asked",
+        ),
+        // Both first runs of issue-shaped fixtures ended green with an
+        // app left out: an app with no dev script is the agent's to add.
+        (
+            "`app_dirs` that no process covers",
+            "that an app pando found no command for is the agent's to add",
+        ),
+        (
+            "object of process tables",
+            "how several processes are answered",
+        ),
+        ("{port:<role>}", "how a process finds another's address"),
+        (
+            "Ask the developer only what the docs do not say",
+            "that the docs come before the developer",
         ),
         ("pando init --answers - --dry-run", "the preview"),
         (
@@ -4170,6 +4185,12 @@ fn the_job_carries_the_briefs_first_run_section_and_only_that() {
     assert!(
         !section.contains("## 0."),
         "the section runs on into the brief's next one:\n{section}"
+    );
+    // The job prints this section and no other, so a pointer to one of
+    // the brief's numbered sections points at nothing the reader has.
+    assert!(
+        !section.contains('§'),
+        "the section sends its reader to a part of the brief the job does not print:\n{section}"
     );
 
     let fx = fixture();
