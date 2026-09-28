@@ -19,7 +19,8 @@ pando checkout they are `agent/brief.md` and `agent/json.md`.) Or run
 **Read the exit code first**: `0` carry on · `1` read stderr and do not
 retry · `2` you asked wrongly, fix the request · `3` **a question is
 unanswered and it is on stderr**. Answer a `3` with
-`pando init --answers <file>`, or hand the question to the developer.
+`pando init --answers -`, the answers on stdin and never in a file in the
+repository, or hand the question to the developer.
 Never retry unchanged, and never reach for `--yes` to make a `3` go away:
 that is you deciding on their behalf with no evidence you did not already
 have.

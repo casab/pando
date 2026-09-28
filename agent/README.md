@@ -51,7 +51,8 @@ a stale copy is the one failure mode this layout has.
 
 ## If you are the agent
 
-Run `pando init --agent`, or read [`brief.md`](./brief.md). Start with
-`pando signals` and `pando doctor --json`, write only through
-`pando init --answers`, and never write a byte into the developer's
+Run `pando init --agent`, or read [`brief.md`](./brief.md). Take
+pando's choices with `pando init --yes`, answer what it leaves open from
+`pando signals` and `pando doctor --json` through `pando init --answers -`,
+prove it with `pando check`, and never write a byte into the developer's
 repository.
