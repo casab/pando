@@ -2702,10 +2702,6 @@ fn the_memory_block_names_the_project_its_root_and_only_real_commands() {
         ),
         ("exit 3", "the code that is a question"),
         (
-            "a phone cannot reach `127.0.0.1`",
-            "that a device needs the LAN address",
-        ),
-        (
             "`pando init --agent --reference brief`",
             "where the rest is",
         ),

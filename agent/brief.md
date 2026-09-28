@@ -62,15 +62,13 @@ pando's own, inside `.git`, removed when it is done.
      stopped, a runtime missing) is the developer's, and the one thing to
      tell them before you are done: the command pando printed. Change no
      setting for it.
-   - A base failure (`kind: "base"`) means the commit the check tested
-     lacks a file the setup needs — a lockfile, most often — which the
-     main checkout's branch has. The settings may be right: change none
-     of them to get past it, and never drop a frozen install's flag, which
-     would pass on the wrong commit. Which branch work starts from is the
-     developer's: tell them both refs from `reason`, and once they name
-     one, answer `base` with it through `pando init --answers -` and run
-     the check again. `pando check --base <branch>` tests one without
-     saving it.
+   - A base failure (`kind: "base"`) means the tested commit lacks a
+     file the setup needs, often a lockfile, that the main checkout's
+     branch has. Change no setting to get past it, and never drop a frozen
+     install's flag: that passes on the wrong commit. The branch work
+     starts from is the developer's: tell them both refs from `reason`,
+     answer `base` with the one they name, and check again. `pando check
+     --base <branch>` tests one without saving it.
    - Exit 3 is not a failure: a question is still open, and the check
      started nothing. Answer it with `pando init --answers -`, then run
      the check again.

@@ -302,9 +302,7 @@ fn project_now(paths: &PandoPaths, config: &Config) -> String {
             }
             // No proposal here is no gap: origin/HEAD is close enough to
             // the main checkout's branch to be where work starts.
-            (false, None) if slot == Slot::Base => {
-                "origin/HEAD, which nothing says is behind where work starts".to_string()
-            }
+            (false, None) if slot == Slot::Base => "origin/HEAD".to_string(),
             (false, None) => "nothing proposed".to_string(),
         };
         let _ = writeln!(out, "- {name}: {line}");

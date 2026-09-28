@@ -49,7 +49,6 @@ pub fn memory_block(paths: &PandoPaths) -> String {
          - a new branch: `pando new <branch>`, then `pando start <branch> --wait`\n\
          - every worktree: `pando ls --json`\n\
          - exit 3: pando has a question, on stderr. Put it to the developer; never add `--yes`.\n\
-         - a phone cannot reach `127.0.0.1`: tell the developer to set the LAN address in `env`\n\
          - the rest: `pando init --agent --reference brief`\n",
     );
     out
