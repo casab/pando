@@ -7,6 +7,16 @@ may change behaviour.
 
 ## Unreleased
 
+### Changed
+
+- pando states the oldest Rust it builds with, 1.88, in `Cargo.toml`
+  (`rust-version`), so an older toolchain gets a clear message instead
+  of a build error, and CI builds with exactly that version.
+- The README and the website say how to get Rust (rustup) when there is
+  none, and install with `cargo install --locked`, the dependency
+  versions CI tested. The website no longer calls what shipped in 0.5.0
+  unreleased.
+
 ## 0.5.0 — 2026-09-28
 
 ### Added

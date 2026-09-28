@@ -13,6 +13,7 @@ mod agent;
 mod check;
 mod cli;
 mod detect;
+mod distribution;
 mod docker;
 mod engines;
 mod hooks;

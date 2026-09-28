@@ -2,6 +2,11 @@
 name = "pando-cli"
 version = "0.5.0"
 edition = "2024"
+# The oldest Rust that builds pando: 1.88, for `if … && let` chains and
+# because ratatui, darling and instability need it themselves. The
+# README and the website state it, `tests/distribution.rs` holds them to
+# this line, and the CI job `msrv` builds with exactly this toolchain.
+rust-version = "1.88"
 description = "One repo. Every branch alive."
 authors = ["Mert Karadayi <https://github.com/mertkaradayi>"]
 license = "AGPL-3.0-only"

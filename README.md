@@ -67,9 +67,12 @@ for people and for the coding agents working beside them.
 
 ## Sixty seconds
 
+No Rust yet? `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`,
+then open a new terminal. pando needs Rust 1.88 or newer.
+
 ```bash
 git clone https://github.com/mertkaradayi/pando && cd pando
-cargo install --path .              # pando lands in ~/.cargo/bin
+cargo install --locked --path .     # pando lands in ~/.cargo/bin
 
 cd ~/code/your-project
 pando                               # the TUI; the first time, the setup screen
@@ -456,14 +459,25 @@ document whole.
 
 ## Install
 
-There is no published binary yet. Build it from source with a Rust
-toolchain, recent and stable (pando is developed on 1.90):
+There is no published binary yet. Build it from source: it needs `git`
+and Rust 1.88 or newer. With no Rust on the machine, rustup installs the
+current stable toolchain, and a new terminal then has `cargo`:
 
 ```bash
-cargo install --path .        # puts `pando` in ~/.cargo/bin
-# or
-cargo build --release         # the binary is target/release/pando
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
+
+On a new Mac, `git` comes with the Xcode Command Line Tools
+(`xcode-select --install`). Then, from a clone of this repository:
+
+```bash
+cargo install --locked --path .   # puts `pando` in ~/.cargo/bin
+# or
+cargo build --release             # the binary is target/release/pando
+```
+
+`--locked` builds with the exact dependency versions CI tested; without
+it cargo may pick newer ones that need a newer Rust.
 
 `pando --version` says which version you have, and `pando completions zsh`
 (or bash, fish…) prints a completion script. Worktrees need `git`; isolated

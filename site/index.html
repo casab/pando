@@ -65,14 +65,19 @@
         <a class="btn" href="#try">Try it here <span class="kbd">↓</span></a>
         <a class="btn ghost" href="#install">Install</a>
       </div>
-      <div class="hero-steps" role="group" aria-label="Install pando, then run it in your project">
+      <div class="hero-steps" role="group" aria-label="Get Rust if you need it, install pando, then run it in your project">
         <div class="hs-row">
           <span class="hs-n" aria-hidden="true">1</span>
-          <code class="hs-cmd"><span class="p">$</span> git clone https://github.com/mertkaradayi/pando &amp;&amp; cd pando &amp;&amp; cargo install --path .</code>
-          <button class="copy hs-copy" type="button" data-copy="git clone https://github.com/mertkaradayi/pando &amp;&amp; cd pando &amp;&amp; cargo install --path ." aria-label="Copy the install command">copy</button>
+          <code class="hs-cmd"><span class="p">$</span> curl --proto &#39;=https&#39; --tlsv1.2 -sSf https://sh.rustup.rs | sh</code>
+          <span class="hs-c">only without Rust 1.88+</span>
         </div>
         <div class="hs-row">
           <span class="hs-n" aria-hidden="true">2</span>
+          <code class="hs-cmd"><span class="p">$</span> git clone https://github.com/mertkaradayi/pando &amp;&amp; cd pando &amp;&amp; cargo install --locked --path .</code>
+          <button class="copy hs-copy" type="button" data-copy="git clone https://github.com/mertkaradayi/pando &amp;&amp; cd pando &amp;&amp; cargo install --locked --path ." aria-label="Copy the install command">copy</button>
+        </div>
+        <div class="hs-row">
+          <span class="hs-n" aria-hidden="true">3</span>
           <code class="hs-cmd"><span class="p">$</span> pando<span class="cur" aria-hidden="true"></span></code>
           <span class="hs-c">then, in any project you work on</span>
         </div>
@@ -195,7 +200,7 @@
       <div><span class="gl g">◌</span><span>starting, or something is being done to it</span></div>
       <div><span class="gl rd">✗</span><span>failed: <kbd>l</kbd> shows the log that says why</span></div>
       <div><span class="gl d">○</span><span>stopped: <kbd>s</kbd> starts it</span></div>
-      <div><span class="gl g">⌂</span><span>the main checkout, always the first row <span class="tag-new">unreleased</span></span></div>
+      <div><span class="gl g">⌂</span><span>the main checkout, always the first row <span class="tag-new">new in 0.5.0</span></span></div>
       <div><span class="gl or">▣</span><span>isolated: private copies of the services</span></div>
       <div><span class="gl am">◧</span><span>namespaced: a database and a slot of its own (experimental)</span></div>
       <div><span class="gl g">◈</span><span>public: shared on the internet</span></div>
@@ -204,7 +209,7 @@
       <div><span class="gl d">✎</span><span>uncommitted changes</span></div>
       <div><span class="gl d">:22809</span><span>where it serves: <kbd>c</kbd> copies the URL</span></div>
     </div>
-    <p class="rv d">The ⌂ row, the ▣ and ◧ marks and this column layout are on <code>main</code>, after 0.4.0. A key that would interrupt something running asks for a second press within three seconds: <kbd>x</kbd> <kbd>x</kbd> stops it, and <kbd>r</kbd> <kbd>r</kbd> restarts it. Sharing, removing, stopping everything and switching a running worktree's mode ask in a dialog instead. On a stopped worktree, <kbd>x</kbd>, <kbd>r</kbd> and <kbd>P</kbd> act at once. The screen keeps up by polling: every quarter second for the screen, every second for processes, every five seconds for the worktree list and the selected worktree's git state, and every thirty for the others'. It fits a tmux split: below 72 columns the table and the detail pane stack.</p>
+    <p class="rv d">The ⌂ row, the ▣ and ◧ marks and this column layout are new in 0.5.0. A key that would interrupt something running asks for a second press within three seconds: <kbd>x</kbd> <kbd>x</kbd> stops it, and <kbd>r</kbd> <kbd>r</kbd> restarts it. Sharing, removing, stopping everything and switching a running worktree's mode ask in a dialog instead. On a stopped worktree, <kbd>x</kbd>, <kbd>r</kbd> and <kbd>P</kbd> act at once. The screen keeps up by polling: every quarter second for the screen, every second for processes, every five seconds for the worktree list and the selected worktree's git state, and every thirty for the others'. It fits a tmux split: below 72 columns the table and the detail pane stack.</p>
   </div>
 </section>
 
@@ -391,7 +396,7 @@ fingerprint = [<span class="s">"prisma/migrations/**"</span>]</pre>
       </div>
     </div>
 
-    <h3 class="rv" data-beat="the main checkout">The main checkout runs too <span class="tag-new">unreleased</span></h3>
+    <h3 class="rv" data-beat="the main checkout">The main checkout runs too <span class="tag-new">new in 0.5.0</span></h3>
     <p class="rv"><code>pando start main</code>, or <code>pando start</code> with no name from inside it, runs the main checkout's processes on ports pando allocates. It is listed first, marked <span class="g">⌂</span>. The checkout is yours and you set it up, so pando runs its processes and nothing else: no install, no hooks, and always on the project's own services. <code>rm</code> never removes it. Careful: <code>pando stop</code> with no name inside the main checkout stops every worktree, not only the main one.</p>
   </div>
 </section>
@@ -668,7 +673,7 @@ include = [<span class="s">"postgres"</span>, <span class="s">"redis"</span>]
 env = { DATABASE_URL = <span class="s">"postgres"</span>, REDIS_URL = <span class="s">"redis"</span> }</pre>
     </div>
 
-    <h3 class="rv" data-beat="setup screen">The guided first run <span class="tag-new">unreleased</span></h3>
+    <h3 class="rv" data-beat="setup screen">The guided first run <span class="tag-new">new in 0.5.0</span></h3>
     <div class="split wide-left">
       <div class="setup rv" role="group" aria-label="The pando setup screen">
         <div class="setup-top"><span class="w b">pando</span> <span class="d">— acme-shop</span><span class="grow"></span><span class="d">first time here</span></div>
@@ -709,7 +714,7 @@ Pando: one aspen, 47,000 stems, one root. Your repo, every branch alive.
       </div>
     </div>
 
-    <h3 class="rv" data-beat="check">pando check: proof in a throwaway worktree <span class="tag-new">unreleased</span></h3>
+    <h3 class="rv" data-beat="check">pando check: proof in a throwaway worktree <span class="tag-new">new in 0.5.0</span></h3>
     <div class="split stack">
       <div class="rv">
         <p><code>pando check</code> makes a detached worktree of the commit a new branch would fork from, so there is no branch. It installs it, starts every process, waits until they are ready, and asks the process that owns the URL for <code>/</code>. Then it stops and removes the worktree, keeps its logs, and records the result in <code>check.json</code>.</p>
@@ -741,7 +746,7 @@ pando: removed the test worktree; nothing left behind</span>
             <tr><td class="g">3</td><td>pando has a question, printed on stderr. It is not a failure. An agent puts the question to the developer and never adds <code>--yes</code> on its own.</td></tr>
           </tbody>
         </table>
-        <p>The repository includes a Claude Code plugin and Codex skills, each a thin wrapper around one brief (<code>agent/brief.md</code>). The binary carries the brief as well: <code>pando init --agent --reference brief</code>. When the check passes, the agent offers to save a short note on how to run this project with pando, in its own memory and never in your repository. It saves the note only if you say yes, and later sessions then start and stop worktrees through pando instead of by hand. <span class="tag-new">unreleased</span></p>
+        <p>The repository includes a Claude Code plugin and Codex skills, each a thin wrapper around one brief (<code>agent/brief.md</code>). The binary carries the brief as well: <code>pando init --agent --reference brief</code>. When the check passes, the agent offers to save a short note on how to run this project with pando, in its own memory and never in your repository. It saves the note only if you say yes, and later sessions then start and stop worktrees through pando instead of by hand. <span class="tag-new">new in 0.5.0</span></p>
       </div>
 <pre class="code rv"><span class="p">$</span> pando status feat/login --json   <span class="c"># trimmed</span>
 {
@@ -783,12 +788,12 @@ pando: removed the test worktree; nothing left behind</span>
     <h3 id="ref-verbs" class="rv" data-beat="commands">Commands</h3>
     <p class="rv d">A worktree is named by its branch (<code>feat/login</code>) or its directory (<code>feat+login</code>). Inside a worktree, <code>start</code>, <code>stop</code>, <code>restart</code>, <code>logs</code>, <code>open</code>, <code>share</code> and <code>unshare</code> need no name. stdout carries only the answer; narration goes to stderr.</p>
     <div class="verbs rv">
-      <div class="verb"><div class="sig"><span class="name">pando</span></div><div class="what">Open the TUI for the repository you are in. The first time, in a project with nothing to run, the setup screen <span class="tag-new">unreleased</span>.</div></div>
+      <div class="verb"><div class="sig"><span class="name">pando</span></div><div class="what">Open the TUI for the repository you are in. The first time, in a project with nothing to run, the setup screen <span class="tag-new">new in 0.5.0</span>.</div></div>
       <div class="verb"><div class="sig"><span class="name">new</span> &lt;branch&gt;</div><div class="what"><p>Create a worktree and branch from the default base: check out, link the provisioned files, run the install step.</p><div class="flags"><code>--base &lt;ref&gt;</code> fork from here · <code>--yes</code> take pando's first choice for any question</div></div></div>
       <div class="verb"><div class="sig"><span class="name">start</span> [name]</div><div class="what"><p>Start its processes on its ports. On a terminal, wait until each is listening on its port.</p><div class="flags"><code>--shared</code> · <code>--isolated</code> · <code>--namespaced</code> (experimental) · <code>--only &lt;process&gt;</code> · <code>--wait</code> / <code>--no-wait</code> · <code>--yes</code></div></div></div>
-      <div class="verb"><div class="sig"><span class="name">stop</span> [name]</div><div class="what"><p>Stop its processes, its private services and its public URL. Ports, logs and data are kept.</p><div class="flags"><code>--only &lt;process&gt;</code> · <code>--all</code> every worktree (and the main checkout <span class="tag-new">unreleased</span>)</div></div></div>
+      <div class="verb"><div class="sig"><span class="name">stop</span> [name]</div><div class="what"><p>Stop its processes, its private services and its public URL. Ports, logs and data are kept.</p><div class="flags"><code>--only &lt;process&gt;</code> · <code>--all</code> every worktree (and the main checkout <span class="tag-new">new in 0.5.0</span>)</div></div></div>
       <div class="verb"><div class="sig"><span class="name">restart</span> [name]</div><div class="what"><p>Stop and start again, keeping the ports.</p><div class="flags"><code>--isolated</code> · <code>--namespaced</code> (experimental) · <code>--only &lt;process&gt;</code> · <code>--wait</code> / <code>--no-wait</code> · <code>--yes</code> (the way back to shared is <code>start --shared</code>)</div></div></div>
-      <div class="verb"><div class="sig"><span class="name">ls</span></div><div class="what"><p>Every worktree, the main checkout first <span class="tag-new">unreleased</span>: status, URL, ports, git. The columns fit the terminal.</p><div class="flags"><code>-l</code> adds HEAD and path · <code>--json</code></div></div></div>
+      <div class="verb"><div class="sig"><span class="name">ls</span></div><div class="what"><p>Every worktree, the main checkout first <span class="tag-new">new in 0.5.0</span>: status, URL, ports, git. The columns fit the terminal.</p><div class="flags"><code>-l</code> adds HEAD and path · <code>--json</code></div></div></div>
       <div class="verb"><div class="sig"><span class="name">status</span> [name]</div><div class="what"><p>What runs where, per process and per service, with its reason when it failed.</p><div class="flags"><code>--json</code> · <code>--env</code> prints <code>export</code> lines: <code>eval "$(pando status --env feat/login)"</code></div></div></div>
       <div class="verb"><div class="sig"><span class="name">logs</span> [name]</div><div class="what"><p>Its log: one process, or all of them merged, with the process name in front of each line.</p><div class="flags"><code>-s, --source &lt;process&gt;</code> · <code>-n, --tail N</code> (50) · <code>-f, --follow</code> · <code>--json</code> one object per line</div></div></div>
       <div class="verb"><div class="sig"><span class="name">open</span> [name]</div><div class="what"><p>Print its URL and open it in the browser (<code>$BROWSER</code>, or the desktop's opener).</p><div class="flags"><code>--public</code> the shared URL</div></div></div>
@@ -796,8 +801,8 @@ pando: removed the test worktree; nothing left behind</span>
       <div class="verb"><div class="sig"><span class="name">unshare</span> [name]</div><div class="what">Take the public URL down.</div></div>
       <div class="verb"><div class="sig"><span class="name">path</span> &lt;name&gt;</div><div class="what">Print the worktree's absolute path: <code>cd "$(pando path feat/login)"</code>.</div></div>
       <div class="verb"><div class="sig"><span class="name">rm</span> &lt;name&gt;</div><div class="what"><p>Stop everything, remove the worktree, wipe its logs and data. The branch is kept, and the main checkout is never removed.</p><div class="flags"><code>--force</code> even with uncommitted changes · <code>--yes</code> a worktree pando did not create</div></div></div>
-      <div class="verb"><div class="sig"><span class="name">init</span></div><div class="what"><p>Answer every setup question now, in one pass, instead of taking defaults as you go.</p><div class="flags"><code>--yes</code> · <code>--answers &lt;file|-&gt;</code> · <code>--dry-run</code> · <code>--replace</code>, <code>--agent</code> the job for a coding agent, <code>--reference brief|json|memory</code> <span class="tag-new">unreleased</span></div></div></div>
-      <div class="verb"><div class="sig"><span class="name">check</span></div><div class="what"><p>Test the setup in a throwaway worktree: install, start, ask for the page, remove. <span class="tag-new">unreleased</span></p><div class="flags"><code>--json</code></div></div></div>
+      <div class="verb"><div class="sig"><span class="name">init</span></div><div class="what"><p>Answer every setup question now, in one pass, instead of taking defaults as you go.</p><div class="flags"><code>--yes</code> · <code>--answers &lt;file|-&gt;</code> · <code>--dry-run</code> · <code>--replace</code>, <code>--agent</code> the job for a coding agent, <code>--reference brief|json|memory</code> <span class="tag-new">new in 0.5.0</span></div></div></div>
+      <div class="verb"><div class="sig"><span class="name">check</span></div><div class="what"><p>Test the setup in a throwaway worktree: install, start, ask for the page, remove. <span class="tag-new">new in 0.5.0</span></p><div class="flags"><code>--json</code></div></div></div>
       <div class="verb"><div class="sig"><span class="name">doctor</span></div><div class="what"><p>What pando found and where, and what is missing: project, config, runtime, tools, worktrees, services, hooks. Read-only.</p><div class="flags"><code>--json</code> · <code>--adopt &lt;old-id&gt;</code> after you moved the repository</div></div></div>
       <div class="verb"><div class="sig"><span class="name">signals</span></div><div class="what">The detection evidence as JSON: what the repository says about how to run itself. Two runs print the same thing.</div></div>
       <div class="verb"><div class="sig"><span class="name">completions</span> &lt;shell&gt;</div><div class="what">A completion script for bash, zsh, fish, elvish or PowerShell; in bash, zsh and fish it completes worktree names too.</div></div>
@@ -820,7 +825,7 @@ pando: removed the test worktree; nothing left behind</span>
       <div class="row"><span class="ks"><kbd>p</kbd></span><span>open pull requests: ⏎ makes a worktree for one</span></div>
       <div class="row"><span class="ks"><kbd>/</kbd></span><span>filter by branch or name</span></div>
       <div class="row"><span class="ks"><kbd>m</kbd></span><span>messages: what pando said, in full</span></div>
-      <div class="row"><span class="ks"><kbd>a</kbd><kbd>v</kbd></span><span>copy the setup prompt / test the setup with <code>pando check</code> <span class="tag-new">unreleased</span></span></div>
+      <div class="row"><span class="ks"><kbd>a</kbd><kbd>v</kbd></span><span>copy the setup prompt / test the setup with <code>pando check</code> <span class="tag-new">new in 0.5.0</span></span></div>
       <div class="row"><span class="ks"><kbd>T</kbd></span><span>pick a colour theme, previewed live</span></div>
       <div class="row"><span class="ks"><kbd>R</kbd><kbd>?</kbd><kbd>q</kbd></span><span>refresh now / help / quit</span></div>
     </div>
@@ -961,20 +966,29 @@ theme = <span class="s">"catppuccin"</span>
   <div class="wrap">
     <div class="eyebrow rv"><span class="n">10</span><span class="dot">·</span><span class="nm">Install</span><span class="bt">// from source</span></div>
     <h2 class="headline" data-type><span class="chev" aria-hidden="true">›</span><span class="txt">Build it. Run it.</span><span class="cur" aria-hidden="true"></span></h2>
-    <p class="sub rv">no published binary yet: build it from source with a recent stable Rust</p>
+    <p class="sub rv">no published binary yet: build it from source with Rust 1.88 or newer</p>
     <div class="split wide-left">
       <ol class="install-steps rv">
         <li>
-          <div class="is-h"><span class="hs-n">1</span>Install it</div>
-          <p class="is-note">It needs <code>git</code> and a recent stable Rust (<a href="https://rustup.rs">rustup.rs</a>).</p>
+          <div class="is-h"><span class="hs-n">1</span>No Rust yet?</div>
+          <p class="is-note">Skip this if <code>cargo --version</code> says 1.88 or newer. Otherwise <a href="https://rustup.rs">rustup</a> installs the current stable Rust; open a new terminal afterwards so it has <code>cargo</code>.</p>
           <div class="term">
-            <div class="term-bar"><span class="dots"><i></i><i></i><i></i></span><span class="grow">one line: copy, paste, done</span><button class="copy hs-copy" type="button" data-copy="git clone https://github.com/mertkaradayi/pando &amp;&amp; cd pando &amp;&amp; cargo install --path ." aria-label="Copy the install command">copy</button></div>
-<pre class="wrap-cmd"><span class="p">$</span> git clone https://github.com/mertkaradayi/pando &amp;&amp; cd pando &amp;&amp; cargo install --path .</pre>
+            <div class="term-bar"><span class="dots"><i></i><i></i><i></i></span><span class="grow">rustup, Rust's own installer</span><button class="copy hs-copy" type="button" data-copy="curl --proto &#39;=https&#39; --tlsv1.2 -sSf https://sh.rustup.rs | sh" aria-label="Copy the rustup command">copy</button></div>
+<pre class="wrap-cmd"><span class="p">$</span> curl --proto &#39;=https&#39; --tlsv1.2 -sSf https://sh.rustup.rs | sh</pre>
           </div>
-          <p class="demo-hint">It clones pando, builds it, and puts the <code>pando</code> command in <code>~/.cargo/bin</code>. <code>pando --version</code> says which version you have.</p>
+          <p class="demo-hint">On a new Mac, <code>git</code> comes with the Xcode Command Line Tools: <code>xcode-select --install</code>.</p>
         </li>
         <li>
-          <div class="is-h"><span class="hs-n">2</span>Run it in your project</div>
+          <div class="is-h"><span class="hs-n">2</span>Install it</div>
+          <p class="is-note">It needs <code>git</code> and Rust 1.88 or newer.</p>
+          <div class="term">
+            <div class="term-bar"><span class="dots"><i></i><i></i><i></i></span><span class="grow">one line: copy, paste, done</span><button class="copy hs-copy" type="button" data-copy="git clone https://github.com/mertkaradayi/pando &amp;&amp; cd pando &amp;&amp; cargo install --locked --path ." aria-label="Copy the install command">copy</button></div>
+<pre class="wrap-cmd"><span class="p">$</span> git clone https://github.com/mertkaradayi/pando &amp;&amp; cd pando &amp;&amp; cargo install --locked --path .</pre>
+          </div>
+          <p class="demo-hint">It clones pando, builds it, and puts the <code>pando</code> command in <code>~/.cargo/bin</code>. <code>--locked</code> builds with the dependency versions CI tested. <code>pando --version</code> says which version you have.</p>
+        </li>
+        <li>
+          <div class="is-h"><span class="hs-n">3</span>Run it in your project</div>
           <p>Open a terminal in any git repository you work on, your own project, not pando's, and type:</p>
 <pre class="code run-cmd"><span class="p">$</span> pando</pre>
           <p class="demo-hint">The first time, it opens the <a href="#first-run">setup screen</a>. After that, the list of every worktree. There's nothing to configure first, and nothing is written into your checkout. <code>pando completions zsh</code> (or bash, fish…) prints a completion script.</p>
@@ -986,7 +1000,7 @@ theme = <span class="s">"catppuccin"</span>
 <span class="p">$</span> scripts/fixture-repo.sh mono-web-api --listener
 <span class="c"># builds one in a temporary directory,
 # and prints how to run pando in it</span></pre>
-        <p class="demo-hint">pando is developed on Rust 1.90. There is no published binary, crate or Homebrew tap yet.</p>
+        <p class="demo-hint">pando needs Rust 1.88 or newer. There is no published binary, crate or Homebrew tap yet.</p>
       </div>
     </div>
 
@@ -995,7 +1009,7 @@ theme = <span class="s">"catppuccin"</span>
       <div class="panel rv">
         <h4>What there is</h4>
         <ul class="yes">
-          <li>Every command on this page is implemented on <code>main</code> and covered by tests. 0.4.0 is the last tag; what is marked unreleased came after it</li>
+          <li>Every command on this page is implemented on <code>main</code> and covered by tests. 0.5.0 is the last release; what is marked new came with it</li>
           <li>Tests that read no developer's shell profile and need none of their tools; databases in the tests are throwaway servers the tests start themselves</li>
           <li>Developed on macOS. For every change, CI checks formatting and runs clippy and the whole test suite on macOS and on Linux, and all of it must pass</li>
         </ul>

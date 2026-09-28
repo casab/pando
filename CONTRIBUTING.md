@@ -27,8 +27,8 @@ issue.
 
 ## Building and testing
 
-You need a recent stable Rust (pando is developed on 1.90, edition 2024)
-and `git`. Nothing else: the default test suite brings stand-ins for every
+You need Rust 1.88 or newer (`rust-version` in `Cargo.toml`; rustup.rs
+installs it) and `git`. Nothing else: the default test suite brings stand-ins for every
 other tool it drives.
 
 ```bash

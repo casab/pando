@@ -1,16 +1,15 @@
 name: ci
 
 # The paths below are ones no test reads: a change to them alone runs nothing.
-# README.md, CLAUDE.md, agent/ and assets/ are not among them, because tests
-# hold those to the code. The two lists are the same; keep them so.
+# README.md, CONTRIBUTING.md, CLAUDE.md, agent/, assets/ and site/ are not
+# among them, because tests hold those to the code. The two lists are the
+# same; keep them so (tests/distribution.rs checks it).
 on:
   push:
     branches: [main]
     paths-ignore:
-      - "site/**"
       - "CHANGELOG.md"
       - "CODE_OF_CONDUCT.md"
-      - "CONTRIBUTING.md"
       - "SECURITY.md"
       - "LICENSE"
       - ".github/ISSUE_TEMPLATE/**"
@@ -19,10 +18,8 @@ on:
       - ".github/workflows/pages.yml"
   pull_request:
     paths-ignore:
-      - "site/**"
       - "CHANGELOG.md"
       - "CODE_OF_CONDUCT.md"
-      - "CONTRIBUTING.md"
       - "SECURITY.md"
       - "LICENSE"
       - ".github/ISSUE_TEMPLATE/**"
@@ -71,3 +68,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --no-fail-fast
+
+  msrv:
+    # The oldest Rust pando says it builds with: Cargo.toml's rust-version,
+    # read here rather than written twice. Only the library and the binary,
+    # which is what `cargo install` builds; the tests' dependencies may need
+    # newer.
+    name: minimum Rust (rust-version)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - id: msrv
+        run: echo "version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].rust_version')" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked --lib --bins
