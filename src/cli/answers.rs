@@ -437,27 +437,72 @@ pub(super) fn init_asker(
     }
 }
 
-/// What the answers file said that nothing used.
+/// Answers for questions config has already answered, refused before
+/// anything is written.
+///
+/// Dropped with a note and exit 0, a program that reads exit codes took
+/// the run for its answer being written, and went on to test settings it
+/// never changed. Refusing the whole file keeps a retry simple: nothing
+/// of it landed, so the corrected file is the only one that has to.
+///
+/// Under `--replace` an answered slot is what the flag is for, so nothing
+/// is refused here; `actions::init` refuses the few it never changes.
+pub(super) fn refuse_answered(answers: &Answers, config: &Config, replace: bool) -> Result<()> {
+    if replace {
+        return Ok(());
+    }
+    let answered: Vec<crate::detect::Slot> = answers
+        .slots()
+        .into_iter()
+        .filter(|slot| actions::settled(*slot, config))
+        .collect();
+    if answered.is_empty() {
+        return Ok(());
+    }
+    let clauses: Vec<String> = answered
+        .iter()
+        .map(|slot| {
+            let name = slot_name(*slot);
+            let not_applied = format!("{name} is already answered, so your answer was not applied");
+            match slot {
+                // `--replace` never changes it, so pointing there would
+                // send a program to a second refusal.
+                crate::detect::Slot::Prelude => {
+                    format!("{not_applied} — only a person changes it; leave it out")
+                }
+                // Several process tables: neither slot is about one
+                // process, and the answer that covers them is the tables.
+                crate::detect::Slot::DevCmd | crate::detect::Slot::PortEnv
+                    if !config.processes.is_empty()
+                        && !crate::detect::fills_one_dev_process(config) =>
+                {
+                    format!(
+                        "{not_applied} — the processes answer covers it; answer processes with \
+                         --replace to change it"
+                    )
+                }
+                _ => format!("{not_applied} — add --replace to replace it"),
+            }
+        })
+        .collect();
+    Err(usage(format!(
+        "{}; nothing was written",
+        clauses.join("; ")
+    )))
+}
+
+/// What the answers said that nothing used.
 ///
 /// Never silent: a program that answered a question pando did not ask has
 /// to learn that from the run rather than from a config that looks nothing
-/// like what it sent.
-///
-/// Under `--replace` an answered slot is not a reason for an answer to go
-/// unused, so a slot nothing asked about is just that.
-pub(super) fn report_unused(answers: &Answers, before: &Config, replace: bool) {
+/// like what it sent. An answered slot is never the reason: without
+/// `--replace`, [`refuse_answered`] has refused those already.
+pub(super) fn report_unused(answers: &Answers) {
     for slot in answers.unasked() {
-        let name = slot_name(slot);
-        if actions::settled(slot, before) && !replace {
-            notice(&format!(
-                "{name} is already answered — the answers file was not applied to it"
-            ));
-        } else {
-            notice(&format!(
-                "nothing asked about {name} in this run — the answers file's value for it was \
-                 not used"
-            ));
-        }
+        notice(&format!(
+            "nothing asked about {} in this run — your answer for it was not used",
+            slot_name(slot)
+        ));
     }
 }
 

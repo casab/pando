@@ -27,6 +27,7 @@ mod wait;
 
 use self::answers::init_asker;
 use self::answers::read_answers;
+use self::answers::refuse_answered;
 use self::answers::render_init;
 use self::answers::report_unused;
 use self::answers::volunteered_from;
@@ -748,6 +749,11 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             ..
         } => {
             let answers = answers.as_deref().map(read_answers).transpose()?;
+            // Before the dry run too: a preview that exits 0 where the
+            // real run would refuse is a preview of something else.
+            if let Some(answers) = &answers {
+                refuse_answered(answers, config, replace)?;
+            }
             // Every slot the file names: `actions` refuses the ones
             // `--replace` may not change, before anything is written.
             let replacing: Vec<crate::detect::Slot> = match (&answers, replace) {
@@ -774,7 +780,7 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             // Before the summary, because it is about what the file the
             // summary describes does *not* say.
             if let Some(answers) = &answers {
-                report_unused(answers, config, replace);
+                report_unused(answers);
             }
             for warning in &report.warnings {
                 notice(warning);

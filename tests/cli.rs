@@ -3293,10 +3293,11 @@ fn init_agent_reads_a_services_port_beside_the_app() {
     );
 }
 
-// Re-running is safe: the answers for slots that already have one are
-// reported and left alone, comment and all.
+// An answer for a slot that already has one is refused, whole file and
+// preview alike: dropped with a note and exit 0, a program took the run
+// for its answer being written.
 #[test]
-fn answers_for_questions_already_answered_are_reported_and_not_reapplied() {
+fn answers_for_questions_already_answered_are_refused_and_nothing_is_written() {
     let e = env_of(Kind::NextMessy);
     assert_eq!(
         code(&e.pando_stdin(&["init", "--answers", "-"], ANSWERS)),
@@ -3304,20 +3305,47 @@ fn answers_for_questions_already_answered_are_reported_and_not_reapplied() {
     );
     let first = std::fs::read_to_string(e.config_file()).unwrap();
 
-    let out = e.pando_stdin(&["init", "--answers", "-"], ANSWERS);
-    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
-    let printed = stderr(&out);
-    for name in ["dev_cmd", "port_env", "services"] {
+    // An unanswered slot beside them is not written either: nothing of a
+    // refused file lands, so the corrected file is the only one to send.
+    let mixed = r#"{"dev_cmd": "pnpm dev", "install": "make deps"}"#;
+    for args in [
+        &["init", "--answers", "-"][..],
+        &["init", "--answers", "-", "--dry-run"][..],
+    ] {
+        let out = e.pando_stdin(args, mixed);
+        assert_eq!(code(&out), EXIT_USAGE, "{args:?} stderr: {}", stderr(&out));
+        let printed = stderr(&out);
         assert!(
-            printed.contains(&format!("{name} is already answered")),
+            printed.contains(
+                "dev_cmd is already answered, so your answer was not applied — add --replace to \
+                 replace it"
+            ),
             "{printed}"
         );
+        assert!(printed.contains("nothing was written"), "{printed}");
+        assert!(!printed.contains("answers file"), "{printed}");
+        assert!(stdout(&out).is_empty(), "{}", stdout(&out));
     }
     assert_eq!(
         std::fs::read_to_string(e.config_file()).unwrap(),
         first,
-        "a second run with the same answers changes nothing"
+        "a refused file changes nothing"
     );
+
+    // Every slot it names is named back, not only the first.
+    let out = e.pando_stdin(&["init", "--answers", "-"], ANSWERS);
+    assert_eq!(code(&out), EXIT_USAGE, "stderr: {}", stderr(&out));
+    for name in ["dev_cmd", "port_env", "services"] {
+        assert!(
+            stderr(&out).contains(&format!("{name} is already answered")),
+            "{}",
+            stderr(&out)
+        );
+    }
+
+    // And the way it names is the way through.
+    let out = e.pando_stdin(&["init", "--answers", "-", "--replace"], mixed);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
 }
 
 // The preview is the real renderer against a copy, so what it prints is
@@ -3618,7 +3646,9 @@ fn the_set_question_and_the_machine_question_are_not_volunteered_for() {
     let printed = stderr(&out);
     for name in ["services", "prelude"] {
         assert!(
-            printed.contains(&format!("nothing asked about {name}")),
+            printed.contains(&format!(
+                "nothing asked about {name} in this run — your answer for it was not used"
+            )),
             "{printed}"
         );
     }
@@ -4011,14 +4041,19 @@ fn signals_publishes_the_dev_command_answered_when_config_declares_its_processes
         assert_eq!(slot["answered"], true, "{slot:#}");
     }
 
-    // A preview, so the questions this fixture still has stay open.
+    // A preview, so the questions this fixture still has stay open. The
+    // refusal points at the answer that covers the slot: `--replace` on
+    // `dev_cmd` alone would have nothing to replace here.
     let out = e.pando_stdin(
         &["init", "--answers", "-", "--dry-run"],
         r#"{"dev_cmd": "pnpm dev"}"#,
     );
-    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    assert_eq!(code(&out), EXIT_USAGE, "stderr: {}", stderr(&out));
     assert!(
-        stderr(&out).contains("dev_cmd is already answered"),
+        stderr(&out).contains(
+            "dev_cmd is already answered, so your answer was not applied — the processes \
+             answer covers it"
+        ),
         "{}",
         stderr(&out)
     );

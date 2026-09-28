@@ -707,10 +707,12 @@ several is written — and each owns the role its name says: `PORT` owns
 `web`, `API_PORT` owns `api`. One variable owns `web` whatever it is
 called.
 
-An answer for a slot that was
-already answered (without `--replace`), or that nothing asked about, is
-**reported on stderr and not applied** — it is not an error, and the run
-still exits 0. A slot with no proposal at all is not "nothing asked about":
+An answer for a slot that is already answered is **refused with exit 2,
+and nothing is written**, `--dry-run` included: the refusal names the slot
+and says how to change it, `--replace` for most. An answer for a slot
+nothing asked about in this run — `dev_cmd` once the same file's
+`processes` has answered it — is reported on stderr and not applied, and
+the run still exits 0. A slot with no proposal at all is not "nothing asked about":
 it takes a custom answer, except at `services` and `prelude`. See the
 three-state table above.
 

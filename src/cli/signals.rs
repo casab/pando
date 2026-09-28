@@ -54,7 +54,7 @@ struct SlotOut {
     /// The question, as it would be asked.
     prompt: &'static str,
     /// Whether config already answers this, from any layer. An answers
-    /// file for an answered slot is reported and not applied.
+    /// file for an answered slot is refused unless it says `--replace`.
     answered: bool,
     /// `null` when the rules had nothing to say about this slot at all —
     /// which is different from a proposal with no candidates, and the

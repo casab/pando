@@ -3057,6 +3057,43 @@ fn the_contract_describes_replace_as_clap_has_it() {
         section.contains("a `prelude` that is already answered"),
         "{section}"
     );
+    // And an answered slot without the flag is a refusal, not a note: a
+    // program that reads exit codes has to learn its answer did not land.
+    assert!(
+        section.contains("already answered is **refused with exit 2,\nand nothing is written**"),
+        "{section}"
+    );
+}
+
+// The refusal an answered slot earns: exit 2's type, every slot named, and
+// the way through for each — `--replace` would only refuse the prelude again.
+#[test]
+fn an_answer_for_an_answered_slot_is_a_usage_error_naming_the_way_through() {
+    let mut config = Config::default();
+    config.project.install = Some("make deps".into());
+    config.runtime.prelude = Some(String::new());
+    let answers =
+        Answers::parse(r#"{"install": "npm ci", "prelude": "export A=1", "base": "main"}"#)
+            .unwrap();
+    let err = super::answers::refuse_answered(&answers, &config, false).unwrap_err();
+    assert!(err.downcast_ref::<UsageError>().is_some(), "{err:#}");
+    let text = format!("{err:#}");
+    assert!(
+        text.contains(
+            "install is already answered, so your answer was not applied — add --replace"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("prelude is already answered"), "{text}");
+    assert!(text.contains("only a person changes it"), "{text}");
+    assert!(
+        !text.contains("base"),
+        "an open slot is not refused: {text}"
+    );
+    assert!(text.ends_with("nothing was written"), "{text}");
+
+    super::answers::refuse_answered(&answers, &config, true)
+        .expect("under --replace an answered slot is what the flag is for");
 }
 
 fn parse_err(json: &str) -> String {
