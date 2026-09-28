@@ -16,6 +16,7 @@
 </p>
 
 <p align="center">
+  <a href="https://mertkaradayi.github.io/pando/"><b>Website</b></a> ·
   <a href="#sixty-seconds">Quick start</a> ·
   <a href="#your-first-run">First run</a> ·
   <a href="#commands">Commands</a> ·
@@ -28,6 +29,10 @@
 > Pando is a forest that is one tree. Your repo is too. `pando` checks out every
 > branch you are working on side by side, gives each one a running dev server,
 > its own database, and a shareable URL, and never writes a byte into your repo.
+
+**[mertkaradayi.github.io/pando](https://mertkaradayi.github.io/pando/)** tells the story in
+pictures and has a copy of the TUI you can drive with your keyboard, in the
+browser, before installing anything.
 
 Created by [Mert Karadayi](https://github.com/mertkaradayi).
 
@@ -481,6 +486,7 @@ TOML file:
 | a language or version manager | a row | `src/runtime/languages.rs` |
 | a colour scheme you love | a theme | `src/theme/builtin/*.toml` |
 | a project shape pando breaks on | a fixture and a failing test | `tests/common/mod.rs` |
+| a clearer way to explain it | a change to the website: plain HTML, no build step | `site/` |
 
 Try pando without pointing it at anything real:
 
