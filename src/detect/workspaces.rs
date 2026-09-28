@@ -16,7 +16,7 @@ use super::dev::{
 };
 use super::frameworks::{only_builds, runs, script_framework};
 use super::proposal::{Candidate, Proposal, Slot};
-use super::signals::{AppDir, LIBRARY_PARENT, Signals, parse_scripts, present};
+use super::signals::{AppDir, LIBRARY_PARENT, Signals, env_file_value, parse_scripts, present};
 
 /// One app of a workspace: a directory with its own manifest and its own
 /// dev script.
@@ -276,7 +276,7 @@ pub fn workspace_apps(root: &Path, signals: &Signals) -> Vec<WorkspaceApp> {
                 );
             }
             apps.push(WorkspaceApp {
-                default_port: fixed.or_else(|| app_default_port(signals, name, rule)),
+                default_port: fixed.or_else(|| app_default_port(signals, &path, name, rule)),
                 port: match rule {
                     _ if fixed.is_some() => PortMechanism::Ask,
                     Some(rule) if rule.port == PortMechanism::InCommand && flag.is_none() => {
@@ -377,9 +377,15 @@ fn usable_as_role(name: &str) -> bool {
 }
 
 /// The port an app listens on by default: what the root env example says
-/// for it, else what its framework does.
+/// for it, else what its own env files say for a variable it takes its
+/// port from, else what its framework does.
+///
+/// Its own env files before its framework's default: a `node server.js`
+/// whose `.env` says `PORT=8787` listens on 8787, and a sibling told
+/// `http://127.0.0.1:8787` is being told where that app is.
 fn app_default_port(
     signals: &Signals,
+    dir: &Path,
     name: &str,
     rule: Option<&'static FrameworkRule>,
 ) -> Option<u16> {
@@ -389,7 +395,18 @@ fn app_default_port(
         .iter()
         .find(|(key, _)| *key == wanted)
         .and_then(|(_, value)| value.parse::<u16>().ok());
-    from_example.or_else(|| rule.map(|r| r.default_port))
+    let framework_var = rule.and_then(|rule| match rule.port {
+        PortMechanism::Env(var) => Some(var),
+        _ => None,
+    });
+    let from_own_files = || {
+        std::iter::once(wanted.as_str())
+            .chain(framework_var)
+            .find_map(|var| env_file_value(dir, var)?.trim().parse::<u16>().ok())
+    };
+    from_example
+        .or_else(from_own_files)
+        .or_else(|| rule.map(|r| r.default_port))
 }
 
 /// The env variables an app reads its port from: a `<APP>_PORT` key the

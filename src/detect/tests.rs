@@ -4044,6 +4044,57 @@ fn an_apps_own_env_example_points_it_at_another_apps_port() {
     );
 }
 
+// A `node server.js` backend listens where its own `.env` puts it, not on
+// the Node default, so the mobile app's example URL to that port is the
+// backend's, and Metro is told the worktree's. A URL to a port no app
+// listens on is left as it is.
+#[test]
+fn an_apps_own_env_file_says_which_port_a_sibling_url_points_at() {
+    let dir = tree(&[
+        (".gitignore", ".env\n"),
+        (
+            "backend/package.json",
+            r#"{ "scripts": { "dev": "node server.js" } }"#,
+        ),
+        ("backend/package-lock.json", "{}"),
+        ("backend/.env", "PORT=8787\n"),
+        (
+            "apps/mobile/package.json",
+            r#"{ "main": "expo-router/entry", "scripts": { "start": "expo start" },
+                 "dependencies": { "expo": "~57.0.0" } }"#,
+        ),
+        ("apps/mobile/package-lock.json", "{}"),
+        (
+            "apps/mobile/.env.example",
+            "EXPO_PUBLIC_API_BASE_URL=http://127.0.0.1:8787\n\
+             EXPO_PUBLIC_OTHER_URL=http://127.0.0.1:9999\n",
+        ),
+    ]);
+    assert!(
+        dir.path().join("backend/.env").is_file(),
+        "ignored, and there"
+    );
+    let apps = workspace_apps(dir.path(), &signals(dir.path()));
+    let backend = apps.iter().find(|a| a.name == "backend").unwrap();
+    assert_eq!(backend.default_port, Some(8787));
+
+    let processes = proposed_processes(dir.path()).candidates[0]
+        .processes
+        .clone()
+        .unwrap();
+    let mobile = &processes["mobile"];
+    assert_eq!(
+        mobile.env["EXPO_PUBLIC_API_BASE_URL"],
+        "http://127.0.0.1:{port:backend}"
+    );
+    assert!(
+        !mobile.env.contains_key("EXPO_PUBLIC_OTHER_URL"),
+        "{:?}",
+        mobile.env
+    );
+    assert_eq!(processes["backend"].env["PORT"], "{port:backend}");
+}
+
 // Only a framework pando knows how to start is found under `start`: a
 // `start: node server.js` is as often production as development.
 #[test]

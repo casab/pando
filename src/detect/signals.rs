@@ -617,6 +617,30 @@ pub(super) fn env_example(root: &Path) -> Vec<(String, String)> {
     Vec::new()
 }
 
+/// The env files an app reads for itself, in the order a dotenv loader
+/// lets one override the next: `.env.local` over `.env`.
+const LOCAL_ENV_FILES: [&str; 2] = [".env.local", ".env"];
+
+/// The value `key` has in a directory's own env files: its local ones
+/// first, which are what the app really reads in the main checkout, then
+/// its env example.
+///
+/// Read for a port number and nothing else: an app whose framework has no
+/// default of its own to say, `node server.js`, listens where its `.env`
+/// puts it. The value itself is never proposed or written anywhere.
+pub(super) fn env_file_value(dir: &Path, key: &str) -> Option<String> {
+    LOCAL_ENV_FILES
+        .iter()
+        .chain(ENV_EXAMPLES.iter())
+        .filter_map(|name| std::fs::read_to_string(dir.join(name)).ok())
+        .find_map(|text| {
+            text.lines()
+                .filter_map(crate::services::parse_env_line)
+                .find(|(held, _)| held == key)
+                .map(|(_, value)| value)
+        })
+}
+
 /// Root-level files that git ignores and that exist — the local files a
 /// fresh worktree would be missing.
 ///
