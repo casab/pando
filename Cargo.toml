@@ -15,9 +15,9 @@ homepage = "https://mertkaradayi.github.io/pando/"
 readme = "README.md"
 keywords = ["git", "worktree", "dev-server", "tui", "cli"]
 categories = ["command-line-utilities", "development-tools"]
-# The README's pictures and the GitHub files are for the repository page,
-# not for a build.
-exclude = ["assets/", ".github/", ".claude-plugin/"]
+# The README's pictures, the GitHub files and the website are for the
+# repository and its pages, not for a build.
+exclude = ["assets/", ".github/", ".claude-plugin/", "site/"]
 # The files in tests/ are modules of one test binary: tests/integration.rs.
 # The binary embeds agent/brief.md and agent/json.md (`pando init --agent`),
 # so both must ship with the crate.
