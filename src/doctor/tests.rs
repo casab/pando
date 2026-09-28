@@ -1434,8 +1434,54 @@ fn a_mismatch_offers_the_prelude_of_a_manager_this_machine_really_has() {
         .expect("a fix built from the injected home");
     assert!(from_home.contains("nvm use"), "{from_home}");
     let fix = runtime_fix(&report);
-    assert!(fix.contains("set [runtime].prelude to one of:"), "{fix}");
+    let user = fx.paths.user_config_file();
+    assert!(
+        fix.contains(&format!(
+            "set [runtime].prelude in {} to one of:",
+            user.display()
+        )),
+        "{fix}"
+    );
     assert!(fix.contains("nvm"), "{fix}");
+    assert!(
+        fix.ends_with(
+            "`pando init --answers -` with {\"prelude\": \"<the line>\"} writes it there, and \
+             `prelude = \"\"` there accepts the mismatch"
+        ),
+        "nobody has answered, so the question's own answer is the way in: {fix}"
+    );
+    let message = &report
+        .findings
+        .iter()
+        .find(|f| f.section == Section::Runtime)
+        .unwrap()
+        .message;
+    assert!(
+        message.ends_with("so the next `init`, `check` or `start` asks"),
+        "{message}"
+    );
+}
+
+// A prelude that is set and not working is a person's to change: the fix
+// names the file it is in, and no `init --answers`, which would refuse it.
+#[test]
+fn a_set_prelude_that_fails_is_changed_in_its_own_file() {
+    let fx = fixture();
+    pin_node(&fx, "22");
+    let user = fx.paths.user_config_file();
+    std::fs::create_dir_all(user.parent().unwrap()).unwrap();
+    std::fs::write(&user, "[runtime]\nprelude = \"true\"\n").unwrap();
+    let report = report_of(&fx, &shell_resolving_node("24.21.0", "/n/bin/node"));
+    let fix = runtime_fix(&report);
+    assert!(
+        fix.contains(&format!("set [runtime].prelude in {}", user.display())),
+        "{fix}"
+    );
+    assert!(!fix.contains("--answers"), "{fix}");
+    assert!(
+        fix.ends_with("`prelude = \"\"` there accepts the mismatch"),
+        "{fix}"
+    );
 }
 
 // A manager that is here and gives `bash -lc` nothing the project accepts
@@ -1451,16 +1497,17 @@ fn a_manager_without_the_version_is_named_with_its_install_command() {
     let report = report_of(&fx, &shell_resolving_node("24.21.0", "/n/bin/node"));
     let fix = runtime_fix(&report);
     assert!(
-        fix.contains(
+        fix.contains(&format!(
             "nvm is installed here, and gives `bash -lc` no node 22 — `nvm install 22` puts one \
-             under nvm (pando never installs one), or set [runtime].prelude to a line that puts \
-             a node 22 first on PATH"
-        ),
+             under nvm (pando never installs one), or set [runtime].prelude in {} to a line \
+             that puts a node 22 first on PATH",
+            fx.paths.user_config_file().display()
+        )),
         "{fix}"
     );
     assert!(!fix.contains("no version manager"), "{fix}");
     assert!(
-        !fix.contains("set [runtime].prelude to one of:"),
+        !fix.contains("to one of:"),
         "nvm's line does not work yet, so it is not what to set: {fix}"
     );
     assert!(
@@ -1501,10 +1548,11 @@ fn no_manager_at_all_says_so() {
     let report = report_of(&fx, &shell_resolving_node("24.21.0", "/n/bin/node"));
     let fix = runtime_fix(&report);
     assert!(
-        fix.contains(
+        fix.contains(&format!(
             "no version manager pando knows about is installed for node — install one, or set \
-             [runtime].prelude to a line that puts a node 22 first on PATH"
-        ),
+             [runtime].prelude in {} to a line that puts a node 22 first on PATH",
+            fx.paths.user_config_file().display()
+        )),
         "{fix}"
     );
 }
@@ -1526,7 +1574,7 @@ fn a_node_in_a_well_known_place_is_offered_as_a_path_line() {
         &shell_resolving_node_behind("24.21.0", "opt/homebrew/bin", "25.8.2"),
     );
     let fix = runtime_fix(&report);
-    assert!(fix.contains("set [runtime].prelude to one of:"), "{fix}");
+    assert!(fix.contains("to one of:"), "{fix}");
     assert!(
         fix.contains(&format!("export PATH=\"{}:$PATH\"", brew.display())),
         "{fix}"

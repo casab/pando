@@ -102,7 +102,12 @@ pub(super) fn runtime_report(
             && !actions::runs_through_runner(&dir, config, entry, effective, machine.shell)
         {
             let offers = offers.unwrap_or_default();
-            let fix = mismatch_fix(&report, &offers, install);
+            // The file a line goes in: the one it is already in, or this
+            // machine's config, where the prelude question writes it.
+            let file = prelude_from
+                .clone()
+                .unwrap_or_else(|| paths.user_config_file().display().to_string());
+            let fix = mismatch_fix(&report, &offers, install, &file, prelude.as_deref());
             findings.push(mismatch_finding(
                 &report,
                 fix,
@@ -123,7 +128,7 @@ pub(super) fn runtime_report(
 /// A mismatch, at the severity the three outcomes in the plan give it.
 ///
 /// With no prelude set it is a **note**: nobody has been asked yet, and
-/// the next `start` asks — exit 3 with the question, which is designed
+/// the next `init`, `check` or `start` asks — exit 3 with the question, which is designed
 /// behaviour rather than a break. With one set, empty included, it is a
 /// **problem**: somebody has said how this machine resolves the runtime,
 /// and it does not, so the next start spawns a process that dies of it.
@@ -157,7 +162,7 @@ fn mismatch_finding(
             severity: Severity::Note,
             message: format!(
                 "this project asks for {wanted}, and {got} — nobody has answered the prelude \
-                 question, so the next `start` will ask"
+                 question, so the next `init`, `check` or `start` asks"
             ),
             fix: Some(fix.trim_end().to_string()),
         },
@@ -194,10 +199,16 @@ fn mismatch_finding(
 /// said two things at once; a manager that is here and gives `bash -lc`
 /// nothing it accepts is fixed by its own install command, which pando
 /// prints and never runs.
+///
+/// It names the file the line goes in, `file`, and the ways into it: the
+/// prelude question's own answer while nobody has answered it, and in
+/// either case `prelude = ""`, which accepts the mismatch.
 fn mismatch_fix(
     language: &LanguageReport,
     offers: &[actions::Offer],
     install: Option<(&'static str, String)>,
+    file: &str,
+    prelude: Option<&str>,
 ) -> String {
     let wanted = format!("{} {}", language.language, language.spec);
     let mut fix = String::new();
@@ -207,13 +218,13 @@ fn mismatch_fix(
     );
     let line = |offer: &actions::Offer| format!("  {}  ({})", offer.line, offer.why);
     if offers.iter().any(|offer| offer.works) {
-        let _ = writeln!(fix, "set [runtime].prelude to one of:");
+        let _ = writeln!(fix, "set [runtime].prelude in {file} to one of:");
         for offer in offers {
             let _ = writeln!(fix, "{}", line(offer));
         }
     } else {
         let first_on_path =
-            format!("set [runtime].prelude to a line that puts a {wanted} first on PATH");
+            format!("set [runtime].prelude in {file} to a line that puts a {wanted} first on PATH");
         let _ = match (language.managers.as_slice(), install) {
             ([], _) => writeln!(
                 fix,
@@ -249,6 +260,17 @@ fn mismatch_fix(
             }
         }
     }
+    // `init --answers` only answers a prelude nobody has; one that is set
+    // is a person's to change. `""` already says what accepting would.
+    let _ = match prelude.map(str::trim) {
+        None => writeln!(
+            fix,
+            "`pando init --answers -` with {{\"prelude\": \"<the line>\"}} writes it there, and \
+             `prelude = \"\"` there accepts the mismatch"
+        ),
+        Some("") => Ok(()),
+        Some(_) => writeln!(fix, "`prelude = \"\"` there accepts the mismatch"),
+    };
     fix
 }
 
