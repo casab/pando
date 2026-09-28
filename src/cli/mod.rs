@@ -263,9 +263,10 @@ Examples:
         ///
         /// One key per question, named as `pando signals` names it, whose
         /// value is the option's own text, a command of your own, a list
-        /// for a question whose answer is a set, or null for "none of
-        /// them". Every answer goes through the same checks a person's
-        /// does and is written down as a program's.
+        /// for a question whose answer is a set, null for "none of them",
+        /// or, at `processes`, an object of process tables. Every answer
+        /// goes through the same checks a person's does and is written
+        /// down as a program's.
         #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
         answers: Option<String>,
         /// Apply the answers to questions already answered too.

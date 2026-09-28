@@ -6143,6 +6143,128 @@ fn a_typed_port_variable_that_is_no_variable_name_is_refused_as_a_usage_error() 
     }
 }
 
+/// A FastAPI backend and a Nuxt frontend in sibling directories, with no
+/// manifest at the root: nothing pando's rules can propose a process for.
+fn sibling_apps_fixture() -> Fx {
+    let fx = fixture();
+    for dir in ["backend", "frontend"] {
+        std::fs::create_dir_all(fx.root.join(dir)).unwrap();
+        std::fs::write(fx.root.join(dir).join("README.md"), "app\n").unwrap();
+    }
+    git(&fx.root, &["add", "."]);
+    git(&fx.root, &["commit", "--quiet", "-m", "apps"]);
+    fx
+}
+
+fn tables(json: &str) -> BTreeMap<String, ProcessConfig> {
+    serde_json::from_str(json).expect("process tables")
+}
+
+/// `init` with a program answering `processes` alone.
+fn init_with_tables(fx: &Fx, json: &str) -> Result<InitReport> {
+    let program = program_answering(Slot::Processes, Answer::Processes(tables(json)));
+    let ask = |q: &Question| program(q).unwrap_or_else(|| refuse(q));
+    init(
+        &fx.paths,
+        &fx.config,
+        &Answering::by_program(&ask, &program),
+        &noop,
+    )
+}
+
+// A multi-process app had no way in through the answers path: a custom
+// string became one `[dev] cmd`. Process tables of the program's own are
+// written as `[processes.<name>]`, each checked and noted as a program's.
+#[test]
+fn process_tables_a_program_wrote_become_the_process_list() {
+    let fx = sibling_apps_fixture();
+    init_with_tables(
+        &fx,
+        r#"{
+            "api": { "cmd": "uv run uvicorn app.main:app --port {port}", "cwd": "backend",
+                     "ports": ["api"] },
+            "worker": { "cmd": "uv run python -m worker", "cwd": "backend", "ports": [] },
+            "web": { "cmd": "npm run dev", "cwd": "frontend", "ports": { "PORT": "web" },
+                     "env": { "NUXT_BACKEND_URL": "http://127.0.0.1:{port:api}" },
+                     "ready": { "timeout_s": 90 } }
+        }"#,
+    )
+    .unwrap();
+
+    let config = crate::config::load(&fx.paths).unwrap().config;
+    assert_eq!(
+        config.processes.keys().collect::<Vec<_>>(),
+        ["api", "web", "worker"]
+    );
+    assert_eq!(config.processes["api"].cwd.as_deref(), Some("backend"));
+    assert_eq!(config.processes["worker"].roles(), Vec::<String>::new());
+    assert_eq!(config.processes["web"].port_env()["PORT"], "{port:web}");
+    assert_eq!(
+        config.processes["web"]
+            .ready
+            .as_ref()
+            .and_then(|r| r.timeout_s),
+        Some(90)
+    );
+    let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+    assert!(
+        written.contains("[processes.web]  # answered: a program,"),
+        "{written}"
+    );
+    assert!(!written.contains("[dev]"), "{written}");
+    // The log holds the object as it was sent, so it replays.
+    let log = std::fs::read_to_string(fx.paths.decisions_file()).unwrap();
+    let entry: serde_json::Value = serde_json::from_str(log.lines().next().unwrap()).unwrap();
+    assert_eq!(entry["slot"], "processes");
+    assert_eq!(entry["shape"], "custom");
+    assert_eq!(entry["answer"]["web"]["cwd"], "frontend");
+}
+
+// What the loader refuses and what only a hand-written table can get
+// wrong are both the program's input that is wrong: exit 2, and nothing
+// on disk.
+#[test]
+fn process_tables_that_cannot_run_are_refused_as_a_usage_error() {
+    for (json, says) in [
+        (
+            r#"{ "api": { "cmd": "x", "ports": ["web"] }, "web": { "cmd": "y", "ports": ["web"] } }"#,
+            "both claim the role",
+        ),
+        (
+            r#"{ "api": { "cmd": "x", "cwd": "../elsewhere" } }"#,
+            "escape",
+        ),
+        (
+            r#"{ "api": { "cmd": "x", "cwd": "missing" } }"#,
+            "not a directory",
+        ),
+        (
+            r#"{ "web": { "cmd": "y", "ports": ["web"], "env": { "API": "{port:api}" } } }"#,
+            "processes.web.env.API cannot be resolved",
+        ),
+        (
+            r#"{ "worker": { "cmd": "run --port {port}" } }"#,
+            "needs a role",
+        ),
+        (
+            r#"{ "api": { "cmd": "x", "ports": ["api"], "ready": { "role": "web" } } }"#,
+            "ready.role",
+        ),
+    ] {
+        let fx = sibling_apps_fixture();
+        let e = init_with_tables(&fx, json).unwrap_err();
+        assert!(
+            e.downcast_ref::<RefusedAnswer>().is_some(),
+            "{json}: a program's bad tables are exit 2: {e:#}"
+        );
+        let e = format!("{e:#}");
+        assert!(e.contains(says), "{json}: {e}");
+        assert!(e.contains("nothing was written"), "{e}");
+        let written = std::fs::read_to_string(fx.paths.config_file()).unwrap_or_default();
+        assert!(!written.contains("processes"), "{json}: {written}");
+    }
+}
+
 #[test]
 fn init_takes_every_slot_a_rule_decided_and_asks_nothing() {
     let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");

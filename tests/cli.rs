@@ -3114,6 +3114,64 @@ fn an_answer_that_is_not_on_offer_names_what_is() {
     );
 }
 
+// A project of several apps in sibling directories, answered as it is
+// written: one table per process, through the one write path.
+#[test]
+fn process_tables_answer_a_project_of_several_apps() {
+    let e = env();
+    for dir in ["backend", "frontend"] {
+        std::fs::create_dir_all(e.root.join(dir)).unwrap();
+    }
+    let out = e.pando_stdin(
+        &["init", "--answers", "-"],
+        r#"{"processes": {
+            "api": {"cmd": "uv run uvicorn app:app --port {port}", "cwd": "backend", "ports": ["api"]},
+            "web": {"cmd": "npm run dev", "cwd": "frontend", "ports": {"PORT": "web"},
+                    "env": {"API_URL": "http://127.0.0.1:{port:api}"}}
+        }}"#,
+    );
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    let written = std::fs::read_to_string(e.config_file()).unwrap();
+    assert!(
+        written.contains("[processes.api]  # answered: a program,"),
+        "{written}"
+    );
+    assert!(written.contains(r#"cwd = "frontend""#), "{written}");
+}
+
+// What is no way to say it is exit 2, naming what is.
+#[test]
+fn answers_that_cannot_describe_the_processes_are_usage_errors() {
+    for (answers, says) in [
+        (
+            r#"{"processes": "api: uvicorn app:app in backend; web: npm run dev in frontend"}"#,
+            "object of process tables",
+        ),
+        (
+            r#"{"processes": ["uvicorn app:app", "npm run dev"]}"#,
+            "an object of process tables",
+        ),
+        (
+            r#"{"processes": {"api": {"command": "x"}}}"#,
+            "unknown field",
+        ),
+        (
+            r#"{"port_env": "PORT, API-PORT"}"#,
+            "not an environment variable name",
+        ),
+    ] {
+        let e = env();
+        let out = e.pando_stdin(&["init", "--answers", "-"], answers);
+        assert_eq!(code(&out), EXIT_USAGE, "{answers}: {}", stderr(&out));
+        assert!(stderr(&out).contains(says), "{answers}: {}", stderr(&out));
+        let written = std::fs::read_to_string(e.config_file()).unwrap_or_default();
+        assert!(
+            !written.contains("[dev]") && !written.contains("[processes"),
+            "{written}"
+        );
+    }
+}
+
 // Re-running is safe: the answers for slots that already have one are
 // reported and left alone, comment and all.
 #[test]

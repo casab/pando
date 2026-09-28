@@ -132,30 +132,34 @@ impl Answers {
 
 /// Which shapes a slot's answer may take, decided from the slot alone.
 ///
-/// Three, and each one means the same thing everywhere: the text of an
+/// Four, and each one means the same thing everywhere: the text of an
 /// option or a command of your own, a list for an answer that is a set or
-/// a list of files, and null for "none of them". Anything else is a usage
-/// error naming the question, never a silent skip — and it is caught when
-/// the file is read, so a bad shape on a slot no rule ends up asking
-/// about is still reported.
+/// a list of files, null for "none of them", and — at the process list
+/// alone — an object of whole process tables. Anything else is a usage
+/// error naming the question and what it does take, never a silent skip —
+/// and it is caught when the file is read, so a bad shape on a slot no
+/// rule ends up asking about is still reported.
 fn check_shape(slot: crate::detect::Slot, value: &serde_json::Value) -> Result<()> {
     let name = slot_name(slot);
     match value {
         serde_json::Value::Null if !slot.allows_none() => Err(usage(format!(
-            "{name} has no \"none\" answer — null answers only the questions that have one"
+            "{name} has no \"none\" answer — it takes {}",
+            accepted(slot)
         ))),
         serde_json::Value::Null => Ok(()),
         serde_json::Value::String(text) if text.trim().is_empty() => Err(usage(format!(
             "{name} was answered with an empty string — null is how you say none"
         ))),
         serde_json::Value::String(_) if slot.is_multi() => Err(usage(format!(
-            "{name} is answered with a list of the options, or null for none of them"
+            "{name} takes {}, not a string",
+            accepted(slot)
         ))),
         serde_json::Value::String(_) => Ok(()),
         serde_json::Value::Array(items) => {
             if !slot.is_multi() && !slot.is_list() {
                 return Err(usage(format!(
-                    "{name} takes one answer, not a list of them"
+                    "{name} takes {}, not a list",
+                    accepted(slot)
                 )));
             }
             if items.iter().any(|item| !item.is_string()) {
@@ -170,10 +174,119 @@ fn check_shape(slot: crate::detect::Slot, value: &serde_json::Value) -> Result<(
             }
             Ok(())
         }
+        serde_json::Value::Object(_) if slot == crate::detect::Slot::Processes => {
+            process_tables(value).map(|_| ())
+        }
         other => Err(usage(format!(
-            "{name} takes a string, a list of strings, or null — not {other}"
+            "{name} takes {} — not {other}",
+            accepted(slot)
         ))),
     }
+}
+
+/// Every shape a slot takes, in a phrase: what a refusal says in place of
+/// only what was wrong, so a program's next file is a right one.
+fn accepted(slot: crate::detect::Slot) -> String {
+    if slot.is_multi() {
+        return "a list of the options, or null for none of them".to_string();
+    }
+    let mut shapes = match slot {
+        _ if slot.is_list() => vec!["a list of file names", "one string naming them"],
+        crate::detect::Slot::Processes => vec![
+            "one string — an option's own text, or one command of your own",
+            "an object of process tables, {\"<name>\": {\"cmd\": \"…\"}, …}",
+        ],
+        _ => vec!["one string — an option's own text, or one of your own"],
+    };
+    if slot.allows_none() {
+        shapes.push("null for none");
+    }
+    match shapes.split_last() {
+        Some((last, [])) => last.to_string(),
+        Some((last, rest)) => format!("{}, or {last}", rest.join(", ")),
+        None => String::new(),
+    }
+}
+
+/// An object at the process list, as the tables it names: each value
+/// read exactly as a `[processes.<name>]` table is — the same keys, the
+/// same types, an unknown key refused — and held to what a table needs
+/// before any config is in hand.
+///
+/// What depends on the project — a role another process already owns, a
+/// `cwd` that is not there, a placeholder nothing will fill — is the
+/// resolver's to refuse, with the same exit code.
+fn process_tables(
+    value: &serde_json::Value,
+) -> Result<BTreeMap<String, crate::config::ProcessConfig>> {
+    let slot = crate::detect::Slot::Processes;
+    let name = slot_name(slot);
+    let serde_json::Value::Object(object) = value else {
+        return Err(usage(format!("{name} takes {}", accepted(slot))));
+    };
+    if object.is_empty() {
+        return Err(usage(format!(
+            "{name} was answered with an empty object — name at least one process, as \
+             {{\"<name>\": {{\"cmd\": \"…\"}}}}"
+        )));
+    }
+    let mut tables = BTreeMap::new();
+    for (process, table) in object {
+        let parsed: crate::config::ProcessConfig =
+            serde_json::from_value(table.clone()).map_err(|e| {
+                usage(format!(
+                    "{name}.{process} is not a process table: {e} — it takes cmd, and \
+                     optionally cwd, ports, env and ready"
+                ))
+            })?;
+        if parsed.cmd.trim().is_empty() {
+            return Err(usage(format!(
+                "{name}.{process} has no cmd — a process table is a command to run"
+            )));
+        }
+        let mut variables: Vec<&String> = parsed.env.keys().collect();
+        if let Some(crate::config::PortsSpec::Map(map)) = &parsed.ports {
+            variables.extend(map.keys());
+        }
+        if let Some(bad) = variables
+            .into_iter()
+            .find(|var| !crate::detect::is_env_name(var))
+        {
+            return Err(usage(format!(
+                "{name}.{process} names the variable {bad:?}, which is not an environment \
+                 variable name — letters, digits and `_`, not starting with a digit"
+            )));
+        }
+        tables.insert(process.clone(), parsed);
+    }
+    Ok(tables)
+}
+
+/// Whether a typed command reads as the list pando shows its own per-app
+/// option as — `api: npm run dev in apps/api; web: vite in apps/web` —
+/// rather than as a shell line.
+///
+/// That text names an option; it is not a way to describe one. Typed with
+/// processes of one's own in it, it matched nothing and became one
+/// command, which a shell runs as `api:` and fails. Recognised rather than
+/// parsed: the way to answer several processes is the object form, which
+/// says everything a table does and is checked like one.
+pub(super) fn reads_as_process_list(text: &str) -> bool {
+    text.split(';').all(|entry| {
+        let Some((process, rest)) = entry.trim().split_once(": ") else {
+            return false;
+        };
+        let Some((cmd, dir)) = rest.rsplit_once(" in ") else {
+            return false;
+        };
+        !process.is_empty()
+            && process
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+            && !cmd.trim().is_empty()
+            && !dir.trim().is_empty()
+            && !dir.trim().contains(char::is_whitespace)
+    })
 }
 
 /// One JSON value, as an answer to one question.
@@ -200,6 +313,19 @@ pub(super) fn answer_from(
                 // contract that breaks the day a rule finds one more
                 // candidate.
                 Some(index) => program(actions::Answer::Choice(index)),
+                None if matches!(
+                    question.slot,
+                    crate::detect::Slot::Processes | crate::detect::Slot::DevCmd
+                ) && reads_as_process_list(text) =>
+                {
+                    Err(usage(format!(
+                        "{name} was answered {text:?}, which is written the way pando shows its \
+                         own per-app option and is none of the options here — as a command it \
+                         would run as one broken shell line. Answer several processes as \
+                         `processes` with an object of process tables: {{\"api\": {{\"cmd\": \
+                         \"…\", \"cwd\": \"backend\", \"ports\": [\"api\"]}}, …}}"
+                    )))
+                }
                 None if question.allow_custom => program(actions::Answer::Custom(text.to_string())),
                 None => Err(unknown_option(question, &name, text)),
             }
@@ -231,8 +357,12 @@ pub(super) fn answer_from(
                 None => program(actions::Answer::Custom(joined)),
             }
         }
+        // Only ever at the process list: `check_shape` refused it
+        // everywhere else.
+        serde_json::Value::Object(_) => program(actions::Answer::Processes(process_tables(value)?)),
         other => Err(usage(format!(
-            "{name} takes a string, a list of strings, or null — not {other}"
+            "{name} takes {} — not {other}",
+            accepted(question.slot)
         ))),
     }
 }

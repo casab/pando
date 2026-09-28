@@ -59,9 +59,10 @@ pub enum What {
     /// A program answered a question the rules could not decide.
     Answer {
         /// The answer, in exactly the shape an answers file would send:
-        /// a string, a list of strings, or null. The log can therefore be
-        /// turned back into an answers file, which is what makes it
-        /// replayable rather than only readable.
+        /// a string, a list of strings, null, or an object of process
+        /// tables. The log can therefore be turned back into an answers
+        /// file, which is what makes it replayable rather than only
+        /// readable.
         answer: serde_json::Value,
         shape: Shape,
         /// What config said about this slot once the answer was written,
@@ -88,7 +89,8 @@ pub enum What {
 pub enum Shape {
     /// One of the options pando offered, named by its own text.
     Choice,
-    /// A command or path of the answerer's own, matching no option.
+    /// A command or path of the answerer's own, matching no option — or
+    /// process tables of their own, at the process list.
     Custom,
     /// Several of the options, at the one question whose answer is a set.
     Set,

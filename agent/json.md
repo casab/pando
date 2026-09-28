@@ -237,7 +237,7 @@ loops:
 
 | State | Means | What a program does |
 |---|---|---|
-| `"proposal": null` | no rule had anything to say about this slot at all | **Nothing to choose, and still answerable.** There are no options and nobody is asked, so an `--answers` value is taken as a command of your own — validated and written like any other. `services` and `prelude` are the two exceptions and report it as unused. Do not put the slot to a human: pando is not asking |
+| `"proposal": null` | no rule had anything to say about this slot at all | **Nothing to choose, and still answerable.** There are no options and nobody is asked, so an `--answers` value is taken as a command of your own, or at `processes` as process tables — validated and written like any other. `services` and `prelude` are the two exceptions and report it as unused. Do not put the slot to a human: pando is not asking |
 | `"decided": true` | a rule settled it; no question will be asked | Leave it alone. An `--answers` value for it is reported as unused |
 | `"decided": false` | pando will ask | This is the only state an answer changes. Answer by value |
 
@@ -623,6 +623,29 @@ One JSON object. Keys are the question names above. Values:
 | `["a", "b"]` | the whole list, at `version_files` and `provision`, whose single answer is a list of files |
 | `null` | "none of them", where `allow_none` is true. At `schema_hook` it is "no": the step is written with `on = "never"` |
 | `[]` | "none of them" at the set question. A usage error anywhere else — `null` is how you say none |
+| `{"api": {...}, "web": {...}}` | at `processes` only: process tables of your own, one per key, each exactly what `[processes.<name>]` takes — `cmd`, and optionally `cwd`, `ports`, `env` and `ready` |
+
+The object is how a project of several processes is answered when no
+option fits it. A string of your own at `processes` is **one** command,
+written as `[dev]`; the `name: cmd in dir; …` text pando shows its own
+per-app option in names that option and is never a way to describe one.
+
+```jsonc
+{ "processes": {
+    "api":    { "cmd": "uv run uvicorn app.main:app --port {port}", "cwd": "backend",
+                "ports": ["api"] },
+    "worker": { "cmd": "uv run python -m app.worker", "cwd": "backend", "ports": [] },
+    "web":    { "cmd": "npm run dev", "cwd": "frontend", "ports": { "PORT": "web" },
+                "env": { "API_URL": "http://127.0.0.1:{port:api}" },
+                "ready": { "timeout_s": 90 } } } }
+```
+
+`ports` is a list of the roles the process owns, whose port reaches it
+as `{port}` or `{port:<role>}`, or a map of environment variable to role;
+`[]` is a process with no port, a worker. `{port:<role>}` in `cmd` or
+`env` may name any process's role or a service's name. `ready` takes
+`role` and `timeout_s`. Each table is written with
+`# answered: a program` on its header.
 
 **Answers are by value, never by index.** An index breaks the day a rule
 finds one more candidate; the text does not, and picking an option by its
@@ -634,10 +657,20 @@ Refusals, all exit 2 and all naming the key: a name that is not a question;
 a shape the question cannot take; a value that is not one of the options at
 a question that has them; an empty string; a `prelude` that fails its own
 probe on this machine, which is never written down; a `port_env` of your
-own that is not environment variable names. Several of them are one string
-separated by commas, `"PORT, API_PORT"`, the way the option naming several
-is written, and each owns the role its name says: `PORT` owns `web`,
-`API_PORT` owns `api`. One variable owns `web` whatever it is called. An answer for a slot that was
+own that is not environment variable names; a string at `processes` or
+`dev_cmd` in the `name: cmd in dir; …` form that is none of the options;
+process tables with a key a table does not take, no `cmd`, a variable
+that is not a name, a `cwd` that is not a directory of the repository or
+leaves it, a role two processes claim, or a `{…}` nothing will fill. Each
+refusal says what the question does take.
+
+A `port_env` of your own may name several variables, as one string
+separated by commas, `"PORT, API_PORT"` — the way the option naming
+several is written — and each owns the role its name says: `PORT` owns
+`web`, `API_PORT` owns `api`. One variable owns `web` whatever it is
+called.
+
+An answer for a slot that was
 already answered (without `--replace`), or that nothing asked about, is
 **reported on stderr and not applied** — it is not an error, and the run
 still exits 0. A slot with no proposal at all is not "nothing asked about":

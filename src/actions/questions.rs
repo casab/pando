@@ -91,6 +91,14 @@ pub enum Answer {
     /// an empty answer that means something: the port, and the empty set
     /// at the services question.
     None,
+    /// Whole process tables of the answerer's own, at the one question
+    /// whose answer is several processes: what `[processes.<name>]` says,
+    /// named as it would be there.
+    ///
+    /// The typed answer a multi-process project needs. A command of one's
+    /// own is one process, and a project of three is not one command
+    /// without losing each process's log, readiness and port.
+    Processes(std::collections::BTreeMap<String, config::ProcessConfig>),
     /// One of the shapes above, from a program rather than a person:
     /// `init --answers`.
     ///
@@ -385,6 +393,11 @@ pub(super) fn pending_decision(
             decisions::Shape::Set,
         ),
         Answer::None => (serde_json::Value::Null, decisions::Shape::None),
+        // The object the answers file sent, so the line replays as one.
+        Answer::Processes(tables) => (
+            serde_json::to_value(tables).unwrap_or_default(),
+            decisions::Shape::Custom,
+        ),
         // `--yes` never reaches here, and every wrapper is peeled before
         // this is called.
         Answer::Auto(_) | Answer::Program(_) => return None,
@@ -889,7 +902,7 @@ pub fn resolve_on(
         let Some(proposal) = proposals.iter().find(|p| p.slot == *slot) else {
             // No rule had anything to say. There is nobody to ask — but a
             // program driving this pass may still have an answer for it.
-            if volunteer(paths, &mut config, *slot, answers, progress)? {
+            if volunteer(paths, &mut config, *slot, &proposals, answers, progress)? {
                 if replacing {
                     answers.wrote_replacement(*slot);
                 }
@@ -1033,6 +1046,14 @@ pub fn resolve_on(
                 Answer::Custom(value) => {
                     (typed(*slot, &value, by)?, by.note(config::Note::Answered))
                 }
+                Answer::Processes(tables) if *slot == Slot::Processes => (
+                    process_tables(paths, &config, &proposals, tables, by)?,
+                    by.note(config::Note::Answered),
+                ),
+                Answer::Processes(_) => bail!(
+                    "{} is not answered with process tables — only the process list is",
+                    slot_label(*slot)
+                ),
                 // Only the multi-select slot has a set for an answer, and
                 // it never reaches here.
                 Answer::Many(_) => bail!(
@@ -1082,7 +1103,7 @@ pub fn resolve_on(
             // nothing is on disk, exactly as `write_answer` would.
             let mut proposed = config.clone();
             detect::apply(*slot, &candidate, &mut proposed);
-            refuse_unloadable(paths, *slot, &candidate.value, &proposed)?;
+            refuse_unloadable(paths, *slot, &candidate.value, &proposed, &note)?;
             config = proposed;
             deferred.push(Deferred {
                 slot: *slot,
@@ -1174,7 +1195,7 @@ fn write_answer(
     // disk, instead of at the next load with half a project broken.
     let mut proposed = config.clone();
     detect::apply(slot, candidate, &mut proposed);
-    refuse_unloadable(paths, slot, &candidate.value, &proposed)?;
+    refuse_unloadable(paths, slot, &candidate.value, &proposed, &note)?;
     // Checked, so the old answer can go: now, and only now.
     if replaces {
         forget_on_disk(paths, slot)?;
@@ -1259,7 +1280,7 @@ fn write_empty_answer(
     // exception to it is one the next rule walks into.
     let mut proposed = config.clone();
     apply_empty(slot, &mut proposed);
-    refuse_unloadable(paths, slot, "none of them", &proposed)?;
+    refuse_unloadable(paths, slot, "none of them", &proposed, &note)?;
     config::set_detected(
         paths,
         slot.layer(),
@@ -1300,6 +1321,7 @@ fn volunteer(
     paths: &PandoPaths,
     config: &mut Config,
     slot: Slot,
+    proposals: &[detect::Proposal],
     answers: &Answering<'_>,
     progress: &dyn Fn(&str),
 ) -> Result<bool> {
@@ -1326,6 +1348,11 @@ fn volunteer(
     match answer {
         Answer::Custom(value) => {
             let candidate = typed(slot, &value, by)?;
+            let note = by.note(config::Note::Answered);
+            write_answer(paths, config, slot, &candidate, note, pending, progress)?;
+        }
+        Answer::Processes(tables) if slot == Slot::Processes => {
+            let candidate = process_tables(paths, config, proposals, tables, by)?;
             let note = by.note(config::Note::Answered);
             write_answer(paths, config, slot, &candidate, note, pending, progress)?;
         }
@@ -1408,7 +1435,7 @@ fn apply_service_answer(
     let mut proposed = config.clone();
     detect::apply_services(&file, &refs, &mut proposed);
     let names: Vec<&str> = refs.iter().map(|c| c.value.as_str()).collect();
-    refuse_unloadable(paths, Slot::Services, &names.join(", "), &proposed)?;
+    refuse_unloadable(paths, Slot::Services, &names.join(", "), &proposed, &note)?;
     if replaces {
         forget_on_disk(paths, Slot::Services)?;
     }
@@ -1437,7 +1464,7 @@ pub(super) fn apply_native_service_answer(
     if chosen.is_empty() {
         let mut proposed = config.clone();
         proposed.isolation.none = true;
-        refuse_unloadable(paths, Slot::Services, "none of them", &proposed)?;
+        refuse_unloadable(paths, Slot::Services, "none of them", &proposed, &note)?;
         if replaces {
             forget_on_disk(paths, Slot::Services)?;
         }
@@ -1459,7 +1486,7 @@ pub(super) fn apply_native_service_answer(
     let mut proposed = config.clone();
     detect::apply_native_services(chosen, &mut proposed);
     let names: Vec<&str> = chosen.iter().map(|c| c.value.as_str()).collect();
-    refuse_unloadable(paths, Slot::Services, &names.join(", "), &proposed)?;
+    refuse_unloadable(paths, Slot::Services, &names.join(", "), &proposed, &note)?;
     if replaces {
         forget_on_disk(paths, Slot::Services)?;
     }
@@ -1547,19 +1574,126 @@ fn apply_empty(slot: Slot, config: &mut Config) {
 /// cross-slot rule `validate` knows about is covered, present and future,
 /// and the message a developer sees is the loader's own — the same
 /// sentence they would have read later, minus the broken file.
+///
+/// A program's answer refused here is the program's input that is wrong,
+/// so it gets the usage-error shape: `note` says whose answer it was.
 fn refuse_unloadable(
     paths: &PandoPaths,
     slot: Slot,
     answer: &str,
     proposed: &Config,
+    note: &config::Note,
 ) -> Result<()> {
     let Err(e) = config::validate(proposed, &paths.project) else {
         return Ok(());
     };
-    bail!(
+    let by = match note {
+        config::Note::Program => Answerer::Program,
+        _ => Answerer::Human,
+    };
+    Err(by.refuse(format!(
         "{answer:?} cannot be this project's {}: {e:#} — nothing was written",
         slot_label(slot)
-    )
+    )))
+}
+
+/// Process tables a program wrote, as the candidate they become — held
+/// first to what the rules' own per-app option is true of by
+/// construction.
+///
+/// The loader's rules — names, roles, `ready.role`, a `cwd` inside the
+/// worktree — are [`refuse_unloadable`]'s, which every answer passes on
+/// its way to disk. What is left is what only a table somebody wrote can
+/// get wrong: a `cwd` that is not a directory of this repository, and a
+/// `{…}` in a command or an environment value that names nothing a
+/// worktree will have. Either one is a start that fails after the install
+/// has run, for a reason the answer could have been told.
+fn process_tables(
+    paths: &PandoPaths,
+    config: &Config,
+    proposals: &[detect::Proposal],
+    tables: std::collections::BTreeMap<String, config::ProcessConfig>,
+    by: Answerer,
+) -> Result<detect::Candidate> {
+    let refuse = |message: String| by.refuse(format!("{message} — nothing was written"));
+    for (name, process) in &tables {
+        // One that leaves the worktree is the loader's to refuse, in its
+        // own words.
+        if let Some(cwd) = process.cwd.as_deref()
+            && Path::new(cwd).components().all(|c| {
+                matches!(
+                    c,
+                    std::path::Component::Normal(_) | std::path::Component::CurDir
+                )
+            })
+            && !paths.root().join(cwd).is_dir()
+        {
+            return Err(refuse(format!(
+                "processes.{name}.cwd is {cwd:?}, which is not a directory of this repository"
+            )));
+        }
+    }
+    // Every role a placeholder may name: the answer's own processes', a
+    // service config already has, and a service the rules offer. The
+    // services are asked after the processes, so a process told where
+    // its database is names a role no config holds yet.
+    let offered = proposals
+        .iter()
+        .filter(|p| p.slot == Slot::Services)
+        .flat_map(|p| p.candidates.iter().map(|c| c.value.clone()));
+    let mut roles = std::collections::BTreeMap::new();
+    for role in tables
+        .values()
+        .flat_map(config::ProcessConfig::roles)
+        .chain(service_roles(config))
+        .chain(offered)
+    {
+        // Only there so a template can render: which number is not the
+        // question, whether there is one is.
+        roles.entry(role).or_insert(crate::ports::PORT_MIN);
+    }
+    for (name, process) in &tables {
+        let own = process.roles();
+        let ctx = crate::template::Context {
+            name: "a-worktree",
+            branch: Some("a-branch"),
+            worktree: Path::new("/worktree"),
+            root: Path::new("/root"),
+            project: "project",
+            ports: &roles,
+            default_role: own.first().map(String::as_str),
+            log: Some(Path::new("/log")),
+        };
+        let texts = std::iter::once(("cmd".to_string(), &process.cmd)).chain(
+            process
+                .env
+                .iter()
+                .map(|(key, value)| (format!("env.{key}"), value)),
+        );
+        for (what, text) in texts {
+            if let Err(e) = crate::template::render(text, &ctx) {
+                return Err(refuse(format!(
+                    "processes.{name}.{what} cannot be resolved: {e:#} — a role is one a \
+                     process owns in its `ports`, or a service's name"
+                )));
+            }
+        }
+    }
+    // What the question and the refusals show, in the form the rules' own
+    // per-app option is shown.
+    let value = tables
+        .iter()
+        .map(|(name, process)| match &process.cwd {
+            Some(cwd) => format!("{name}: {} in {cwd}", process.cmd),
+            None => format!("{name}: {}", process.cmd),
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Ok(detect::Candidate {
+        value,
+        processes: Some(tables),
+        ..detect::Candidate::default()
+    })
 }
 
 /// Edits gathered per table, keeping the order they were produced in.

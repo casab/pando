@@ -1,4 +1,5 @@
 use super::answers::answer_from;
+use super::answers::reads_as_process_list;
 use super::answers::slot_named;
 use super::answers::slot_names;
 use super::logs::silence_notes;
@@ -2972,6 +2973,162 @@ fn a_shape_the_slot_cannot_take_is_refused_before_anything_is_written() {
     assert!(Answers::parse(r#"{"services": []}"#).is_ok());
     assert!(Answers::parse(r#"{"provision": [".env"]}"#).is_ok());
     assert!(Answers::parse(r#"{"version_files": [".nvmrc"]}"#).is_ok());
+}
+
+/// The process-list question with nothing on offer: a project with no
+/// manifest pando reads.
+fn processes_question() -> actions::Question {
+    actions::Question {
+        slot: crate::detect::Slot::Processes,
+        prompt: crate::detect::Slot::Processes.prompt().to_string(),
+        ..dev_question(&[])
+    }
+}
+
+// An object mirroring `[processes.<name>]` was refused as a shape no
+// question takes. At the process list it is the answer a project of
+// several processes needs.
+#[test]
+fn an_object_at_processes_is_whole_process_tables() {
+    let answers = Answers::parse(
+        r#"{"processes": {
+            "api": {"cmd": "uv run uvicorn app:app --port {port}", "cwd": "backend",
+                    "ports": ["api"]},
+            "web": {"cmd": "npm run dev", "cwd": "frontend", "ports": {"PORT": "web"},
+                    "env": {"API_URL": "http://127.0.0.1:{port:api}"},
+                    "ready": {"timeout_s": 90}}
+        }}"#,
+    )
+    .unwrap();
+    let answer = answers
+        .for_question(&processes_question())
+        .expect("the file answers it")
+        .unwrap();
+    let actions::Answer::Program(inner) = answer else {
+        panic!("a program's answer says so: {answer:?}");
+    };
+    let actions::Answer::Processes(tables) = *inner else {
+        panic!("process tables: {inner:?}");
+    };
+    assert_eq!(tables.keys().collect::<Vec<_>>(), ["api", "web"]);
+    assert_eq!(tables["api"].roles(), ["api"]);
+    assert_eq!(tables["web"].port_env()["PORT"], "{port:web}");
+    assert_eq!(tables["web"].ready.as_ref().unwrap().timeout_s, Some(90));
+}
+
+#[test]
+fn process_tables_are_read_as_strictly_as_the_toml_they_become() {
+    for (json, says) in [
+        (r#"{"processes": {}}"#, "empty object"),
+        (
+            r#"{"processes": {"api": {"command": "x"}}}"#,
+            "processes.api is not a process table: unknown field `command`",
+        ),
+        (
+            r#"{"processes": {"api": {"cwd": "backend"}}}"#,
+            "processes.api has no cmd",
+        ),
+        (
+            r#"{"processes": {"api": "uvicorn"}}"#,
+            "processes.api is not a process table",
+        ),
+        (
+            r#"{"processes": {"api": {"cmd": "x", "ports": {"API-PORT": "api"}}}}"#,
+            "\"API-PORT\", which is not an environment variable name",
+        ),
+        (
+            r#"{"processes": {"api": {"cmd": "x", "env": {"A B": "1"}}}}"#,
+            "not an environment variable name",
+        ),
+    ] {
+        let e = Answers::parse(json).unwrap_err();
+        assert!(e.downcast_ref::<UsageError>().is_some(), "{json}");
+        let e = format!("{e:#}");
+        assert!(e.contains(says), "{json}: {e}");
+    }
+}
+
+// Each refusal says what the question does take. The two a program met
+// back to back said "a string, a list of strings, or null" and then "one
+// answer, not a list of them", and neither one was true of the question.
+#[test]
+fn a_refused_shape_says_what_the_question_takes() {
+    let err = parse_err(r#"{"processes": ["api: x", "web: y"]}"#);
+    assert!(err.contains("not a list"), "{err}");
+    assert!(err.contains("an object of process tables"), "{err}");
+    assert!(!err.contains("list of strings"), "{err}");
+
+    let err = parse_err(r#"{"processes": 1}"#);
+    assert!(err.contains("an object of process tables"), "{err}");
+    assert!(!err.contains("list of strings"), "{err}");
+
+    // Only the process list takes tables.
+    let err = parse_err(r#"{"dev_cmd": {"api": {"cmd": "x"}}}"#);
+    assert!(err.contains("dev_cmd takes one string"), "{err}");
+    assert!(!err.contains("object"), "{err}");
+
+    let err = parse_err(r#"{"port_env": ["PORT"]}"#);
+    assert!(err.contains("null for none"), "{err}");
+    let err = parse_err(r#"{"provision": 1}"#);
+    assert!(err.contains("a list of file names"), "{err}");
+}
+
+// The per-app option is shown as `name: cmd in dir; …`. Typed with
+// processes of one's own in it, it matched nothing and became one shell
+// command that runs `api:` and fails.
+#[test]
+fn a_typed_process_list_in_the_options_own_form_is_refused_for_the_object_form() {
+    let typed = "api: uv run uvicorn app:app in backend; worker: uv run python -m worker in \
+                 backend; web: npm run dev in frontend";
+    for question in [processes_question(), dev_question(&["pnpm dev"])] {
+        let err = answer_from(&question, &serde_json::json!(typed)).unwrap_err();
+        assert!(err.downcast_ref::<UsageError>().is_some());
+        let err = format!("{err:#}");
+        assert!(err.contains("object of process tables"), "{err}");
+    }
+    // Named as an option it is still that option.
+    let question = actions::Question {
+        options: vec![(typed.to_string(), "a dev script in each app".to_string())],
+        ..processes_question()
+    };
+    assert_eq!(
+        answer_from(&question, &serde_json::json!(typed)).unwrap(),
+        actions::Answer::Program(Box::new(actions::Answer::Choice(0)))
+    );
+    // And a command that only has a colon or a semicolon in it is a
+    // command.
+    for command in [
+        "npm run dev",
+        "cd backend; uv run uvicorn app:app",
+        "echo ready: yes",
+        "PORT=3000 node server.js in-memory",
+    ] {
+        assert!(!reads_as_process_list(command), "{command}");
+    }
+}
+
+// The recogniser is held to the text the rules' own per-app option
+// really has, so the two cannot drift apart.
+#[test]
+fn the_per_app_option_reads_as_a_process_list() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("package.json"), r#"{ "workspaces": ["apps/*"] }"#).unwrap();
+    for (app, dev) in [("web", "vite"), ("api", "node --watch src/index.js")] {
+        std::fs::create_dir_all(root.join("apps").join(app)).unwrap();
+        std::fs::write(
+            root.join("apps").join(app).join("package.json"),
+            format!(r#"{{ "scripts": {{ "dev": "{dev}" }} }}"#),
+        )
+        .unwrap();
+    }
+    let proposal = crate::detect::propose(root, &crate::detect::signals(root))
+        .into_iter()
+        .find(|p| p.slot == crate::detect::Slot::Processes)
+        .expect("a workspace has a per-app option");
+    let option = &proposal.candidates[0];
+    assert!(option.processes.as_ref().is_some_and(|p| p.len() == 2));
+    assert!(reads_as_process_list(&option.value), "{}", option.value);
 }
 
 #[test]

@@ -257,7 +257,19 @@ developer's repository — keys are the slot names above, and:
   is true. An empty string is a usage error. `[]` means "none of them" at
   the set question and is a usage error anywhere else.
 - a string that matches no option is a command of your own, wherever
-  `allow_custom` is true.
+  `allow_custom` is true. At `processes` it is **one** process.
+- an **object** at `processes` is several processes of your own, one
+  `[processes.<name>]` table per key: `{"api": {"cmd": "…", "cwd":
+  "backend", "ports": ["api"]}, "web": {"cmd": "npm run dev", "cwd":
+  "frontend", "ports": {"PORT": "web"}, "env": {"API_URL":
+  "http://127.0.0.1:{port:api}"}}}`. It is how a project of several apps is
+  answered when no option fits it — never one command that backgrounds
+  them all, which loses each one's log, readiness and port. The
+  `name: cmd in dir; …` text pando shows its own per-app option in names
+  that option and is refused as a description of yours. `pando init
+  --agent --reference json` has every key a table takes.
+- a `port_env` of your own may name several variables, comma-separated:
+  `"PORT, API_PORT"`, each owning the role its name says.
 - **a slot with no proposal at all takes that same custom answer.** There
   are no options for it to match, so whatever you send is a command of your
   own: validated, refused if it would make the config unloadable, and
