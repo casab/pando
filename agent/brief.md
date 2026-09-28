@@ -473,7 +473,8 @@ you start the scratch worktree again. A fix that is not — a variable one
 process needs, an app whose own config pins a port — is the developer's:
 name the process, what it did, and the line that would fix it, and write
 nothing. Stop the scratch worktree when you are done and tell the
-developer its name; removing it is theirs, as removing anything is.
+developer its name; removing it is theirs, as removing anything is. §9
+has the shape that line takes.
 
 ## 7. What pando records about you
 
@@ -539,6 +540,53 @@ Absolute. None of these has an exception worth taking.
   It writes into their own database server. It is experimental, it needs
   a grant only they can give, and `rm` of a namespaced worktree drops its
   database.
+
+## 9. The process table, for what the answers cannot say
+
+When a project needs what no answer writes — a process with an `env` of
+its own, a readiness wait, a port another process has to know — you
+still write nothing. You give the developer the exact lines to add to
+pando's config for the project, the project layer `pando doctor` names,
+and `pando check` proves them once they have. The shape:
+
+```toml
+[processes.api]                       # one table per process; [dev] is one called dev
+cmd = "uv run uvicorn app.main:app --port {port:api}"
+cwd = "backend"                       # relative to the worktree; the root when left out
+ports = ["api"]                       # the roles it owns: {port:api} is the api role's port
+
+[processes.web]
+cmd = "npm run dev"
+cwd = "frontend"
+ports = { PORT = "web" }              # a map puts the role's port in that variable
+env = { VITE_API_URL = "http://127.0.0.1:{port:api}" }  # another process's port, by role
+ready = { timeout_s = 90 }            # how long its first start may take
+
+[processes.worker]
+cmd = "uv run python -m app.worker"
+cwd = "backend"
+ports = []                            # no port: ready once it stays up
+```
+
+- **`{port:<role>}`** is the port pando gave that role in this worktree,
+  in `cmd` and in `env` alike, whichever process owns the role. It is
+  how a frontend finds its own worktree's backend: `VITE_API_URL`,
+  `NEXT_PUBLIC_API_URL`, `EXPO_PUBLIC_API_BASE_URL`, whatever the app
+  reads. A variable a bundler inlines, such as `EXPO_PUBLIC_*` or
+  `VITE_*`, has to reach it this way, as the process's environment.
+- **The URL** `status` and `open` give, and the page `check` asks for,
+  is the `web` role's, else the first role of the first process by
+  name. The other roles need no page: a check asks none of them for
+  one, and `http_status: null` there is right. A role nobody opens in a
+  browser — an API, a mobile bundler — still wants its own name rather
+  than `web`.
+- **A phone cannot reach `127.0.0.1`.** Every URL pando gives, and every
+  `{port:<role>}` address written as `127.0.0.1`, is this machine's. An
+  app on a physical device needs the machine's LAN address instead: in
+  its backend URL, and, for Expo, in `REACT_NATIVE_PACKAGER_HOSTNAME` on
+  the bundler's process. Which address that is belongs to the
+  developer's network, so tell them the variable and where it goes;
+  never guess the address.
 
 ---
 

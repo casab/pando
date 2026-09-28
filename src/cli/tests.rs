@@ -2702,6 +2702,10 @@ fn the_memory_block_names_the_project_its_root_and_only_real_commands() {
         ),
         ("exit 3", "the code that is a question"),
         (
+            "a phone cannot reach `127.0.0.1`",
+            "that a device needs the LAN address",
+        ),
+        (
             "`pando init --agent --reference brief`",
             "where the rest is",
         ),
@@ -2884,6 +2888,14 @@ fn the_brief_teaches_the_things_only_it_teaches() {
         ),
         ("exit 3", "the code that means a question is open"),
         ("--json", "never parse human-readable output"),
+        ("[processes.", "the process table an answer cannot write"),
+        ("{port:<role>}", "how one process finds another's port"),
+        ("`http_status: null`", "that a role need not serve a page"),
+        (
+            "REACT_NATIVE_PACKAGER_HOSTNAME",
+            "that a phone needs the machine's LAN address",
+        ),
+        ("kind: \"base\"", "a failure no setting fixes"),
     ] {
         assert!(
             text.to_lowercase().contains(&phrase.to_lowercase()),
@@ -2894,6 +2906,35 @@ fn the_brief_teaches_the_things_only_it_teaches() {
     for name in slot_names() {
         assert!(text.contains(&name), "the brief never mentions {name}");
     }
+}
+
+/// The brief's process table is one pando reads: every key it shows is a
+/// key of the schema, and the whole of it loads, so the lines an agent
+/// hands a developer to paste are lines pando takes.
+#[test]
+fn the_briefs_process_table_is_a_config_pando_loads() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("agent/brief.md");
+    let text = std::fs::read_to_string(&path).expect("the brief");
+    let section = &text[text
+        .find("## 9. The process table")
+        .expect("the brief has the process table section")..];
+    let start = section.find("```toml\n").expect("a TOML block") + "```toml\n".len();
+    let block = &section[start..start + section[start..].find("```").unwrap()];
+    let fx = fixture();
+    std::fs::create_dir_all(fx.paths.config_file().parent().unwrap()).unwrap();
+    std::fs::write(fx.paths.config_file(), block).unwrap();
+    let loaded = crate::config::load(&fx.paths).unwrap_or_else(|e| panic!("{e:#}\n{block}"));
+    assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+    let processes = &loaded.config.processes;
+    assert_eq!(
+        processes.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["api", "web", "worker"]
+    );
+    assert_eq!(
+        processes["web"].env["VITE_API_URL"],
+        "http://127.0.0.1:{port:api}"
+    );
+    assert_eq!(processes["worker"].roles(), Vec::<String>::new());
 }
 
 /// The contract file says the same names, in the same order.
