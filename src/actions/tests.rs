@@ -12712,7 +12712,11 @@ fn a_running_worktree_keeps_a_slot_another_record_names_and_rm_of_the_other_empt
     assert!(report.started.is_empty(), "{said:?}");
     assert!(said.iter().any(|l| l == kept), "{said:?}");
 
-    std::fs::remove_file(&ns.seen).unwrap();
+    // The start above cleared the file and started nothing, so whether it
+    // is here depends only on when the running app wrote its environment:
+    // before that clearing (gone) or after (here). Either way it is
+    // cleared now, for `env_line` to wait for the restarted app's.
+    let _ = std::fs::remove_file(&ns.seen);
     let (said, progress) = collecting();
     let report = super::restart(
         &ns.fx.paths,
