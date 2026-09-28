@@ -1214,6 +1214,39 @@ fn shell_resolving_node<'a>(
     }
 }
 
+/// A shell that resolves node `without`, and `with` once a prelude
+/// carrying `needle` is in front of it — a version manager's line, or a
+/// directory put first on PATH.
+fn shell_resolving_node_behind<'a>(
+    without: &'a str,
+    needle: &'a str,
+    with: &'a str,
+) -> impl Fn(&str) -> Option<String> + 'a {
+    move |script: &str| {
+        if script.contains(TOOL_DONE_MARK) {
+            return every_tool(script);
+        }
+        let version = match script.contains(needle) {
+            true => with,
+            false => without,
+        };
+        Some(format!(
+            "pando-runtime-path:/n/{version}/bin/node\npando-runtime-version:v{version}\n\
+             pando-runtime-status:0\npando-runtime-ok\n"
+        ))
+    }
+}
+
+/// The runtime finding's fix, whole.
+fn runtime_fix(report: &Report) -> String {
+    report
+        .findings
+        .iter()
+        .find(|f| f.section == Section::Runtime)
+        .and_then(|f| f.fix.clone())
+        .unwrap_or_default()
+}
+
 fn pin_node(fx: &Fx, version: &str) {
     std::fs::write(fx.root.join(".nvmrc"), format!("{version}\n")).expect("write .nvmrc");
 }
@@ -1388,7 +1421,10 @@ fn a_mismatch_offers_the_prelude_of_a_manager_this_machine_really_has() {
     // installed never decides the assertion.
     std::fs::create_dir_all(fx.machine_home.join(".nvm")).expect("nvm dir");
     std::fs::write(fx.machine_home.join(".nvm/nvm.sh"), "# fake\n").expect("nvm.sh");
-    let report = report_of(&fx, &shell_resolving_node("24.21.0", "/n/bin/node"));
+    let report = report_of(
+        &fx,
+        &shell_resolving_node_behind("24.21.0", "nvm.sh", "22.14.0"),
+    );
     let node = &report.runtime.languages[0];
     assert!(node.managers.contains(&"nvm"), "{:?}", node.managers);
     let from_home = node
@@ -1397,14 +1433,110 @@ fn a_mismatch_offers_the_prelude_of_a_manager_this_machine_really_has() {
         .find(|fix| fix.contains(&fx.machine_home.display().to_string()))
         .expect("a fix built from the injected home");
     assert!(from_home.contains("nvm use"), "{from_home}");
-    let fix = report
-        .findings
-        .iter()
-        .find(|f| f.section == Section::Runtime)
-        .and_then(|f| f.fix.clone())
-        .unwrap_or_default();
+    let fix = runtime_fix(&report);
     assert!(fix.contains("set [runtime].prelude to one of:"), "{fix}");
     assert!(fix.contains("nvm"), "{fix}");
+}
+
+// A manager that is here and gives `bash -lc` nothing the project accepts
+// is not "no manager": the fix names it and the command that would put
+// the version under it, and never says no manager is installed while the
+// same entry lists one.
+#[test]
+fn a_manager_without_the_version_is_named_with_its_install_command() {
+    let fx = fixture();
+    pin_node(&fx, "22");
+    std::fs::create_dir_all(fx.machine_home.join(".nvm")).expect("nvm dir");
+    std::fs::write(fx.machine_home.join(".nvm/nvm.sh"), "# fake\n").expect("nvm.sh");
+    let report = report_of(&fx, &shell_resolving_node("24.21.0", "/n/bin/node"));
+    let fix = runtime_fix(&report);
+    assert!(
+        fix.contains(
+            "nvm is installed here, and gives `bash -lc` no node 22 — `nvm install 22` puts one \
+             under nvm (pando never installs one), or set [runtime].prelude to a line that puts \
+             a node 22 first on PATH"
+        ),
+        "{fix}"
+    );
+    assert!(!fix.contains("no version manager"), "{fix}");
+    assert!(
+        !fix.contains("set [runtime].prelude to one of:"),
+        "nvm's line does not work yet, so it is not what to set: {fix}"
+    );
+    assert!(
+        fix.contains("then [runtime].prelude can be one of:") && fix.contains("nvm use"),
+        "and it is what to set once the version is there: {fix}"
+    );
+}
+
+// The same when nvm is here but its line cannot read the requirement —
+// a `.nvmrc` in an app directory — so there is no line of its own.
+#[test]
+fn a_manager_with_no_line_for_the_requirement_is_still_named() {
+    let fx = fixture();
+    std::fs::create_dir_all(fx.root.join("backend")).expect("backend");
+    std::fs::write(fx.root.join("backend/.nvmrc"), "25\n").expect("write .nvmrc");
+    std::fs::write(
+        fx.root.join("pando.toml"),
+        "[runtime]\nversion_files = [\"backend/.nvmrc\"]\n",
+    )
+    .expect("write pando.toml");
+    std::fs::create_dir_all(fx.machine_home.join(".nvm")).expect("nvm dir");
+    std::fs::write(fx.machine_home.join(".nvm/nvm.sh"), "# fake\n").expect("nvm.sh");
+    let report = report_of(&fx, &shell_resolving_node("24.21.0", "/n/bin/node"));
+    let node = &report.runtime.languages[0];
+    assert_eq!(node.managers, vec!["nvm"]);
+    let fix = runtime_fix(&report);
+    assert!(
+        fix.contains("nvm is installed here, and gives `bash -lc` no node 25 — `nvm install 25`"),
+        "{fix}"
+    );
+    assert!(!fix.contains("no version manager"), "{fix}");
+}
+
+#[test]
+fn no_manager_at_all_says_so() {
+    let fx = fixture();
+    pin_node(&fx, "22");
+    let report = report_of(&fx, &shell_resolving_node("24.21.0", "/n/bin/node"));
+    let fix = runtime_fix(&report);
+    assert!(
+        fix.contains(
+            "no version manager pando knows about is installed for node — install one, or set \
+             [runtime].prelude to a line that puts a node 22 first on PATH"
+        ),
+        "{fix}"
+    );
+}
+
+// A node the project accepts, sitting where Homebrew puts one, is a line
+// doctor prints: the directory first on PATH, with the version it gives
+// and the fact that it runs in every project on this machine. Read under
+// the injected machine, so this laptop's own /opt/homebrew decides
+// nothing.
+#[test]
+fn a_node_in_a_well_known_place_is_offered_as_a_path_line() {
+    let fx = fixture();
+    pin_node(&fx, "25");
+    let brew = fx.machine_home.join("opt/homebrew/bin");
+    std::fs::create_dir_all(&brew).expect("brew bin");
+    std::fs::write(brew.join("node"), "#!/bin/sh\n").expect("node");
+    let report = report_of(
+        &fx,
+        &shell_resolving_node_behind("24.21.0", "opt/homebrew/bin", "25.8.2"),
+    );
+    let fix = runtime_fix(&report);
+    assert!(fix.contains("set [runtime].prelude to one of:"), "{fix}");
+    assert!(
+        fix.contains(&format!("export PATH=\"{}:$PATH\"", brew.display())),
+        "{fix}"
+    );
+    assert!(fix.contains("node 25.8.2 is in"), "{fix}");
+    assert!(fix.contains("every project on this machine"), "{fix}");
+    assert!(
+        !fx.paths.runtime_cache_file().exists(),
+        "doctor tries the line and remembers nothing"
+    );
 }
 
 #[test]

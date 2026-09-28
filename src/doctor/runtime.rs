@@ -38,14 +38,38 @@ pub(super) fn runtime_report(
         // problems would be the kind of report this command exists to
         // replace.
         let check = runtime::check(requirement, effective, machine.shell);
-        let managers: Vec<&'static str> = runtime::installed(entry, &machine.home, &machine.system)
-            .into_iter()
-            .map(|manager| manager.name)
-            .collect();
-        let fixes: Vec<String> = runtime::fixes(entry, &machine.home, &machine.system, requirement)
-            .into_iter()
-            .map(|fix| format!("{}  ({})", fix.line, fix.why))
-            .collect();
+        let installed = runtime::installed(entry, &machine.home, &machine.system);
+        let managers: Vec<&'static str> = installed.iter().map(|manager| manager.name).collect();
+        // For a mismatch, the lines the prelude question would offer, each
+        // tried on this machine as the question tries it; writing nothing,
+        // so a line that works is not remembered. For anything else the
+        // managers' lines as they are: nothing needs fixing, and trying
+        // them would be a shell each for no question.
+        let offers: Option<Vec<actions::Offer>> = match check.verdict {
+            Verdict::Mismatch => Some(
+                actions::prelude_offers(paths, config, &requirements, &check, machine, false)
+                    .unwrap_or_default(),
+            ),
+            _ => None,
+        };
+        let fixes: Vec<String> = match &offers {
+            Some(offers) => offers
+                .iter()
+                .map(|offer| format!("{}  ({})", offer.line, offer.why))
+                .collect(),
+            None => runtime::fixes(entry, &machine.home, &machine.system, requirement)
+                .into_iter()
+                .map(|fix| format!("{}  ({})", fix.line, fix.why))
+                .collect(),
+        };
+        // Printed, never run: what would put the version under the first
+        // manager here that installs one.
+        let install = installed.iter().find_map(|manager| {
+            Some((
+                manager.name,
+                manager.install_command(entry, &requirement.spec)?,
+            ))
+        });
         let report = LanguageReport {
             language: requirement.language.clone(),
             spec: requirement.spec.clone(),
@@ -77,7 +101,14 @@ pub(super) fn runtime_report(
         if check.verdict == Verdict::Mismatch
             && !actions::runs_through_runner(&dir, config, entry, effective, machine.shell)
         {
-            findings.push(mismatch_finding(&report, prelude.as_deref(), &prelude_from));
+            let offers = offers.unwrap_or_default();
+            let fix = mismatch_fix(&report, &offers, install);
+            findings.push(mismatch_finding(
+                &report,
+                fix,
+                prelude.as_deref(),
+                &prelude_from,
+            ));
         }
         languages.push(report);
     }
@@ -98,6 +129,7 @@ pub(super) fn runtime_report(
 /// and it does not, so the next start spawns a process that dies of it.
 fn mismatch_finding(
     language: &LanguageReport,
+    fix: String,
     prelude: Option<&str>,
     prelude_from: &Option<String>,
 ) -> Finding {
@@ -119,27 +151,6 @@ fn mismatch_finding(
         (_, _, Some(failure)) => format!("the prelude never got as far as asking: {failure}"),
         (_, _, None) => format!("`bash -lc` here has no {} at all", language.language),
     };
-    let mut fix = String::new();
-    let _ = writeln!(
-        fix,
-        "pando runs every command with `bash -lc`, which is not your interactive shell"
-    );
-    match language.fixes.as_slice() {
-        [] => {
-            let _ = writeln!(
-                fix,
-                "no version manager pando knows about is installed for {} — install one, or \
-                 put the right binary on the PATH a login bash shell has",
-                language.language
-            );
-        }
-        fixes => {
-            let _ = writeln!(fix, "set [runtime].prelude to one of:");
-            for line in fixes {
-                let _ = writeln!(fix, "  {line}");
-            }
-        }
-    }
     match prelude {
         None => Finding {
             section: Section::Runtime,
@@ -172,5 +183,80 @@ fn mismatch_finding(
             ),
             fix: Some(fix.trim_end().to_string()),
         },
+    }
+}
+
+/// What to do about a mismatch: the lines the prelude question would
+/// offer, or, when none of them works yet, what would make one.
+///
+/// "No manager" and "a manager without this version" are different
+/// sentences. nvm listed beside "no version manager pando knows about"
+/// said two things at once; a manager that is here and gives `bash -lc`
+/// nothing it accepts is fixed by its own install command, which pando
+/// prints and never runs.
+fn mismatch_fix(
+    language: &LanguageReport,
+    offers: &[actions::Offer],
+    install: Option<(&'static str, String)>,
+) -> String {
+    let wanted = format!("{} {}", language.language, language.spec);
+    let mut fix = String::new();
+    let _ = writeln!(
+        fix,
+        "pando runs every command with `bash -lc`, which is not your interactive shell"
+    );
+    let line = |offer: &actions::Offer| format!("  {}  ({})", offer.line, offer.why);
+    if offers.iter().any(|offer| offer.works) {
+        let _ = writeln!(fix, "set [runtime].prelude to one of:");
+        for offer in offers {
+            let _ = writeln!(fix, "{}", line(offer));
+        }
+    } else {
+        let first_on_path =
+            format!("set [runtime].prelude to a line that puts a {wanted} first on PATH");
+        let _ = match (language.managers.as_slice(), install) {
+            ([], _) => writeln!(
+                fix,
+                "no version manager pando knows about is installed for {} — install one, or \
+                 {first_on_path}",
+                language.language
+            ),
+            (managers, Some((manager, command))) => writeln!(
+                fix,
+                "{} installed here, and {} `bash -lc` no {wanted} — `{command}` puts one under \
+                 {manager} (pando never installs one), or {first_on_path}",
+                is_are(managers),
+                match managers.len() {
+                    1 => "gives",
+                    _ => "none gives",
+                }
+            ),
+            (managers, None) => writeln!(
+                fix,
+                "{} installed here, and {} `bash -lc` no {wanted} — install it under one, or \
+                 {first_on_path}",
+                is_are(managers),
+                match managers.len() {
+                    1 => "gives",
+                    _ => "none gives",
+                }
+            ),
+        };
+        if !offers.is_empty() {
+            let _ = writeln!(fix, "then [runtime].prelude can be one of:");
+            for offer in offers {
+                let _ = writeln!(fix, "{}", line(offer));
+            }
+        }
+    }
+    fix
+}
+
+/// `nvm is`, `nvm and fnm are`: the managers as the subject of a sentence.
+fn is_are(managers: &[&str]) -> String {
+    match managers {
+        [one] => format!("{one} is"),
+        [rest @ .., last] => format!("{} and {last} are", rest.join(", ")),
+        [] => String::new(),
     }
 }
