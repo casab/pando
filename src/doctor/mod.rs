@@ -22,7 +22,8 @@
 //! (`Finding`, `Section`, `Severity`, and one `*Report` per section) and
 //! `render` turns them into text. Each section is built in its own file:
 //! `config` (the project and every config layer), `runtime`, `tools`,
-//! `worktrees`, `services`, `namespaces` (databases a namespaced worktree
+//! `worktrees`, `services` with `workers` (queue workers that share one
+//! Redis across worktrees), `namespaces` (databases a namespaced worktree
 //! left behind), `hooks`, and `adopt` (project folders left behind by a
 //! moved repository, and `--adopt` itself). `stale` compares
 //! detected values with what detection would write now, and `validate`
@@ -46,6 +47,7 @@ mod stale;
 mod tests;
 mod tools;
 mod validate;
+mod workers;
 mod worktrees;
 
 use adopt::adoptable;

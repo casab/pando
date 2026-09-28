@@ -286,6 +286,26 @@ pub(super) fn native_candidates(signals: &Signals, evidence: &MachineEvidence) -
         .collect()
 }
 
+/// The engines the env example in `dir` addresses, by recipe name, read
+/// as [`native_candidates`] reads them: for `doctor`, which asks whether
+/// an app talks to Redis at all, of the root and of an app's own
+/// directory alike.
+pub fn addressed_engines(dir: &Path) -> Vec<&'static str> {
+    let signals = Signals {
+        env_example: super::signals::env_example(dir),
+        ..Signals::default()
+    };
+    native_candidates(&signals, &MachineEvidence::unknown())
+        .iter()
+        .filter_map(|candidate| {
+            SERVICE_ADDRESSES
+                .iter()
+                .map(|(recipe, _, _)| *recipe)
+                .find(|recipe| *recipe == candidate.value)
+        })
+        .collect()
+}
+
 /// Which mechanism a project's private services would use, and the
 /// evidence that decided it.
 ///

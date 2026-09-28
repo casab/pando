@@ -3355,3 +3355,96 @@ fn a_namespace_login_written_inline_is_reported_without_its_password() {
         assert!(!shown.contains("committed-secret"), "{shown}");
     }
 }
+
+fn worker_notes(report: &Report) -> Vec<&Finding> {
+    report
+        .findings
+        .iter()
+        .filter(|f| f.message.contains("jobs off a queue, and a shared start"))
+        .collect()
+}
+
+// A FastAPI backend with an ARQ worker beside it, both in `backend/`: the
+// worker is `python -m …worker`, not the `arq` command, and the manifest
+// is what says which queue it is. ARQ only queues on Redis, so in a
+// shared start every worktree's worker takes the same jobs.
+#[test]
+fn a_queue_worker_on_the_shared_redis_is_a_note() {
+    let fx = fixture();
+    std::fs::create_dir_all(fx.root.join("backend")).unwrap();
+    std::fs::write(
+        fx.root.join("backend/pyproject.toml"),
+        "[project]\nname = \"api\"\ndependencies = [\"fastapi>=0.110\", \"arq>=0.26\"]\n",
+    )
+    .unwrap();
+    write_project_config(
+        &fx,
+        "[processes.api]\ncmd = \"uv run uvicorn app.main:app\"\ncwd = \"backend\"\n\
+         ports = { PORT = \"web\" }\n\n\
+         [processes.jobs]\ncmd = \"uv run python -m src.scripts.worker\"\ncwd = \"backend\"\n\
+         ports = []\n",
+    );
+    let report = report(&fx);
+    let notes = worker_notes(&report);
+    assert_eq!(notes.len(), 1, "{:?}", messages(&report));
+    let note = notes[0];
+    assert_eq!(note.section, Section::Services);
+    assert_eq!(note.severity, Severity::Note);
+    assert!(
+        note.message
+            .starts_with("the process \"jobs\" takes ARQ jobs off a queue"),
+        "{}",
+        note.message
+    );
+    let fix = note.fix.as_deref().unwrap();
+    assert!(fix.contains("--namespaced"), "{fix}");
+    assert!(fix.contains("--only jobs"), "{fix}");
+}
+
+// Celery's broker may be RabbitMQ: its worker is only on a shared Redis
+// where the project addresses one.
+#[test]
+fn a_celery_worker_is_a_note_only_where_the_project_talks_to_redis() {
+    let fx = fixture();
+    write_project_config(
+        &fx,
+        "[processes.web]\ncmd = \"python manage.py runserver\"\nports = []\n\n\
+         [processes.celery]\ncmd = \"celery -A shop worker -l info\"\nports = []\n",
+    );
+    assert!(worker_notes(&report(&fx)).is_empty());
+
+    std::fs::write(
+        fx.root.join(".env.example"),
+        "CELERY_BROKER_URL=redis://localhost:6379/0\n",
+    )
+    .unwrap();
+    let report = report(&fx);
+    let notes = worker_notes(&report);
+    assert_eq!(notes.len(), 1, "{:?}", messages(&report));
+    assert!(notes[0].message.contains("Celery"), "{}", notes[0].message);
+}
+
+// A process called a worker in a project that declares no queue library
+// is somebody's own loop, and doctor says nothing about it.
+#[test]
+fn a_process_named_worker_with_no_queue_library_is_not_a_note() {
+    let fx = fixture();
+    std::fs::write(
+        fx.root.join("package.json"),
+        r#"{ "dependencies": { "express": "^4" } }"#,
+    )
+    .unwrap();
+    write_project_config(
+        &fx,
+        "[processes.worker]\ncmd = \"node worker.js\"\nports = []\n",
+    );
+    assert!(worker_notes(&report(&fx)).is_empty());
+
+    std::fs::write(
+        fx.root.join("package.json"),
+        r#"{ "dependencies": { "express": "^4", "bullmq": "^5" } }"#,
+    )
+    .unwrap();
+    let report = report(&fx);
+    assert_eq!(worker_notes(&report).len(), 1, "{:?}", messages(&report));
+}

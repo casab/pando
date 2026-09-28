@@ -27,6 +27,7 @@
 //! | a framework | a row in [`catalog::frameworks::RULES`] |
 //! | a service image a compose file uses | a row in [`catalog::images::IMAGES`] |
 //! | a tool cache or artifact `provision` must never offer | a row in [`catalog::artifacts::ARTIFACTS`] |
+//! | a job queue whose worker `doctor` recognises | a row in [`catalog::queue_workers::QUEUE_WORKERS`] |
 //! | a language or version manager | `runtime/languages.rs` |
 //! | a native service (postgres, redis…) | a TOML file in `recipes/builtin/`, and a row in [`recipes::BUILT_IN`] |
 //! | a CLI verb | `cli/mod.rs` (`Command`, `dispatch`), its output in a file of its own under `cli/`, the behaviour in `actions/`, and the verb list in `CLAUDE.md`, which a test holds to clap |

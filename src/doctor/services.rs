@@ -130,6 +130,7 @@ pub(super) fn services_report(
         });
     }
     name_collisions(paths, config, findings);
+    super::workers::shared_queue_findings(paths, config, findings);
     ServicesReport {
         compose,
         native,

@@ -17,7 +17,9 @@
 //!   [`artifacts::ARTIFACTS`];
 //! - a language or version manager: `runtime::languages`, which the
 //!   runtime probe reads directly;
-//! - a native service (postgres, redis…): a recipe file, see `recipes`.
+//! - a native service (postgres, redis…): a recipe file, see `recipes`;
+//! - a job queue library whose worker `doctor` recognises: a row in
+//!   [`queue_workers::QUEUE_WORKERS`].
 //!
 //! Nothing in this module reads the disk or runs anything. It is data plus
 //! the lookups over it; the modules that act on the data stay where they
@@ -28,3 +30,4 @@ pub mod frameworks;
 pub mod host_checks;
 pub mod images;
 pub mod package_managers;
+pub mod queue_workers;
