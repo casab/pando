@@ -529,6 +529,9 @@ pub fn prelude_offers(
     for dir in crate::runtime::binary_dirs(language, &machine.system, &machine.path)
         .into_iter()
         .filter(|dir| Some(dir) != resolved_dir.as_ref())
+        // Before the login shell a probe costs: a binary that says it is
+        // the wrong version is not worth one.
+        .filter(|dir| !crate::runtime::rules_out(language, dir, spec))
         .take(MAX_PATH_OFFERS)
     {
         let Some(line) = crate::runtime::path_line(&dir) else {

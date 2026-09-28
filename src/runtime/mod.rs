@@ -20,7 +20,7 @@ mod probe;
 mod probe_cache;
 mod version;
 
-pub use fixes::{Fix, binary_dirs, fixes, installed, path_line};
+pub use fixes::{Fix, binary_dirs, fixes, installed, path_line, rules_out};
 pub use languages::{Family, LANGUAGES, Language, Manager, Source, SourceKind, language};
 pub use probe::{Check, Resolved, Shell, Verdict, check, probe_command};
 pub use probe_cache::{ProbeCache, fingerprint, load_cache, save_cache};

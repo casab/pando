@@ -843,3 +843,30 @@ fn saves_at_the_same_moment_never_fail_each_other() {
         .collect();
     assert_eq!(left, ["runtime.json"], "no temp file is left behind");
 }
+
+// A directory whose binary says, asked directly, that it is a version the
+// pin rejects is ruled out before any login shell; one that says nothing
+// readable, or a version the pin takes, goes on to the probe.
+#[test]
+fn a_binary_that_names_a_rejected_version_rules_its_directory_out() {
+    use std::os::unix::fs::PermissionsExt;
+    let node = super::language("node").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let with = |name: &str, script: &str, executable: bool| {
+        let bin = dir.path().join(name);
+        std::fs::create_dir_all(&bin).unwrap();
+        let path = bin.join("node");
+        std::fs::write(&path, script).unwrap();
+        let mode = if executable { 0o755 } else { 0o644 };
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        bin
+    };
+    let old = with("old", "#!/bin/sh\necho v24.21.0\n", true);
+    let new = with("new", "#!/bin/sh\necho v25.8.2\n", true);
+    let silent = with("silent", "#!/bin/sh\n", true);
+    let unrunnable = with("unrunnable", "#!/bin/sh\necho v24.21.0\n", false);
+    assert!(super::rules_out(node, &old, "25"));
+    assert!(!super::rules_out(node, &new, "25"));
+    assert!(!super::rules_out(node, &silent, "25"));
+    assert!(!super::rules_out(node, &unrunnable, "25"));
+}

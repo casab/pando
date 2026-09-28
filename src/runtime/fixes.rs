@@ -100,6 +100,58 @@ pub fn binary_dirs(language: &Language, system: &Path, path: &[PathBuf]) -> Vec<
     out
 }
 
+/// Whether `dir`'s own binary says, asked directly, that it is a version
+/// `spec` rejects: a directory ruled out for the price of one exec rather
+/// than a login shell, which on a developer's machine loads their whole
+/// profile. Anything short of a version read and refused rules nothing
+/// out, and the directory goes to the probe as before.
+pub fn rules_out(language: &Language, dir: &Path, spec: &str) -> bool {
+    let Some(binary) = language
+        .binaries
+        .iter()
+        .map(|binary| dir.join(binary))
+        .find(|path| path.is_file())
+    else {
+        return false;
+    };
+    let Some(output) = version_output(&binary, language.version_flag) else {
+        return false;
+    };
+    super::first_version(&output)
+        .is_some_and(|version| super::satisfies(spec, &version) == super::Verdict::Mismatch)
+}
+
+/// What `binary <flag>` prints, given two seconds: a version flag answers
+/// at once, and one that does not is no answer.
+fn version_output(binary: &Path, flag: &str) -> Option<String> {
+    use std::io::Read;
+    let mut child = std::process::Command::new(binary)
+        .arg(flag)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match child.try_wait().ok()? {
+            Some(_) => break,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    }
+    let mut text = String::new();
+    child.stdout.take()?.read_to_string(&mut text).ok()?;
+    if text.trim().is_empty() {
+        child.stderr.take()?.read_to_string(&mut text).ok()?;
+    }
+    Some(text)
+}
+
 /// The prelude line that puts `dir` first on PATH, for a directory whose
 /// name survives double quotes as it is. `None` for one that does not: a
 /// line pando would have to escape is not one to hand a developer.
