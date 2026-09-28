@@ -3840,6 +3840,41 @@ fn an_expo_app_in_a_workspace_is_a_process_of_its_own() {
     assert_eq!(api.ready.clone().unwrap().timeout_s, None);
 }
 
+// Expo inlines `EXPO_PUBLIC_*` from Metro's environment into the bundle,
+// so the api's worktree port has to reach Metro as a variable. The app's
+// own env example says which variable, and only that app is told.
+#[test]
+fn an_apps_own_env_example_points_it_at_another_apps_port() {
+    let dir = tempdir().unwrap();
+    expo_workspace(dir.path());
+    std::fs::write(
+        dir.path().join("apps/mobile/.env.example"),
+        "EXPO_PUBLIC_API_URL=http://127.0.0.1:3000/v1\n\
+         EXPO_PUBLIC_SELF_URL=http://localhost:8081\n\
+         EXPO_PUBLIC_SENTRY_DSN=https://key@sentry.example.com/1\n",
+    )
+    .unwrap();
+    let processes = proposed_processes(dir.path()).candidates[0]
+        .processes
+        .clone()
+        .unwrap();
+    let mobile = &processes["mobile"];
+    assert_eq!(
+        mobile.env["EXPO_PUBLIC_API_URL"],
+        "http://127.0.0.1:{port:api}/v1"
+    );
+    assert!(
+        !mobile.env.contains_key("EXPO_PUBLIC_SELF_URL"),
+        "an app is not told where it is itself: {:?}",
+        mobile.env
+    );
+    assert!(!mobile.env.contains_key("EXPO_PUBLIC_SENTRY_DSN"));
+    assert!(
+        !processes["api"].env.contains_key("EXPO_PUBLIC_API_URL"),
+        "one app's env example is that app's alone"
+    );
+}
+
 // Only a framework pando knows how to start is found under `start`: a
 // `start: node server.js` is as often production as development.
 #[test]
