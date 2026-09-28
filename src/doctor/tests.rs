@@ -3440,6 +3440,9 @@ fn a_queue_worker_on_the_shared_redis_is_a_note() {
     let fix = note.fix.as_deref().unwrap();
     assert!(fix.contains("--namespaced"), "{fix}");
     assert!(fix.contains("--only jobs"), "{fix}");
+    // A namespaced start moves only an app that reads a slot setting.
+    assert!(fix.contains("`--isolated` for a Redis of its own"), "{fix}");
+    assert!(fix.contains("reads a Redis slot setting"), "{fix}");
 }
 
 // Celery's broker may be RabbitMQ: its worker is only on a shared Redis

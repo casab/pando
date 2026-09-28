@@ -68,10 +68,12 @@ pub(super) fn shared_queue_findings(
                     worker.name
                 ),
             )
+            // Namespaced gives a slot, and only an app that reads a slot
+            // setting is moved to it: a split host and port stay shared.
             .with_fix(format!(
-                "start a worktree with `--namespaced` or `--isolated` to give it a Redis of \
-                 its own, or keep the worker to one worktree: `pando stop <worktree> --only \
-                 {name}` in the others"
+                "start a worktree with `--isolated` for a Redis of its own, or `--namespaced` \
+                 where the app reads a Redis slot setting, or keep the worker to one worktree: \
+                 `pando stop <worktree> --only {name}` in the others"
             )),
         );
     }
