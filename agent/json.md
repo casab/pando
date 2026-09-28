@@ -82,6 +82,13 @@ Exit 3 is not a failure. It is the whole reason the answers file exists: a
 program that cannot answer a question gets the question rather than a
 guess, a hang, or a wrong config.
 
+One exit 3 has no options: `pando init` on a project that would run
+nothing — no process configured, and no proposal at `processes` or
+`dev_cmd`. The question is `dev_cmd`, `--yes` has nothing to take for it,
+and `init --agent` lists it open. Answer it with a command of your own, or
+`processes` with an object of process tables (see the answers file below).
+`new` and `start` never ask it.
+
 Two traps worth knowing:
 
 - `pando doctor` exits **1** when it found something that will break a

@@ -11,7 +11,7 @@ use crate::detect::{self, Slot};
 use crate::paths::PandoPaths;
 use crate::process as proc;
 
-use super::questions::{Answering, RefusedAnswer, resolve_silencing, settled, slot_label};
+use super::questions::{Answering, RefusedAnswer, resolve_for_init, settled, slot_label};
 use super::services::service_roles;
 // Only for the intra-doc links above `ALL_SLOTS` and `init_dry_run`.
 #[cfg(doc)]
@@ -41,6 +41,20 @@ pub const ALL_SLOTS: [Slot; 9] = [
     Slot::SchemaHook,
     Slot::Provision,
 ];
+
+/// Whether this project would run nothing: no process that config
+/// configures, and no rule with a process to offer at `processes` or
+/// `dev_cmd`.
+///
+/// The state `init` asks the dev command in with no options, and the one
+/// `init --agent` lists that question open for — so the job and the run
+/// agree about whether there is a question.
+pub fn runs_nothing(config: &Config, proposals: &[detect::Proposal]) -> bool {
+    config.runnable_processes().next().is_none()
+        && !proposals
+            .iter()
+            .any(|p| matches!(p.slot, Slot::Processes | Slot::DevCmd) && !p.candidates.is_empty())
+}
 
 /// One slot, after `init` has been through it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,7 +167,7 @@ fn init_slots(
         .iter()
         .map(|slot| settled(*slot, config))
         .collect();
-    resolve_silencing(paths, config, slots, &[], answers, progress)?;
+    resolve_for_init(paths, config, slots, answers, progress)?;
     // Read back from disk rather than reported from memory. The summary is
     // then a statement about the file that exists, and a file pando cannot
     // read again is a failure worth having at the end of `init` rather

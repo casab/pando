@@ -3156,7 +3156,7 @@ fn answers_that_cannot_describe_the_processes_are_usage_errors() {
             "unknown field",
         ),
         (
-            r#"{"port_env": "PORT, API-PORT"}"#,
+            r#"{"dev_cmd": "./serve.sh", "port_env": "PORT, API-PORT"}"#,
             "not an environment variable name",
         ),
     ] {
@@ -3166,10 +3166,43 @@ fn answers_that_cannot_describe_the_processes_are_usage_errors() {
         assert!(stderr(&out).contains(says), "{answers}: {}", stderr(&out));
         let written = std::fs::read_to_string(e.config_file()).unwrap_or_default();
         assert!(
-            !written.contains("[dev]") && !written.contains("[processes"),
+            !written.contains("ports") && !written.contains("[processes"),
             "{written}"
         );
     }
+}
+
+// A project that would run nothing got "Open questions: none" from the
+// job and exit 0 from `init --yes`, and the gap surfaced as a failed
+// check. The dev command is an open question there, and `--yes` has
+// nothing it may take for it.
+#[test]
+fn a_project_that_would_run_nothing_has_the_dev_command_open() {
+    let e = env();
+    let job = stdout(&e.pando(&["init", "--agent"]));
+    assert!(
+        job.contains("- dev_cmd: open, below: nothing would run"),
+        "{job}"
+    );
+    assert!(!job.contains("Open questions: none"), "{job}");
+
+    let out = e.pando(&["init", "--yes"]);
+    assert_eq!(code(&out), EXIT_NEEDS_ANSWER, "stderr: {}", stderr(&out));
+    let printed = stderr(&out);
+    assert!(
+        printed.contains("Which command starts the local development server?"),
+        "{printed}"
+    );
+    assert!(
+        printed.contains(r#"{"dev_cmd": "<your own>"}"#),
+        "{printed}"
+    );
+    assert!(printed.contains(r#"{"processes": {"#), "{printed}");
+
+    // Answered, it is not open any more.
+    let out = e.pando_stdin(&["init", "--answers", "-"], r#"{"dev_cmd": "./serve.sh"}"#);
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    assert_eq!(code(&e.pando(&["init", "--yes"])), EXIT_OK);
 }
 
 // Re-running is safe: the answers for slots that already have one are

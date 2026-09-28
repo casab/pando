@@ -799,6 +799,34 @@ fn completion_menus_get_the_short_help_only() {
     }
 }
 
+/// The exit 3 with no options is documented where the exit codes are,
+/// naming the question it asks; `tests/cli.rs` holds the binary to it.
+#[test]
+fn the_contract_documents_the_exit_3_for_a_project_that_would_run_nothing() {
+    let doc = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("agent/json.md"),
+    )
+    .expect("read agent/json.md");
+    let codes = &doc[doc
+        .find("## stdout, stderr, and exit codes")
+        .expect("an exit codes section")..];
+    let codes = &codes[..codes[3..].find("\n## ").map_or(codes.len(), |at| at + 3)];
+    let flat = codes.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(
+            "One exit 3 has no options: `pando init` on a project that would run nothing"
+        ),
+        "{flat}"
+    );
+    assert!(
+        flat.contains(&format!(
+            "The question is `{}`",
+            slot_name(crate::detect::Slot::DevCmd)
+        )),
+        "{flat}"
+    );
+}
+
 #[test]
 fn help_documents_the_needs_answer_exit_code() {
     let help = Cli::command().render_help().to_string();

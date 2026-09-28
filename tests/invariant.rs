@@ -1695,8 +1695,13 @@ fn the_whole_agent_path_never_writes_into_the_repository() {
         ),
         // The one worth the lifecycle: seeding a worktree's `.env` from
         // a tracked example is the only thing on this path that writes
-        // inside a worktree at all.
-        (Kind::EnvNeverArrived, r#"{"provision": ".env"}"#, true),
+        // inside a worktree at all. It runs nothing of its own, so the
+        // dev command is answered too, or `init` stops at it.
+        (
+            Kind::EnvNeverArrived,
+            r#"{"dev_cmd": "./serve.sh", "provision": ".env"}"#,
+            true,
+        ),
     ] {
         let name = kind.dir_name();
         let h = harness_built(kind, "", true);

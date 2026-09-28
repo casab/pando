@@ -405,11 +405,12 @@ const RECORDED: &[Recorded] = &[
     // A gitignored env that never arrived. Copying a file out of a
     // tracked example is a write nobody has authorised, so `--yes`
     // declines it — and an answers file naming it is a developer
-    // authorising it.
+    // authorising it. With no manifest and no script, nothing would run
+    // until the dev command is answered too, and `init` asks it.
     Recorded {
         kind: Kind::EnvNeverArrived,
-        answers: r#"{"provision": ".env"}"#,
-        asks: Some(&["provision"]),
+        answers: r#"{"dev_cmd": "./serve.sh", "provision": ".env"}"#,
+        asks: Some(&["dev_cmd", "provision"]),
         healthy: true,
         expect: |c| {
             assert_eq!(

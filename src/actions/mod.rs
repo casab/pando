@@ -33,7 +33,7 @@ pub use hooks::{
 };
 pub use init::{
     ALL_SLOTS, InitReport, SlotSummary, init, init_dry_run, machine_evidence,
-    machine_evidence_from, machine_evidence_script, slot_value,
+    machine_evidence_from, machine_evidence_script, runs_nothing, slot_value,
 };
 pub use lifecycle::{
     Mode, StartReport, StartedProcess, StopAllReport, StopOutcome, process_names,

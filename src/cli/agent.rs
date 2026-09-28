@@ -252,9 +252,19 @@ fn project_now(paths: &PandoPaths, config: &Config) -> String {
 
     out.push_str("\nEach question, as it stands (`pando signals` has the evidence):\n\n");
     let mut open: Vec<&detect::Proposal> = Vec::new();
+    // A project that would run nothing has one question no rule raised:
+    // `init` asks the dev command with no options, and "Open questions:
+    // none" above a setup that starts nothing sent an agent to a check
+    // that could only fail.
+    let nothing_to_run = actions::runs_nothing(config, &proposals);
+    let dev_cmd = detect::Proposal::of(Slot::DevCmd, Vec::new(), false);
     for slot in actions::ALL_SLOTS {
         let name = slot_name(slot);
         let line = match (actions::settled(slot, config), proposal(slot)) {
+            (false, None) if slot == Slot::DevCmd && nothing_to_run => {
+                open.push(&dev_cmd);
+                "open, below: nothing would run".to_string()
+            }
             (true, _) => match actions::slot_value(config, slot) {
                 Some(value) => format!("set: `{value}`"),
                 None => "set".to_string(),
@@ -358,6 +368,15 @@ fn open_question(paths: &PandoPaths, proposal: &detect::Proposal) -> String {
             false => "",
         };
         let _ = writeln!(out, "  {}. `{value}`{why}{mark}", index + 1);
+    }
+    if question.options.is_empty() {
+        let _ = writeln!(
+            out,
+            "  pando found nothing to offer, and `pando init --yes` exits 3 here. Answer it with \
+             a command of your own from the project's docs, or, for several processes, \
+             `processes` with an object of process tables (`--reference json`, \"The answers \
+             file\")."
+        );
     }
     out
 }

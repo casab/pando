@@ -629,6 +629,14 @@ fn how_to_answer(question: &actions::Question, rerun: Rerun) -> String {
             slot_name(question.slot),
             rerun.then()
         ));
+        // With nothing on offer the project may well be several apps, and
+        // one command of one's own is the wrong answer for those.
+        if question.slot == crate::detect::Slot::DevCmd && question.options.is_empty() {
+            out.push_str(
+                "  or, for several processes, `processes` with an object of process tables: \
+                 {\"processes\": {\"<name>\": {\"cmd\": \"…\", \"cwd\": \"…\"}, …}}\n",
+            );
+        }
     }
     out
 }

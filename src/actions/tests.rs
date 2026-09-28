@@ -6265,6 +6265,83 @@ fn process_tables_that_cannot_run_are_refused_as_a_usage_error() {
     }
 }
 
+/// `--yes`, as the CLI's asker is: the preselected option, or the
+/// question back when there is none.
+fn take_the_first(q: &Question) -> Result<Answer> {
+    match q.preselect {
+        Some(index) => Ok(Answer::Auto(index)),
+        None => Err(NeedsAnswer {
+            question: q.clone(),
+        }
+        .into()),
+    }
+}
+
+// `init --yes` on a project with nothing to run exited 0 having written
+// only a provision list, and the gap surfaced as a failed `check`. The
+// dev command is a question there, with no options.
+#[test]
+fn init_on_a_project_that_would_run_nothing_asks_for_the_dev_command() {
+    let fx = sibling_apps_fixture();
+    let e = init(
+        &fx.paths,
+        &fx.config,
+        &Answering::asking(&take_the_first),
+        &noop,
+    )
+    .unwrap_err();
+    let needs = e.downcast_ref::<NeedsAnswer>().expect("exit 3, not exit 0");
+    assert_eq!(needs.question.slot, Slot::DevCmd);
+    assert!(needs.question.options.is_empty() && needs.question.allow_custom);
+
+    // Typed, it is the dev command, written down as an answer.
+    let ask = |q: &Question| -> Result<Answer> {
+        match q.slot {
+            Slot::DevCmd => Ok(Answer::Custom("./run.sh --port {port:web}".into())),
+            _ => take_the_first(q),
+        }
+    };
+    init(&fx.paths, &fx.config, &Answering::asking(&ask), &noop).unwrap();
+    let config = crate::config::load(&fx.paths).unwrap().config;
+    assert_eq!(config.processes["dev"].cmd, "./run.sh --port {port:web}");
+    assert_eq!(config.processes["dev"].roles(), ["web"]);
+    let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+    assert!(written.contains("# answered:"), "{written}");
+}
+
+// The preview says so rather than failing, as for any open question.
+#[test]
+fn a_dry_run_of_a_project_that_would_run_nothing_shows_the_dev_command_open() {
+    let fx = sibling_apps_fixture();
+    let (report, _) = init_dry_run(
+        &fx.paths,
+        &fx.config,
+        &Answering::asking(&take_the_first),
+        &noop,
+    )
+    .unwrap();
+    let dev = report
+        .slots
+        .iter()
+        .find(|s| s.slot == Slot::DevCmd)
+        .unwrap();
+    assert!(
+        dev.value
+            .as_deref()
+            .is_some_and(|v| v.starts_with("(unanswered)")),
+        "{dev:?}"
+    );
+}
+
+// Only `init` asks it: `start` and `new` never put a question nobody can
+// pick an option at to a developer who only wanted to start something.
+#[test]
+fn a_start_of_a_project_that_would_run_nothing_asks_nothing() {
+    let fx = sibling_apps_fixture();
+    let config = resolve_process(&fx.paths, &fx.config, &refuse, &noop).unwrap();
+    assert!(config.runnable_processes().next().is_none());
+}
+
 #[test]
 fn init_takes_every_slot_a_rule_decided_and_asks_nothing() {
     let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");

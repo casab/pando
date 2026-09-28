@@ -760,6 +760,47 @@ pub fn resolve_on(
     progress: &dyn Fn(&str),
     machine: &Machine<'_>,
 ) -> Result<Config> {
+    resolve_pass(
+        paths, config, slots, silent, answers, progress, machine, false,
+    )
+}
+
+/// `init`'s pass: every slot, and one question no other command asks.
+///
+/// A project where nothing configures a process and no rule proposes one
+/// has the dev command put to whoever is answering, with no options: a
+/// command of their own on a terminal or in an answers file, exit 3
+/// everywhere else. `init` is the wizard, and a setup that runs nothing is
+/// not one it may call finished. `new` and `start` never ask it — a
+/// question nobody can pick an option at is the one thing they do not
+/// put to a developer who only wanted to start something.
+pub(super) fn resolve_for_init(
+    paths: &PandoPaths,
+    config: &Config,
+    slots: &[Slot],
+    answers: &Answering<'_>,
+    progress: &dyn Fn(&str),
+) -> Result<Config> {
+    let shell = runtime_shell(paths.root());
+    let machine = Machine {
+        shell: &shell,
+        home: user_home(),
+    };
+    resolve_pass(paths, config, slots, &[], answers, progress, &machine, true)
+}
+
+/// One resolution pass. `needs_a_process` is [`resolve_for_init`]'s.
+#[allow(clippy::too_many_arguments)]
+fn resolve_pass(
+    paths: &PandoPaths,
+    config: &Config,
+    slots: &[Slot],
+    silent: &[Slot],
+    answers: &Answering<'_>,
+    progress: &dyn Fn(&str),
+    machine: &Machine<'_>,
+    needs_a_process: bool,
+) -> Result<Config> {
     let ask = answers.ask;
     let mut config = config.clone();
     // First, and before the early return below: the commonest shape for a
@@ -899,18 +940,37 @@ pub fn resolve_on(
         if replacing {
             unanswer(*slot, &mut config);
         }
-        let Some(proposal) = proposals.iter().find(|p| p.slot == *slot) else {
-            // No rule had anything to say. There is nobody to ask — but a
-            // program driving this pass may still have an answer for it.
-            if volunteer(paths, &mut config, *slot, &proposals, answers, progress)? {
-                if replacing {
-                    answers.wrote_replacement(*slot);
+        // Declared out here so the question below can borrow it like any
+        // proposal the rules made.
+        let nothing_proposed;
+        let proposal = match proposals.iter().find(|p| p.slot == *slot) {
+            Some(proposal) => proposal,
+            None => {
+                // No rule had anything to say. There is nobody to ask — but
+                // a program driving this pass may still have an answer for
+                // it.
+                if volunteer(paths, &mut config, *slot, &proposals, answers, progress)? {
+                    if replacing {
+                        answers.wrote_replacement(*slot);
+                    }
+                    if *slot == Slot::Processes {
+                        may_fill_dev = detect::fills_one_dev_process(&config);
+                    }
+                    continue;
                 }
-                if *slot == Slot::Processes {
-                    may_fill_dev = detect::fills_one_dev_process(&config);
+                // …except where the pass is `init`'s and nothing would run:
+                // then the dev command is a question with no options, and
+                // not asking it is a green `init` followed by a `check`
+                // that finds nothing to start.
+                if !(needs_a_process
+                    && *slot == Slot::DevCmd
+                    && config.runnable_processes().next().is_none())
+                {
+                    continue;
                 }
+                nothing_proposed = detect::Proposal::of(*slot, Vec::new(), false);
+                &nothing_proposed
             }
-            continue;
         };
         if !proposal.decided && silent.contains(slot) {
             continue;
