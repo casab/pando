@@ -78,26 +78,86 @@ pub fn installed(language: &Language, home: &Path, system: &Path) -> Vec<&'stati
         .collect()
 }
 
-/// Directories that hold one of the language's binaries: each directory
-/// on `path` in its order, then the language's install directories.
+/// Directories that hold one of the language's binaries, narrowest
+/// first: the ones that hold only this runtime, then the
+/// [shared ones](super::languages::SHARED_BIN_DIRS) that hold every
+/// tool. Within each, the directories on `path` in its order, then the
+/// language's install directories.
 ///
 /// `path` is the PATH pando was started with, which is the developer's own
 /// shell's: the binary they get by hand is found there without reading
 /// their profile. Whether a directory holds a version the project accepts
 /// is the probe's to say, through the line [`path_line`] makes of it.
-pub fn binary_dirs(language: &Language, system: &Path, path: &[PathBuf]) -> Vec<PathBuf> {
+///
+/// Two directories that hold the same binary, through a link, are one
+/// option: the narrowest is kept. A directory whose name states a version
+/// the pin rejects is left out before that, so a stale `node@24` link to
+/// a node 25 never stands for it.
+pub fn binary_dirs(
+    language: &Language,
+    system: &Path,
+    path: &[PathBuf],
+    requirement: &Requirement,
+) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     let installs = language.install_dirs_under(system);
     for dir in path.iter().chain(installs.iter()) {
-        let holds = language
-            .binaries
-            .iter()
-            .any(|binary| dir.join(binary).is_file());
-        if holds && dir.is_absolute() && !out.contains(dir) {
+        if binary_in(language, dir).is_some()
+            && dir.is_absolute()
+            && !out.contains(dir)
+            && !named_for_another(language, dir, system, requirement)
+        {
             out.push(dir.clone());
         }
     }
+    // Stable, so each group keeps the order it was found in.
+    out.sort_by_key(|dir| super::languages::is_shared_bin(dir, system));
+    let mut seen: Vec<PathBuf> = Vec::new();
+    out.retain(|dir| {
+        let Some(real) = binary_in(language, dir).and_then(|b| std::fs::canonicalize(b).ok())
+        else {
+            return true;
+        };
+        if seen.contains(&real) {
+            return false;
+        }
+        seen.push(real);
+        true
+    });
     out
+}
+
+/// The first of the language's binaries `dir` holds.
+fn binary_in(language: &Language, dir: &Path) -> Option<PathBuf> {
+    language
+        .binaries
+        .iter()
+        .map(|binary| dir.join(binary))
+        .find(|path| path.is_file())
+}
+
+/// Whether `dir`'s name states a version the requirement's pin rejects:
+/// `node@24` for a pin of 25. Only a pin is held to it; a range is left
+/// to the probe, since a name like `node@24` states a whole major.
+fn named_for_another(
+    language: &Language,
+    dir: &Path,
+    system: &Path,
+    requirement: &Requirement,
+) -> bool {
+    if !requirement.pinned {
+        return false;
+    }
+    let Some(stated) = language.stated_version(dir, system) else {
+        return false;
+    };
+    let pin = super::normalize_spec(&requirement.spec);
+    // Compared as far as both go: `python@3.12` holds a pin of `3.12.1`,
+    // and a pin of `3` as well.
+    stated
+        .split('.')
+        .zip(pin.split('.'))
+        .any(|(a, b)| a.parse::<u64>().ok() != b.parse::<u64>().ok())
 }
 
 /// Whether `dir`'s own binary says, asked directly, that it is a version
@@ -106,12 +166,7 @@ pub fn binary_dirs(language: &Language, system: &Path, path: &[PathBuf]) -> Vec<
 /// profile. Anything short of a version read and refused rules nothing
 /// out, and the directory goes to the probe as before.
 pub fn rules_out(language: &Language, dir: &Path, spec: &str) -> bool {
-    let Some(binary) = language
-        .binaries
-        .iter()
-        .map(|binary| dir.join(binary))
-        .find(|path| path.is_file())
-    else {
+    let Some(binary) = binary_in(language, dir) else {
         return false;
     };
     let Some(output) = version_output(&binary, language.version_flag) else {

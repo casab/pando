@@ -770,9 +770,51 @@ fn binary_dirs_put_the_developers_path_first_and_hold_the_binary() {
         root.join("opt/homebrew/bin"),
     ];
     assert_eq!(
-        binary_dirs(node(), root, &path),
+        binary_dirs(node(), root, &path, &nvmrc()),
         [root.join("own/bin"), root.join("opt/homebrew/bin")]
     );
+}
+
+// On a Homebrew machine one node answers from three places: the shared
+// bin, its versioned keg, and a stale alias whose name says 24. They are
+// one option, the narrowest: the keg, before any shared bin. The alias
+// is dropped for its name, which contradicts a pin of 25, whatever it
+// links to; a range is not held to a name.
+#[test]
+fn binary_dirs_are_one_per_binary_narrowest_first_and_a_contradicting_name_is_dropped() {
+    let system = TempDir::new().unwrap();
+    let root = system.path();
+    let cellar = root.join("opt/homebrew/Cellar/node/25.8.2/bin");
+    std::fs::create_dir_all(&cellar).unwrap();
+    std::fs::write(cellar.join("node"), "#!/bin/sh\n").unwrap();
+    let brew = root.join("opt/homebrew/bin");
+    let keg = root.join("opt/homebrew/opt/node@25/bin");
+    let stale = root.join("opt/homebrew/opt/node@24/bin");
+    for dir in [&brew, &keg, &stale] {
+        std::fs::create_dir_all(dir).unwrap();
+        std::os::unix::fs::symlink(cellar.join("node"), dir.join("node")).unwrap();
+    }
+    let other = root.join("own/bin");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("node"), "#!/bin/sh\n").unwrap();
+    let path = [brew.clone(), other.clone()];
+
+    let pin = Requirement::new("node", "25", ".nvmrc".into());
+    assert_eq!(
+        binary_dirs(node(), root, &path, &pin),
+        [other.clone(), keg.clone()]
+    );
+
+    let range = Requirement::new("node", ">=20", "package.json engines.node".into());
+    assert_eq!(
+        binary_dirs(node(), root, &path, &range),
+        [other, keg],
+        "the alias is still the same binary as the keg"
+    );
+    assert!(super::is_shared_bin(&brew, root));
+    assert!(!super::is_shared_bin(&stale, root));
+    assert_eq!(node().stated_version(&stale, root).as_deref(), Some("24"));
+    assert_eq!(node().stated_version(&brew, root), None);
 }
 
 // The line puts the directory first, quoted; a directory whose name a

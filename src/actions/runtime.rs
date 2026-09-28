@@ -447,9 +447,9 @@ pub struct Offer {
 /// does not, each tried on it.
 ///
 /// First the installed managers' lines that work, in the table's order;
-/// then the directories that hold a version the project accepts — where
-/// the developer's own shell finds the binary, then the language's
-/// install directories; last the managers' lines that do not work yet,
+/// then the directories that hold a version the project accepts, one per
+/// binary and narrowest first ([`binary_dirs`](crate::runtime::binary_dirs));
+/// last the managers' lines that do not work yet,
 /// each with the command that would install the version under it. A
 /// directory whose line does not work is not offered at all: nothing but
 /// that directory would make it.
@@ -526,7 +526,7 @@ pub fn prelude_offers(
         .as_deref()
         .and_then(|path| Path::new(path).parent())
         .map(Path::to_path_buf);
-    for dir in crate::runtime::binary_dirs(language, &machine.system, &machine.path)
+    for dir in crate::runtime::binary_dirs(language, &machine.system, &machine.path, requirement)
         .into_iter()
         .filter(|dir| Some(dir) != resolved_dir.as_ref())
         // Before the login shell a probe costs: a binary that says it is
@@ -545,9 +545,15 @@ pub fn prelude_offers(
             continue;
         }
         if let Some(version) = tried(&line)? {
+            // A directory every installer shares puts all of them first,
+            // which is worth knowing before picking it.
+            let what = match crate::runtime::is_shared_bin(&dir, &machine.system) {
+                true => "it and everything else in that directory",
+                false => "it",
+            };
             let why = format!(
-                "{name} {version} is in {}; this puts it first on PATH, in every project on \
-                 this machine",
+                "{name} {version} is in {}; this puts {what} first on PATH, in every project \
+                 on this machine",
                 dir.display()
             );
             working.push(Offer {

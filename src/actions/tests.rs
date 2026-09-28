@@ -10083,6 +10083,10 @@ fn a_matching_node_in_a_well_known_place_is_offered_for_the_developer_to_pick() 
     assert_eq!(offered, &line);
     assert!(why.contains("node 25.8.2 is in"), "{why}");
     assert!(why.contains("every project on this machine"), "{why}");
+    assert!(
+        why.contains("puts it and everything else in that directory first"),
+        "Homebrew's bin is every formula's: {why}"
+    );
     assert_eq!(
         question.preselect, None,
         "a PATH line is the developer's pick"

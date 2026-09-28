@@ -191,14 +191,7 @@ impl Language {
     pub fn install_dirs_under(&self, system: &Path) -> Vec<PathBuf> {
         let mut out: Vec<PathBuf> = Vec::new();
         for pattern in self.install_dirs {
-            let patterns: Vec<String> = match pattern.strip_prefix("{brew}") {
-                Some(rest) => HOMEBREW_PREFIXES
-                    .iter()
-                    .map(|prefix| format!("{prefix}{rest}"))
-                    .collect(),
-                None => vec![pattern.to_string()],
-            };
-            for pattern in patterns {
+            for pattern in with_brew(pattern) {
                 for dir in expand(system, &pattern) {
                     if !out.contains(&dir) {
                         out.push(dir);
@@ -208,11 +201,74 @@ impl Language {
         }
         out
     }
+
+    /// The version `dir`'s own name states, when it is one of the
+    /// [`install_dirs`](Language::install_dirs) whose `*` stands for a
+    /// version: `24` for `{brew}/opt/node@24/bin`. Read from the name
+    /// alone, which Homebrew leaves in place when the formula it once
+    /// named has moved on to another version.
+    pub fn stated_version(&self, dir: &Path, system: &Path) -> Option<String> {
+        let relative = dir.strip_prefix(system).ok()?;
+        let names: Vec<&str> = relative
+            .components()
+            .filter_map(|part| part.as_os_str().to_str())
+            .collect();
+        self.install_dirs
+            .iter()
+            .flat_map(|pattern| with_brew(pattern))
+            .find_map(|pattern| {
+                let parts: Vec<&str> = pattern.trim_start_matches('/').split('/').collect();
+                if parts.len() != names.len() {
+                    return None;
+                }
+                let mut stated = None;
+                for (part, name) in parts.iter().zip(&names) {
+                    match part.split_once('*') {
+                        Some((head, tail))
+                            if name.len() >= head.len() + tail.len()
+                                && name.starts_with(head)
+                                && name.ends_with(tail) =>
+                        {
+                            let middle = &name[head.len()..name.len() - tail.len()];
+                            stated = super::first_version(middle);
+                        }
+                        None if part == name => {}
+                        _ => return None,
+                    }
+                }
+                stated
+            })
+    }
 }
 
 /// Where Homebrew lives: on Apple silicon, on an Intel Mac, and on Linux.
 pub const HOMEBREW_PREFIXES: [&str; 3] =
     ["/opt/homebrew", "/usr/local", "/home/linuxbrew/.linuxbrew"];
+
+/// Directories every installer puts its binaries in, so one put first on
+/// PATH puts every tool in it first, not only the runtime asked for.
+/// `{brew}` is each of [`HOMEBREW_PREFIXES`], `/usr/local` among them.
+pub const SHARED_BIN_DIRS: [&str; 4] = ["{brew}/bin", "{brew}/sbin", "/usr/bin", "/bin"];
+
+/// Whether `dir`, read under `system`, is one of [`SHARED_BIN_DIRS`].
+pub fn is_shared_bin(dir: &Path, system: &Path) -> bool {
+    SHARED_BIN_DIRS
+        .iter()
+        .flat_map(|pattern| with_brew(pattern))
+        .any(|pattern| system.join(pattern.trim_start_matches('/')) == dir)
+}
+
+/// A pattern with `{brew}` spelt out for each Homebrew prefix, or the
+/// pattern alone when it names none.
+fn with_brew(pattern: &str) -> Vec<String> {
+    match pattern.strip_prefix("{brew}") {
+        Some(rest) => HOMEBREW_PREFIXES
+            .iter()
+            .map(|prefix| format!("{prefix}{rest}"))
+            .collect(),
+        None => vec![pattern.to_string()],
+    }
+}
 
 /// The directories an absolute pattern names under `system`, where one
 /// component may hold a `*` that matches any run of characters.
