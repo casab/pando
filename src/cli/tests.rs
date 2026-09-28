@@ -2936,8 +2936,9 @@ fn the_job_says_when_this_machine_needs_a_prelude() {
     assert!(
         job.contains(
             "- prelude: open: node 25 asked (backend/.nvmrc), `bash -lc` resolves 24.21.0. \
-             `pando init --yes` takes a line that fixes it, or exits 3 with the options; the \
-             line is this machine's, run in every project, so tell the developer which\n"
+             Ask the developer which line, if any (`pando doctor` lists them): it runs in \
+             every project on this machine, so never pick one yourself; `prelude = \"\"` \
+             accepts the mismatch\n"
         ),
         "{job}"
     );
@@ -2956,6 +2957,41 @@ fn the_job_says_when_this_machine_needs_a_prelude() {
         !fx.paths.home.exists(),
         "the job writes nothing, not even pando's home"
     );
+}
+
+// Where a version manager's line works, the job names the line `--yes`
+// would take, since that is what it will do; nothing is written by
+// trying it.
+#[test]
+fn the_job_names_the_managers_line_init_yes_would_take() {
+    let fx = fixture();
+    std::fs::write(fx.root.join(".nvmrc"), "25\n").unwrap();
+    let home = fx.root.join("machine");
+    std::fs::create_dir_all(home.join(".volta/bin")).unwrap();
+    let shell = |command: &str| {
+        let version = match command.contains(".volta/bin") {
+            true => "25.8.2",
+            false => "24.21.0",
+        };
+        Some(crate::runtime::probe_reply("/n/bin/node", version))
+    };
+    let job = super::agent::job_on(
+        &fx.paths,
+        &crate::actions::Machine::at(&shell, home.clone()),
+    );
+    let line = format!(
+        "export PATH=\"{}:$PATH\"",
+        home.join(".volta/bin").display()
+    );
+    assert!(
+        job.contains(&format!(
+            "- prelude: open: node 25 asked (.nvmrc), `bash -lc` resolves 24.21.0. `pando init \
+             --yes` takes `{line}`; it runs in every project on this machine, so tell the \
+             developer\n"
+        )),
+        "{job}"
+    );
+    assert!(!fx.paths.home.exists(), "trying the line writes nothing");
 }
 
 // After a passing check the job says nothing is left, and nothing below

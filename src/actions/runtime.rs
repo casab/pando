@@ -443,6 +443,15 @@ pub struct Offer {
     pub reorders_path: bool,
 }
 
+impl Offer {
+    /// Whether `--yes` may take this line: a manager's line that works.
+    /// A PATH line works as well, but it reorders every project's tools,
+    /// so the developer picks it.
+    pub fn taken_by_yes(&self) -> bool {
+        self.works && !self.reorders_path
+    }
+}
+
 /// The lines that would make this machine resolve what `check` found it
 /// does not, each tried on it.
 ///
@@ -569,9 +578,7 @@ pub fn prelude_offers(
 }
 
 /// The prelude question's options: every line [`prelude_offers`] tried,
-/// and only a version manager's line that works is one `--yes` may take.
-/// A PATH line works as well, but it reorders every project's tools, so
-/// the developer picks it.
+/// and only the ones [`Offer::taken_by_yes`] are lines `--yes` may take.
 pub(super) fn prelude_proposal(
     paths: &PandoPaths,
     config: &Config,
@@ -582,9 +589,9 @@ pub(super) fn prelude_proposal(
     let candidates = prelude_offers(paths, config, requirements, check, machine, true)?
         .into_iter()
         .map(|offer| detect::Candidate {
+            needs_a_human: !offer.taken_by_yes(),
             value: offer.line,
             why: offer.why,
-            needs_a_human: !offer.works || offer.reorders_path,
             ..detect::Candidate::default()
         })
         .collect();

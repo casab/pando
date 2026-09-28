@@ -450,12 +450,28 @@ fn prelude_line(
         (None, Some(path)) => format!("`bash -lc` finds {path}, and it fails"),
         (None, None) => format!("`bash -lc` has no {language}"),
     };
-    format!(
-        "open: {language} {} asked ({}), {resolved}. `pando init --yes` takes a line that \
-         fixes it, or exits 3 with the options; the line is this machine's, run in every \
-         project, so tell the developer which",
+    let asked = format!(
+        "open: {language} {} asked ({}), {resolved}",
         requirement.spec, requirement.source
-    )
+    );
+    // What `--yes` would really do, from the lines tried on this machine:
+    // a manager's line that works, or nothing at all, since a PATH line is
+    // never taken for the developer. Nothing is written by trying them.
+    let requirements = crate::runtime::requirements_for(paths.root(), &files);
+    let offers = actions::prelude_offers(paths, &after_init, &requirements, &check, machine, false)
+        .unwrap_or_default();
+    match offers.iter().find(|offer| offer.taken_by_yes()) {
+        Some(offer) => format!(
+            "{asked}. `pando init --yes` takes `{}`; it runs in every project on this \
+             machine, so tell the developer",
+            offer.line
+        ),
+        None => format!(
+            "{asked}. Ask the developer which line, if any (`pando doctor` lists them): it \
+             runs in every project on this machine, so never pick one yourself; \
+             `prelude = \"\"` accepts the mismatch"
+        ),
+    }
 }
 
 /// Candidates as a list of their values, each with the signal that found
