@@ -4391,9 +4391,11 @@ fn a_checks_worktree_is_in_no_list_and_answers_to_no_name() {
         format!("{err:#}").starts_with("no worktree named"),
         "{err:#}"
     );
-    // Nor by its logs, which the check keeps.
-    std::fs::create_dir_all(fx.paths.logs_dir(crate::paths::CHECK_WORKTREE)).unwrap();
-    assert!(super::names::resolve(&fx.paths, crate::paths::CHECK_WORKTREE).is_err());
+    // Nor by its logs, which the check keeps, nor by a probe's.
+    for logs in crate::paths::CHECK_LOG_DIRS {
+        std::fs::create_dir_all(fx.paths.logs_dir(logs)).unwrap();
+        assert!(super::names::resolve(&fx.paths, logs).is_err(), "{logs}");
+    }
 
     let finds_nothing = |_: &str| None;
     let report = crate::doctor::run_on(

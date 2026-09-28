@@ -10,7 +10,7 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
 
 use common::{Kind, build, git_raw, python3_available, wait_until};
-use pando::paths::{CHECK_WORKTREE, PandoPaths};
+use pando::paths::{CHECK_HELD_LOGS, CHECK_PROBE_LOGS, CHECK_WORKTREE, PandoPaths};
 use pando::setup::{CheckOutcome, CheckRecord, FailureKind, SetupState};
 use tempfile::TempDir;
 
@@ -410,6 +410,23 @@ fn a_probe_of_another_base_never_replaces_the_last_check_at_the_settings_own() {
     e.assert_nothing_left(&branches);
     assert_eq!(e.record(), Some(passed.clone()), "the probe saved nothing");
     assert_eq!(e.setup_state(), SetupState::Ready);
+    // Nor did it write over the passing check's logs: its own are beside
+    // them.
+    let read = |dir: &str, source: &str| std::fs::read_to_string(e.paths.log_file(dir, source));
+    assert!(read(CHECK_WORKTREE, "install").unwrap().contains("locked"));
+    assert!(e.paths.log_file(CHECK_WORKTREE, "dev").is_file());
+    assert!(
+        read(CHECK_PROBE_LOGS, "install")
+            .unwrap()
+            .contains("app.lock"),
+        "the probe's failure is in its own logs"
+    );
+    assert!(!e.paths.log_file(CHECK_PROBE_LOGS, "dev").exists());
+    assert!(!e.paths.logs_dir(CHECK_HELD_LOGS).exists());
+    // And its reason names the log where it is now.
+    let reason = v["reason"].as_str().unwrap();
+    let log = e.paths.log_file(CHECK_PROBE_LOGS, "install");
+    assert!(reason.contains(&log.display().to_string()), "{reason}");
 
     // A pass at another base says it is not the setup's, and is not.
     e.write_config(&config_running(&answering(200), ""));
@@ -420,6 +437,9 @@ fn a_probe_of_another_base_never_replaces_the_last_check_at_the_settings_own() {
         "✓ plain passes at old: answer `base` with it to make that the setup's\n"
     );
     assert_eq!(e.record().unwrap().started_at, passed.started_at);
+    // Its logs replace the last probe's, and the saved check's stay.
+    assert!(e.paths.log_file(CHECK_PROBE_LOGS, "dev").is_file());
+    assert!(read(CHECK_WORKTREE, "install").unwrap().contains("locked"));
 
     // The settings' own base, named: an ordinary check, saved.
     let out = e.pando(&["check", "--base", "main"]);

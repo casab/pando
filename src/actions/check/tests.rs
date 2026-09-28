@@ -192,3 +192,56 @@ fn a_file_is_named_whole_or_not_at_all() {
     assert!(!names("myuv.lock", "uv.lock"));
     assert!(!names("uv.lock.bak", "uv.lock"));
 }
+
+// A probe writes where the check's processes always write, so it holds
+// the last check's logs aside and puts them back after; one killed first
+// is put right by the next check.
+#[test]
+fn a_probe_keeps_its_logs_beside_the_last_checks_and_a_killed_ones_are_put_back() {
+    use super::logs::{claim, settle};
+    use crate::paths::{CHECK_HELD_LOGS, CHECK_PROBE_LOGS, CHECK_WORKTREE};
+    let (dir, root) = repo_ahead_of_main();
+    let project = crate::project::ProjectRef::from_root(&root).unwrap();
+    let paths = crate::paths::PandoPaths::new(dir.path().join("pando-home"), project);
+    let write = |logs: &str, text: &str| {
+        std::fs::create_dir_all(paths.logs_dir(logs)).unwrap();
+        std::fs::write(paths.log_file(logs, "dev"), text).unwrap();
+    };
+    let read = |logs: &str| std::fs::read_to_string(paths.log_file(logs, "dev")).ok();
+    write(CHECK_WORKTREE, "the check's");
+
+    // A probe, run to its end.
+    claim(&paths, true).unwrap();
+    assert_eq!(read(CHECK_HELD_LOGS).as_deref(), Some("the check's"));
+    write(CHECK_WORKTREE, "the first probe's");
+    settle(&paths);
+    assert_eq!(read(CHECK_WORKTREE).as_deref(), Some("the check's"));
+    assert_eq!(read(CHECK_PROBE_LOGS).as_deref(), Some("the first probe's"));
+    assert!(!paths.logs_dir(CHECK_HELD_LOGS).exists());
+
+    // One killed before it settled: the next check's settle does it, and
+    // its logs replace the last probe's.
+    claim(&paths, true).unwrap();
+    write(CHECK_WORKTREE, "the killed probe's");
+    settle(&paths);
+    assert_eq!(read(CHECK_WORKTREE).as_deref(), Some("the check's"));
+    assert_eq!(
+        read(CHECK_PROBE_LOGS).as_deref(),
+        Some("the killed probe's")
+    );
+
+    // With no check's logs to hold, none come back, and a probe that made
+    // none leaves no probe's either.
+    claim(&paths, false).unwrap();
+    assert!(!paths.logs_dir(CHECK_WORKTREE).exists());
+    claim(&paths, true).unwrap();
+    settle(&paths);
+    assert!(!paths.logs_dir(CHECK_WORKTREE).exists());
+    assert!(!paths.logs_dir(CHECK_PROBE_LOGS).exists());
+    assert!(!paths.logs_dir(CHECK_HELD_LOGS).exists());
+
+    // Nothing held, nothing moved.
+    write(CHECK_WORKTREE, "a check's");
+    settle(&paths);
+    assert_eq!(read(CHECK_WORKTREE).as_deref(), Some("a check's"));
+}

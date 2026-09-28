@@ -277,6 +277,26 @@ fn socket_base() -> PathBuf {
     base
 }
 
+/// The directory name of `pando check`'s throwaway worktree, under the
+/// worktrees directory, and of the log directory its processes write in.
+/// A dot first: git refuses a ref component that starts with one, so no
+/// branch's directory can be this, and the TUI's watcher already passes
+/// over dot names.
+pub const CHECK_WORKTREE: &str = ".pando-check";
+
+/// Where a `pando check --base` probe's logs are kept once it ends, under
+/// `logs/`: beside the last check's own, which a probe leaves alone, and
+/// replaced by the next probe's.
+pub const CHECK_PROBE_LOGS: &str = ".pando-check-probe";
+
+/// Where the last check's logs wait, under `logs/`, while a probe writes
+/// in their place.
+pub const CHECK_HELD_LOGS: &str = ".pando-check-held";
+
+/// Every log directory a check keeps. None of them is a worktree a
+/// command takes by name.
+pub const CHECK_LOG_DIRS: [&str; 3] = [CHECK_WORKTREE, CHECK_PROBE_LOGS, CHECK_HELD_LOGS];
+
 /// Log names pando keeps for its own use: the install hook's log, and the
 /// `tunnel` and `proxy` logs `share` writes.
 ///
@@ -284,12 +304,6 @@ fn socket_base() -> PathBuf {
 /// into the same `logs/<worktree>/` directory and whichever of them starts
 /// last truncates the other's log. Phase 3's `[[hooks]]` and Phase 4's
 /// `share` extend this rather than keeping a second list somewhere else.
-/// The directory name of `pando check`'s throwaway worktree, under the
-/// worktrees directory. A dot first: git refuses a ref component that
-/// starts with one, so no branch's directory can be this, and the TUI's
-/// watcher already passes over dot names.
-pub const CHECK_WORKTREE: &str = ".pando-check";
-
 pub const RESERVED_LOG_SOURCES: [&str; 3] = ["install", "tunnel", "proxy"];
 
 /// Refuses a name that would not be exactly one component of

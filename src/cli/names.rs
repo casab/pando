@@ -94,8 +94,8 @@ fn resolve_listed(paths: &PandoPaths, discovery: &Discovery, typed: &str) -> Res
         return Ok(w.name.clone());
     }
     // Nor is the check's by what pando still has of it: its record while
-    // it runs, and the logs it keeps.
-    if worktree::is_check(typed) {
+    // it runs, and the logs it keeps, a probe's included.
+    if worktree::is_check(typed) || crate::paths::CHECK_LOG_DIRS.contains(&typed) {
         anyhow::bail!("{}", unknown(typed, &discovery.worktrees));
     }
     // Read without the lock: this only asks whether the name is known.

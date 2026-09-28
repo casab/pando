@@ -37,6 +37,7 @@ use super::super::worktree::{
 use super::super::{INSTALL_HOOK, Mode};
 use super::base::on_the_base;
 use super::interrupt::interrupted;
+use super::logs;
 use super::machine::first_down;
 use super::teardown::{sweep_leftover_check, tear_down};
 
@@ -141,8 +142,8 @@ pub fn check_at(
     };
     // What a killed check left, before anything else is made.
     sweep_leftover_check(paths, config, say)?;
-    // The last check's logs are kept until this one needs the place.
-    let _ = std::fs::remove_dir_all(paths.logs_dir(CHECK_WORKTREE));
+    // And the logs of a probe killed before it put the last check's back.
+    logs::settle(paths);
 
     // The settings a start would run on, with no question put to
     // anybody: a slot the rules cannot settle alone is an answer the
@@ -287,6 +288,9 @@ pub fn check_at(
     // The worktrees directory goes too when this check made it, empty.
     let worktrees_dir = config.worktrees_dir(paths);
     let made_dir = !worktrees_dir.exists();
+    // The last check's logs are kept until this one needs the place, and
+    // a probe's never take it.
+    logs::claim(paths, run.probe.is_some())?;
     let outcome = run.test(&config, &commit, namespaced);
     // A step that failed for want of a file the tested commit never had
     // is the base's, not the settings'.
@@ -324,6 +328,11 @@ pub fn check_at(
             (say.detail)(&line);
             outcome
         }
+    };
+    logs::settle(paths);
+    let outcome = match run.probe {
+        Some(_) => logs::pointed_at_probe(paths, outcome),
+        None => outcome,
     };
     let after = config::load(paths)
         .map(|loaded| fingerprint(&loaded.config))

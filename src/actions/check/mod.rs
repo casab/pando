@@ -5,11 +5,12 @@
 //! install, every process, the page the browser would get. Then it takes
 //! all of it down and records the result in `check.json`, which the setup
 //! state and the TUI read. One file per concern: the run, the machine it
-//! runs on, the teardown and the sweep of what a killed check left, and
-//! the signals that end one early.
+//! runs on, where its logs are kept, the teardown and the sweep of what a
+//! killed check left, and the signals that end one early.
 
 mod base;
 mod interrupt;
+mod logs;
 mod machine;
 mod run;
 mod teardown;
