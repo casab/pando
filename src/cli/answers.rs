@@ -509,6 +509,34 @@ pub(super) fn report_unused(answers: &Answers) {
 /// How a preview marks a slot nobody here could answer, in its value.
 const UNANSWERED: &str = "(unanswered)";
 
+/// The two files `init` answers into, as they were before it ran: so a
+/// run a question stops can say which of them it wrote.
+pub(super) struct InitFiles(Vec<(std::path::PathBuf, Option<String>)>);
+
+impl InitFiles {
+    pub(super) fn read(paths: &crate::paths::PandoPaths) -> Self {
+        InitFiles(
+            [paths.config_file(), paths.user_config_file()]
+                .into_iter()
+                .map(|path| {
+                    let text = std::fs::read_to_string(&path).ok();
+                    (path, text)
+                })
+                .collect(),
+        )
+    }
+
+    /// `wrote <file>` for each one that is not what it was, as
+    /// [`render_init`] says a finished run's.
+    pub(super) fn render_written(&self) -> String {
+        self.0
+            .iter()
+            .filter(|(path, before)| std::fs::read_to_string(path).ok() != *before)
+            .map(|(path, _)| format!("wrote {}\n", path.display()))
+            .collect()
+    }
+}
+
 /// What `init` prints: where the answers went, and what they say.
 ///
 /// The path first, because the one thing a developer wants after a batch

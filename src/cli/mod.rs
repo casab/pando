@@ -28,9 +28,9 @@ mod wait;
 use self::answers::init_asker;
 use self::answers::read_answers;
 use self::answers::refuse_answered;
-use self::answers::render_init;
 use self::answers::report_unused;
 use self::answers::volunteered_from;
+use self::answers::{InitFiles, render_init};
 use self::prompt::everyday_asker;
 pub use agent::Reference;
 pub use answers::{
@@ -772,10 +772,21 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             .replacing(&replacing);
             let (report, preview) = match dry_run {
                 true => actions::init_dry_run(paths, config, &answering, &notice)?,
-                false => (
-                    actions::init(paths, config, &answering, &notice)?,
-                    Vec::new(),
-                ),
+                false => {
+                    let before = InitFiles::read(paths);
+                    match actions::init(paths, config, &answering, &notice) {
+                        Ok(report) => (report, Vec::new()),
+                        // A question stops the pass after the answers
+                        // before it were written: said as a finished run
+                        // says it, so none of them reads as refused.
+                        Err(e) => {
+                            if e.is::<actions::NeedsAnswer>() {
+                                write!(out, "{}", before.render_written())?;
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
             };
             // Before the summary, because it is about what the file the
             // summary describes does *not* say.

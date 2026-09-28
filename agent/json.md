@@ -82,6 +82,10 @@ Exit 3 is not a failure. It is the whole reason the answers file exists: a
 program that cannot answer a question gets the question rather than a
 guess, a hang, or a wrong config.
 
+An `init` that stops on a question has still kept the answers it wrote
+before it: stdout says `wrote <file>` for each file it changed, as a run
+that finishes does. They were not refused; answer the question.
+
 One exit 3 has no options: `pando init` on a project that would run
 nothing — no process configured, and no proposal at `processes` or
 `dev_cmd`. The question is `dev_cmd`, `--yes` has nothing to take for it,

@@ -3236,6 +3236,44 @@ fn a_project_that_would_run_nothing_has_the_dev_command_open() {
     assert_eq!(code(&e.pando(&["init", "--yes"])), EXIT_OK);
 }
 
+// An answer written before the next open question stopped the run printed
+// nothing, and exit 3 read as the answer refused. It says what it wrote
+// as a finished run does, before the question.
+#[test]
+fn answers_written_before_an_open_question_are_said_as_written() {
+    let e = env();
+    let out = e.pando_stdin(&["init", "--answers", "-"], r#"{"install": "true"}"#);
+    assert_eq!(code(&out), EXIT_NEEDS_ANSWER, "stderr: {}", stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        format!("wrote {}\n", e.config_file().display())
+    );
+    assert!(
+        std::fs::read_to_string(e.config_file())
+            .unwrap()
+            .contains("install = \"true\""),
+    );
+    assert!(
+        stderr(&out).contains("Which command starts the local development server?"),
+        "{}",
+        stderr(&out)
+    );
+
+    // Nothing new written, nothing said.
+    let out = e.pando_stdin(&["init", "--answers", "-"], "{}");
+    assert_eq!(code(&out), EXIT_NEEDS_ANSWER, "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+
+    // The contract says so.
+    let doc = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("agent/json.md"))
+        .unwrap();
+    let flat = doc.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("stdout says `wrote <file>` for each file it changed"),
+        "agent/json.md"
+    );
+}
+
 // A Python api with no script beside a frontend with one: the job marked
 // the frontend alone as pando's choice, `init --yes` took it, and the
 // check passed with the api never run. The process list is open, says
