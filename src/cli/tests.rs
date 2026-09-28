@@ -2740,6 +2740,21 @@ fn the_memory_block_names_the_project_its_root_and_only_real_commands() {
     );
 }
 
+// A prelude nobody has answered is a question about this machine, and the
+// line says where the answer to it is, as a whole sentence.
+#[test]
+fn the_job_says_what_doctor_tells_about_the_prelude() {
+    let fx = fixture();
+    let job = super::agent::job(&fx.paths);
+    assert!(
+        job.contains(
+            "- prelude: asked only if this machine needs one; `pando doctor --json`'s runtime \
+             section says whether it does\n"
+        ),
+        "{job}"
+    );
+}
+
 // `--reference memory` prints the block and nothing else, and the job's
 // last section is the same block, fenced, so what an agent saves from
 // either is the same text.

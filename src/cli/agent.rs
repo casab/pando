@@ -324,8 +324,8 @@ fn project_now(
                 chosen => format!("pando's guess: {}", candidates(chosen)),
             },
             (false, None) if slot == Slot::Prelude => {
-                "asked only if this machine needs one: `pando doctor --json`'s runtime \
-                 section says"
+                "asked only if this machine needs one; `pando doctor --json`'s runtime \
+                 section says whether it does"
                     .to_string()
             }
             // No proposal here is no gap: origin/HEAD is close enough to
