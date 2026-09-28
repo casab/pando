@@ -37,7 +37,7 @@ may change behaviour.
   checkout's branch has, such as a lockfile, fails with `kind: "base"`
   and names both refs, instead of asking for other settings ([#4]).
   A `check --base` of another branch is a probe: it never replaces the
-  last result at the project's own base. With the `base` question still
+  last result at the project's own base, or its logs. With the `base` question still
   open, `pando check` asks it instead of testing origin/HEAD.
 - `pando status` gives the command that opens an Expo app on the iOS
   simulator (`xcrun simctl openurl booted exp://127.0.0.1:<port>`), and
@@ -46,8 +46,11 @@ may change behaviour.
 - When `bash -lc` resolves the wrong runtime version, the prelude
   question also offers a line that puts a matching binary first on PATH,
   from where your own shell finds it or a well-known place such as
-  Homebrew's. Such a line is offered and never taken for you, because
-  it changes every project on the machine.
+  Homebrew's: one line per binary, the narrowest directory first, and
+  never a directory named for a version the pin rejects. Such a line is
+  offered and never taken for you, because it changes every project on
+  the machine. `doctor` names the file a prelude goes in and the ways to
+  set it.
 - `doctor` notes a queue worker (ARQ, Celery, RQ, Sidekiq, BullMQ)
   whose Redis every worktree shares: a job queued in one worktree can
   run on another's code ([#4]).
@@ -73,7 +76,12 @@ may change behaviour.
   came from ([#4]).
 - An answer for a question that already has one is refused with exit
   2 and a pointer to `--replace`. Before, it was dropped and the run
-  exited 0.
+  exited 0. An answers run that stops on the next question says what it
+  wrote first.
+- A failed install in a check is said once, with its exit status.
+- `doctor` notes a compose service named like a process role only for a
+  compose file pando takes services from, and its fix renames the role,
+  never the committed compose file.
 - The Claude Code and Codex setup skills, and the website, follow the
   first run as it now is.
 - A typed `port_env` answer such as `PORT, API_PORT` is split into its
