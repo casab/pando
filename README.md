@@ -10,14 +10,14 @@
   <a href="LICENSE"><img alt="License: AGPL-3.0-only" src="https://img.shields.io/badge/license-AGPL--3.0--only-ebc34b?style=flat-square"></a>
   <a href="https://github.com/mertkaradayi/pando/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/mertkaradayi/pando/ci.yml?branch=main&style=flat-square&label=ci"></a>
   <img alt="Rust 2024 edition" src="https://img.shields.io/badge/rust-2024_edition-e6963c?style=flat-square&logo=rust">
-  <img alt="Platform: macOS" src="https://img.shields.io/badge/platform-macOS-6e9beb?style=flat-square&logo=apple">
+  <img alt="Platform: macOS and Linux" src="https://img.shields.io/badge/platform-macOS_|_Linux-6e9beb?style=flat-square">
   <img alt="Version 0.5.1, pre-release" src="https://img.shields.io/badge/version-0.5.1_pre--release-b482e6?style=flat-square">
   <a href="CONTRIBUTING.md"><img alt="PRs welcome" src="https://img.shields.io/badge/PRs-welcome-50c878?style=flat-square"></a>
 </p>
 
 <p align="center">
   <a href="https://mertkaradayi.github.io/pando/"><b>Website</b></a> ·
-  <a href="#sixty-seconds">Quick start</a> ·
+  <a href="#get-started">Get started</a> ·
   <a href="#your-first-run">First run</a> ·
   <a href="#commands">Commands</a> ·
   <a href="#shared-namespaced-isolated">Modes</a> ·
@@ -29,6 +29,24 @@
 > Pando is a forest that is one tree. Your repo is too. `pando` checks out every
 > branch you are working on side by side, gives each one a running dev server,
 > its own database, and a shareable URL, and never writes a byte into your repo.
+
+## Get started
+
+```bash
+brew install mertkaradayi/tap/pando
+
+cd ~/code/your-project
+pando                               # the first time, the setup screen
+```
+
+No Homebrew? This one line installs it on macOS or Linux:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/mertkaradayi/pando/releases/latest/download/pando-cli-installer.sh | sh
+```
+
+Neither needs Rust. [Install](#install) has the details and building from
+source.
 
 **[mertkaradayi.github.io/pando](https://mertkaradayi.github.io/pando/)** tells the story in
 pictures and has a copy of the TUI you can drive with your keyboard, in the
@@ -67,24 +85,10 @@ for people and for the coding agents working beside them.
 
 ## Sixty seconds
 
-```bash
-brew install mertkaradayi/tap/pando
-
-cd ~/code/your-project
-pando                               # the TUI; the first time, the setup screen
-```
-
-No Homebrew? One line installs it on macOS or Linux:
-
-```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/mertkaradayi/pando/releases/latest/download/pando-cli-installer.sh | sh
-```
-
-No Rust needed for either; [Install](#install) has the other ways.
-
-Or straight from the shell. This is a real run, trimmed a little, on one of
-the fixture repositories pando's tests are built on — a workspace with a
-web app, an API and a Postgres in its compose file:
+`pando` with no arguments is the TUI. Everything it does is a command too;
+this is a real run, trimmed a little, on one of the fixture repositories
+pando's tests are built on — a workspace with a web app, an API and a
+Postgres in its compose file:
 
 ```console
 $ pando new feat/checkout
