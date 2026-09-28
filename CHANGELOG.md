@@ -41,13 +41,29 @@ may change behaviour.
   run on another's code ([#4]).
 - The agent brief documents the `[processes]` table, `{port:<role>}`
   in `env`, and that a phone needs the machine's LAN address ([#4],
-  [#5]).
+  [#5]). For a project with an Expo process, the setup job and the
+  memory block also tell the developer about the LAN address.
 
 ### Changed
 
 - A project that would run nothing is an open question: `init --agent`
   lists the dev command, and `init --yes` exits 3 instead of writing a
   config that starts nothing ([#4]).
+- An app directory that nothing starts, such as a Python API with no
+  dev script beside a frontend with one, keeps `processes` open:
+  `init --yes` exits 3 and names the directory, so a first run cannot
+  pass while leaving the app out ([#4]).
+- An app's default port includes the port its own env files state, so
+  a sibling's URL to it (`EXPO_PUBLIC_API_BASE_URL=http://127.0.0.1:8787`)
+  is given the worktree's port ([#5]).
+- A shared service's port is also read from the env files beside the
+  apps (`backend/.env`), and the job and the check name the file it
+  came from ([#4]).
+- An answer for a question that already has one is refused with exit
+  2 and a pointer to `--replace`. Before, it was dropped and the run
+  exited 0.
+- The Claude Code and Codex setup skills, and the website, follow the
+  first run as it now is.
 - A typed `port_env` answer such as `PORT, API_PORT` is split into its
   variables, and a name that is not an environment variable is
   refused ([#4]).
