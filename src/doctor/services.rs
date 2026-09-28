@@ -537,6 +537,13 @@ fn native_instances(paths: &PandoPaths, service: &str) -> Vec<NativeInstance> {
 /// Only for services that have not been answered for yet: once one is in
 /// `include` the config does not load at all, and that is the Config
 /// section's headline problem rather than a second copy of it here.
+///
+/// And only in a compose file pando takes services from: the root's, or
+/// one a `[[services]]` table names. `docker/compose.yml` below the root
+/// is never offered, so a name in it collides with nothing.
+///
+/// The fix is pando's side of the pair, the role: the compose file is the
+/// repository's, and nobody should edit a committed file to suit pando.
 fn name_collisions(paths: &PandoPaths, config: &Config, findings: &mut Vec<Finding>) {
     let mut owner: BTreeMap<String, String> = BTreeMap::new();
     for (process, spec) in &config.processes {
@@ -548,8 +555,15 @@ fn name_collisions(paths: &PandoPaths, config: &Config, findings: &mut Vec<Findi
         return;
     }
     let answered = declared_services(config);
-    let signals = detect::signals(paths.root());
-    for file in &signals.compose_files {
+    let mut offered: Vec<String> = crate::compose::find(paths.root()).into_iter().collect();
+    for service in &config.services {
+        if let ServiceConfig::Compose { file, .. } = service
+            && !offered.contains(file)
+        {
+            offered.push(file.clone());
+        }
+    }
+    for file in &offered {
         let Ok(read) = crate::compose::read(&paths.root().join(file)) else {
             continue;
         };
@@ -571,9 +585,8 @@ fn name_collisions(paths: &PandoPaths, config: &Config, findings: &mut Vec<Findi
                     ),
                 )
                 .with_fix(format!(
-                    "rename the role in that process's `ports`, or rename the service in \
-                     {file} — answering the services question with {name:?} is refused \
-                     until one of them moves"
+                    "give that process's role {name:?} another name in its `ports` — \
+                     answering the services question with {name:?} is refused until it moves"
                 )),
             );
         }

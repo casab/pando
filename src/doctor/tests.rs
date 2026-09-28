@@ -2333,6 +2333,59 @@ fn a_compose_service_that_shares_a_name_with_a_role_is_reported_before_the_quest
     // A note: nothing is broken until somebody answers the question,
     // and answering it is now refused.
     assert!(report.healthy(), "{:?}", report.findings);
+    // The fix is the role, pando's side: never an edit to the
+    // repository's compose file.
+    let fix = report
+        .findings
+        .iter()
+        .find(|f| f.message.contains("already owns the role"))
+        .and_then(|f| f.fix.clone())
+        .unwrap_or_default();
+    assert!(
+        fix.starts_with("give that process's role \"api\" another name in its `ports`"),
+        "{fix}"
+    );
+    assert!(!fix.contains("docker-compose.yml"), "{fix}");
+}
+
+// A compose file below the root is never where services are proposed
+// from, so a name in it collides with nothing — unless a `[[services]]`
+// table names that file, and its other services can be offered.
+#[test]
+fn a_collision_is_reported_only_in_a_compose_file_pando_takes_services_from() {
+    let fx = fixture();
+    std::fs::create_dir_all(fx.root.join("docker")).unwrap();
+    std::fs::write(
+        fx.root.join("docker/compose.yml"),
+        "services:\n  api:\n    image: kong:3\n  postgres:\n    image: postgres:16\n",
+    )
+    .unwrap();
+    let processes =
+        "[processes.dev]\ncmd = \"serve\"\nports = { WEB_PORT = \"web\", API_PORT = \"api\" }\n";
+    write_project_config(&fx, processes);
+    let below = report(&fx);
+    assert!(
+        !mentions(&below, "already owns the role"),
+        "{:?}",
+        messages(&below)
+    );
+
+    write_project_config(
+        &fx,
+        &format!(
+            "{processes}\n[[services]]\nkind = \"compose\"\nfile = \"docker/compose.yml\"\n\
+             include = [\"postgres\"]\n"
+        ),
+    );
+    let named = report(&fx);
+    assert!(
+        mentions(
+            &named,
+            "docker/compose.yml declares a service called \"api\""
+        ),
+        "{:?}",
+        messages(&named)
+    );
 }
 
 #[test]
