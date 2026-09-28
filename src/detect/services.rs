@@ -283,13 +283,35 @@ pub fn service_choice_for(
         .and_then(|p| p.service_file())
         .map(str::to_string)
         .or_else(|| crate::compose::find(root));
-    service_choice(
+    let choice = service_choice(
         file.as_deref(),
         compose.as_ref().map(|p| p.candidates.len()).unwrap_or(0),
         &native,
         evidence,
         config.isolation.preferred(),
-    )
+    );
+    noted_below_root(choice, file.as_deref(), signals)
+}
+
+/// A choice that found no compose file at the root, with the ones below
+/// it named: a developer told "no compose file" while `docker/compose.yml`
+/// sits in the repository would rightly stop trusting the rest.
+fn noted_below_root(
+    mut choice: ServiceChoice,
+    compose_file: Option<&str>,
+    signals: &Signals,
+) -> ServiceChoice {
+    if compose_file.is_none() && !signals.compose_files.is_empty() {
+        let at = choice.evidence.len().min(1);
+        choice.evidence.insert(
+            at,
+            format!(
+                "services are proposed from a compose file at the root, not from {} below it",
+                listed(&signals.compose_files)
+            ),
+        );
+    }
+    choice
 }
 
 /// What pando says when both mechanisms are real and nobody has chosen.
@@ -327,7 +349,7 @@ pub fn service_choice(
             if compose_candidates == 1 { "" } else { "s" }
         )),
         Some(file) => why.push(format!("{file} declares nothing this project depends on")),
-        None => why.push("this repository has no compose file".to_string()),
+        None => why.push("this repository has no compose file at its root".to_string()),
     }
     match native_declared {
         true => why.push(format!(
@@ -595,6 +617,7 @@ pub(super) fn services_proposal(
         evidence,
         prefer,
     );
+    let choice = noted_below_root(choice, compose_file.as_deref(), signals);
     match choice.mechanism {
         Some("native") => {
             // Decided when this machine can run every one of them.

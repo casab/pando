@@ -3576,6 +3576,49 @@ fn an_app_directorys_local_env_file_is_a_provision_file() {
     );
 }
 
+// A deployment's compose file one directory down is reported, and said
+// to be only that: no services are proposed from it, and the evidence no
+// longer claims the repository has no compose file.
+#[test]
+fn a_compose_file_below_the_root_is_reported_and_not_run_from() {
+    let dir = polyglot_siblings();
+    let found = signals(dir.path());
+    assert_eq!(found.compose_files, ["docker/compose.yml"]);
+    let proposal = services_proposal(dir.path(), &found, None, &MachineEvidence::unknown(), None);
+    assert!(
+        proposal
+            .as_ref()
+            .is_none_or(|p| p.candidates.iter().all(|c| c
+                .service
+                .as_ref()
+                .and_then(ServiceHint::file)
+                .is_none())),
+        "{proposal:?}"
+    );
+    let choice = service_choice_for(
+        dir.path(),
+        &found,
+        &MachineEvidence::unknown(),
+        &Config::default(),
+    );
+    assert_eq!(
+        choice.evidence[..2],
+        [
+            "this repository has no compose file at its root".to_string(),
+            "services are proposed from a compose file at the root, not from \
+             docker/compose.yml below it"
+                .to_string(),
+        ]
+    );
+
+    // A compose file at the root is the one, as it always was.
+    let dir = tree(&[
+        ("compose.yml", "services: {}\n"),
+        ("docker/compose.yml", "services: {}\n"),
+    ]);
+    assert_eq!(signals(dir.path()).compose_files, ["compose.yml"]);
+}
+
 // An app directory's version file is proposed under its path, which is
 // the form the runtime reads it back in.
 #[test]

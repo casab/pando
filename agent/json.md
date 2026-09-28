@@ -119,7 +119,7 @@ repository, which is what makes it safe to read before deciding anything.
     ],
     "env_example": [],          // [key, value] pairs from the env example
     "markers": [],              // framework and toolchain markers
-    "compose_files": [],
+    "compose_files": [],        // the root's; with none there, those one directory below
     "ignored_present": [],      // gitignored files that exist in the checkout
     "provision_seeds": [],      // examples a worktree file could be copied from
     "workspace_env_links": [],  // [app/.env, .env]: the root .env for apps with none
@@ -179,6 +179,12 @@ processes run in. Each app's env example joins
 `env_example`, and its local env files (`backend/.env`, never a cache or
 a coverage file) join `ignored_present` and `provision_seeds` under its
 path.
+
+A compose file one directory down, `docker/compose.yml`, is listed in
+`compose_files` and read under `compose` when the root has none of its
+own, but the services question is only proposed from one at the root: a
+file kept beside a deployment is as often the production stack as the
+development one.
 
 `extends`, `include` and `error` are why a services proposal can be missing
 or under-ticked: they are the parts of a compose file this build did not

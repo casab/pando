@@ -37,6 +37,8 @@ pub struct Signals {
     pub env_example: Vec<(String, String)>,
     /// Framework marker files that exist.
     pub markers: Vec<String>,
+    /// The compose files at the root, or, when it has none, those one
+    /// directory below it, under their path: `docker/compose.yml`.
     pub compose_files: Vec<String>,
     /// Root-level files that are gitignored and present — what a new
     /// worktree would be missing — then each app directory's local env
@@ -142,7 +144,7 @@ pub fn signals(root: &Path) -> Signals {
         runtime_requirements: crate::runtime::requirements(root),
         env_example: env_example(root),
         markers: present(root, &frameworks::marker_files()),
-        compose_files: present(root, &COMPOSE_FILES),
+        compose_files: compose_files(root),
         ignored_present: ignored_present(root),
         provision_seeds: provision_seeds(root),
         workspace_env_links: Vec::new(),
@@ -232,33 +234,70 @@ const APP_PARENTS: [&str; 2] = ["apps", "packages"];
 /// skipped, and so is a directory with nothing pando recognises in it:
 /// `docker/`, `docs/` and `scripts/` are not apps.
 pub(super) fn app_dirs(root: &Path) -> Vec<AppDir> {
-    let children = |parent: &str| -> Vec<String> {
-        let Ok(entries) = std::fs::read_dir(root.join(parent)) else {
-            return Vec::new();
-        };
-        entries
-            .flatten()
-            .filter(|entry| entry.path().is_dir())
-            .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
-            .filter(|name| !name.starts_with('.') && !artifacts::is_artifact(name))
-            .map(|name| match parent {
-                "" => name,
-                parent => format!("{parent}/{name}"),
-            })
-            .collect()
-    };
-    let mut dirs: Vec<String> = children("");
+    let mut dirs: Vec<String> = subdirs(root, "");
     for parent in APP_PARENTS {
-        dirs.extend(children(parent));
+        dirs.extend(subdirs(root, parent));
     }
-    let ignored = gitignored(root, &dirs);
-    let mut out: Vec<AppDir> = dirs
+    dirs.sort();
+    let apps: Vec<AppDir> = dirs
         .into_iter()
-        .filter(|dir| !ignored.contains(dir))
         .filter_map(|dir| app_dir(root, dir))
         .collect();
-    out.sort_by(|a, b| a.dir.cmp(&b.dir));
+    let ignored = gitignored(
+        root,
+        &apps.iter().map(|a| a.dir.clone()).collect::<Vec<_>>(),
+    );
+    apps.into_iter()
+        .filter(|app| !ignored.contains(&app.dir))
+        .collect()
+}
+
+/// The directories directly below `root/parent`, as paths relative to
+/// `root`, sorted: never a hidden one, nor a cache or dependency tree.
+fn subdirs(root: &Path, parent: &str) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(root.join(parent)) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+        .filter(|name| !name.starts_with('.') && !artifacts::is_artifact(name))
+        .map(|name| match parent {
+            "" => name,
+            parent => format!("{parent}/{name}"),
+        })
+        .collect();
+    out.sort();
     out
+}
+
+/// The compose files the root has, or, when it has none, the ones a
+/// directory directly below it has: `docker/compose.yml`.
+///
+/// Reported, so an agent and doctor see the file, and nothing more: the
+/// services a worktree runs are proposed from a compose file at the root
+/// only. One a directory keeps beside the deployment it describes is as
+/// often the production stack as the development one, and pando has no
+/// way to tell which.
+fn compose_files(root: &Path) -> Vec<String> {
+    let at_root = present(root, &COMPOSE_FILES);
+    if !at_root.is_empty() {
+        return at_root;
+    }
+    let below: Vec<String> = subdirs(root, "")
+        .into_iter()
+        .flat_map(|dir| {
+            present(&root.join(&dir), &COMPOSE_FILES)
+                .into_iter()
+                .map(move |file| format!("{dir}/{file}"))
+        })
+        .collect();
+    let ignored = gitignored(root, &below);
+    below
+        .into_iter()
+        .filter(|file| !ignored.contains(file))
+        .collect()
 }
 
 /// What one directory holds, when it is an app: a manifest or a lockfile
