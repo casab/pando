@@ -24,9 +24,14 @@ struct Fx {
 }
 
 fn fixture() -> Fx {
+    fixture_of(init_repo)
+}
+
+/// [`fixture`], with the repository made by `make`.
+fn fixture_of(make: impl Fn(&Path)) -> Fx {
     let dir = TempDir::new().expect("temp dir");
     let root = dir.path().join("repo");
-    init_repo(&root);
+    make(&root);
     // Canonical, because `ProjectRef` canonicalises and macOS prints
     // `/var` where git prints `/private/var`: a test comparing the two
     // spellings is comparing the platform, not the report.
@@ -131,6 +136,42 @@ fn a_project_with_no_config_at_all_is_healthy_and_says_where_everything_is() {
     assert!(text.starts_with("0 problems, 1 note"), "{text}");
     assert!(text.contains("nothing to run"), "{text}");
     assert!(text.contains("not there"), "every layer is named: {text}");
+}
+
+// origin/HEAD far behind the branch work happens on is a note with both
+// ways out, until the project names its own base.
+#[test]
+fn origin_head_far_behind_the_main_checkout_is_a_note_until_a_base_is_named() {
+    let fx = fixture_of(|root| {
+        crate::testutil::drifted_repo(
+            root,
+            crate::worktree::FAR_AHEAD,
+            crate::worktree::STALE_DAYS,
+            None,
+        )
+    });
+    let report = report(&fx);
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.message.starts_with("origin/HEAD is origin/develop"))
+        .unwrap_or_else(|| panic!("no base note: {:?}", report.findings));
+    assert_eq!(finding.section, Section::Project);
+    assert_eq!(finding.severity, Severity::Note);
+    assert!(
+        finding.message.contains(&format!(
+            "last committed {} days before work",
+            crate::worktree::STALE_DAYS
+        )),
+        "{}",
+        finding.message
+    );
+    let fix = finding.fix.as_deref().unwrap();
+    assert!(fix.contains("answer `base` with it"), "{fix}");
+    assert!(fix.contains("git remote set-head origin work"), "{fix}");
+
+    write_project_config(&fx, "[project]\nbase = \"work\"\n");
+    assert!(!mentions(&report_of(&fx, &every_tool), "origin/HEAD is"));
 }
 
 #[test]

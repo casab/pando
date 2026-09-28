@@ -29,6 +29,13 @@ pub(super) fn project_report(
             .with_fix(format!("chmod 700 {}", paths.home.display())),
         );
     }
+    // Only while nothing names the base: a project whose own does has
+    // said where work starts, whatever origin/HEAD says.
+    if config.project.base.is_none()
+        && let Some(drift) = crate::worktree::base_drift(paths.root())
+    {
+        findings.push(base_drift_finding(&drift));
+    }
     // Read straight, with no lock and no save: `actions::refresh` would
     // take the lock, advance phases and write the file back, and doctor
     // writes nothing.
@@ -53,6 +60,33 @@ pub(super) fn project_report(
         bases_in_range: ports::BASE_COUNT,
         windows_held,
     }
+}
+
+/// origin/HEAD far behind the main checkout's branch: `new` and `check`
+/// fork from it all the same, so a check can fail on a commit nobody
+/// works on. A note, not a problem: which branch work starts from is the
+/// developer's to say, and either way out is theirs.
+fn base_drift_finding(drift: &crate::worktree::BaseDrift) -> Finding {
+    let crate::worktree::BaseDrift {
+        default,
+        current,
+        ahead,
+        days_older,
+        ..
+    } = drift;
+    Finding::note(
+        Section::Project,
+        format!(
+            "origin/HEAD is {default}, last committed {days_older} days before {current}, the \
+             main checkout's branch, which has {ahead} commits it lacks — `pando new` and \
+             `pando check` fork from {default}"
+        ),
+    )
+    .with_fix(format!(
+        "if work starts from {current}, make it this project's base: answer `base` with it \
+         through `pando init --answers -` — or point origin/HEAD at it in your repository: \
+         `git remote set-head origin {current}`"
+    ))
 }
 
 /// How the default spelling of the machine-wide config is written in text
