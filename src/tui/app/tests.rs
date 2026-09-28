@@ -7108,6 +7108,7 @@ fn a_failed_check_says_why_and_whether_an_agent_ran_it() {
             screen(&app).line(),
             SetupLine::Failed {
                 reason: "web exited after 0.8s".into(),
+                kind: FailureKind::Settings,
                 by_program,
             }
         );
@@ -7647,6 +7648,7 @@ fn a_guess_whose_check_fails_shows_the_failure() {
         screen(&app).line(),
         SetupLine::Failed {
             reason: "dev exited after 0.8s".into(),
+            kind: FailureKind::Settings,
             by_program: false,
         }
     );

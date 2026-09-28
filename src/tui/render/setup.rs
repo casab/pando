@@ -12,7 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::art::WordmarkSize;
-use crate::setup::SETUP_PROMPT;
+use crate::setup::{FailureKind, SETUP_PROMPT};
 use crate::theme::{green, orange, red, surface, text, text_dim, text_muted, yellow};
 use crate::tui::app::{App, SetupLine, SetupScreen, Trying};
 
@@ -316,7 +316,15 @@ fn live_lines(app: &App, screen: &SetupScreen, pad: usize, room: usize) -> Vec<L
             marked(spinner, yellow(), &said, dim, pad, room)
         }
         SetupLine::Passed => marked("✓", green(), "the test passed", dim, pad, room),
-        SetupLine::Failed { reason, by_program } => {
+        // Whose it is decides the rest. A settings failure goes back to
+        // the agent with the prompt; a machine's, or a base's, no setting
+        // fixes, so the agent has stopped and the developer is who acts,
+        // on the command the reason carries.
+        SetupLine::Failed {
+            reason,
+            kind: FailureKind::Settings,
+            by_program,
+        } => {
             let mut lines = marked(
                 "✗",
                 red(),
@@ -335,6 +343,34 @@ fn live_lines(app: &App, screen: &SetupScreen, pad: usize, room: usize) -> Vec<L
                     Style::new().fg(text_muted()),
                 ));
             }
+            lines
+        }
+        SetupLine::Failed { reason, kind, .. } => {
+            let mut lines = marked(
+                "✗",
+                red(),
+                &format!("the test failed: {reason}"),
+                dim,
+                pad,
+                room,
+            );
+            let yours = match kind {
+                FailureKind::Base => {
+                    "This one is yours, not your agent's: which branch work starts from is \
+                     your call. Run the command above, or tell your agent the branch · v tests \
+                     again"
+                }
+                _ => {
+                    "This one is yours, not your agent's: no setting fixes it. Run the command \
+                     above · v tests again"
+                }
+            };
+            lines.extend(wrapped(
+                yours,
+                pad + 2,
+                room.saturating_sub(2).max(1),
+                Style::new().fg(text_muted()),
+            ));
             lines
         }
         SetupLine::Interrupted => marked(

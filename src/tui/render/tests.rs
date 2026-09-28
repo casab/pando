@@ -4109,6 +4109,43 @@ fn a_failed_check_names_the_reason_and_says_the_agent_is_on_it_only_for_a_progra
     }
 }
 
+// A machine's failure, or a base's, is the developer's even when an agent
+// ran the check: the agent stopped, and the reason's command is theirs.
+#[test]
+fn a_failure_no_setting_fixes_is_the_developers_whoever_ran_the_check() {
+    for (kind, says) in [
+        (
+            FailureKind::Machine,
+            "no setting fixes it. Run the command above",
+        ),
+        (
+            FailureKind::Base,
+            "which branch work starts from is your call",
+        ),
+    ] {
+        let (_dir, mut app) = app_on_setup_screen(true);
+        let failed = CheckOutcome::Failed {
+            kind,
+            reason: "nothing answers on localhost:5432 — start it first: `brew services start \
+                     postgresql`"
+                .into(),
+        };
+        finished(&mut app, SetupState::Failing, failed, RanBy::Program);
+        let text = text_of(&draw(&mut app, 160, 30));
+        assert!(
+            text.contains("`brew services start postgresql`"),
+            "the command is shown: {text}"
+        );
+        assert!(
+            text.contains("This one is yours, not your agent's"),
+            "{text}"
+        );
+        assert!(text.contains(says), "{kind:?}:\n{text}");
+        assert!(!text.contains("Your agent is probably on it"), "{text}");
+        assert!(!text.contains("which now includes this"), "{text}");
+    }
+}
+
 #[test]
 fn an_interrupted_or_unfinished_setup_says_what_to_press() {
     let (_dir, mut app) = app_on_setup_screen(true);

@@ -25,7 +25,7 @@ use crate::config::Config;
 use crate::detect;
 use crate::doctor;
 use crate::paths::PandoPaths;
-use crate::setup::{self, CheckOutcome, RanBy, Setup, SetupMemory, SetupState};
+use crate::setup::{self, CheckOutcome, FailureKind, RanBy, Setup, SetupMemory, SetupState};
 
 use super::App;
 use super::background::{AppEvent, config_now};
@@ -84,6 +84,9 @@ pub enum SetupLine {
     Passed,
     Failed {
         reason: String,
+        /// Whose it is to fix: a settings failure is the agent's, a
+        /// machine's or a base's the developer's.
+        kind: FailureKind,
         /// A program ran the check, which is the agent the prompt went to.
         by_program: bool,
     },
@@ -196,8 +199,9 @@ impl SetupScreen {
                 Some((CheckOutcome::NotSetUp { slot }, _)) => {
                     SetupLine::NotSetUp { slot: slot.clone() }
                 }
-                Some((CheckOutcome::Failed { reason, .. }, ran_by)) => SetupLine::Failed {
+                Some((CheckOutcome::Failed { kind, reason }, ran_by)) => SetupLine::Failed {
                     reason: reason.clone(),
+                    kind: *kind,
                     by_program: ran_by == RanBy::Program,
                 },
                 // Failing is decided from a finished, failed record; any

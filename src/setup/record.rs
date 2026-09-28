@@ -140,7 +140,7 @@ pub struct ProcessResult {
 }
 
 /// Who ran a check, so the screen can say "your agent is probably on it"
-/// only when a program did.
+/// only when a program did, and only of a failure that is the settings'.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RanBy {
