@@ -4,6 +4,7 @@ use super::*;
 use crate::config::Config;
 use crate::setup::RanBy;
 use crate::testutil::git;
+use anyhow::Context as _;
 use tempfile::TempDir;
 
 #[test]
@@ -290,4 +291,45 @@ fn a_probe_keeps_its_logs_beside_the_last_checks_and_a_killed_ones_are_put_back(
     write(CHECK_WORKTREE, "a check's");
     settle(&paths);
     assert_eq!(read(CHECK_WORKTREE).as_deref(), Some("a check's"));
+}
+
+// The error an install that fails gives, built by the code that builds it
+// for `new`: said by the check once, with its exit status, rather than
+// "the install step failed: the install hook failed: exited 2: …".
+#[test]
+fn an_install_failure_says_the_step_failed_once_with_its_exit_status() {
+    use super::run::install_failed;
+    use crate::actions::{CREATED_BUT_INSTALL_FAILED, INSTALL_HOOK};
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("install.log");
+    let hook = super::super::hooks::failed_words(INSTALL_HOOK);
+    let as_new_says = |cmd: &str| {
+        let err = crate::hooks::run(&log, cmd, dir.path(), &[])
+            .context(hook.clone())
+            .context(format!("abc1234 {CREATED_BUT_INSTALL_FAILED}"))
+            .unwrap_err();
+        format!("{err:#}")
+    };
+    assert_eq!(
+        install_failed(&as_new_says("echo 'error: no lockfile'; exit 2")),
+        format!(
+            "the install step failed (exit 2): error: no lockfile — the whole log is at {}",
+            log.display()
+        )
+    );
+    // With nothing printed, the status alone.
+    assert_eq!(
+        install_failed(&as_new_says("exit 7")),
+        format!(
+            "the install step failed (exit 7) — the whole log is at {}",
+            log.display()
+        )
+    );
+    // Anything else that failed the step is said as it came.
+    assert_eq!(
+        install_failed(&format!(
+            "abc1234 {CREATED_BUT_INSTALL_FAILED}: {hook}: in the command for hook install"
+        )),
+        "the install step failed: in the command for hook install"
+    );
 }

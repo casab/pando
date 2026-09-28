@@ -569,10 +569,7 @@ impl<'a> Run<'a> {
                     INSTALL_HOOK,
                     &self.paths.log_file(CHECK_WORKTREE, INSTALL_HOOK),
                 );
-                return failed(
-                    FailureKind::Settings,
-                    &format!("the install step failed: {}", strip_created(&text)),
-                );
+                return failed(FailureKind::Settings, &install_failed(&text));
             }
             return failed(
                 FailureKind::Settings,
@@ -867,11 +864,26 @@ impl<'a> Run<'a> {
     }
 }
 
-/// An install failure as `new` words it, less the part that says the
-/// worktree was kept: the check removes it.
-fn strip_created(text: &str) -> String {
-    match text.split_once(CREATED_BUT_INSTALL_FAILED) {
-        Some((_, rest)) => rest.trim_start_matches([':', ' ']).to_string(),
-        None => text.to_string(),
+/// An install failure as `new` words it, said once: less the part that
+/// says the worktree was kept, which the check removes, and less the
+/// hook's own name for the step, with its exit status beside the words —
+/// "the install step failed (exit 2): …" where `new` has "was created,
+/// but its install step failed: the install hook failed: exited 2: …".
+pub(super) fn install_failed(text: &str) -> String {
+    let rest = match text.split_once(CREATED_BUT_INSTALL_FAILED) {
+        Some((_, rest)) => rest.trim_start_matches([':', ' ']),
+        None => text,
+    };
+    let hook = format!("{}: ", failed_words(INSTALL_HOOK));
+    let rest = rest.strip_prefix(&hook).unwrap_or(rest);
+    let status = rest.strip_prefix("exited ").and_then(|after| {
+        let digits = after
+            .find(|c: char| !c.is_ascii_digit() && c != '-')
+            .unwrap_or(after.len());
+        (digits > 0).then(|| after.split_at(digits))
+    });
+    match status {
+        Some((code, after)) => format!("the install step failed (exit {code}){after}"),
+        None => format!("the install step failed: {rest}"),
     }
 }

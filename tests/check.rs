@@ -444,8 +444,13 @@ fn a_probe_of_another_base_never_replaces_the_last_check_at_the_settings_own() {
     );
     assert!(!e.paths.log_file(CHECK_PROBE_LOGS, "dev").exists());
     assert!(!e.paths.logs_dir(CHECK_HELD_LOGS).exists());
-    // And its reason names the log where it is now.
+    // And its reason, which says the step failed once, names the log
+    // where it is now.
     let reason = v["reason"].as_str().unwrap();
+    assert!(
+        reason.starts_with("the install step failed (exit 1): "),
+        "{reason}"
+    );
     let log = e.paths.log_file(CHECK_PROBE_LOGS, "install");
     assert!(reason.contains(&log.display().to_string()), "{reason}");
 
