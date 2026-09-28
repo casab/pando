@@ -196,7 +196,7 @@ pub(super) fn last_check(setup: &crate::setup::Setup) -> Option<String> {
                      Change no setting to get past it, and never drop a frozen install's flag. \
                      Which branch work starts from is the developer's: tell them both refs from \
                      the reason, and once they name one, answer `base` with it through \
-                     `pando init --answers -`."
+                     `pando init --answers -`, with `--replace` if `base` is already answered."
                 }
             };
             let tail = record.map(|r| r.failed_tail.as_slice()).unwrap_or_default();

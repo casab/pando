@@ -4383,7 +4383,13 @@ fn a_failed_check_leads_with_its_reason_its_last_lines_and_whose_it_is() {
         "{text}"
     );
     assert!(text.contains("answer `base` with it"), "{text}");
-    assert!(!text.contains("--replace"), "{text}");
+    // `--replace` only for a base already answered, which a plain answer
+    // would be refused for; never the settings' "correct them" advice.
+    assert!(
+        text.contains("with `--replace` if `base` is already answered"),
+        "{text}"
+    );
+    assert!(!text.contains("correct them"), "{text}");
     assert!(
         text.lines()
             .filter(|line| !line.starts_with("    "))
