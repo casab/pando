@@ -598,6 +598,16 @@ ports = []                            # no port: ready once it stays up
   the bundler's process. Which address that is belongs to the
   developer's network, so tell them the variable and where it goes;
   never guess the address.
+- **An Expo app is opened by a link, not a page.** pando runs Metro
+  with no terminal, so its "press i" is gone. The iOS simulator shares
+  `127.0.0.1`: `pando status <name>` prints, under a running Metro, the
+  command that opens it in Expo Go, `xcrun simctl openurl booted
+  exp://127.0.0.1:<port>`, and `--json` carries it as the process's
+  `app`. A development build opens
+  `exp+<scheme>://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A<port>`
+  instead, `<scheme>` being `expo.scheme` in the app's `app.json`, which
+  pando does not keep: read it there and fill it in. On a device, the
+  same links take the LAN address above.
 
 ---
 

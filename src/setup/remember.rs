@@ -96,7 +96,8 @@ pub fn memory_block(paths: &PandoPaths, device_note: Option<&str>) -> String {
     if let Some(note) = device_note {
         let _ = writeln!(
             out,
-            "- {note}. Ask the developer for the address; never guess it."
+            "- {note}. Ask the developer for the address; never guess it. On the simulator,\n  \
+             `pando status <name>` gives the command that opens the app."
         );
     }
     out.push_str("- the rest: `pando init --agent --reference brief`\n");

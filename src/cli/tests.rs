@@ -3050,6 +3050,14 @@ fn the_job_says_a_devices_address_only_for_an_app_a_device_runs() {
     );
     assert!(list.contains("never guess the address"), "{list}");
     assert!(block.contains("REACT_NATIVE_PACKAGER_HOSTNAME"), "{block}");
+    // And where the simulator's command is, since Expo's keypress for it
+    // is gone under pando.
+    for text in [list, block] {
+        assert!(
+            text.contains("`pando status <name>` gives the command that opens the app"),
+            "{text}"
+        );
+    }
     let mut out = Vec::new();
     super::agent::agent(&fx.paths, Some(super::agent::Reference::Memory), &mut out).unwrap();
     let memory = String::from_utf8(out).unwrap();
@@ -3209,6 +3217,10 @@ fn the_brief_teaches_the_things_only_it_teaches() {
         (
             "REACT_NATIVE_PACKAGER_HOSTNAME",
             "that a phone needs the machine's LAN address",
+        ),
+        (
+            "expo-development-client",
+            "how a development build of an Expo app is opened",
         ),
         ("kind: \"base\"", "a failure no setting fixes"),
     ] {

@@ -317,7 +317,8 @@ fn project_now(
     if let Some(note) = device_note {
         let _ = writeln!(
             out,
-            "- {note}. Tell the developer when you are done, and never guess the address."
+            "- {note}. Tell the developer when you are done, and never guess the address; \
+             for the simulator, `pando status <name>` gives the command that opens the app."
         );
     }
 
