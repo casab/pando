@@ -11,7 +11,7 @@
   <a href="https://github.com/mertkaradayi/pando/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/mertkaradayi/pando/ci.yml?branch=main&style=flat-square&label=ci"></a>
   <img alt="Rust 2024 edition" src="https://img.shields.io/badge/rust-2024_edition-e6963c?style=flat-square&logo=rust">
   <img alt="Platform: macOS" src="https://img.shields.io/badge/platform-macOS-6e9beb?style=flat-square&logo=apple">
-  <img alt="Version 0.4.0, pre-release" src="https://img.shields.io/badge/version-0.4.0_pre--release-b482e6?style=flat-square">
+  <img alt="Version 0.5.0, pre-release" src="https://img.shields.io/badge/version-0.5.0_pre--release-b482e6?style=flat-square">
   <a href="CONTRIBUTING.md"><img alt="PRs welcome" src="https://img.shields.io/badge/PRs-welcome-50c878?style=flat-square"></a>
 </p>
 
@@ -504,7 +504,7 @@ taking part follows the [code of conduct](CODE_OF_CONDUCT.md).
 
 ## Status
 
-Version 0.4.0, built and not published. Every command above is
+Version 0.5.0, built and not published. Every command above is
 implemented and covered by tests, in this order: worktrees and their
 lifecycle; detached dev servers with their own ports, logs and readiness;
 several processes per worktree; the log viewer; private per-worktree
@@ -516,8 +516,12 @@ database and a Redis slot of their own in the main checkout's servers,
 tested against throwaway MariaDB and Redis servers the tests start
 themselves. 0.4.0 adds no command: it is all of that after a review of
 the whole project and the fixes it found, with a test suite that reads
-no developer's shell profile and needs none of their tools. What changed
-in each version is in the [changelog](CHANGELOG.md).
+no developer's shell profile and needs none of their tools. 0.5.0 adds
+the guided first run: the first `pando` in a project with nothing to run
+hands its setup to the developer's own coding agent, `pando init --agent`
+prints that job, and `pando check` proves the result in a throwaway
+worktree it removes again. What changed in each version is in the
+[changelog](CHANGELOG.md).
 
 macOS is what it is developed on. CI runs the whole test suite on macOS
 and on Linux for every change, and both pass — but the suite runs on

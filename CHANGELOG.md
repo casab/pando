@@ -7,6 +7,8 @@ may change behaviour.
 
 ## Unreleased
 
+## 0.5.0 — 2026-09-28
+
 ### Added
 
 - **The guided first run.** The first `pando` in a project with nothing
@@ -25,6 +27,8 @@ may change behaviour.
   repository, how to run the project's worktrees with pando, and saves
   it only if the developer says yes.
 - The main checkout runs like a worktree, and is listed first.
+- The TUI's list shows each worktree's pull request and its state first,
+  marks its mode and git state, and lines its columns up.
 - The licence (AGPL-3.0-only), contribution guide, code of conduct,
   security policy, and CI on macOS and Linux.
 
@@ -32,6 +36,8 @@ may change behaviour.
 
 - A failed hook says why, and how to fix it.
 - A worktree's namespaced database is made in the main one's shape.
+- `start` says a process is ready as soon as it is, and keeps a
+  worktree's window; `stop --all` names a running check.
 
 ## 0.4.0 — 2026-09-26
 

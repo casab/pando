@@ -65,8 +65,7 @@ proves the setup in a throwaway detached worktree it removes again. The
 screen turns green by itself when a check passes; `esc` always skips it,
 and a project configured before this is never sent to it. Where a
 project's setup stands is `setup::read`, from files under `~/.pando`
-only. It is unreleased, and the maintainer's own proof on a real project,
-with a real agent, is next.
+only. 0.5.0 was built and tagged with it on 2026-09-28.
 
 Later on 2026-09-27 the repository was made ready to open, at the
 maintainer's request: the licence is AGPL-3.0-only, and beside it are
