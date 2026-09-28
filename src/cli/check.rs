@@ -135,6 +135,7 @@ fn failure_sentence(kind: FailureKind, reason: &str) -> String {
             "the check could not run: {reason}. This is the machine's to fix; no setting \
              changes it"
         ),
+        FailureKind::Base => format!("the check failed on the commit it tested: {reason}"),
     }
 }
 

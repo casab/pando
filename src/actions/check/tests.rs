@@ -1,3 +1,4 @@
+use super::base::{names, on_the_base};
 use super::run::commit_to_test;
 use super::*;
 use crate::config::Config;
@@ -92,4 +93,102 @@ fn with_no_default_branch_the_commit_is_head_and_with_no_commit_there_is_none() 
     let (commit, base) = commit_to_test(&root, &Config::default(), None).unwrap();
     assert_eq!(base, None, "HEAD is said as HEAD");
     assert_eq!(commit, sha(&root, "HEAD"));
+}
+
+/// A failure of the settings, as the check records one.
+fn settings_failure(reason: &str) -> crate::setup::CheckOutcome {
+    crate::setup::CheckOutcome::Failed {
+        kind: crate::setup::FailureKind::Settings,
+        reason: reason.to_string(),
+    }
+}
+
+// A file the failure names, on the main checkout's branch and not at the
+// commit tested, makes the failure the base's, naming both refs and the
+// run that tests the right one.
+#[test]
+fn a_failure_for_a_file_only_the_main_checkouts_branch_has_is_the_bases() {
+    use crate::setup::{CheckOutcome, FailureKind};
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("repo");
+    crate::testutil::drifted_repo(&root, 1, 1, Some("backend/uv.lock"));
+    let tested = sha(&root, "origin/develop");
+    let failed = "the install step failed: `cd backend && uv sync --frozen` exited with 2";
+    let tail =
+        ["error: Unable to find lockfile at `uv.lock`, but `--frozen` was provided".to_string()];
+
+    let outcome = on_the_base(
+        &root,
+        settings_failure(failed),
+        &tested,
+        Some("origin/develop"),
+        &tail,
+        None,
+    );
+    let CheckOutcome::Failed { kind, reason } = outcome else {
+        panic!("still a failure");
+    };
+    assert_eq!(kind, FailureKind::Base);
+    assert!(reason.starts_with(failed), "{reason}");
+    assert!(
+        reason.contains(&format!(
+            "backend/uv.lock is on work, the main checkout's branch, but not at origin/develop \
+             ({}), the commit this check tested",
+            &tested[..7]
+        )),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("`pando check --base work`, or answer `base`"),
+        "{reason}"
+    );
+
+    // A lockfile of a manager the install runs counts unnamed.
+    let outcome = on_the_base(
+        &root,
+        settings_failure(failed),
+        &tested,
+        Some("origin/develop"),
+        &[],
+        Some("cd backend && uv sync --frozen"),
+    );
+    assert!(matches!(
+        outcome,
+        CheckOutcome::Failed {
+            kind: FailureKind::Base,
+            ..
+        }
+    ));
+
+    // Nothing the base explains is left as it was: another failure, a
+    // machine's, or a check of the main checkout's own commit.
+    let head = sha(&root, "HEAD");
+    let machine = CheckOutcome::Failed {
+        kind: FailureKind::Machine,
+        reason: "uv.lock".to_string(),
+    };
+    for (outcome, commit, tail) in [
+        (
+            settings_failure("dev exited with status 1"),
+            tested.as_str(),
+            vec!["port in use".to_string()],
+        ),
+        (machine, tested.as_str(), tail.to_vec()),
+        (settings_failure(failed), head.as_str(), tail.to_vec()),
+    ] {
+        assert_eq!(
+            on_the_base(&root, outcome.clone(), commit, None, &tail, Some("npm ci")),
+            outcome
+        );
+    }
+}
+
+#[test]
+fn a_file_is_named_whole_or_not_at_all() {
+    assert!(names("at `uv.lock`, but", "uv.lock"));
+    assert!(names("missing backend/uv.lock.", "uv.lock"));
+    assert!(names("uv.lock", "uv.lock"));
+    assert!(!names("uv.lockfile is gone", "uv.lock"));
+    assert!(!names("myuv.lock", "uv.lock"));
+    assert!(!names("uv.lock.bak", "uv.lock"));
 }

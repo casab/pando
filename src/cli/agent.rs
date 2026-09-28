@@ -146,10 +146,22 @@ pub(super) fn last_check(setup: &crate::setup::Setup) -> Option<String> {
         (SetupState::Failing, Some(CheckOutcome::Failed { kind, reason })) => {
             let whose = match kind {
                 FailureKind::Settings => {
-                    "pando's settings for this project are wrong, which is yours to fix: correct                      them with `pando init --answers - --replace`, then run `pando check` again."
+                    "pando's settings for this project are wrong, which is yours to fix: correct \
+                     them with `pando init --answers - --replace`, then run `pando check` again."
                 }
                 FailureKind::Machine => {
-                    "This machine is not ready (`kind: \"machine\"`), which is the developer's:                      tell them the command pando printed, and change no setting."
+                    "This machine is not ready (`kind: \"machine\"`), which is the developer's: \
+                     tell them the command pando printed, and change no setting."
+                }
+                // The trap is loosening the install until it passes: on
+                // the wrong commit, with a lockfile it wrote itself.
+                FailureKind::Base => {
+                    "The commit the check tested lacks a file the setup needs, which the main \
+                     checkout's branch has (`kind: \"base\"`): the settings may well be right. \
+                     Change no setting to get past it, and never drop a frozen install's flag. \
+                     Which branch work starts from is the developer's: tell them both refs from \
+                     the reason, and once they name one, answer `base` with it through \
+                     `pando init --answers -`."
                 }
             };
             let tail = record.map(|r| r.failed_tail.as_slice()).unwrap_or_default();

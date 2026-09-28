@@ -62,6 +62,15 @@ pando's own, inside `.git`, removed when it is done.
      stopped, a runtime missing) is the developer's, and the one thing to
      tell them before you are done: the command pando printed. Change no
      setting for it.
+   - A base failure (`kind: "base"`) means the commit the check tested
+     lacks a file the setup needs — a lockfile, most often — which the
+     main checkout's branch has. The settings may be right: change none
+     of them to get past it, and never drop a frozen install's flag, which
+     would pass on the wrong commit. Which branch work starts from is the
+     developer's: tell them both refs from `reason`, and once they name
+     one, answer `base` with it through `pando init --answers -` and run
+     the check again. `pando check --base <branch>` tests one without
+     saving it.
    - Exit 3 is not a failure: a question is still open, and the check
      started nothing. Answer it with `pando init --answers -`, then run
      the check again.
@@ -235,7 +244,7 @@ Four more facts that are not visible in the shape:
 | `services` | rules + **human** | which services get a private copy — see §5 for the mechanism |
 | `schema_hook` | rules + **human** | the command that brings a fresh database to the schema. Always a question — it touches data — and only an isolated or namespaced start asks it. The hook runs on those starts only unless its entry says `on = "always"`; `null` answers "no" and writes it with `on = "never"` |
 | `provision` | rules, mostly | which local files a worktree needs. Seeding from an example needs a human |
-| `base` | rules, then **human** | the branch `new` forks from and `check` tests. Asked only when origin/HEAD is far behind the main checkout's branch; otherwise origin/HEAD, and nothing to answer |
+| `base` | rules, then **human** | the branch `new` forks from and `check` tests. Asked only when origin/HEAD is far behind the main checkout's branch; otherwise origin/HEAD, and nothing to answer. A check that fails with `kind: "base"` is the case for it: see step 5 |
 
 ## 4. Writing: `pando init --answers`, and nothing else
 
@@ -694,7 +703,7 @@ a `source` key. Pass `--source` when you know which log you want.
 |---|---|
 | `0` | carry on |
 | `1` | read stderr. It is one sentence. **Do not retry** — a failure that repeats is a failure that repeats |
-| `1` from `pando check` | the setup is wrong, or the machine is: fix it before trying again. The first-run section says which is yours |
+| `1` from `pando check` | the setup is wrong, or the machine is, or the commit it tested: fix it before trying again. The first-run section says which is yours |
 | `2` | you asked wrongly: a bad flag, or an answers file naming a question pando does not ask. Fix the request |
 | `3` | **a question is unanswered, and it is on stderr** with its options. Answer it through `init --answers`, or put it to the human. Never retry unchanged, and never add `--yes` to make it go away |
 

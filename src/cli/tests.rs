@@ -3882,7 +3882,11 @@ fn every_check_value_agent_json_documents_is_one_the_binary_prints() {
     known.sort();
     assert_eq!(results, known);
     assert_eq!(documented(&section, "result"), known);
-    let kinds = [FailureKind::Settings, FailureKind::Machine];
+    let kinds = [
+        FailureKind::Settings,
+        FailureKind::Machine,
+        FailureKind::Base,
+    ];
     let mut kinds: Vec<String> = kinds.into_iter().map(serde_word).collect();
     kinds.sort();
     assert_eq!(documented(&section, "kind"), kinds);
@@ -4153,6 +4157,28 @@ fn a_failed_check_leads_with_its_reason_its_last_lines_and_whose_it_is() {
     assert!(text.contains("change no setting"), "{text}");
     assert!(!text.contains("--replace"), "{text}");
     assert!(!text.contains("Its last lines"), "{text}");
+
+    // The base's is the developer's too, and the trap is named: a looser
+    // install would pass on the wrong commit.
+    let text = super::agent::last_check(&setup_after(
+        SetupState::Failing,
+        failed(FailureKind::Base),
+        &["error: Unable to find lockfile at `uv.lock`"],
+    ))
+    .unwrap();
+    assert!(text.contains("`kind: \"base\"`"), "{text}");
+    assert!(
+        text.contains("never drop a frozen install's flag"),
+        "{text}"
+    );
+    assert!(text.contains("answer `base` with it"), "{text}");
+    assert!(!text.contains("--replace"), "{text}");
+    assert!(
+        text.lines()
+            .filter(|line| !line.starts_with("    "))
+            .all(|line| !line.contains("  ")),
+        "no run of spaces inside a sentence: {text}"
+    );
 
     let text = super::agent::last_check(&setup_after(
         SetupState::Failing,

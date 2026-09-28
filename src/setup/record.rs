@@ -117,6 +117,11 @@ pub enum FailureKind {
     /// The machine is not ready — a server not running, Docker stopped, a
     /// runtime missing: the developer's, and no setting changes it.
     Machine,
+    /// The commit tested lacks a file the step needed, which the main
+    /// checkout's branch has: the base is the wrong one, and loosening a
+    /// setting to get past it would test the wrong commit. The developer's
+    /// to choose, with `check --base` or the `base` answer.
+    Base,
 }
 
 /// One process of a check.

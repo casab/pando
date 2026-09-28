@@ -270,6 +270,71 @@ fn a_check_passes_skips_the_hooks_after_services_and_leaves_nothing_behind() {
     e.assert_nothing_left(&branches);
 }
 
+// origin/HEAD behind the branch the main checkout is on, and a file the
+// install needs only on that branch: the failure is the base's, naming
+// both refs and the run that tests the right one, and `--base` tests it.
+#[test]
+fn an_install_that_fails_for_a_file_the_base_lacks_is_the_bases_and_base_tests_another() {
+    let e = env(
+        "[project]\ninstall = \"cat app.lock\"\n\n[dev]\ncmd = \"echo up; exit 3\"\nports = []\n",
+    );
+    let old = e.git(&["rev-parse", "HEAD"]);
+    e.git(&["update-ref", "refs/remotes/origin/main", old.trim()]);
+    e.git(&[
+        "symbolic-ref",
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/main",
+    ]);
+    e.git(&["checkout", "--quiet", "-b", "work"]);
+    std::fs::write(e.root.join("app.lock"), "locked\n").unwrap();
+    e.git(&["add", "app.lock"]);
+    e.git(&["commit", "--quiet", "-m", "lock"]);
+    let branches = e.git(&["branch", "--list"]);
+
+    let out = e.pando(&["check", "--json"]);
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    let v = json(&out);
+    assert_eq!(v["kind"], "base", "{v}");
+    assert_eq!(v["base_ref"], "origin/main");
+    assert_eq!(v["failed_process"], "install");
+    let reason = v["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("app.lock is on work, the main checkout's branch, but not at origin/main"),
+        "{reason}"
+    );
+    assert!(reason.contains("`pando check --base work`"), "{reason}");
+    assert!(
+        err.contains("pando: the check failed on the commit it tested:"),
+        "{err}"
+    );
+    e.assert_nothing_left(&branches);
+
+    // At the branch that has it, the install passes, and what fails next
+    // is the settings' own.
+    let out = e.pando(&["check", "--json", "--base", "work"]);
+    let v = json(&out);
+    assert_eq!(v["base_ref"], "work", "{v}");
+    assert_eq!(v["kind"], "settings", "{v}");
+    assert_eq!(v["failed_process"], "dev");
+    assert!(
+        v["notes"][0]
+            .as_str()
+            .unwrap()
+            .contains("`pando new` forks from origin/main until this project's base is work"),
+        "{v}"
+    );
+    e.assert_nothing_left(&branches);
+
+    let out = e.pando(&["check", "--base", "nope"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains("base \"nope\" does not exist"),
+        "{}",
+        stderr(&out)
+    );
+}
+
 #[test]
 fn a_process_that_exits_at_once_fails_the_check_with_its_lines_redacted() {
     let e = env(&config_running(

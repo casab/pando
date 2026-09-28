@@ -519,7 +519,7 @@ tested, and why.
   "project": { "id": "...", "root": "...", "name": "..." },
   "result": "passed|failed|not_set_up|interrupted",
   "mode": "shared|namespaced",     // where its data ran: see below
-  "kind": "settings|machine",      // whose the failure is; null unless "failed"
+  "kind": "settings|machine|base", // whose the failure is; null unless "failed"
   "reason": "web exited with status 1 — ...", // null when "passed"
   "slot": "dev_cmd",               // the open question; null unless "not_set_up"
   "commit": "a1b2c3d4…",           // the full sha tested, or null
@@ -550,7 +550,13 @@ is `failed_process`, by its name. `machine` is this machine: a shared
 service nothing answers on, found before anything was made, or in a
 namespaced check a server that refuses the login or a login with no grant
 to make a database. `reason` then carries the command that fixes it, and
-no setting changes it.
+no setting changes it. `base` is the commit tested: a step failed on a
+file — one its failure names, or a lockfile of a manager the install
+runs — that the main checkout's branch has and that commit does not.
+`reason` names both refs and `pando check --base <branch>`; no setting
+fixes it, and loosening the install until it passes would pass on the
+wrong commit. Which branch work starts from is the developer's to say,
+and the `base` answer records it.
 
 `ready` is about the process alone, judged as `start --wait` judges it.
 The page is judged apart: a process can be `ready` with a page that

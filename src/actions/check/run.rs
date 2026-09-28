@@ -33,6 +33,7 @@ use super::super::worktree::{
     CREATED_BUT_INSTALL_FAILED, new_detached, ref_exists, resolve_create_base,
 };
 use super::super::{INSTALL_HOOK, Mode};
+use super::base::on_the_base;
 use super::interrupt::interrupted;
 use super::machine::first_down;
 use super::teardown::{sweep_leftover_check, tear_down};
@@ -253,6 +254,19 @@ pub fn check_at(
     let worktrees_dir = config.worktrees_dir(paths);
     let made_dir = !worktrees_dir.exists();
     let outcome = run.test(&config, &commit, namespaced);
+    // A step that failed for want of a file the tested commit never had
+    // is the base's, not the settings'.
+    let install = (run.record.failed_process.as_deref() == Some(INSTALL_HOOK))
+        .then_some(config.project.install.as_deref())
+        .flatten();
+    let outcome = on_the_base(
+        paths.root(),
+        outcome,
+        &commit,
+        base_ref.as_deref(),
+        &run.record.failed_tail,
+        install,
+    );
     let outcome = match tear_down(paths, &config, say.detail) {
         Ok(left) => {
             if made_dir {

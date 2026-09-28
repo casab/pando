@@ -8,6 +8,7 @@
 //! runs on, the teardown and the sweep of what a killed check left, and
 //! the signals that end one early.
 
+mod base;
 mod interrupt;
 mod machine;
 mod run;
