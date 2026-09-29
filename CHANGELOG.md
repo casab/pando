@@ -19,6 +19,9 @@ may change behaviour.
   `.aab`, `.ipa`, `.app`, `.xcarchive`, `.dSYM`, `.dmg`, `.msi`,
   `.AppImage` and `.log`, whatever the file is called. A local
   `eas build` leaves its packages in the checkout.
+- An `--answers` value for a slot a rule decided wins over the rule's
+  choice ([#5]). `pando init --answers -` used to keep the guessed
+  `provision` and report the answer as unused.
 
 ## 0.6.0 — 2026-09-29
 

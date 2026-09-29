@@ -765,11 +765,16 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             // rule proposed anything for, where there is no question to
             // put to anybody and a program is the only one who could know.
             let volunteered = volunteered_from(answers.as_ref());
+            // And every slot it names is put to it, where a rule decided the
+            // slot too: an answer given beats a guess.
+            let answered: Vec<crate::detect::Slot> =
+                answers.as_ref().map(|a| a.slots()).unwrap_or_default();
             let answering = match &volunteered {
                 Some(program) => actions::Answering::by_program(&ask, program),
                 None => actions::Answering::asking(&ask),
             }
-            .replacing(&replacing);
+            .replacing(&replacing)
+            .answered(&answered);
             let (report, preview) = match dry_run {
                 true => actions::init_dry_run(paths, config, &answering, &notice)?,
                 false => {

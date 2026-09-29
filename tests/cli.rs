@@ -3236,6 +3236,27 @@ fn a_project_that_would_run_nothing_has_the_dev_command_open() {
     assert_eq!(code(&e.pando(&["init", "--yes"])), EXIT_OK);
 }
 
+// A rule's guess never stands in for an answer the file gives: on a first
+// run the gitignored files were taken as decided and the answer for them
+// reported as asked about by nothing.
+#[test]
+fn an_answer_beats_the_guess_a_rule_decided() {
+    let e = env();
+    std::fs::write(e.root.join(".env"), "A=1\n").unwrap();
+    std::fs::write(e.root.join(".env.local"), "B=2\n").unwrap();
+    let out = e.pando_stdin(
+        &["init", "--answers", "-"],
+        r#"{"dev_cmd": "./serve.sh", "provision": [".env"]}"#,
+    );
+    assert_eq!(code(&out), EXIT_OK, "stderr: {}", stderr(&out));
+    assert!(!stderr(&out).contains("nothing asked"), "{}", stderr(&out));
+    let written = std::fs::read_to_string(e.config_file()).unwrap();
+    assert!(
+        written.contains(r#"provision = [".env"]  # answered: a program"#),
+        "{written}"
+    );
+}
+
 // An answer written before the next open question stopped the run printed
 // nothing, and exit 3 read as the answer refused. It says what it wrote
 // as a finished run does, before the question.

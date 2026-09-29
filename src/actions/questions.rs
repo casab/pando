@@ -189,6 +189,11 @@ pub struct Answering<'a> {
     /// The slots whose answer the program replaces: `init --answers
     /// --replace`. Empty on every other pass.
     replace: &'a [Slot],
+    /// The slots the program has an answer for: its question is put to it
+    /// even where a rule decided the slot, because the program's answer is
+    /// the one it gave and the rule's is a guess. Empty on every other
+    /// pass.
+    answered: &'a [Slot],
     /// Which of them this pass wrote, so `init` can say so: a replaced
     /// slot was settled before the run and is settled after it.
     replaced: std::cell::RefCell<Vec<Slot>>,
@@ -202,6 +207,7 @@ impl<'a> Answering<'a> {
             ask,
             program: None,
             replace: &[],
+            answered: &[],
             replaced: Default::default(),
         }
     }
@@ -212,6 +218,7 @@ impl<'a> Answering<'a> {
             ask,
             program: Some(program),
             replace: &[],
+            answered: &[],
             replaced: Default::default(),
         }
     }
@@ -231,6 +238,22 @@ impl<'a> Answering<'a> {
             replace: slots,
             ..self
         }
+    }
+
+    /// The same pass, with the program holding answers for these slots:
+    /// a rule's decision does not stand in for any of them. Only for a
+    /// pass whose `ask` puts these slots to the program, as `replacing`.
+    pub fn answered(self, slots: &'a [Slot]) -> Answering<'a> {
+        Answering {
+            answered: slots,
+            ..self
+        }
+    }
+
+    /// Whether a rule's decision for `slot` is taken without asking: not
+    /// when the pass replaces it, nor when the program has its own answer.
+    fn takes_decision(&self, slot: Slot) -> bool {
+        !self.replaces(slot) && !self.answered.contains(&slot)
     }
 
     /// Whether this pass replaces the answer to `slot`.
@@ -1016,7 +1039,7 @@ fn resolve_pass(
         // the options — it is a subset of them.
         if slot.is_multi() {
             let (chosen, note): (Vec<detect::Candidate>, config::Note) = if proposal.decided
-                && !replacing
+                && answers.takes_decision(*slot)
             {
                 let taken: Vec<detect::Candidate> =
                     proposal.preferred_set().into_iter().cloned().collect();
@@ -1097,7 +1120,7 @@ fn resolve_pass(
             }
             continue;
         }
-        let candidate = if proposal.decided && !replacing {
+        let candidate = if proposal.decided && answers.takes_decision(*slot) {
             let candidate = proposal
                 .preferred()
                 .expect("a decided proposal has a candidate")

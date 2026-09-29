@@ -258,8 +258,8 @@ loops:
 | State | Means | What a program does |
 |---|---|---|
 | `"proposal": null` | no rule had anything to say about this slot at all | **Nothing to choose, and still answerable.** There are no options and nobody is asked, so an `--answers` value is taken as a command of your own, or at `processes` as process tables — validated and written like any other. `services` and `prelude` are the two exceptions and report it as unused. Do not put the slot to a human: pando is not asking |
-| `"decided": true` | a rule settled it; no question will be asked | Leave it alone. An `--answers` value for it is reported as unused |
-| `"decided": false` | pando will ask | This is the only state an answer changes. Answer by value |
+| `"decided": true` | a rule settled it; no question will be asked | Leave it alone unless it is wrong. An `--answers` value for it wins over the rule's choice, and is checked and written as an answer to the question would be |
+| `"decided": false` | pando will ask | Answer by value |
 
 A proposal with `"decided": true`, no candidates and a `none_because` is a
 rule deciding the answer is *none of them* — which is a real answer, and
