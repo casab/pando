@@ -115,3 +115,11 @@ install-path = ["$XDG_BIN_HOME/", "$XDG_DATA_HOME/../bin", "~/.local/bin"]
 install-updater = false
 # Which actions to run on pull requests
 pr-run-mode = "plan"
+
+# The Intel macOS binary is cross-compiled on an Apple silicon runner:
+# Apple's toolchain builds x86_64-apple-darwin natively there, in about
+# the time the arm64 build takes, where the Intel runner took nine
+# minutes and held back the formula. The smoke still runs it on Intel.
+[workspace.metadata.dist.github-custom-runners.x86_64-apple-darwin]
+runner = "macos-14"
+host = "aarch64-apple-darwin"
