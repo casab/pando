@@ -7,6 +7,8 @@ may change behaviour.
 
 ## Unreleased
 
+## 0.6.1 — 2026-09-29
+
 ### Added
 
 - A process can say `page = false`: no browser opens its port, so it is

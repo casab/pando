@@ -107,6 +107,14 @@ simulator command. Agents playing the developer's coding agent on
 fixtures of both shapes proved the pasted first-run prompt ends with
 every app running. What they left is in `plans/open-follow-ups.md`.
 
+On 2026-09-29 the reporter of #5 ran 0.6.0 on their real Expo app, and
+0.6.1 was built and tagged with what they found: no `CI=1` for Metro,
+the development build's link from `expo.slug`, `page = false` for a
+process no browser opens (Metro's by default, so an Expo-only worktree
+has no URL and `open` prints the app's link), no packaged builds in
+`provision`, an `--answers` value over a decided guess, and `status`
+naming a branch's native changes.
+
 What is left is not a phase. `plans/open-follow-ups.md` carries the known
 edges, each with who found it and where it belongs, and the rest of the
 launch checklist in `docs/08-roadmap.md` is open: no published crate, no

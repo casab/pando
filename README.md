@@ -11,7 +11,7 @@
   <a href="https://github.com/mertkaradayi/pando/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/mertkaradayi/pando/ci.yml?branch=main&style=flat-square&label=ci"></a>
   <img alt="Rust 2024 edition" src="https://img.shields.io/badge/rust-2024_edition-e6963c?style=flat-square&logo=rust">
   <img alt="Platform: macOS and Linux" src="https://img.shields.io/badge/platform-macOS_|_Linux-6e9beb?style=flat-square">
-  <img alt="Version 0.6.0, pre-release" src="https://img.shields.io/badge/version-0.6.0_pre--release-b482e6?style=flat-square">
+  <img alt="Version 0.6.1, pre-release" src="https://img.shields.io/badge/version-0.6.1_pre--release-b482e6?style=flat-square">
   <a href="CONTRIBUTING.md"><img alt="PRs welcome" src="https://img.shields.io/badge/PRs-welcome-50c878?style=flat-square"></a>
   <a href="https://github.com/mertkaradayi/pando/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/mertkaradayi/pando?style=flat-square&logo=github&color=ebc34b"></a>
 </p>
@@ -542,7 +542,7 @@ taking part follows the [code of conduct](CODE_OF_CONDUCT.md).
 
 ## Status
 
-Version 0.6.0, released as binaries for macOS and Linux. Every command above is
+Version 0.6.1, released as binaries for macOS and Linux. Every command above is
 implemented and covered by tests, in this order: worktrees and their
 lifecycle; detached dev servers with their own ports, logs and readiness;
 several processes per worktree; the log viewer; private per-worktree
@@ -562,8 +562,10 @@ worktree it removes again. 0.5.1 is the first with binaries: Homebrew
 or one install script, no Rust needed. 0.6.0 reads a repository whose
 apps sit in directories of their own below a root with no manifest,
 recognises Expo apps, and lets an agent describe several processes, so
-the first run on a polyglot monorepo ends with every app running. What
-changed in each version is in the [changelog](CHANGELOG.md).
+the first run on a polyglot monorepo ends with every app running.
+0.6.1 fixes what the first real Expo project found: Metro keeps its
+reloads, is never taken for a web page, and opens in the app's own
+development build. What changed in each version is in the [changelog](CHANGELOG.md).
 
 macOS is what it is developed on. CI runs the whole test suite on macOS
 and on Linux for every change, and both pass — but the suite runs on
