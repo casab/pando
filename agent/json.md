@@ -317,7 +317,9 @@ half `signals` deliberately leaves out. It writes nothing anywhere.
   "runtime":  { "prelude": "...", "prelude_from": "...",
                 "languages": [...], "requirements": [...] },
   "tools":    [ { "name": "git", "path": "/usr/bin/git", "version": "...",
-                  "detail": null, "needed_for": "...", "found": true } ],
+                  "detail": null, "needed_for": "...",
+                  "install": null,  // for a tool not found: the line that gets it
+                  "found": true } ],
   "worktrees":[ { "name": "...", "path": "...", "phase": "...", "created_by_pando": true,
                   "main": false,  // the main checkout's record, once pando has run it
                   "mode": "shared|namespaced|isolated", "isolated": false,
@@ -335,6 +337,11 @@ half `signals` deliberately leaves out. It writes nothing anywhere.
                   "severity": "problem|note", "message": "...", "fix": "..." } ]
 }
 ```
+
+`tools[].install` is set only for a tool the shell was asked about and
+did not have, when pando knows how it is got: `"brew install cloudflared
+  (or Cloudflare's cloudflared package)"`. It is advice for the developer,
+not a command to run for them; pando never installs anything.
 
 `findings` is the part to read first. `severity` is `problem` — something
 here will break a command, and `ok` is `false` — or `note`, which is

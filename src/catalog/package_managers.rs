@@ -86,6 +86,9 @@ pub struct PackageManager {
     /// `None` for a manager with one lockfile name, where the plain
     /// install writes the one that is ignored.
     pub unsaved_install: Option<&'static str>,
+    /// How a developer gets this manager, as doctor prints it after
+    /// "install it with:". pando never runs it.
+    pub get: &'static str,
 }
 
 /// Every manager pando knows, in detection order. Order is a contract: it
@@ -111,6 +114,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         }),
         unlocked_install: Some("pnpm install"),
         unsaved_install: None,
+        get: "corepack enable pnpm   (or npm install -g pnpm)",
     },
     PackageManager {
         program: "npm",
@@ -130,6 +134,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         }),
         unlocked_install: Some("npm install"),
         unsaved_install: None,
+        get: "brew install node   (npm comes with Node.js)",
     },
     PackageManager {
         program: "yarn",
@@ -153,6 +158,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         }),
         unlocked_install: Some("yarn install"),
         unsaved_install: None,
+        get: "corepack enable yarn   (or npm install -g yarn)",
     },
     PackageManager {
         program: "bun",
@@ -172,6 +178,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         }),
         unlocked_install: Some("bun install"),
         unsaved_install: Some("bun install --no-save"),
+        get: "brew install oven-sh/bun/bun   (or the install script at bun.sh)",
     },
     PackageManager {
         program: "uv",
@@ -191,6 +198,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         }),
         unlocked_install: None,
         unsaved_install: None,
+        get: "brew install uv   (or the install script at astral.sh/uv)",
     },
     PackageManager {
         program: "poetry",
@@ -209,6 +217,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         install_shape: None,
         unlocked_install: None,
         unsaved_install: None,
+        get: "pipx install poetry",
     },
     PackageManager {
         program: "pipenv",
@@ -230,6 +239,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         }),
         unlocked_install: None,
         unsaved_install: None,
+        get: "pipx install pipenv",
     },
     PackageManager {
         program: "bundle",
@@ -251,6 +261,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         }),
         unlocked_install: None,
         unsaved_install: None,
+        get: "gem install bundler",
     },
     PackageManager {
         program: "composer",
@@ -272,6 +283,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         }),
         unlocked_install: None,
         unsaved_install: None,
+        get: "brew install composer   (or the installer at getcomposer.org)",
     },
     PackageManager {
         program: "mix",
@@ -288,6 +300,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         install_shape: None,
         unlocked_install: None,
         unsaved_install: None,
+        get: "brew install elixir   (mix comes with Elixir)",
     },
     PackageManager {
         program: "go",
@@ -302,6 +315,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         install_shape: None,
         unlocked_install: None,
         unsaved_install: None,
+        get: "brew install go   (or your distribution's golang package)",
     },
     PackageManager {
         program: "cargo",
@@ -320,6 +334,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         }),
         unlocked_install: None,
         unsaved_install: None,
+        get: "rustup, from https://rustup.rs",
     },
 ];
 

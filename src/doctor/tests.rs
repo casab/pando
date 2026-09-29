@@ -824,6 +824,64 @@ fn a_missing_tool_is_a_line_and_only_a_problem_when_this_project_needs_it() {
 }
 
 #[test]
+fn a_missing_tool_says_how_to_get_it_and_a_found_one_does_not() {
+    let fx = fixture();
+    let missing = report_of(&fx, &no_tools);
+    let text = missing.render();
+    for name in ["git", "docker", "cloudflared", "gh"] {
+        let get = crate::catalog::tools::how_to_get(name).expect("a catalog row");
+        assert_eq!(tool(&missing, name).install.as_deref(), Some(get), "{name}");
+        let line = format!("install it with: {get} — pando never will");
+        assert!(text.contains(&line), "{text}");
+    }
+    // A finding's fix names the same command as the line does.
+    let git = missing
+        .findings
+        .iter()
+        .find(|f| f.message.starts_with("git is not on"))
+        .expect("git's finding");
+    assert!(
+        git.fix
+            .as_deref()
+            .is_some_and(|fix| fix.contains("xcode-select")),
+        "{git:?}"
+    );
+    // `docker compose` is docker's own news, told once.
+    assert_eq!(tool(&missing, "docker compose").install, None);
+
+    let found = report(&fx);
+    for tool in &found.tools {
+        assert_eq!(tool.install, None, "{}", tool.name);
+    }
+    assert!(!found.render().contains("install it with:"));
+}
+
+// Every key of a `tools[]` entry is one an agent reads, so the contract
+// names each of them.
+#[test]
+fn agent_json_documents_every_tools_key() {
+    let doc = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("agent/json.md"),
+    )
+    .unwrap();
+    let section = doc
+        .split("## `pando doctor --json`")
+        .nth(1)
+        .expect("the doctor section")
+        .split("\n## ")
+        .next()
+        .unwrap();
+    let fx = fixture();
+    let published = serde_json::to_value(tool(&report_of(&fx, &no_tools), "git")).unwrap();
+    for key in published.as_object().unwrap().keys() {
+        assert!(
+            section.contains(&format!("\"{key}\"")),
+            "agent/json.md never documents doctor's tools[].{key}"
+        );
+    }
+}
+
+#[test]
 fn docker_missing_is_a_note_only_when_the_project_declares_compose_services() {
     let fx = fixture();
     let plain = report_of(&fx, &no_tools);

@@ -271,6 +271,9 @@ pub struct ToolReport {
     pub detail: Option<String>,
     /// Why pando looked for it.
     pub needed_for: String,
+    /// What gets it, when the shell was asked, did not have it, and
+    /// pando knows a line for it. `null` otherwise.
+    pub install: Option<String>,
     pub found: bool,
     /// Whether the shell answered when asked about it. When it did not, a
     /// tool with no path was never looked for rather than not found.

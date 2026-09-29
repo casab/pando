@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use crate::actions::{self, Machine};
-use crate::catalog::package_managers;
+use crate::catalog::{package_managers, tools};
 use crate::config::{Config, HookScope, ServiceConfig};
 use crate::paths::PandoPaths;
 use crate::process as proc;
@@ -92,25 +92,34 @@ pub(super) fn tools_report(
     for (index, probe) in probes.iter().enumerate() {
         let entry = found.get(&index);
         let present = entry.is_some_and(|f| f.path.is_some());
+        // Only for a tool the shell was asked about and did not have.
+        let install = (!present && failure.is_none())
+            .then(|| tools::how_to_get(&probe.name))
+            .flatten();
         // Only when the probe itself ran: "not found" is a claim about
         // this machine, and a shell that never answered has not made it.
         if !present
             && failure.is_none()
             && let Some((severity, reason)) = &probe.missing
         {
+            let install_it = match install {
+                Some(get) => format!("install it with {get}"),
+                None => "install it".to_string(),
+            };
             let (on, fix) = match probe.direct {
                 true => (
                     "the PATH pando was started with",
                     format!(
-                        "install it so it is on the PATH pando is started with, or put a shim \
-                         at {}",
+                        "{install_it} so it is on the PATH pando is started with, or put a \
+                         shim at {}",
                         paths.home.join("bin").join(&probe.name).display()
                     ),
                 ),
                 false => (
                     "the PATH `bash -lc` has",
-                    "install it, or set [runtime].prelude so a login bash shell finds it"
-                        .to_string(),
+                    format!(
+                        "{install_it}, or set [runtime].prelude so a login bash shell finds it"
+                    ),
                 ),
             };
             findings.push(Finding {
@@ -128,6 +137,7 @@ pub(super) fn tools_report(
                 .and_then(|f| f.detail.clone())
                 .map(|d| format!("{}{d}", probe.detail_label)),
             needed_for: probe.needed_for.clone(),
+            install: install.map(str::to_string),
             found: present,
             asked: failure.is_none(),
         });
@@ -336,6 +346,18 @@ fn tool_probes(paths: &PandoPaths, config: &Config) -> Vec<ToolProbe> {
         needed_for: "`pando share`, which publishes a worktree at a public URL".to_string(),
         // `share` is opt-in and says this itself. A line is enough. Direct,
         // because `share` checks for it on pando's own PATH before it runs.
+        missing: None,
+        direct: true,
+    });
+    probes.push(ToolProbe {
+        name: "gh".to_string(),
+        program: "gh".to_string(),
+        args: "--version",
+        detail_args: None,
+        detail_label: "",
+        needed_for: "the TUI's pull request picker".to_string(),
+        // Opt-in like `share`, and the picker says so itself. Direct,
+        // because the TUI runs it without a shell.
         missing: None,
         direct: true,
     });

@@ -19,7 +19,9 @@
 //!   runtime probe reads directly;
 //! - a native service (postgres, redis…): a recipe file, see `recipes`;
 //! - a job queue library whose worker `doctor` recognises: a row in
-//!   [`queue_workers::QUEUE_WORKERS`].
+//!   [`queue_workers::QUEUE_WORKERS`];
+//! - a program pando runs itself (git, docker…): a row in
+//!   [`tools::TOOLS`], with how a developer gets it.
 //!
 //! Nothing in this module reads the disk or runs anything. It is data plus
 //! the lookups over it; the modules that act on the data stay where they
@@ -31,3 +33,4 @@ pub mod host_checks;
 pub mod images;
 pub mod package_managers;
 pub mod queue_workers;
+pub mod tools;

@@ -7,6 +7,20 @@ may change behaviour.
 
 ## Unreleased
 
+### Added
+
+- `pando doctor` says how to get each tool it did not find: a line
+  under it, `install it with: brew install cloudflared … — pando never
+  will`, and the same command in the finding's fix. `doctor --json`
+  carries it as `tools[].install`. It covers git, Docker, cloudflared,
+  gh and every package manager pando knows; a native engine already had
+  its recipe's. pando still installs nothing.
+- `pando doctor` looks for `gh`, which the TUI's pull request picker
+  needs. The README said it did; it never had.
+- The README's Get started is five steps that work as written, and
+  Install lists every tool pando can use, what needs it, and how to get
+  it on macOS and on Linux.
+
 ### Changed
 
 - A process that is still running at its readiness deadline, with

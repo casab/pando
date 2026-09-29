@@ -33,21 +33,59 @@
 
 ## Get started
 
+**1. Install pando.** On macOS or Linux, no Rust needed:
+
 ```bash
 brew install mertkaradayi/tap/pando
-
-cd ~/code/your-project
-pando                               # the first time, the setup screen
 ```
 
-No Homebrew? This one line installs it on macOS or Linux:
+No Homebrew? This one line does the same:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/mertkaradayi/pando/releases/latest/download/pando-cli-installer.sh | sh
 ```
 
-Neither needs Rust. [Install](#install) has the details and building from
-source.
+[Install](#install) has the details and building from source.
+
+**2. Open a terminal in a project you work on.** pando works on the git
+repository you run it in: the one with the dev server you wish you could
+run on two branches at once. Nothing else needs to be set up first.
+
+**3. Run it:**
+
+```bash
+pando
+```
+
+The first time, pando opens its setup screen. Press `a` to copy a
+one-line prompt, and paste it into Claude Code or Codex, opened in the same
+project: your agent reads the project, answers pando's questions, and
+proves the setup in a throwaway worktree. The screen turns green when it
+passes. No agent? Press enter, and pando tries its own guess. Esc skips
+the setup altogether. [Your first run](#your-first-run) walks through it.
+
+**4. Work on a second branch next to the first:**
+
+```bash
+pando new feat/checkout       # its own checkout, dependencies installed
+pando start feat/checkout     # its own dev server, on ports of its own
+pando open feat/checkout      # in your browser
+```
+
+Your main checkout is untouched and still runs as before. In the TUI, the
+same steps are `n`, then enter. `pando rm feat/checkout` stops it and
+removes the checkout and its data.
+
+**5. See what else your project needs:**
+
+```bash
+pando doctor
+```
+
+It lists every tool this project will have pando run, which ones are
+installed, and the command that installs each one that is missing. Only
+`git` is required; the rest is needed only for the feature that uses it:
+[What else pando uses](#what-else-pando-uses).
 
 **[mertkaradayi.github.io/pando](https://mertkaradayi.github.io/pando/)** tells the story in
 pictures and has a copy of the TUI you can drive with your keyboard, in the
@@ -504,10 +542,36 @@ it cargo may pick newer ones that need a newer Rust. On a new Mac, `git`
 comes with the Xcode Command Line Tools (`xcode-select --install`).
 
 `pando --version` says which version you have, and `pando completions zsh`
-(or bash, fish…) prints a completion script. Worktrees need `git`; isolated
-services need Docker or the native engine a recipe names; sharing needs
-`cloudflared`; the pull request picker needs `gh`. `pando doctor` checks
-all of them.
+(or bash, fish…) prints a completion script.
+
+### What else pando uses
+
+pando itself is one binary. The tools below are needed only for the
+feature beside them, and only when your project uses that feature.
+`pando doctor` checks each one and prints the command for any that is
+missing; pando never installs anything on your machine by itself.
+
+| Tool | Needed for | macOS | Linux |
+|---|---|---|---|
+| `git` | everything | `xcode-select --install` | your distribution's `git` |
+| `cloudflared` | `pando share`, a public URL for a worktree | `brew install cloudflared` | [Cloudflare's package](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) |
+| `gh` | the TUI's pull request picker (`p`) | `brew install gh` | [the GitHub CLI's package](https://github.com/cli/cli#installation) |
+| Docker with Compose | `start --isolated`, when the project's services are in a compose file | Docker Desktop or OrbStack | Docker Engine and its compose plugin |
+| `redis-server`, `redis-cli` | a private Redis without Docker; `redis-cli` alone for `--namespaced` | `brew install redis` | `redis-server`, `redis-tools` |
+| `mariadbd`, `mariadb` | a private MariaDB without Docker; the `mariadb` client alone for `--namespaced` | `brew install mariadb` | `mariadb-server`, `mariadb-client` |
+| `postgres`, `psql` | a private Postgres without Docker | `brew install postgresql@16` | `postgresql` |
+| `mongod`, `mongosh` | a private MongoDB without Docker | `brew install mongodb/brew/mongodb-community` | [MongoDB's package](https://www.mongodb.com/docs/manual/administration/install-on-linux/) |
+
+The usual pair on a Mac, for sharing and pull requests:
+
+```bash
+brew install cloudflared gh
+```
+
+Your project's own toolchain (Node and its package manager, Python,
+Go…) is whatever you already run it with. pando finds it through your
+login shell and never replaces it; `pando doctor` names any it cannot
+find, with how to get it.
 
 ## Contributing
 

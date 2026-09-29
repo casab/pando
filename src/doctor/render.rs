@@ -314,6 +314,13 @@ fn render_tools(out: &mut String, tools: &[ToolReport], style: &Style) {
             text.push_str(&format!("  {detail}"));
         }
         let _ = writeln!(out, "  {:<width$}{text}", tool.name);
+        if let Some(install) = &tool.install {
+            let _ = writeln!(
+                out,
+                "  {:<width$}install it with: {install} — pando never will",
+                ""
+            );
+        }
     }
 }
 

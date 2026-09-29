@@ -175,7 +175,8 @@ fn ensure_runnable(program: &Path, shim: &Path) -> Result<()> {
         return Ok(());
     }
     bail!(
-        "cloudflared is not installed — `brew install cloudflared`, or put a shim at {}",
+        "cloudflared is not installed — install it with {}, or put a shim at {}",
+        crate::catalog::tools::how_to_get("cloudflared").unwrap_or("its own package"),
         shim.display()
     )
 }
