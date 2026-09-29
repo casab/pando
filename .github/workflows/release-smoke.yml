@@ -90,9 +90,10 @@ jobs:
           git init -q -b main
           # A bare socket, not `http.server`: that one resolves its own
           # name between bind and listen, which outlasts the readiness wait
-          # on the macOS runners.
+          # on the macOS runners. The test suite's own listener, character
+          # for character: tests/distribution.rs holds the two together.
           printf '%s\n' '[dev]' \
-            "cmd = '''python3 -u -c \"import socket,time;s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind(('127.0.0.1',{port:web}));s.listen(5);print('listening');time.sleep(3600)\"'''" \
+            "cmd = '''python3 -u -c \"import socket,time;s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind(('127.0.0.1',{port:web}));s.listen(5);print('listening on {port:web}');time.sleep(3600)\"'''" \
             'ports = ["web"]' > pando.toml
           echo "# smoke" > README.md
           git add .

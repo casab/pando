@@ -119,10 +119,11 @@ fn ci_runs_these_tests_on_every_document_they_read() {
         push, pull_request,
         "ci.yml ignores different paths for pushes and for pull requests"
     );
-    for doc in INSTALL_DOCS
-        .iter()
-        .chain(&["Cargo.toml", ".github/workflows/ci.yml"])
-    {
+    for doc in INSTALL_DOCS.iter().chain(&[
+        "Cargo.toml",
+        ".github/workflows/ci.yml",
+        ".github/workflows/release-smoke.yml",
+    ]) {
         for pattern in &push {
             assert!(
                 !ignores(pattern, doc),
@@ -216,5 +217,22 @@ fn the_homebrew_publish_job_pushes_to_the_tap_dist_names() {
     assert!(
         workflow.contains(&format!("repository: {tap}\n")),
         "publish-homebrew.yml does not check out {tap}, the tap dist names"
+    );
+}
+
+/// The release smoke makes its fixture in a few lines of shell, so it
+/// needs no Rust toolchain, and those lines carry the test suite's own
+/// listener: a bare socket that listens the moment it binds. Written out
+/// twice, the two drift, and the smoke is what proves a release installs.
+/// `http.server`, which it ran before, resolves its own name between bind
+/// and listen, and on the macOS runners that outlasted the readiness wait.
+#[test]
+fn the_release_smoke_starts_the_test_suites_own_listener() {
+    let workflow = read(".github/workflows/release-smoke.yml");
+    // Inside a double-quoted shell word there, so its quotes are escaped.
+    let listener = crate::common::listener_on_port_template().replace('"', "\\\"");
+    assert!(
+        workflow.contains(&format!("cmd = '''{listener}'''")),
+        "release-smoke.yml's fixture no longer starts listener_on_port_template():\n{listener}"
     );
 }
