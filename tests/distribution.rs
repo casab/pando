@@ -191,3 +191,30 @@ fn the_docs_install_what_the_release_publishes() {
         }
     }
 }
+
+/// The formula reaches the tap through `publish-homebrew.yml`, not dist's
+/// own job, and that workflow names the tap a second time: it must be
+/// the one `[workspace.metadata.dist]` names, and dist must be told to
+/// run it, or a release publishes no Homebrew install at all.
+#[test]
+fn the_homebrew_publish_job_pushes_to_the_tap_dist_names() {
+    let manifest: toml::Table = read("Cargo.toml").parse().expect("Cargo.toml parses");
+    let dist = &manifest["workspace"]["metadata"]["dist"];
+    let tap = dist["tap"].as_str().expect("dist has a Homebrew tap");
+    let jobs: Vec<&str> = dist["publish-jobs"]
+        .as_array()
+        .expect("dist has publish-jobs")
+        .iter()
+        .filter_map(|job| job.as_str())
+        .collect();
+    assert!(
+        jobs.contains(&"./publish-homebrew"),
+        "publish-jobs is {jobs:?}, so dist never runs publish-homebrew.yml"
+    );
+
+    let workflow = read(".github/workflows/publish-homebrew.yml");
+    assert!(
+        workflow.contains(&format!("repository: {tap}\n")),
+        "publish-homebrew.yml does not check out {tap}, the tap dist names"
+    );
+}

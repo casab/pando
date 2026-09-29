@@ -101,8 +101,9 @@ installers = ["shell", "homebrew"]
 tap = "mertkaradayi/homebrew-tap"
 # Customize the Homebrew formula name
 formula = "pando"
-# Publish jobs to run in CI
-publish-jobs = ["homebrew"]
+# Publish jobs to run in CI. publish-homebrew.yml pushes the formula in
+# place of dist's own homebrew job, without its minute of `brew update`.
+publish-jobs = ["./publish-homebrew"]
 # Post-announce jobs to run in CI
 post-announce-jobs = ["./release-smoke"]
 # Checksums to generate for each App

@@ -1,0 +1,53 @@
+name: publish-homebrew
+
+# Pushes the release's `pando` formula to mertkaradayi/homebrew-tap.
+#
+# dist calls this as a publish job (publish-jobs in Cargo.toml), in place
+# of its own homebrew job, which spent 45 of its 53 seconds on `brew
+# update` so that `brew style --fix` could realign the formula's
+# whitespace. A personal tap is never audited, and the formula dist
+# writes installs the same either way, so this commits it as dist wrote
+# it: the Homebrew install is live that much sooner.
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+# The tap is pushed with HOMEBREW_TAP_TOKEN and the artifacts come from
+# this run, so the job needs nothing of GITHUB_TOKEN; dist's caller grants
+# a publish job id-token and packages only, and a request for more fails.
+permissions: {}
+
+jobs:
+  formula:
+    name: push the formula
+    runs-on: ubuntu-latest
+    env:
+      PLAN: ${{ inputs.plan }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: true
+          repository: mertkaradayi/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      - name: Fetch the formula
+        uses: actions/download-artifact@v8
+        with:
+          pattern: artifacts-*
+          path: Formula/
+          merge-multiple: true
+      - name: Commit and push it
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "axo bot"
+          git config user.email "admin+bot@axo.dev"
+          for release in $(jq --compact-output '.releases[] | select([.artifacts[] | endswith(".rb")] | any)' <<<"$PLAN"); do
+            filename=$(jq --raw-output '.artifacts[] | select(endswith(".rb"))' <<<"$release")
+            version=$(jq --raw-output .app_version <<<"$release")
+            git add "Formula/${filename}"
+            git commit -m "${filename%.rb} ${version}"
+          done
+          git push
