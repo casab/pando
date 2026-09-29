@@ -2673,9 +2673,9 @@ fn seed_fixture(files: &[(&str, &str)]) -> TempDir {
 #[test]
 fn only_root_level_ignored_files_are_present_ones() {
     let dir = seed_fixture(&[
-        (".gitignore", "node_modules/\n.env\n*.log\n"),
+        (".gitignore", "node_modules/\n.env\n*.local\n"),
         (".env", "PORT=3000\n"),
-        ("debug.log", "\n"),
+        ("config.local", "\n"),
     ]);
     for rel in ["node_modules/pkg/lib", "sub"] {
         std::fs::create_dir_all(dir.path().join(rel)).unwrap();
@@ -2684,8 +2684,8 @@ fn only_root_level_ignored_files_are_present_ones() {
         std::fs::write(dir.path().join(format!("node_modules/pkg/lib/{i}.js")), "").unwrap();
     }
     std::fs::write(dir.path().join("node_modules/.env"), "").unwrap();
-    std::fs::write(dir.path().join("sub/x.log"), "").unwrap();
-    assert_eq!(ignored_present(dir.path()), [".env", "debug.log"]);
+    std::fs::write(dir.path().join("sub/x.local"), "").unwrap();
+    assert_eq!(ignored_present(dir.path()), [".env", "config.local"]);
 }
 
 // A test run leaves a coverage database at the root, gitignored and
@@ -2698,6 +2698,21 @@ fn a_tool_artifact_is_never_a_provision_file() {
         (".coverage", "sqlite"),
         (".coverage.laptop.1.2", "sqlite"),
         (".eslintcache", "{}"),
+        (".env", "PORT=3000\n"),
+    ]);
+    assert_eq!(ignored_present(dir.path()), [".env"]);
+}
+
+// `eas build --local` leaves its packages at the root, gitignored and
+// present, a gigabyte and more of them: never a worktree's local file.
+#[test]
+fn a_packaged_build_or_a_log_is_never_a_provision_file() {
+    let dir = seed_fixture(&[
+        (".gitignore", ".env\nbuild-*\n*.log\n"),
+        ("build-1759132.aab", "zip"),
+        ("build-1759132.ipa", "zip"),
+        ("build-1759133.apk", "zip"),
+        ("metro.log", "\n"),
         (".env", "PORT=3000\n"),
     ]);
     assert_eq!(ignored_present(dir.path()), [".env"]);

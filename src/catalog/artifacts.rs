@@ -13,14 +13,10 @@
 /// files, so a directory here changes nothing today, but this is the one
 /// list of what a worktree never needs, and a directory is as much a
 /// cache as a file is.
-pub const ARTIFACTS: [&str; 24] = [
+pub const ARTIFACTS: [&str; 21] = [
     // Editors and operating systems.
     ".DS_Store",
     "Thumbs.db",
-    // Package managers' own logs.
-    "npm-debug.log",
-    "yarn-error.log",
-    "pnpm-debug.log",
     // JavaScript build output and caches.
     "tsconfig.tsbuildinfo",
     ".eslintcache",
@@ -50,10 +46,42 @@ pub const ARTIFACTS: [&str; 24] = [
 /// `.coverage.<host>.<pid>.<random>`.
 const ARTIFACT_PREFIXES: [&str; 1] = [".coverage."];
 
+/// Extensions that make a file an artifact whatever it is called: a
+/// packaged build, which a local build leaves beside the sources (`eas
+/// build --local` writes `build-<id>.aab` and `.ipa` into the checkout,
+/// hundreds of megabytes each), and a log. A worktree runs from its
+/// sources, never from another checkout's build of them. Not for a
+/// dotfile, whose last part names a setting: `.env.app` is an env file.
+const ARTIFACT_EXTENSIONS: [&str; 10] = [
+    // Android and iOS builds and archives.
+    "apk",
+    "aab",
+    "ipa",
+    "app",
+    "xcarchive",
+    "dSYM",
+    // Desktop installers.
+    "dmg",
+    "msi",
+    "AppImage",
+    // Logs, of any tool.
+    "log",
+];
+
 /// Whether a file or directory name, the last component of a path, is an
 /// artifact.
 pub fn is_artifact(name: &str) -> bool {
-    ARTIFACTS.contains(&name) || ARTIFACT_PREFIXES.iter().any(|p| name.starts_with(p))
+    ARTIFACTS.contains(&name)
+        || ARTIFACT_PREFIXES.iter().any(|p| name.starts_with(p))
+        || !name.starts_with('.')
+            && name
+                .rsplit_once('.')
+                .filter(|(stem, _)| !stem.is_empty())
+                .is_some_and(|(_, extension)| {
+                    ARTIFACT_EXTENSIONS
+                        .iter()
+                        .any(|known| known.eq_ignore_ascii_case(extension))
+                })
 }
 
 #[cfg(test)]
@@ -68,6 +96,27 @@ mod tests {
         assert!(!is_artifact(".env"));
         assert!(!is_artifact(".env.local"));
         assert!(!is_artifact("coverage"), "a directory of the project's own");
+    }
+
+    // A local mobile build writes its packages into the checkout, and they
+    // are gitignored and present: exactly what `provision` offers, and
+    // nothing a worktree runs from.
+    #[test]
+    fn a_packaged_build_or_a_log_is_an_artifact_by_its_extension() {
+        for name in [
+            "build-1759132.aab",
+            "build-1759132.ipa",
+            "app-release.APK",
+            "Shop.app",
+            "Shop.xcarchive",
+            "Shop.app.dSYM",
+            "server.log",
+        ] {
+            assert!(is_artifact(name), "{name}");
+        }
+        for name in [".env", ".env.app", "app", ".log", "config.local.json"] {
+            assert!(!is_artifact(name), "{name}");
+        }
     }
 
     #[test]

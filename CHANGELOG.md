@@ -13,6 +13,13 @@ may change behaviour.
   off its reloads and file watching, and with no terminal Expo waits on
   no keypress anyway. `doctor` notes a process that still sets it.
 
+### Fixed
+
+- `provision` never offers a packaged build or a log ([#5]): `.apk`,
+  `.aab`, `.ipa`, `.app`, `.xcarchive`, `.dSYM`, `.dmg`, `.msi`,
+  `.AppImage` and `.log`, whatever the file is called. A local
+  `eas build` leaves its packages in the checkout.
+
 ## 0.6.0 — 2026-09-29
 
 ### Added
