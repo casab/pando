@@ -7,6 +7,15 @@ may change behaviour.
 
 ## Unreleased
 
+### Changed
+
+- A process that is still running at its readiness deadline, with
+  nothing in its log to explain it and no other port open, is told how
+  to wait longer: its failure ends with the `ready = { timeout_s = N }`
+  to put in its table, at twice the wait it had. A cold build, a JVM,
+  a server that waits for its database or a slow name lookup is only
+  slow, and the timeout never said what to change.
+
 ## 0.6.1 — 2026-09-29
 
 ### Added

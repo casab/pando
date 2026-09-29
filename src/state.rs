@@ -67,6 +67,11 @@ pub fn longest_starting_secs(timeout_secs: i64) -> i64 {
 /// there would silently stop every failure being explained.
 pub const EXITED: &str = "process exited";
 
+/// How the reason for a process that outlived its readiness wait with
+/// nothing bound begins: the same half-sentence, finished by
+/// `actions::explain_new_failures`, which may say to wait longer.
+pub const NOTHING_BOUND: &str = "timeout: nothing bound port";
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct State {
     pub version: u32,
@@ -836,7 +841,7 @@ pub fn advance_phases<R: Into<PortCheck>>(
                                 None
                             }
                             PortCheck::NotBound if elapsed > timeout => {
-                                Some(format!("timeout: nothing bound port {port} in {timeout}s"))
+                                Some(format!("{NOTHING_BOUND} {port} in {timeout}s"))
                             }
                             // Not an answer, so not a reason to give up at
                             // the window's end: the wait goes on while the

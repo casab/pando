@@ -327,11 +327,24 @@ pub(super) fn explain_new_failures(
             {
                 continue;
             }
-            let mut explained = explain_failure(reason, &p.log_path, proc::group_alive(p.pgid));
-            if let Some(Some(listening)) = scans.get(&p.pgid)
-                && let Some(note) = listening_elsewhere(reason, listening, &assigned)
-            {
-                explained = format!("{explained} — {note}");
+            let alive = proc::group_alive(p.pgid);
+            let (mut explained, log_explains) = explain(reason, &p.log_path, alive);
+            let elsewhere = scans
+                .get(&p.pgid)
+                .and_then(|scan| scan.as_deref())
+                .and_then(|listening| listening_elsewhere(reason, listening, &assigned));
+            // Listening on another port, or a log that says what went
+            // wrong, is the diagnosis; more time is not. Only a process
+            // still up with nothing else to say may simply be slow.
+            let hint = match elsewhere {
+                Some(note) => Some(note),
+                None if alive && !log_explains => {
+                    slow_start_hint(reason, process, p.ready_timeout_s)
+                }
+                None => None,
+            };
+            if let Some(hint) = hint {
+                explained = format!("{explained} — {hint}");
             }
             if &explained == reason {
                 continue;
@@ -346,26 +359,6 @@ pub(super) fn explain_new_failures(
     changed
 }
 
-/// Everything that can be said about one failure, in one line.
-///
-/// Three sources, in the order a reader wants them. What the phase knew —
-/// that the process is gone, or that nothing bound the port it was waiting
-/// for. Then the status its shell recorded on the way out, which is the
-/// only thing that separates a crash from a command that did its job and
-/// returned. Then either what the log says, or — when the log is empty —
-/// that it is empty, which is a fact about the command and not an absence
-/// of information.
-///
-/// The empty half is why this exists. A first run proposed a Makefile
-/// guard as a dev command; it exited 0 in a millisecond because the tool
-/// it guarded was installed, and `status`, `doctor` and the TUI all said
-/// "failed — process exited" over a log file with nothing in it.
-///
-/// `group_alive` is the guard on the one claim here that is a judgement
-/// rather than a fact: a command that backgrounds the server and returns
-/// looks identical from the leader's exit status, and is not the wrong
-/// command. Read after the phases are advanced, so the leader has already
-/// been reaped and a zombie cannot hold its own group open.
 /// What a readiness timeout leaves out when the process is up and serving,
 /// just not where pando waited: the ports it did open.
 ///
@@ -429,7 +422,30 @@ pub fn failure_tail(log_path: &Path) -> Vec<String> {
     kept.into_iter().skip(skip).collect()
 }
 
-pub(super) fn explain_failure(reason: &str, log_path: &Path, group_alive: bool) -> String {
+/// Everything that can be said about one failure, in one line.
+///
+/// Three sources, in the order a reader wants them. What the phase knew —
+/// that the process is gone, or that nothing bound the port it was waiting
+/// for. Then the status its shell recorded on the way out, which is the
+/// only thing that separates a crash from a command that did its job and
+/// returned. Then either what the log says, or — when the log is empty —
+/// that it is empty, which is a fact about the command and not an absence
+/// of information.
+///
+/// The empty half is why this exists. A first run proposed a Makefile
+/// guard as a dev command; it exited 0 in a millisecond because the tool
+/// it guarded was installed, and `status`, `doctor` and the TUI all said
+/// "failed — process exited" over a log file with nothing in it.
+///
+/// `group_alive` is the guard on the one claim here that is a judgement
+/// rather than a fact: a command that backgrounds the server and returns
+/// looks identical from the leader's exit status, and is not the wrong
+/// command. Read after the phases are advanced, so the leader has already
+/// been reaped and a zombie cannot hold its own group open.
+///
+/// With it, whether the log itself explained the failure: a line the
+/// classifier knows, which is the diagnosis where there is one.
+pub(super) fn explain(reason: &str, log_path: &Path, group_alive: bool) -> (String, bool) {
     let mut out = reason.to_string();
     let code = proc::recorded_exit_status(&crate::paths::exit_status_file(log_path));
     // Only onto the phase's own "it is gone": a timeout is a process that
@@ -445,8 +461,30 @@ pub(super) fn explain_failure(reason: &str, log_path: &Path, group_alive: bool) 
     if let Some(note) = crate::observe::exit_note(code, printed_anything, group_alive) {
         out = format!("{out} — {note}");
     }
-    if let Some(hint) = crate::observe::classify_failure(&lines) {
+    let classified = crate::observe::classify_failure(&lines);
+    if let Some(hint) = &classified {
         out = format!("{out} — {}", hint.hint);
     }
-    out
+    (out, classified.is_some())
+}
+
+/// What to say of a process that outlived its readiness wait with nothing
+/// bound and nothing else wrong: it may only be slow — a cold build, a JVM,
+/// a server that waits for its database, a name lookup on a slow network —
+/// and `ready.timeout_s` is how it gets longer. Twice the wait it had, so
+/// the number is one worth trying. `None` for any other failure.
+pub(super) fn slow_start_hint(
+    reason: &str,
+    process: &str,
+    timeout_s: Option<u64>,
+) -> Option<String> {
+    if !reason.starts_with(state::NOTHING_BOUND) {
+        return None;
+    }
+    let waited = timeout_s.unwrap_or(state::START_TIMEOUT_SECS.unsigned_abs());
+    let longer = waited.saturating_mul(2);
+    Some(format!(
+        "if it is only slow to start, `ready = {{ timeout_s = {longer} }}` in the {process} \
+         process's table in pando.toml gives it {longer}s"
+    ))
 }

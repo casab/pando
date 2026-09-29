@@ -2764,6 +2764,91 @@ fn a_timeout_names_the_ports_the_process_opened_instead() {
     assert!(!reason.contains("instead"), "{reason}");
 }
 
+// A process still up at its deadline, with nothing in its log and no
+// other port open, may only be slow: a cold build, a JVM, a server that
+// waits for its database. The timeout says how it gets longer, and only
+// then: a crash needs its log, and a server on another port needs its
+// port, not more time.
+#[test]
+fn a_timeout_over_a_process_that_is_still_up_says_how_to_wait_longer() {
+    let own_group = nix::unistd::getpgrp().as_raw();
+    let failed = |pgid: i32, ready_timeout_s: Option<u64>| {
+        let mut process = fake_record(pgid);
+        process.ready_timeout_s = ready_timeout_s;
+        process.phase = Phase::Failed {
+            at: Utc::now(),
+            reason: "timeout: nothing bound port 17000 in 30s".to_string(),
+        };
+        process
+    };
+    let mut store = state::State::new();
+    let mut record = WorktreeRecord::new("/trees/feat+one", true);
+    record.ports.insert("web".to_string(), 17_000);
+    record
+        .processes
+        .insert("web".to_string(), failed(own_group, None));
+    record
+        .processes
+        .insert("metro".to_string(), failed(own_group, Some(90)));
+    record
+        .processes
+        .insert("gone".to_string(), failed(999_903, None));
+    store.worktrees.insert("feat+one".to_string(), record);
+    assert!(explain_new_failures(&mut store, &[], &BTreeMap::new()));
+    let reason = |process: &str| match &store.worktrees["feat+one"].processes[process].phase {
+        Phase::Failed { reason, .. } => reason.clone(),
+        _ => panic!("still failed"),
+    };
+    assert!(
+        reason("web").ends_with(
+            "if it is only slow to start, `ready = { timeout_s = 60 }` in the web process's \
+             table in pando.toml gives it 60s"
+        ),
+        "{}",
+        reason("web")
+    );
+    assert!(
+        reason("metro").contains("timeout_s = 180"),
+        "{}",
+        reason("metro")
+    );
+    assert!(
+        !reason("gone").contains("slow to start"),
+        "{}",
+        reason("gone")
+    );
+
+    // Serving on a port of its own choosing is the diagnosis instead.
+    let mut store = state::State::new();
+    let mut record = WorktreeRecord::new("/trees/feat+one", true);
+    record.ports.insert("web".to_string(), 17_000);
+    record
+        .processes
+        .insert("web".to_string(), failed(own_group, None));
+    store.worktrees.insert("feat+one".to_string(), record);
+    let scans = BTreeMap::from([(own_group, Some(vec![3000]))]);
+    assert!(explain_new_failures(&mut store, &[], &scans));
+    let Phase::Failed { reason, .. } = &store.worktrees["feat+one"].processes["web"].phase else {
+        panic!("still failed");
+    };
+    assert!(reason.contains("listening on 3000 instead"), "{reason}");
+    assert!(!reason.contains("slow to start"), "{reason}");
+}
+
+#[test]
+fn only_a_timeout_with_nothing_bound_is_offered_a_longer_wait() {
+    assert_eq!(slow_start_hint(state::EXITED, "web", None), None);
+    assert_eq!(
+        slow_start_hint(
+            "timeout: pando could not confirm port 17000 was bound in 45s",
+            "web",
+            None
+        ),
+        None
+    );
+    assert!(slow_start_hint("timeout: nothing bound port 17000 in 30s", "web", None).is_some());
+}
+
 #[test]
 fn only_a_timeout_is_explained_by_where_the_process_listens() {
     assert_eq!(listening_elsewhere(state::EXITED, &[3000], &[17_000]), None);
@@ -7764,7 +7849,7 @@ fn a_failure_with_an_empty_log_says_that_it_is_empty() {
     let status = crate::paths::exit_status_file(&log);
 
     std::fs::write(&status, "0").unwrap();
-    let silent = explain_failure(state::EXITED, &log, false);
+    let silent = explain(state::EXITED, &log, false).0;
     assert!(silent.starts_with("process exited"), "{silent}");
     assert!(silent.contains("status 0"), "{silent}");
     assert!(
@@ -7779,7 +7864,7 @@ fn a_failure_with_an_empty_log_says_that_it_is_empty() {
     // A timeout is a process that is still up, so no status belongs to
     // it — and none is invented.
     let timeout = "timeout: nothing bound port 17000 in 30s";
-    let waited = explain_failure(timeout, &log, false);
+    let waited = explain(timeout, &log, false).0;
     assert!(
         !waited.contains("status 0"),
         "only the phase's own \"it is gone\" takes a status: {waited}"
@@ -7789,7 +7874,7 @@ fn a_failure_with_an_empty_log_says_that_it_is_empty() {
     // And a log with something in it is explained by the log.
     std::fs::write(&log, "Error: listen EADDRINUSE :::17342\n").unwrap();
     std::fs::write(&status, "1").unwrap();
-    let loud = explain_failure(state::EXITED, &log, false);
+    let loud = explain(state::EXITED, &log, false).0;
     assert!(loud.contains("status 1"), "{loud}");
     assert!(
         !loud.contains("printed nothing"),
