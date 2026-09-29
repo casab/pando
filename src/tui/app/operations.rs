@@ -265,6 +265,8 @@ impl App {
         {
             self.config = loaded.config;
             self.namespace_shared = std::cell::OnceCell::new();
+            self.app_manifests = Default::default();
+            self.app_manifests = Default::default();
             self.nothing_to_run = false;
             return false;
         }

@@ -813,12 +813,20 @@ fn phase_as_aggregate(process: &str, record: &ProcessRecord) -> Aggregate {
 }
 
 /// The simulator's command for each running process whose app a device
-/// runs, never cut. From the settings and the record alone: no reads.
+/// runs, never cut. From the settings, the record, and the app's
+/// manifests as the session read them once.
 fn app_rows<'a>(app: &App, name: &str, width: usize) -> Vec<Line<'a>> {
     let Some(record) = app.record_for(name) else {
         return Vec::new();
     };
-    crate::actions::app_links(&app.config, record)
+    let read = |device: &crate::catalog::frameworks::Device, dir: &std::path::Path| {
+        app.app_manifests
+            .borrow_mut()
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| crate::actions::read_manifest(device, dir))
+            .clone()
+    };
+    crate::actions::app_links_with(&app.config, record, &read)
         .into_iter()
         .filter(|(process, _)| {
             record

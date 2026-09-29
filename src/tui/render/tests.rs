@@ -1027,7 +1027,7 @@ fn the_detail_pane_gives_the_simulator_command_for_a_running_expo_app() {
         "{rendered}"
     );
     assert!(
-        rendered.contains("        exp://127.0.0.1:17344"),
+        rendered.contains("        'exp://127.0.0.1:17344'"),
         "{rendered}"
     );
     assert_eq!(rendered.matches("simctl").count(), 1, "{rendered}");

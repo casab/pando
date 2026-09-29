@@ -40,13 +40,15 @@ struct ProcessOut {
 /// A process's app, opened on a simulator or a device: Expo's.
 #[derive(Serialize)]
 struct AppOut {
-    /// The URL its framework's own client opens it at: `exp://…` in Expo
-    /// Go.
+    /// What opens `url`: `Expo Go`, or `its development build` for an app
+    /// that depends on `expo-dev-client`.
+    client: &'static str,
+    /// The URL `client` opens it at: `exp://…` in Expo Go.
     url: String,
     /// The command that opens `url` on the booted iOS simulator.
     simulator: String,
-    /// The URL a development build opens it at. `<scheme>` is the app's
-    /// own, from its manifest, which pando does not read.
+    /// The URL a development build opens it at, its scheme `exp+` and the
+    /// slug in `app.json`; `exp+<slug>` where no `app.json` says it.
     development_build: String,
 }
 
@@ -241,6 +243,7 @@ pub fn status_json<W: Write>(paths: &PandoPaths, only: Option<&str>, out: &mut W
                                     reason: phase_reason(&p.phase),
                                     log: p.log_path.display().to_string(),
                                     app: apps.remove(name).map(|links| AppOut {
+                                        client: links.client,
                                         url: links.url,
                                         simulator: links.simulator,
                                         development_build: links.development_build,
@@ -415,14 +418,21 @@ fn status_lines<W: Write>(
             if matches!(p.phase, Phase::Running { .. })
                 && let Some(links) = apps.get(name)
             {
+                // The development build's link only where it is not the
+                // one the command already opens.
+                let other = match links.url == links.development_build {
+                    true => String::new(),
+                    false => format!(
+                        "; for a development build, open {}",
+                        links.development_build
+                    ),
+                };
                 let row = format!(
-                    "  {}  {:<PHASE_CELL$}  {} — opens it in {} on the simulator; for a \
-                     development build, open {}",
+                    "  {}  {:<PHASE_CELL$}  {} — opens it in {} on the simulator{other}",
                     pad(name, process_width),
                     "app",
                     links.simulator,
                     links.client,
-                    links.development_build,
                 );
                 writeln!(out, "{}", ellipsize_end(&row, width))?;
             }

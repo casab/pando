@@ -22,6 +22,13 @@ may change behaviour.
 - An `--answers` value for a slot a rule decided wins over the rule's
   choice ([#5]). `pando init --answers -` used to keep the guessed
   `provision` and report the answer as unused.
+- The development build link uses the scheme `expo-dev-client`
+  registers, `exp+` and `expo.slug` lowercased, and not `expo.scheme`
+  ([#5]). pando fills it in from the worktree's `app.json`. When the app
+  depends on `expo-dev-client`, `status` and the TUI give the command
+  that opens its development build instead of Expo Go, and
+  `status --json` says which in the app's new `client` field. The
+  simulator command quotes its URL.
 
 ## 0.6.0 — 2026-09-29
 

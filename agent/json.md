@@ -398,9 +398,10 @@ next start runs it again. A worktree it has never run in has no entry.
                  "log": "/abs/path/dev.log",
                  "app": null },           // or, for Expo's Metro, the object below
         "mobile": { "...": "…",
-                    "app": { "url": "exp://127.0.0.1:17012",
-                             "simulator": "xcrun simctl openurl booted exp://127.0.0.1:17012",
-                             "development_build": "exp+<scheme>://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A17012" } }
+                    "app": { "client": "Expo Go|its development build",
+                             "url": "exp://127.0.0.1:17012",
+                             "simulator": "xcrun simctl openurl booted 'exp://127.0.0.1:17012'",
+                             "development_build": "exp+shop://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A17012" } }
       },
       "services": {
         "postgres": { "kind": "compose|native", "port": 17010, "up": true,
@@ -447,11 +448,15 @@ handled for you.
 `app` is non-null for a process whose app runs on a phone, a tablet or a
 simulator rather than in a browser: Expo's Metro, known from the settings
 by its port variable, `RCT_METRO_PORT`, or by `expo start` in its command.
-`url` opens it in Expo Go, `simulator` is the command that opens `url` on
-the booted iOS simulator, and `development_build` is the link a
-development build opens instead. Its `<scheme>` is the app's own,
-`expo.scheme` in its `app.json` or `app.config.*`, which pando does not
-read at run time: fill it in. Every address is
+`client` is what opens `url`: `Expo Go`, or `its development build` for
+an app whose `package.json` depends on `expo-dev-client`, which Expo Go
+cannot run. `simulator` is the command that opens `url` on the booted
+iOS simulator, and `development_build` is the link a development build
+opens, whichever `client` is. Its scheme is the one `expo-dev-client`
+registers: `exp+` and the app's `expo.slug`, lowercased with anything but
+letters, digits, `+`, `-` and `.` dropped — never `expo.scheme`. pando
+reads the slug from the worktree's `app.json`; an app configured in
+`app.config.*` alone gets `exp+<slug>`: fill it in. Every address is
 `127.0.0.1`, which the simulator shares and a physical device cannot
 reach; for a device, use the machine's LAN address the developer gives.
 It is there whatever the process's `phase`, and opens something only while

@@ -191,6 +191,11 @@ pub struct App {
     /// and why: read from the env files once per config, not on every
     /// paint. Emptied wherever `config` is replaced.
     pub namespace_shared: std::cell::OnceCell<Vec<(String, String)>>,
+    /// What each device app's manifests say about opening it, by its
+    /// directory: read once per config, not on every paint. Emptied
+    /// wherever `config` is replaced.
+    pub app_manifests:
+        std::cell::RefCell<BTreeMap<std::path::PathBuf, crate::catalog::frameworks::AppManifest>>,
     pub main: Option<Worktree>,
     pub default_base: Option<String>,
     pub worktrees: Vec<Worktree>,
@@ -344,6 +349,7 @@ impl App {
             paths,
             config,
             namespace_shared: std::cell::OnceCell::new(),
+            app_manifests: Default::default(),
             main: None,
             default_base: None,
             worktrees: Vec::new(),
@@ -607,6 +613,7 @@ impl App {
     pub(super) fn adopt_config(&mut self, config: Config) {
         self.config = config;
         self.namespace_shared = std::cell::OnceCell::new();
+        self.app_manifests = Default::default();
         // Only ever cleared here, never concluded: a config file with no
         // process in it is what `new` writes, and a start is what asks for
         // the command. `nothing_to_run` is set by a start that failed for
@@ -1477,6 +1484,7 @@ impl App {
             paths,
             config,
             namespace_shared: std::cell::OnceCell::new(),
+            app_manifests: Default::default(),
             main: None,
             default_base: Some("main".into()),
             worktrees,

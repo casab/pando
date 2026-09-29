@@ -1592,10 +1592,11 @@ fn status_gives_the_link_that_opens_an_expo_app_on_the_simulator() {
     assert_eq!(
         processes["mobile"]["app"],
         serde_json::json!({
+            "client": "Expo Go",
             "url": "exp://127.0.0.1:18081",
-            "simulator": "xcrun simctl openurl booted exp://127.0.0.1:18081",
+            "simulator": "xcrun simctl openurl booted 'exp://127.0.0.1:18081'",
             "development_build":
-                "exp+<scheme>://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A18081",
+                "exp+<slug>://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A18081",
         })
     );
     assert_eq!(processes["api"]["app"], serde_json::Value::Null);
@@ -1628,8 +1629,8 @@ fn status_gives_the_link_that_opens_an_expo_app_on_the_simulator() {
     assert!(apps[0].trim_start().starts_with("mobile  app"), "{text}");
     assert!(
         apps[0].contains(
-            "xcrun simctl openurl booted exp://127.0.0.1:18081 — opens it in Expo Go on the \
-             simulator; for a development build, open exp+<scheme>://expo-development-client/"
+            "xcrun simctl openurl booted 'exp://127.0.0.1:18081' — opens it in Expo Go on the \
+             simulator; for a development build, open exp+<slug>://expo-development-client/"
         ),
         "{text}"
     );
@@ -1637,8 +1638,55 @@ fn status_gives_the_link_that_opens_an_expo_app_on_the_simulator() {
     // command in front of it.
     let narrow = capture(|b| status_text_at(&fx.paths, None, b, 80));
     assert!(
-        narrow.contains("xcrun simctl openurl booted exp://127.0.0.1:18081"),
+        narrow.contains("xcrun simctl openurl booted 'exp://127.0.0.1:18081'"),
         "{narrow}"
+    );
+}
+
+// An app with `expo-dev-client` is opened by its development build, which
+// registers `exp+` and its slug, lowercased — not `expo.scheme`: the link
+// is filled in from the worktree's own `app.json`, and it is the one the
+// simulator command opens.
+#[test]
+fn status_opens_an_app_with_the_development_client_in_its_development_build() {
+    let fx = fixture();
+    let name = with_mobile_app(&fx, MOBILE_BY_VARIABLE);
+    let record = crate::state::load(&fx.paths.state_file())
+        .unwrap()
+        .worktrees[&name]
+        .clone();
+    let app = record.path.join("apps/mobile");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(
+        app.join("app.json"),
+        r#"{ "expo": { "name": "Drivee", "slug": "DriveeSafeCall", "scheme": "drivee" } }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        app.join("package.json"),
+        r#"{ "dependencies": { "expo": "~57.0.0", "expo-dev-client": "~6.0.0" } }"#,
+    )
+    .unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&capture(|b| status_json(&fx.paths, None, b))).unwrap();
+    let url = "exp+driveesafecall://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A18081";
+    assert_eq!(
+        v["worktrees"][0]["processes"]["mobile"]["app"],
+        serde_json::json!({
+            "client": "its development build",
+            "url": url,
+            "simulator": format!("xcrun simctl openurl booted '{url}'"),
+            "development_build": url,
+        })
+    );
+    let text = capture(|b| status_text_at(&fx.paths, None, b, usize::MAX));
+    let line = text.lines().find(|line| line.contains("simctl")).unwrap();
+    assert!(
+        line.ends_with(&format!(
+            "xcrun simctl openurl booted '{url}' — opens it in its development build on the \
+             simulator"
+        )),
+        "{text}"
     );
 }
 

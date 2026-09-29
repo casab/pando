@@ -72,40 +72,106 @@ pub struct Device {
     pub client: &'static str,
     /// The URL the client opens the app at.
     pub url: &'static str,
-    /// The URL a development build of the app opens it at. Its scheme is
-    /// the app's own, in a manifest the runtime never reads, so it stays a
-    /// placeholder for the developer or their agent to fill.
+    /// The URL a development build of the app opens it at, `{scheme}` the
+    /// scheme the build registers.
     pub development_build: &'static str,
+    /// The dependency in the app's `package.json` that makes its builds
+    /// development builds: with it, a development build opens the app,
+    /// not [`Device::client`].
+    pub development_client: &'static str,
+    /// Where the scheme a development build registers comes from.
+    pub scheme: Scheme,
     /// The command that opens a URL, `{url}`, on the booted iOS
-    /// simulator, which shares this machine's `127.0.0.1`.
+    /// simulator, which shares this machine's `127.0.0.1`. Quoted: a
+    /// development build's URL has a `?`, which zsh globs.
     pub simulator: &'static str,
     /// Environment that turns off what a dev server is for, as `(variable,
     /// what it turns off)`: `doctor` names one a process sets.
     pub disabled_by: &'static [(&'static str, &'static str)],
 }
 
+/// The scheme a development build registers: a name from the app's own
+/// manifest, made a URI scheme, behind a prefix.
+#[derive(Debug, Clone, Copy)]
+pub struct Scheme {
+    /// The JSON file, in the app's directory, that holds the name.
+    pub manifest: &'static str,
+    /// The keys down to the name: `expo.slug`.
+    pub key: &'static [&'static str],
+    pub prefix: &'static str,
+}
+
+impl Scheme {
+    /// The scheme a build of an app so named registers: the name's letters,
+    /// digits, `+`, `-` and `.` (RFC 3986's scheme characters), lowercased,
+    /// behind the prefix. `None` for a name with none of them.
+    pub fn of(&self, name: &str) -> Option<String> {
+        let kept: String = name
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+            .collect();
+        (!kept.is_empty()).then(|| format!("{}{}", self.prefix, kept.to_ascii_lowercase()))
+    }
+
+    /// What stands for the scheme where the manifest does not say it:
+    /// `exp+<slug>`, for the developer or their agent to fill in.
+    pub fn placeholder(&self) -> String {
+        format!(
+            "{}<{}>",
+            self.prefix,
+            self.key.last().copied().unwrap_or("name")
+        )
+    }
+}
+
+/// What an app's own manifests say about opening it, read from its
+/// directory by whoever may read files.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AppManifest {
+    /// The scheme its development build registers, when the manifest says.
+    pub scheme: Option<String>,
+    /// Whether it depends on [`Device::development_client`].
+    pub development_client: bool,
+}
+
 /// A [`Device`]'s addresses for one running bundler.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppLinks {
+    /// The app that opens `url`: the framework's client, or a development
+    /// build of the app.
     pub client: &'static str,
     pub url: String,
-    pub development_build: String,
+    /// The command that opens `url` on the simulator.
     pub simulator: String,
+    pub development_build: String,
 }
+
+/// [`AppLinks::client`] for an app a development build opens.
+pub const DEVELOPMENT_BUILD: &str = "its development build";
 
 impl Device {
     /// The addresses of the app a bundler on `host` and `port` serves.
-    pub fn links(&self, host: &str, port: u16) -> AppLinks {
+    /// With a development client among its dependencies, its development
+    /// build is what opens it, and `url` is that build's.
+    pub fn links(&self, host: &str, port: u16, app: &AppManifest) -> AppLinks {
         let fill = |template: &str| {
             template
                 .replace("{host}", host)
                 .replace("{port}", &port.to_string())
         };
-        let url = fill(self.url);
+        let scheme = app
+            .scheme
+            .clone()
+            .unwrap_or_else(|| self.scheme.placeholder());
+        let development_build = fill(self.development_build).replace("{scheme}", &scheme);
+        let (client, url) = match app.development_client {
+            true => (DEVELOPMENT_BUILD, development_build.clone()),
+            false => (self.client, fill(self.url)),
+        };
         AppLinks {
-            client: self.client,
+            client,
             simulator: self.simulator.replace("{url}", &url),
-            development_build: fill(self.development_build),
+            development_build,
             url,
         }
     }
@@ -229,8 +295,16 @@ pub const RULES: [FrameworkRule; 13] = [
             client: "Expo Go",
             url: "exp://{host}:{port}",
             // Expo's own form: Metro's URL, encoded, as the query value.
-            development_build: "exp+<scheme>://expo-development-client/?url=http%3A%2F%2F{host}%3A{port}",
-            simulator: "xcrun simctl openurl booted {url}",
+            development_build: "{scheme}://expo-development-client/?url=http%3A%2F%2F{host}%3A{port}",
+            development_client: "expo-dev-client",
+            // `expo-dev-client` registers `exp+` and the slug, not
+            // `expo.scheme` (its `getDefaultScheme`).
+            scheme: Scheme {
+                manifest: "app.json",
+                key: &["expo", "slug"],
+                prefix: "exp+",
+            },
+            simulator: "xcrun simctl openurl booted '{url}'",
             // Expo's CLI reads it as any CI does, and Metro then says
             // "reloads are disabled".
             disabled_by: &[("CI", "Metro's reloads and file watching")],
@@ -459,30 +533,65 @@ mod tests {
     }
 
     // Expo's app opens in Expo Go at `exp://`, on the simulator through
-    // `simctl`, and in a development build through the app's own scheme,
-    // with Metro's URL encoded as the query value Expo's CLI writes.
+    // `simctl`, and in a development build through the scheme the build
+    // registers, with Metro's URL encoded as the query value Expo's CLI
+    // writes.
     #[test]
     fn expos_app_is_opened_by_its_links() {
         let (expo, var) = device(&["RCT_METRO_PORT"], "").expect("Expo's device");
         assert_eq!(var, "RCT_METRO_PORT");
-        let links = expo.links("127.0.0.1", 8123);
+        let links = expo.links("127.0.0.1", 8123, &AppManifest::default());
         assert_eq!(links.client, "Expo Go");
         assert_eq!(links.url, "exp://127.0.0.1:8123");
         assert_eq!(
             links.simulator,
-            "xcrun simctl openurl booted exp://127.0.0.1:8123"
+            "xcrun simctl openurl booted 'exp://127.0.0.1:8123'"
         );
         assert_eq!(
             links.development_build,
-            "exp+<scheme>://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A8123"
+            "exp+<slug>://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A8123"
         );
         // Every placeholder of every row is filled.
         for rule in RULES.iter().filter_map(|rule| rule.device.as_ref()) {
-            let links = rule.links("127.0.0.1", 1);
+            let links = rule.links("127.0.0.1", 1, &AppManifest::default());
             for filled in [&links.url, &links.simulator, &links.development_build] {
                 assert!(!filled.contains('{'), "{filled}");
             }
         }
+    }
+
+    // An app with `expo-dev-client` is opened by its development build,
+    // which is what the simulator command then opens.
+    #[test]
+    fn a_development_build_opens_an_app_that_depends_on_the_client() {
+        let (expo, _) = device(&["RCT_METRO_PORT"], "").expect("Expo's device");
+        let app = AppManifest {
+            scheme: expo.scheme.of("DriveeSafeCall"),
+            development_client: true,
+        };
+        let links = expo.links("127.0.0.1", 8123, &app);
+        let url = "exp+driveesafecall://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A8123";
+        assert_eq!(links.client, DEVELOPMENT_BUILD);
+        assert_eq!(links.url, url);
+        assert_eq!(links.development_build, url);
+        assert_eq!(
+            links.simulator,
+            format!("xcrun simctl openurl booted '{url}'")
+        );
+    }
+
+    // Expo's own `getDefaultScheme`: the slug's scheme characters,
+    // lowercased, behind `exp+`.
+    #[test]
+    fn a_development_builds_scheme_is_its_slug_made_a_scheme() {
+        let (expo, _) = device(&["RCT_METRO_PORT"], "").expect("Expo's device");
+        assert_eq!(
+            expo.scheme.of("hello-world").as_deref(),
+            Some("exp+hello-world")
+        );
+        assert_eq!(expo.scheme.of("My App_2").as_deref(), Some("exp+myapp2"));
+        assert_eq!(expo.scheme.of("!!!"), None);
+        assert_eq!(expo.scheme.placeholder(), "exp+<slug>");
     }
 
     #[test]
