@@ -1600,6 +1600,7 @@ fn status_gives_the_link_that_opens_an_expo_app_on_the_simulator() {
             "simulator": "xcrun simctl openurl booted 'exp://127.0.0.1:18081'",
             "development_build":
                 "exp+<slug>://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A18081",
+            "native": null,
         })
     );
     assert_eq!(processes["api"]["app"], serde_json::Value::Null);
@@ -1673,8 +1674,11 @@ fn status_opens_an_app_with_the_development_client_in_its_development_build() {
     let v: serde_json::Value =
         serde_json::from_str(&capture(|b| status_json(&fx.paths, None, b))).unwrap();
     let url = "exp+driveesafecall://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A18081";
+    let mut app = v["worktrees"][0]["processes"]["mobile"]["app"].clone();
+    // A new `app.json` is a native change of the branch's own, said apart.
+    app.as_object_mut().unwrap().remove("native");
     assert_eq!(
-        v["worktrees"][0]["processes"]["mobile"]["app"],
+        app,
         serde_json::json!({
             "client": "its development build",
             "url": url,
@@ -1689,6 +1693,70 @@ fn status_opens_an_app_with_the_development_client_in_its_development_build() {
             "xcrun simctl openurl booted '{url}' — opens it in its development build on the \
              simulator"
         )),
+        "{text}"
+    );
+}
+
+// A branch that changes an app's native code needs a build of its own,
+// or Metro's bundle loads into a build that lacks the module: `status`
+// says which files, against which base, and the command that builds it.
+// A change to the app's JavaScript alone is no native change.
+#[test]
+fn status_says_when_a_branch_changes_its_apps_native_code() {
+    let fx = fixture();
+    let name = with_mobile_app(&fx, MOBILE_BY_VARIABLE);
+    let record = crate::state::load(&fx.paths.state_file())
+        .unwrap()
+        .worktrees[&name]
+        .clone();
+    let app = record.path.join("apps/mobile");
+    let v: serde_json::Value =
+        serde_json::from_str(&capture(|b| status_json(&fx.paths, None, b))).unwrap();
+    assert_eq!(
+        v["worktrees"][0]["processes"]["mobile"]["app"]["native"],
+        serde_json::Value::Null,
+        "nothing changed yet"
+    );
+
+    for (file, text) in [
+        ("ios/Podfile", "pod 'Call'\n"),
+        ("app/index.tsx", "export {}\n"),
+    ] {
+        std::fs::create_dir_all(app.join(file).parent().unwrap()).unwrap();
+        std::fs::write(app.join(file), text).unwrap();
+    }
+    git(&record.path, &["add", "-A"]);
+    git(&record.path, &["commit", "-qm", "native"]);
+    // And one not committed yet, in a local module.
+    let module = app.join("modules/call/android");
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::write(module.join("CallModule.kt"), "class CallModule\n").unwrap();
+
+    let v: serde_json::Value =
+        serde_json::from_str(&capture(|b| status_json(&fx.paths, None, b))).unwrap();
+    let native = &v["worktrees"][0]["processes"]["mobile"]["app"]["native"];
+    assert_eq!(native["base"], "main");
+    assert_eq!(
+        native["changed"],
+        serde_json::json!([
+            "apps/mobile/ios/Podfile",
+            "apps/mobile/modules/call/android/CallModule.kt"
+        ])
+    );
+    assert_eq!(
+        native["build"],
+        "npx expo run:ios --no-bundler --port 18081"
+    );
+    let text = capture(|b| status_text_at(&fx.paths, None, b, usize::MAX));
+    let line = text.lines().find(|line| line.contains("native")).unwrap();
+    assert!(
+        line.contains(
+            "this branch changes native code against main (apps/mobile/ios/Podfile and 1 more)"
+        ),
+        "{text}"
+    );
+    assert!(
+        line.contains("`npx expo run:ios --no-bundler --port 18081` in the app's directory"),
         "{text}"
     );
 }

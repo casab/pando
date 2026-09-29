@@ -620,7 +620,10 @@ page = false                          # no browser opens it; Metro's is the defa
   `<slug>` being `expo.slug` lowercased (never `expo.scheme`), filled in
   from `app.json`. Only an app configured in `app.config.*` alone keeps
   `<slug>` for you to fill. On a device, the same links take the LAN
-  address above.
+  address above. A branch that changes the app's native code (`ios/`,
+  `android/`, a local module's, or `app.json`/`app.config.*`) needs a
+  build of its own: `status` says so under the process, with the
+  `npx expo run:ios --no-bundler --port <port>` that makes one.
 
 ---
 

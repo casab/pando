@@ -16,6 +16,12 @@ may change behaviour.
   `o` give the command that opens its app instead of a browser at
   Metro's root. `share` still publishes its port. A lone
   `RCT_METRO_PORT` answer now names its role `metro`, not `web`.
+- `pando status` says when a worktree's branch changes an Expo app's
+  native code against its base ([#5]): files under `ios/` or `android/`
+  anywhere in the app, or `app.json`/`app.config.*`. It names the
+  files and gives `npx expo run:ios --no-bundler --port <metro port>`,
+  which builds that worktree its own development build. `status --json`
+  carries it as the app's `native`.
 
 ### Changed
 

@@ -91,6 +91,36 @@ pub struct Device {
     /// Environment that turns off what a dev server is for, as `(variable,
     /// what it turns off)`: `doctor` names one a process sets.
     pub disabled_by: &'static [(&'static str, &'static str)],
+    /// What in the app's directory a build compiles in, which the bundler
+    /// cannot bring to a build made without it.
+    pub native: Native,
+}
+
+/// The native code of an app a device runs: a branch that changes it
+/// needs a build of its own, or the bundle it serves reaches for a module
+/// the installed build lacks.
+#[derive(Debug, Clone, Copy)]
+pub struct Native {
+    /// Directories that hold native code, at any depth below the app:
+    /// `ios/`, and a local module's `modules/<name>/ios/`.
+    pub dirs: &'static [&'static str],
+    /// Files at the app's top whose settings a build bakes in.
+    pub files: &'static [&'static str],
+    /// The command, run in the app's directory, that makes and installs a
+    /// build of this worktree on the simulator and points it at the
+    /// bundler already running on `{port}`.
+    pub build: &'static str,
+}
+
+impl Native {
+    /// Whether `path`, relative to the app's directory, is native code.
+    pub fn is_native(&self, path: &str) -> bool {
+        self.files.contains(&path) || {
+            let mut dirs = path.split('/');
+            dirs.next_back();
+            dirs.any(|dir| self.dirs.contains(&dir))
+        }
+    }
 }
 
 /// The scheme a development build registers: a name from the app's own
@@ -312,6 +342,18 @@ pub const RULES: [FrameworkRule; 13] = [
             // Expo's CLI reads it as any CI does, and Metro then says
             // "reloads are disabled".
             disabled_by: &[("CI", "Metro's reloads and file watching")],
+            // A config plugin runs at build time, from the app config.
+            native: Native {
+                dirs: &["ios", "android"],
+                files: &[
+                    "app.json",
+                    "app.config.js",
+                    "app.config.ts",
+                    "app.config.mjs",
+                    "app.config.cjs",
+                ],
+                build: "npx expo run:ios --no-bundler --port {port}",
+            },
         }),
     },
     // The app servers come before the Vite row: a Laravel app has a
@@ -589,6 +631,31 @@ mod tests {
             links.simulator,
             format!("xcrun simctl openurl booted '{url}'")
         );
+    }
+
+    // A native module's own directory is native at any depth; a screen's
+    // source, or a directory merely named like one, is not.
+    #[test]
+    fn expos_native_code_is_its_native_directories_and_app_config() {
+        let (expo, _) = device(&["RCT_METRO_PORT"], "").expect("Expo's device");
+        for path in [
+            "ios/Podfile",
+            "android/app/build.gradle",
+            "modules/call/ios/CallModule.swift",
+            "app.json",
+            "app.config.ts",
+        ] {
+            assert!(expo.native.is_native(path), "{path}");
+        }
+        for path in [
+            "app/index.tsx",
+            "src/ios.ts",
+            "ios",
+            "docs/app.json",
+            "package.json",
+        ] {
+            assert!(!expo.native.is_native(path), "{path}");
+        }
     }
 
     // Expo's own `getDefaultScheme`: the slug's scheme characters,

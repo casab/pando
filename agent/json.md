@@ -401,7 +401,10 @@ next start runs it again. A worktree it has never run in has no entry.
                     "app": { "client": "Expo Go|its development build",
                              "url": "exp://127.0.0.1:17012",
                              "simulator": "xcrun simctl openurl booted 'exp://127.0.0.1:17012'",
-                             "development_build": "exp+shop://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A17012" } }
+                             "development_build": "exp+shop://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A17012",
+                             "native": { "base": "main",   // or null: no native change
+                                         "changed": ["apps/mobile/ios/Podfile"],
+                                         "build": "npx expo run:ios --no-bundler --port 17012" } } }
       },
       "services": {
         "postgres": { "kind": "compose|native", "port": 17010, "up": true,
@@ -469,6 +472,19 @@ reads the slug from the worktree's `app.json`; an app configured in
 reach; for a device, use the machine's LAN address the developer gives.
 It is there whatever the process's `phase`, and opens something only while
 it is `running`.
+
+`app.native` is non-null when the worktree's branch changes the app's
+native code against `base`, the base the branch forks from: a file under
+an `ios/` or `android/` directory anywhere in the app (a local module's
+`modules/<name>/ios/` included), or its `app.json` or `app.config.*`,
+committed since the branch left `base` or not. A build of another branch
+lacks what those add, so the bundle this worktree's Metro serves can
+crash into a missing module. `changed` lists the files, relative to the
+worktree, and `build`, run in the app's directory, builds and installs
+this worktree's own development build on the simulator, pointed at its
+running Metro; the simulator keeps one build per bundle id, so it
+replaces the one there. A new native dependency in `package.json` alone
+is not seen. It is always `null` for the main checkout.
 
 `share.url` is the public URL. **No cookie is ever in this shape**, even
 when the share is behind an auth command.

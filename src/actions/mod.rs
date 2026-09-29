@@ -30,7 +30,9 @@ pub use check::{
     CHECK_RAN_BY_ENV, Checked, LeftoverCheck, Narration, catch_check_interrupts, check, check_at,
     leftover_check, ran_by,
 };
-pub use device::{ReadManifest, app_links, app_links_with, read_manifest};
+pub use device::{
+    NativeChanges, ReadManifest, app_links, app_links_with, native_changes, read_manifest,
+};
 pub use hooks::{
     HookContext, INSTALL_HOOK, hook_scope, install_remedy, matched_nothing, run_hooks, runs_again,
 };

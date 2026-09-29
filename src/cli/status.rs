@@ -50,6 +50,45 @@ struct AppOut {
     /// The URL a development build opens it at, its scheme `exp+` and the
     /// slug in `app.json`; `exp+<slug>` where no `app.json` says it.
     development_build: String,
+    /// The app's native code this worktree's branch changes, which a
+    /// build of another branch lacks; `null` when it changes none, and
+    /// for the main checkout.
+    native: Option<NativeOut>,
+}
+
+/// What a branch changes of an app's native code, and how the worktree
+/// gets a build of its own.
+#[derive(Serialize)]
+struct NativeOut {
+    base: String,
+    /// Relative to the worktree.
+    changed: Vec<String>,
+    /// Run in the app's directory: builds and installs this worktree's app
+    /// on the simulator, pointed at its running Metro.
+    build: String,
+}
+
+/// Each device app's native changes in a worktree, against the base its
+/// branch forks from, where it has apps a device runs. None for the main
+/// checkout, which is what the others are measured against.
+fn native_of(
+    paths: &PandoPaths,
+    config: &crate::config::Config,
+    w: &crate::worktree::Worktree,
+    main: bool,
+    record: &WorktreeRecord,
+    apps: &BTreeMap<String, crate::catalog::frameworks::AppLinks>,
+) -> BTreeMap<String, actions::NativeChanges> {
+    if main || apps.is_empty() {
+        return BTreeMap::new();
+    }
+    w.branch
+        .as_deref()
+        .and_then(|branch| config.base_for_branch(branch))
+        .map(str::to_string)
+        .or_else(|| crate::worktree::resolve_base_branch(paths.root()))
+        .map(|base| actions::native_changes(config, record, &base))
+        .unwrap_or_default()
 }
 
 #[derive(Serialize)]
@@ -195,6 +234,7 @@ pub fn status_json<W: Write>(paths: &PandoPaths, only: Option<&str>, out: &mut W
                 let empty = WorktreeRecord::new(&w.path, false);
                 let record = record.unwrap_or(&empty);
                 let mut apps = actions::app_links(&config, record);
+                let mut native = native_of(paths, &config, &w, w.name == main_name, record, &apps);
                 StatusWorktreeOut {
                     name: w.name.clone(),
                     main: w.name == main_name,
@@ -247,6 +287,11 @@ pub fn status_json<W: Write>(paths: &PandoPaths, only: Option<&str>, out: &mut W
                                         url: links.url,
                                         simulator: links.simulator,
                                         development_build: links.development_build,
+                                        native: native.remove(name).map(|n| NativeOut {
+                                            base: n.base,
+                                            changed: n.changed,
+                                            build: n.build,
+                                        }),
                                     }),
                                 },
                             )
@@ -400,6 +445,10 @@ fn status_lines<W: Write>(
             .as_ref()
             .map(|config| actions::app_links(config, record))
             .unwrap_or_default();
+        let native = config
+            .as_ref()
+            .map(|config| native_of(paths, config, w, w.name == main_name, record, &apps))
+            .unwrap_or_default();
         let process_width = record
             .processes
             .keys()
@@ -433,6 +482,25 @@ fn status_lines<W: Write>(
                     "app",
                     links.simulator,
                     links.client,
+                );
+                writeln!(out, "{}", ellipsize_end(&row, width))?;
+            }
+            // Whatever its phase: a build is made before its bundler runs.
+            if let Some(changes) = native.get(name) {
+                let [first, rest @ ..] = changes.changed.as_slice() else {
+                    continue;
+                };
+                let more = match rest.len() {
+                    0 => String::new(),
+                    n => format!(" and {n} more"),
+                };
+                let row = format!(
+                    "  {}  {:<PHASE_CELL$}  this branch changes native code against {} ({first}{more}) \
+                     — a build of another branch lacks it; `{}` in the app's directory builds its own",
+                    pad(name, process_width),
+                    "native",
+                    changes.base,
+                    changes.build,
                 );
                 writeln!(out, "{}", ellipsize_end(&row, width))?;
             }
