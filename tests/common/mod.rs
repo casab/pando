@@ -426,6 +426,7 @@ impl Kind {
                                 role: Some(app.to_string()),
                                 timeout_s: None,
                             }),
+                            page: None,
                         },
                     );
                 }
@@ -594,6 +595,7 @@ impl Kind {
                             role: Some("web".to_string()),
                             timeout_s: None,
                         }),
+                        page: None,
                     },
                 );
                 config.processes.insert(
@@ -615,6 +617,7 @@ impl Kind {
                             role: Some("api".to_string()),
                             timeout_s: None,
                         }),
+                        page: None,
                     },
                 );
                 config.services.push(compose_service(

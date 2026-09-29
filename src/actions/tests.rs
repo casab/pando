@@ -2872,6 +2872,35 @@ fn start_and_the_read_paths_agree_on_the_url_when_nothing_owns_web() {
     assert_eq!(worktree_url(&fx.state().worktrees[&name]), report.url);
 }
 
+// `start` writes down which processes serve no page, beside who owns
+// what, so `status` and the TUI skip them from the record alone.
+#[test]
+fn start_records_the_processes_that_serve_no_page() {
+    let mut fx = fixture();
+    for (process, role, page) in [("alpha", "srv", Some(false)), ("beta", "admin", None)] {
+        fx.config.processes.insert(
+            process.to_string(),
+            ProcessConfig {
+                cmd: "sleep 30".to_string(),
+                ports: Some(PortsSpec::List(vec![role.to_string()])),
+                page,
+                ..Default::default()
+            },
+        );
+    }
+    let name = worktree_named(&fx, "feat/page");
+    let report = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
+    let _g = guard(&report);
+    let record = &fx.state().worktrees[&name];
+    assert_eq!(
+        record.pageless,
+        std::collections::BTreeSet::from(["alpha".to_string()])
+    );
+    let expected = format!("http://localhost:{}", report.ports["admin"]);
+    assert_eq!(report.url.as_deref(), Some(expected.as_str()));
+    assert_eq!(worktree_url(record), report.url);
+}
+
 // ---- share -----------------------------------------------------------
 
 use crate::testutil::{FAKE_TUNNEL_URL, fake_cloudflared_failing, fake_cloudflared_publishing};
@@ -15059,4 +15088,72 @@ fn trying_on_its_own_takes_the_first_base_so_the_check_has_nothing_to_ask() {
         "{guessed:?}"
     );
     assert_eq!(base_of(&fx).as_deref(), Some("work"));
+}
+
+// Metro's root is no page: the URL skips a process that serves none, `web`
+// role included (pando's Expo rule named Metro's role `web` until 0.6.0),
+// and a worktree that runs nothing else has no URL. A share still reaches
+// it: a tunnel is how Expo reaches a phone off the LAN.
+#[test]
+fn the_url_is_never_a_role_of_a_process_that_serves_no_page() {
+    let mut record = WorktreeRecord::new("/tmp/feat+one", true);
+    record.ports.insert("web".to_string(), 17000);
+    record.ports.insert("api".to_string(), 17001);
+    record
+        .roles
+        .insert("mobile".to_string(), vec!["web".to_string()]);
+    record
+        .roles
+        .insert("backend".to_string(), vec!["api".to_string()]);
+    record
+        .processes
+        .insert("mobile".to_string(), fake_record(900));
+    record
+        .processes
+        .insert("backend".to_string(), fake_record(901));
+    assert_eq!(
+        worktree_url(&record).as_deref(),
+        Some("http://localhost:17000")
+    );
+
+    record.pageless.insert("mobile".to_string());
+    assert_eq!(
+        worktree_url(&record).as_deref(),
+        Some("http://localhost:17001")
+    );
+    assert_eq!(share_target_port("feat+one", &record).unwrap(), 17001);
+
+    record.roles.remove("backend");
+    record.ports.remove("api");
+    record.processes.remove("backend");
+    assert_eq!(worktree_url(&record), None);
+    assert_eq!(url_owner_not_running(&record), None);
+    assert_eq!(share_target_port("feat+one", &record).unwrap(), 17000);
+    // And a record from before pageless was written reads as it did.
+    record.pageless.clear();
+    assert_eq!(
+        worktree_url(&record).as_deref(),
+        Some("http://localhost:17000")
+    );
+}
+
+// Whether a process serves a page is what its settings say, and else
+// whether its framework's app runs in a browser: known from Metro's port
+// variable or `expo start` in the command, as the device links are.
+#[test]
+fn a_process_serves_a_page_unless_its_settings_or_its_framework_say_not() {
+    let process = |text: &str| -> ProcessConfig { toml::from_str(text).unwrap() };
+    assert!(process("cmd = \"npm run dev\"\nports = { PORT = \"web\" }").serves_page());
+    assert!(
+        !process("cmd = \"npm run start\"\nports = { RCT_METRO_PORT = \"metro\" }").serves_page()
+    );
+    assert!(
+        !process("cmd = \"npx expo start --port {port:mobile}\"\nports = [\"mobile\"]")
+            .serves_page()
+    );
+    assert!(!process("cmd = \"uv run api\"\nports = [\"api\"]\npage = false").serves_page());
+    // `expo start --web` serves a page on Metro's port: the settings say.
+    assert!(
+        process("cmd = \"npx expo start --web\"\nports = [\"web\"]\npage = true").serves_page()
+    );
 }

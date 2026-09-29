@@ -7,6 +7,16 @@ may change behaviour.
 
 ## Unreleased
 
+### Added
+
+- A process can say `page = false`: no browser opens its port, so it is
+  never the worktree's URL ([#5]). Expo's Metro is one without saying
+  it; `page = true` says otherwise, for `expo start --web`. A worktree
+  with no page has no URL in `status`, and `pando open` and the TUI's
+  `o` give the command that opens its app instead of a browser at
+  Metro's root. `share` still publishes its port. A lone
+  `RCT_METRO_PORT` answer now names its role `metro`, not `web`.
+
 ### Changed
 
 - The Expo rule no longer proposes `CI=1` ([#5]). Under it Metro turns

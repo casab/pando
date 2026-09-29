@@ -98,6 +98,11 @@ pub struct WorktreeRecord {
     /// has since been stopped.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub roles: BTreeMap<String, Vec<String>>,
+    /// The processes whose port no browser opens, as config said at the
+    /// last start (`ProcessConfig::serves_page`): the URL is never one of
+    /// theirs. Written and kept beside `roles`, for the same reason.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub pageless: std::collections::BTreeSet<String>,
     /// Every listening socket seen across this worktree's process groups:
     /// the union of the per-process lists below.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -162,6 +167,7 @@ impl WorktreeRecord {
             processes: BTreeMap::new(),
             ports: BTreeMap::new(),
             roles: BTreeMap::new(),
+            pageless: Default::default(),
             observed_ports: Vec::new(),
             services: Vec::new(),
             mode: None,

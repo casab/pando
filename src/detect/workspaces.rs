@@ -687,6 +687,8 @@ pub(super) fn processes_proposal(root: &Path, signals: &Signals) -> Option<Propo
                     role: Some(app.name.clone()),
                     timeout_s: app.ready_timeout_s,
                 }),
+                // Left to the catalog, as a written config leaves it.
+                page: None,
             },
         );
     }

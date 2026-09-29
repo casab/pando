@@ -544,10 +544,13 @@ fn open_wants_something_up_or_a_share() {
     );
 
     with_share(&fx, &name, None);
-    assert_eq!(open(&config, false).unwrap(), "http://localhost:17342");
+    assert_eq!(
+        open(&config, false).unwrap(),
+        super::open::Opening::Url("http://localhost:17342".into())
+    );
     assert_eq!(
         open(&config, true).unwrap(),
-        "https://fake-host.trycloudflare.com"
+        super::open::Opening::Url("https://fake-host.trycloudflare.com".into())
     );
 }
 
@@ -1687,6 +1690,44 @@ fn status_opens_an_app_with_the_development_client_in_its_development_build() {
              simulator"
         )),
         "{text}"
+    );
+}
+
+// An Expo-only worktree has no page: `status` gives no URL, and `open`
+// says how its app is opened rather than hand a browser Metro's root.
+#[test]
+fn open_gives_the_app_link_of_a_worktree_that_serves_no_page() {
+    let fx = fixture();
+    let name = actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
+    let config_text = "[processes.mobile]\ncmd = \"npm run start\"\n\
+                       ports = { RCT_METRO_PORT = \"metro\" }\n";
+    std::fs::write(fx.paths.config_file(), config_text).unwrap();
+    let mut store = crate::state::load(&fx.paths.state_file()).unwrap();
+    let record = store.worktrees.get_mut(&name).unwrap();
+    record.ports.insert("metro".to_string(), 18_081);
+    record
+        .roles
+        .insert("mobile".to_string(), vec!["metro".to_string()]);
+    record.pageless.insert("mobile".to_string());
+    record
+        .processes
+        .insert("mobile".to_string(), listening(999_998, &[]));
+    crate::state::save(&fx.paths.state_file(), &store).unwrap();
+
+    let v: serde_json::Value =
+        serde_json::from_str(&capture(|b| status_json(&fx.paths, None, b))).unwrap();
+    assert_eq!(v["worktrees"][0]["url"], serde_json::Value::Null);
+    let config: Config = toml::from_str(config_text).unwrap();
+    let named = super::names::target_named(&fx.paths, Some("feat/one"), "open").unwrap();
+    let opening = super::open::url_to_open(&fx.paths, &config, &named, false).unwrap();
+    assert_eq!(
+        opening,
+        super::open::Opening::NoPage(
+            "feat/one serves no page to open in a browser\n\
+             mobile: `xcrun simctl openurl booted 'exp://127.0.0.1:18081'` opens its app in \
+             Expo Go on the simulator"
+                .to_string()
+        )
     );
 }
 
@@ -3339,13 +3380,15 @@ fn the_briefs_process_table_is_a_config_pando_loads() {
     let processes = &loaded.config.processes;
     assert_eq!(
         processes.keys().map(String::as_str).collect::<Vec<_>>(),
-        ["api", "web", "worker"]
+        ["api", "mobile", "web", "worker"]
     );
     assert_eq!(
         processes["web"].env["VITE_API_URL"],
         "http://127.0.0.1:{port:api}"
     );
     assert_eq!(processes["worker"].roles(), Vec::<String>::new());
+    assert!(processes["web"].serves_page());
+    assert!(!processes["mobile"].serves_page());
 }
 
 /// The contract file says the same names, in the same order.

@@ -951,7 +951,14 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             public,
         } => {
             let named = names::target_named(paths, typed.as_deref(), "open")?;
-            let url = open::url_to_open(paths, config, &named, public)?;
+            let url = match open::url_to_open(paths, config, &named, public)? {
+                open::Opening::Url(url) => url,
+                // A browser at Metro's root shows nothing anybody wants.
+                open::Opening::NoPage(said) => {
+                    writeln!(out, "{said}")?;
+                    return Ok(());
+                }
+            };
             // Printed first, so the URL is there to copy even when there is
             // no browser to hand it to.
             writeln!(out, "{url}")?;

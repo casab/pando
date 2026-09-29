@@ -212,6 +212,12 @@ pub struct ProcessConfig {
     pub env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ready: Option<ReadySpec>,
+    /// Whether its port serves a page a browser opens: `false` for a
+    /// bundler a device reads, or an API nobody browses. `None` leaves it
+    /// to the catalog: a framework whose app runs on a device serves none,
+    /// everything else does. See [`ProcessConfig::serves_page`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<bool>,
 }
 
 /// Roles a process owns. The map form `{ ENV = "role" }` is sugar for the
@@ -244,6 +250,18 @@ impl ProcessConfig {
             .as_ref()
             .map(PortsSpec::env_templates)
             .unwrap_or_default()
+    }
+
+    /// Whether a browser opens this process's port: what `page` says, and
+    /// where it says nothing, whether its framework's app runs in a
+    /// browser at all. Expo's Metro serves a bundle to a device, and its
+    /// root is no page anybody wants.
+    pub fn serves_page(&self) -> bool {
+        self.page.unwrap_or_else(|| {
+            let vars = self.port_vars();
+            let vars: Vec<&str> = vars.keys().map(String::as_str).collect();
+            crate::catalog::frameworks::device(&vars, &self.cmd).is_none()
+        })
     }
 
     /// Each variable a port reaches this process through: the map form of

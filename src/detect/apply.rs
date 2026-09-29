@@ -167,7 +167,7 @@ pub fn typed_ports(value: &str) -> Result<PortsSpec, String> {
         [] => Err("it names no variable".to_string()),
         [one] => Ok(PortsSpec::Map(BTreeMap::from([(
             one.to_string(),
-            crate::config::WEB_ROLE.to_string(),
+            one_role(one).to_string(),
         )]))),
         several => super::dev::roles_named_by(several)
             .map(PortsSpec::Map)
@@ -194,9 +194,16 @@ fn port_spec(candidate: &Candidate) -> PortsSpec {
     candidate.ports.clone().unwrap_or_else(|| {
         PortsSpec::Map(BTreeMap::from([(
             candidate.value.clone(),
-            crate::config::WEB_ROLE.to_string(),
+            one_role(&candidate.value).to_string(),
         )]))
     })
+}
+
+/// The role one port variable owns: `web`, the role a browser opens,
+/// except for a bundler a device reads, which has a name of its own —
+/// `RCT_METRO_PORT` owns `metro`.
+fn one_role(var: &str) -> &'static str {
+    crate::catalog::frameworks::device_role(var).unwrap_or(crate::config::WEB_ROLE)
 }
 
 /// Writes a chosen candidate into a config. The one place that knows what

@@ -709,6 +709,14 @@ fn start_checked(
         .map(|(process, config)| (process.clone(), config.roles()))
         .filter(|(_, roles)| !roles.is_empty())
         .collect();
+    // And which of them serve no page, so the URL skips their roles the
+    // same way from the record alone.
+    let pageless: std::collections::BTreeSet<String> = config
+        .processes
+        .iter()
+        .filter(|(process, config)| owners.contains_key(*process) && !config.serves_page())
+        .map(|(process, _)| process.clone())
+        .collect();
     // The containers of services that were compose and are native now,
     // stopped once the lock is let go: the port the native server is about
     // to be given is the one they publish. Their compose records stay
@@ -721,6 +729,7 @@ fn start_checked(
     let mut moved_kinds: Vec<(String, state::ServiceKind)> = Vec::new();
     if let Some(record) = store.worktrees.get_mut(name) {
         record.roles = owners;
+        record.pageless = pageless;
         if isolate {
             moved_kinds = changed_kinds(config, record);
             changed_kind = leave_changed_kinds(paths, config, name, record)?;

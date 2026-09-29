@@ -1985,11 +1985,13 @@ pub fn export_lines(env: &BTreeMap<String, String>) -> String {
 /// processes it runs — and one function, because `start`, `status`, `ls`,
 /// the TUI's row and the TUI's `o` key all have to hand out the same one.
 ///
-/// The role is `web` whenever any process owns it, because that is the role
-/// everything else defaults to; otherwise the first role of the
-/// alphabetically first process that owns one. The port is what that
-/// process is really listening on when that is known, and the port pando
-/// assigned it otherwise.
+/// The role is `web` whenever a process that serves a page owns it,
+/// because that is the role everything else defaults to; otherwise the
+/// first role of the alphabetically first such process. A process whose
+/// port no browser opens — Expo's Metro, or one whose config says `page =
+/// false` — is never the URL: a worktree that runs nothing else has none.
+/// The port is what that process is really listening on when that is
+/// known, and the port pando assigned it otherwise.
 ///
 /// From the record alone: `status` and the TUI never see config, and the
 /// answer has to survive a stop unchanged.
@@ -2002,21 +2004,50 @@ pub fn worktree_url(record: &WorktreeRecord) -> Option<String> {
     ))
 }
 
-/// The role a worktree's URL points at: `web` wherever anything owns it,
-/// else the first role of the alphabetically first process that owns one.
+/// The role a worktree's URL points at: `web` wherever a process that
+/// serves a page owns it, else the first role of the alphabetically first
+/// such process.
 pub(super) fn url_role(record: &WorktreeRecord) -> Option<String> {
-    if record.ports.contains_key(DEFAULT_READY_ROLE) {
+    served_role(record, false)
+}
+
+/// The role a share publishes: the URL's, else, where no process serves a
+/// page, the one the URL rule names with every process counted. A tunnel
+/// is how an API's webhooks reach it and how Expo reaches a phone off the
+/// LAN, so "no page" is no reason to refuse one.
+pub(super) fn share_role(record: &WorktreeRecord) -> Option<String> {
+    url_role(record).or_else(|| served_role(record, true))
+}
+
+/// The URL rule over the processes that serve a page, or over every
+/// process with `pageless`.
+fn served_role(record: &WorktreeRecord, pageless: bool) -> Option<String> {
+    let counted = |process: &String| pageless || !record.pageless.contains(process);
+    let owned_by_counted = |role: &str| {
+        !record
+            .roles
+            .iter()
+            .any(|(process, roles)| !counted(process) && roles.iter().any(|r| r == role))
+    };
+    if record.ports.contains_key(DEFAULT_READY_ROLE) && owned_by_counted(DEFAULT_READY_ROLE) {
         return Some(DEFAULT_READY_ROLE.to_string());
     }
     record
         .roles
-        .values()
-        .find_map(|roles| roles.first())
+        .iter()
+        .filter(|(process, _)| counted(process))
+        .find_map(|(_, roles)| roles.first())
         .filter(|role| record.ports.contains_key(*role))
         .cloned()
         // A record written before pando kept track of who owns what: the
         // ports are all there is to go on.
-        .or_else(|| record.ports.keys().next().cloned())
+        .or_else(|| {
+            record
+                .ports
+                .keys()
+                .find(|role| owned_by_counted(role))
+                .cloned()
+        })
 }
 
 /// Who serves the port a worktree's URL names.
@@ -2034,7 +2065,16 @@ pub(super) enum UrlOwner<'a> {
 /// the two need opposite answers, and one `None` for both read a stopped
 /// owner as "anything running will do".
 pub(super) fn url_owner(record: &WorktreeRecord) -> UrlOwner<'_> {
-    let Some(role) = url_role(record) else {
+    owner_of(record, url_role(record))
+}
+
+/// The owner of the role a share publishes, as [`url_owner`] is the URL's.
+pub(super) fn share_owner(record: &WorktreeRecord) -> UrlOwner<'_> {
+    owner_of(record, share_role(record))
+}
+
+fn owner_of(record: &WorktreeRecord, role: Option<String>) -> UrlOwner<'_> {
+    let Some(role) = role else {
         return UrlOwner::Unknown;
     };
     let Some(owner) = record
@@ -2055,7 +2095,16 @@ pub(super) fn url_owner(record: &WorktreeRecord) -> UrlOwner<'_> {
 /// and something else of the worktree is. Nothing answers the URL then,
 /// however much else is up, so nothing may hand it out as live.
 pub fn url_owner_not_running(record: &WorktreeRecord) -> Option<&str> {
-    match url_owner(record) {
+    not_running(record, url_owner(record))
+}
+
+/// [`url_owner_not_running`], of the process a share publishes.
+pub(super) fn share_owner_not_running(record: &WorktreeRecord) -> Option<&str> {
+    not_running(record, share_owner(record))
+}
+
+fn not_running<'a>(record: &WorktreeRecord, owner: UrlOwner<'a>) -> Option<&'a str> {
+    match owner {
         UrlOwner::Absent(owner) if !record.processes.is_empty() => Some(owner),
         _ => None,
     }

@@ -1690,6 +1690,23 @@ fn open_needs_a_port_before_it_has_a_url() {
     assert_eq!(app.opened.as_deref(), Some("http://localhost:17342"));
 }
 
+// A worktree whose only process serves no page, Expo's Metro, has no URL:
+// `o` hands no browser Metro's root and points at the pane's app row.
+#[test]
+fn o_on_a_worktree_that_serves_no_page_opens_no_browser() {
+    let mut app = test_app(&["feat+one"]);
+    with_process(&mut app, "feat+one", running_phase());
+    let record = app.state.worktrees.get_mut("feat+one").unwrap();
+    record.pageless.insert("dev".to_string());
+    assert!(app.url_of("feat+one").is_none());
+
+    press(&mut app, KeyCode::Char('o'));
+    assert_eq!(app.opened, None);
+    let (message, _) = app.active_status().unwrap();
+    assert!(message.contains("serves no page"), "{message}");
+    assert!(message.contains("app row"), "{message}");
+}
+
 // A worktree whose processes all run with `ports = []`, a worker or a
 // watcher, is running and has no URL. `o` and `c` said to start it first,
 // beside a row that said it was running.

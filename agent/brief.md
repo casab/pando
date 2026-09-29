@@ -579,6 +579,13 @@ ready = { timeout_s = 90 }            # how long its first start may take
 cmd = "uv run python -m app.worker"
 cwd = "backend"
 ports = []                            # no port: ready once it stays up
+
+[processes.mobile]
+cmd = "npx expo start"
+cwd = "apps/mobile"
+ports = { RCT_METRO_PORT = "metro" }  # Expo reads this, never PORT
+env = { EXPO_PUBLIC_API_URL = "http://127.0.0.1:{port:api}" }
+page = false                          # no browser opens it; Metro's is the default
 ```
 
 - **`{port:<role>}`** is the port pando gave that role in this worktree,
@@ -589,10 +596,13 @@ ports = []                            # no port: ready once it stays up
   `VITE_*`, has to reach it this way, as the process's environment.
 - **The URL** `status` and `open` give, and the page `check` asks for,
   is the `web` role's, else the first role of the first process by
-  name. The other roles need no page: a check asks none of them for
-  one, and `http_status: null` there is right. A role nobody opens in a
-  browser — an API, a mobile bundler — still wants its own name rather
-  than `web`.
+  name, among the processes that serve a page. The other roles need no
+  page: a check asks none of them for one, and `http_status: null`
+  there is right. A process whose port no browser opens says `page =
+  false`, and Expo's Metro is one without saying it; a role nobody opens
+  in a browser — an API, a mobile bundler — still wants its own name
+  rather than `web`. A worktree with no page has no URL: `open` prints
+  how its app is opened, and `share` still publishes its port.
 - **A phone cannot reach `127.0.0.1`.** Every URL pando gives, and every
   `{port:<role>}` address written as `127.0.0.1`, is this machine's. An
   app on a physical device needs the machine's LAN address instead: in

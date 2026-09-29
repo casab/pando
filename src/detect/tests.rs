@@ -3899,8 +3899,9 @@ fn an_expo_app_at_the_root_is_started_by_its_start_script() {
         process.ports,
         Some(PortsSpec::Map(BTreeMap::from([(
             "RCT_METRO_PORT".to_string(),
-            "web".to_string()
-        )])))
+            "metro".to_string()
+        )]))),
+        "Metro's is no page a browser opens, so its role is not `web`"
     );
     assert!(process.env.is_empty(), "{:?}", process.env);
     assert_eq!(process.ready.as_ref().and_then(|r| r.timeout_s), Some(90));

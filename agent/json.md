@@ -388,7 +388,7 @@ next start runs it again. A worktree it has never run in has no entry.
       "path": "/abs/path",
       "ports": { "web": 17008 },       // the roles this worktree holds
       "observed_ports": [17008],       // what is actually listening
-      "url": "http://localhost:17008", // the readiness role's URL, or null
+      "url": "http://localhost:17008", // the page a browser opens, or null
       "mode": "shared|namespaced|isolated", // which services it talks to
       "isolated": false,               // true exactly when mode is "isolated"
       "share": null,                   // or { url, local_port, proxy_port, since }
@@ -444,6 +444,14 @@ never started namespaced. No login is ever in this shape.
 sentence to show a human. `log` is an absolute path — read it with
 `pando logs`, not by opening the file, so truncation and partial lines are
 handled for you.
+
+`url` is the worktree's page: the `web` role's, else the first role of
+the first process by name, among the processes that serve a page. A
+process serves none when its table says `page = false`, or, saying
+nothing, when it is a bundler whose app runs on a device (Expo's Metro,
+below). A worktree that runs nothing else has `url: null`, and `pando
+open` prints how its app is opened instead of launching a browser.
+`pando share` still publishes such a worktree's port.
 
 `app` is non-null for a process whose app runs on a phone, a tablet or a
 simulator rather than in a browser: Expo's Metro, known from the settings
@@ -692,7 +700,7 @@ One JSON object. Keys are the question names above. Values:
 | `["a", "b"]` | the whole list, at `version_files` and `provision`, whose single answer is a list of files |
 | `null` | "none of them", where `allow_none` is true. At `schema_hook` it is "no": the step is written with `on = "never"` |
 | `[]` | "none of them" at the set question. A usage error anywhere else — `null` is how you say none |
-| `{"api": {...}, "web": {...}}` | at `processes` only: process tables of your own, one per key, each exactly what `[processes.<name>]` takes — `cmd`, and optionally `cwd`, `ports`, `env` and `ready` |
+| `{"api": {...}, "web": {...}}` | at `processes` only: process tables of your own, one per key, each exactly what `[processes.<name>]` takes — `cmd`, and optionally `cwd`, `ports`, `env`, `ready` and `page` |
 
 The object is how a project of several processes is answered when no
 option fits it. A string of your own at `processes` is **one** command,
@@ -713,7 +721,8 @@ per-app option in names that option and is never a way to describe one.
 as `{port}` or `{port:<role>}`, or a map of environment variable to role;
 `[]` is a process with no port, a worker. `{port:<role>}` in `cmd` or
 `env` may name any process's role or a service's name. `ready` takes
-`role` and `timeout_s`. Each table is written with
+`role` and `timeout_s`. `page = false` marks a process whose port no
+browser opens, which the worktree's URL then skips. Each table is written with
 `# answered: a program` on its header.
 
 **Answers are by value, never by index.** An index breaks the day a rule

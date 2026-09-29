@@ -68,6 +68,9 @@ pub struct Device {
     /// What the developer has to be told: every address pando gives is
     /// `127.0.0.1`, which a phone or a tablet cannot reach.
     pub note: &'static str,
+    /// The role its bundler's port is named, where the port variable is
+    /// all an answer says: not `web`, which is the role a browser opens.
+    pub role: &'static str,
     /// The app that opens [`Device::url`]: the framework's own client.
     pub client: &'static str,
     /// The URL the client opens the app at.
@@ -292,6 +295,7 @@ pub const RULES: [FrameworkRule; 13] = [
             note: "a phone or tablet reaches Metro, and the app reaches its backend, at this \
                    machine's LAN address, not 127.0.0.1: REACT_NATIVE_PACKAGER_HOSTNAME and the \
                    EXPO_PUBLIC_* backend URL need it",
+            role: "metro",
             client: "Expo Go",
             url: "exp://{host}:{port}",
             // Expo's own form: Metro's URL, encoded, as the query value.
@@ -470,6 +474,13 @@ pub fn device(port_vars: &[&str], cmd: &str) -> Option<(&'static Device, &'stati
             .any(|marker| cmd.contains(marker));
         (by_port || by_cmd).then_some((device, var))
     })
+}
+
+/// The role a port variable owns when it is the only one an answer names:
+/// [`Device::role`] for the variable a device framework reads, `None` for
+/// every other, which owns the browser's role.
+pub fn device_role(var: &str) -> Option<&'static str> {
+    device(&[var], "").map(|(device, _)| device.role)
 }
 
 /// [`Device::note`], for a process [`device`] recognises.

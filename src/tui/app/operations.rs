@@ -563,6 +563,17 @@ impl App {
                 "{label} has failed — l shows the log, r restarts it"
             )),
             Some(_) => match self.url_of(&name) {
+                // Metro's root in a browser shows nothing anybody wants:
+                // the pane's app row is how its app is opened.
+                None if self
+                    .record_for(&name)
+                    .is_some_and(|record| !record.pageless.is_empty()) =>
+                {
+                    self.set_error(format!(
+                        "{label} serves no page to open in a browser — its app row gives the \
+                         command that opens the app"
+                    ))
+                }
                 None => self.set_error(format!(
                     "{label} is running and holds no port, so it has no URL to open"
                 )),

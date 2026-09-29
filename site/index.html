@@ -859,6 +859,7 @@ cwd = <span class="s">"."</span>
 ports = { PORT = <span class="s">"web"</span> }
 env = { NODE_ENV = <span class="s">"development"</span> }
 ready = { role = <span class="s">"web"</span>, timeout_s = 30 }
+page = true                               <span class="c"># false: no browser opens it, so it is never the URL (Expo's Metro by default)</span>
 
 <span class="k">[[services]]</span>
 kind = <span class="s">"compose"</span>

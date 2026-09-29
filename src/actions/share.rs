@@ -20,7 +20,8 @@ use super::lifecycle::{STOP_GRACE, sweep_orphaned_groups};
 use super::refresh::{advance_before_reconcile, refresh};
 use super::runtime::with_prelude;
 use super::services::{
-    UrlOwner, observed_port_for_role, resolved_env, url_owner, url_owner_not_running, url_role,
+    UrlOwner, observed_port_for_role, resolved_env, share_owner, share_owner_not_running,
+    share_role,
 };
 use super::worktree::find_worktree;
 
@@ -647,7 +648,7 @@ pub(super) fn share_ready_budget(store: &state::State, name: &str) -> Option<Dur
         Phase::Starting { since } => Some((p.ready_timeout_s, since)),
         _ => None,
     };
-    let (timeout_s, since) = match url_owner(record) {
+    let (timeout_s, since) = match share_owner(record) {
         UrlOwner::Recorded(process) => starting(process)?,
         // Nothing is coming up to serve it, whatever its siblings are doing.
         UrlOwner::Absent(_) => return None,
@@ -693,7 +694,7 @@ pub(super) fn share_target_is_up(record: &WorktreeRecord, is_alive: &impl Fn(u32
     let up = |p: &state::ProcessRecord| {
         matches!(p.phase, Phase::Running { .. } | Phase::Starting { .. }) && is_alive(p.pid)
     };
-    match url_owner(record) {
+    match share_owner(record) {
         UrlOwner::Recorded(process) => up(process),
         UrlOwner::Absent(_) => false,
         // A record written before pando tracked who owns what: anything up
@@ -712,7 +713,7 @@ pub(super) fn share_target_is_up(record: &WorktreeRecord, is_alive: &impl Fn(u32
 /// answers — wait, read the log, start it — and one message for all three
 /// sent a developer who had just run `start` back to run it again.
 pub(super) fn share_target_port(name: &str, record: &WorktreeRecord) -> Result<u16> {
-    let Some(role) = url_role(record) else {
+    let Some(role) = share_role(record) else {
         bail!("{name} has no port yet — start it first");
     };
     let Some(assigned) = record.ports.get(&role).copied() else {
@@ -728,7 +729,7 @@ pub(super) fn share_target_port(name: &str, record: &WorktreeRecord) -> Result<u
             "{name} failed to start ({reason}) — `pando logs {name}` says why; there is nothing \
              for a public URL to point at yet"
         ),
-        None => match url_owner_not_running(record) {
+        None => match share_owner_not_running(record) {
             Some(owner) => bail!(
                 "{name} is not running {owner}, the process its URL points at — start it, then \
                  share it"
@@ -745,7 +746,7 @@ pub(super) fn share_target_port(name: &str, record: &WorktreeRecord) -> Result<u
 /// the best of what the worktree is running. `None` when the owner is not
 /// running, whatever its siblings are.
 fn share_state(record: &WorktreeRecord) -> Option<Phase> {
-    match url_owner(record) {
+    match share_owner(record) {
         UrlOwner::Recorded(process) => return Some(process.phase.clone()),
         UrlOwner::Absent(_) => return None,
         UrlOwner::Unknown => {}

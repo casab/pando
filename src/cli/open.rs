@@ -6,10 +6,21 @@ use crate::actions::{self, worktree_url};
 use crate::config::Config;
 use crate::paths::PandoPaths;
 use crate::state::{self, Aggregate};
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 
-/// The URL `open` would hand the browser: the local one while something is
-/// up to answer it, or the public one with `public`.
+/// What `open` does with a worktree that is up.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Opening {
+    /// Hand this URL to the browser.
+    Url(String),
+    /// Nothing of it serves a page: say this instead, which is how its
+    /// app is opened when a device runs it.
+    NoPage(String),
+}
+
+/// What `open` would hand the browser: the local URL while something is
+/// up to answer it, or the public one with `public` — or, for a worktree
+/// whose processes serve no page, what opens their app instead.
 ///
 /// Messages name the worktree as a person knows it, and the commands they
 /// suggest spell it the way it was typed.
@@ -18,7 +29,7 @@ pub(super) fn url_to_open(
     config: &Config,
     named: &Named,
     public: bool,
-) -> Result<String> {
+) -> Result<Opening> {
     let Named { dir, shown, typed } = named;
     let refreshed = actions::refresh(paths);
     let record = refreshed.state.worktrees.get(dir.as_str());
@@ -35,7 +46,7 @@ pub(super) fn url_to_open(
     super::report_refresh(&refreshed);
     if public {
         return match record.and_then(|r| r.share.as_ref()) {
-            Some(share) => Ok(share.public_url.clone()),
+            Some(share) => Ok(Opening::Url(share.public_url.clone())),
             None => bail!("{shown} is not shared — `pando share {typed}` publishes it"),
         };
     }
@@ -68,11 +79,33 @@ pub(super) fn url_to_open(
                      `pando start {typed} --only {owner}` starts it"
                 );
             }
-            worktree_url(record).with_context(|| {
-                format!("{shown} is running and holds no port, so it has no URL to open")
-            })
+            if let Some(url) = worktree_url(record) {
+                return Ok(Opening::Url(url));
+            }
+            if record.pageless.is_empty() {
+                bail!("{shown} is running and holds no port, so it has no URL to open");
+            }
+            Ok(Opening::NoPage(no_page(config, record, shown)))
         }
     }
+}
+
+/// What `open` says of a worktree whose every port is a process's that
+/// serves no page: the command that opens each app a device runs, and the
+/// processes that are simply not pages.
+fn no_page(config: &Config, record: &state::WorktreeRecord, shown: &str) -> String {
+    let apps = actions::app_links(config, record);
+    let mut lines = vec![format!("{shown} serves no page to open in a browser")];
+    for process in &record.pageless {
+        lines.push(match apps.get(process) {
+            Some(links) => format!(
+                "{process}: `{}` opens its app in {} on the simulator",
+                links.simulator, links.client
+            ),
+            None => format!("{process}: its settings say `page = false`"),
+        });
+    }
+    lines.join("\n")
 }
 
 /// Hands `url` to the browser: `$BROWSER` when it is set, the desktop's
