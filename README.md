@@ -13,6 +13,7 @@
   <img alt="Platform: macOS and Linux" src="https://img.shields.io/badge/platform-macOS_|_Linux-6e9beb?style=flat-square">
   <img alt="Version 0.6.0, pre-release" src="https://img.shields.io/badge/version-0.6.0_pre--release-b482e6?style=flat-square">
   <a href="CONTRIBUTING.md"><img alt="PRs welcome" src="https://img.shields.io/badge/PRs-welcome-50c878?style=flat-square"></a>
+  <a href="https://github.com/mertkaradayi/pando/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/mertkaradayi/pando?style=flat-square&logo=github&color=ebc34b"></a>
 </p>
 
 <p align="center">
@@ -580,6 +581,16 @@ not. If pando breaks on yours, that is the most useful issue you can open.
 
 Next, roughly in order: a published crate, a JSON schema for
 `pando.toml`, and a recipe directory with its own contribution guide.
+
+## Star history
+
+<a href="https://star-history.com/#mertkaradayi/pando&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=mertkaradayi/pando&type=Date&theme=dark">
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=mertkaradayi/pando&type=Date">
+    <img alt="Star history of mertkaradayi/pando over time" src="https://api.star-history.com/svg?repos=mertkaradayi/pando&type=Date">
+  </picture>
+</a>
 
 ## License
 
