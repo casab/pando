@@ -7,6 +7,12 @@ may change behaviour.
 
 ## Unreleased
 
+### Changed
+
+- The Expo rule no longer proposes `CI=1` ([#5]). Under it Metro turns
+  off its reloads and file watching, and with no terminal Expo waits on
+  no keypress anyway. `doctor` notes a process that still sets it.
+
 ## 0.6.0 — 2026-09-29
 
 ### Added

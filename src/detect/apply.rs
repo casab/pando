@@ -445,7 +445,7 @@ pub fn edits(slot: Slot, candidate: &Candidate) -> Vec<Edit> {
                 ));
             }
             // The rest of `[dev]` a framework's rule proposes with its
-            // command: Expo's `CI` and its longer wait.
+            // command: Expo's longer wait.
             if let Some(rule) = candidate.processes.as_ref().and_then(|p| p.get(DEV)) {
                 if !rule.env.is_empty() {
                     out.push(single(&["dev"], "env", env_value(&rule.env)));

@@ -3719,3 +3719,38 @@ fn a_process_named_worker_with_no_queue_library_is_not_a_note() {
     let report = report(&fx);
     assert_eq!(worker_notes(&report).len(), 1, "{:?}", messages(&report));
 }
+
+// pando's Expo rule proposed `CI = "1"` until 0.6.0, and Metro under it
+// neither reloads nor watches a file: a config written then is told.
+#[test]
+fn ci_on_expos_metro_is_a_note_that_says_what_it_turns_off() {
+    let fx = fixture();
+    write_project_config(
+        &fx,
+        "[processes.mobile]\ncmd = \"npx expo start\"\nports = { RCT_METRO_PORT = \"metro\" }\n\
+         env = { CI = \"1\" }\n\n\
+         [processes.api]\ncmd = \"npm run dev\"\nports = { PORT = \"web\" }\nenv = { CI = \"1\" }\n",
+    );
+    let report = report(&fx);
+    let found: Vec<&Finding> = report
+        .findings
+        .iter()
+        .filter(|f| f.message.contains("sets CI"))
+        .collect();
+    assert_eq!(found.len(), 1, "{:?}", messages(&report));
+    assert_eq!(found[0].severity, Severity::Note);
+    assert!(
+        found[0].message.contains("\"mobile\""),
+        "{}",
+        found[0].message
+    );
+    assert!(found[0].message.contains("reloads"), "{}", found[0].message);
+    assert!(
+        found[0]
+            .fix
+            .as_deref()
+            .is_some_and(|fix| fix.contains("remove CI")),
+        "{:?}",
+        found[0].fix
+    );
+}

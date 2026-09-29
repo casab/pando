@@ -48,10 +48,6 @@ pub struct FrameworkRule {
     /// not its server: a library's `vite build --watch` binds no port, and
     /// its CLI refuses the `--port` a server would be given.
     pub build_markers: &'static [&'static str],
-    /// Environment a process running this framework's server is proposed
-    /// with, beside its port: what keeps a CLI that would otherwise wait
-    /// on a keypress from waiting on one. Empty for almost every rule.
-    pub env: &'static [(&'static str, &'static str)],
     /// How long a process running this framework's server is proposed to
     /// get before its port has to be bound, for a framework whose cold
     /// start is known to outlast pando's default wait. `None` keeps the
@@ -83,6 +79,9 @@ pub struct Device {
     /// The command that opens a URL, `{url}`, on the booted iOS
     /// simulator, which shares this machine's `127.0.0.1`.
     pub simulator: &'static str,
+    /// Environment that turns off what a dev server is for, as `(variable,
+    /// what it turns off)`: `doctor` names one a process sets.
+    pub disabled_by: &'static [(&'static str, &'static str)],
 }
 
 /// A [`Device`]'s addresses for one running bundler.
@@ -152,7 +151,6 @@ pub const RULES: [FrameworkRule; 13] = [
         guard: Guard::Marker,
         scripts_build_assets: false,
         build_markers: &[],
-        env: &[],
         ready_timeout_s: None,
         device: None,
     },
@@ -167,7 +165,6 @@ pub const RULES: [FrameworkRule; 13] = [
         guard: Guard::Marker,
         scripts_build_assets: false,
         build_markers: &[],
-        env: &[],
         ready_timeout_s: None,
         device: None,
     },
@@ -184,7 +181,6 @@ pub const RULES: [FrameworkRule; 13] = [
         guard: Guard::Marker,
         scripts_build_assets: false,
         build_markers: &[],
-        env: &[],
         ready_timeout_s: None,
         device: None,
     },
@@ -200,17 +196,17 @@ pub const RULES: [FrameworkRule; 13] = [
         scripts_build_assets: false,
         // A library's `ng build --watch`.
         build_markers: &["ng build"],
-        env: &[],
         ready_timeout_s: None,
         device: None,
     },
     // Expo, React Native's dev server. Metro serves a bundle to a device
     // or a simulator, not a page. Its CLI reads `--port`, then
     // `RCT_METRO_PORT`, then falls back to 8081, and never `PORT`. Its
-    // template names the dev script `start`, not `dev`. On a terminal it
-    // waits on keypresses, which `CI=1` turns off, and a cold Metro cache
-    // can take well past pando's default wait to bind. The app runs on a
-    // device, which reaches this machine only at its LAN address.
+    // template names the dev script `start`, not `dev`. With no terminal
+    // it waits on no keypress, so it needs no `CI=1`, which would also
+    // turn off its reloads and file watching. A cold Metro cache can take
+    // well past pando's default wait to bind. The app runs on a device,
+    // which reaches this machine only at its LAN address.
     FrameworkRule {
         name: "Expo",
         markers: &["app.json", "app.config.js", "app.config.ts"],
@@ -225,7 +221,6 @@ pub const RULES: [FrameworkRule; 13] = [
         scripts_build_assets: false,
         // A static export, or the native projects generated for a build.
         build_markers: &["expo export", "expo prebuild"],
-        env: &[("CI", "1")],
         ready_timeout_s: Some(90),
         device: Some(Device {
             note: "a phone or tablet reaches Metro, and the app reaches its backend, at this \
@@ -236,6 +231,9 @@ pub const RULES: [FrameworkRule; 13] = [
             // Expo's own form: Metro's URL, encoded, as the query value.
             development_build: "exp+<scheme>://expo-development-client/?url=http%3A%2F%2F{host}%3A{port}",
             simulator: "xcrun simctl openurl booted {url}",
+            // Expo's CLI reads it as any CI does, and Metro then says
+            // "reloads are disabled".
+            disabled_by: &[("CI", "Metro's reloads and file watching")],
         }),
     },
     // The app servers come before the Vite row: a Laravel app has a
@@ -252,7 +250,6 @@ pub const RULES: [FrameworkRule; 13] = [
         guard: Guard::Marker,
         scripts_build_assets: true,
         build_markers: &[],
-        env: &[],
         ready_timeout_s: None,
         device: None,
     },
@@ -269,7 +266,6 @@ pub const RULES: [FrameworkRule; 13] = [
         guard: Guard::Marker,
         scripts_build_assets: true,
         build_markers: &[],
-        env: &[],
         ready_timeout_s: None,
         device: None,
     },
@@ -286,7 +282,6 @@ pub const RULES: [FrameworkRule; 13] = [
         guard: Guard::Mentions(&["mix.exs", "mix.lock"], ":phoenix,"),
         scripts_build_assets: true,
         build_markers: &[],
-        env: &[],
         ready_timeout_s: None,
         device: None,
     },
@@ -301,7 +296,6 @@ pub const RULES: [FrameworkRule; 13] = [
         guard: Guard::Marker,
         scripts_build_assets: true,
         build_markers: &[],
-        env: &[],
         ready_timeout_s: None,
         device: None,
     },
@@ -333,7 +327,6 @@ pub const RULES: [FrameworkRule; 13] = [
         // Library mode's `vite build --watch`. Not `vite preview`, which
         // serves the build and takes `--port`.
         build_markers: &["vite build"],
-        env: &[],
         ready_timeout_s: None,
         device: None,
     },
@@ -351,7 +344,6 @@ pub const RULES: [FrameworkRule; 13] = [
         guard: Guard::GoMain,
         scripts_build_assets: false,
         build_markers: &[],
-        env: &[],
         ready_timeout_s: None,
         device: None,
     },
@@ -368,7 +360,6 @@ pub const RULES: [FrameworkRule; 13] = [
         guard: Guard::BinaryCrate,
         scripts_build_assets: false,
         build_markers: &[],
-        env: &[],
         ready_timeout_s: None,
         device: None,
     },
@@ -383,7 +374,6 @@ pub const RULES: [FrameworkRule; 13] = [
         guard: Guard::Marker,
         scripts_build_assets: false,
         build_markers: &[],
-        env: &[],
         ready_timeout_s: None,
         device: None,
     },

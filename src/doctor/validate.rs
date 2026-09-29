@@ -14,6 +14,7 @@ pub(super) fn validate_config(paths: &PandoPaths, config: &Config, findings: &mu
     check_provision(paths, config, findings);
     check_install(paths.root(), config, findings);
     check_templates(config, findings);
+    check_disabling_env(paths, config, findings);
     check_something_to_run(paths, config, findings);
 }
 
@@ -143,6 +144,36 @@ fn check_install(root: &Path, config: &Config, findings: &mut Vec<Finding>) {
             ),
             format!("use `{fix}`"),
         ));
+    }
+}
+
+/// A process whose environment turns off what its framework's dev server
+/// is for: `CI` on Expo's Metro, which then neither reloads nor watches a
+/// file. pando's own Expo rule proposed it until 0.6.0, so a config
+/// written then still says it.
+fn check_disabling_env(paths: &PandoPaths, config: &Config, findings: &mut Vec<Finding>) {
+    for (name, process) in &config.processes {
+        let vars = process.port_vars();
+        let vars: Vec<&str> = vars.keys().map(String::as_str).collect();
+        let Some((device, _)) = crate::catalog::frameworks::device(&vars, &process.cmd) else {
+            continue;
+        };
+        for (var, what) in device.disabled_by {
+            if !process.env.contains_key(*var) {
+                continue;
+            }
+            findings.push(
+                Finding::note(
+                    Section::Config,
+                    format!("process {name:?} sets {var}, which turns off {what}"),
+                )
+                .with_fix(format!(
+                    "remove {var} from the process's `env` in {} — with no terminal it waits \
+                     on no keypress without it",
+                    paths.config_file().display()
+                )),
+            );
+        }
     }
 }
 

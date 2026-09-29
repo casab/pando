@@ -1308,8 +1308,8 @@ fn write_answer(
     {
         edits.retain(|edit| edit.key != "ports");
     }
-    // And for the same reason an `env` or a `ready` they wrote: the rule's
-    // `CI = "1"` written whole over their `env` would lose every key of it.
+    // And for the same reason an `env` or a `ready` they wrote: a rule's
+    // own written whole over theirs would lose every key of it.
     if slot == Slot::DevCmd
         && let Some(process) = config.processes.get(detect::DEV)
     {

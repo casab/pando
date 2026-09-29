@@ -12,7 +12,7 @@ use crate::config::{PortsSpec, ProcessConfig, ReadySpec};
 
 use super::apply::DEV;
 use super::dev::{
-    dev_script, flag_reaches_server, is_multiplexer, own_port, rule_env, script_args, script_runner,
+    dev_script, flag_reaches_server, is_multiplexer, own_port, script_args, script_runner,
 };
 use super::frameworks::{only_builds, runs, script_framework};
 use super::proposal::{Candidate, Proposal, Slot};
@@ -37,10 +37,9 @@ pub struct WorkspaceApp {
     /// move: `next dev --port 3000` binds 3000 whatever `PORT` says, and
     /// so does `PORT=3000 next dev`. Such an app owns no role.
     pub fixed_port: Option<u16>,
-    /// The environment its framework's rule proposes for its server, and
-    /// the readiness wait: Expo's `CI = "1"` and 90 seconds. Empty and
-    /// `None` for an app whose script runs no rule's server.
-    pub env: BTreeMap<String, String>,
+    /// The readiness wait its framework's rule proposes for its server:
+    /// Expo's 90 seconds. `None` for an app whose script runs no rule's
+    /// server, or a rule that keeps the default.
     pub ready_timeout_s: Option<u64>,
 }
 
@@ -286,7 +285,6 @@ pub fn workspace_apps(root: &Path, signals: &Signals) -> Vec<WorkspaceApp> {
                     None => PortMechanism::Ask,
                 },
                 fixed_port: fixed,
-                env: serves.map(rule_env).unwrap_or_default(),
                 ready_timeout_s: serves.and_then(|rule| rule.ready_timeout_s),
                 name: name.to_string(),
                 dir,
@@ -672,11 +670,6 @@ pub(super) fn processes_proposal(root: &Path, signals: &Signals) -> Option<Propo
             // own port wins over a sibling's of the same spelling.
             env.entry(var.clone())
                 .or_insert_with(|| format!("{{port:{target}}}"));
-        }
-        // Last, and never over anything above: a variable the project's own
-        // env example gives a meaning wins over a framework's default.
-        for (var, value) in &app.env {
-            env.entry(var.clone()).or_insert_with(|| value.clone());
         }
         let roles = if *owns {
             vec![app.name.clone()]

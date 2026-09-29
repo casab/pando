@@ -356,28 +356,16 @@ pub(super) fn dev_script<'a>(root: &Path, signals: &'a Signals) -> Option<(&'a s
     })
 }
 
-/// The environment a rule proposes for a process that runs its server.
-pub(super) fn rule_env(rule: &FrameworkRule) -> BTreeMap<String, String> {
-    rule.env
-        .iter()
-        .map(|(key, value)| (key.to_string(), value.to_string()))
-        .collect()
-}
-
 /// The keys besides `cmd` and `ports` that the one `[dev]` process a
 /// `dev_cmd` answer fills is proposed with, when it runs `rule`'s server:
-/// the rule's environment and its readiness wait. `None` for a rule that
-/// brings neither, which is nearly every rule, so an answer writes nothing
-/// it does not need.
+/// the rule's readiness wait. `None` for a rule that brings none, which is
+/// nearly every rule, so an answer writes nothing it does not need.
 fn rule_process(rule: &FrameworkRule, cmd: &str) -> Option<BTreeMap<String, ProcessConfig>> {
-    if rule.env.is_empty() && rule.ready_timeout_s.is_none() {
-        return None;
-    }
+    rule.ready_timeout_s?;
     Some(BTreeMap::from([(
         DEV.to_string(),
         ProcessConfig {
             cmd: cmd.to_string(),
-            env: rule_env(rule),
             ready: rule.ready_timeout_s.map(|timeout| ReadySpec {
                 role: None,
                 timeout_s: Some(timeout),

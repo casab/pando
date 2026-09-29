@@ -5828,21 +5828,25 @@ fn a_typed_command_carrying_a_port_keeps_the_ports_the_developer_wrote() {
     assert_eq!(reloaded.processes["dev"].roles(), vec!["hmr", "web"]);
 }
 
-// An Expo app's `[dev]` is written with the rule's `CI = "1"` and its
-// longer wait, unless the developer's own `[dev]` already says either:
-// the rule's `env` written whole would have replaced theirs in the file.
+// An Expo app's `[dev]` is written with the rule's longer wait, and never
+// with `CI`, which turns off Metro's reloads; a `[dev]` whose own `env` or
+// `ready` the developer wrote keeps them.
 #[test]
-fn a_rules_env_and_wait_are_written_only_where_the_developer_wrote_none() {
+fn a_rules_wait_is_written_only_where_the_developer_wrote_none() {
     let fx = detectable_fixture(r#"{ "start": "expo start" }"#, "");
     std::fs::write(fx.root.join("app.json"), r#"{ "expo": {} }"#).unwrap();
     let (ask, _) = scripted(Vec::new());
     resolve_process(&fx.paths, &fx.config, &ask, &noop).unwrap();
     let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
-    assert!(written.contains(r#"env = { CI = "1" }"#), "{written}");
+    assert!(!written.contains("CI"), "{written}");
     assert!(written.contains("ready = { timeout_s = 90 }"), "{written}");
 
     let file = fx.paths.config_file();
-    std::fs::write(&file, "[dev]\nenv = { EXPO_OFFLINE = \"1\" }\n").unwrap();
+    std::fs::write(
+        &file,
+        "[dev]\nenv = { EXPO_OFFLINE = \"1\" }\nready = { timeout_s = 300 }\n",
+    )
+    .unwrap();
     let loaded = crate::config::load(&fx.paths).unwrap().config;
     let config = resolve_process(&fx.paths, &loaded, &ask, &noop).unwrap();
     assert_eq!(config.processes["dev"].cmd, "pnpm start");
@@ -5852,7 +5856,8 @@ fn a_rules_env_and_wait_are_written_only_where_the_developer_wrote_none() {
         "{written}"
     );
     assert!(!written.contains("CI"), "{written}");
-    assert!(written.contains("ready = { timeout_s = 90 }"), "{written}");
+    assert!(written.contains("ready = { timeout_s = 300 }"), "{written}");
+    assert!(!written.contains("timeout_s = 90"), "{written}");
     let reloaded = crate::config::load(&fx.paths).unwrap().config;
     assert_eq!(reloaded.processes["dev"], config.processes["dev"]);
 }

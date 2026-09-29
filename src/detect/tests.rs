@@ -3856,8 +3856,9 @@ fn expo_app(dir: &Path) {
 }
 
 // The whole `[dev]` an Expo app at the root gets with nobody asked: its own
-// `start` script, Metro's port variable, `CI` so it never waits on a key,
-// and the longer wait a cold Metro needs.
+// `start` script, Metro's port variable and the longer wait a cold Metro
+// needs. No `CI`: with no terminal Expo waits on no key already, and `CI`
+// turns off Metro's reloads.
 #[test]
 fn an_expo_app_at_the_root_is_started_by_its_start_script() {
     let dir = tempdir().unwrap();
@@ -3886,17 +3887,14 @@ fn an_expo_app_at_the_root_is_started_by_its_start_script() {
             "web".to_string()
         )])))
     );
-    assert_eq!(
-        process.env,
-        BTreeMap::from([("CI".to_string(), "1".to_string())])
-    );
+    assert!(process.env.is_empty(), "{:?}", process.env);
     assert_eq!(process.ready.as_ref().and_then(|r| r.timeout_s), Some(90));
     assert_eq!(process.ready.as_ref().and_then(|r| r.role.clone()), None);
 
     // And written to the file as it was applied.
     let written = snippet(Slot::DevCmd, &[&dev.candidates[0]]);
     assert!(written.contains(r#"cmd = "npm run start""#), "{written}");
-    assert!(written.contains(r#"env = { CI = "1" }"#), "{written}");
+    assert!(!written.contains("CI"), "{written}");
     assert!(written.contains("ready = { timeout_s = 90 }"), "{written}");
 }
 
@@ -3912,7 +3910,7 @@ fn an_expo_app_with_no_script_is_started_by_the_expo_cli() {
     let dev = dev_in(dir.path(), &signals(dir.path()));
     assert_eq!(values(&dev), vec!["npx expo start"]);
     let process = &dev.candidates[0].processes.as_ref().unwrap()[DEV];
-    assert_eq!(process.env["CI"], "1");
+    assert!(process.env.is_empty(), "{:?}", process.env);
     assert_eq!(process.ready.as_ref().and_then(|r| r.timeout_s), Some(90));
 }
 
@@ -3997,7 +3995,10 @@ fn an_expo_app_in_a_workspace_is_a_process_of_its_own() {
     assert_eq!(mobile.roles(), vec!["mobile"]);
     assert_eq!(mobile.env["RCT_METRO_PORT"], "{port:mobile}");
     assert!(!mobile.env.contains_key("PORT"), "Expo never reads PORT");
-    assert_eq!(mobile.env["CI"], "1");
+    assert!(
+        !mobile.env.contains_key("CI"),
+        "CI turns off Metro's reloads"
+    );
     let ready = mobile.ready.clone().unwrap();
     assert_eq!(ready.role.as_deref(), Some("mobile"));
     assert_eq!(ready.timeout_s, Some(90));
@@ -4005,7 +4006,6 @@ fn an_expo_app_in_a_workspace_is_a_process_of_its_own() {
     let api = &processes["api"];
     assert_eq!(api.cmd, "npm run dev");
     assert_eq!(api.env["PORT"], "{port:api}");
-    assert!(!api.env.contains_key("CI"), "only Expo's rule proposes it");
     assert_eq!(api.ready.clone().unwrap().timeout_s, None);
 }
 
