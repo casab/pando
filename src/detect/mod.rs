@@ -42,7 +42,7 @@ pub use apply::{
     service_entry, snippet, still_needed, typed_ports,
 };
 pub use dev::unlocked_command;
-pub use frameworks::framework;
+pub use frameworks::{Served, framework, served_by};
 pub use proposal::{
     Candidate, ComposeResolver, Proposal, ServiceHint, Slot, propose, propose_with,
 };

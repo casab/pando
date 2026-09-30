@@ -539,6 +539,119 @@ fn a_stale_port_beside_its_command_is_fixed_by_the_answer_not_by_deleting_it() {
     );
 }
 
+// ---- a server with no port of its own -----------------------------
+
+fn portless(report: &Report) -> Vec<&Finding> {
+    report
+        .findings
+        .iter()
+        .filter(|f| f.message.contains("and has no `ports`"))
+        .collect()
+}
+
+// The other half of the reporter's case: with the line gone, nothing
+// asked and nothing said, and Metro listened on 8081 in every worktree.
+#[test]
+fn a_dev_process_running_a_framework_with_no_ports_is_a_problem_with_the_answer() {
+    let fx = fixture();
+    write_expo_app(&fx.root);
+    write_project_config(&fx, "[dev]\ncmd = \"npm run start\"\n");
+    let report = report(&fx);
+    let found = portless(&report);
+    let [finding] = found.as_slice() else {
+        panic!("{:?}", messages(&report));
+    };
+    assert_eq!(finding.severity, Severity::Problem);
+    assert!(!report.healthy());
+    assert!(
+        finding
+            .message
+            .contains("process \"dev\" runs Expo through package.json's \"start\""),
+        "{}",
+        finding.message
+    );
+    assert!(finding.message.contains("8081"), "{}", finding.message);
+    let fix = finding.fix.as_deref().expect("a fix");
+    assert!(
+        fix.contains(
+            r#"`echo '{"port_env":"RCT_METRO_PORT"}' | pando init --answers - --replace`"#
+        ),
+        "{fix}"
+    );
+}
+
+// A named process table is not a question's to fill: the fix is the
+// line, in the table, with the role the catalog gives the variable.
+#[test]
+fn a_named_process_with_no_ports_is_given_the_line_that_fixes_it() {
+    let fx = fixture();
+    std::fs::create_dir_all(fx.root.join("apps/mobile")).expect("app dir");
+    write_expo_app(&fx.root.join("apps/mobile"));
+    write_project_config(
+        &fx,
+        "[processes.api]\ncmd = \"./serve\"\nports = [\"web\"]\n\n\
+         [processes.mobile]\ncmd = \"pnpm start\"\ncwd = \"apps/mobile\"\n",
+    );
+    let report = report(&fx);
+    let found = portless(&report);
+    let [finding] = found.as_slice() else {
+        panic!("{:?}", messages(&report));
+    };
+    let fix = finding.fix.as_deref().expect("a fix");
+    assert!(
+        fix.contains(r#"`ports = { RCT_METRO_PORT = "metro" }`"#),
+        "{fix}"
+    );
+    assert!(fix.contains("[processes.mobile]"), "{fix}");
+}
+
+// A framework told its port by a flag gets the flag, on the script it
+// runs, through the runner's own separator.
+#[test]
+fn a_process_whose_framework_takes_a_flag_is_given_the_command_with_it() {
+    let fx = fixture();
+    std::fs::write(
+        fx.root.join("package.json"),
+        r#"{"scripts":{"dev":"vite"},"devDependencies":{"vite":"6"}}"#,
+    )
+    .expect("package.json");
+    write_project_config(&fx, "[dev]\ncmd = \"npm run dev\"\n");
+    let report = report(&fx);
+    let found = portless(&report);
+    let [finding] = found.as_slice() else {
+        panic!("{:?}", messages(&report));
+    };
+    let fix = finding.fix.as_deref().expect("a fix");
+    assert!(
+        fix.contains(
+            r#"`echo '{"dev_cmd":"npm run dev -- --port {port:web}"}' | pando init --answers - --replace`"#
+        ),
+        "{fix}"
+    );
+}
+
+// Said, not guessed at: `ports = []` is a process that has none, a
+// command that fixes its own port is not moved by one pando hands it,
+// and a plain `node` script is as often a worker as a server.
+#[test]
+fn a_process_that_has_said_or_may_have_no_port_is_left_alone() {
+    for config in [
+        "[dev]\ncmd = \"npm run start\"\nports = []\n",
+        "[dev]\ncmd = \"npx expo start --port 8082\"\n",
+        "[processes.worker]\ncmd = \"node worker.js\"\n",
+    ] {
+        let fx = fixture();
+        write_expo_app(&fx.root);
+        write_project_config(&fx, config);
+        let report = report(&fx);
+        assert!(
+            portless(&report).is_empty(),
+            "{config}: {:?}",
+            messages(&report)
+        );
+    }
+}
+
 // Where taking the line out does reopen the question, both ways are
 // given.
 #[test]

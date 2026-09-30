@@ -224,6 +224,14 @@ Four more facts that are not visible in the shape:
   gets its command and its port. Answers you
   sent for those two are then reported as unused, which is correct and not
   an error.
+- **A process with no `ports` at all has answered the port question too,
+  and may still need one.** One whose command runs a framework's server
+  listens on that framework's own port in every worktree, and the second
+  worktree started finds it taken. The job's `port_env` line then says
+  "not given one" and gives the fix, which `pando doctor` gives as a
+  problem as well: the answers command for `[dev]`, or the `ports` line
+  for a named process. `ports = []` is a process that has none, and is
+  left alone.
 - **Two slots take no answer when nothing was proposed.** `services` is a
   set of the options, and with no options there is nothing to name — a
   service pando did not find is not a service it can run. `prelude` is

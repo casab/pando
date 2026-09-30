@@ -373,6 +373,14 @@ never reported: that is a decision, by a person or by a program, and pando
 does not second-guess decisions — so a deliberate answer closes this for
 good.
 
+A process with no `ports` key at all whose command runs a framework's
+server — named in the command, or in the `package.json` script it runs in
+its directory — is a `config` finding at `problem`: it listens on the
+framework's own port in every worktree, so two running at once clash.
+`ports = []` is never reported; it says the process has none. The fix is
+the `init --answers - --replace` command for a lone `[dev]`, or the
+`ports` line to add to a named process table.
+
 `services.isolation` carries the native-versus-container decision and the
 evidence behind it. It is the report a program should quote to a human
 rather than re-deriving.

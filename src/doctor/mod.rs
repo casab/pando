@@ -27,9 +27,10 @@
 //! Redis across worktrees), `namespaces` (databases a namespaced worktree
 //! left behind), `hooks`, and `adopt` (project folders left behind by a
 //! moved repository, and `--adopt` itself). `stale` compares
-//! detected values with what detection would write now, and `validate`
-//! checks the merged config. This file only gathers them: [`run`] and
-//! [`run_on`].
+//! detected values with what detection would write now, `validate`
+//! checks the merged config, and `portless` names a process that runs a
+//! framework's server with no port of its own. This file only gathers
+//! them: [`run`] and [`run_on`].
 
 use crate::actions;
 use crate::actions::Machine;
@@ -39,6 +40,7 @@ mod adopt;
 mod config;
 mod hooks;
 mod namespaces;
+mod portless;
 mod provision;
 mod render;
 mod report;
@@ -56,6 +58,7 @@ use adopt::adoptable;
 pub use adopt::{AdoptPlan, Adoptable, Adoption, adopt};
 use config::{config_report, project_report};
 use hooks::hooks_report;
+pub use portless::{Portless, portless_processes};
 pub use report::{
     ComposeEntryReport, ConfigReport, EngineBinary, Finding, HookReport, HookRunReport,
     IncludedService, IsolationReport, KeyReport, LanguageReport, LayerReport, NativeInstance,
@@ -104,6 +107,7 @@ pub fn run_on(paths: &PandoPaths, machine: &Machine<'_>) -> Report {
 
     let config_report = config_report(paths, error, warnings, &mut findings);
     validate_config(paths, &config, &mut findings);
+    portless::portless_findings(paths, &config, &mut findings);
     stale_detection_findings(paths, &config, &config_report, &mut findings);
     let project = project_report(paths, &config, &mut findings);
     let runtime = runtime_report(paths, &config, machine, &mut findings);

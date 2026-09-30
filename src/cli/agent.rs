@@ -333,6 +333,10 @@ fn project_now(
     // that could only fail.
     let nothing_to_run = actions::runs_nothing(config, proposals);
     let dev_cmd = detect::Proposal::of(Slot::DevCmd, Vec::new(), false);
+    // Processes that run a framework's server with no port: settled, and
+    // still every worktree's server on the framework's own port. "Covered
+    // by processes" there sent an agent past the one thing to fix.
+    let portless = crate::doctor::portless_processes(paths, config);
     for slot in actions::ALL_SLOTS {
         let name = slot_name(slot);
         let line = match (actions::settled(slot, config), proposal(slot)) {
@@ -340,6 +344,11 @@ fn project_now(
                 open.push(&dev_cmd);
                 "open, below: nothing would run".to_string()
             }
+            (true, _) if slot == Slot::PortEnv && !portless.is_empty() => portless
+                .iter()
+                .map(|p| format!("not given one: {} — fix: {}", p.message, p.fix))
+                .collect::<Vec<_>>()
+                .join("; "),
             (true, _) => match actions::slot_value(config, slot) {
                 Some(value) => format!("set: `{value}`"),
                 // The dev command and its ports, settled by process

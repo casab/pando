@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use crate::catalog::frameworks::{FrameworkRule, Guard, RULES};
+use crate::catalog::package_managers::{self, Ecosystem, PackageManager};
 
 use super::signals::Signals;
 
@@ -20,6 +21,72 @@ pub fn framework(root: &Path, signals: &Signals) -> Option<&'static FrameworkRul
         }
         by_marker || names_a_script(rule, signals)
     })
+}
+
+/// The framework server a process's command runs, as the rules recognise
+/// one: which rule, and the `package.json` script it runs it through.
+#[derive(Debug, Clone)]
+pub struct Served {
+    pub rule: &'static FrameworkRule,
+    /// The script, when the command runs one rather than naming the
+    /// framework itself: `start` for `npm run start`.
+    pub script: Option<String>,
+    /// What goes between that command and a flag handed on to the script:
+    /// npm's `-- `. Empty for a command that names the framework.
+    pub script_args: &'static str,
+}
+
+/// The framework server `cmd` runs in `dir`: named in the command itself,
+/// `npx expo start`, or in the `package.json` script of `dir` the command
+/// runs, `pnpm start`.
+///
+/// Through the rules' own script markers, and with their own exceptions:
+/// `None` for a command that runs several things at once, one that runs
+/// only a framework's build, and one that fixes its own port — no port
+/// pando hands it moves that one.
+pub fn served_by(dir: &Path, cmd: &str) -> Option<Served> {
+    let serves = |body: &str| {
+        if super::dev::is_multiplexer(body) {
+            return None;
+        }
+        let rule = RULES
+            .iter()
+            .find(|rule| runs(rule, body) && !only_builds(rule, body))?;
+        super::dev::own_port(body, Some(rule))
+            .is_none()
+            .then_some(rule)
+    };
+    if let Some(rule) = serves(cmd) {
+        return Some(Served {
+            rule,
+            script: None,
+            script_args: "",
+        });
+    }
+    let (manager, script) = script_run_by(cmd)?;
+    let manifest = std::fs::read_to_string(dir.join("package.json")).ok()?;
+    let scripts = super::signals::parse_scripts(&manifest);
+    let rule = serves(scripts.get(script)?)?;
+    Some(Served {
+        rule,
+        script: Some(script.to_string()),
+        script_args: manager.script_args,
+    })
+}
+
+/// The `package.json` script a command runs, and the manager that runs
+/// it: `pnpm dev`, `npm run start`, `yarn run dev`, `npm start`. The
+/// managers are the catalog's JavaScript rows that run scripts.
+fn script_run_by(cmd: &str) -> Option<(&'static PackageManager, &str)> {
+    let mut words = cmd.split_whitespace().skip_while(|word| word.contains('='));
+    let manager = package_managers::for_program(words.next()?).filter(|manager| {
+        manager.ecosystem == Ecosystem::JavaScript && manager.run_prefix.is_some()
+    })?;
+    let script = match words.next()? {
+        "run" | "run-script" => words.next()?,
+        script => script,
+    };
+    Some((manager, script))
 }
 
 /// The rule for what `dev`, a project's own `dev` script, runs. For a
@@ -384,7 +451,48 @@ fn ignored(line: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Signals, framework, mentions};
+    use super::{Signals, framework, mentions, script_run_by, served_by};
+
+    #[test]
+    fn the_script_a_command_runs_is_read_through_the_catalogs_runners() {
+        for (cmd, script, args) in [
+            ("npm run start", "start", "-- "),
+            ("npm start", "start", "-- "),
+            ("pnpm dev", "dev", ""),
+            ("yarn run dev", "dev", ""),
+            ("bun run dev", "dev", ""),
+            ("NODE_ENV=development pnpm dev", "dev", ""),
+        ] {
+            let (manager, found) = script_run_by(cmd).unwrap_or_else(|| panic!("{cmd}"));
+            assert_eq!(found, script, "{cmd}");
+            assert_eq!(manager.script_args, args, "{cmd}");
+        }
+        assert!(script_run_by("uv run manage.py").is_none());
+        assert!(script_run_by("make dev").is_none());
+    }
+
+    #[test]
+    fn a_command_serves_the_framework_its_script_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"start":"expo start","both":"concurrently \"expo start\" \"tsc -w\"","build":"vite build"}}"#,
+        )
+        .unwrap();
+        let served = served_by(dir.path(), "npm run start").expect("expo");
+        assert_eq!(served.rule.name, "Expo");
+        assert_eq!(served.script.as_deref(), Some("start"));
+        assert_eq!(
+            served_by(dir.path(), "npx expo start").unwrap().script,
+            None
+        );
+        // Several things at once, a build, and a port of its own: none
+        // of them is a server a port pando hands it would move.
+        assert!(served_by(dir.path(), "npm run both").is_none());
+        assert!(served_by(dir.path(), "npm run build").is_none());
+        assert!(served_by(dir.path(), "npx expo start --port 8082").is_none());
+        assert!(served_by(dir.path(), "npm run missing").is_none());
+    }
 
     fn with_scripts(pairs: &[(&str, &str)]) -> Signals {
         Signals {

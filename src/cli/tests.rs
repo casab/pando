@@ -3399,6 +3399,36 @@ fn the_job_after_a_passing_check_has_nothing_left_to_do() {
     assert!(job.contains("- processes: set: `api, web`"), "{job}");
 }
 
+// A `[dev]` whose command runs a framework's server and that has no
+// `ports` has settled the port question, and still runs every worktree's
+// server on the framework's own port: the job says so, with doctor's fix,
+// rather than "covered by processes".
+#[test]
+fn the_job_names_a_server_with_no_port_rather_than_calling_it_covered() {
+    let fx = fixture();
+    std::fs::write(
+        fx.root.join("package.json"),
+        r#"{"dependencies":{"expo":"57.0.0"},"scripts":{"start":"expo start"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        fx.root.join("pando.toml"),
+        "[dev]\ncmd = \"npm run start\"\n",
+    )
+    .unwrap();
+    let job = super::agent::job(&fx.paths);
+    let line = job
+        .lines()
+        .find(|line| line.starts_with("- port_env: "))
+        .unwrap_or_else(|| panic!("{job}"));
+    assert!(line.contains("not given one"), "{line}");
+    assert!(line.contains("8081"), "{line}");
+    assert!(
+        line.contains(r#"echo '{"port_env":"RCT_METRO_PORT"}' | pando init --answers - --replace"#),
+        "{line}"
+    );
+}
+
 // `--reference memory` prints the block and nothing else, and the job's
 // last section is the same block, fenced, so what an agent saves from
 // either is the same text.

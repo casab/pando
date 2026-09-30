@@ -4555,33 +4555,71 @@ fn doctor_names_a_detected_value_the_rules_would_not_write_now() {
 #[test]
 fn the_command_doctor_prints_for_a_stale_port_fixes_it() {
     let e = env();
+    write_expo_app(&e);
+    e.write_config(
+        "[dev]\ncmd = \"npm run start\"  # detected: package.json scripts.start\n\
+         ports = { RCT_METRO_PORT = \"web\" }  # detected: the Expo rule\n",
+    );
+    run_printed(&e, &doctor_fix(&e, "dev.ports = "));
+    assert_metro_has_its_port(&e);
+}
+
+/// And with the line already deleted: doctor says so, as a problem, and
+/// its command fixes that too.
+#[test]
+fn the_command_doctor_prints_for_a_server_with_no_port_fixes_it() {
+    let e = env();
+    write_expo_app(&e);
+    e.write_config("[dev]\ncmd = \"npm run start\"  # detected: package.json scripts.start\n");
+    assert_eq!(code(&e.pando(&["doctor"])), EXIT_ERROR);
+    run_printed(&e, &doctor_fix(&e, "process \"dev\" runs Expo"));
+    assert_metro_has_its_port(&e);
+}
+
+/// An Expo app at the root of `e`, as its template makes one.
+fn write_expo_app(e: &Env) {
     std::fs::write(
         e.root.join("package.json"),
         r#"{"name":"shop","dependencies":{"expo":"57.0.0"},"scripts":{"start":"expo start"}}"#,
     )
     .unwrap();
     std::fs::write(e.root.join("app.json"), r#"{"expo":{"slug":"shop"}}"#).unwrap();
-    e.write_config(
-        "[dev]\ncmd = \"npm run start\"  # detected: package.json scripts.start\n\
-         ports = { RCT_METRO_PORT = \"web\" }  # detected: the Expo rule\n",
-    );
+}
 
+/// The fix of the one finding whose message starts with `lead`, as
+/// `doctor --json` gives it.
+fn doctor_fix(e: &Env, lead: &str) -> String {
     let json: serde_json::Value =
         serde_json::from_str(&stdout(&e.pando(&["doctor", "--json"]))).expect("one object");
-    let fix = json["findings"]
+    json["findings"]
         .as_array()
         .expect("findings")
         .iter()
-        .find(|f| {
-            f["message"]
-                .as_str()
-                .is_some_and(|m| m.starts_with("dev.ports = "))
-        })
+        .find(|f| f["message"].as_str().is_some_and(|m| m.starts_with(lead)))
         .and_then(|f| f["fix"].as_str())
         .unwrap_or_else(|| panic!("{}", json["findings"]))
-        .to_string();
-    // Run as printed: the line between the backquotes, through a shell,
-    // with this test's pando first on PATH.
+        .to_string()
+}
+
+/// Metro has its port in pando's config, and doctor has nothing to say.
+fn assert_metro_has_its_port(e: &Env) {
+    let config = std::fs::read_to_string(e.config_file()).unwrap();
+    assert!(
+        config.contains(r#"ports = { RCT_METRO_PORT = "metro" }"#),
+        "{config}"
+    );
+    let out = e.pando(&["doctor"]);
+    assert_eq!(code(&out), EXIT_OK, "{}", stdout(&out));
+    assert!(
+        stdout(&out).contains("nothing to report"),
+        "{}",
+        stdout(&out)
+    );
+}
+
+/// Runs the command a fix gives between its first backquotes, as printed:
+/// through a shell, with this test's pando first on PATH.
+fn run_printed(e: &Env, fix: &str) {
     let command = fix.split('`').nth(1).unwrap_or_else(|| panic!("{fix}"));
     assert!(
         command.ends_with("| pando init --answers - --replace"),
@@ -4604,19 +4642,6 @@ fn the_command_doctor_prints_for_a_stale_port_fixes_it() {
         .output()
         .unwrap();
     assert_eq!(code(&out), EXIT_OK, "{}{}", stdout(&out), stderr(&out));
-
-    let config = std::fs::read_to_string(e.config_file()).unwrap();
-    assert!(
-        config.contains(r#"ports = { RCT_METRO_PORT = "metro" }"#),
-        "{config}"
-    );
-    let out = e.pando(&["doctor"]);
-    assert_eq!(code(&out), EXIT_OK, "{}", stdout(&out));
-    assert!(
-        stdout(&out).contains("nothing to report"),
-        "{}",
-        stdout(&out)
-    );
 }
 
 /// `agent/json.md` describes the provenance comment on a config key, and
