@@ -30,6 +30,9 @@ pub struct Target {
     /// starting and is worth another try: `simctl openurl` right after a
     /// cold boot times out with `code=60`.
     pub starting: &'static [&'static str],
+    /// Words in an open's output that say it failed, though it exited 0:
+    /// `am start` reports an intent nothing handles on its output alone.
+    pub refused: &'static [&'static str],
 }
 
 /// The simulator first: it shares this machine's `127.0.0.1`, and it is
@@ -41,6 +44,7 @@ pub const TARGETS: [Target; 2] = [
         list: "xcrun simctl list devices booted",
         ready: "(Booted)",
         starting: &["code=60"],
+        refused: &[],
     },
     // `emulator-5554	device`; `unauthorized` and `offline` are not ready.
     Target {
@@ -49,6 +53,9 @@ pub const TARGETS: [Target; 2] = [
         list: "adb devices",
         ready: "device",
         starting: &[],
+        // `Error: Activity not started, unable to resolve Intent`: no app
+        // on the device registers the link's scheme.
+        refused: &["Error: "],
     },
 ];
 
@@ -88,6 +95,11 @@ impl Target {
     pub fn still_starting(&self, output: &str) -> bool {
         self.starting.iter().any(|word| output.contains(word))
     }
+
+    /// Whether an open that exited 0 says it failed all the same.
+    pub fn refuses(&self, output: &str) -> bool {
+        self.refused.iter().any(|word| output.contains(word))
+    }
 }
 
 #[cfg(test)]
@@ -124,6 +136,13 @@ mod tests {
         assert!(!android.lists_one_ready(&format!("{header}R58M\tunauthorized\n")));
         assert!(!android.lists_one_ready(&format!("{header}emulator-5554\toffline\n")));
         assert!(android.lists_one_ready(&format!("{header}emulator-5554\tdevice\n")));
+        // `am start` says so on its output when nothing handles the link.
+        assert!(android.refuses(
+            "Starting: Intent { act=android.intent.action.VIEW }\nError: Activity not \
+             started, unable to resolve Intent { act=android.intent.action.VIEW }"
+        ));
+        assert!(!android.refuses("Starting: Intent { act=android.intent.action.VIEW }"));
+        assert!(!target(Platform::Ios).refuses(""));
     }
 
     // One target per platform, so each of a framework's commands is run

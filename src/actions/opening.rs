@@ -164,7 +164,7 @@ fn open_on(
     loop {
         let ran = (opener.run)(command);
         let output = match &ran {
-            Some(ran) if ran.ok => return Ok(target.name),
+            Some(ran) if ran.ok && !target.refuses(&ran.output) => return Ok(target.name),
             Some(ran) => ran.output.clone(),
             None => "it could not be run".to_string(),
         };

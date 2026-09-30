@@ -15575,3 +15575,38 @@ fn an_app_whose_scheme_is_unknown_is_never_opened() {
     assert!(said.is_empty(), "{said:?}");
     assert!(machine.ran().is_empty(), "{:?}", machine.ran());
 }
+
+// `am start` exits 0 when nothing on the device handles the link, and
+// says so only on its output: that is a failed open, with what it said,
+// not "opened".
+#[test]
+fn an_android_open_that_says_error_failed_though_it_exited_zero() {
+    let links = expo_links();
+    let run = |command: &str| {
+        Some(Ran {
+            ok: true,
+            output: match command {
+                "adb devices" => "List of devices attached\nemulator-5554\tdevice\n",
+                "xcrun simctl list devices booted" => "== Devices ==\n",
+                _ => {
+                    "Starting: Intent { act=android.intent.action.VIEW }\nError: Activity not \
+                     started, unable to resolve Intent { act=android.intent.action.VIEW }\n"
+                }
+            }
+            .to_string(),
+        })
+    };
+    let opener = Opener {
+        run: &run,
+        may_start_simulator: true,
+        boot_wait: Duration::from_millis(300),
+        retry_wait: Duration::from_millis(300),
+        every: Duration::from_millis(1),
+    };
+    let opened = open_app(&links, &opener, &|_| {});
+    let Err(NotOpened::Failed { on, output, .. }) = opened else {
+        panic!("{opened:?}")
+    };
+    assert_eq!(on, "the connected Android device or emulator");
+    assert!(output.contains("unable to resolve Intent"), "{output}");
+}
