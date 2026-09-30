@@ -1684,9 +1684,12 @@ fn open_opens_a_device_app_on_the_simulator_or_the_emulator() {
         app["simulator"].as_str().unwrap(),
         format!("xcrun simctl openurl booted '{url}'")
     );
+    // The installed builds first, read as `status` reads them; then the
+    // booted simulator, and the open.
     assert_eq!(
         common::device_calls(&e.home, "xcrun"),
         [
+            "simctl list -j devices booted".to_string(),
             "simctl list devices booted".to_string(),
             format!("simctl openurl booted {url}")
         ]
