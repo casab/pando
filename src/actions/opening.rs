@@ -62,6 +62,10 @@ pub enum NotOpened {
     /// There is nothing here to open it on, and why: the caller gives the
     /// commands, for the developer to run once there is.
     Nowhere(String),
+    /// Its link is not whole, and why ([`AppLinks::unknown`]): nothing
+    /// was run, and the caller gives the commands for the developer to
+    /// fill in.
+    Unknown(String),
     /// A command ran on a target and failed, with what it said.
     Failed {
         on: &'static str,
@@ -73,7 +77,7 @@ pub enum NotOpened {
 impl std::fmt::Display for NotOpened {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            NotOpened::Nowhere(why) => write!(f, "{why}"),
+            NotOpened::Nowhere(why) | NotOpened::Unknown(why) => write!(f, "{why}"),
             NotOpened::Failed {
                 on,
                 command,
@@ -101,11 +105,17 @@ pub fn open_commands(links: &AppLinks) -> Vec<(&'static str, &str)> {
 /// Opens the app `links` names, and says where: on the first target that
 /// is ready, else on a simulator it starts. `say` hears each wait before
 /// it begins, with how long it may last.
+///
+/// A link that is not whole is never run, nor a simulator started for it:
+/// a scheme nobody registers only fails, after a boot it waited for.
 pub fn open_app(
     links: &AppLinks,
     opener: &Opener<'_>,
     say: &dyn Fn(&str),
 ) -> Result<&'static str, NotOpened> {
+    if let Some(why) = &links.unknown {
+        return Err(NotOpened::Unknown(why.clone()));
+    }
     for target in &TARGETS {
         if ready(target, opener) {
             return open_on(target, links, opener, false, say);
@@ -201,8 +211,11 @@ fn start_simulator(ios: &Target, opener: &Opener<'_>, say: &dyn Fn(&str)) -> Res
         .map(|name| apps.join(name))
         .find(|app| app.exists())
     else {
+        // Command Line Tools alone is a developer directory with no
+        // simulator app: say the directory, not "the Xcode".
         return Err(format!(
-            "the Xcode at {developer} has no {} to start a simulator with",
+            "`{}` names {developer}, which has no {} to start a simulator with",
+            SIMULATOR_APP.developer_dir,
             SIMULATOR_APP.names.join(" or ")
         ));
     };

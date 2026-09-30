@@ -185,6 +185,11 @@ pub struct AppLinks {
     /// emulator.
     pub android: String,
     pub development_build: String,
+    /// Why `url` cannot be opened as it stands, when it cannot: a
+    /// development build's link whose scheme no manifest said, so it holds
+    /// [`Scheme::placeholder`]. The commands are printed with it, for the
+    /// developer to fill in, and never run.
+    pub unknown: Option<String>,
 }
 
 /// [`AppLinks::client`] for an app a development build opens.
@@ -209,12 +214,22 @@ impl Device {
             true => (DEVELOPMENT_BUILD, development_build.clone()),
             false => (self.client, fill(self.url)),
         };
+        let unknown = (app.development_client && app.scheme.is_none()).then(|| {
+            format!(
+                "no {} in its directory names its {}, so the scheme its development build \
+                 registers is not known: `{}` stands for it",
+                self.scheme.manifest,
+                self.scheme.key.join("."),
+                self.scheme.placeholder()
+            )
+        });
         AppLinks {
             client,
             simulator: self.simulator.replace("{url}", &url),
             android: fill(self.android).replace("{url}", &url),
             development_build,
             url,
+            unknown,
         }
     }
 }
@@ -658,6 +673,29 @@ mod tests {
         assert_eq!(
             links.simulator,
             format!("xcrun simctl openurl booted '{url}'")
+        );
+        assert_eq!(links.unknown, None);
+        // Expo Go's link is always whole.
+        assert_eq!(
+            expo.links("127.0.0.1", 8123, &AppManifest::default())
+                .unknown,
+            None
+        );
+
+        // An app configured in `app.config.ts` alone: no manifest names
+        // the slug, so its link holds the placeholder, and says so.
+        let app = AppManifest {
+            scheme: None,
+            development_client: true,
+        };
+        let links = expo.links("127.0.0.1", 8123, &app);
+        assert!(links.url.starts_with("exp+<slug>://"), "{}", links.url);
+        assert_eq!(
+            links.unknown.as_deref(),
+            Some(
+                "no app.json in its directory names its expo.slug, so the scheme its \
+                 development build registers is not known: `exp+<slug>` stands for it"
+            )
         );
     }
 

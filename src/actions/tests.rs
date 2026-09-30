@@ -15545,3 +15545,33 @@ fn an_open_the_simulator_refuses_fails_at_once_with_what_it_said() {
         .count();
     assert_eq!(opens, 1);
 }
+
+// A development build's link whose slug no manifest said — an app
+// configured in `app.config.ts` alone — holds `exp+<slug>`, which no
+// build registers: nothing is run for it, not even a look for a
+// simulator, and the reason is the caller's to print beside the
+// commands, for the developer to fill in.
+#[test]
+fn an_app_whose_scheme_is_unknown_is_never_opened() {
+    let (device, _) = crate::catalog::frameworks::device(&["RCT_METRO_PORT"], "").unwrap();
+    let links = device.links(
+        "127.0.0.1",
+        18_081,
+        &crate::catalog::frameworks::AppManifest {
+            scheme: None,
+            development_client: true,
+        },
+    );
+    let machine = DeviceMachine {
+        booted: true.into(),
+        android: true,
+        ..DeviceMachine::new()
+    };
+    let (opened, said) = open_app_on(&machine, true, &links);
+    let Err(NotOpened::Unknown(why)) = opened else {
+        panic!("{opened:?}")
+    };
+    assert!(why.contains("`exp+<slug>`"), "{why}");
+    assert!(said.is_empty(), "{said:?}");
+    assert!(machine.ran().is_empty(), "{:?}", machine.ran());
+}

@@ -657,6 +657,9 @@ impl App {
                     Err(actions::NotOpened::Nowhere(why)) => {
                         format!("{label}: {why} — its app rows give the commands that open it")
                     }
+                    Err(actions::NotOpened::Unknown(why)) => format!(
+                        "{label}'s {process}: {why} — its app rows give the commands, to fill in"
+                    ),
                     Err(failed) => format!("{label}'s {process}: {failed}"),
                 };
                 let _ = tx.send(AppEvent::AppOpened(Err(result)));

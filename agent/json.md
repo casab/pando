@@ -483,7 +483,9 @@ a development build opens, whichever `client` is. Its scheme is the one `expo-de
 registers: `exp+` and the app's `expo.slug`, lowercased with anything but
 letters, digits, `+`, `-` and `.` dropped — never `expo.scheme`. pando
 reads the slug from the worktree's `app.json`; an app configured in
-`app.config.*` alone gets `exp+<slug>`: fill it in. Every address is
+`app.config.*` alone gets `exp+<slug>`: fill it in. `pando open` runs
+no command that holds it, since no build registers that scheme, and
+prints the commands to fill in instead. Every address is
 `127.0.0.1`, which the simulator shares and a physical device cannot
 reach; for a device, use the machine's LAN address the developer gives.
 It is there whatever the process's `phase`, and opens something only while

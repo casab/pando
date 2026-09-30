@@ -1715,6 +1715,47 @@ fn status_opens_an_app_with_the_development_client_in_its_development_build() {
         )),
         "{text}"
     );
+
+    // Configured in `app.config.ts` alone, the slug is not known: `open`
+    // runs nothing for a link that holds `exp+<slug>`, which no build
+    // registers, and prints the commands to fill in.
+    let app = record.path.join("apps/mobile");
+    std::fs::remove_file(app.join("app.json")).unwrap();
+    std::fs::write(
+        app.join("app.config.ts"),
+        "export default { slug: 'DriveeSafeCall' };\n",
+    )
+    .unwrap();
+    let config: Config = toml::from_str(MOBILE_BY_VARIABLE).unwrap();
+    let links = actions::app_links(&config, &record)["mobile"].clone();
+    assert!(links.url.starts_with("exp+<slug>://"), "{}", links.url);
+    let said = std::cell::RefCell::new(Vec::new());
+    let text = capture(|b| {
+        super::open::open_apps(
+            &fx.paths,
+            &[("mobile".to_string(), links.clone())],
+            b,
+            &|line| said.borrow_mut().push(line.to_string()),
+        )
+    });
+    assert_eq!(
+        text.lines().collect::<Vec<_>>(),
+        [
+            "mobile: no app.json in its directory names its expo.slug, so the scheme its \
+             development build registers is not known: `exp+<slug>` stands for it — filled \
+             in, this opens its app in its development build:"
+                .to_string(),
+            format!("  on the booted iOS simulator: {}", links.simulator),
+            format!(
+                "  on the connected Android device or emulator: {}",
+                links.android
+            ),
+        ]
+    );
+    assert_eq!(
+        *said.borrow(),
+        ["opening mobile's app in its development build"]
+    );
 }
 
 // A branch that changes an app's native code needs a build of its own,

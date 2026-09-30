@@ -208,6 +208,16 @@ pub(super) fn open_apps(
                     writeln!(out, "  on {on}: {command}")?;
                 }
             }
+            Err(NotOpened::Unknown(why)) => {
+                writeln!(
+                    out,
+                    "{process}: {why} — filled in, this opens its app in {}:",
+                    links.client
+                )?;
+                for (on, command) in actions::open_commands(links) {
+                    writeln!(out, "  on {on}: {command}")?;
+                }
+            }
             Err(failed) => bail!("{process}: {failed}"),
         }
     }
