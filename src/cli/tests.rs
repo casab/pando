@@ -1743,9 +1743,14 @@ fn status_says_when_a_branch_changes_its_apps_native_code() {
             "apps/mobile/modules/call/android/CallModule.kt"
         ])
     );
+    // `build` is the iOS one, as it was before there were two.
+    assert_eq!(native["build"], "npx expo run:ios --port 18081");
     assert_eq!(
-        native["build"],
-        "npx expo run:ios --no-bundler --port 18081"
+        native["builds"],
+        serde_json::json!({
+            "ios": "npx expo run:ios --port 18081",
+            "android": "npx expo run:android --port 18081",
+        })
     );
     let text = capture(|b| status_text_at(&fx.paths, None, b, usize::MAX));
     let line = text.lines().find(|line| line.contains("native")).unwrap();
@@ -1756,8 +1761,26 @@ fn status_says_when_a_branch_changes_its_apps_native_code() {
         "{text}"
     );
     assert!(
-        line.contains("`npx expo run:ios --no-bundler --port 18081` in the app's directory"),
+        line.contains(
+            "`npx expo run:ios --port 18081` (ios) or `npx expo run:android --port 18081` \
+             (android) in the app's directory"
+        ),
         "{text}"
+    );
+    // Published: the contract names each key under `native`.
+    let doc = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("agent/json.md"),
+    )
+    .unwrap();
+    for key in native.as_object().unwrap().keys() {
+        assert!(
+            doc.contains(&format!("\"{key}\"")),
+            "agent/json.md never documents app.native's {key}"
+        );
+    }
+    assert!(
+        !doc.contains("--no-bundler"),
+        "Expo refuses it beside --port"
     );
 }
 

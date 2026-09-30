@@ -106,10 +106,11 @@ pub struct Native {
     pub dirs: &'static [&'static str],
     /// Files at the app's top whose settings a build bakes in.
     pub files: &'static [&'static str],
-    /// The command, run in the app's directory, that makes and installs a
-    /// build of this worktree on the simulator and points it at the
-    /// bundler already running on `{port}`.
-    pub build: &'static str,
+    /// The commands, run in the app's directory, that make and install a
+    /// build of this worktree and point it at the bundler already running
+    /// on `{port}`, as `(platform, command)`: one per platform the app is
+    /// built for, the iOS simulator's first.
+    pub builds: &'static [(&'static str, &'static str)],
 }
 
 impl Native {
@@ -352,7 +353,13 @@ pub const RULES: [FrameworkRule; 13] = [
                     "app.config.mjs",
                     "app.config.cjs",
                 ],
-                build: "npx expo run:ios --no-bundler --port {port}",
+                // `--port` with this app's Metro already on it reuses that
+                // Metro rather than starting a second one; `--no-bundler`
+                // beside it is refused as mutually exclusive.
+                builds: &[
+                    ("ios", "npx expo run:ios --port {port}"),
+                    ("android", "npx expo run:android --port {port}"),
+                ],
             },
         }),
     },
@@ -655,6 +662,28 @@ mod tests {
             "package.json",
         ] {
             assert!(!expo.native.is_native(path), "{path}");
+        }
+    }
+
+    // One build per platform, the iOS simulator's first, which `status
+    // --json` keeps as its `build`. Expo refuses `--port` beside
+    // `--no-bundler`; `--port` alone reuses the worktree's Metro.
+    #[test]
+    fn expos_builds_are_one_per_platform_on_the_worktrees_metro() {
+        let (expo, _) = device(&["RCT_METRO_PORT"], "").expect("Expo's device");
+        assert_eq!(
+            expo.native.builds,
+            [
+                ("ios", "npx expo run:ios --port {port}"),
+                ("android", "npx expo run:android --port {port}"),
+            ]
+        );
+        for rule in RULES.iter().filter_map(|rule| rule.device.as_ref()) {
+            assert_eq!(rule.native.builds.first().map(|b| b.0), Some("ios"));
+            for (platform, build) in rule.native.builds {
+                assert!(build.contains("{port}"), "{platform}: {build}");
+                assert!(!build.contains("--no-bundler"), "{platform}: {build}");
+            }
         }
     }
 

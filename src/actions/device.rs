@@ -54,9 +54,10 @@ pub struct NativeChanges {
     /// The files, relative to the worktree, changed since the branch left
     /// `base`: committed, uncommitted, or new.
     pub changed: Vec<String>,
-    /// The command, run in the app's directory, that makes this worktree
-    /// a development build of its own on the simulator.
-    pub build: String,
+    /// The commands, run in the app's directory, that make this worktree
+    /// a development build of its own, as `(platform, command)` in the
+    /// catalog's order: the iOS simulator's first.
+    pub builds: Vec<(&'static str, String)>,
 }
 
 /// Each device app's native code the worktree's branch changes against
@@ -94,11 +95,15 @@ pub fn native_changes(
                 let changes = NativeChanges {
                     base: base.to_string(),
                     changed: native,
-                    build: app
+                    builds: app
                         .device
                         .native
-                        .build
-                        .replace("{port}", &app.port.to_string()),
+                        .builds
+                        .iter()
+                        .map(|(platform, build)| {
+                            (*platform, build.replace("{port}", &app.port.to_string()))
+                        })
+                        .collect(),
                 };
                 (app.name.to_string(), changes)
             })

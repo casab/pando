@@ -623,7 +623,8 @@ page = false                          # no browser opens it; Metro's is the defa
   address above. A branch that changes the app's native code (`ios/`,
   `android/`, a local module's, or `app.json`/`app.config.*`) needs a
   build of its own: `status` says so under the process, with the
-  `npx expo run:ios --no-bundler --port <port>` that makes one.
+  `npx expo run:ios --port <port>` and `npx expo run:android --port
+  <port>` that make one on Metro's port, reusing the Metro pando runs.
 
 ---
 

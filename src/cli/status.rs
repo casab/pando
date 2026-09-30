@@ -64,8 +64,12 @@ struct NativeOut {
     /// Relative to the worktree.
     changed: Vec<String>,
     /// Run in the app's directory: builds and installs this worktree's app
-    /// on the simulator, pointed at its running Metro.
+    /// on the iOS simulator, pointed at its running Metro. The same as
+    /// `builds.ios`, kept for the readers written before `builds`.
     build: String,
+    /// The same for every platform the app is built for, by platform:
+    /// `ios`, `android`.
+    builds: BTreeMap<&'static str, String>,
 }
 
 /// Each device app's native changes in a worktree, against the base its
@@ -290,7 +294,12 @@ pub fn status_json<W: Write>(paths: &PandoPaths, only: Option<&str>, out: &mut W
                                         native: native.remove(name).map(|n| NativeOut {
                                             base: n.base,
                                             changed: n.changed,
-                                            build: n.build,
+                                            build: n
+                                                .builds
+                                                .first()
+                                                .map(|(_, build)| build.clone())
+                                                .unwrap_or_default(),
+                                            builds: n.builds.into_iter().collect(),
                                         }),
                                     }),
                                 },
@@ -494,13 +503,19 @@ fn status_lines<W: Write>(
                     0 => String::new(),
                     n => format!(" and {n} more"),
                 };
+                // One command per platform, the iOS simulator's first.
+                let builds: Vec<String> = changes
+                    .builds
+                    .iter()
+                    .map(|(platform, build)| format!("`{build}` ({platform})"))
+                    .collect();
                 let row = format!(
                     "  {}  {:<PHASE_CELL$}  this branch changes native code against {} ({first}{more}) \
-                     — a build of another branch lacks it; `{}` in the app's directory builds its own",
+                     — a build of another branch lacks it; {} in the app's directory builds its own",
                     pad(name, process_width),
                     "native",
                     changes.base,
-                    changes.build,
+                    builds.join(" or "),
                 );
                 writeln!(out, "{}", ellipsize_end(&row, width))?;
             }

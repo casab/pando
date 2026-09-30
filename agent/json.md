@@ -411,7 +411,9 @@ next start runs it again. A worktree it has never run in has no entry.
                              "development_build": "exp+shop://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A17012",
                              "native": { "base": "main",   // or null: no native change
                                          "changed": ["apps/mobile/ios/Podfile"],
-                                         "build": "npx expo run:ios --no-bundler --port 17012" } } }
+                                         "build": "npx expo run:ios --port 17012",
+                                         "builds": { "ios": "npx expo run:ios --port 17012",
+                                                     "android": "npx expo run:android --port 17012" } } } }
       },
       "services": {
         "postgres": { "kind": "compose|native", "port": 17010, "up": true,
@@ -487,10 +489,13 @@ an `ios/` or `android/` directory anywhere in the app (a local module's
 committed since the branch left `base` or not. A build of another branch
 lacks what those add, so the bundle this worktree's Metro serves can
 crash into a missing module. `changed` lists the files, relative to the
-worktree, and `build`, run in the app's directory, builds and installs
-this worktree's own development build on the simulator, pointed at its
-running Metro; the simulator keeps one build per bundle id, so it
-replaces the one there. A new native dependency in `package.json` alone
+worktree, and `builds`, by platform (`ios`, `android`), run in the app's
+directory, builds and installs this worktree's own development build on
+the iOS simulator or on an Android emulator or device, pointed at its
+running Metro, which it reuses rather than starting a second one; a
+simulator or a device keeps one build per bundle id, so it replaces the
+one there. `build` is `builds.ios`, kept for readers written before
+`builds`. A new native dependency in `package.json` alone
 is not seen. It is always `null` for the main checkout.
 
 `share.url` is the public URL. **No cookie is ever in this shape**, even
