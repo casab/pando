@@ -511,14 +511,14 @@ registers: `exp+` and the app's `expo.slug`, lowercased with anything but
 letters, digits, `+`, `-` and `.` dropped — never `expo.scheme`. pando
 reads the slug from the worktree's `app.json`, else from `app.config.*`
 without running it: a `slug: "…"` string literal, taken only when every
-place the file sets `slug` gives the same one. An app whose config
-computes its slug gets the slug of its development build on a booted
-simulator (`app.installed`, below), else `exp+<slug>`: fill it in.
-`pando open` runs no command that holds `<slug>`, since no build
-registers that scheme, and prints the commands to fill in instead.
-Every address is
-`127.0.0.1`, which the simulator shares and a physical device cannot
-reach; for a device, use the machine's LAN address the developer gives.
+place those files set `slug` gives the same one. An app whose config
+computes its slug gets, while it runs, the slug of its development build
+on a booted simulator (`app.installed`, below), else `exp+<slug>`: fill
+it in. `pando open` runs no command that holds `<slug>`, since no build
+registers that scheme, and prints the commands to fill in instead. Every
+address is `127.0.0.1`, which the simulator shares and a physical device
+cannot reach; for a device, use the machine's LAN address the developer
+gives.
 It is there whatever the process's `phase`, and opens something only while
 it is `running`.
 
