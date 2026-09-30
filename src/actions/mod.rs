@@ -8,9 +8,10 @@
 //! One file per concern: worktrees, hooks, questions, `init`, the runtime
 //! check, start/stop/restart, when a start is ready, private services,
 //! namespaced starts, share, reading state, an app on a device's links
-//! and opening it there, `pando check`, and trying pando's own guess for
-//! the setup screen.
+//! and opening it there, the name its config written as code gives it,
+//! `pando check`, and trying pando's own guess for the setup screen.
 
+mod app_config;
 mod check;
 mod device;
 mod hooks;

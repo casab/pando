@@ -1758,6 +1758,55 @@ fn status_opens_an_app_with_the_development_client_in_its_development_build() {
     );
 }
 
+// An app configured in `app.config.ts` alone gets its development build's
+// scheme from the slug the file gives as a literal, read and never run;
+// one that computes its slug keeps the placeholder.
+#[test]
+fn status_reads_the_slug_an_app_config_gives_as_a_literal() {
+    let fx = fixture();
+    let name = with_mobile_app(&fx, MOBILE_BY_VARIABLE);
+    let record = crate::state::load(&fx.paths.state_file())
+        .unwrap()
+        .worktrees[&name]
+        .clone();
+    let app = record.path.join("apps/mobile");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(
+        app.join("package.json"),
+        r#"{ "dependencies": { "expo": "~57.0.0", "expo-dev-client": "~6.0.0" } }"#,
+    )
+    .unwrap();
+    let url_of = || -> String {
+        let v: serde_json::Value =
+            serde_json::from_str(&capture(|b| status_json(&fx.paths, None, b))).unwrap();
+        v["worktrees"][0]["processes"]["mobile"]["app"]["url"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    std::fs::write(
+        app.join("app.config.ts"),
+        "import type { ExpoConfig } from \"expo/config\";\n\
+         // slug: \"OldName\",\n\
+         const config: ExpoConfig = { name: \"Drivee\", slug: \"DriveeSafeCall\" };\n\
+         export default config;\n",
+    )
+    .unwrap();
+    assert_eq!(
+        url_of(),
+        "exp+driveesafecall://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A18081"
+    );
+    std::fs::write(
+        app.join("app.config.ts"),
+        "export default { slug: process.env.APP_SLUG ?? \"drivee\" };\n",
+    )
+    .unwrap();
+    assert_eq!(
+        url_of(),
+        "exp+<slug>://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A18081"
+    );
+}
+
 // A branch that changes an app's native code needs a build of its own,
 // or Metro's bundle loads into a build that lacks the module: `status`
 // says which files, against which base, and the command that builds it.

@@ -51,7 +51,8 @@ struct AppOut {
     /// emulator, after pointing its `127.0.0.1` port at this machine's.
     android: String,
     /// The URL a development build opens it at, its scheme `exp+` and the
-    /// slug in `app.json`; `exp+<slug>` where no `app.json` says it.
+    /// slug in `app.json` or a literal in `app.config.*`; `exp+<slug>`
+    /// where neither says it.
     development_build: String,
     /// The app's native code this worktree's branch changes, which a
     /// build of another branch lacks; `null` when it changes none, and

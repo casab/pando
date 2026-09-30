@@ -15754,3 +15754,91 @@ fn an_android_open_that_says_error_failed_though_it_exited_zero() {
     assert_eq!(on, "the connected Android device or emulator");
     assert!(output.contains("unable to resolve Intent"), "{output}");
 }
+
+// A name in a config written as code is read as a literal, never run.
+mod app_config_literals {
+    use super::super::app_config::literal;
+
+    fn slug(source: &str) -> Option<String> {
+        literal(&[source], "slug")
+    }
+
+    #[test]
+    fn one_literal_is_the_name() {
+        let source = r#"
+            import { ExpoConfig } from "expo/config";
+            const config: ExpoConfig = {
+              name: "Drivee",
+              slug: "DriveeSafeCall",
+              ios: { bundleIdentifier: 'com.example.drivee' },
+            };
+            export default config;
+        "#;
+        assert_eq!(slug(source).as_deref(), Some("DriveeSafeCall"));
+        assert_eq!(
+            literal(&[source], "bundleIdentifier").as_deref(),
+            Some("com.example.drivee")
+        );
+        // Quoted keys, single quotes, and the last key of an object.
+        assert_eq!(slug("{ 'slug': 'shop' }").as_deref(), Some("shop"));
+        assert_eq!(slug("{\"slug\": \"shop\"}").as_deref(), Some("shop"));
+        // The same literal twice is still one name.
+        let twice = "export default ({ config }) => ({ ...config, slug: \"shop\", \
+                     extra: { eas: { slug: \"shop\" } } });";
+        assert_eq!(slug(twice).as_deref(), Some("shop"));
+        // A template with nothing substituted is a literal too.
+        assert_eq!(slug("{ slug: `shop` }").as_deref(), Some("shop"));
+    }
+
+    #[test]
+    fn two_different_literals_give_nothing() {
+        let source = r#"
+            const prod = { slug: "shop" };
+            const dev = { slug: "shop-dev" };
+            export default process.env.APP_ENV === "production" ? prod : dev;
+        "#;
+        assert_eq!(slug(source), None);
+        // Across the files too.
+        assert_eq!(literal(&["{ slug: 'a' }", "{ slug: 'b' }"], "slug"), None);
+    }
+
+    #[test]
+    fn a_computed_name_gives_nothing() {
+        for source in [
+            "export default { slug: process.env.SLUG };",
+            "export default { slug: isDev ? \"shop-dev\" : \"shop\" };",
+            "export default { slug: \"shop\" + suffix };",
+            "export default { slug: `shop-${variant}` };",
+            "export default { slug: getSlug() };",
+            // One computed place spoils a literal elsewhere.
+            "const a = { slug: \"shop\" }; export default { ...a, slug: name };",
+            // Shorthand names a variable pando does not evaluate.
+            "const slug = \"shop\"; export default { slug };",
+        ] {
+            assert_eq!(slug(source), None, "{source}");
+        }
+    }
+
+    #[test]
+    fn a_commented_out_line_does_not_count() {
+        let source = r#"
+            export default {
+              // slug: "old-name",
+              /* slug: "older-name",
+                 slug: "oldest" */
+              slug: "shop", // was slug: "legacy"
+              description: "slug: 'not-a-key'",
+              homepage: "https://example.com/slug",
+            };
+        "#;
+        assert_eq!(slug(source).as_deref(), Some("shop"));
+        assert_eq!(slug("// slug: \"shop\"\nexport default {};"), None);
+    }
+
+    #[test]
+    fn a_ternary_or_a_member_named_like_the_key_is_not_the_key() {
+        let source = "const slug = base.slug;\n\
+                      export default { name: ready ? slug : other, slug: \"shop\" };";
+        assert_eq!(slug(source).as_deref(), Some("shop"));
+    }
+}

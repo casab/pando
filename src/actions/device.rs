@@ -192,24 +192,19 @@ fn device_processes<'a>(config: &'a Config, record: &WorktreeRecord) -> Vec<Devi
 }
 
 /// What the app in `dir` says about opening it: the scheme its
-/// development build registers, from the name in its manifest, and
-/// whether it depends on the development client.
+/// development build registers, from the name in its config, and whether
+/// it depends on the development client.
 ///
-/// A manifest that is missing or does not parse says nothing, and the
-/// links keep the scheme's placeholder: an `app.config.ts` is code, and
-/// pando does not run it to read a name.
+/// The name is its manifest's, else the one string literal its config
+/// written as code gives it: an `app.config.ts` is code, and pando does
+/// not run it to read a name. Where neither says, the links keep the
+/// scheme's placeholder.
 pub fn read_manifest(device: &Device, dir: &Path) -> AppManifest {
     let json = |file: &str| -> Option<serde_json::Value> {
         serde_json::from_str(&std::fs::read_to_string(dir.join(file)).ok()?).ok()
     };
-    let scheme = json(device.scheme.manifest).and_then(|manifest| {
-        let name = device
-            .scheme
-            .key
-            .iter()
-            .try_fold(&manifest, |value, key| value.get(key))?;
-        device.scheme.of(name.as_str()?)
-    });
+    let scheme =
+        config_value(device, dir, device.scheme.key).and_then(|name| device.scheme.of(&name));
     let development_client = json("package.json").is_some_and(|package| {
         ["dependencies", "devDependencies"]
             .iter()
@@ -219,4 +214,36 @@ pub fn read_manifest(device: &Device, dir: &Path) -> AppManifest {
         scheme,
         development_client,
     }
+}
+
+/// The string the app in `dir` gives `key`, a path below its config's
+/// root: its manifest's, else the one literal its config written as code
+/// gives the key's last name.
+fn config_value(device: &Device, dir: &Path, key: &[&str]) -> Option<String> {
+    let scheme = &device.scheme;
+    let manifest: Option<serde_json::Value> = std::fs::read_to_string(dir.join(scheme.manifest))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok());
+    manifest
+        .as_ref()
+        .and_then(|manifest| {
+            scheme
+                .root
+                .iter()
+                .chain(key)
+                .try_fold(manifest, |value, key| value.get(key))?
+                .as_str()
+                .map(str::to_string)
+        })
+        .or_else(|| super::app_config::literal(&config_code(device, dir), key.last()?))
+}
+
+/// The source of each config the app in `dir` writes as code.
+fn config_code(device: &Device, dir: &Path) -> Vec<String> {
+    device
+        .scheme
+        .code
+        .iter()
+        .filter_map(|file| std::fs::read_to_string(dir.join(file)).ok())
+        .collect()
 }

@@ -506,10 +506,12 @@ port reaches this machine's Metro), and `development_build` is the link
 a development build opens, whichever `client` is. Its scheme is the one `expo-dev-client`
 registers: `exp+` and the app's `expo.slug`, lowercased with anything but
 letters, digits, `+`, `-` and `.` dropped — never `expo.scheme`. pando
-reads the slug from the worktree's `app.json`; an app configured in
-`app.config.*` alone gets `exp+<slug>`: fill it in. `pando open` runs
-no command that holds it, since no build registers that scheme, and
-prints the commands to fill in instead. Every address is
+reads the slug from the worktree's `app.json`, else from `app.config.*`
+without running it: a `slug: "…"` string literal, taken only when every
+place the file sets `slug` gives the same one. An app whose config
+computes its slug gets `exp+<slug>`: fill it in. `pando open` runs no
+command that holds it, since no build registers that scheme, and prints
+the commands to fill in instead. Every address is
 `127.0.0.1`, which the simulator shares and a physical device cannot
 reach; for a device, use the machine's LAN address the developer gives.
 It is there whatever the process's `phase`, and opens something only while

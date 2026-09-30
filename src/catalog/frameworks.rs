@@ -129,13 +129,21 @@ impl Native {
 }
 
 /// The scheme a development build registers: a name from the app's own
-/// manifest, made a URI scheme, behind a prefix.
+/// config, made a URI scheme, behind a prefix.
 #[derive(Debug, Clone, Copy)]
 pub struct Scheme {
     /// The JSON file, in the app's directory, that holds the name.
     pub manifest: &'static str,
-    /// The keys down to the name: `expo.slug`.
+    /// Where in that file the app's config is: `expo`. The config written
+    /// as code has the same keys at its top.
+    pub root: &'static [&'static str],
+    /// The keys, below the root, down to the name: `slug`.
     pub key: &'static [&'static str],
+    /// The app's config written as code, in the app's directory. pando
+    /// never runs it: the name is read from it only as the string literal
+    /// the key's last name is given (`slug: "shop"`), and only where every
+    /// place that sets it gives the same one.
+    pub code: &'static [&'static str],
     pub prefix: &'static str,
 }
 
@@ -359,7 +367,15 @@ pub const RULES: [FrameworkRule; 13] = [
             // `expo.scheme` (its `getDefaultScheme`).
             scheme: Scheme {
                 manifest: "app.json",
-                key: &["expo", "slug"],
+                root: &["expo"],
+                key: &["slug"],
+                // Every file Expo reads a dynamic config from.
+                code: &[
+                    "app.config.ts",
+                    "app.config.js",
+                    "app.config.mjs",
+                    "app.config.cjs",
+                ],
                 prefix: "exp+",
             },
             simulator: "xcrun simctl openurl booted '{url}'",
@@ -743,6 +759,22 @@ mod tests {
                 assert!(build.contains("{port}"), "{platform}: {build}");
                 assert!(!build.contains("--no-bundler"), "{platform}: {build}");
             }
+        }
+    }
+
+    // Every file the scheme's name is read from is a file a build bakes
+    // in, and the other way round: one set of config files, named twice
+    // because one list is read and the other watched.
+    #[test]
+    fn a_devices_config_files_are_its_native_files() {
+        for device in RULES.iter().filter_map(|rule| rule.device.as_ref()) {
+            let mut read: Vec<&str> = std::iter::once(device.scheme.manifest)
+                .chain(device.scheme.code.iter().copied())
+                .collect();
+            let mut watched = device.native.files.to_vec();
+            read.sort_unstable();
+            watched.sort_unstable();
+            assert_eq!(read, watched);
         }
     }
 
