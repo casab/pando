@@ -22,7 +22,8 @@
 //! (`Finding`, `Section`, `Severity`, and one `*Report` per section) and
 //! `render` turns them into text. Each section is built in its own file:
 //! `config` (the project and every config layer), `runtime`, `tools`,
-//! `worktrees`, `services` with `workers` (queue workers that share one
+//! `worktrees` with `provision` (worktrees pando did not create that lack
+//! a file `provision` names), `services` with `workers` (queue workers that share one
 //! Redis across worktrees), `namespaces` (databases a namespaced worktree
 //! left behind), `hooks`, and `adopt` (project folders left behind by a
 //! moved repository, and `--adopt` itself). `stale` compares
@@ -38,6 +39,7 @@ mod adopt;
 mod config;
 mod hooks;
 mod namespaces;
+mod provision;
 mod render;
 mod report;
 mod runtime;
@@ -109,6 +111,7 @@ pub fn run_on(paths: &PandoPaths, machine: &Machine<'_>) -> Report {
     // advance a phase, and that is a real cost to pay twice.
     let view = actions::inspect(paths);
     let worktrees = worktrees_report(paths, &config, &view, &mut findings);
+    provision::unprovisioned_findings(paths, &config, &view, &mut findings);
     let services = services_report(paths, &config, machine, &mut findings);
     namespaces::leftover_findings(paths, &config, &mut findings);
     let hooks = hooks_report(paths, &config, &view, &worktrees, &mut findings);

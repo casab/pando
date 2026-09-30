@@ -2890,6 +2890,188 @@ fn a_service_record_the_config_no_longer_includes_is_reported_with_its_volume() 
     assert!(report.healthy(), "{:?}", report.findings);
 }
 
+// ---- provisioned files an adopted worktree lacks ----------------
+
+/// A repository that ignores `.env` and has one in its main checkout, as
+/// a project that provisions it does, with `config` as pando's layer.
+fn provisioned_fixture(config: &str) -> Fx {
+    let fx = fixture();
+    std::fs::write(fx.root.join(".gitignore"), ".env\n").expect("gitignore");
+    git(&fx.root, &["add", "."]);
+    git(&fx.root, &["commit", "--quiet", "-m", "ignore .env"]);
+    std::fs::write(fx.root.join(".env"), "SECRET=1\n").expect("env");
+    write_project_config(&fx, config);
+    fx
+}
+
+/// A worktree made by git and never by pando, beside the main checkout,
+/// on a new branch — or on `branch` as it is, when it exists.
+fn adopted_worktree(fx: &Fx, branch: &str) -> PathBuf {
+    let dir = fx.root.parent().expect("parent").join(branch);
+    let dir_arg = dir.to_str().expect("utf-8").to_string();
+    let exists = git_ok(&fx.root, &["rev-parse", "--verify", "--quiet", branch]);
+    match exists {
+        true => git(&fx.root, &["worktree", "add", "--quiet", &dir_arg, branch]),
+        false => git(
+            &fx.root,
+            &["worktree", "add", "--quiet", "-b", branch, &dir_arg],
+        ),
+    }
+    std::fs::canonicalize(dir).expect("canonical worktree")
+}
+
+fn git_ok(cwd: &Path, args: &[&str]) -> bool {
+    std::process::Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
+fn lacking(report: &Report) -> Vec<&Finding> {
+    report
+        .findings
+        .iter()
+        .filter(|f| f.section == Section::Worktrees && f.message.contains("did not create"))
+        .collect()
+}
+
+// The reporter had fourteen of seventeen adopted worktrees without the
+// `.env` `provision` names, and doctor said nothing: `provision` only
+// reaches the worktrees `new` makes.
+#[test]
+fn an_adopted_worktree_without_a_provisioned_file_is_named_with_the_command_that_gives_it() {
+    let fx = provisioned_fixture("[project]\nprovision = [\".env\"]\n");
+    let dir = adopted_worktree(&fx, "feat-a");
+    let report = report(&fx);
+    let found = lacking(&report);
+    let [finding] = found.as_slice() else {
+        panic!("{:?}", messages(&report));
+    };
+    assert_eq!(finding.severity, Severity::Note);
+    assert!(
+        finding.message.starts_with("feat-a: "),
+        "{}",
+        finding.message
+    );
+    assert!(finding.message.contains(".env"), "{}", finding.message);
+    // Linked, as `new` would have: `provision_mode` is `link` unless said.
+    let fix = finding.fix.as_deref().expect("a fix");
+    assert!(
+        fix.contains(&format!(
+            "`ln -s {} {}`",
+            fx.root.join(".env").display(),
+            dir.join(".env").display()
+        )),
+        "{fix}"
+    );
+    assert!(report.healthy(), "{:?}", report.findings);
+    assert!(!dir.join(".env").exists(), "doctor writes nothing");
+}
+
+#[test]
+fn many_adopted_worktrees_lacking_the_same_file_are_one_note_with_one_command() {
+    let fx = provisioned_fixture("[project]\nprovision = [\".env\"]\nprovision_mode = \"copy\"\n");
+    let a = adopted_worktree(&fx, "feat-a");
+    let b = adopted_worktree(&fx, "feat-b");
+    let has = adopted_worktree(&fx, "feat-c");
+    std::fs::write(has.join(".env"), "MINE=1\n").expect("its own");
+    let report = report(&fx);
+    let found = lacking(&report);
+    let [finding] = found.as_slice() else {
+        panic!("{:?}", messages(&report));
+    };
+    assert!(
+        finding
+            .message
+            .starts_with("2 worktrees pando did not create have no .env"),
+        "{}",
+        finding.message
+    );
+    assert!(
+        finding.message.ends_with(": feat-a, feat-b"),
+        "{}",
+        finding.message
+    );
+    let fix = finding.fix.as_deref().expect("a fix");
+    assert!(
+        fix.contains(&format!(
+            "`for w in {} {}; do cp {} \"$w\"/.env; done`",
+            a.display(),
+            b.display(),
+            fx.root.join(".env").display()
+        )),
+        "{fix}"
+    );
+}
+
+// A seeded example is copied whatever the mode says, as `new` copies it:
+// a link to a tracked file makes every edit in the worktree an edit to
+// the repository.
+#[test]
+fn an_adopted_worktree_lacking_a_seeded_file_is_given_a_copy_of_the_example() {
+    let fx = fixture();
+    std::fs::write(fx.root.join(".gitignore"), ".env\n").expect("gitignore");
+    std::fs::write(fx.root.join(".env.example"), "PORT=3000\n").expect("example");
+    git(&fx.root, &["add", "."]);
+    git(&fx.root, &["commit", "--quiet", "-m", "an example"]);
+    write_project_config(
+        &fx,
+        "[project]\nprovision = [\".env\"]\nprovision_from = { \".env\" = \".env.example\" }\n",
+    );
+    let dir = adopted_worktree(&fx, "feat-a");
+    let report = report(&fx);
+    let found = lacking(&report);
+    let [finding] = found.as_slice() else {
+        panic!("{:?}", messages(&report));
+    };
+    let fix = finding.fix.as_deref().expect("a fix");
+    assert!(
+        fix.contains(&format!(
+            "`cp {} {}`",
+            fx.root.join(".env.example").display(),
+            dir.join(".env").display()
+        )),
+        "{fix}"
+    );
+}
+
+// Invariant 1 is about the worktree the file lands in: a branch whose
+// .gitignore does not ignore the path gets no command that writes it.
+#[test]
+fn an_adopted_worktree_that_does_not_ignore_the_path_gets_no_command() {
+    let fx = provisioned_fixture("[project]\nprovision = [\".env\"]\n");
+    git(&fx.root, &["branch", "loose"]);
+    let dir = adopted_worktree(&fx, "loose");
+    std::fs::write(dir.join(".gitignore"), "node_modules/\n").expect("gitignore");
+    let report = report(&fx);
+    let found = lacking(&report);
+    let [finding] = found.as_slice() else {
+        panic!("{:?}", messages(&report));
+    };
+    assert!(
+        finding.message.contains("does not ignore"),
+        "{}",
+        finding.message
+    );
+    let fix = finding.fix.as_deref().expect("a fix");
+    assert!(!fix.contains("cp ") && !fix.contains("ln -s"), "{fix}");
+}
+
+// A worktree pando created gets the file at its next `start`: not news
+// here.
+#[test]
+fn a_worktree_pando_created_is_not_reported_for_a_file_it_lacks() {
+    let fx = provisioned_fixture("[project]\nprovision = [\".env\"]\n");
+    let dir = adopted_worktree(&fx, "feat-a");
+    write_state(
+        &fx,
+        &one_worktree("feat-a", state::WorktreeRecord::new(dir, true)),
+    );
+    let report = report(&fx);
+    assert!(lacking(&report).is_empty(), "{:?}", messages(&report));
+}
+
 // ---- adoption ---------------------------------------------------
 
 // The notice was one string literal whose line continuations had lost

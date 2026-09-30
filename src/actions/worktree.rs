@@ -1232,63 +1232,216 @@ fn provision_worktree_files(
     progress: &dyn Fn(&str),
 ) -> Result<()> {
     for rel in config.project.provision_paths() {
-        let dst = worktree.join(rel);
-        if dst.exists() {
-            continue;
+        provision_path(paths, config, worktree, rel, progress)?;
+    }
+    Ok(())
+}
+
+/// One provisioned path, into a worktree pando created: nothing when the
+/// worktree has something there already, a dangling link included, or
+/// when the main checkout has nothing to give it.
+fn provision_path(
+    paths: &PandoPaths,
+    config: &Config,
+    worktree: &Path,
+    rel: &str,
+    progress: &dyn Fn(&str),
+) -> Result<()> {
+    let dst = worktree.join(rel);
+    if is_present(&dst) {
+        return Ok(());
+    }
+    let Some((src, seeded)) = provision_source(paths, config, rel) else {
+        return Ok(());
+    };
+    // Invariant 1, checked in the worktree the file lands in and
+    // immediately before the write — a seeded file is no different, and
+    // the example it comes from being tracked buys it nothing.
+    ensure_gitignored(worktree, rel)?;
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create dir {}", parent.display()))?;
+    }
+    // A seed is always copied, whatever the mode says. A symlink to the
+    // tracked example would make every edit inside the worktree a write
+    // into the repository, which is the invariant this whole path exists
+    // to keep.
+    let mode = match seeded {
+        true => {
+            // Every guess is visible, and this one is a file being created
+            // out of contents pando did not write: the notice names the
+            // source, so the developer can go and read it.
+            let from = config
+                .project
+                .provision_from
+                .get(rel)
+                .map(String::as_str)
+                .unwrap_or_default();
+            progress(&format!("seeding {rel} from {from}"));
+            ProvisionMode::Copy
         }
-        let Some((src, seeded)) = provision_source(paths, config, rel) else {
-            continue;
-        };
-        // Invariant 1, checked in the worktree the file lands in and
-        // immediately before the write — a seeded file is no different, and
-        // the example it comes from being tracked buys it nothing.
-        ensure_gitignored(worktree, rel)?;
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create dir {}", parent.display()))?;
+        false => config.project.provision_mode,
+    };
+    match mode {
+        ProvisionMode::Link => {
+            std::os::unix::fs::symlink(&src, &dst)
+                .with_context(|| format!("symlink {} → {}", src.display(), dst.display()))?;
+            // Said per file, and said to be a link: an edit in the worktree
+            // edits the main checkout's file.
+            progress(&format!(
+                "linked {rel} → {} (symlink; `provision_mode = \"copy\"` gives each worktree \
+                 its own)",
+                src.display()
+            ));
         }
-        // A seed is always copied, whatever the mode says. A symlink to the
-        // tracked example would make every edit inside the worktree a write
-        // into the repository, which is the invariant this whole path
-        // exists to keep.
-        let mode = match seeded {
-            true => {
-                // Every guess is visible, and this one is a file being
-                // created out of contents pando did not write: the notice
-                // names the source, so the developer can go and read it.
-                let from = config
-                    .project
-                    .provision_from
-                    .get(rel)
-                    .map(String::as_str)
-                    .unwrap_or_default();
-                progress(&format!("seeding {rel} from {from}"));
-                ProvisionMode::Copy
-            }
-            false => config.project.provision_mode,
-        };
-        match mode {
-            ProvisionMode::Link => {
-                std::os::unix::fs::symlink(&src, &dst)
-                    .with_context(|| format!("symlink {} → {}", src.display(), dst.display()))?;
-                // Said per file, and said to be a link: an edit in the
-                // worktree edits the main checkout's file.
-                progress(&format!(
-                    "linked {rel} → {} (symlink; `provision_mode = \"copy\"` gives each \
-                     worktree its own)",
-                    src.display()
-                ));
-            }
-            ProvisionMode::Copy => {
-                std::fs::copy(&src, &dst)
-                    .with_context(|| format!("copy {} → {}", src.display(), dst.display()))?;
-                if !seeded {
-                    progress(&format!("copied {rel} from {}", src.display()));
-                }
+        ProvisionMode::Copy => {
+            copy_new(&src, &dst)
+                .with_context(|| format!("copy {} → {}", src.display(), dst.display()))?;
+            if !seeded {
+                progress(&format!("copied {rel} from {}", src.display()));
             }
         }
     }
     Ok(())
+}
+
+/// Whether anything is at `path`, a link whose target is gone included:
+/// a write there would follow the link to wherever it points.
+fn is_present(path: &Path) -> bool {
+    path.symlink_metadata().is_ok()
+}
+
+/// A copy that never replaces a file: one that appeared since the check
+/// above is somebody's, and is left as it is.
+fn copy_new(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let mut from = std::fs::File::open(src)?;
+    let mut to = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dst)?;
+    std::io::copy(&mut from, &mut to)?;
+    to.set_permissions(from.metadata()?.permissions())
+}
+
+/// A provisioned path a worktree does not have and the main checkout can
+/// give it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unprovisioned {
+    /// The path, as `provision` names it: `.env`, `apps/web/.env`.
+    pub rel: String,
+    /// What it would come from: the main checkout's own file, or the
+    /// example `provision_from` names.
+    pub source: PathBuf,
+    /// Where it would go.
+    pub target: PathBuf,
+    /// Whether `new` would link it rather than copy it: `provision_mode =
+    /// "link"`, and a local file rather than an example, which is always
+    /// copied.
+    pub link: bool,
+    /// Whether the worktree's own gitignore ignores it. pando writes only
+    /// a path that is, so a command for one that is not is a file that
+    /// shows up in `git status`.
+    pub ignored: bool,
+}
+
+impl Unprovisioned {
+    /// The command that gives the worktree what `new` would have: `cp`,
+    /// or `ln -s` for a link.
+    pub fn command(&self) -> String {
+        format!(
+            "{} {} {}",
+            self.verb(),
+            crate::process::shell_word(&self.source.display().to_string()),
+            crate::process::shell_word(&self.target.display().to_string())
+        )
+    }
+
+    /// `cp` or `ln -s`.
+    pub fn verb(&self) -> &'static str {
+        match self.link {
+            true => "ln -s",
+            false => "cp",
+        }
+    }
+
+    /// What `start` says about it in a worktree pando did not create,
+    /// before it starts the app without it.
+    pub fn adopted_line(&self) -> String {
+        match self.ignored {
+            true => format!(
+                "{} is not in this worktree, and pando writes only into worktrees it created — \
+                 `{}` gives it the main checkout's",
+                self.rel,
+                self.command()
+            ),
+            false => format!(
+                "{} is not in this worktree, and this worktree's .gitignore does not ignore it, \
+                 so pando would not write it even into a worktree of its own — a copy would show \
+                 in `git status` until it is ignored there",
+                self.rel
+            ),
+        }
+    }
+}
+
+/// Every provisioned path `worktree` lacks that the main checkout can give
+/// it, in `provision`'s order. Reads, and asks git whether each is ignored
+/// there; writes nothing.
+pub fn unprovisioned(paths: &PandoPaths, config: &Config, worktree: &Path) -> Vec<Unprovisioned> {
+    config
+        .project
+        .provision_paths()
+        .iter()
+        .filter(|rel| !is_present(&worktree.join(rel)))
+        .filter_map(|rel| {
+            let (source, seeded) = provision_source(paths, config, rel)?;
+            Some(Unprovisioned {
+                rel: rel.clone(),
+                target: worktree.join(rel),
+                link: !seeded && config.project.provision_mode == ProvisionMode::Link,
+                ignored: crate::detect::is_gitignored(worktree, rel),
+                source,
+            })
+        })
+        .collect()
+}
+
+/// What `start` does about provisioned paths a worktree lacks, before
+/// anything runs in it.
+///
+/// A worktree pando created gets them, the way `new` gives them: never
+/// over anything already there, and with the gitignore check made in the
+/// worktree immediately before each write. `provision` answered after the
+/// worktree was made, or a file deleted since, is otherwise an app that
+/// starts with no `.env` and nothing saying why. One that cannot be
+/// written is said and the start goes on, as it would have without it.
+///
+/// A worktree pando did not create is never written into — Invariant 1
+/// names the worktrees pando created — so each path it lacks is said, with
+/// the command that gives it one.
+pub(super) fn provision_at_start(
+    paths: &PandoPaths,
+    config: &Config,
+    worktree: &Path,
+    created_by_pando: bool,
+    progress: &dyn Fn(&str),
+) {
+    let missing = unprovisioned(paths, config, worktree);
+    if missing.is_empty() {
+        return;
+    }
+    if !created_by_pando {
+        for path in &missing {
+            progress(&path.adopted_line());
+        }
+        return;
+    }
+    progress("provisioning");
+    for path in &missing {
+        if let Err(e) = provision_path(paths, config, worktree, &path.rel, progress) {
+            progress(&format!("{e:#} — starting without it"));
+        }
+    }
 }
 
 /// Where a provisioned path's contents come from, and whether that is the

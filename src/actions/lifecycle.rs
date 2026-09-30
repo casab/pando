@@ -31,7 +31,9 @@ use super::share::{share_closed, share_target_is_up, sweep_dead_shares_with, tak
 // Only for the intra-doc link above `sweep_orphaned_groups`.
 #[cfg(doc)]
 use super::share::sweep_dead_shares;
-use super::worktree::{Checkout, MAIN_RUNS_ONLY, find_live_checkout, find_worktree};
+use super::worktree::{
+    Checkout, MAIN_RUNS_ONLY, find_live_checkout, find_worktree, provision_at_start,
+};
 
 /// How long a process group gets to exit on its own before SIGKILL.
 pub(super) const STOP_GRACE: Duration = Duration::from_secs(5);
@@ -752,6 +754,18 @@ fn start_checked(
         for namespace in ready.iter().flat_map(|ready| &ready.namespaces) {
             namespaced::keep(record, namespace);
         }
+    }
+    // The files `provision` names, before anything runs that reads them:
+    // given to a worktree pando created that lacks one, and said of one it
+    // did not. Under the lock, as `new` gives them, so two starts do not
+    // both decide a file is missing. Not the main checkout, which is where
+    // they come from, nor a start with nothing to start.
+    if !everything_up && !main {
+        let created = store
+            .worktrees
+            .get(name)
+            .is_some_and(|record| record.created_by_pando);
+        provision_at_start(paths, config, &canonical, created, progress);
     }
     // Written down before anything is brought up: a start that fails
     // halfway must still leave `rm` able to name the compose project and

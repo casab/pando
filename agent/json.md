@@ -374,6 +374,15 @@ good.
 evidence behind it. It is the report a program should quote to a human
 rather than re-deriving.
 
+A worktree pando did not create that lacks a file `provision` names is a
+`worktrees` finding, at `note`: one per path, naming every worktree that
+lacks it. pando never writes into such a worktree, so the fix is the
+command for the developer to run — a `cp`, or an `ln -s` where
+`provision_mode` links, one loop over them all when there are several.
+Where that worktree's `.gitignore` does not ignore the path, the finding
+says so and gives no command. A worktree pando created gets a file it
+lacks at its next `start`, and is not reported.
+
 `hooks[].matches` is how many files the hook's `fingerprint` globs match
 in the main checkout — at `0` it runs on every start, and a `hooks`
 finding says so — and `null` for a hook keyed on nothing, which runs on

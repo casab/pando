@@ -324,6 +324,57 @@ fn adopting_and_removing_a_worktree_elsewhere_leaves_the_repository_untouched() 
     assert_eq!(tree(&h.root), h.baseline);
 }
 
+// A start gives a worktree pando created a provisioned file it lacks. One
+// pando did not create is never written into, whatever it lacks: the
+// start says what, and the worktree is the same tree after it.
+#[test]
+fn starting_an_adopted_worktree_never_provisions_into_it() {
+    let h = harness_with(
+        "[project]\nprovision = [\".env\", \".env.local\"]\n\n[dev]\ncmd = \"sleep 30\"\nports = []\n",
+    );
+    let worktrees = h.config.worktrees_dir(&h.paths);
+    std::fs::create_dir_all(&worktrees).unwrap();
+    let adopted = worktrees.join("adopted");
+    git(
+        &h.root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "adopted",
+            adopted.to_str().unwrap(),
+        ],
+    );
+    let before = tree(&adopted);
+    assert!(!before.contains_key(".env"), "{before:?}");
+
+    let said = std::cell::RefCell::new(Vec::<String>::new());
+    actions::start(
+        &h.paths,
+        &h.config,
+        "adopted",
+        None,
+        actions::Mode::Remembered,
+        &|line: &str| said.borrow_mut().push(line.to_string()),
+    )
+    .unwrap();
+    assert_eq!(
+        tree(&adopted),
+        before,
+        "start wrote into a worktree it did not create"
+    );
+    h.assert_untouched("start of an adopted worktree", None);
+    assert!(
+        said.borrow()
+            .iter()
+            .any(|line| line.starts_with(".env is not in this worktree")),
+        "{:?}",
+        said.borrow()
+    );
+    actions::stop(&h.paths, "adopted", None, &|_| {}).unwrap();
+}
+
 // Config is read from the repository when a team commits one, and written
 // only to pando's home. Both halves are covered here because a regression
 // would be the quietest possible invariant break.

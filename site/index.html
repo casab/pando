@@ -218,7 +218,7 @@
     <div class="split wide-left">
       <div class="rv">
         <p class="lede">pando does not invent a new kind of checkout. It drives <code>git worktree</code>, and keeps everything around it in its own home, <code>~/.pando</code>: the ports, the processes, the logs, the private services, the record of what runs where.</p>
-        <p>A worktree is an ordinary directory. You can <code>cd</code> into it, run <code>git</code> in it, open it in your editor, commit from it. pando manages every worktree <code>git worktree list</code> reports, so the ones you made by hand are listed, started and stopped too. They are marked <em>adopted</em>.</p>
+        <p>A worktree is an ordinary directory. You can <code>cd</code> into it, run <code>git</code> in it, open it in your editor, commit from it. pando manages every worktree <code>git worktree list</code> reports, so the ones you made by hand are listed, started and stopped too. They are marked <em>adopted</em>. pando never writes into one: the files <code>provision</code> names are not given to it, and <code>start</code> and <code>doctor</code> say which it lacks, with the command that copies them in.</p>
         <p>A worktree is named by its branch, <code>feat/login</code>, or by its directory, <code>feat+login</code>: a slash cannot be in a directory name, so it becomes a plus. Every command takes either spelling. Inside a worktree, <code>start</code>, <code>stop</code>, <code>restart</code>, <code>logs</code>, <code>open</code>, <code>share</code> and <code>unshare</code> need no name at all.</p>
       </div>
       <figure class="fig rv" style="margin-top:0">
@@ -243,7 +243,7 @@
       <ol class="num rv">
         <li><strong>Finds the branch.</strong> A local branch is checked out as it is. Otherwise <code>origin/feat/login</code>, fetched if it is missing, never prompting for a password. Otherwise a new branch, forked from the base: <code>--base</code>, then a matching <code>[branches].rules</code> glob, then <code>[project].base</code>, then <code>origin/HEAD</code>, <code>main</code>, <code>master</code>.</li>
         <li><strong>Checks it out.</strong> <code>git worktree add</code> into <code>~/.pando/projects/&lt;id&gt;/worktrees/feat+login</code>. The project id is the checkout's directory name and eight hex characters of a hash of its path.</li>
-        <li><strong>Provisions.</strong> The gitignored files you listed in <code>provision</code>, such as <code>.env</code>, are linked in from the main checkout. They are symlinks by default; <code>provision_mode = "copy"</code> gives each worktree its own copy. A path the project does not gitignore is refused.</li>
+        <li><strong>Provisions.</strong> The gitignored files you listed in <code>provision</code>, such as <code>.env</code>, are linked in from the main checkout. They are symlinks by default; <code>provision_mode = "copy"</code> gives each worktree its own copy. A path the project does not gitignore is refused. A worktree made before <code>provision</code> was answered, or one that lost a file since, gets it at its next <code>start</code>, never over a file that is there.</li>
         <li><strong>Installs.</strong> The project's install step, such as <code>pnpm install --frozen-lockfile</code>, runs in the new worktree, so its dependencies are its own.</li>
       </ol>
       <div class="rv">

@@ -8677,6 +8677,114 @@ fn a_missing_provision_source_is_skipped_rather_than_invented() {
     assert!(!fx.worktrees_dir().join(&name).join(".env").exists());
 }
 
+// `provision` answered after the worktree was made, or the file deleted
+// since: the app started with no `.env` and nothing said why. `start`
+// gives it, as `new` would have, and never over one that is there.
+#[test]
+fn start_gives_a_worktree_pando_created_the_provisioned_file_it_lacks() {
+    let mut fx = fixture();
+    with_dev(&mut fx, dev("sleep 30"));
+    let name = worktree_named(&fx, "feat/one");
+    let env = fx.worktrees_dir().join(&name).join(".env");
+    assert!(!env.exists(), "nothing was provisioned when it was made");
+
+    fx.config.project.provision = Some(vec![".env".to_string()]);
+    fx.config.project.provision_mode = ProvisionMode::Copy;
+    let (lines, progress) = collecting();
+    let first = start(&fx.paths, &fx.config, &name, None, &progress).unwrap();
+    drop(guard(&first));
+    assert_eq!(std::fs::read_to_string(&env).unwrap(), "SECRET=1\n");
+    let said = lines.borrow().clone();
+    assert!(said.iter().any(|l| l == "provisioning"), "{said:?}");
+    assert!(
+        said.iter().any(|l| l.starts_with("copied .env from ")),
+        "the same line `new` prints: {said:?}"
+    );
+
+    // The developer's own edit, and then a start with nothing running:
+    // what is there stays.
+    stop(&fx.paths, &name, None).unwrap();
+    std::fs::write(&env, "MINE=1\n").unwrap();
+    let (lines, progress) = collecting();
+    let second = start(&fx.paths, &fx.config, &name, None, &progress).unwrap();
+    let _guard = guard(&second);
+    assert_eq!(std::fs::read_to_string(&env).unwrap(), "MINE=1\n");
+    assert!(
+        !lines.borrow().iter().any(|l| l == "provisioning"),
+        "{:?}",
+        lines.borrow()
+    );
+}
+
+// Invariant 1 has no exception for a start: the worktree's own gitignore
+// is asked immediately before the write, and a path it does not ignore is
+// said and not written. The start goes on, as it did without the file.
+#[test]
+fn start_does_not_provision_a_path_the_worktree_does_not_ignore() {
+    let mut fx = fixture();
+    with_dev(&mut fx, dev("sleep 30"));
+    let name = worktree_named(&fx, "feat/loose");
+    let dir = fx.worktrees_dir().join(&name);
+    std::fs::write(dir.join(".gitignore"), "node_modules/\n").unwrap();
+
+    fx.config.project.provision = Some(vec![".env".to_string()]);
+    let (lines, progress) = collecting();
+    let report = start(&fx.paths, &fx.config, &name, None, &progress).unwrap();
+    let _guard = guard(&report);
+    assert!(!report.started.is_empty(), "the start went on");
+    assert!(!dir.join(".env").exists());
+    assert!(!dir.join(".env").is_symlink());
+    let said = lines.borrow().clone();
+    assert!(
+        said.iter()
+            .any(|l| l.contains("is not ignored") && l.contains("starting without it")),
+        "{said:?}"
+    );
+}
+
+// A worktree pando did not create is never written into — that is
+// Invariant 1 — so `start` says what it lacks, one line per file, with
+// the command that gives it, before the app starts without it.
+#[test]
+fn start_never_provisions_an_adopted_worktree_and_says_what_it_lacks() {
+    let mut fx = fixture();
+    with_dev(&mut fx, dev("sleep 30"));
+    fx.config.project.provision = Some(vec![".env".to_string()]);
+    let adopted = fx.worktrees_dir().join("adopted");
+    std::fs::create_dir_all(fx.worktrees_dir()).unwrap();
+    git(
+        &fx.root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "adopted",
+            adopted.to_str().unwrap(),
+        ],
+    );
+
+    let (lines, progress) = collecting();
+    let report = start(&fx.paths, &fx.config, "adopted", None, &progress).unwrap();
+    let _guard = guard(&report);
+    assert!(!adopted.join(".env").exists());
+    assert!(!adopted.join(".env").is_symlink());
+    let said = lines.borrow().clone();
+    let adopted = std::fs::canonicalize(&adopted).unwrap();
+    // Linked, as `new` would: `provision_mode` is `link` by default.
+    let command = format!(
+        "ln -s {} {}",
+        fx.root.join(".env").display(),
+        adopted.join(".env").display()
+    );
+    let line = said
+        .iter()
+        .find(|l| l.starts_with(".env is not in this worktree"))
+        .unwrap_or_else(|| panic!("{said:?}"));
+    assert!(line.contains(&command), "{line}");
+    assert!(!said.iter().any(|l| l == "provisioning"), "{said:?}");
+}
+
 /// The fixture as a fresh clone leaves it: the example is tracked and
 /// here, the local file it is an example of is gitignored and never
 /// arrived.

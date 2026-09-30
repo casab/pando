@@ -478,6 +478,21 @@ pub fn shell_quote(word: &str) -> String {
     format!("'{}'", word.replace('\'', "'\\''"))
 }
 
+/// One word of a command printed for a person to paste: as it is when
+/// nothing in it means anything to a shell, else [`shell_quote`]d. A path
+/// with no space in it reads better bare, and one with a space in it
+/// still pastes as one word.
+pub fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+' | ',' | ':' | '@')
+        });
+    match plain {
+        true => word.to_string(),
+        false => shell_quote(word),
+    }
+}
+
 /// SIGTERM to the whole group, then SIGKILL to whatever is left after
 /// `grace`. Returns once the group is empty, or once it has been SIGKILLed.
 ///
@@ -813,6 +828,15 @@ mod tests {
         assert_eq!(shell_quote("plain"), "'plain'");
         assert_eq!(shell_quote("/tmp/x y/pando"), "'/tmp/x y/pando'");
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn shell_word_quotes_only_what_a_shell_would_read() {
+        assert_eq!(shell_word("/tmp/feat+one/.env"), "/tmp/feat+one/.env");
+        assert_eq!(shell_word("/tmp/x y/.env"), "'/tmp/x y/.env'");
+        assert_eq!(shell_word(r#"{"a":1}"#), r#"'{"a":1}'"#);
+        assert_eq!(shell_word("~/x"), "'~/x'");
+        assert_eq!(shell_word(""), "''");
     }
 
     #[test]
