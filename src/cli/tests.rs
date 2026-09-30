@@ -3740,6 +3740,83 @@ fn the_contract_describes_replace_as_clap_has_it() {
     );
 }
 
+// Every answers command `doctor` prints is a file this parser takes for
+// its slot: a list at a list slot, the tables at the process list, text
+// everywhere else.
+#[test]
+fn the_answer_a_doctor_fix_prints_is_one_the_answers_file_takes() {
+    use crate::detect::{Candidate, Slot, answers_value};
+    let candidate = |value: &str| Candidate {
+        value: value.to_string(),
+        ..Candidate::default()
+    };
+    let processes = Candidate {
+        value: "api: npm run dev in apps/api".to_string(),
+        processes: Some(BTreeMap::from([(
+            "api".to_string(),
+            crate::config::ProcessConfig {
+                cmd: "npm run dev".to_string(),
+                cwd: Some("apps/api".to_string()),
+                ports: Some(crate::config::PortsSpec::List(vec!["api".to_string()])),
+                ..Default::default()
+            },
+        )])),
+        ..Candidate::default()
+    };
+    let cases = [
+        (Slot::Install, candidate("pnpm install --frozen-lockfile")),
+        (Slot::VersionFiles, candidate(".nvmrc,.tool-versions")),
+        (Slot::Provision, candidate(".env,.env.local")),
+        (Slot::DevCmd, candidate("pnpm dev")),
+        (Slot::PortEnv, candidate("RCT_METRO_PORT")),
+        (Slot::Services, candidate("postgres")),
+        (Slot::SchemaHook, candidate("pnpm prisma migrate deploy")),
+        (Slot::Base, candidate("develop")),
+        (Slot::Processes, processes),
+    ];
+    for (slot, candidate) in cases {
+        let command = crate::doctor::answers_command(slot, answers_value(slot, &candidate));
+        let file = command
+            .strip_prefix("echo '")
+            .and_then(|rest| rest.split_once("' | pando init --answers - --replace"))
+            .map(|(file, _)| file)
+            .unwrap_or_else(|| panic!("{command}"));
+        let parsed = Answers::parse(file).unwrap_or_else(|e| panic!("{slot:?}: {file}: {e:#}"));
+        let question = actions::Question {
+            slot,
+            prompt: slot.prompt().to_string(),
+            options: vec![(candidate.value.clone(), "a signal".to_string())],
+            preselect: Some(0),
+            allow_custom: slot.allows_custom(),
+            allow_none: slot.allows_none(),
+            multi: slot.is_multi(),
+            checked: Vec::new(),
+            details: Vec::new(),
+            answer_file: None,
+            snippet: String::new(),
+        };
+        let answer = parsed
+            .for_question(&question)
+            .unwrap_or_else(|| panic!("{slot:?}: {file}"))
+            .unwrap_or_else(|e| panic!("{slot:?}: {file}: {e:#}"));
+        // The option itself, not a command of the same text: what is
+        // chosen carries the roles and the tables the candidate does.
+        let chosen = match answer {
+            actions::Answer::Program(inner) => *inner,
+            other => other,
+        };
+        assert!(
+            matches!(
+                chosen,
+                actions::Answer::Choice(0)
+                    | actions::Answer::Many(_)
+                    | actions::Answer::Processes(_)
+            ),
+            "{slot:?}: {file}: {chosen:?}"
+        );
+    }
+}
+
 // The refusal an answered slot earns: exit 2's type, every slot named, and
 // the way through for each — `--replace` would only refuse the prelude again.
 #[test]

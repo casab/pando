@@ -634,6 +634,33 @@ fn split_list(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// The value `init --answers` takes for this candidate at this slot: what
+/// a command pando prints puts in the file, so that running it chooses
+/// exactly this candidate.
+///
+/// The shapes are the answers file's own: a JSON array for a list slot
+/// and for the set question, the whole process tables at the process
+/// list — its option's text is a summary, and a summary typed back is a
+/// command nobody wrote — and the option's own text everywhere else.
+pub fn answers_value(slot: Slot, candidate: &Candidate) -> serde_json::Value {
+    let strings = |values: Vec<String>| {
+        serde_json::Value::Array(values.into_iter().map(serde_json::Value::String).collect())
+    };
+    if slot.is_list() {
+        return strings(split_list(&candidate.value));
+    }
+    if slot.is_multi() {
+        return strings(vec![candidate.value.clone()]);
+    }
+    if slot == Slot::Processes
+        && let Some(tables) = &candidate.processes
+        && let Ok(value) = serde_json::to_value(tables)
+    {
+        return value;
+    }
+    serde_json::Value::String(candidate.value.clone())
+}
+
 /// Keeps the first of each repeated value: the Makefile target and the Go
 /// rule both say `go run .`, and that is one candidate, not two.
 pub(super) fn dedup_by_value(candidates: &mut Vec<Candidate>) {

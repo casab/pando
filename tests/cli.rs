@@ -4547,6 +4547,78 @@ fn doctor_names_a_detected_value_the_rules_would_not_write_now() {
     assert!(!after.contains("pando detected itself"), "{after}");
 }
 
+/// The reporter's run, end to end: an Expo app whose `dev.ports` an older
+/// pando gave the browser's role. Deleting the line, as doctor used to
+/// say, asked nothing and left Metro on 8081 in every worktree; the fix
+/// doctor prints now, run as printed, leaves nothing to report and the
+/// process with its port.
+#[test]
+fn the_command_doctor_prints_for_a_stale_port_fixes_it() {
+    let e = env();
+    std::fs::write(
+        e.root.join("package.json"),
+        r#"{"name":"shop","dependencies":{"expo":"57.0.0"},"scripts":{"start":"expo start"}}"#,
+    )
+    .unwrap();
+    std::fs::write(e.root.join("app.json"), r#"{"expo":{"slug":"shop"}}"#).unwrap();
+    e.write_config(
+        "[dev]\ncmd = \"npm run start\"  # detected: package.json scripts.start\n\
+         ports = { RCT_METRO_PORT = \"web\" }  # detected: the Expo rule\n",
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout(&e.pando(&["doctor", "--json"]))).expect("one object");
+    let fix = json["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .find(|f| {
+            f["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("dev.ports = "))
+        })
+        .and_then(|f| f["fix"].as_str())
+        .unwrap_or_else(|| panic!("{}", json["findings"]))
+        .to_string();
+    // Run as printed: the line between the backquotes, through a shell,
+    // with this test's pando first on PATH.
+    let command = fix.split('`').nth(1).unwrap_or_else(|| panic!("{fix}"));
+    assert!(
+        command.ends_with("| pando init --answers - --replace"),
+        "{command}"
+    );
+    let bin = std::path::Path::new(env!("CARGO_BIN_EXE_pando"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new("sh")
+        .args(["-c", command])
+        .current_dir(&e.root)
+        .env("PANDO_HOME", &e.home)
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert_eq!(code(&out), EXIT_OK, "{}{}", stdout(&out), stderr(&out));
+
+    let config = std::fs::read_to_string(e.config_file()).unwrap();
+    assert!(
+        config.contains(r#"ports = { RCT_METRO_PORT = "metro" }"#),
+        "{config}"
+    );
+    let out = e.pando(&["doctor"]);
+    assert_eq!(code(&out), EXIT_OK, "{}", stdout(&out));
+    assert!(
+        stdout(&out).contains("nothing to report"),
+        "{}",
+        stdout(&out)
+    );
+}
+
 /// `agent/json.md` describes the provenance comment on a config key, and
 /// it is one of the few strings in the JSON an agent is told to branch
 /// on. It documented the spelling without the `#` the note is actually

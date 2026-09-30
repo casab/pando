@@ -64,6 +64,7 @@ pub use report::{
 };
 use runtime::runtime_report;
 use services::services_report;
+pub use stale::answers_command;
 use stale::stale_detection_findings;
 use tools::tools_report;
 pub use validate::nothing_to_run_fix;
@@ -103,7 +104,7 @@ pub fn run_on(paths: &PandoPaths, machine: &Machine<'_>) -> Report {
 
     let config_report = config_report(paths, error, warnings, &mut findings);
     validate_config(paths, &config, &mut findings);
-    stale_detection_findings(paths, &config_report, &mut findings);
+    stale_detection_findings(paths, &config, &config_report, &mut findings);
     let project = project_report(paths, &config, &mut findings);
     let runtime = runtime_report(paths, &config, machine, &mut findings);
     let tools = tools_report(paths, &config, machine, &mut findings);

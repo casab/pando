@@ -493,6 +493,72 @@ fn a_stale_line_a_higher_layer_answers_over_is_not_reported() {
     assert!(stale(&report).is_none(), "{:?}", messages(&report));
 }
 
+/// An Expo app, as its template makes one: the dev server is the `start`
+/// script.
+fn write_expo_app(dir: &Path) {
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{"name":"shop","dependencies":{"expo":"57.0.0"},"scripts":{"start":"expo start"}}"#,
+    )
+    .expect("package.json");
+    std::fs::write(dir.join("app.json"), r#"{"expo":{"slug":"shop"}}"#).expect("app.json");
+}
+
+// The reporter's case: the role an older pando gave Metro's port. The
+// fix said to delete the line and let the next command ask — but a
+// `[dev]` whose command is still there has answered its ports, so
+// nothing asked, and Metro ran on 8081 in every worktree. The fix is the
+// command that writes what the rules offer now.
+#[test]
+fn a_stale_port_beside_its_command_is_fixed_by_the_answer_not_by_deleting_it() {
+    let fx = fixture();
+    write_expo_app(&fx.root);
+    write_project_config(
+        &fx,
+        "[dev]\ncmd = \"npm run start\"  # detected: package.json scripts.start\n\
+         ports = { RCT_METRO_PORT = \"web\" }  # detected: the Expo rule\n",
+    );
+    let report = report(&fx);
+    let finding = stale(&report).unwrap_or_else(|| panic!("{:?}", messages(&report)));
+    assert!(
+        finding.message.starts_with("dev.ports = "),
+        "{}",
+        finding.message
+    );
+    let fix = finding.fix.as_deref().expect("a fix");
+    assert!(
+        fix.contains(
+            r#"`echo '{"port_env":"RCT_METRO_PORT"}' | pando init --answers - --replace`"#
+        ),
+        "{fix}"
+    );
+    assert!(fix.contains(r#"{ RCT_METRO_PORT = "metro" }"#), "{fix}");
+    assert!(
+        !fix.contains("delete that line"),
+        "deleting it asks nothing: {fix}"
+    );
+}
+
+// Where taking the line out does reopen the question, both ways are
+// given.
+#[test]
+fn a_stale_command_can_be_answered_again_or_deleted() {
+    let fx = fixture();
+    write_makefile(&fx, GUARDED_MAKEFILE);
+    write_project_config(
+        &fx,
+        &format!("[dev]\ncmd = '{LIFTED_GUARD}'  # detected: the dev target\n"),
+    );
+    let report = report(&fx);
+    let finding = stale(&report).unwrap_or_else(|| panic!("{:?}", messages(&report)));
+    let fix = finding.fix.as_deref().expect("a fix");
+    assert!(
+        fix.contains(r#"`echo '{"dev_cmd":"make dev"}' | pando init --answers - --replace`"#),
+        "{fix}"
+    );
+    assert!(fix.contains("delete that line"), "{fix}");
+}
+
 #[test]
 fn a_project_layer_that_does_not_load_is_the_headline_problem() {
     let fx = fixture();

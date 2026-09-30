@@ -363,8 +363,11 @@ finding in the `config` section, at `note`. pando asks each question once
 and never asks again, so a value an older rule wrote survives every
 improvement to that rule — and so does a value that was right until the
 repository changed under it. The finding names the key, the file, what it
-holds, and what the rules offer for that key instead; the fix is to delete
-the line, which is what makes the next command that needs it ask again.
+holds, and what the rules offer for that key instead. The fix is the
+`pando init --answers - --replace` command that writes the first of them,
+where that question's answer is what the key holds; and deleting the line
+where that makes the next command that needs it ask again — not always:
+a `[dev]` whose command is still there has answered its ports.
 pando never rewrites the value itself. A value marked `# answered:` is
 never reported: that is a decision, by a person or by a program, and pando
 does not second-guess decisions — so a deliberate answer closes this for
