@@ -365,9 +365,12 @@ improvement to that rule — and so does a value that was right until the
 repository changed under it. The finding names the key, the file, what it
 holds, and what the rules offer for that key instead. The fix is the
 `pando init --answers - --replace` command that writes the first of them,
-where that question's answer is what the key holds; and deleting the line
-where that makes the next command that needs it ask again — not always:
-a `[dev]` whose command is still there has answered its ports.
+where that question's answer is what the key holds — for a key under a
+process table, the command replaces every process table in pando's own
+file, and the fix says so; for a service or a hook, whose answer is one
+entry of a set, there is none — and deleting the line where that makes
+the next command that needs it ask again — not always: a `[dev]` whose
+command is still there has answered its ports.
 pando never rewrites the value itself. A value marked `# answered:` is
 never reported: that is a decision, by a person or by a program, and pando
 does not second-guess decisions — so a deliberate answer closes this for

@@ -672,6 +672,43 @@ fn a_stale_command_can_be_answered_again_or_deleted() {
     assert!(fix.contains("delete that line"), "{fix}");
 }
 
+// The process list's answer is every process table at once, and
+// `--replace` takes them all away before it writes: a process added by
+// hand beside the stale one goes too. The fix says so rather than
+// promising one line.
+#[test]
+fn a_stale_process_key_says_its_command_replaces_every_process_table() {
+    let fx = fixture();
+    std::fs::create_dir_all(fx.root.join("apps/mobile")).expect("app dir");
+    write_expo_app(&fx.root.join("apps/mobile"));
+    std::fs::create_dir_all(fx.root.join("backend")).expect("backend dir");
+    std::fs::write(
+        fx.root.join("backend/package.json"),
+        r#"{"name":"backend","scripts":{"dev":"tsx watch src/index.ts"},"dependencies":{"express":"5"}}"#,
+    )
+    .expect("package.json");
+    write_project_config(
+        &fx,
+        "[processes.mobile]\ncmd = \"npm run start --old\"  # detected: package.json scripts.start\n\
+         cwd = \"apps/mobile\"\nports = [\"mobile\"]\n\n\
+         [processes.worker]\ncmd = \"sleep 100\"\nports = []\n",
+    );
+    let report = report(&fx);
+    let finding = stale(&report).unwrap_or_else(|| panic!("{:?}", messages(&report)));
+    assert!(
+        finding.message.starts_with("processes.mobile.cmd = "),
+        "{}",
+        finding.message
+    );
+    let fix = finding.fix.as_deref().expect("a fix");
+    assert!(fix.contains("| pando init --answers - --replace`"), "{fix}");
+    assert!(
+        fix.contains("replaces every process table in") && fix.contains("added to them by hand"),
+        "{fix}"
+    );
+    assert!(!fix.contains("in its place"), "{fix}");
+}
+
 #[test]
 fn a_project_layer_that_does_not_load_is_the_headline_problem() {
     let fx = fixture();

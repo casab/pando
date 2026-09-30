@@ -121,11 +121,25 @@ pub(super) fn stale_detection_findings(
             .iter()
             .find(|offer| replaces(paths, layer, &key.key, offer.slot))
             .map(|offer| {
-                format!(
-                    "`{}` writes {} in its place",
-                    answers_command(offer.slot, offer.answer.clone()),
-                    offer.text
-                )
+                let command = answers_command(offer.slot, offer.answer.clone());
+                match offer.slot.key() {
+                    Some(_) => format!("`{command}` writes {} in its place", offer.text),
+                    // The process list's answer is whole tables, and a
+                    // replacement takes every one of them away first: a
+                    // process added by hand, or a key added to one, goes
+                    // with it. Said, so "in its place" is not a promise
+                    // about one line.
+                    None => format!(
+                        "`{command}` replaces every process table in {} with the ones the rules \
+                         offer now ({}), and anything added to them by hand goes with them",
+                        layer.path,
+                        offer
+                            .answer
+                            .as_object()
+                            .map(|tables| tables.keys().cloned().collect::<Vec<_>>().join(", "))
+                            .unwrap_or_default()
+                    ),
+                }
             });
         let delete = reopens(config, layer, &key.key, merged).then(|| {
             format!(
@@ -160,9 +174,9 @@ pub(super) fn stale_detection_findings(
 ///
 /// Only where `key` is that slot's own: the dev command's rule writes
 /// `dev.ports` beside `dev.cmd`, and a replaced command leaves a `ports`
-/// already there as it is. A slot whose answer is whole tables replaces
-/// every key under them, but only in pando's own layer — `--replace`
-/// refuses tables a file beneath it declares. The prelude it never
+/// already there as it is. The process list, whose answer is whole
+/// tables, replaces every key under them, but only in pando's own layer —
+/// `--replace` refuses tables a file beneath it declares. The prelude it never
 /// replaces: only a person changes it.
 fn replaces(paths: &PandoPaths, layer: &LayerReport, key: &str, slot: Slot) -> bool {
     if slot.layer() != crate::config::Layer::Project {
@@ -170,6 +184,12 @@ fn replaces(paths: &PandoPaths, layer: &LayerReport, key: &str, slot: Slot) -> b
     }
     if slot.key().is_some() {
         return owns(slot, key);
+    }
+    // Of the slots whose answer is whole tables, only the process list's
+    // candidate is the whole answer. A service or a hook is one entry of a
+    // set, and the set replaced by that one entry loses every other.
+    if slot != Slot::Processes {
+        return false;
     }
     let own_layer = layer.path == paths.config_file().display().to_string();
     own_layer
