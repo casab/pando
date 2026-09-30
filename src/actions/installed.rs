@@ -116,6 +116,57 @@ impl InstalledBuild {
     pub fn stale(&self) -> bool {
         matches!((self.sdk, self.expected_sdk), (Some(built), Some(needed)) if built != needed)
     }
+
+    /// What `status` says of a [stale](InstalledBuild::stale) build, and
+    /// why `open` does not open the app in it: the SDKs, and the command
+    /// that replaces it.
+    pub fn mismatch(&self) -> Option<String> {
+        let (Some(sdk), Some(needed)) = (self.sdk, self.expected_sdk) else {
+            return None;
+        };
+        (sdk != needed).then(|| {
+            format!(
+                "the development build on {} is SDK {sdk} and this worktree needs SDK {needed} \
+                 — `{}` in the app's directory builds its own",
+                self.device, self.build
+            )
+        })
+    }
+}
+
+/// The device apps `open` is about to open, as their development builds
+/// on the booted simulators leave them: each one's links, with the scheme
+/// a build installed for it fills in where the app's own config does not
+/// say it, and, apart, each app not to open, with why: its build there
+/// was made for another SDK, and would crash on this worktree's
+/// JavaScript.
+///
+/// The simulators are looked at once, for all of them; a machine with
+/// none booted, or no xcrun, leaves the links as they were.
+pub fn openable_apps(
+    paths: &PandoPaths,
+    config: &Config,
+    record: &WorktreeRecord,
+    apps: Vec<(String, frameworks::AppLinks)>,
+) -> (Vec<(String, frameworks::AppLinks)>, Vec<String>) {
+    let installed = installed_builds(config, record, &Simulators::new(paths));
+    if installed.is_empty() {
+        return (apps, Vec::new());
+    }
+    let mut filled = super::device::app_links_installed(config, record, &installed);
+    let mut refused = Vec::new();
+    let apps = apps
+        .into_iter()
+        .filter_map(|(process, links)| {
+            if let Some(why) = installed.get(&process).and_then(InstalledBuild::mismatch) {
+                refused.push(format!("{process}: {why}"));
+                return None;
+            }
+            let links = filled.remove(&process).unwrap_or(links);
+            Some((process, links))
+        })
+        .collect();
+    (apps, refused)
 }
 
 /// Each running device app's development build on a booted simulator, by
@@ -155,7 +206,10 @@ pub fn installed_builds(
                     scheme: found
                         .value(device.scheme.key)
                         .and_then(|name| device.scheme.of(name)),
-                    build: device.native.simulator_build().replace("{port}", &app.port.to_string()),
+                    build: device
+                        .native
+                        .simulator_build()
+                        .replace("{port}", &app.port.to_string()),
                 })
                 .collect();
             let chosen = builds

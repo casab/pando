@@ -46,7 +46,7 @@ pub use init::{
     ALL_SLOTS, InitReport, SlotSummary, init, init_dry_run, machine_evidence,
     machine_evidence_from, machine_evidence_script, runs_nothing, slot_value,
 };
-pub use installed::{InstalledBuild, Simulators, installed_builds};
+pub use installed::{InstalledBuild, Simulators, installed_builds, openable_apps};
 pub use lifecycle::{
     Mode, StartReport, StartedProcess, StopAllReport, StopOutcome, process_names,
     refuse_only_on_a_mode_change, restart, start, stop, stop_all, stop_all_listed, stop_all_with,

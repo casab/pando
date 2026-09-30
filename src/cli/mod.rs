@@ -971,12 +971,21 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
                 open::Opening::Url(url) => url,
                 // A browser at Metro's root shows nothing anybody wants:
                 // the app it serves is opened where it runs.
-                open::Opening::Apps { apps, said } => {
+                open::Opening::Apps {
+                    apps,
+                    said,
+                    refused,
+                } => {
                     for line in said {
                         writeln!(out, "{line}")?;
                     }
                     out.flush()?;
-                    return open::open_apps(paths, &apps, &mut out, &notice);
+                    open::open_apps(paths, &apps, &mut out, &notice)?;
+                    // Opened, it would crash on this worktree's JavaScript.
+                    if !refused.is_empty() {
+                        anyhow::bail!("{}", refused.join("\n"));
+                    }
+                    return Ok(());
                 }
             };
             // Printed first, so the URL is there to copy even when there is

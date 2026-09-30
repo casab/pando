@@ -589,9 +589,10 @@ impl App {
     /// whose app a device runs: on the booted simulator, a connected
     /// Android device, or a simulator it starts, as `pando open` does.
     fn open_device_apps(&mut self, name: &str, label: &str) {
-        let Some(record) = self.record_for(name) else {
+        let Some(record) = self.record_for(name).cloned() else {
             return;
         };
+        let record = &record;
         let read = |device: &crate::catalog::frameworks::Device, dir: &std::path::Path| {
             self.app_manifests
                 .borrow_mut()
@@ -629,22 +630,33 @@ impl App {
         }
         self.app_opening = true;
         self.set_progress(format!("opening {label}'s app"));
-        self.spawn_app_open(label, apps);
+        let record = record.clone();
+        self.spawn_app_open(label, record, apps);
     }
 
     /// Opens each app on a worker thread: finding a simulator, starting
     /// one and waiting for it to boot take up to minutes. Each wait is
-    /// said as progress, and the end as a success or an error.
+    /// said as progress, and the end as a success or an error. The
+    /// simulators' installed builds are read there too, as `pando open`
+    /// reads them: one fills a scheme the app's config computes, and one
+    /// made for another SDK is not opened.
     #[cfg(not(test))]
     fn spawn_app_open(
         &mut self,
         label: &str,
+        record: crate::state::WorktreeRecord,
         apps: Vec<(String, crate::catalog::frameworks::AppLinks)>,
     ) {
         let paths = self.paths.clone();
+        let config = self.config.clone();
         let tx = self.event_tx.clone();
         let label = label.to_string();
         thread::spawn(move || {
+            let (apps, refused) = actions::openable_apps(&paths, &config, &record, apps);
+            if let Some(why) = refused.first() {
+                let _ = tx.send(AppEvent::AppOpened(Err(format!("{label}'s {why}"))));
+                return;
+            }
             let run = |command: &str| actions::run_command(&paths, command);
             let opener = actions::Opener::new(&run);
             let say = |line: &str| {
@@ -680,6 +692,7 @@ impl App {
     fn spawn_app_open(
         &mut self,
         _label: &str,
+        _record: crate::state::WorktreeRecord,
         apps: Vec<(String, crate::catalog::frameworks::AppLinks)>,
     ) {
         self.opened_apps = apps.into_iter().map(|(_, links)| links.url).collect();

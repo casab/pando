@@ -550,16 +550,11 @@ fn status_lines<W: Write>(
             }
             // A build on the simulator made for another SDK: the bundle
             // this Metro serves calls into native code it lacks.
-            if let Some(build) = installed.get(name).filter(|build| build.stale())
-                && let (Some(sdk), Some(needed)) = (build.sdk, build.expected_sdk)
-            {
+            if let Some(mismatch) = installed.get(name).and_then(|build| build.mismatch()) {
                 let row = format!(
-                    "  {}  {:<PHASE_CELL$}  the development build on {} is SDK {sdk} and this \
-                     worktree needs SDK {needed} — `{}` in the app's directory builds its own",
+                    "  {}  {:<PHASE_CELL$}  {mismatch}",
                     pad(name, process_width),
                     "build",
-                    build.device,
-                    build.build,
                 );
                 writeln!(out, "{}", ellipsize_end(&row, width))?;
             }

@@ -1718,14 +1718,15 @@ fn status_opens_an_app_with_the_development_client_in_its_development_build() {
         "{text}"
     );
 
-    // Configured in `app.config.ts` alone, the slug is not known: `open`
-    // runs nothing for a link that holds `exp+<slug>`, which no build
-    // registers, and prints the commands to fill in.
+    // Configured in an `app.config.ts` that computes it, with no build on
+    // a simulator, the slug is not known: `open` runs nothing for a link
+    // that holds `exp+<slug>`, which no build registers, and prints the
+    // commands to fill in.
     let app = record.path.join("apps/mobile");
     std::fs::remove_file(app.join("app.json")).unwrap();
     std::fs::write(
         app.join("app.config.ts"),
-        "export default { slug: 'DriveeSafeCall' };\n",
+        "export default { slug: process.env.APP_SLUG };\n",
     )
     .unwrap();
     let config: Config = toml::from_str(MOBILE_BY_VARIABLE).unwrap();
@@ -1743,9 +1744,10 @@ fn status_opens_an_app_with_the_development_client_in_its_development_build() {
     assert_eq!(
         text.lines().collect::<Vec<_>>(),
         [
-            "mobile: no app.json in its directory names its expo.slug, so the scheme its \
-             development build registers is not known: `exp+<slug>` stands for it — filled \
-             in, this opens its app in its development build:"
+            "mobile: neither its app.json nor a `slug: \"…\"` literal in its config's code \
+             names its expo.slug, and no build of it is on a booted simulator, so the scheme \
+             its development build registers is not known: `exp+<slug>` stands for it — \
+             filled in, this opens its app in its development build:"
                 .to_string(),
             format!("  on the booted iOS simulator: {}", links.simulator),
             format!(
@@ -2078,6 +2080,81 @@ fn status_opens_an_app_that_computes_its_slug_in_the_build_installed_for_it() {
     assert!(!calls.exists(), "xcrun was asked with no Metro running");
 }
 
+// `open` reads the booted simulator the way `status` does: a build made
+// for the worktree's SDK fills the scheme a computed config leaves out,
+// and one made for another SDK is not opened, since it would crash on
+// this worktree's JavaScript; the refusal gives the build that replaces
+// it.
+#[test]
+fn open_takes_the_installed_builds_scheme_and_refuses_one_for_another_sdk() {
+    let fx = fixture();
+    let name = with_mobile_app(&fx, MOBILE_BY_VARIABLE);
+    let config: Config = toml::from_str(MOBILE_BY_VARIABLE).unwrap();
+    let record = crate::state::load(&fx.paths.state_file())
+        .unwrap()
+        .worktrees[&name]
+        .clone();
+    let app = record.path.join("apps/mobile");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(
+        app.join("app.config.ts"),
+        "const base = \"DriveeSafeCall\";\nexport default { slug: process.env.APP_SLUG ?? base };\n",
+    )
+    .unwrap();
+    std::fs::write(
+        app.join("package.json"),
+        r#"{ "dependencies": { "expo": "~57.0.0", "expo-dev-client": "~6.0.0" } }"#,
+    )
+    .unwrap();
+    let named = super::names::target_named(&fx.paths, Some("feat/one"), "open").unwrap();
+    let booted = fx._dir.path().join("sim-booted");
+    fake_xcrun(
+        &fx.paths,
+        &simctl_listing(&[("iPhone 17 Pro", "Booted", &booted)]),
+    );
+
+    simulator_with(
+        &booted,
+        &[(
+            "DriveeSafeCall",
+            Some(embedded("DriveeSafeCall", "com.example.drivee", "57.0.0")),
+        )],
+    );
+    let super::open::Opening::Apps { apps, refused, .. } =
+        super::open::url_to_open(&fx.paths, &config, &named, Want::App).unwrap()
+    else {
+        panic!("no apps to open");
+    };
+    assert_eq!(refused, Vec::<String>::new());
+    assert_eq!(
+        apps[0].1.url,
+        "exp+driveesafecall://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A18081"
+    );
+    assert_eq!(apps[0].1.unknown, None);
+
+    std::fs::remove_dir_all(&booted).unwrap();
+    simulator_with(
+        &booted,
+        &[(
+            "DriveeSafeCall",
+            Some(embedded("DriveeSafeCall", "com.example.drivee", "55.0.0")),
+        )],
+    );
+    let super::open::Opening::Apps { apps, refused, .. } =
+        super::open::url_to_open(&fx.paths, &config, &named, Want::App).unwrap()
+    else {
+        panic!("no apps to open");
+    };
+    assert!(apps.is_empty(), "{apps:?}");
+    assert_eq!(
+        refused,
+        [
+            "mobile: the development build on iPhone 17 Pro is SDK 55 and this worktree needs SDK \
+          57 — `npx expo run:ios --port 18081` in the app's directory builds its own"
+        ]
+    );
+}
+
 // xcrun that fails, prints nonsense or stalls is nothing known: no build,
 // no line, and the stall costs no more than its deadline.
 #[test]
@@ -2240,6 +2317,7 @@ fn open_opens_the_app_of_a_worktree_that_serves_no_page() {
         super::open::Opening::Apps {
             apps: vec![("mobile".to_string(), links.clone())],
             said: Vec::new(),
+            refused: Vec::new(),
         }
     );
 
@@ -2296,6 +2374,7 @@ fn open_opens_the_app_of_a_worktree_that_serves_no_page() {
                     .to_string(),
                 "worker: its settings say `page = false`".to_string(),
             ],
+            refused: Vec::new(),
         }
     );
 }
@@ -2325,6 +2404,7 @@ fn open_app_opens_the_app_beside_a_page() {
                 actions::app_links(&config, &record)["mobile"].clone()
             )],
             said: Vec::new(),
+            refused: Vec::new(),
         }
     );
 

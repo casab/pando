@@ -551,9 +551,10 @@ the one the worktree needs, from its installed `expo` package, else
 its `package.json`; either is `null` when unknown. When the two differ,
 the build loads this worktree's JavaScript and fails on native code it
 lacks (`Property 'MessageQueue' doesn't exist`, say): `build`, run in the
-app's directory, replaces it, and `status` says so under the process.
-When the app's config names no slug, the build's slug fills
-`development_build`, unless the build was made for another SDK.
+app's directory, replaces it, and `status` says so under the process;
+`pando open` and the TUI's `o` do not open the app in it, and give that
+command instead (`open` exits 1). When the app's config names no slug, the build's slug
+fills `development_build`, unless the build was made for another SDK.
 
 `share.url` is the public URL. **No cookie is ever in this shape**, even
 when the share is behind an auth command.

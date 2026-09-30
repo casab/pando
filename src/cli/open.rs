@@ -28,9 +28,13 @@ pub(super) enum Opening {
     Url(String),
     /// Open these apps, by process, on a simulator or a device, after
     /// saying `said`: what else of the worktree serves no page, and why.
+    /// Then refuse `refused`: apps whose development build on the booted
+    /// simulator was made for another SDK, with the command that replaces
+    /// it.
     Apps {
         apps: Vec<(String, AppLinks)>,
         said: Vec<String>,
+        refused: Vec<String>,
     },
 }
 
@@ -101,9 +105,11 @@ pub(super) fn url_to_open(
                     ),
                 }
             }
+            let (apps, refused) = actions::openable_apps(paths, config, record, apps);
             Ok(Opening::Apps {
                 apps,
                 said: Vec::new(),
+                refused,
             })
         }
         Some(_) => {
@@ -147,7 +153,12 @@ pub(super) fn url_to_open(
                     said.push(format!("{process}: its settings say `page = false`"));
                 }
             }
-            Ok(Opening::Apps { apps, said })
+            let (apps, refused) = actions::openable_apps(paths, config, record, apps);
+            Ok(Opening::Apps {
+                apps,
+                said,
+                refused,
+            })
         }
     }
 }

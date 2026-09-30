@@ -253,11 +253,20 @@ impl Device {
             false => (self.client, fill(self.url)),
         };
         let unknown = (app.development_client && app.scheme.is_none()).then(|| {
+            let key = self.scheme.key.last().copied().unwrap_or("name");
+            let path: Vec<&str> = self
+                .scheme
+                .root
+                .iter()
+                .chain(self.scheme.key)
+                .copied()
+                .collect();
             format!(
-                "no {} in its directory names its {}, so the scheme its development build \
-                 registers is not known: `{}` stands for it",
+                "neither its {} nor a `{key}: \"…\"` literal in its config's code names its {}, \
+                 and no build of it is on a booted simulator, so the scheme its development \
+                 build registers is not known: `{}` stands for it",
                 self.scheme.manifest,
-                self.scheme.key.join("."),
+                path.join("."),
                 self.scheme.placeholder()
             )
         });
@@ -747,7 +756,8 @@ mod tests {
         assert_eq!(
             links.unknown.as_deref(),
             Some(
-                "no app.json in its directory names its expo.slug, so the scheme its \
+                "neither its app.json nor a `slug: \"…\"` literal in its config's code names \
+                 its expo.slug, and no build of it is on a booted simulator, so the scheme its \
                  development build registers is not known: `exp+<slug>` stands for it"
             )
         );

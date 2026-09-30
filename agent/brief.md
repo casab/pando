@@ -641,7 +641,8 @@ page = false                          # no browser opens it; Metro's is the defa
   the worktree's crashes on this worktree's JavaScript (`Property
   'MessageQueue' doesn't exist`, say): `status` reads the build off the
   booted simulator and says so, with the command that replaces it
-  (`app.installed` in `--json`). A branch that changes the app's native
+  (`app.installed` in `--json`), and `pando open` gives that command
+  rather than opening the app in it. A branch that changes the app's native
   code (`ios/`, `android/`, a local module's, or `app.json`/`app.config.*`)
   needs a build of its own: `status` says so under the process, with the
   `npx expo run:ios --port <port>` and `npx expo run:android --port
