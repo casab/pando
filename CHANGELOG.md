@@ -20,6 +20,36 @@ may change behaviour.
 - The README's Get started is five steps that work as written, and
   Install lists every tool pando can use, what needs it, and how to get
   it on macOS and on Linux.
+- `pando open` and the TUI's `o` open an Expo app rather than printing
+  how ([#5]): on the booted iOS simulator, else on a connected Android
+  device or emulator (`adb reverse`, then the link), else, on a Mac, in
+  a simulator pando starts (Simulator.app, or DeviceHub.app from Xcode
+  27) and waits for. What runs is the command `status` prints. `pando
+  open --app` opens the app of a worktree that also serves a page, a
+  backend beside a mobile app. A link whose scheme is not known is never
+  run.
+- `pando status` gives the Android command beside the simulator's
+  (`app.android` in `--json`), and says when the development build on
+  the booted simulator was made for another Expo SDK than the
+  worktree's, with the build that replaces it (`app.installed`) ([#5]).
+  `open` gives that build instead of opening an app that would crash.
+  The simulator is read from its disk; nothing is booted or run.
+- The development build's scheme comes from a `slug: "…"` literal in
+  `app.config.*` when there is no `app.json`, and from the app's build
+  on a booted simulator when the config computes it ([#5]). pando never
+  runs the config.
+- Everything `pando check` runs, its processes, hooks and install, gets
+  `PANDO_CHECK=1`, so a process can tell a check from a real start
+  ([#5]).
+- `pando start` gives a worktree pando made a `provision` file it lacks,
+  never over one it has ([#5]). A worktree pando did not make is never
+  written to: `start` and `doctor` name the file it lacks and the `cp`
+  or `ln -s` that supplies it, one command for all the worktrees that
+  lack the same file.
+- `pando doctor` names a process with no `ports` that runs a server
+  taking its port from a variable or a flag, such as Metro, which then
+  binds its default port in every worktree ([#5]). Its fix is the
+  command or the line that gives it one.
 
 ### Changed
 
@@ -29,6 +59,20 @@ may change behaviour.
   to put in its table, at twice the wait it had. A cold build, a JVM,
   a server that waits for its database or a slow name lookup is only
   slow, and the timeout never said what to change.
+
+### Fixed
+
+- The build `pando status` gives for a branch that changes native code
+  is `npx expo run:ios --port <metro port>`, and
+  `npx expo run:android --port <metro port>` beside it ([#5]). Expo
+  refused the old one: `--port` and `--no-bundler` do not go together.
+  With `--port` alone it reuses the worktree's running Metro.
+  `status --json` keeps `native.build` and adds `native.builds`.
+- `pando doctor`'s note on a value pando detected and would not detect
+  now gives a command that fixes it, `echo '{"port_env":"RCT_METRO_PORT"}'
+  | pando init --answers - --replace` say, and says "delete that line"
+  only where that asks the question again ([#5]). Deleting `dev.ports`
+  beside a `dev.cmd` asked nothing, and Metro ran on 8081 everywhere.
 
 ## 0.6.1 — 2026-09-29
 
