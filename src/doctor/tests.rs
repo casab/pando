@@ -628,6 +628,19 @@ fn a_process_whose_framework_takes_a_flag_is_given_the_command_with_it() {
         ),
         "{fix}"
     );
+
+    // A command that hands its script arguments already has npm's `--`.
+    write_project_config(&fx, "[dev]\ncmd = \"npm run dev -- --host\"\n");
+    let again = self::report(&fx);
+    let found = portless(&again);
+    let [finding] = found.as_slice() else {
+        panic!("{:?}", messages(&again));
+    };
+    let fix = finding.fix.as_deref().expect("a fix");
+    assert!(
+        fix.contains(r#"{"dev_cmd":"npm run dev -- --host --port {port:web}"}"#),
+        "{fix}"
+    );
 }
 
 // Said, not guessed at: `ports = []` is a process that has none, a

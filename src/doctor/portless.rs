@@ -81,9 +81,15 @@ pub fn portless_processes(paths: &PandoPaths, config: &Config) -> Vec<Portless> 
             }
             (PortMechanism::InCommand, Some(flag)) => {
                 let flag = flag.replace("{port}", &format!("{{port:{role}}}"));
+                // npm's `-- ` once: a command that hands the script
+                // arguments already has it, and a second would reach the
+                // server as an argument of its own.
+                let separated = process.cmd.split_whitespace().any(|word| word == "--");
                 let cmd = match served.script {
-                    Some(_) => format!("{} {}{flag}", process.cmd.trim(), served.script_args),
-                    None => format!("{} {flag}", process.cmd.trim()),
+                    Some(_) if !separated => {
+                        format!("{} {}{flag}", process.cmd.trim(), served.script_args)
+                    }
+                    _ => format!("{} {flag}", process.cmd.trim()),
                 };
                 match lone_dev {
                     true => format!(
