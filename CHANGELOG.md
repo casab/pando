@@ -7,6 +7,8 @@ may change behaviour.
 
 ## Unreleased
 
+## 0.6.2 — 2026-09-30
+
 ### Added
 
 - `pando doctor` says how to get each tool it did not find: a line

@@ -115,6 +115,21 @@ has no URL and `open` prints the app's link), no packaged builds in
 `provision`, an `--answers` value over a decided guess, and `status`
 naming a branch's native changes.
 
+On 2026-09-30 the same reporter ran 0.6.1 through the whole mobile
+loop, and 0.6.2 was built and tagged with what they found: the native
+builds `status` gives are `npx expo run:ios|android --port <port>`
+(Expo refuses `--no-bundler` beside `--port`); `open` and the TUI's `o`
+open the app (`actions::open_app`: a booted simulator, an Android
+device, or a simulator app it starts, Simulator.app or Xcode 27's
+DeviceHub.app); `status` reads the booted simulator's installed build
+(`actions::installed_builds`) and says when it is for another SDK; the
+slug comes from a literal in `app.config.*` or that build;
+`PANDO_CHECK=1` under `check`; `start` provisions a worktree pando made
+and names what an adopted one lacks (Invariant 1 keeps pando out of
+those); and doctor's fixes for a stale port and a server with no port
+are commands that work. Nothing of it has run on a real simulator or
+emulator; the tests use stand-ins.
+
 What is left is not a phase. `plans/open-follow-ups.md` carries the known
 edges, each with who found it and where it belongs, and the rest of the
 launch checklist in `docs/08-roadmap.md` is open: no published crate, no
