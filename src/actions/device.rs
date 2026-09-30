@@ -9,6 +9,7 @@ use crate::catalog::frameworks::{self, AppLinks, AppManifest, Device};
 use crate::config::Config;
 use crate::state::WorktreeRecord;
 
+use super::installed::InstalledBuild;
 use super::services::observed_port_for_role;
 
 /// The address the links name. The iOS simulator shares this machine's;
@@ -40,6 +41,30 @@ pub fn app_links_with(
             let links = app
                 .device
                 .links(HOST, app.port, &read(app.device, &app.dir));
+            (app.name.to_string(), links)
+        })
+        .collect()
+}
+
+/// [`app_links`], with the scheme of an app whose config does not say it
+/// taken from its development build on a booted simulator, from
+/// [`super::installed_builds`]: the scheme that build registers, unless
+/// it was made for another SDK and needs replacing first.
+pub fn app_links_installed(
+    config: &Config,
+    record: &WorktreeRecord,
+    installed: &BTreeMap<String, InstalledBuild>,
+) -> BTreeMap<String, AppLinks> {
+    device_processes(config, record)
+        .into_iter()
+        .map(|app| {
+            let mut manifest = read_manifest(app.device, &app.dir);
+            if manifest.scheme.is_none()
+                && let Some(build) = installed.get(app.name).filter(|build| !build.stale())
+            {
+                manifest.scheme = build.scheme.clone();
+            }
+            let links = app.device.links(HOST, app.port, &manifest);
             (app.name.to_string(), links)
         })
         .collect()
@@ -134,15 +159,15 @@ fn changed_since(dir: &Path, base: &str) -> Option<Vec<String>> {
 }
 
 /// A process whose app a device runs, as the worktree holds it.
-struct DeviceProcess<'a> {
-    name: &'a str,
-    device: &'static Device,
+pub(super) struct DeviceProcess<'a> {
+    pub(super) name: &'a str,
+    pub(super) device: &'static Device,
     /// Its bundler's port: the one it listens on, else the one assigned.
-    port: u16,
+    pub(super) port: u16,
     /// Its directory, as config names it relative to the worktree.
     cwd: Option<&'a str>,
     /// And where that is.
-    dir: PathBuf,
+    pub(super) dir: PathBuf,
 }
 
 /// Every process the settings run whose framework's app runs on a device,
@@ -151,7 +176,10 @@ struct DeviceProcess<'a> {
 /// Recognised from the settings and the catalog alone, the way
 /// `setup::device_note` recognises one: by the framework's port variable
 /// or its server in the command.
-fn device_processes<'a>(config: &'a Config, record: &WorktreeRecord) -> Vec<DeviceProcess<'a>> {
+pub(super) fn device_processes<'a>(
+    config: &'a Config,
+    record: &WorktreeRecord,
+) -> Vec<DeviceProcess<'a>> {
     config
         .runnable_processes()
         .filter_map(|(name, process)| {
@@ -219,7 +247,7 @@ pub fn read_manifest(device: &Device, dir: &Path) -> AppManifest {
 /// The string the app in `dir` gives `key`, a path below its config's
 /// root: its manifest's, else the one literal its config written as code
 /// gives the key's last name.
-fn config_value(device: &Device, dir: &Path, key: &[&str]) -> Option<String> {
+pub(super) fn config_value(device: &Device, dir: &Path, key: &[&str]) -> Option<String> {
     let scheme = &device.scheme;
     let manifest: Option<serde_json::Value> = std::fs::read_to_string(dir.join(scheme.manifest))
         .ok()
@@ -239,7 +267,7 @@ fn config_value(device: &Device, dir: &Path, key: &[&str]) -> Option<String> {
 }
 
 /// The source of each config the app in `dir` writes as code.
-fn config_code(device: &Device, dir: &Path) -> Vec<String> {
+pub(super) fn config_code(device: &Device, dir: &Path) -> Vec<String> {
     device
         .scheme
         .code

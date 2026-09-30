@@ -9,13 +9,15 @@
 //! check, start/stop/restart, when a start is ready, private services,
 //! namespaced starts, share, reading state, an app on a device's links
 //! and opening it there, the name its config written as code gives it,
-//! `pando check`, and trying pando's own guess for the setup screen.
+//! the builds installed on the booted simulators, `pando check`, and
+//! trying pando's own guess for the setup screen.
 
 mod app_config;
 mod check;
 mod device;
 mod hooks;
 mod init;
+mod installed;
 mod lifecycle;
 mod namespaced;
 mod opening;
@@ -33,7 +35,8 @@ pub use check::{
     leftover_check, ran_by,
 };
 pub use device::{
-    NativeChanges, ReadManifest, app_links, app_links_with, native_changes, read_manifest,
+    NativeChanges, ReadManifest, app_links, app_links_installed, app_links_with, native_changes,
+    read_manifest,
 };
 pub use hooks::{
     CHECK_ENV, HookContext, INSTALL_HOOK, hook_scope, install_remedy, matched_nothing, run_hooks,
@@ -43,6 +46,7 @@ pub use init::{
     ALL_SLOTS, InitReport, SlotSummary, init, init_dry_run, machine_evidence,
     machine_evidence_from, machine_evidence_script, runs_nothing, slot_value,
 };
+pub use installed::{InstalledBuild, Simulators, installed_builds};
 pub use lifecycle::{
     Mode, StartReport, StartedProcess, StopAllReport, StopOutcome, process_names,
     refuse_only_on_a_mode_change, restart, start, stop, stop_all, stop_all_listed, stop_all_with,

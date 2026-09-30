@@ -633,10 +633,15 @@ page = false                          # no browser opens it; Metro's is the defa
   `exp+<slug>://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A<port>`,
   `<slug>` being `expo.slug` lowercased (never `expo.scheme`), filled in
   from `app.json`, or from a `slug: "…"` literal in `app.config.*`,
-  which pando reads and never runs. Only an app whose config computes
-  its slug keeps `<slug>` for you to fill; `pando open` then runs
+  which pando reads and never runs, or from its build on a booted
+  simulator. Only an app whose config computes its slug, with no build
+  installed, keeps `<slug>` for you to fill; `pando open` then runs
   nothing and prints the commands. On a device, the same links take the
-  LAN address above. A branch that changes the app's native code (`ios/`,
+  LAN address above. A development build made for another Expo SDK than
+  the worktree's crashes on this worktree's JavaScript (`Property
+  'MessageQueue' doesn't exist`, say): `status` reads the build off the
+  booted simulator and says so, with the command that replaces it
+  (`app.installed` in `--json`). A branch that changes the app's native code (`ios/`,
   `android/`, a local module's, or `app.json`/`app.config.*`) needs a
   build of its own: `status` says so under the process, with the
   `npx expo run:ios --port <port>` and `npx expo run:android --port

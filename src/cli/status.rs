@@ -58,6 +58,37 @@ struct AppOut {
     /// build of another branch lacks; `null` when it changes none, and
     /// for the main checkout.
     native: Option<NativeOut>,
+    /// The development build of this app installed on a booted iOS
+    /// simulator, while the process runs; `null` when none is found.
+    installed: Option<InstalledOut>,
+}
+
+/// A development build of the app on a booted simulator, and the SDK it
+/// was made for against the one the worktree's JavaScript needs.
+#[derive(Serialize)]
+struct InstalledOut {
+    /// The simulator's name.
+    device: String,
+    /// The SDK's major version the build was made with; `null` when its
+    /// config does not say.
+    sdk: Option<u32>,
+    /// The SDK's major version the worktree needs, from its installed
+    /// `expo` package, else its `package.json`; `null` when neither says.
+    expected_sdk: Option<u32>,
+    /// Run in the app's directory: builds and installs this worktree's own
+    /// over it, pointed at its running Metro.
+    build: String,
+}
+
+impl From<actions::InstalledBuild> for InstalledOut {
+    fn from(build: actions::InstalledBuild) -> Self {
+        Self {
+            device: build.device,
+            sdk: build.sdk,
+            expected_sdk: build.expected_sdk,
+            build: build.build,
+        }
+    }
 }
 
 /// What a branch changes of an app's native code, and how the worktree
@@ -228,6 +259,8 @@ pub fn status_json<W: Write>(paths: &PandoPaths, only: Option<&str>, out: &mut W
     let config = crate::config::load(paths)
         .map(|loaded| loaded.config)
         .unwrap_or_default();
+    // Looked at once, and only for a worktree whose device app runs.
+    let simulators = actions::Simulators::new(paths);
     let output = StatusOutput {
         version: JSON_VERSION,
         project: ProjectOut {
@@ -241,7 +274,8 @@ pub fn status_json<W: Write>(paths: &PandoPaths, only: Option<&str>, out: &mut W
                 let record = refreshed.state.worktrees.get(&w.name);
                 let empty = WorktreeRecord::new(&w.path, false);
                 let record = record.unwrap_or(&empty);
-                let mut apps = actions::app_links(&config, record);
+                let mut installed = actions::installed_builds(&config, record, &simulators);
+                let mut apps = actions::app_links_installed(&config, record, &installed);
                 let mut native = native_of(paths, &config, &w, w.name == main_name, record, &apps);
                 StatusWorktreeOut {
                     name: w.name.clone(),
@@ -306,6 +340,7 @@ pub fn status_json<W: Write>(paths: &PandoPaths, only: Option<&str>, out: &mut W
                                                 .unwrap_or_default(),
                                             builds: n.builds.into_iter().collect(),
                                         }),
+                                        installed: installed.remove(name).map(InstalledOut::from),
                                     }),
                                 },
                             )
@@ -420,6 +455,8 @@ fn status_lines<W: Write>(
     // For the services a namespaced worktree leaves shared, and why; a
     // config that does not load only costs those lines.
     let config = crate::config::load(paths).ok().map(|loaded| loaded.config);
+    // Looked at once, and only for a worktree whose device app runs.
+    let simulators = actions::Simulators::new(paths);
     // The listing alone, as for the JSON: nothing here reads a git field.
     let (shown, main_name) = shown_checkouts(paths, only, &refreshed.state)?;
     if shown.is_empty() {
@@ -455,9 +492,13 @@ fn status_lines<W: Write>(
         // One line per process under it, so a worktree that is `failed`
         // says which of its processes is, and each one's pid is reachable.
         let Some(record) = record else { continue };
+        let installed = config
+            .as_ref()
+            .map(|config| actions::installed_builds(config, record, &simulators))
+            .unwrap_or_default();
         let apps = config
             .as_ref()
-            .map(|config| actions::app_links(config, record))
+            .map(|config| actions::app_links_installed(config, record, &installed))
             .unwrap_or_default();
         let native = config
             .as_ref()
@@ -504,6 +545,21 @@ fn status_lines<W: Write>(
                     pad(name, process_width),
                     "app",
                     links.android,
+                );
+                writeln!(out, "{}", ellipsize_end(&row, width))?;
+            }
+            // A build on the simulator made for another SDK: the bundle
+            // this Metro serves calls into native code it lacks.
+            if let Some(build) = installed.get(name).filter(|build| build.stale())
+                && let (Some(sdk), Some(needed)) = (build.sdk, build.expected_sdk)
+            {
+                let row = format!(
+                    "  {}  {:<PHASE_CELL$}  the development build on {} is SDK {sdk} and this \
+                     worktree needs SDK {needed} — `{}` in the app's directory builds its own",
+                    pad(name, process_width),
+                    "build",
+                    build.device,
+                    build.build,
                 );
                 writeln!(out, "{}", ellipsize_end(&row, width))?;
             }

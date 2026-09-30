@@ -1603,6 +1603,7 @@ fn status_gives_the_link_that_opens_an_expo_app_on_the_simulator() {
             "development_build":
                 "exp+<slug>://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A18081",
             "native": null,
+            "installed": null,
         })
     );
     assert_eq!(processes["api"]["app"], serde_json::Value::Null);
@@ -1704,6 +1705,7 @@ fn status_opens_an_app_with_the_development_client_in_its_development_build() {
                  android.intent.action.VIEW -d '{url}'"
             ),
             "development_build": url,
+            "installed": null,
         })
     );
     let text = capture(|b| status_text_at(&fx.paths, None, b, usize::MAX));
@@ -1805,6 +1807,309 @@ fn status_reads_the_slug_an_app_config_gives_as_a_literal() {
         url_of(),
         "exp+<slug>://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A18081"
     );
+}
+
+/// A stand-in `xcrun` in the test's pando bin whose `simctl list` prints
+/// `listing`. Every call is appended to the file returned.
+fn fake_xcrun(paths: &PandoPaths, listing: &serde_json::Value) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = paths.home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let calls = paths.home.join("xcrun-calls");
+    let listed = paths.home.join("simctl-list.json");
+    std::fs::write(&listed, listing.to_string()).unwrap();
+    let script = bin.join("xcrun");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\ncat '{}'\n",
+            calls.display(),
+            listed.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    calls
+}
+
+/// A simulator's data directory at `data`, one install per app: its
+/// `<name>.app` bundle, holding the config Expo embeds where there is one.
+fn simulator_with(data: &std::path::Path, apps: &[(&str, Option<serde_json::Value>)]) {
+    for (i, (name, config)) in apps.iter().enumerate() {
+        let bundle = data
+            .join("Containers/Bundle/Application")
+            .join(format!("INSTALL-{i}"))
+            .join(format!("{name}.app"));
+        std::fs::create_dir_all(bundle.join("EXConstants.bundle")).unwrap();
+        if let Some(config) = config {
+            std::fs::write(
+                bundle.join("EXConstants.bundle/app.config"),
+                config.to_string(),
+            )
+            .unwrap();
+        }
+    }
+}
+
+/// `simctl list -j devices`'s shape, for `(name, state, data directory)`.
+fn simctl_listing(devices: &[(&str, &str, &std::path::Path)]) -> serde_json::Value {
+    let devices: Vec<serde_json::Value> = devices
+        .iter()
+        .enumerate()
+        .map(|(i, (name, state, data))| {
+            serde_json::json!({
+                "name": name,
+                "udid": format!("0000-{i}"),
+                "state": state,
+                "dataPath": data.display().to_string(),
+                "isAvailable": true,
+            })
+        })
+        .collect();
+    serde_json::json!({ "devices": { "com.apple.CoreSimulator.SimRuntime.iOS-27-0": devices } })
+}
+
+/// The config Expo embeds in a development build.
+fn embedded(slug: &str, bundle_id: &str, sdk: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": slug,
+        "slug": slug,
+        "scheme": "drivee",
+        "sdkVersion": sdk,
+        "ios": { "bundleIdentifier": bundle_id },
+    })
+}
+
+// A development build made for an older SDK loads the worktree's newer
+// JavaScript and crashes on the first native call it lacks. `status`
+// reads the build off the booted simulator's disk, runs nothing on it,
+// and says which SDK it is, which the worktree needs, and the command
+// that builds its own. The simulators are listed once per `status`,
+// however many worktrees run an app.
+#[test]
+fn status_says_when_the_installed_development_build_is_for_another_sdk() {
+    let fx = fixture();
+    let name = with_mobile_app(&fx, MOBILE_BY_VARIABLE);
+    let first = crate::state::load(&fx.paths.state_file())
+        .unwrap()
+        .worktrees[&name]
+        .clone();
+    // A second worktree running the same app.
+    let second = actions::new(&fx.paths, &fx.config, "feat/two", None, &|_| {}).unwrap();
+    let mut store = crate::state::load(&fx.paths.state_file()).unwrap();
+    let mut copy = first.clone();
+    copy.path = store.worktrees[&second].path.clone();
+    store.worktrees.insert(second.clone(), copy);
+    crate::state::save(&fx.paths.state_file(), &store).unwrap();
+    for record in [&store.worktrees[&name], &store.worktrees[&second]] {
+        let app = record.path.join("apps/mobile");
+        std::fs::create_dir_all(app.join("node_modules/expo")).unwrap();
+        std::fs::write(
+            app.join("app.config.ts"),
+            "export default { name: \"Drivee\", slug: \"DriveeSafeCall\" };\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("package.json"),
+            r#"{ "dependencies": { "expo": "~57.0.0", "expo-dev-client": "~6.0.0" } }"#,
+        )
+        .unwrap();
+        // What is installed wins over the range.
+        std::fs::write(
+            app.join("node_modules/expo/package.json"),
+            r#"{ "name": "expo", "version": "57.0.3" }"#,
+        )
+        .unwrap();
+    }
+    let booted = fx._dir.path().join("sim-booted");
+    simulator_with(
+        &booted,
+        &[
+            ("Safari", None),
+            (
+                "Other",
+                Some(embedded("other-app", "com.example.other", "57.0.0")),
+            ),
+            (
+                "DriveeSafeCall",
+                Some(embedded("DriveeSafeCall", "com.example.drivee", "55.0.0")),
+            ),
+        ],
+    );
+    // A simulator that is shut down is never read.
+    let shut = fx._dir.path().join("sim-shut");
+    simulator_with(
+        &shut,
+        &[(
+            "DriveeSafeCall",
+            Some(embedded("DriveeSafeCall", "com.example.drivee", "57.0.0")),
+        )],
+    );
+    let calls = fake_xcrun(
+        &fx.paths,
+        &simctl_listing(&[
+            ("iPad Air", "Shutdown", &shut),
+            ("iPhone 17 Pro", "Booted", &booted),
+        ]),
+    );
+
+    let v: serde_json::Value =
+        serde_json::from_str(&capture(|b| status_json(&fx.paths, None, b))).unwrap();
+    for worktree in v["worktrees"].as_array().unwrap() {
+        assert_eq!(
+            worktree["processes"]["mobile"]["app"]["installed"],
+            serde_json::json!({
+                "device": "iPhone 17 Pro",
+                "sdk": 55,
+                "expected_sdk": 57,
+                "build": "npx expo run:ios --port 18081",
+            }),
+            "{worktree}"
+        );
+        assert_eq!(worktree["processes"]["api"]["app"], serde_json::Value::Null);
+    }
+    let listed = std::fs::read_to_string(&calls).unwrap();
+    assert_eq!(listed, "simctl list -j devices booted\n");
+
+    let text = capture(|b| status_text_at(&fx.paths, None, b, usize::MAX));
+    let rows: Vec<&str> = text
+        .lines()
+        .filter(|line| line.contains("the development build on"))
+        .collect();
+    assert_eq!(rows.len(), 2, "{text}");
+    assert!(rows[0].trim_start().starts_with("mobile  build"), "{text}");
+    assert!(
+        rows[0].ends_with(
+            "the development build on iPhone 17 Pro is SDK 55 and this worktree needs SDK 57 \
+             — `npx expo run:ios --port 18081` in the app's directory builds its own"
+        ),
+        "{text}"
+    );
+    assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 2);
+
+    // Published: the contract names the key and each key under it.
+    let doc = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("agent/json.md"),
+    )
+    .unwrap();
+    let installed = v["worktrees"][0]["processes"]["mobile"]["app"]["installed"]
+        .as_object()
+        .unwrap();
+    for key in std::iter::once(&"installed".to_string()).chain(installed.keys()) {
+        assert!(
+            doc.contains(&format!("\"{key}\"")),
+            "agent/json.md never documents status's app {key}"
+        );
+    }
+}
+
+// An app whose config computes its slug and its bundle id opens in the
+// build on the simulator whose name the config quotes: that build's
+// scheme fills the link, since it was made for the worktree's SDK. With
+// no running Metro, nothing asks the simulators at all.
+#[test]
+fn status_opens_an_app_that_computes_its_slug_in_the_build_installed_for_it() {
+    let fx = fixture();
+    let name = with_mobile_app(&fx, MOBILE_BY_VARIABLE);
+    let record = crate::state::load(&fx.paths.state_file())
+        .unwrap()
+        .worktrees[&name]
+        .clone();
+    let app = record.path.join("apps/mobile");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(
+        app.join("app.config.ts"),
+        "const base = \"DriveeSafeCall\";\n\
+         export default {\n\
+           slug: process.env.APP_SLUG ?? base,\n\
+           ios: { bundleIdentifier: process.env.BUNDLE_ID ?? base },\n\
+         };\n",
+    )
+    .unwrap();
+    std::fs::write(
+        app.join("package.json"),
+        r#"{ "dependencies": { "expo": "^57.0.0", "expo-dev-client": "~6.0.0" } }"#,
+    )
+    .unwrap();
+    let booted = fx._dir.path().join("sim-booted");
+    simulator_with(
+        &booted,
+        &[
+            (
+                "Other",
+                Some(embedded("other-app", "com.example.other", "55.0.0")),
+            ),
+            (
+                "DriveeSafeCall",
+                Some(embedded("DriveeSafeCall", "com.example.drivee", "57.0.0")),
+            ),
+        ],
+    );
+    let calls = fake_xcrun(
+        &fx.paths,
+        &simctl_listing(&[("iPhone 17 Pro", "Booted", &booted)]),
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&capture(|b| status_json(&fx.paths, None, b))).unwrap();
+    let got = &v["worktrees"][0]["processes"]["mobile"]["app"];
+    assert_eq!(
+        got["url"],
+        "exp+driveesafecall://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A18081"
+    );
+    assert_eq!(got["installed"]["sdk"], 57);
+    assert_eq!(got["installed"]["expected_sdk"], 57);
+    let text = capture(|b| status_text_at(&fx.paths, None, b, usize::MAX));
+    assert!(!text.contains("the development build on"), "{text}");
+
+    // Metro stopped: its app is not looked for.
+    let mut store = crate::state::load(&fx.paths.state_file()).unwrap();
+    store
+        .worktrees
+        .get_mut(&name)
+        .unwrap()
+        .processes
+        .remove("mobile");
+    crate::state::save(&fx.paths.state_file(), &store).unwrap();
+    std::fs::remove_file(&calls).unwrap();
+    capture(|b| status_json(&fx.paths, None, b));
+    capture(|b| status_text_at(&fx.paths, None, b, usize::MAX));
+    assert!(!calls.exists(), "xcrun was asked with no Metro running");
+}
+
+// xcrun that fails, prints nonsense or stalls is nothing known: no build,
+// no line, and the stall costs no more than its deadline.
+#[test]
+fn a_failing_or_stalled_xcrun_is_nothing_known() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = fixture();
+    let name = with_mobile_app(&fx, MOBILE_BY_VARIABLE);
+    let config: Config = toml::from_str(MOBILE_BY_VARIABLE).unwrap();
+    let record = crate::state::load(&fx.paths.state_file())
+        .unwrap()
+        .worktrees[&name]
+        .clone();
+    let bin = fx.paths.home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for body in [
+        "echo 'xcrun: error: unable to find utility \"simctl\"' >&2\nexit 72",
+        "echo 'not json'",
+        "exec sleep 30",
+    ] {
+        let script = bin.join("xcrun");
+        std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = std::time::Instant::now();
+        let simulators =
+            actions::Simulators::within(&fx.paths, std::time::Duration::from_millis(300));
+        assert!(
+            actions::installed_builds(&config, &record, &simulators).is_empty(),
+            "{body}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{body}"
+        );
+    }
 }
 
 // A branch that changes an app's native code needs a build of its own,

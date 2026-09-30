@@ -98,6 +98,30 @@ pub struct Device {
     /// What in the app's directory a build compiles in, which the bundler
     /// cannot bring to a build made without it.
     pub native: Native,
+    /// What a build installed on a simulator says about itself.
+    pub installed: Installed,
+}
+
+/// What a development build installed on the iOS simulator says about
+/// itself, read from its app bundle on the simulator's disk: nothing runs.
+/// A build made for another SDK than the worktree's JavaScript needs
+/// fails on the first call into native code the bundle expects.
+#[derive(Debug, Clone, Copy)]
+pub struct Installed {
+    /// The JSON the framework puts in the app bundle, relative to the
+    /// bundle's `<Name>.app`: the app's config as it was built, its keys
+    /// those below [`Scheme::root`].
+    pub config: &'static str,
+    /// The keys, below the root, down to the app's iOS bundle identifier,
+    /// which the build's config and the app's own share.
+    pub bundle_id: &'static [&'static str],
+    /// The keys, in the build's config, down to the SDK version it was
+    /// built with: `55.0.0`.
+    pub sdk: &'static [&'static str],
+    /// The package whose major version is the SDK the app's JavaScript
+    /// needs: installed in `node_modules`, else its range in
+    /// `package.json`.
+    pub sdk_package: &'static str,
 }
 
 /// The native code of an app a device runs: a branch that changes it
@@ -118,6 +142,12 @@ pub struct Native {
 }
 
 impl Native {
+    /// The build for the iOS simulator, the one a build installed there
+    /// is replaced with: the first of [`Native::builds`].
+    pub fn simulator_build(&self) -> &'static str {
+        self.builds.first().map_or("", |(_, build)| build)
+    }
+
     /// Whether `path`, relative to the app's directory, is native code.
     pub fn is_native(&self, path: &str) -> bool {
         self.files.contains(&path) || {
@@ -402,6 +432,14 @@ pub const RULES: [FrameworkRule; 13] = [
                     ("ios", "npx expo run:ios --port {port}"),
                     ("android", "npx expo run:android --port {port}"),
                 ],
+            },
+            // `expo-constants` embeds the public config at build time;
+            // its `sdkVersion` is the `expo` package's.
+            installed: Installed {
+                config: "EXConstants.bundle/app.config",
+                bundle_id: &["ios", "bundleIdentifier"],
+                sdk: &["sdkVersion"],
+                sdk_package: "expo",
             },
         }),
     },

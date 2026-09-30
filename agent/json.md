@@ -438,7 +438,10 @@ next start runs it again. A worktree it has never run in has no entry.
                                          "changed": ["apps/mobile/ios/Podfile"],
                                          "build": "npx expo run:ios --port 17012",
                                          "builds": { "ios": "npx expo run:ios --port 17012",
-                                                     "android": "npx expo run:android --port 17012" } } } }
+                                                     "android": "npx expo run:android --port 17012" } },
+                             "installed": { "device": "iPhone 17 Pro",   // or null
+                                            "sdk": 55, "expected_sdk": 57,
+                                            "build": "npx expo run:ios --port 17012" } } }
       },
       "services": {
         "postgres": { "kind": "compose|native", "port": 17010, "up": true,
@@ -509,9 +512,11 @@ letters, digits, `+`, `-` and `.` dropped — never `expo.scheme`. pando
 reads the slug from the worktree's `app.json`, else from `app.config.*`
 without running it: a `slug: "…"` string literal, taken only when every
 place the file sets `slug` gives the same one. An app whose config
-computes its slug gets `exp+<slug>`: fill it in. `pando open` runs no
-command that holds it, since no build registers that scheme, and prints
-the commands to fill in instead. Every address is
+computes its slug gets the slug of its development build on a booted
+simulator (`app.installed`, below), else `exp+<slug>`: fill it in.
+`pando open` runs no command that holds `<slug>`, since no build
+registers that scheme, and prints the commands to fill in instead.
+Every address is
 `127.0.0.1`, which the simulator shares and a physical device cannot
 reach; for a device, use the machine's LAN address the developer gives.
 It is there whatever the process's `phase`, and opens something only while
@@ -532,6 +537,23 @@ simulator or a device keeps one build per bundle id, so it replaces the
 one there. `build` is `builds.ios`, kept for readers written before
 `builds`. A new native dependency in `package.json` alone
 is not seen. It is always `null` for the main checkout.
+
+`app.installed` is the app's development build on a booted iOS
+simulator, while the process is `running`; `null` when none is found,
+and always where there is no `xcrun`. pando reads it from the
+simulator's disk (the config Expo embeds in the build) and never boots,
+launches or installs anything. A build is the app's when its slug or
+its `ios.bundleIdentifier` is the app's own, from `app.json` or a literal
+in `app.config.*`, or, where the config computes both, when the config
+quotes the build's slug or bundle id. `device` is the simulator's name,
+`sdk` the major Expo SDK the build was made with, and `expected_sdk`
+the one the worktree needs, from its installed `expo` package, else
+its `package.json`; either is `null` when unknown. When the two differ,
+the build loads this worktree's JavaScript and fails on native code it
+lacks (`Property 'MessageQueue' doesn't exist`, say): `build`, run in the
+app's directory, replaces it, and `status` says so under the process.
+When the app's config names no slug, the build's slug fills
+`development_build`, unless the build was made for another SDK.
 
 `share.url` is the public URL. **No cookie is ever in this shape**, even
 when the share is behind an auth command.
