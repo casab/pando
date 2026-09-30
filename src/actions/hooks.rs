@@ -629,7 +629,7 @@ pub(super) fn pando_env(
     branch: Option<&str>,
     worktree: &Path,
 ) -> Vec<(String, String)> {
-    vec![
+    let mut env = vec![
         ("PANDO_NAME".to_string(), name.to_string()),
         // The git branch, the same string the dev process is given. A hook
         // doing `git checkout "$PANDO_BRANCH"` with the *directory* name
@@ -642,5 +642,17 @@ pub(super) fn pando_env(
         ("PANDO_WORKTREE".to_string(), worktree.display().to_string()),
         ("PANDO_ROOT".to_string(), paths.root().display().to_string()),
         ("PANDO_PROJECT".to_string(), paths.project_id().to_string()),
-    ]
+    ];
+    // What `pando check` runs is a test of the settings, in a throwaway
+    // worktree: a process that reaches outside the worktree — opening an
+    // app on the simulator, say — can leave that out, and needs a
+    // documented way to know rather than the check's directory name.
+    if name == crate::paths::CHECK_WORKTREE {
+        env.push((CHECK_ENV.to_string(), "1".to_string()));
+    }
+    env
 }
+
+/// Set to `1` for every process and hook `pando check` starts, and for
+/// nothing else.
+pub const CHECK_ENV: &str = "PANDO_CHECK";

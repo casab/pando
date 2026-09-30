@@ -15,7 +15,7 @@ use crate::state::{self, Phase, ProcessRecord, ServiceMode, WorktreeRecord};
 use crate::template;
 use crate::worktree::{self, Worktree};
 
-use super::hooks::{HookContext, run_hooks, run_probes};
+use super::hooks::{HookContext, pando_env, run_hooks, run_probes};
 use super::namespaced::{self, Ready};
 use super::refresh::advance_before_reconcile;
 use super::runtime::with_prelude;
@@ -2202,14 +2202,13 @@ pub(super) fn process_env(
             template::render(tmpl, ctx).with_context(|| format!("in env.{var}"))?,
         );
     }
-    env.insert("PANDO_NAME".into(), name.to_string());
-    env.insert(
-        "PANDO_BRANCH".into(),
-        worktree.branch.clone().unwrap_or_else(|| name.to_string()),
-    );
-    env.insert("PANDO_WORKTREE".into(), ctx.worktree.display().to_string());
-    env.insert("PANDO_ROOT".into(), paths.root().display().to_string());
-    env.insert("PANDO_PROJECT".into(), paths.project_id().to_string());
+    // The same variables a hook gets, from the one list.
+    env.extend(pando_env(
+        paths,
+        name,
+        worktree.branch.as_deref(),
+        ctx.worktree,
+    ));
     Ok(env.into_iter().collect())
 }
 

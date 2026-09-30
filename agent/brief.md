@@ -59,7 +59,10 @@ own, inside `.git`, removed when it is done.
    install, starts every process, checks the one the browser opens really
    answers, and removes it all. The prompt the developer pasted is their
    consent to this test. Its notes say whether the schema step was tested:
-   only namespaced mode with a login runs it.
+   only namespaced mode with a login runs it. Everything it runs, the
+   install, the hooks and the processes, has `PANDO_CHECK=1` in its
+   environment: a process that reaches outside its worktree, one that
+   opens the app on a simulator, can skip that part under a check.
 5. **When the check fails, fix, then rerun; never rerun unchanged.**
    - A settings failure is yours: correct the answer with
      `pando init --answers - --replace`, then run the check again.

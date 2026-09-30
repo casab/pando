@@ -329,7 +329,7 @@ pando: the last lines of the web log:</span>
         <p>One process can learn another's port the same way. Here the web app gets the API's address, whatever port the API was given:</p>
         <ul class="dash">
           <li><code>{port}</code>, <code>{port:api}</code>, <code>{name}</code>, <code>{branch}</code>, <code>{worktree}</code>, <code>{root}</code>, <code>{project}</code>, <code>{log}</code>. An unknown placeholder is a config error, never an empty string.</li>
-          <li>Every process also gets <code>PANDO_NAME</code>, <code>PANDO_BRANCH</code>, <code>PANDO_WORKTREE</code>, <code>PANDO_ROOT</code> and <code>PANDO_PROJECT</code>.</li>
+          <li>Every process also gets <code>PANDO_NAME</code>, <code>PANDO_BRANCH</code>, <code>PANDO_WORKTREE</code>, <code>PANDO_ROOT</code> and <code>PANDO_PROJECT</code>. What <code>pando check</code> runs also gets <code>PANDO_CHECK=1</code>, so a process that reaches outside its worktree can leave that out of a test.</li>
           <li><code>eval "$(pando status --env feat/login)"</code> puts that same environment in your own shell.</li>
         </ul>
       </div>

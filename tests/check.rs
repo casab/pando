@@ -480,6 +480,29 @@ fn a_probe_of_another_base_never_replaces_the_last_check_at_the_settings_own() {
     e.assert_nothing_left(&branches);
 }
 
+// A process that reaches outside its worktree — one that opens the app on
+// the simulator — has a documented way to know it runs under a check:
+// the install, a hook and the process each get `PANDO_CHECK=1`.
+#[test]
+fn everything_a_check_runs_is_told_so_by_pando_check() {
+    let dir = TempDir::new().unwrap();
+    let sink = dir.path().join("seen");
+    let e = env(&format!(
+        "[project]\ninstall = \"echo install=$PANDO_CHECK >> '{sink}'\"\n\n\
+         [dev]\ncmd = '''echo dev=$PANDO_CHECK >> '{sink}'; exit 3'''\n\
+         ports = {{ PORT = \"web\" }}\n\n\
+         [[hooks]]\nname = \"prepare\"\nafter = \"create\"\n\
+         cmd = \"echo hook=$PANDO_CHECK >> '{sink}'\"\n",
+        sink = sink.display()
+    ));
+    let out = e.pando(&["check"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let seen = std::fs::read_to_string(&sink).unwrap();
+    for line in ["install=1", "hook=1", "dev=1"] {
+        assert!(seen.lines().any(|l| l == line), "{line} in {seen}");
+    }
+}
+
 #[test]
 fn a_process_that_exits_at_once_fails_the_check_with_its_lines_redacted() {
     let e = env(&config_running(

@@ -233,6 +233,8 @@ fn start_runs_in_the_worktree_with_the_ports_and_pando_variables_in_the_environm
     ] {
         assert!(log.contains(&expected), "missing {expected} in:\n{log}");
     }
+    // Only what `pando check` runs is told it runs under a check.
+    assert!(!log.contains(super::CHECK_ENV), "{log}");
 }
 
 #[test]

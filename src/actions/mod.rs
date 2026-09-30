@@ -34,7 +34,8 @@ pub use device::{
     NativeChanges, ReadManifest, app_links, app_links_with, native_changes, read_manifest,
 };
 pub use hooks::{
-    HookContext, INSTALL_HOOK, hook_scope, install_remedy, matched_nothing, run_hooks, runs_again,
+    CHECK_ENV, HookContext, INSTALL_HOOK, hook_scope, install_remedy, matched_nothing, run_hooks,
+    runs_again,
 };
 pub use init::{
     ALL_SLOTS, InitReport, SlotSummary, init, init_dry_run, machine_evidence,

@@ -314,9 +314,10 @@ Examples:
     /// serves. Then stops and removes all of it, keeps its logs, and
     /// records the result. Hooks after `services`
     /// are skipped: on the shared services they would run against your
-    /// own data. Exits 0 when it passed, 1 when it failed — the settings'
-    /// or the machine's, `--json` says which — and 3 when a question is
-    /// still open.
+    /// own data. Everything it runs has `PANDO_CHECK=1` in its
+    /// environment. Exits 0 when it passed, 1 when it failed — the
+    /// settings' or the machine's, `--json` says which — and 3 when a
+    /// question is still open.
     #[command(after_help = "\
 Examples:
   pando check                 test it, and say what went wrong
