@@ -190,12 +190,14 @@ fn builds_of<'s>(device: &Device, dir: &Path, apps: &'s [SimulatorApp]) -> Vec<&
     // quotes somewhere, if that is one app, however many simulators have
     // it.
     let code = config_code(device, dir);
+    // An empty name is quoted by every config that has an empty string.
     let quoted = |text: &str| {
-        code.iter().any(|source| {
-            ['"', '\'', '`']
-                .iter()
-                .any(|q| source.contains(&format!("{q}{text}{q}")))
-        })
+        !text.is_empty()
+            && code.iter().any(|source| {
+                ['"', '\'', '`']
+                    .iter()
+                    .any(|q| source.contains(&format!("{q}{text}{q}")))
+            })
     };
     let found: Vec<&SimulatorApp> = ours
         .filter(|app| {

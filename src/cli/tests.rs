@@ -2022,7 +2022,7 @@ fn status_opens_an_app_that_computes_its_slug_in_the_build_installed_for_it() {
         "const base = \"DriveeSafeCall\";\n\
          export default {\n\
            slug: process.env.APP_SLUG ?? base,\n\
-           ios: { bundleIdentifier: process.env.BUNDLE_ID ?? base },\n\
+           ios: { bundleIdentifier: process.env.BUNDLE_ID ?? base, buildNumber: \"\" },\n\
          };\n",
     )
     .unwrap();
@@ -2043,6 +2043,8 @@ fn status_opens_an_app_that_computes_its_slug_in_the_build_installed_for_it() {
                 "DriveeSafeCall",
                 Some(embedded("DriveeSafeCall", "com.example.drivee", "57.0.0")),
             ),
+            // Named nothing: the config's empty string is not its name.
+            ("Unnamed", Some(embedded("", "", "55.0.0"))),
         ],
     );
     let calls = fake_xcrun(
