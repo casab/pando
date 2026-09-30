@@ -1342,6 +1342,9 @@ pub struct Unprovisioned {
     /// a path that is, so a command for one that is not is a file that
     /// shows up in `git status`.
     pub ignored: bool,
+    /// The example it is seeded from, as `provision_from` names it, when
+    /// the main checkout has no file of its own to give.
+    pub seeded_from: Option<String>,
 }
 
 impl Unprovisioned {
@@ -1364,15 +1367,26 @@ impl Unprovisioned {
         }
     }
 
+    /// Whether the directory it goes in is there. A branch without the
+    /// app a path belongs to — one made before `apps/mobile` was — has
+    /// nothing that reads it, and a `cp` into it fails.
+    pub fn has_place(&self) -> bool {
+        self.target.parent().is_some_and(Path::is_dir)
+    }
+
     /// What `start` says about it in a worktree pando did not create,
     /// before it starts the app without it.
     pub fn adopted_line(&self) -> String {
         match self.ignored {
             true => format!(
                 "{} is not in this worktree, and pando writes only into worktrees it created — \
-                 `{}` gives it the main checkout's",
+                 `{}` gives it {}",
                 self.rel,
-                self.command()
+                self.command(),
+                match &self.seeded_from {
+                    Some(from) => format!("a copy of the main checkout's {from}"),
+                    None => "the main checkout's".to_string(),
+                }
             ),
             false => format!(
                 "{} is not in this worktree, and this worktree's .gitignore does not ignore it, \
@@ -1400,6 +1414,9 @@ pub fn unprovisioned(paths: &PandoPaths, config: &Config, worktree: &Path) -> Ve
                 target: worktree.join(rel),
                 link: !seeded && config.project.provision_mode == ProvisionMode::Link,
                 ignored: crate::detect::is_gitignored(worktree, rel),
+                seeded_from: seeded
+                    .then(|| config.project.provision_from.get(rel).cloned())
+                    .flatten(),
                 source,
             })
         })
@@ -1431,7 +1448,7 @@ pub(super) fn provision_at_start(
         return;
     }
     if !created_by_pando {
-        for path in &missing {
+        for path in missing.iter().filter(|path| path.has_place()) {
             progress(&path.adopted_line());
         }
         return;

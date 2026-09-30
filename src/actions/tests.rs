@@ -8785,6 +8785,42 @@ fn start_never_provisions_an_adopted_worktree_and_says_what_it_lacks() {
     assert!(!said.iter().any(|l| l == "provisioning"), "{said:?}");
 }
 
+// A path whose directory the adopted branch does not have — an app
+// added after the branch was made — has nothing there that reads it, and
+// the command would fail: `start` does not name it.
+#[test]
+fn start_says_nothing_of_a_path_whose_directory_an_adopted_worktree_lacks() {
+    let mut fx = fixture();
+    with_dev(&mut fx, dev("sleep 30"));
+    std::fs::create_dir_all(fx.root.join("apps/mobile")).unwrap();
+    std::fs::write(fx.root.join("apps/mobile/.env"), "X=1\n").unwrap();
+    fx.config.project.provision = Some(vec!["apps/mobile/.env".to_string()]);
+    let adopted = fx.worktrees_dir().join("adopted");
+    std::fs::create_dir_all(fx.worktrees_dir()).unwrap();
+    git(
+        &fx.root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "adopted",
+            adopted.to_str().unwrap(),
+        ],
+    );
+    assert!(!adopted.join("apps/mobile").exists());
+
+    let (lines, progress) = collecting();
+    let report = start(&fx.paths, &fx.config, "adopted", None, &progress).unwrap();
+    let _guard = guard(&report);
+    assert!(!adopted.join("apps").exists(), "nothing was made there");
+    let said = lines.borrow().clone();
+    assert!(
+        !said.iter().any(|l| l.contains("apps/mobile/.env")),
+        "{said:?}"
+    );
+}
+
 /// The fixture as a fresh clone leaves it: the example is tracked and
 /// here, the local file it is an example of is gitignored and never
 /// arrived.

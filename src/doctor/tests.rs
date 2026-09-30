@@ -3241,6 +3241,14 @@ fn an_adopted_worktree_lacking_a_seeded_file_is_given_a_copy_of_the_example() {
     let [finding] = found.as_slice() else {
         panic!("{:?}", messages(&report));
     };
+    // Seeded from the example, not something the main checkout has.
+    assert!(
+        finding
+            .message
+            .contains("never seeded its .env from the main checkout's .env.example"),
+        "{}",
+        finding.message
+    );
     let fix = finding.fix.as_deref().expect("a fix");
     assert!(
         fix.contains(&format!(
@@ -3249,6 +3257,34 @@ fn an_adopted_worktree_lacking_a_seeded_file_is_given_a_copy_of_the_example() {
             dir.join(".env").display()
         )),
         "{fix}"
+    );
+}
+
+// A branch made before the app a path belongs to has nothing that reads
+// it, and a `cp` into a directory that is not there fails: not named.
+#[test]
+fn an_adopted_worktree_without_the_directory_a_path_goes_in_is_not_named() {
+    let fx = fixture();
+    git(&fx.root, &["branch", "before-mobile"]);
+    std::fs::create_dir_all(fx.root.join("apps/mobile")).expect("app dir");
+    std::fs::write(fx.root.join(".gitignore"), ".env\n").expect("gitignore");
+    std::fs::write(fx.root.join("apps/mobile/app.json"), "{}\n").expect("app");
+    git(&fx.root, &["add", "."]);
+    git(&fx.root, &["commit", "--quiet", "-m", "the mobile app"]);
+    std::fs::write(fx.root.join("apps/mobile/.env"), "X=1\n").expect("env");
+    write_project_config(&fx, "[project]\nprovision = [\"apps/mobile/.env\"]\n");
+    let old = adopted_worktree(&fx, "before-mobile");
+    assert!(!old.join("apps/mobile").exists());
+    adopted_worktree(&fx, "feat-a");
+    let report = report(&fx);
+    let found = lacking(&report);
+    let [finding] = found.as_slice() else {
+        panic!("{:?}", messages(&report));
+    };
+    assert!(
+        finding.message.starts_with("feat-a: "),
+        "{}",
+        finding.message
     );
 }
 

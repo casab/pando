@@ -394,7 +394,8 @@ lacks it. pando never writes into such a worktree, so the fix is the
 command for the developer to run — a `cp`, or an `ln -s` where
 `provision_mode` links, one loop over them all when there are several.
 Where that worktree's `.gitignore` does not ignore the path, the finding
-says so and gives no command. A worktree pando created gets a file it
+says so and gives no command; a worktree without the directory the path
+goes in, a branch from before that app, is not named. A worktree pando created gets a file it
 lacks at its next `start`, and is not reported.
 
 `hooks[].matches` is how many files the hook's `fingerprint` globs match

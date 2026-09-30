@@ -43,7 +43,12 @@ pub(super) fn unprovisioned_findings(
         if worktree.prunable || ours.get(&worktree.name) == Some(&true) {
             continue;
         }
-        for missing in actions::unprovisioned(paths, config, &worktree.path) {
+        // Not a path whose directory the branch does not have: nothing
+        // there reads it, and the command would fail on it.
+        for missing in actions::unprovisioned(paths, config, &worktree.path)
+            .into_iter()
+            .filter(Unprovisioned::has_place)
+        {
             groups
                 .entry((missing.rel.clone(), missing.ignored))
                 .or_default()
@@ -76,14 +81,24 @@ struct Lacking {
 fn lacking_note(rel: &str, lacking: &[Lacking]) -> Finding {
     let names: Vec<&str> = lacking.iter().map(|w| w.name.as_str()).collect();
     let first = &lacking[0].missing;
-    let message = match names.as_slice() {
-        [one] => format!(
+    let message = match (names.as_slice(), &first.seeded_from) {
+        ([one], None) => format!(
             "{one}: pando did not create this worktree, so `provision` never gave it {rel}, \
              which the main checkout has — its app starts without it"
         ),
-        several => format!(
+        ([one], Some(from)) => format!(
+            "{one}: pando did not create this worktree, so `provision` never seeded its {rel} \
+             from the main checkout's {from} — its app starts without it"
+        ),
+        (several, None) => format!(
             "{} worktrees pando did not create have no {rel}, which `provision` gives the ones \
              it creates and the main checkout has — their apps start without it: {}",
+            several.len(),
+            several.join(", ")
+        ),
+        (several, Some(from)) => format!(
+            "{} worktrees pando did not create have no {rel}, which `provision` seeds from the \
+             main checkout's {from} in the ones it creates — their apps start without it: {}",
             several.len(),
             several.join(", ")
         ),
