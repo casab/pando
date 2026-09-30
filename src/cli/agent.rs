@@ -318,7 +318,8 @@ fn project_now(
         let _ = writeln!(
             out,
             "- {note}. Tell the developer when you are done, and never guess the address; \
-             for the simulator, `pando status <name>` gives the command that opens the app."
+             on the simulator, `pando open <name>` opens the app; `pando status <name>` gives \
+             the commands."
         );
     }
 

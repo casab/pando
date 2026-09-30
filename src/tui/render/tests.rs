@@ -1031,6 +1031,15 @@ fn the_detail_pane_gives_the_simulator_command_for_a_running_expo_app() {
         "{rendered}"
     );
     assert_eq!(rendered.matches("simctl").count(), 1, "{rendered}");
+    // And under it, an Android device's or emulator's.
+    assert!(
+        rendered.contains(" app    adb reverse tcp:17344"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("android.intent.action.VIEW"),
+        "{rendered}"
+    );
 
     let record = app.state.worktrees.get_mut("feat+one").unwrap();
     record.processes.get_mut("mobile").unwrap().phase = crate::state::Phase::Failed {
@@ -1039,6 +1048,7 @@ fn the_detail_pane_gives_the_simulator_command_for_a_running_expo_app() {
     };
     let rendered = text_of(&draw(&mut app, 200, 30));
     assert!(!rendered.contains("simctl"), "{rendered}");
+    assert!(!rendered.contains("adb"), "{rendered}");
 }
 
 // The api of a root script that runs web and api died behind the web

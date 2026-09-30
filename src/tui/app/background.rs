@@ -51,6 +51,10 @@ pub enum AppEvent {
     ConfigResolved(Box<Config>),
     /// A shell or editor handed to tmux or the desktop did not start.
     LaunchFailed(String),
+    /// What opening an app on a simulator or a device is waiting for.
+    AppOpening(String),
+    /// Where the app opened, or why it did not.
+    AppOpened(Result<String, String>),
     /// Something a worker decided without asking, worth a line in the
     /// header and in `m`: the first choice it took for a question.
     Notice(String),

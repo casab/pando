@@ -1356,6 +1356,58 @@ pub fn fake_cloudflared(home: &Path) {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// Installs stand-ins for every program `pando open` runs to open an app
+/// on a device — `xcrun`, `adb`, `xcode-select` and macOS's `open` — at
+/// `<home>/bin`, which pando puts first on PATH for them, so no test ever
+/// reaches a real simulator or launches an app on the developer's Mac.
+///
+/// `xcrun simctl list devices booted` lists one booted simulator when
+/// `booted` is true, and `adb devices` one emulator when `android` is.
+/// Every other call succeeds and prints nothing, except `xcode-select`,
+/// which names no Xcode. Each program appends its arguments, one call to
+/// a line, to `<home>/bin/<program>.calls`.
+pub fn fake_devices(home: &Path, booted: bool, android: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let simulator = match booted {
+        true => "echo '    iPhone 17 (5E1B7C0A) (Booted) '",
+        false => "echo '== Devices =='",
+    };
+    let emulator = match android {
+        true => "printf 'List of devices attached\\nemulator-5554\\tdevice\\n'",
+        false => "echo 'List of devices attached'",
+    };
+    for (program, body) in [
+        (
+            "xcrun",
+            format!("[ \"$*\" = 'simctl list devices booted' ] && {simulator}\nexit 0"),
+        ),
+        (
+            "adb",
+            format!("[ \"$*\" = 'devices' ] && {emulator}\nexit 0"),
+        ),
+        ("xcode-select", "exit 2".to_string()),
+        ("open", "exit 1".to_string()),
+    ] {
+        let path = bin.join(program);
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\necho \"$*\" >> \"$0.calls\"\n{body}\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+/// What a stand-in [`fake_devices`] installed was called with, one call to
+/// a line; empty when it never was.
+pub fn device_calls(home: &Path, program: &str) -> Vec<String> {
+    std::fs::read_to_string(home.join("bin").join(format!("{program}.calls")))
+        .map(|calls| calls.lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
 /// Writes the fixture's listener config into an injected pando home.
 pub fn write_listener_config(kind: Kind, home: &Path, root: &Path) -> PathBuf {
     let project = ProjectRef::from_root(root).unwrap();

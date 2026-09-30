@@ -310,7 +310,8 @@ pando ls              list the main checkout and the worktrees: status, URL,
 pando rm <name>       stop everything, remove the worktree, wipe its data
 pando share <name>    expose it at a public URL
 pando unshare <name>  take the public URL down
-pando open <name>     open its URL in the browser; --public for the shared one
+pando open <name>     open its URL in the browser; --public for the shared one,
+                      --app for its app on a simulator or device
 pando logs <name>     tail its logs; --json for machines
 pando status          what runs where, per process; --json
 pando path <name>     print the worktree's path
@@ -345,7 +346,7 @@ s i S    start it: as last time, isolated, or on the shared services
 l        open the log viewer
 x X      stop it, or stop everything
 r P      restart it, or only the selected process
-o O      open its URL, or the public one
+o O      open its URL (or its app, where it serves no page), or the public one
 c C y    copy its local URL, its public URL, its path
 t        share it publicly, or stop sharing
 ! e      a shell in it, or open it in your editor

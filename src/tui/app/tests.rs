@@ -1691,20 +1691,52 @@ fn open_needs_a_port_before_it_has_a_url() {
 }
 
 // A worktree whose only process serves no page, Expo's Metro, has no URL:
-// `o` hands no browser Metro's root and points at the pane's app row.
+// `o` hands no browser Metro's root, and opens its app instead, on a
+// worker, saying so; the worker's end is a success or an error. A test
+// reaches no simulator: the app it would open is recorded.
 #[test]
-fn o_on_a_worktree_that_serves_no_page_opens_no_browser() {
+fn o_on_a_worktree_that_serves_no_page_opens_its_app() {
     let mut app = test_app(&["feat+one"]);
     with_process(&mut app, "feat+one", running_phase());
+    app.config =
+        toml::from_str("[processes.dev]\ncmd = \"npx expo start\"\nports = [\"web\"]\n").unwrap();
     let record = app.state.worktrees.get_mut("feat+one").unwrap();
     record.pageless.insert("dev".to_string());
     assert!(app.url_of("feat+one").is_none());
 
     press(&mut app, KeyCode::Char('o'));
-    assert_eq!(app.opened, None);
-    let (message, _) = app.active_status().unwrap();
+    assert_eq!(app.opened, None, "no browser");
+    assert_eq!(app.opened_apps, ["exp://127.0.0.1:17342"]);
+    assert_eq!(
+        app.active_status().map(|(m, _)| m),
+        Some("opening feat/one's app")
+    );
+    app.handle_event(AppEvent::AppOpening(
+        "starting DeviceHub and waiting up to 120s for a simulator to boot".into(),
+    ));
+    assert_eq!(
+        app.active_status().map(|(m, _)| m),
+        Some("starting DeviceHub and waiting up to 120s for a simulator to boot")
+    );
+    app.handle_event(AppEvent::AppOpened(Ok(
+        "opened feat/one's dev in Expo Go on the booted iOS simulator".into(),
+    )));
+    let (message, is_error) = app.active_status().unwrap();
+    assert!(message.starts_with("opened feat/one's dev"), "{message}");
+    assert!(!is_error);
+    app.handle_event(AppEvent::AppOpened(Err("feat/one: no simulator".into())));
+    assert!(app.active_status().unwrap().1, "an error");
+
+    // A process that only says `page = false` has no app to open.
+    app.opened_apps.clear();
+    app.config =
+        toml::from_str("[processes.dev]\ncmd = \"npm run worker\"\nports = [\"web\"]\n").unwrap();
+    press(&mut app, KeyCode::Char('o'));
+    assert!(app.opened_apps.is_empty());
+    let (message, is_error) = app.active_status().unwrap();
     assert!(message.contains("serves no page"), "{message}");
-    assert!(message.contains("app row"), "{message}");
+    assert!(message.contains("runs no app"), "{message}");
+    assert!(is_error);
 }
 
 // A worktree whose processes all run with `ports = []`, a worker or a

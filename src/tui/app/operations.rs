@@ -6,7 +6,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use crate::actions;
-use crate::state::{Aggregate, ServiceMode};
+use crate::state::{Aggregate, Phase, ServiceMode};
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
 use super::background::{AppEvent, ask_through_ui, config_now};
@@ -564,15 +564,12 @@ impl App {
             )),
             Some(_) => match self.url_of(&name) {
                 // Metro's root in a browser shows nothing anybody wants:
-                // the pane's app row is how its app is opened.
+                // its app is opened where it runs, as `pando open` does.
                 None if self
                     .record_for(&name)
                     .is_some_and(|record| !record.pageless.is_empty()) =>
                 {
-                    self.set_error(format!(
-                        "{label} serves no page to open in a browser — its app row gives the \
-                         command that opens the app"
-                    ))
+                    self.open_device_apps(&name, &label)
                 }
                 None => self.set_error(format!(
                     "{label} is running and holds no port, so it has no URL to open"
@@ -586,6 +583,97 @@ impl App {
                 },
             },
         }
+    }
+
+    /// Opens the app of each running process of a worktree with no page
+    /// whose app a device runs: on the booted simulator, a connected
+    /// Android device, or a simulator it starts, as `pando open` does.
+    fn open_device_apps(&mut self, name: &str, label: &str) {
+        let Some(record) = self.record_for(name) else {
+            return;
+        };
+        let read = |device: &crate::catalog::frameworks::Device, dir: &std::path::Path| {
+            self.app_manifests
+                .borrow_mut()
+                .entry(dir.to_path_buf())
+                .or_insert_with(|| actions::read_manifest(device, dir))
+                .clone()
+        };
+        let mut apps = Vec::new();
+        let mut starting = None;
+        for (process, links) in actions::app_links_with(&self.config, record, &read) {
+            if !record.pageless.contains(&process) {
+                continue;
+            }
+            match record.processes.get(&process).map(|p| &p.phase) {
+                Some(Phase::Running { .. }) => apps.push((process, links)),
+                Some(Phase::Starting { .. }) => starting = starting.or(Some(process)),
+                _ => {}
+            }
+        }
+        if apps.is_empty() {
+            return self.set_error(match starting {
+                Some(process) => {
+                    format!("{label}'s {process} is still starting — o opens its app once it runs")
+                }
+                None => format!(
+                    "{label} serves no page to open in a browser, and runs no app a simulator or \
+                     a device opens"
+                ),
+            });
+        }
+        self.set_progress(format!("opening {label}'s app"));
+        self.spawn_app_open(label, apps);
+    }
+
+    /// Opens each app on a worker thread: finding a simulator, starting
+    /// one and waiting for it to boot take up to minutes. Each wait is
+    /// said as progress, and the end as a success or an error.
+    #[cfg(not(test))]
+    fn spawn_app_open(
+        &mut self,
+        label: &str,
+        apps: Vec<(String, crate::catalog::frameworks::AppLinks)>,
+    ) {
+        let paths = self.paths.clone();
+        let tx = self.event_tx.clone();
+        let label = label.to_string();
+        thread::spawn(move || {
+            let run = |command: &str| actions::run_command(&paths, command);
+            let opener = actions::Opener::new(&run);
+            let say = |line: &str| {
+                let _ = tx.send(AppEvent::AppOpening(line.to_string()));
+            };
+            let mut opened = Vec::new();
+            for (process, links) in &apps {
+                let result = match actions::open_app(links, &opener, &say) {
+                    Ok(on) => {
+                        opened.push(format!(
+                            "opened {label}'s {process} in {} on {on}",
+                            links.client
+                        ));
+                        continue;
+                    }
+                    Err(actions::NotOpened::Nowhere(why)) => {
+                        format!("{label}: {why} — its app rows give the commands that open it")
+                    }
+                    Err(failed) => format!("{label}'s {process}: {failed}"),
+                };
+                let _ = tx.send(AppEvent::AppOpened(Err(result)));
+                return;
+            }
+            let _ = tx.send(AppEvent::AppOpened(Ok(opened.join(" · "))));
+        });
+    }
+
+    /// Tests open no app: nothing under test may reach a simulator.
+    #[cfg(test)]
+    fn spawn_app_open(
+        &mut self,
+        _label: &str,
+        apps: Vec<(String, crate::catalog::frameworks::AppLinks)>,
+    ) {
+        self.opened_apps = apps.into_iter().map(|(_, links)| links.url).collect();
     }
 
     /// Hands a URL to the browser — `$BROWSER` when it is set, as

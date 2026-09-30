@@ -88,6 +88,10 @@ pub struct Device {
     /// simulator, which shares this machine's `127.0.0.1`. Quoted: a
     /// development build's URL has a `?`, which zsh globs.
     pub simulator: &'static str,
+    /// The command that opens `{url}` on a connected Android device or
+    /// emulator: first it has the device's `127.0.0.1:{port}` reach this
+    /// machine's, where the bundler listens. Quoted as the simulator's is.
+    pub android: &'static str,
     /// Environment that turns off what a dev server is for, as `(variable,
     /// what it turns off)`: `doctor` names one a process sets.
     pub disabled_by: &'static [(&'static str, &'static str)],
@@ -175,8 +179,11 @@ pub struct AppLinks {
     /// build of the app.
     pub client: &'static str,
     pub url: String,
-    /// The command that opens `url` on the simulator.
+    /// The command that opens `url` on the booted iOS simulator.
     pub simulator: String,
+    /// The command that opens `url` on a connected Android device or
+    /// emulator.
+    pub android: String,
     pub development_build: String,
 }
 
@@ -205,6 +212,7 @@ impl Device {
         AppLinks {
             client,
             simulator: self.simulator.replace("{url}", &url),
+            android: fill(self.android).replace("{url}", &url),
             development_build,
             url,
         }
@@ -340,6 +348,9 @@ pub const RULES: [FrameworkRule; 13] = [
                 prefix: "exp+",
             },
             simulator: "xcrun simctl openurl booted '{url}'",
+            // `adb reverse` is what `expo run:android` sets up itself.
+            android: "adb reverse tcp:{port} tcp:{port} && adb shell am start -a \
+                      android.intent.action.VIEW -d '{url}'",
             // Expo's CLI reads it as any CI does, and Metro then says
             // "reloads are disabled".
             disabled_by: &[("CI", "Metro's reloads and file watching")],
@@ -608,13 +619,23 @@ mod tests {
             "xcrun simctl openurl booted 'exp://127.0.0.1:8123'"
         );
         assert_eq!(
+            links.android,
+            "adb reverse tcp:8123 tcp:8123 && adb shell am start -a \
+             android.intent.action.VIEW -d 'exp://127.0.0.1:8123'"
+        );
+        assert_eq!(
             links.development_build,
             "exp+<slug>://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A8123"
         );
         // Every placeholder of every row is filled.
         for rule in RULES.iter().filter_map(|rule| rule.device.as_ref()) {
             let links = rule.links("127.0.0.1", 1, &AppManifest::default());
-            for filled in [&links.url, &links.simulator, &links.development_build] {
+            for filled in [
+                &links.url,
+                &links.simulator,
+                &links.android,
+                &links.development_build,
+            ] {
                 assert!(!filled.contains('{'), "{filled}");
             }
         }

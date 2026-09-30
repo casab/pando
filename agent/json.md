@@ -408,6 +408,7 @@ next start runs it again. A worktree it has never run in has no entry.
                     "app": { "client": "Expo Go|its development build",
                              "url": "exp://127.0.0.1:17012",
                              "simulator": "xcrun simctl openurl booted 'exp://127.0.0.1:17012'",
+                             "android": "adb reverse tcp:17012 tcp:17012 && adb shell am start -a android.intent.action.VIEW -d 'exp://127.0.0.1:17012'",
                              "development_build": "exp+shop://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A17012",
                              "native": { "base": "main",   // or null: no native change
                                          "changed": ["apps/mobile/ios/Podfile"],
@@ -462,7 +463,11 @@ the first process by name, among the processes that serve a page. A
 process serves none when its table says `page = false`, or, saying
 nothing, when it is a bundler whose app runs on a device (Expo's Metro,
 below). A worktree that runs nothing else has `url: null`, and `pando
-open` prints how its app is opened instead of launching a browser.
+open` opens its app instead of launching a browser, as `pando open
+--app` does beside a page: on the booted iOS simulator, else on a
+connected Android device or emulator, else, on a Mac with Xcode, on a
+simulator it starts and waits for, running the `simulator` or `android`
+command below. With nowhere to open it, it prints why and both commands.
 `pando share` still publishes such a worktree's port.
 
 `app` is non-null for a process whose app runs on a phone, a tablet or a
@@ -471,8 +476,10 @@ by its port variable, `RCT_METRO_PORT`, or by `expo start` in its command.
 `client` is what opens `url`: `Expo Go`, or `its development build` for
 an app whose `package.json` depends on `expo-dev-client`, which Expo Go
 cannot run. `simulator` is the command that opens `url` on the booted
-iOS simulator, and `development_build` is the link a development build
-opens, whichever `client` is. Its scheme is the one `expo-dev-client`
+iOS simulator, `android` the one that opens it on a connected Android
+device or emulator (`adb reverse` first, so the device's `127.0.0.1`
+port reaches this machine's Metro), and `development_build` is the link
+a development build opens, whichever `client` is. Its scheme is the one `expo-dev-client`
 registers: `exp+` and the app's `expo.slug`, lowercased with anything but
 letters, digits, `+`, `-` and `.` dropped — never `expo.scheme`. pando
 reads the slug from the worktree's `app.json`; an app configured in

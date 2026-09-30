@@ -25,6 +25,7 @@
 //! |---|---|
 //! | a package manager or lockfile | a row in [`catalog::package_managers`] |
 //! | a framework | a row in [`catalog::frameworks::RULES`] |
+//! | somewhere a device app is opened (a simulator, an emulator) | a row in [`catalog::devices::TARGETS`], its open command in the framework's `Device` row |
 //! | a service image a compose file uses | a row in [`catalog::images::IMAGES`] |
 //! | a tool cache or artifact `provision` must never offer | a row in [`catalog::artifacts::ARTIFACTS`] |
 //! | a job queue whose worker `doctor` recognises | a row in [`catalog::queue_workers::QUEUE_WORKERS`] |

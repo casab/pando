@@ -604,8 +604,8 @@ page = false                          # no browser opens it; Metro's is the defa
   there is right. A process whose port no browser opens says `page =
   false`, and Expo's Metro is one without saying it; a role nobody opens
   in a browser — an API, a mobile bundler — still wants its own name
-  rather than `web`. A worktree with no page has no URL: `open` prints
-  how its app is opened, and `share` still publishes its port.
+  rather than `web`. A worktree with no page has no URL: `open` opens
+  its app instead, and `share` still publishes its port.
 - **A phone cannot reach `127.0.0.1`.** Every URL pando gives, and every
   `{port:<role>}` address written as `127.0.0.1`, is this machine's. An
   app on a physical device needs the machine's LAN address instead: in
@@ -615,8 +615,11 @@ page = false                          # no browser opens it; Metro's is the defa
   never guess the address.
 - **An Expo app is opened by a link, not a page.** pando runs Metro
   with no terminal, so its "press i" is gone. The iOS simulator shares
-  `127.0.0.1`: `pando status <name>` prints, under a running Metro, the
-  command that opens it, and `--json` carries it as the process's `app`.
+  `127.0.0.1`: `pando open <name>` opens the app of a worktree that
+  serves no page (`--app` beside a page) on the booted simulator, a
+  connected Android device or emulator, or a simulator it starts.
+  `pando status <name>` prints, under a running Metro, the commands it
+  runs, and `--json` carries them as the process's `app`.
   That is Expo Go's `exp://127.0.0.1:<port>`, or, for an app that
   depends on `expo-dev-client`, its development build's
   `exp+<slug>://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A<port>`,

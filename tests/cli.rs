@@ -1642,6 +1642,78 @@ fn start_wait_returns_once_ready_and_open_hands_the_url_to_the_browser() {
     assert!(stderr(&out).contains("pando start"), "{}", stderr(&out));
 }
 
+// A worktree that runs Expo's Metro alone serves no page: `open` opens
+// its app on the booted simulator, running the very command `status`
+// prints, and with none booted, on the connected Android emulator. Every
+// program it runs is a stand-in in the test's own bin.
+#[test]
+fn open_opens_a_device_app_on_the_simulator_or_the_emulator() {
+    if !common::python3_available() {
+        return;
+    }
+    let e = env();
+    let metro = common::listener_on_port_env().replace("['PORT']", "['RCT_METRO_PORT']");
+    e.write_config(&format!(
+        "[processes.mobile]\ncmd = '''{metro}'''\nports = {{ RCT_METRO_PORT = \"metro\" }}\n"
+    ));
+    assert_eq!(code(&e.pando(&["new", "feat/one"])), EXIT_OK);
+    let out = e.pando(&["start", "feat/one", "--wait"]);
+    assert_eq!(code(&out), EXIT_OK, "{}", stderr(&out));
+    let status: serde_json::Value =
+        serde_json::from_str(&stdout(&e.pando(&["status", "--json"]))).unwrap();
+    let worktree = &status["worktrees"][0];
+    assert_eq!(worktree["url"], serde_json::Value::Null, "no page");
+    let app = &worktree["processes"]["mobile"]["app"];
+    let url = app["url"].as_str().unwrap();
+    let port = worktree["ports"]["metro"].as_u64().unwrap();
+
+    common::fake_devices(&e.home, true, true);
+    let out = e.pando(&["open", "feat/one"]);
+    assert_eq!(code(&out), EXIT_OK, "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out).trim(),
+        "mobile: opened its app in Expo Go on the booted iOS simulator"
+    );
+    assert!(
+        stderr(&out).contains("opening mobile's app in Expo Go"),
+        "{}",
+        stderr(&out)
+    );
+    // The command status prints, as sh ran it.
+    assert_eq!(
+        app["simulator"].as_str().unwrap(),
+        format!("xcrun simctl openurl booted '{url}'")
+    );
+    assert_eq!(
+        common::device_calls(&e.home, "xcrun"),
+        [
+            "simctl list devices booted".to_string(),
+            format!("simctl openurl booted {url}")
+        ]
+    );
+    assert!(common::device_calls(&e.home, "adb").is_empty());
+
+    std::fs::remove_dir_all(e.home.join("bin")).unwrap();
+    common::fake_devices(&e.home, false, true);
+    let out = e.pando(&["open", "feat/one", "--app"]);
+    assert_eq!(code(&out), EXIT_OK, "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out).trim(),
+        "mobile: opened its app in Expo Go on the connected Android device or emulator"
+    );
+    assert_eq!(
+        common::device_calls(&e.home, "adb"),
+        [
+            "devices".to_string(),
+            format!("reverse tcp:{port} tcp:{port}"),
+            format!("shell am start -a android.intent.action.VIEW -d {url}"),
+        ]
+    );
+    // Nothing started a simulator.
+    assert!(common::device_calls(&e.home, "open").is_empty());
+    e.pando(&["stop", "--all"]);
+}
+
 #[test]
 fn start_wait_fails_with_the_reason_when_the_process_dies() {
     let e = env();

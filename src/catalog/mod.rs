@@ -10,6 +10,8 @@
 //!
 //! - a package manager or lockfile: a row in [`package_managers`];
 //! - a framework: a row in [`frameworks::RULES`];
+//! - somewhere a device app is opened (a simulator, an emulator): a row
+//!   in [`devices::TARGETS`];
 //! - a service image compose files use: a row in [`images::IMAGES`];
 //! - a dev server that refuses unknown hosts: a row in
 //!   [`host_checks::HOST_CHECKS`];
@@ -28,6 +30,7 @@
 //! are.
 
 pub mod artifacts;
+pub mod devices;
 pub mod frameworks;
 pub mod host_checks;
 pub mod images;

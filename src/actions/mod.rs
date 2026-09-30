@@ -7,9 +7,9 @@
 //!
 //! One file per concern: worktrees, hooks, questions, `init`, the runtime
 //! check, start/stop/restart, when a start is ready, private services,
-//! namespaced starts, share, reading state, how an app on a device is
-//! opened, `pando check`, and trying pando's own guess for the setup
-//! screen.
+//! namespaced starts, share, reading state, an app on a device's links
+//! and opening it there, `pando check`, and trying pando's own guess for
+//! the setup screen.
 
 mod check;
 mod device;
@@ -17,6 +17,7 @@ mod hooks;
 mod init;
 mod lifecycle;
 mod namespaced;
+mod opening;
 mod questions;
 mod readiness;
 mod refresh;
@@ -48,6 +49,9 @@ pub use lifecycle::{
 pub use namespaced::{
     Leftover, login_question, namespace_leftovers, namespace_lines, namespace_login,
     namespaced_not_own_data, namespaces_rm_drops,
+};
+pub use opening::{
+    BOOT_WAIT, NotOpened, Opener, RETRY_WAIT, Ran, RunCommand, open_app, open_commands, run_command,
 };
 pub use questions::{
     Answer, Answering, Ask, NEW_SLOTS, NeedsAnswer, Question, RefusedAnswer, START_SLOTS,

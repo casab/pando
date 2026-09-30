@@ -47,6 +47,9 @@ struct AppOut {
     url: String,
     /// The command that opens `url` on the booted iOS simulator.
     simulator: String,
+    /// The command that opens `url` on a connected Android device or
+    /// emulator, after pointing its `127.0.0.1` port at this machine's.
+    android: String,
     /// The URL a development build opens it at, its scheme `exp+` and the
     /// slug in `app.json`; `exp+<slug>` where no `app.json` says it.
     development_build: String,
@@ -290,6 +293,7 @@ pub fn status_json<W: Write>(paths: &PandoPaths, only: Option<&str>, out: &mut W
                                         client: links.client,
                                         url: links.url,
                                         simulator: links.simulator,
+                                        android: links.android,
                                         development_build: links.development_build,
                                         native: native.remove(name).map(|n| NativeOut {
                                             base: n.base,
@@ -491,6 +495,14 @@ fn status_lines<W: Write>(
                     "app",
                     links.simulator,
                     links.client,
+                );
+                writeln!(out, "{}", ellipsize_end(&row, width))?;
+                // And under it, the same on an Android device or emulator.
+                let row = format!(
+                    "  {}  {:<PHASE_CELL$}  {} — opens it on an Android device or emulator",
+                    pad(name, process_width),
+                    "app",
+                    links.android,
                 );
                 writeln!(out, "{}", ellipsize_end(&row, width))?;
             }

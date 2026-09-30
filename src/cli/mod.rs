@@ -475,14 +475,20 @@ Examples:
         #[arg(value_name = WORKTREE, value_hint = clap::ValueHint::Other)]
         name: Option<String>,
     },
-    /// Open a running worktree's URL in the browser.
+    /// Open a running worktree's URL in the browser, or its app.
     ///
     /// The TUI's `o` key, from a shell. The URL is printed too, so it
-    /// works over SSH where there is no browser to open.
+    /// works over SSH where there is no browser to open. A worktree that
+    /// serves no page, only an app a phone or a simulator runs (Expo's),
+    /// has that app opened instead: on the booted iOS simulator, else on
+    /// a connected Android device or emulator, else, on a Mac with Xcode,
+    /// on a simulator it starts. With none of those, it prints the
+    /// commands that open it.
     #[command(after_help = "\
 Examples:
   pando open feat/login           http://localhost:<port>
-  pando open feat/login --public  the URL `pando share` published")]
+  pando open feat/login --public  the URL `pando share` published
+  pando open feat/login --app     its app on the simulator, beside a page")]
     #[command(display_order = 5)]
     Open {
         /// The worktree or the main checkout, by branch or directory name.
@@ -491,8 +497,11 @@ Examples:
         #[arg(value_name = WORKTREE, value_hint = clap::ValueHint::Other)]
         name: Option<String>,
         /// The public URL `share` published, instead of the local one.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "app")]
         public: bool,
+        /// Its app on a simulator or a device, even when it serves a page.
+        #[arg(long)]
+        app: bool,
     },
     /// Print a worktree's log.
     #[command(after_help = "\
@@ -950,14 +959,24 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
         Command::Open {
             name: typed,
             public,
+            app,
         } => {
             let named = names::target_named(paths, typed.as_deref(), "open")?;
-            let url = match open::url_to_open(paths, config, &named, public)? {
+            let want = match (public, app) {
+                (true, _) => open::Want::Public,
+                (_, true) => open::Want::App,
+                _ => open::Want::Page,
+            };
+            let url = match open::url_to_open(paths, config, &named, want)? {
                 open::Opening::Url(url) => url,
-                // A browser at Metro's root shows nothing anybody wants.
-                open::Opening::NoPage(said) => {
-                    writeln!(out, "{said}")?;
-                    return Ok(());
+                // A browser at Metro's root shows nothing anybody wants:
+                // the app it serves is opened where it runs.
+                open::Opening::Apps { apps, said } => {
+                    for line in said {
+                        writeln!(out, "{line}")?;
+                    }
+                    out.flush()?;
+                    return open::open_apps(paths, &apps, &mut out, &notice);
                 }
             };
             // Printed first, so the URL is there to copy even when there is

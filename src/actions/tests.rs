@@ -15244,3 +15244,304 @@ fn a_process_serves_a_page_unless_its_settings_or_its_framework_say_not() {
         process("cmd = \"npx expo start --web\"\nports = [\"web\"]\npage = true").serves_page()
     );
 }
+
+// ---- opening a device app ---------------------------------------------------
+
+/// A machine for [`open_app`], as the commands it answers: which targets
+/// list one ready, where Xcode is, how many opens fail while a device is
+/// still starting, and every command run, in order.
+struct DeviceMachine {
+    booted: std::cell::Cell<bool>,
+    android: bool,
+    /// What `xcode-select -p` prints; `None` fails it.
+    developer_dir: Option<PathBuf>,
+    /// Whether the simulator app, once started, boots a device.
+    boots: bool,
+    /// Opens that fail with simctl's `code=60` before one works.
+    starting: std::cell::Cell<u32>,
+    /// What an open that fails for good says, when one does.
+    refuses: Option<&'static str>,
+    ran: std::cell::RefCell<Vec<String>>,
+}
+
+impl DeviceMachine {
+    fn new() -> DeviceMachine {
+        DeviceMachine {
+            booted: false.into(),
+            android: false,
+            developer_dir: None,
+            boots: true,
+            starting: 0.into(),
+            refuses: None,
+            ran: Vec::new().into(),
+        }
+    }
+
+    fn run(&self, command: &str) -> Option<Ran> {
+        self.ran.borrow_mut().push(command.to_string());
+        let answer = |ok: bool, output: &str| {
+            Some(Ran {
+                ok,
+                output: output.to_string(),
+            })
+        };
+        match command {
+            "xcrun simctl list devices booted" => match self.booted.get() {
+                true => answer(true, "== Devices ==\n    iPhone 17 (0000) (Booted) \n"),
+                false => answer(true, "== Devices ==\n"),
+            },
+            "adb devices" => match self.android {
+                true => answer(true, "List of devices attached\nemulator-5554\tdevice\n"),
+                false => answer(true, "List of devices attached\n"),
+            },
+            "xcode-select -p" => match &self.developer_dir {
+                Some(dir) => answer(true, &format!("{}\n", dir.display())),
+                None => answer(false, "xcode-select: error: no developer directory"),
+            },
+            launch if launch.starts_with("open -a ") => {
+                self.booted.set(self.boots);
+                answer(true, "")
+            }
+            _ => match self.refuses {
+                Some(said) => answer(false, said),
+                None if self.starting.get() > 0 => {
+                    self.starting.set(self.starting.get() - 1);
+                    answer(
+                        false,
+                        "An error was encountered (domain=NSPOSIXErrorDomain, code=60)",
+                    )
+                }
+                None => answer(true, ""),
+            },
+        }
+    }
+
+    fn ran(&self) -> Vec<String> {
+        self.ran.borrow().clone()
+    }
+}
+
+fn expo_links() -> crate::catalog::frameworks::AppLinks {
+    let (device, _) = crate::catalog::frameworks::device(&["RCT_METRO_PORT"], "").unwrap();
+    device.links(
+        "127.0.0.1",
+        18_081,
+        &crate::catalog::frameworks::AppManifest::default(),
+    )
+}
+
+/// Opens `links` on `machine`, on a Mac or not, with every wait short;
+/// returns what it said too.
+fn open_app_on(
+    machine: &DeviceMachine,
+    mac: bool,
+    links: &crate::catalog::frameworks::AppLinks,
+) -> (Result<&'static str, NotOpened>, Vec<String>) {
+    let run = |command: &str| machine.run(command);
+    let opener = Opener {
+        run: &run,
+        may_start_simulator: mac,
+        boot_wait: Duration::from_millis(300),
+        retry_wait: Duration::from_millis(300),
+        every: Duration::from_millis(1),
+    };
+    let said = std::cell::RefCell::new(Vec::new());
+    let result = open_app(links, &opener, &|line| {
+        said.borrow_mut().push(line.to_string())
+    });
+    (result, said.into_inner())
+}
+
+// A booted simulator comes first, and what runs there is the very command
+// `status` prints; no Android device is asked about.
+#[test]
+fn an_app_opens_on_the_booted_simulator_with_the_command_status_prints() {
+    let machine = DeviceMachine {
+        booted: true.into(),
+        android: true,
+        ..DeviceMachine::new()
+    };
+    let links = expo_links();
+    let (opened, said) = open_app_on(&machine, true, &links);
+    assert_eq!(opened, Ok("the booted iOS simulator"));
+    assert!(said.is_empty(), "{said:?}");
+    assert_eq!(
+        machine.ran(),
+        ["xcrun simctl list devices booted", links.simulator.as_str()]
+    );
+}
+
+// With no simulator booted, a connected Android device or emulator: the
+// Android command, `adb reverse` and all, as printed.
+#[test]
+fn an_app_opens_on_a_connected_android_device_when_no_simulator_is_booted() {
+    let machine = DeviceMachine {
+        android: true,
+        ..DeviceMachine::new()
+    };
+    let links = expo_links();
+    let (opened, _) = open_app_on(&machine, true, &links);
+    assert_eq!(opened, Ok("the connected Android device or emulator"));
+    assert_eq!(machine.ran().last(), Some(&links.android));
+    assert!(
+        links
+            .android
+            .starts_with("adb reverse tcp:18081 tcp:18081 && ")
+    );
+}
+
+// Off a Mac, with nothing to open it on, nothing is started: the reason,
+// for the caller to print beside the commands.
+#[test]
+fn an_app_with_nowhere_to_open_says_why_and_runs_nothing() {
+    let machine = DeviceMachine::new();
+    let links = expo_links();
+    let (opened, said) = open_app_on(&machine, false, &links);
+    assert_eq!(
+        opened,
+        Err(NotOpened::Nowhere(
+            "no iOS simulator is booted and no Android device or emulator is connected".into()
+        ))
+    );
+    assert!(said.is_empty(), "{said:?}");
+    assert_eq!(
+        machine.ran(),
+        ["xcrun simctl list devices booted", "adb devices"]
+    );
+    // What the caller prints instead: each target's command, from the
+    // same links.
+    assert_eq!(
+        open_commands(&links),
+        [
+            ("the booted iOS simulator", links.simulator.as_str()),
+            (
+                "the connected Android device or emulator",
+                links.android.as_str()
+            ),
+        ]
+    );
+}
+
+// On a Mac, the simulator app of the Xcode in use is found from
+// `xcode-select -p`, DeviceHub.app from Xcode 27 and Simulator.app
+// before, started, and waited for; the first opens after its cold boot
+// time out, and are tried again, saying so.
+#[test]
+fn a_mac_starts_the_simulator_app_xcode_ships_and_waits_for_it_to_boot() {
+    for app in ["DeviceHub.app", "Simulator.app"] {
+        let dir = tempdir().unwrap();
+        let developer = dir.path().join("Xcode.app/Contents/Developer");
+        std::fs::create_dir_all(&developer).unwrap();
+        let apps = dir.path().join("Xcode.app/Contents/Applications");
+        std::fs::create_dir_all(apps.join(app)).unwrap();
+        let machine = DeviceMachine {
+            developer_dir: Some(developer),
+            starting: 2.into(),
+            ..DeviceMachine::new()
+        };
+        let links = expo_links();
+        let (opened, said) = open_app_on(&machine, true, &links);
+        assert_eq!(opened, Ok("the booted iOS simulator"), "{app}");
+        let apps = std::fs::canonicalize(&apps).unwrap();
+        let launch = format!("open -a '{}'", apps.join(app).display());
+        let ran = machine.ran();
+        assert!(ran.contains(&launch), "{app}: {ran:?}");
+        assert_eq!(
+            ran.iter().filter(|c| **c == links.simulator).count(),
+            3,
+            "two timeouts, then the open: {ran:?}"
+        );
+        let stem = app.trim_end_matches(".app");
+        assert_eq!(
+            said,
+            [
+                format!("starting {stem} and waiting up to 0s for a simulator to boot"),
+                "the booted iOS simulator is still starting — trying again for up to 0s"
+                    .to_string(),
+            ]
+        );
+    }
+}
+
+// What stops a Mac from starting one is said: no Xcode, an Xcode with no
+// simulator app, a simulator app that boots nothing in time.
+#[test]
+fn a_mac_that_cannot_start_a_simulator_says_why() {
+    let links = expo_links();
+    let (opened, _) = open_app_on(&DeviceMachine::new(), true, &links);
+    let Err(NotOpened::Nowhere(why)) = opened else {
+        panic!("{opened:?}")
+    };
+    assert!(
+        why.ends_with("`xcode-select -p` names no Xcode to start a simulator with"),
+        "{why}"
+    );
+
+    let dir = tempdir().unwrap();
+    let developer = dir.path().join("Xcode.app/Contents/Developer");
+    std::fs::create_dir_all(&developer).unwrap();
+    let machine = DeviceMachine {
+        developer_dir: Some(developer.clone()),
+        ..DeviceMachine::new()
+    };
+    let (opened, _) = open_app_on(&machine, true, &links);
+    let Err(NotOpened::Nowhere(why)) = opened else {
+        panic!("{opened:?}")
+    };
+    assert!(
+        why.contains("has no Simulator.app or DeviceHub.app"),
+        "{why}"
+    );
+
+    let hub = dir
+        .path()
+        .join("Xcode.app/Contents/Applications/DeviceHub.app");
+    std::fs::create_dir_all(hub).unwrap();
+    let machine = DeviceMachine {
+        developer_dir: Some(developer),
+        boots: false,
+        ..DeviceMachine::new()
+    };
+    let (opened, _) = open_app_on(&machine, true, &links);
+    let Err(NotOpened::Nowhere(why)) = opened else {
+        panic!("{opened:?}")
+    };
+    assert!(
+        why.contains("DeviceHub booted no simulator within"),
+        "{why}"
+    );
+    assert!(
+        !machine.ran().contains(&links.simulator),
+        "nothing to open it on"
+    );
+}
+
+// An open a booted simulator refuses for good, with no build that
+// registers the scheme, is said at once, with the command and its last
+// line, not tried again for a minute.
+#[test]
+fn an_open_the_simulator_refuses_fails_at_once_with_what_it_said() {
+    let machine = DeviceMachine {
+        booted: true.into(),
+        refuses: Some("error: no application is registered to open\nOSStatus error -10814"),
+        ..DeviceMachine::new()
+    };
+    let links = expo_links();
+    let (opened, _) = open_app_on(&machine, true, &links);
+    let Err(failed) = opened else {
+        panic!("{opened:?}")
+    };
+    assert_eq!(
+        failed.to_string(),
+        format!(
+            "`{}` failed on the booted iOS simulator: OSStatus error -10814",
+            links.simulator
+        )
+    );
+    let opens = machine
+        .ran()
+        .iter()
+        .filter(|c| **c == links.simulator)
+        .count();
+    assert_eq!(opens, 1);
+}

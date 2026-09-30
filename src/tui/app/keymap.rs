@@ -81,7 +81,11 @@ pub const LIST_KEYS: &[KeyHelp] = &[
         &[KeyCode::Char('P')],
         "restart only the ▸ process (tab picks it; P twice)",
     ),
-    key("o", &[KeyCode::Char('o')], "open its URL in the browser"),
+    key(
+        "o",
+        &[KeyCode::Char('o')],
+        "open its URL in the browser, or its app on a simulator or device",
+    ),
     key(
         "t",
         &[KeyCode::Char('t')],

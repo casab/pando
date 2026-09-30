@@ -5,6 +5,7 @@ use super::answers::slot_names;
 use super::logs::silence_notes;
 use super::logs::{leading_timestamp, level_word};
 use super::ls::ORDER;
+use super::open::Want;
 use super::prompt::asker;
 use super::prompt::prompt_with;
 use super::status::{human_duration, phase_word};
@@ -298,7 +299,7 @@ fn a_refresh_that_only_failed_to_save_still_answers_about_the_worktree() {
 
     let named = super::names::target_named(&fx.paths, Some("feat/two"), "open").unwrap();
     let err =
-        super::open::url_to_open(&fx.paths, &with_dev(&fx.config), &named, false).unwrap_err();
+        super::open::url_to_open(&fx.paths, &with_dev(&fx.config), &named, Want::Page).unwrap_err();
     assert_eq!(
         format!("{err:#}"),
         "feat/two is not running — `pando start feat/two` starts it"
@@ -529,15 +530,14 @@ fn open_wants_something_up_or_a_share() {
     let name = actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
     let config = with_dev(&fx.config);
     let named = super::names::target_named(&fx.paths, Some("feat/one"), "open").unwrap();
-    let open =
-        |config: &Config, public| super::open::url_to_open(&fx.paths, config, &named, public);
-    let err = open(&config, false).unwrap_err();
+    let open = |config: &Config, want| super::open::url_to_open(&fx.paths, config, &named, want);
+    let err = open(&config, Want::Page).unwrap_err();
     // Named as a person knows it, and the command echoes what was typed.
     assert_eq!(
         format!("{err:#}"),
         "feat/one is not running — `pando start feat/one` starts it"
     );
-    let err = open(&config, true).unwrap_err();
+    let err = open(&config, Want::Public).unwrap_err();
     assert_eq!(
         format!("{err:#}"),
         "feat/one is not shared — `pando share feat/one` publishes it"
@@ -545,11 +545,11 @@ fn open_wants_something_up_or_a_share() {
 
     with_share(&fx, &name, None);
     assert_eq!(
-        open(&config, false).unwrap(),
+        open(&config, Want::Page).unwrap(),
         super::open::Opening::Url("http://localhost:17342".into())
     );
     assert_eq!(
-        open(&config, true).unwrap(),
+        open(&config, Want::Public).unwrap(),
         super::open::Opening::Url("https://fake-host.trycloudflare.com".into())
     );
 }
@@ -573,7 +573,7 @@ fn open_on_a_project_with_nothing_to_run_says_so_and_how_to_add_one() {
     let fx = fixture();
     actions::new(&fx.paths, &fx.config, "feat/r", None, &|_| {}).unwrap();
     let named = super::names::target_named(&fx.paths, Some("feat/r"), "open").unwrap();
-    let err = super::open::url_to_open(&fx.paths, &fx.config, &named, false).unwrap_err();
+    let err = super::open::url_to_open(&fx.paths, &fx.config, &named, Want::Page).unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.starts_with("feat/r is not running, and this project has nothing to run"));
     assert!(!msg.contains("pando start"), "{msg}");
@@ -1598,6 +1598,8 @@ fn status_gives_the_link_that_opens_an_expo_app_on_the_simulator() {
             "client": "Expo Go",
             "url": "exp://127.0.0.1:18081",
             "simulator": "xcrun simctl openurl booted 'exp://127.0.0.1:18081'",
+            "android": "adb reverse tcp:18081 tcp:18081 && adb shell am start -a \
+                        android.intent.action.VIEW -d 'exp://127.0.0.1:18081'",
             "development_build":
                 "exp+<slug>://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A18081",
             "native": null,
@@ -1635,6 +1637,20 @@ fn status_gives_the_link_that_opens_an_expo_app_on_the_simulator() {
         apps[0].contains(
             "xcrun simctl openurl booted 'exp://127.0.0.1:18081' — opens it in Expo Go on the \
              simulator; for a development build, open exp+<slug>://expo-development-client/"
+        ),
+        "{text}"
+    );
+    // And under it, the Android device's or emulator's.
+    let android = text
+        .lines()
+        .skip_while(|line| !line.contains("simctl"))
+        .nth(1)
+        .unwrap_or_default();
+    assert!(android.trim_start().starts_with("mobile  app"), "{text}");
+    assert!(
+        android.ends_with(
+            "adb reverse tcp:18081 tcp:18081 && adb shell am start -a android.intent.action.VIEW \
+             -d 'exp://127.0.0.1:18081' — opens it on an Android device or emulator"
         ),
         "{text}"
     );
@@ -1683,6 +1699,10 @@ fn status_opens_an_app_with_the_development_client_in_its_development_build() {
             "client": "its development build",
             "url": url,
             "simulator": format!("xcrun simctl openurl booted '{url}'"),
+            "android": format!(
+                "adb reverse tcp:18081 tcp:18081 && adb shell am start -a \
+                 android.intent.action.VIEW -d '{url}'"
+            ),
             "development_build": url,
         })
     );
@@ -1785,9 +1805,11 @@ fn status_says_when_a_branch_changes_its_apps_native_code() {
 }
 
 // An Expo-only worktree has no page: `status` gives no URL, and `open`
-// says how its app is opened rather than hand a browser Metro's root.
+// opens its app rather than hand a browser Metro's root. With nothing
+// here to open it on (a unit test runs no command), it says why and
+// gives each target's command, the ones `status` prints.
 #[test]
-fn open_gives_the_app_link_of_a_worktree_that_serves_no_page() {
+fn open_opens_the_app_of_a_worktree_that_serves_no_page() {
     let fx = fixture();
     let name = actions::new(&fx.paths, &fx.config, "feat/one", None, &|_| {}).unwrap();
     let config_text = "[processes.mobile]\ncmd = \"npm run start\"\n\
@@ -1810,16 +1832,140 @@ fn open_gives_the_app_link_of_a_worktree_that_serves_no_page() {
     assert_eq!(v["worktrees"][0]["url"], serde_json::Value::Null);
     let config: Config = toml::from_str(config_text).unwrap();
     let named = super::names::target_named(&fx.paths, Some("feat/one"), "open").unwrap();
-    let opening = super::open::url_to_open(&fx.paths, &config, &named, false).unwrap();
+    let opening = super::open::url_to_open(&fx.paths, &config, &named, Want::Page).unwrap();
+    let record = crate::state::load(&fx.paths.state_file())
+        .unwrap()
+        .worktrees[&name]
+        .clone();
+    let links = actions::app_links(&config, &record)["mobile"].clone();
     assert_eq!(
         opening,
-        super::open::Opening::NoPage(
-            "feat/one serves no page to open in a browser\n\
-             mobile: `xcrun simctl openurl booted 'exp://127.0.0.1:18081'` opens its app in \
-             Expo Go on the simulator"
-                .to_string()
-        )
+        super::open::Opening::Apps {
+            apps: vec![("mobile".to_string(), links.clone())],
+            said: Vec::new(),
+        }
     );
+
+    let said = std::cell::RefCell::new(Vec::new());
+    let text = capture(|b| {
+        super::open::open_apps(
+            &fx.paths,
+            &[("mobile".to_string(), links.clone())],
+            b,
+            &|line| said.borrow_mut().push(line.to_string()),
+        )
+    });
+    assert_eq!(said.borrow()[0], "opening mobile's app in Expo Go");
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(
+        lines[0].starts_with(
+            "mobile: no iOS simulator is booted and no Android device or emulator is connected"
+        ),
+        "{text}"
+    );
+    assert!(
+        lines[0].ends_with("— once one is, this opens its app in Expo Go:"),
+        "{text}"
+    );
+    assert_eq!(
+        lines[1..],
+        [
+            format!("  on the booted iOS simulator: {}", links.simulator),
+            format!(
+                "  on the connected Android device or emulator: {}",
+                links.android
+            ),
+        ]
+    );
+
+    // A process that says `page = false` and is no device's app has
+    // nothing to open, and says so, as before; and an app that stopped
+    // says how to start it.
+    let mut store = crate::state::load(&fx.paths.state_file()).unwrap();
+    let record = store.worktrees.get_mut(&name).unwrap();
+    record.pageless.insert("worker".to_string());
+    record.processes.remove("mobile");
+    record
+        .processes
+        .insert("worker".to_string(), listening(999_998, &[]));
+    crate::state::save(&fx.paths.state_file(), &store).unwrap();
+    assert_eq!(
+        super::open::url_to_open(&fx.paths, &config, &named, Want::Page).unwrap(),
+        super::open::Opening::Apps {
+            apps: Vec::new(),
+            said: vec![
+                "feat/one serves no page to open in a browser".to_string(),
+                "mobile: its app is not running — `pando start feat/one --only mobile` starts it"
+                    .to_string(),
+                "worker: its settings say `page = false`".to_string(),
+            ],
+        }
+    );
+}
+
+// `--app` opens a worktree's app beside its page: a backend and a mobile
+// app, where plain `open` opens the backend's page. A worktree with no
+// app a device runs is refused, with the command that opens its page.
+#[test]
+fn open_app_opens_the_app_beside_a_page() {
+    let fx = fixture();
+    let name = with_mobile_app(&fx, MOBILE_BY_VARIABLE);
+    let config: Config = toml::from_str(MOBILE_BY_VARIABLE).unwrap();
+    let named = super::names::target_named(&fx.paths, Some("feat/one"), "open").unwrap();
+    assert_eq!(
+        super::open::url_to_open(&fx.paths, &config, &named, Want::Page).unwrap(),
+        super::open::Opening::Url("http://localhost:17342".into())
+    );
+    let record = crate::state::load(&fx.paths.state_file())
+        .unwrap()
+        .worktrees[&name]
+        .clone();
+    assert_eq!(
+        super::open::url_to_open(&fx.paths, &config, &named, Want::App).unwrap(),
+        super::open::Opening::Apps {
+            apps: vec![(
+                "mobile".to_string(),
+                actions::app_links(&config, &record)["mobile"].clone()
+            )],
+            said: Vec::new(),
+        }
+    );
+
+    let web_only: Config =
+        toml::from_str("[processes.api]\ncmd = \"npm run dev\"\nports = { PORT = \"web\" }\n")
+            .unwrap();
+    let err = super::open::url_to_open(&fx.paths, &web_only, &named, Want::App).unwrap_err();
+    assert_eq!(
+        format!("{err:#}"),
+        "feat/one runs no app a simulator or a device opens — `pando open feat/one` opens its \
+         page"
+    );
+}
+
+// The flag is clap's, so completions offer it, and `--public` beside it
+// is refused rather than one of them silently winning.
+#[test]
+fn open_takes_app_and_completions_offer_it() {
+    let open = Cli::command()
+        .get_subcommands()
+        .find(|sub| sub.get_name() == "open")
+        .unwrap()
+        .clone();
+    assert!(open.get_arguments().any(|a| a.get_long() == Some("app")));
+    for shell in [
+        clap_complete::Shell::Zsh,
+        clap_complete::Shell::Bash,
+        clap_complete::Shell::Fish,
+    ] {
+        let script = completion_script(shell);
+        let flag = match shell {
+            clap_complete::Shell::Fish => "-l app",
+            _ => "--app",
+        };
+        assert!(script.contains(flag), "{shell:?}");
+    }
+    let err = Cli::try_parse_from(["pando", "open", "feat/one", "--app", "--public"]).unwrap_err();
+    assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
 }
 
 // A command that runs Expo's server by name is known the same way, and
@@ -3270,7 +3416,9 @@ fn the_job_says_a_devices_address_only_for_an_app_a_device_runs() {
     // is gone under pando.
     for text in [list, block] {
         assert!(
-            text.contains("`pando status <name>` gives the command that opens the app"),
+            text.contains(
+                "`pando open <name>` opens the app; `pando status <name>` gives the commands"
+            ),
             "{text}"
         );
     }

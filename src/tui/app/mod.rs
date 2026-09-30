@@ -338,6 +338,10 @@ pub struct App {
     /// The URL a test asked to open, instead of handing it to the desktop.
     #[cfg(test)]
     pub opened: Option<String>,
+    /// The app URLs a test asked to open on a simulator or a device,
+    /// instead of reaching one.
+    #[cfg(test)]
+    pub opened_apps: Vec<String>,
 }
 
 impl App {
@@ -411,6 +415,8 @@ impl App {
             clipboard: None,
             #[cfg(test)]
             opened: None,
+            #[cfg(test)]
+            opened_apps: Vec::new(),
         };
         // One synchronous read so the first frame has rows, hydrated from the
         // disk cache so those rows already carry sha, age, and dirty state.
@@ -571,6 +577,17 @@ impl App {
             }
             AppEvent::LaunchFailed(message) => {
                 self.set_error(message);
+                true
+            }
+            AppEvent::AppOpening(message) => {
+                self.set_progress(message);
+                true
+            }
+            AppEvent::AppOpened(result) => {
+                match result {
+                    Ok(message) => self.set_success(message),
+                    Err(message) => self.set_error(message),
+                }
                 true
             }
             AppEvent::Notice(message) => {
@@ -1543,6 +1560,7 @@ impl App {
             checks_started: 0,
             clipboard: None,
             opened: None,
+            opened_apps: Vec::new(),
         };
         app.refilter();
         app

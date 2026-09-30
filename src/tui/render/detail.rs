@@ -234,10 +234,11 @@ pub(super) fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
             rows.push((KEEP_URL, line));
         }
     }
-    // And, for a running bundler whose app a device runs, the command that
-    // opens it on the simulator, whole for the same reason: Expo's own
-    // keypress for it is gone with no terminal. `pando status` also gives
-    // a development build's link.
+    // And, for a running bundler whose app a device runs, the commands
+    // that open it on the simulator and on an Android device, whole for
+    // the same reason: Expo's own keypresses for them are gone with no
+    // terminal, and `o` runs them. `pando status` also gives a
+    // development build's link.
     for line in app_rows(app, &name, width) {
         rows.push((KEEP_URL, line));
     }
@@ -812,8 +813,8 @@ fn phase_as_aggregate(process: &str, record: &ProcessRecord) -> Aggregate {
     }
 }
 
-/// The simulator's command for each running process whose app a device
-/// runs, never cut. From the settings, the record, and the app's
+/// The commands that open the app of each running process whose app a
+/// device runs, never cut. From the settings, the record, and the app's
 /// manifests as the session read them once.
 fn app_rows<'a>(app: &App, name: &str, width: usize) -> Vec<Line<'a>> {
     let Some(record) = app.record_for(name) else {
@@ -834,8 +835,13 @@ fn app_rows<'a>(app: &App, name: &str, width: usize) -> Vec<Line<'a>> {
                 .get(process)
                 .is_some_and(|p| matches!(p.phase, Phase::Running { .. }))
         })
+        // The simulator's, then an Android device's or emulator's: the
+        // commands `o` runs, in the order it tries them.
         .flat_map(|(_, links)| {
-            command_rows("app", &links.simulator, Style::new().fg(text()), width)
+            let style = Style::new().fg(text());
+            let mut rows = command_rows("app", &links.simulator, style, width);
+            rows.extend(command_rows("app", &links.android, style, width));
+            rows
         })
         .collect()
 }
