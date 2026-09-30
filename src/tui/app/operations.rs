@@ -622,6 +622,12 @@ impl App {
                 ),
             });
         }
+        // One opening at a time: a second would start the simulator and
+        // wait for its boot all over again.
+        if self.app_opening {
+            return self.set_status("an app is being opened already — its message says when");
+        }
+        self.app_opening = true;
         self.set_progress(format!("opening {label}'s app"));
         self.spawn_app_open(label, apps);
     }

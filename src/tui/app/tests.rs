@@ -1711,6 +1711,18 @@ fn o_on_a_worktree_that_serves_no_page_opens_its_app() {
         app.active_status().map(|(m, _)| m),
         Some("opening feat/one's app")
     );
+    // A second `o` while it opens starts no second opening.
+    app.opened_apps.clear();
+    press(&mut app, KeyCode::Char('o'));
+    assert!(app.opened_apps.is_empty());
+    assert!(
+        app.active_status()
+            .unwrap()
+            .0
+            .contains("being opened already"),
+        "{:?}",
+        app.active_status()
+    );
     app.handle_event(AppEvent::AppOpening(
         "starting DeviceHub and waiting up to 120s for a simulator to boot".into(),
     ));
@@ -1726,6 +1738,10 @@ fn o_on_a_worktree_that_serves_no_page_opens_its_app() {
     assert!(!is_error);
     app.handle_event(AppEvent::AppOpened(Err("feat/one: no simulator".into())));
     assert!(app.active_status().unwrap().1, "an error");
+    // Once it ended, `o` opens it again.
+    press(&mut app, KeyCode::Char('o'));
+    assert_eq!(app.opened_apps, ["exp://127.0.0.1:17342"]);
+    app.handle_event(AppEvent::AppOpened(Ok("opened".into())));
 
     // A process that only says `page = false` has no app to open.
     app.opened_apps.clear();

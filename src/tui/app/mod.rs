@@ -250,6 +250,9 @@ pub struct App {
     pub pr_list: Vec<PrInfo>,
     /// A fetch is on its way; the picker says so rather than "none".
     pub pr_fetching: bool,
+    /// An app is being opened on a simulator or a device: a second `o`
+    /// waits for it rather than starting the simulator twice.
+    pub app_opening: bool,
     /// Why the last fetch failed, for the picker to say.
     pub pr_error: Option<String>,
     /// Which GitHub account `gh` acts as for this project; `None` while
@@ -376,6 +379,7 @@ impl App {
             prs: HashMap::new(),
             pr_list: Vec::new(),
             pr_fetching: false,
+            app_opening: false,
             pr_error: None,
             gh_account: None,
             list_state: ListState::default(),
@@ -584,6 +588,7 @@ impl App {
                 true
             }
             AppEvent::AppOpened(result) => {
+                self.app_opening = false;
                 match result {
                     Ok(message) => self.set_success(message),
                     Err(message) => self.set_error(message),
@@ -1524,6 +1529,7 @@ impl App {
             prs: HashMap::new(),
             pr_list: Vec::new(),
             pr_fetching: false,
+            app_opening: false,
             pr_error: None,
             gh_account: None,
             list_state: ListState::default(),
