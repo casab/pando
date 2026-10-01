@@ -16,6 +16,7 @@ mod detect;
 mod distribution;
 mod docker;
 mod engines;
+mod git;
 mod hooks;
 mod invariant;
 mod isolation;

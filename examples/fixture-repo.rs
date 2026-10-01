@@ -23,6 +23,11 @@ fn main() {
     let rest: Vec<String> = args.collect();
     let with_origin = rest.iter().any(|a| a == "--with-origin");
     let with_listener = rest.iter().any(|a| a == "--listener");
+    let with_drift = rest.iter().any(|a| a == "--drift");
+    if with_drift && !with_origin {
+        eprintln!("--drift needs --with-origin: it is origin that moves on");
+        std::process::exit(2);
+    }
 
     let Some(kind) = Kind::parse(&requested) else {
         eprintln!("unknown fixture {requested:?}. Known kinds:");
@@ -48,6 +53,18 @@ fn main() {
 
     if let Some(remote) = &fixture.remote {
         eprintln!("origin: {}", remote.display());
+    }
+    // Branches that have drifted every way the TUI's git menu handles.
+    if with_drift {
+        for (branch, path) in common::DRIFT_BRANCHES
+            .iter()
+            .zip(common::drift(&fixture, &parent))
+        {
+            eprintln!("worktree {branch}: {}", path.display());
+        }
+        eprintln!(
+            "origin's main is 3 commits ahead, unfetched: u then f on the main checkout fetches it"
+        );
     }
     // A dev process that needs no real framework installed, so the manual
     // demo can start, watch, and stop something that really binds a port.

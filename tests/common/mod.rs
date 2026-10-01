@@ -734,6 +734,72 @@ pub fn build_with_origin(kind: Kind, parent: &Path) -> Fixture {
     }
 }
 
+/// The worktrees [`drift`] makes beside a fixture, by branch.
+pub const DRIFT_BRANCHES: [&str; 3] = ["feat/clean", "feat/conflict", "fix/dirty"];
+
+/// A fixture with origin whose branches have drifted, for trying the
+/// TUI's git menu on every shape it has: origin's `main` three commits
+/// past the main checkout's, unfetched, and three worktrees beside the
+/// fixture, made with plain git from the main checkout's `main` —
+///
+/// - `feat/clean`, two commits of its own that rebase cleanly;
+/// - `feat/conflict`, a `notes.txt` of its own that one of origin's new
+///   commits also adds, so a rebase or a merge stops on it;
+/// - `fix/dirty`, an uncommitted file, which every move refuses.
+///
+/// The main checkout is given an identity of its own, as a developer's
+/// repository has one: a rebase and a merge commit with it.
+pub fn drift(fixture: &Fixture, parent: &Path) -> Vec<PathBuf> {
+    let root = &fixture.root;
+    for (key, value) in [
+        ("user.name", "t"),
+        ("user.email", "t@t"),
+        ("commit.gpgsign", "false"),
+    ] {
+        git(root, &["config", key, value]);
+    }
+    let dir = parent.join(format!(
+        "{}-worktrees",
+        root.file_name().unwrap().to_string_lossy()
+    ));
+    let commit = |at: &Path, file: &str, contents: &str, message: &str| {
+        write_file(at, file, contents);
+        git(at, &["add", file]);
+        git(at, &["commit", "--quiet", "-m", message]);
+    };
+    let made: Vec<PathBuf> = DRIFT_BRANCHES
+        .iter()
+        .map(|branch| {
+            let path = dir.join(branch.replace('/', "+"));
+            git(
+                root,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "-b",
+                    branch,
+                    path.to_str().unwrap(),
+                    "main",
+                ],
+            );
+            path
+        })
+        .collect();
+    commit(&made[0], "clean-1.txt", "one\n", "clean: first");
+    commit(&made[0], "clean-2.txt", "two\n", "clean: second");
+    commit(&made[1], "notes.txt", "mine\n", "conflict: my notes");
+    write_file(&made[2], "wip.txt", "not committed yet\n");
+
+    // Origin moves on, from the seed the fixture was cloned through.
+    let seed = parent.join("seed").join(root.file_name().unwrap());
+    commit(&seed, "drift-1.txt", "1\n", "origin: first");
+    commit(&seed, "notes.txt", "theirs\n", "origin: their notes");
+    commit(&seed, "drift-3.txt", "3\n", "origin: third");
+    git(&seed, &["push", "--quiet", "origin", "main"]);
+    made
+}
+
 fn write_file(root: &Path, rel: &str, contents: &str) {
     let path = root.join(rel);
     if let Some(parent) = path.parent() {
