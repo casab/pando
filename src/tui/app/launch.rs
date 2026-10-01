@@ -256,7 +256,12 @@ impl App {
         let Some((path, label)) = self.selected_path_and_label() else {
             return;
         };
-        let request = plan_shell(&self.launch_env, &path, &label);
+        self.open_shell_in(&path, &label);
+    }
+
+    /// A shell in `path`: `!`, and the git menu's way to do it by hand.
+    pub(super) fn open_shell_in(&mut self, path: &Path, label: &str) {
+        let request = plan_shell(&self.launch_env, path, label);
         self.request_launch(request);
     }
 

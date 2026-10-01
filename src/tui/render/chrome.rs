@@ -301,12 +301,13 @@ pub(super) fn gh_account_spans(account: Option<&GhAccount>) -> Vec<Span<'static>
 
 /// Key hints for a selected worktree that runs, most valuable first. The
 /// essential ones are never dropped.
-pub(super) const RUNNING_HINTS: [(&str, &str, bool); 15] = [
+pub(super) const RUNNING_HINTS: [(&str, &str, bool); 16] = [
     ("j/k", "move", true),
     ("l", "logs", true),
     ("x", "stop", true),
     ("⏎", "mode", false),
     ("r", "restart", false),
+    ("u", "git", false),
     ("o", "open", false),
     ("c", "copy url", false),
     ("t", "share", false),
@@ -320,9 +321,10 @@ pub(super) const RUNNING_HINTS: [(&str, &str, bool); 15] = [
 ];
 
 /// And for one that is stopped: what starts it, in each mode.
-pub(super) const STOPPED_HINTS: [(&str, &str, bool); 11] = [
+pub(super) const STOPPED_HINTS: [(&str, &str, bool); 12] = [
     ("j/k", "move", true),
     ("⏎", "start", true),
+    ("u", "git", false),
     ("i", "isolated", false),
     ("l", "logs", false),
     ("!", "shell", false),
@@ -336,8 +338,9 @@ pub(super) const STOPPED_HINTS: [(&str, &str, bool); 11] = [
 
 /// For a stopped worktree of a project that has nothing to run: no start
 /// key is offered, because none would start anything.
-pub(super) const NOTHING_TO_RUN_HINTS: [(&str, &str, bool); 9] = [
+pub(super) const NOTHING_TO_RUN_HINTS: [(&str, &str, bool); 10] = [
     ("j/k", "move", true),
+    ("u", "git", false),
     ("l", "logs", false),
     ("!", "shell", false),
     ("e", "edit", false),

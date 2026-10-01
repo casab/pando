@@ -6,6 +6,7 @@ use std::thread;
 use std::time::Instant;
 
 use crate::actions;
+use crate::actions::git::{GitAction, Ran};
 use crate::config::Config;
 use crate::paths::PandoPaths;
 use crate::state::{self, Aggregate, Phase, WorktreeRecord};
@@ -15,7 +16,7 @@ use super::App;
 use super::background::{AppEvent, ask_through_ui, config_now};
 use super::dialogs::Modal;
 
-pub(super) const SPINNER_FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+pub const SPINNER_FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
 /// What a start says when the config names no process. Matched loosely:
 /// the wording after it may change, and a miss only means the TUI learns
@@ -55,6 +56,8 @@ pub enum PendingKind {
     Share,
     Unshare,
     StopAll,
+    /// A move from the git menu.
+    Git(GitAction),
 }
 
 impl PendingKind {
@@ -69,6 +72,7 @@ impl PendingKind {
             PendingKind::Share => "sharing",
             PendingKind::Unshare => "unsharing",
             PendingKind::StopAll => "stopping",
+            PendingKind::Git(action) => action.verb(),
         }
     }
 
@@ -83,6 +87,7 @@ impl PendingKind {
             PendingKind::Share => "share",
             PendingKind::Unshare => "unshare",
             PendingKind::StopAll => "stop",
+            PendingKind::Git(action) => action.word(),
         }
     }
 }
@@ -103,6 +108,8 @@ pub enum PendingOutcome {
     /// Every worktree `X` stopped, and every one it left running because
     /// it came up after the confirmation was shown.
     StoppedAll(actions::StopAllReport),
+    /// What a move from the git menu did to the worktree.
+    Git(String, Ran),
 }
 
 impl PendingOutcome {
@@ -388,6 +395,7 @@ impl App {
         match pending.rx.try_recv() {
             Ok(Ok(outcome)) => {
                 let label = pending.label.clone();
+                let kind = pending.kind;
                 let said = pending.all_it_said();
                 let doing = format!("{} {label}", pending.kind.verb());
                 self.pending = None;
@@ -487,6 +495,13 @@ impl App {
                         self.set_success(format!("{label} is no longer public"));
                         self.spawn_refresh();
                     }
+                    PendingOutcome::Git(name, ran) => {
+                        let action = match kind {
+                            PendingKind::Git(action) => action,
+                            _ => GitAction::Fetch,
+                        };
+                        self.git_finished(&name, &label, action, Ok(ran));
+                    }
                 }
                 // After the outcome, so the header has them: a hook that
                 // changed the worktree is what Invariant 1 promises is
@@ -502,6 +517,10 @@ impl App {
                 let said = pending.all_it_said();
                 self.pending = None;
                 self.keep_what_it_said(&format!("{} {label}", kind.verb()), &said);
+                if let PendingKind::Git(action) = kind {
+                    self.git_finished(&name, &label, action, Err(e));
+                    return;
+                }
                 // And on the header after the error, as after an outcome:
                 // a restart whose start half failed has already closed the
                 // share, and the error alone never said which URL had gone.

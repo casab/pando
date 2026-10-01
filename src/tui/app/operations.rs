@@ -455,7 +455,12 @@ impl App {
         }
     }
 
-    fn restart_named(&mut self, name: String, mode: actions::Mode, only: Option<String>) {
+    pub(super) fn restart_named(
+        &mut self,
+        name: String,
+        mode: actions::Mode,
+        only: Option<String>,
+    ) {
         if self.phase_of(&name).is_none() && self.refuses_nothing_to_run() {
             return;
         }

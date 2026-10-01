@@ -69,6 +69,8 @@ pub enum AppEvent {
     SetupRead(Box<Result<(Config, crate::setup::Setup), String>>),
     /// pando's own guess, worked out for the setup screen's `⏎`.
     SetupTried(Box<Result<super::setup::Tried, String>>),
+    /// Where a checkout stands, for the git menu opened on it.
+    GitRead(Box<(String, actions::git::GitRead)>),
 }
 
 /// One consistent read of the repository, taken off the UI thread.

@@ -8139,3 +8139,306 @@ fn the_order_is_saved_beside_the_theme() {
     sort::set_sort(&mut doc, ListSort::Name);
     assert!(doc.to_string().contains("[ui]\nsort = \"name\""), "{doc}");
 }
+
+// ---- the git menu ----------------------------------------------------
+
+use crate::actions::git::{GitAction, GitRead, Ran};
+
+/// A worktree ten commits behind origin/main with 46 of its own, all of
+/// them pushed, and up to date with its upstream.
+pub fn a_git_read(main: bool) -> GitRead {
+    GitRead {
+        checkout: PathBuf::from("/trees/feat+one"),
+        main,
+        branch: Some("feat/one".into()),
+        base: Some("origin/main".into()),
+        base_drift: Some((46, 10)),
+        upstream: Some("origin/feat/one".into()),
+        upstream_remote: Some("origin".into()),
+        upstream_drift: Some((0, 0)),
+        pushed: 46,
+        dirty: 0,
+        in_progress: None,
+        has_origin: true,
+        fetched: None,
+    }
+}
+
+/// `u` on the selected row, and its read landing as the worker sends it.
+pub fn open_git_menu(app: &mut App, name: &str, read: GitRead) {
+    press(app, KeyCode::Char('u'));
+    assert!(
+        matches!(
+            &app.modal,
+            Some(Modal::Git {
+                stage: GitStage::Reading,
+                ..
+            })
+        ),
+        "u opens the menu, reading"
+    );
+    assert!(app.handle_event(AppEvent::GitRead(Box::new((name.to_string(), read)))));
+}
+
+fn git_stage(app: &App) -> &GitStage {
+    match &app.modal {
+        Some(Modal::Git { stage, .. }) => stage,
+        other => panic!("the git menu is not open: {other:?}"),
+    }
+}
+
+fn status_text(app: &App) -> String {
+    app.status
+        .as_ref()
+        .map(|s| s.message.clone())
+        .unwrap_or_default()
+}
+
+/// Runs the previewed action, and swaps the worker's channel for one the
+/// test answers on.
+fn run_git_preview(app: &mut App) -> mpsc::Sender<Result<PendingOutcome, String>> {
+    press(app, KeyCode::Enter);
+    assert!(matches!(git_stage(app), GitStage::Running { .. }));
+    let (tx, rx) = mpsc::channel();
+    app.pending.as_mut().expect("a run is in flight").rx = rx;
+    tx
+}
+
+#[test]
+fn u_opens_the_git_menu_on_the_move_the_row_most_likely_wants() {
+    let mut app = test_app(&["feat+one"]);
+    open_git_menu(&mut app, "feat+one", a_git_read(false));
+    match git_stage(&app) {
+        // f p r m: the base has ten new commits, the upstream none.
+        GitStage::Menu { selected, .. } => assert_eq!(*selected, 2),
+        other => panic!("{other:?}"),
+    }
+    let mut behind_upstream = a_git_read(true);
+    behind_upstream.upstream_drift = Some((0, 3));
+    let mut app = test_app(&["feat+one"]);
+    open_git_menu(&mut app, "feat+one", behind_upstream);
+    assert!(matches!(
+        git_stage(&app),
+        GitStage::Menu { selected: 1, .. }
+    ));
+}
+
+#[test]
+fn a_read_for_another_row_is_not_the_menus() {
+    let mut app = test_app(&["feat+one", "feat+two"]);
+    press(&mut app, KeyCode::Char('u'));
+    let elsewhere = AppEvent::GitRead(Box::new(("feat+two".to_string(), a_git_read(false))));
+    let selected = app.selected_worktree().unwrap().name.clone();
+    if selected != "feat+two" {
+        assert!(!app.handle_event(elsewhere));
+        assert_eq!(git_stage(&app), &GitStage::Reading);
+    }
+}
+
+#[test]
+fn esc_steps_the_git_menu_back_one_stage_at_a_time() {
+    let mut app = test_app(&["feat+one"]);
+    open_git_menu(&mut app, "feat+one", a_git_read(false));
+    press(&mut app, KeyCode::Enter);
+    assert!(matches!(
+        git_stage(&app),
+        GitStage::Preview {
+            action: GitAction::Rebase,
+            ..
+        }
+    ));
+    press(&mut app, KeyCode::Esc);
+    assert!(matches!(
+        git_stage(&app),
+        GitStage::Menu { selected: 2, .. }
+    ));
+    press(&mut app, KeyCode::Esc);
+    assert!(app.modal.is_none());
+}
+
+#[test]
+fn a_letter_opens_its_preview_and_a_refused_one_says_why() {
+    let mut app = test_app(&["feat+one"]);
+    let mut dirty = a_git_read(false);
+    dirty.dirty = 2;
+    open_git_menu(&mut app, "feat+one", dirty);
+    press(&mut app, KeyCode::Char('r'));
+    assert!(matches!(
+        git_stage(&app),
+        GitStage::Menu { selected: 2, .. }
+    ));
+    assert_eq!(
+        status_text(&app),
+        "✎ 2 uncommitted files — commit or stash first"
+    );
+    press(&mut app, KeyCode::Char('f'));
+    assert!(matches!(
+        git_stage(&app),
+        GitStage::Preview {
+            action: GitAction::Fetch,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn enter_on_a_refused_row_says_why_and_stays() {
+    let mut app = test_app(&["feat+one"]);
+    open_git_menu(&mut app, "feat+one", a_git_read(true));
+    // The main checkout's cursor starts on pull; rebase is the next row.
+    press(&mut app, KeyCode::Char('j'));
+    press(&mut app, KeyCode::Enter);
+    assert!(matches!(
+        git_stage(&app),
+        GitStage::Menu { selected: 2, .. }
+    ));
+    assert_eq!(
+        status_text(&app),
+        "not on the main checkout — pando only fast-forwards it"
+    );
+}
+
+#[test]
+fn by_hand_hands_the_checkout_to_a_shell() {
+    let mut app = test_app(&["feat+one"]);
+    open_git_menu(&mut app, "feat+one", a_git_read(false));
+    press(&mut app, KeyCode::Char('!'));
+    assert!(app.modal.is_none());
+    assert!(app.launch.is_some(), "a shell was asked for");
+}
+
+#[test]
+fn a_run_cannot_be_stepped_out_of_and_lands_in_the_menu() {
+    let mut app = test_app(&["feat+one"]);
+    open_git_menu(&mut app, "feat+one", a_git_read(false));
+    press(&mut app, KeyCode::Enter);
+    let tx = run_git_preview(&mut app);
+    assert_eq!(
+        app.pending.as_ref().map(|p| p.kind),
+        Some(PendingKind::Git(GitAction::Rebase))
+    );
+    press(&mut app, KeyCode::Esc);
+    assert!(matches!(git_stage(&app), GitStage::Running { .. }));
+    assert!(status_text(&app).contains("cannot be stopped halfway"));
+
+    tx.send(Ok(PendingOutcome::Git(
+        "feat+one".into(),
+        Ran::Moved("rebased feat/one onto origin/main · 46 commits on top of 10 new".into()),
+    )))
+    .unwrap();
+    app.handle_event(AppEvent::Tick);
+    assert!(app.pending.is_none());
+    match git_stage(&app) {
+        GitStage::Result { ran, restart, .. } => {
+            assert!(matches!(ran, Ok(Ran::Moved(_))));
+            assert!(!restart, "nothing runs there");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(status_text(&app).contains("rebased feat/one onto origin/main"));
+    press(&mut app, KeyCode::Esc);
+    assert!(app.modal.is_none());
+}
+
+#[test]
+fn a_branch_moved_under_a_running_worktree_restarts_on_one_press() {
+    let mut app = test_app(&["feat+one"]);
+    with_process(&mut app, "feat+one", running_phase());
+    open_git_menu(&mut app, "feat+one", a_git_read(false));
+    press(&mut app, KeyCode::Enter);
+    let tx = run_git_preview(&mut app);
+    tx.send(Ok(PendingOutcome::Git(
+        "feat+one".into(),
+        Ran::Moved("rebased".into()),
+    )))
+    .unwrap();
+    app.handle_event(AppEvent::Tick);
+    assert!(matches!(
+        git_stage(&app),
+        GitStage::Result { restart: true, .. }
+    ));
+    assert!(status_text(&app).contains("until it restarts"));
+    press(&mut app, KeyCode::Char('r'));
+    assert!(app.modal.is_none());
+    assert_eq!(
+        app.pending.as_ref().map(|p| p.kind),
+        Some(PendingKind::Restart),
+        "one press: the preview was the asking"
+    );
+}
+
+#[test]
+fn a_conflict_is_said_and_offers_the_shell() {
+    let mut app = test_app(&["feat+one"]);
+    open_git_menu(&mut app, "feat+one", a_git_read(false));
+    press(&mut app, KeyCode::Enter);
+    let tx = run_git_preview(&mut app);
+    tx.send(Ok(PendingOutcome::Git(
+        "feat+one".into(),
+        Ran::Conflict {
+            op: crate::worktree::InProgress::Rebase,
+            files: vec!["apps/web/cart.ts".into()],
+            at: Some("abc1234 cart: new totals".into()),
+        },
+    )))
+    .unwrap();
+    app.handle_event(AppEvent::Tick);
+    assert!(app.status.as_ref().is_some_and(|s| s.is_error()));
+    assert_eq!(
+        status_text(&app),
+        "feat/one: conflict in apps/web/cart.ts — rebase aborted, nothing changed"
+    );
+    assert!(matches!(
+        git_stage(&app),
+        GitStage::Result { restart: false, .. }
+    ));
+    press(&mut app, KeyCode::Char('!'));
+    assert!(app.modal.is_none());
+    assert!(app.launch.is_some());
+}
+
+#[test]
+fn a_run_that_fails_says_so_in_the_menu_and_the_header() {
+    let mut app = test_app(&["feat+one"]);
+    open_git_menu(&mut app, "feat+one", a_git_read(false));
+    press(&mut app, KeyCode::Char('f'));
+    let tx = run_git_preview(&mut app);
+    tx.send(Err(
+        "`git fetch origin` did not answer in 30s — nothing changed".into(),
+    ))
+    .unwrap();
+    app.handle_event(AppEvent::Tick);
+    assert!(matches!(
+        git_stage(&app),
+        GitStage::Result { ran: Err(_), .. }
+    ));
+    assert_eq!(
+        status_text(&app),
+        "could not fetch feat/one: `git fetch origin` did not answer in 30s — nothing changed"
+    );
+}
+
+// The menu's keys are the table's: every action's letter and `!` answer
+// in the menu, and no other letter does.
+#[test]
+fn the_git_menu_answers_exactly_its_tables_keys() {
+    let mut read = a_git_read(false);
+    // Abort is shown only while something is half-done.
+    read.in_progress = Some(crate::worktree::InProgress::Rebase);
+    let half_done = read.clone();
+    for c in ('a'..='z').chain(['!']) {
+        for read in [a_git_read(false), half_done.clone()] {
+            let mut app = test_app(&["feat+one"]);
+            open_git_menu(&mut app, "feat+one", read.clone());
+            let before = format!("{:?}|{:?}", app.modal, app.launch);
+            press(&mut app, KeyCode::Char(c));
+            let answered = format!("{:?}|{:?}", app.modal, app.launch) != before;
+            let shown = crate::actions::git::offers(&read)
+                .iter()
+                .any(|o| o.action.key() == c);
+            // j k move; q and u close.
+            let expected = shown || matches!(c, '!' | 'j' | 'k' | 'q' | 'u');
+            assert_eq!(answered, expected, "{c:?} on {:?}", read.in_progress);
+        }
+    }
+}

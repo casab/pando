@@ -238,10 +238,19 @@ fn row_cells(app: &App, wt: &Worktree) -> RowCells {
         None => match &phase {
             Some(Aggregate::Starting { .. }) => Some("starting"),
             Some(Aggregate::Failed { .. }) => Some("failed"),
-            _ => None,
+            // A rebase or a merge stopped halfway in a shell: whatever
+            // runs there runs on its conflict markers.
+            _ => wt.in_progress.map(|op| op.word()),
         },
     };
+    let halfway = pending.is_none()
+        && !matches!(
+            phase,
+            Some(Aggregate::Starting { .. } | Aggregate::Failed { .. })
+        )
+        && wt.in_progress.is_some();
     let status = word.map(|word| {
+        let color = if halfway { orange() } else { color };
         let mut style = Style::new().fg(color);
         if matches!(phase, Some(Aggregate::Failed { .. })) && pending.is_none() {
             style = style.add_modifier(Modifier::BOLD);

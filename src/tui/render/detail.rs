@@ -10,7 +10,8 @@ use ratatui::widgets::{Block, BorderType, Paragraph};
 use crate::log_tail::LogLevel;
 use crate::state::{Aggregate, Phase, ProcessRecord, ServiceMode};
 use crate::theme::{
-    border, cyan, green, highlight_bg, magenta, namespaced, red, text, text_dim, text_muted, yellow,
+    border, cyan, green, highlight_bg, magenta, namespaced, orange, red, text, text_dim,
+    text_muted, yellow,
 };
 use crate::tui::app::{App, compact_age};
 
@@ -425,6 +426,20 @@ fn git_row(app: &App, wt: &crate::worktree::Worktree, width: usize) -> Line<'sta
             ],
         };
         parts.push(drift);
+    }
+    // First, ahead of the rest: until it is finished or aborted, nothing
+    // else git says about the tree is the whole story.
+    if let Some(op) = wt.in_progress {
+        parts.insert(
+            0,
+            vec![Span::styled(
+                format!(
+                    "a {} is in progress — u to abort, ! to finish it",
+                    op.noun()
+                ),
+                Style::new().fg(orange()).add_modifier(Modifier::BOLD),
+            )],
+        );
     }
     let mut spans: Vec<Span<'static>> = Vec::new();
     for (i, part) in parts.into_iter().enumerate() {

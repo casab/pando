@@ -85,6 +85,11 @@ pub enum Modal {
         selected: usize,
         before: crate::theme::Palette,
     },
+    /// `u`: the git menu on a checkout, at whichever stage it is.
+    Git {
+        name: String,
+        stage: super::GitStage,
+    },
     Help,
     /// What pando has said this session, in full and newest first: the
     /// header has one row, and a long error does not fit in it.

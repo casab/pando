@@ -13,10 +13,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph};
 
 use super::app::{
-    App, BranchLoadState, CreateRow, INSPECT_LEGEND, KeyHelp, LIST_KEYS, LIST_LEGEND, LOG_KEYS,
-    Modal, RemoveBlocker, SETUP_KEYS, SETUP_LEGEND, StatusKind, create_rows, pr_rows,
+    App, BY_HAND_KEY, BranchLoadState, CreateRow, GitStage, INSPECT_LEGEND, KeyHelp, LIST_KEYS,
+    LIST_LEGEND, LOG_KEYS, Modal, RemoveBlocker, SETUP_KEYS, SETUP_LEGEND, SPINNER_FRAMES,
+    StatusKind, compact_age, create_rows, pr_rows,
 };
 use super::render::{centered_box, chunk_cells, text_width, truncate, truncate_middle, wrap_text};
+use crate::actions;
+use crate::actions::git::{GitAction, GitRead, Ran};
 use crate::state::ServiceMode;
 use crate::theme::{
     AppearanceOrigin, blue, border, cyan, green, highlight_bg, magenta, namespaced, orange, red,
@@ -104,6 +107,7 @@ pub fn render_modal(f: &mut Frame, area: Rect, modal: &Modal, app: &App) -> Opti
             ));
         }
         Modal::Messages => return Some(render_messages(f, area, app)),
+        Modal::Git { name, stage } => render_git(f, area, app, name, stage),
         Modal::Theme { selected, .. } => render_theme_picker(f, area, app, *selected),
     }
     None
@@ -1340,4 +1344,267 @@ fn ago(elapsed: std::time::Duration) -> String {
         60..3600 => format!("{}m ago", secs / 60),
         _ => format!("{}h ago", secs / 3600),
     }
+}
+
+/// The git menu's first lines: where the checkout stands against its base
+/// and its upstream, and whether anything in it would stop a move.
+fn git_header(read: &GitRead) -> Vec<Line<'static>> {
+    let dim = Style::new().fg(text_dim());
+    let drift = |counts: Option<(u32, u32)>| -> Vec<Span<'static>> {
+        match counts {
+            Some((ahead, behind)) => {
+                let mut spans = vec![Span::styled(
+                    format!("↓{behind}"),
+                    Style::new().fg(if behind > 0 { yellow() } else { text_dim() }),
+                )];
+                if ahead > 0 {
+                    spans.push(Span::styled(format!(" ↑{ahead}"), Style::new().fg(green())));
+                }
+                spans.push(Span::raw(" "));
+                spans
+            }
+            None => Vec::new(),
+        }
+    };
+    let fetched = match read.fetched.and_then(|at| at.elapsed().ok()) {
+        Some(ago) => format!(" · fetched {} ago", compact_age(ago.as_secs() as i64)),
+        None => " · never fetched".to_string(),
+    };
+    let mut base = vec![Span::styled("base     ", dim)];
+    match &read.base {
+        Some(name) => {
+            base.extend(drift(read.base_drift));
+            base.push(Span::styled(name.clone(), dim));
+        }
+        None => base.push(Span::styled("none found", dim)),
+    }
+    base.push(Span::styled(fetched, Style::new().fg(text_muted())));
+    let mut upstream = vec![Span::styled("upstream ", dim)];
+    match &read.upstream {
+        Some(name) => {
+            upstream.extend(drift(read.upstream_drift));
+            upstream.push(Span::styled(name.clone(), dim));
+        }
+        None => upstream.push(Span::styled("none", dim)),
+    }
+    let tree = match (read.in_progress, read.dirty) {
+        (Some(op), _) => Span::styled(
+            format!("a {} is in progress", op.noun()),
+            Style::new().fg(orange()),
+        ),
+        (None, 0) => Span::styled("clean", Style::new().fg(green())),
+        (None, 1) => Span::styled("✎ 1 uncommitted file", Style::new().fg(yellow())),
+        (None, n) => Span::styled(
+            format!("✎ {n} uncommitted files"),
+            Style::new().fg(yellow()),
+        ),
+    };
+    vec![
+        Line::from(base),
+        Line::from(upstream),
+        Line::from(vec![Span::styled("tree     ", dim), tree]),
+    ]
+}
+
+/// `u`: the git menu, at whichever stage it is — the same box throughout,
+/// its title saying what it is about.
+fn render_git(f: &mut Frame, area: Rect, app: &App, name: &str, stage: &GitStage) {
+    let cap = max_content_width(area);
+    let label = app.label_of(name);
+    let dim = Style::new().fg(text_dim());
+    let muted = Style::new().fg(text_muted());
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let menu_title = format!("git · {label}");
+    let keys = |pairs: &[(&str, &str)]| {
+        let mut spans = Vec::new();
+        for (i, (key, what)) in pairs.iter().enumerate() {
+            if i > 0 {
+                spans.push(hint_span("   "));
+            }
+            spans.push(key_span(key));
+            spans.push(hint_span(&format!(" {what}")));
+        }
+        Line::from(spans)
+    };
+    let title = match stage {
+        GitStage::Reading => {
+            lines.push(Line::styled("reading git…", muted));
+            lines.push(Line::raw(""));
+            lines.push(keys(&[("esc", "close")]));
+            menu_title
+        }
+        GitStage::Menu { read, selected } => {
+            lines.extend(git_header(read));
+            lines.push(Line::raw(""));
+            let offers = actions::git::offers(read);
+            let word_width = offers
+                .iter()
+                .map(|o| text_width(o.action.word()))
+                .chain([text_width("by hand")])
+                .max()
+                .unwrap_or(0);
+            let rows = offers
+                .iter()
+                .map(|o| {
+                    let (what, refused) = match &o.refused {
+                        Some(why) => (why.clone(), true),
+                        None => (o.what.clone(), false),
+                    };
+                    (o.action.key(), o.action.word(), what, refused)
+                })
+                .chain([(
+                    BY_HAND_KEY,
+                    "by hand",
+                    "a shell in it, to do it yourself".to_string(),
+                    false,
+                )]);
+            for (i, (key, word, what, refused)) in rows.enumerate() {
+                let here = i == *selected;
+                let cursor = Span::styled(if here { "▸ " } else { "  " }, Style::new().fg(blue()));
+                let head = format!("{key}  {word:<word_width$}  ");
+                let room = cap.saturating_sub(2 + text_width(&head));
+                let line = if refused {
+                    Line::from(vec![
+                        cursor,
+                        Span::styled(format!("{head}{}", truncate(&what, room)), muted),
+                    ])
+                } else {
+                    let mut word_style = Style::new().fg(text());
+                    if here {
+                        word_style = word_style.add_modifier(Modifier::BOLD);
+                    }
+                    Line::from(vec![
+                        cursor,
+                        key_span(&key.to_string()),
+                        Span::raw("  "),
+                        Span::styled(format!("{word:<word_width$}"), word_style),
+                        Span::raw("  "),
+                        Span::styled(truncate(&what, room), dim),
+                    ])
+                };
+                lines.push(line);
+            }
+            lines.push(Line::raw(""));
+            lines.push(keys(&[
+                ("↑↓", "choose"),
+                ("⏎", "or its letter: preview"),
+                ("esc", "close"),
+            ]));
+            menu_title
+        }
+        GitStage::Preview { read, action } => {
+            let plan = actions::git::plan(read, *action);
+            for (i, command) in plan.commands.iter().enumerate() {
+                lines.push(Line::from(vec![
+                    Span::styled(if i == 0 { "runs   " } else { "       " }, dim),
+                    Span::styled(command.clone(), Style::new().fg(cyan())),
+                ]));
+            }
+            lines.push(Line::raw(""));
+            if let Some(moves) = &plan.moves {
+                lines.push(Line::styled(moves.clone(), Style::new().fg(text())));
+            }
+            for note in &plan.notes {
+                lines.push(Line::styled(note.clone(), dim));
+            }
+            for warning in &plan.warnings {
+                for (i, row) in wrap_text(warning, cap.saturating_sub(2))
+                    .into_iter()
+                    .enumerate()
+                {
+                    let mark = if i == 0 { "! " } else { "  " };
+                    lines.push(Line::styled(
+                        format!("{mark}{row}"),
+                        Style::new().fg(yellow()),
+                    ));
+                }
+            }
+            if app.is_up(name) && *action != GitAction::Fetch {
+                lines.push(Line::styled("it runs: r restarts it after", dim));
+            }
+            lines.push(Line::raw(""));
+            lines.push(keys(&[("⏎", action.word()), ("esc", "back")]));
+            plan.title
+        }
+        GitStage::Running { read, action } => {
+            let pending = app.pending_on(name);
+            let frame = pending.map_or(0, |p| p.spinner_frame as usize);
+            let glyph = SPINNER_FRAMES[frame % SPINNER_FRAMES.len()];
+            let doing = pending
+                .and_then(|p| p.stage.clone())
+                .unwrap_or_else(|| format!("{}…", action.verb()));
+            lines.push(Line::from(vec![
+                Span::styled(format!("{glyph} "), Style::new().fg(blue())),
+                Span::styled(doing, Style::new().fg(text())),
+            ]));
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "it cannot be stopped halfway: it finishes, or aborts what it started",
+                dim,
+            ));
+            actions::git::plan(read, *action).title
+        }
+        GitStage::Result {
+            read,
+            action,
+            ran,
+            restart,
+        } => {
+            let ok = Style::new().fg(green());
+            let width = cap.saturating_sub(2);
+            let mut said = |mark: &str, style: Style, text: &str| {
+                for (i, row) in wrap_text(text, width).into_iter().enumerate() {
+                    let lead = if i == 0 { mark } else { "  " };
+                    lines.push(Line::styled(format!("{lead}{row}"), style));
+                }
+            };
+            match ran {
+                Ok(ran @ (Ran::Moved(_) | Ran::Unchanged(_))) => {
+                    said("✓ ", ok, &ran.summary());
+                }
+                Ok(ran @ Ran::Diverged { .. }) => {
+                    said("○ ", Style::new().fg(yellow()), &ran.summary());
+                }
+                Ok(Ran::Conflict { op, files, at }) => {
+                    said(
+                        "✗ ",
+                        Style::new().fg(red()),
+                        &format!("conflict in {}", actions::git::file_list(files)),
+                    );
+                    if let Some(at) = at {
+                        said("  ", dim, &format!("at commit {at}"));
+                    }
+                    said(
+                        "  ",
+                        ok,
+                        &format!("git {} --abort: {label} is exactly as it was", op.noun()),
+                    );
+                }
+                Err(e) => said("✗ ", Style::new().fg(red()), e),
+            }
+            lines.push(Line::raw(""));
+            let stuck = !matches!(ran, Ok(Ran::Moved(_) | Ran::Unchanged(_)));
+            if *restart {
+                lines.push(Line::styled(
+                    "it runs on the old files until it restarts",
+                    dim,
+                ));
+                lines.push(keys(&[("r", "restart now"), ("esc", "later")]));
+            } else if stuck {
+                let by_hand = format!("{} by hand in a shell", action.word());
+                lines.push(keys(&[
+                    (&BY_HAND_KEY.to_string(), &by_hand),
+                    ("esc", "close"),
+                ]));
+            } else {
+                lines.push(keys(&[("esc", "close")]));
+            }
+            actions::git::plan(read, *action).title
+        }
+    };
+    let width = widest(&lines).min(cap);
+    let Some(inner) = popup(f, area, &title, None, width, lines.len()) else {
+        return;
+    };
+    f.render_widget(Paragraph::new(lines), inner);
 }

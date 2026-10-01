@@ -78,7 +78,7 @@ pub(crate) fn commits(n: u32) -> String {
 }
 
 /// `a.ts`, `a.ts and b.ts`, `a.ts, b.ts and 3 more`.
-pub(crate) fn file_list(files: &[String]) -> String {
+pub fn file_list(files: &[String]) -> String {
     match files {
         [] => "the files it touched".to_string(),
         [one] => one.clone(),

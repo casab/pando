@@ -15,6 +15,7 @@
 mod ages;
 mod background;
 mod dialogs;
+mod git_menu;
 mod keymap;
 mod launch;
 mod log_keys;
@@ -34,6 +35,7 @@ pub use background::{AppEvent, Snapshot, snapshot};
 pub use dialogs::{
     BranchLoadState, CreateRow, Modal, RemoveBlocker, base_choices, create_rows, pr_rows,
 };
+pub use git_menu::{BY_HAND_KEY, GitStage};
 pub use keymap::{
     INSPECT_LEGEND, KeyHelp, LIST_KEYS, LIST_LEGEND, LOG_KEYS, OVERLAY_KEYS, SETUP_KEYS,
     SETUP_LEGEND,
@@ -43,7 +45,7 @@ pub use launch::{
 };
 pub use log_view::{LOG_VIEWER_CAPACITY, LineInspect, LogFilter, LogView, SearchMode, SearchState};
 pub use merged::{ALL_SOURCE, MergedTail, SOURCE_SEPARATOR, ViewTail, strip_source};
-pub use pending::{AwaitingReady, PendingAction, PendingKind, PendingOutcome};
+pub use pending::{AwaitingReady, PendingAction, PendingKind, PendingOutcome, SPINNER_FRAMES};
 pub use remedies::as_tui_remedy;
 pub use setup::{SetupLine, SetupScreen, SetupWatch, Trying, has_settings};
 pub use setup_row::{SetupHint, SetupRow};
@@ -626,6 +628,10 @@ impl App {
                 self.adopt_config(*config);
                 false
             }
+            AppEvent::GitRead(read) => {
+                let (name, read) = *read;
+                self.git_read_arrived(&name, read)
+            }
             AppEvent::SetupDetected(proposals) => self.setup_detected(*proposals),
             AppEvent::SetupRead(result) => self.setup_read(*result),
             AppEvent::SetupTried(result) => self.setup_tried(*result),
@@ -828,6 +834,10 @@ impl App {
                 self.handle_question_key(key, question, selected, custom, reply);
                 return;
             }
+            Some(Modal::Git { name, stage }) => {
+                self.handle_git_key(key, name, stage);
+                return;
+            }
             None => {}
         }
         // The setup screen owns the whole screen until it is left, and
@@ -873,6 +883,9 @@ impl App {
             KeyCode::Char('n') => self.open_create(),
             KeyCode::Char('p') => self.open_pull_requests(),
             KeyCode::Char('d') => self.open_remove(),
+            // Everything that moves the branch, behind one key: the menu
+            // shows where it stands and the commands before any run.
+            KeyCode::Char('u') => self.open_git_menu(),
             KeyCode::Char('y') => self.copy_selected_path(),
             KeyCode::Char('a') => self.copy_setup_prompt(),
             KeyCode::Char('v') => self.test_setup_from_list(),

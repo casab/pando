@@ -123,6 +123,11 @@ pub const LIST_KEYS: &[KeyHelp] = &[
         &[KeyCode::Char('d')],
         "remove it (never the main checkout)",
     ),
+    key(
+        "u",
+        &[KeyCode::Char('u')],
+        "git: fetch, pull, rebase or merge it — shows the commands first",
+    ),
     key("/", &[KeyCode::Char('/')], "filter by branch or name"),
     key(
         "b",
@@ -182,6 +187,10 @@ pub const LIST_LEGEND: &[(&str, &str)] = &[
          (experimental)",
     ),
     ("↓n ↑n", "git: commits behind / ahead of the base branch"),
+    (
+        "rebasing",
+        "git: a rebase or merge left half-done in it — u aborts it, ! finishes it",
+    ),
     (
         "✎",
         "git: uncommitted changes — the detail pane's git row says more",

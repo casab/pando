@@ -19,7 +19,7 @@ mod table;
 
 pub use offer::{Offer, Plan, offers, plan};
 pub use read::{GitRead, base_for, read};
-pub use run::{Ran, run};
+pub use run::{Ran, file_list, run};
 pub use table::{ACTIONS, ActionRow, GitAction};
 
 #[cfg(test)]

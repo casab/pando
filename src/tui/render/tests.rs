@@ -10,7 +10,7 @@ use crate::tui::app::tests::{
     app_with_logs, app_with_main, running_phase, test_app, with_process, with_second_process,
     write_log, wt,
 };
-use crate::tui::app::{BranchLoadState, Modal};
+use crate::tui::app::{BranchLoadState, GitStage, Modal};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
@@ -311,6 +311,42 @@ fn renders_every_modal_at_any_terminal_size() {
             reply,
         },
     ];
+    let read = || Box::new(crate::tui::app::tests::a_git_read(false));
+    let git = |stage| Modal::Git {
+        name: "feat+one".into(),
+        stage,
+    };
+    let modals = modals.into_iter().chain([
+        git(GitStage::Reading),
+        git(GitStage::Menu {
+            read: read(),
+            selected: 4,
+        }),
+        git(GitStage::Preview {
+            read: read(),
+            action: crate::actions::git::GitAction::Rebase,
+        }),
+        git(GitStage::Running {
+            read: read(),
+            action: crate::actions::git::GitAction::Merge,
+        }),
+        git(GitStage::Result {
+            read: read(),
+            action: crate::actions::git::GitAction::Rebase,
+            ran: Ok(crate::actions::git::Ran::Conflict {
+                op: crate::worktree::InProgress::Rebase,
+                files: (0..9).map(|i| format!("apps/web/src/file-{i}.ts")).collect(),
+                at: Some("abc1234 a commit subject rather longer than the box".into()),
+            }),
+            restart: false,
+        }),
+        git(GitStage::Result {
+            read: read(),
+            action: crate::actions::git::GitAction::Fetch,
+            ran: Err("`git fetch origin` failed: a reason long enough to wrap twice over in a narrow box".into()),
+            restart: true,
+        }),
+    ]);
     for modal in modals {
         let mut app = test_app(&["feat+one"]);
         app.pr_list = (0..12)
@@ -5061,4 +5097,101 @@ fn a_development_build_names_its_branch_in_the_header_and_a_release_does_not() {
         "⎇ git-menu@b7bb2b4 · "
     );
     assert!(build_label_spans(None).is_empty());
+}
+
+// ---- the git menu ----------------------------------------------------
+
+#[test]
+fn the_footer_offers_the_git_menu() {
+    let mut app = test_app(&["feat+one"]);
+    let rendered = text_of(&draw(&mut app, 200, 12));
+    assert!(rendered.contains("u git"), "{rendered}");
+}
+
+// A rebase stopped in a shell: the row says so, and the detail pane says
+// what to do about it.
+#[test]
+fn a_rebase_left_half_done_is_on_its_row_and_in_the_detail_pane() {
+    let mut app = test_app(&["feat+one", "feat+two"]);
+    app.worktrees[0].in_progress = Some(crate::worktree::InProgress::Rebase);
+    let rendered = text_of(&draw(&mut app, 160, 30));
+    assert!(
+        list_row(&rendered, "feat/one").contains("rebasing"),
+        "{rendered}"
+    );
+    assert!(!list_row(&rendered, "feat/two").contains("rebasing"));
+    assert!(
+        rendered.contains("a rebase is in progress — u to abort, ! to finish it"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn the_git_menu_shows_where_it_stands_and_every_move() {
+    let mut app = test_app(&["feat+one"]);
+    crate::tui::app::tests::open_git_menu(
+        &mut app,
+        "feat+one",
+        crate::tui::app::tests::a_git_read(false),
+    );
+    let rendered = text_of(&draw(&mut app, 140, 40));
+    for expected in [
+        "git · feat/one",
+        "base     ↓10 ↑46 origin/main · never fetched",
+        "upstream ↓0 origin/feat/one",
+        "tree     clean",
+        "f  fetch    bring origin up to date",
+        "▸ r  rebase   onto origin/main · replays 46 commits onto 10 new",
+        "m  merge    origin/main into it",
+        "!  by hand  a shell in it",
+        "⏎ or its letter: preview",
+    ] {
+        assert!(rendered.contains(expected), "{expected:?} in:\n{rendered}");
+    }
+}
+
+#[test]
+fn the_preview_shows_the_exact_commands_and_the_warning() {
+    let mut app = test_app(&["feat+one"]);
+    crate::tui::app::tests::with_process(&mut app, "feat+one", running_phase());
+    crate::tui::app::tests::open_git_menu(
+        &mut app,
+        "feat+one",
+        crate::tui::app::tests::a_git_read(false),
+    );
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let rendered = text_of(&draw(&mut app, 140, 40));
+    for expected in [
+        "rebase feat/one onto origin/main",
+        "runs   git fetch origin main",
+        "git rebase origin/main",
+        "replays 46 commits onto 10 new",
+        "on a conflict: git rebase --abort, and nothing changes",
+        "! origin/feat/one has 46 of these commits: the next push needs --force-with-lease",
+        "it runs: r restarts it after",
+        "⏎ rebase",
+    ] {
+        assert!(rendered.contains(expected), "{expected:?} in:\n{rendered}");
+    }
+}
+
+// While it runs, the row says what is being done to it, like any action.
+#[test]
+fn a_running_move_is_the_rows_word() {
+    let mut app = test_app(&["feat+one"]);
+    crate::tui::app::tests::open_git_menu(
+        &mut app,
+        "feat+one",
+        crate::tui::app::tests::a_git_read(false),
+    );
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let rendered = text_of(&draw(&mut app, 160, 40));
+    let row = list_row(&rendered, "feat/one");
+    assert!(row.contains("◌ feat/one"), "{rendered}");
+    assert!(row.contains("rebasing"), "{rendered}");
+    assert!(
+        rendered.contains("it cannot be stopped halfway"),
+        "{rendered}"
+    );
 }
