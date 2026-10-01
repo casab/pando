@@ -161,6 +161,11 @@ pub struct WorktreeRecord {
     /// waiting on one. See [`PendingShare`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_shares: Vec<PendingShare>,
+    /// When a start last spawned one of its processes. Kept through a
+    /// stop, which clears the process records and their times with them,
+    /// so the TUI can still order its list by what ran last.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_started: Option<DateTime<Utc>>,
 }
 
 impl WorktreeRecord {
@@ -181,7 +186,18 @@ impl WorktreeRecord {
             share_port: None,
             share: None,
             pending_shares: Vec::new(),
+            last_started: None,
         }
+    }
+
+    /// When this worktree last ran: the start that last spawned a process,
+    /// or, for a record written before pando kept that, its processes'.
+    pub fn last_run(&self) -> Option<DateTime<Utc>> {
+        self.processes
+            .values()
+            .map(|p| p.started_at)
+            .chain(self.last_started)
+            .max()
     }
 
     /// The mode this worktree runs in, or last ran in: shared when nothing

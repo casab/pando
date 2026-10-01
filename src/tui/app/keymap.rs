@@ -125,6 +125,11 @@ pub const LIST_KEYS: &[KeyHelp] = &[
     ),
     key("/", &[KeyCode::Char('/')], "filter by branch or name"),
     key(
+        "b",
+        &[KeyCode::Char('b')],
+        "sort the list: by PR, newest first, last run first, by name (saved)",
+    ),
+    key(
         "m",
         &[KeyCode::Char('m')],
         "messages: what pando said, in full",

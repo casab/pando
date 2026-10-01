@@ -387,6 +387,12 @@ row has something in it. The glyph before the branch says whether it
 runs: `●` running, `◌` starting, `✗` failed, `○` stopped. The full URL
 and the rest are in the detail pane beside it.
 
+The main checkout is always the first row, and `b` changes the order of
+the rest, which the list's title names: by pull request, the highest
+number first (the default); newest first; last run first; or by name.
+The choice is saved as `[ui] sort` in `~/.pando/config.toml`, as `pr`,
+`newest`, `run` or `name`.
+
 `p` lists the repository's open pull requests through the GitHub CLI
 (`gh`, signed in); typing narrows them by number, title, branch or
 author. Enter checks out the pull request's branch in a new worktree, or
@@ -472,6 +478,7 @@ A choice is saved in `~/.pando/config.toml`:
 theme = "catppuccin"
 # appearance = "dark"            # or "light"; "auto" follows the system
 # theme_from = "~/.config/theme-switcher/current"
+# sort = "run"                   # the list's order: "pr", "newest", "run" or "name"
 ```
 
 `theme_from` names a file whose first line is a theme's name, such as

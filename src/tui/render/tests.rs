@@ -5028,7 +5028,7 @@ fn the_list_draws_the_main_checkout_first_with_its_mark() {
     assert!(rows[0].contains("main ⌂"), "main first: {text}");
     assert!(rows[0].contains("main checkout"), "{text}");
     assert!(rows[1].contains("feat/one"), "{text}");
-    assert!(text.contains("worktrees (2)"), "{text}");
+    assert!(text.contains("worktrees (2) · by PR"), "{text}");
     assert!(text.contains("2 worktrees"), "{text}");
     assert!(
         text.contains("main checkout"),

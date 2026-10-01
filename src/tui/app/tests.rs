@@ -7928,3 +7928,138 @@ fn the_main_checkout_refuses_isolation_and_removal() {
     press(&mut app, KeyCode::Char('d'));
     assert!(matches!(app.modal, Some(Modal::Remove { .. })));
 }
+
+// ---- the list's order -----------------------------------------------------
+
+fn row_names(app: &App) -> Vec<&str> {
+    app.filtered_indices
+        .iter()
+        .map(|&i| app.worktrees[i].name.as_str())
+        .collect()
+}
+
+/// A start `minutes_ago`, then a stop: the time a start leaves behind.
+fn ran(app: &App, name: &str, minutes_ago: i64) -> State {
+    let mut state = app.state.clone();
+    let record = state
+        .worktrees
+        .entry(name.to_string())
+        .or_insert_with(|| WorktreeRecord::new(format!("/trees/{name}"), true));
+    record.last_started = Some(Utc::now() - chrono::Duration::minutes(minutes_ago));
+    state
+}
+
+#[test]
+fn the_list_is_by_pull_request_by_default_the_highest_number_first() {
+    use crate::worktree::PrState::Open;
+    let mut app = app_with_main(&["feat+new", "feat+one", "feat+old"]);
+    assert_eq!(app.sort, ListSort::Pr);
+    app.handle_event(AppEvent::PrsReady(Ok(vec![
+        a_pr(7, "feat/old", Open),
+        a_pr(12, "feat/one", Open),
+    ])));
+    assert_eq!(
+        row_names(&app),
+        ["acme-shop", "feat+one", "feat+old", "feat+new"],
+        "the main checkout first, then the pull requests, then the rest as discovered"
+    );
+}
+
+#[test]
+fn b_cycles_the_order_keeps_the_cursor_and_says_so() {
+    use crate::worktree::PrState::Open;
+    let mut app = app_with_main(&["zeta", "alpha", "mid"]);
+    app.handle_event(AppEvent::PrsReady(Ok(vec![a_pr(3, "mid", Open)])));
+    app.select_index(1);
+    assert_eq!(app.selected_worktree().unwrap().name, "mid");
+
+    press(&mut app, KeyCode::Char('b'));
+    assert_eq!(app.sort, ListSort::Newest);
+    assert_eq!(row_names(&app), ["acme-shop", "zeta", "alpha", "mid"]);
+    assert_eq!(app.selected_worktree().unwrap().name, "mid");
+    assert!(
+        app.active_status()
+            .is_some_and(|(m, _)| m.contains("newest first")),
+        "{:?}",
+        app.active_status()
+    );
+
+    let state = ran(&app, "alpha", 30);
+    app.state = state;
+    let state = ran(&app, "zeta", 5);
+    app.state = state;
+    press(&mut app, KeyCode::Char('b'));
+    assert_eq!(app.sort, ListSort::Run);
+    assert_eq!(
+        row_names(&app),
+        ["acme-shop", "zeta", "alpha", "mid"],
+        "the one started last first, one never started after"
+    );
+
+    press(&mut app, KeyCode::Char('b'));
+    assert_eq!(app.sort, ListSort::Name);
+    assert_eq!(row_names(&app), ["acme-shop", "alpha", "mid", "zeta"]);
+    assert_eq!(app.selected_worktree().unwrap().name, "mid");
+
+    press(&mut app, KeyCode::Char('b'));
+    assert_eq!(app.sort, ListSort::Pr);
+    assert_eq!(row_names(&app), ["acme-shop", "mid", "zeta", "alpha"]);
+}
+
+#[test]
+fn a_start_moves_its_row_up_a_list_sorted_by_last_run() {
+    let mut app = app_with_main(&["feat+a", "feat+b"]);
+    app.sort = ListSort::Run;
+    let state = ran(&app, "feat+a", 10);
+    app.handle_event(refreshed(state));
+    assert_eq!(row_names(&app), ["acme-shop", "feat+a", "feat+b"]);
+
+    let state = ran(&app, "feat+b", 0);
+    app.handle_event(refreshed(state));
+    assert_eq!(row_names(&app), ["acme-shop", "feat+b", "feat+a"]);
+}
+
+#[test]
+fn a_list_sorted_otherwise_does_not_move_when_one_starts() {
+    let mut app = app_with_main(&["feat+a", "feat+b"]);
+    app.sort = ListSort::Newest;
+    let state = ran(&app, "feat+b", 0);
+    app.handle_event(refreshed(state));
+    assert_eq!(row_names(&app), ["acme-shop", "feat+a", "feat+b"]);
+}
+
+#[test]
+fn the_order_comes_from_the_config() {
+    let paths = test_app(&[]).paths.clone();
+    let mut config = Config::default();
+    config.ui.sort = Some("name".into());
+    let app = App::new_for_test(paths, config, vec![wt("b"), wt("a")]);
+    assert_eq!(app.sort, ListSort::Name);
+    assert_eq!(row_names(&app), ["a", "b"]);
+}
+
+#[test]
+fn every_order_is_a_word_the_config_takes_in_the_order_b_cycles_them() {
+    let words: Vec<&str> = ListSort::ALL.iter().map(|s| s.word()).collect();
+    assert_eq!(words, crate::config::LIST_SORTS);
+    for sort in ListSort::ALL {
+        assert_eq!(ListSort::from_word(sort.word()), Some(sort));
+    }
+    let mut sort = ListSort::default();
+    for expected in ListSort::ALL.iter().cycle().skip(1).take(4) {
+        sort = sort.next();
+        assert_eq!(sort, *expected);
+    }
+}
+
+#[test]
+fn the_order_is_saved_beside_the_theme() {
+    let mut doc: toml_edit::DocumentMut = "[ui]\ntheme = \"gruvbox\"\n".parse().unwrap();
+    sort::set_sort(&mut doc, ListSort::Run);
+    let text = doc.to_string();
+    assert!(text.contains("theme = \"gruvbox\""), "{text}");
+    assert!(text.contains("sort = \"run\""), "{text}");
+    let mut doc = toml_edit::DocumentMut::new();
+    sort::set_sort(&mut doc, ListSort::Name);
+    assert!(doc.to_string().contains("[ui]\nsort = \"name\""), "{doc}");
+}

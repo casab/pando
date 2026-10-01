@@ -303,16 +303,18 @@ fn row_cells(app: &App, wt: &Worktree) -> RowCells {
 
 pub(super) fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
     // Worktrees, counted without the main checkout's row: it is not one.
-    let title = if app.filter.is_empty() {
-        format!(" worktrees ({}) ", app.linked_count())
+    // Then their order, which `b` changes.
+    let count = if app.filter.is_empty() {
+        app.linked_count().to_string()
     } else {
         let matched = app
             .filtered_indices
             .iter()
             .filter(|&&idx| !app.is_main(&app.worktrees[idx].name))
             .count();
-        format!(" worktrees ({matched}/{}) ", app.linked_count())
+        format!("{matched}/{}", app.linked_count())
     };
+    let title = format!(" worktrees ({count}) · {} ", app.sort.title());
     let block = Block::bordered()
         .title(Span::styled(title, Style::new().fg(text_dim())))
         .border_type(BorderType::Rounded)

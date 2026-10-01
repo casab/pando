@@ -47,6 +47,14 @@ pub fn validate(config: &Config, project: &ProjectRef) -> Result<()> {
             super::schema::APPEARANCES.join(", ")
         );
     }
+    if let Some(sort) = &config.ui.sort
+        && !super::schema::LIST_SORTS.contains(&sort.as_str())
+    {
+        bail!(
+            "[ui] sort = {sort:?} is not one pando knows — it is {}",
+            super::schema::LIST_SORTS.join(", ")
+        );
+    }
     if config.isolation.none && !config.services.is_empty() {
         bail!(
             "[isolation] none = true says this project runs no private services, and \

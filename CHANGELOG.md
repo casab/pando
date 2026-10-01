@@ -7,6 +7,22 @@ may change behaviour.
 
 ## Unreleased
 
+### Added
+
+- The TUI's list can be sorted: `b` cycles it by pull request, the
+  highest number first (the default); newest first; last run first; and
+  by name. The list's title names the order, the main checkout stays the
+  first row, and the cursor stays on its worktree. The choice is saved
+  as `[ui] sort` in `~/.pando/config.toml`. A worktree's last start is
+  kept in its state record through a stop, so last run first still
+  knows after a stop when a worktree last ran.
+
+### Fixed
+
+- The TUI reads the pull requests the last fetch cached, so a relaunch
+  shows their chips on its first frame rather than once `gh` answers.
+  The cache was written for this and never read.
+
 ## 0.6.2 — 2026-09-30
 
 ### Added

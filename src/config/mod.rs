@@ -35,8 +35,9 @@ pub use layers::{Loaded, load, load_without_home};
 pub use redact::{HIDDEN, hide_passwords, is_password};
 pub use schema::{
     BranchRule, BranchesSection, Config, HookConfig, HookPoint, HookScope, ISOLATION_KINDS,
-    IsolationSection, LoginConfig, PortsSpec, ProbeConfig, ProcessConfig, ProjectSection,
-    ProvisionMode, ReadySpec, RuntimeSection, ServiceConfig, ShareSection, UiSection,
+    IsolationSection, LIST_SORTS, LoginConfig, PortsSpec, ProbeConfig, ProcessConfig,
+    ProjectSection, ProvisionMode, ReadySpec, RuntimeSection, ServiceConfig, ShareSection,
+    UiSection,
 };
 pub use suggest::{KeyError, closest, edit_distance};
 pub use validate::validate;

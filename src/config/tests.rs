@@ -2162,6 +2162,31 @@ fn an_appearance_pando_does_not_know_drops_the_layer_with_the_spellings() {
     );
 }
 
+#[test]
+fn the_user_layer_carries_the_lists_order() {
+    let f = fixture();
+    write_user(&f, "[ui]\nsort = \"run\"\n");
+    let loaded = load(&f.paths).unwrap();
+    assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+    assert_eq!(loaded.config.ui.sort.as_deref(), Some("run"));
+}
+
+#[test]
+fn an_order_pando_does_not_know_drops_the_layer_with_the_spellings() {
+    let f = fixture();
+    write_user(&f, "[ui]\nsort = \"oldest\"\n");
+    let loaded = load(&f.paths).unwrap();
+    assert_eq!(loaded.config.ui.sort, None);
+    assert!(
+        loaded
+            .warnings
+            .iter()
+            .any(|w| w.contains("pr, newest, run, name")),
+        "{:?}",
+        loaded.warnings
+    );
+}
+
 // A login is a password. A file the team shares must not carry one, and a
 // machine-wide one is not where a project's login belongs; pando's own
 // file for the project is.

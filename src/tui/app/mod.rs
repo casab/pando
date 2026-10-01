@@ -25,6 +25,7 @@ mod pending;
 mod remedies;
 mod setup;
 mod setup_row;
+mod sort;
 mod tails;
 mod themes;
 
@@ -46,6 +47,7 @@ pub use pending::{AwaitingReady, PendingAction, PendingKind, PendingOutcome};
 pub use remedies::as_tui_remedy;
 pub use setup::{SetupLine, SetupScreen, SetupWatch, Trying, has_settings};
 pub use setup_row::{SetupHint, SetupRow};
+pub use sort::ListSort;
 pub use tails::LogTails;
 pub use themes::ThemeState;
 
@@ -259,6 +261,8 @@ pub struct App {
     /// the first answer is on its way.
     pub gh_account: Option<GhAccount>,
     pub list_state: ListState,
+    /// The order of the list's rows: `[ui] sort`, then whatever `b` chose.
+    pub sort: ListSort,
     pub filter: String,
     pub filtered_indices: Vec<usize>,
     pub mode: Mode,
@@ -351,6 +355,7 @@ impl App {
     pub fn new(paths: PandoPaths, config: Config) -> Result<Self> {
         let (event_tx, event_rx) = mpsc::channel();
         let theme_settings = config.ui.theme_settings();
+        let sort = ListSort::from_config(&config);
         let themes_dir = paths.themes_dir();
         let mut app = Self {
             paths,
@@ -383,6 +388,7 @@ impl App {
             pr_error: None,
             gh_account: None,
             list_state: ListState::default(),
+            sort,
             filter: String::new(),
             filtered_indices: Vec::new(),
             mode: Mode::Normal,
@@ -422,6 +428,13 @@ impl App {
             #[cfg(test)]
             opened_apps: Vec::new(),
         };
+        // The pull requests the last fetch found, so the first frame has
+        // their chips and is already in their order; the fetch below
+        // replaces them.
+        app.prs = crate::cache::load_prs(&app.paths.pr_cache_file())
+            .prs
+            .into_iter()
+            .collect();
         // One synchronous read so the first frame has rows, hydrated from the
         // disk cache so those rows already carry sha, age, and dirty state.
         app.apply_snapshot(snapshot(&app.paths, None, false)?);
@@ -534,6 +547,9 @@ impl App {
                 self.prs = worktree::prs_by_branch(&prs).into_iter().collect();
                 self.replace_pr_list(prs);
                 self.save_pr_cache();
+                if self.sort == ListSort::Pr {
+                    self.refilter();
+                }
                 true
             }
             // A missing or unauthenticated `gh` just means no chips — and,
@@ -892,6 +908,7 @@ impl App {
             KeyCode::PageDown => self.scroll_tail(self.tail_rows.max(1) as isize),
             KeyCode::Tab => self.cycle_tail(),
             KeyCode::Char('T') => self.open_theme_picker(),
+            KeyCode::Char('b') => self.cycle_sort(),
             KeyCode::Char('R') => {
                 self.spawn_discovery();
                 // An account switched in another terminal shows here too,
@@ -1179,10 +1196,13 @@ impl App {
             })
             .map(|(i, _)| i)
             .collect();
-        // Discovery order, the one `pando ls` prints, and never re-sorted
-        // by what runs: a list whose rows jump when one starts is a list
-        // nobody can find anything in by position. The header counts what
-        // runs.
+        // The order `b` chose, and never by what runs now: a list whose
+        // rows jump when one starts or stops is a list nobody can find
+        // anything in by position. The header counts what runs. `run`
+        // moves a row only when it is started, which is what it is for.
+        let mut rows = std::mem::take(&mut self.filtered_indices);
+        self.sort_rows(&mut rows);
+        self.filtered_indices = rows;
         // Keep the cursor on the same worktree when it survives the filter.
         let row = keep_name.and_then(|name| {
             self.filtered_indices
@@ -1373,8 +1393,17 @@ impl App {
         let shown = self.main_row_shown();
         let before = std::mem::replace(&mut self.state, state);
         // A main checkout started from a shell while the welcome is up gets
-        // its row with the state that records it, not a discovery later.
-        if self.main_row_shown() != shown {
+        // its row with the state that records it, not a discovery later;
+        // a start reorders a list sorted by what ran last.
+        let ran = |state: &State| -> Vec<_> {
+            state
+                .worktrees
+                .iter()
+                .map(|(name, record)| (name.clone(), record.last_run()))
+                .collect()
+        };
+        let reordered = self.sort == ListSort::Run && ran(&before) != ran(&self.state);
+        if self.main_row_shown() != shown || reordered {
             self.refilter();
         }
         let died = self.deaths_since(&before);
@@ -1501,6 +1530,7 @@ impl App {
     pub fn new_for_test(paths: PandoPaths, config: Config, worktrees: Vec<Worktree>) -> Self {
         let (event_tx, event_rx) = mpsc::channel();
         let theme_settings = config.ui.theme_settings();
+        let sort = ListSort::from_config(&config);
         let themes_dir = paths.themes_dir();
         let mut app = Self {
             paths,
@@ -1533,6 +1563,7 @@ impl App {
             pr_error: None,
             gh_account: None,
             list_state: ListState::default(),
+            sort,
             filter: String::new(),
             filtered_indices: Vec::new(),
             mode: Mode::Normal,

@@ -535,10 +535,18 @@ pub struct UiSection {
     /// `auto` (the default: the system's), `dark` or `light`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub appearance: Option<String>,
+    /// How the TUI orders its worktrees, one of [`LIST_SORTS`]: `pr` (the
+    /// default) when nothing says. `b` in the TUI cycles it and saves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort: Option<String>,
 }
 
 /// The spellings `[ui] appearance` takes.
 pub const APPEARANCES: [&str; 3] = ["auto", "dark", "light"];
+
+/// The spellings `[ui] sort` takes, in the order `b` cycles them. The
+/// TUI's `ListSort` is held to this list by a test.
+pub const LIST_SORTS: [&str; 4] = ["pr", "newest", "run", "name"];
 
 impl UiSection {
     fn is_empty(&self) -> bool {

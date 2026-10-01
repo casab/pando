@@ -1163,10 +1163,12 @@ fn start_checked(
             swept: false,
             phase: Phase::Starting { since: now },
         };
-        store
+        let worktree = store
             .worktrees
             .get_mut(name)
-            .expect("the record was just inserted")
+            .expect("the record was just inserted");
+        worktree.last_started = Some(now);
+        worktree
             .processes
             .insert(plan.process.clone(), record.clone());
         started.push(StartedProcess {

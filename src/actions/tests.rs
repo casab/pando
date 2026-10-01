@@ -1914,6 +1914,11 @@ fn stop_ends_the_process_and_keeps_the_ports() {
         "a stopped worktree still owns its ports"
     );
     assert!(record.created_by_pando, "and is still ours");
+    assert_eq!(
+        record.last_run(),
+        Some(outcome.started[0].record.started_at),
+        "and still says when it last ran, for the TUI's order"
+    );
 }
 
 // The origin tool skipped the signal for a record it had written off,
