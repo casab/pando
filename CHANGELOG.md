@@ -17,6 +17,22 @@ may change behaviour.
 - `scripts/dev`, for contributors: each branch in a worktree of its own
   with its own build, `use` to make it the `pando` on your PATH and back,
   `try` for its TUI in a throwaway fixture. See CONTRIBUTING.md.
+- The TUI's git menu, `u` ([#7]): on any row, where its branch stands
+  against its base and its own upstream, and what can be done about it
+  — fetch, pull (a fast-forward, never a merge), rebase onto the base,
+  merge the base in, or abort a rebase or merge left half-done — each
+  saying what it would do there, or why it will not. Picking one shows
+  the exact git commands first; enter runs them, and the row reads
+  `rebasing` while it does. A rebase or merge that stops on a conflict
+  is aborted, so nothing changes, and the menu names the files and
+  offers `!` to do it by hand. Nothing moves a checkout with uncommitted
+  changes, the main checkout is only ever fast-forwarded, and nothing
+  is ever pushed. When a running worktree's branch moved, `r` in the
+  menu restarts it. A rebase or merge stopped in a shell shows on its
+  row and in the detail pane.
+- `scripts/fixture-repo.sh <kind> --with-origin --drift`: a fixture
+  whose origin has moved on and whose worktrees rebase cleanly, conflict,
+  or have uncommitted work, for trying the git menu by hand.
 
 ## 0.6.3 — 2026-10-04
 
@@ -255,6 +271,7 @@ may change behaviour.
 
 [#4]: https://github.com/mertkaradayi/pando/issues/4
 [#5]: https://github.com/mertkaradayi/pando/issues/5
+[#7]: https://github.com/mertkaradayi/pando/issues/7
 
 ## 0.5.1 — 2026-09-28
 
