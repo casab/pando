@@ -9,12 +9,15 @@
 //! check, start/stop/restart, when a start is ready, private services,
 //! namespaced starts, share, reading state, an app on a device's links
 //! and opening it there, the name its config written as code gives it,
-//! the builds installed on the booted simulators, `pando check`, and
-//! trying pando's own guess for the setup screen.
+//! the builds installed on the booted simulators, `pando check`,
+//! trying pando's own guess for the setup screen, and the git menu's
+//! moves, which callers name as `actions::git::…` because `read` and
+//! `run` alone would say nothing.
 
 mod app_config;
 mod check;
 mod device;
+pub mod git;
 mod hooks;
 mod init;
 mod installed;

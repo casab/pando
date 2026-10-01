@@ -34,6 +34,7 @@ pub fn wt(name: &str) -> Worktree {
         head_age: Some("2 hours ago".into()),
         dirty: Some(false),
         ahead_behind: Some((1, 0)),
+        in_progress: None,
     }
 }
 
@@ -5778,6 +5779,7 @@ fn an_enrichment_that_finds_changes_marks_the_worktree_dirty() {
         head_age: Some("5 minutes ago".into()),
         dirty: Some(true),
         ahead_behind: Some((1, 0)),
+        in_progress: None,
     };
     assert!(
         app.handle_event(AppEvent::Enrich(update.clone())),

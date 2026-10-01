@@ -41,6 +41,74 @@ pub struct Worktree {
     pub head_age: Option<String>,
     pub dirty: Option<bool>,
     pub ahead_behind: Option<(u32, u32)>,
+    /// A rebase, a merge or another git operation left half-done in it,
+    /// read from its git directory without running git.
+    pub in_progress: Option<InProgress>,
+}
+
+/// A git operation stopped halfway in a checkout — by a conflict, most
+/// often, in a shell — which git will not start another over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InProgress {
+    Rebase,
+    Merge,
+    CherryPick,
+    Revert,
+    /// `git am`, which keeps its state where a rebase keeps its own.
+    Am,
+}
+
+impl InProgress {
+    /// What it is, as a sentence names it: `a rebase is in progress`.
+    pub fn noun(self) -> &'static str {
+        match self {
+            InProgress::Rebase => "rebase",
+            InProgress::Merge => "merge",
+            InProgress::CherryPick => "cherry-pick",
+            InProgress::Revert => "revert",
+            InProgress::Am => "git am",
+        }
+    }
+
+    /// The word its row shows in the list.
+    pub fn word(self) -> &'static str {
+        match self {
+            InProgress::Rebase => "rebasing",
+            InProgress::Merge => "merging",
+            InProgress::CherryPick => "picking",
+            InProgress::Revert => "reverting",
+            InProgress::Am => "applying",
+        }
+    }
+}
+
+/// The git operation left half-done in `checkout`, if there is one: the
+/// files git keeps in the checkout's own git directory while one is
+/// stopped, looked at directly, so a row can say it without a fork.
+pub fn in_progress(checkout: &Path) -> Option<InProgress> {
+    let dotgit = checkout.join(".git");
+    let gitdir = if dotgit.is_dir() {
+        dotgit
+    } else {
+        linked_gitdir(checkout)?
+    };
+    let apply = gitdir.join("rebase-apply");
+    if gitdir.join("rebase-merge").is_dir() {
+        Some(InProgress::Rebase)
+    } else if apply.is_dir() {
+        Some(match apply.join("applying").exists() {
+            true => InProgress::Am,
+            false => InProgress::Rebase,
+        })
+    } else if gitdir.join("MERGE_HEAD").is_file() {
+        Some(InProgress::Merge)
+    } else if gitdir.join("CHERRY_PICK_HEAD").is_file() {
+        Some(InProgress::CherryPick)
+    } else if gitdir.join("REVERT_HEAD").is_file() {
+        Some(InProgress::Revert)
+    } else {
+        None
+    }
 }
 
 /// Whether `name` is the throwaway worktree `pando check` makes and
@@ -106,6 +174,7 @@ impl Worktree {
             .unwrap_or_else(|| entry.path.to_string_lossy().to_string());
         let path = std::fs::canonicalize(&entry.path).unwrap_or(entry.path);
         let created_at = std::fs::metadata(&path).ok().and_then(|m| m.created().ok());
+        let in_progress = in_progress(&path);
         Self {
             name,
             path,
@@ -123,6 +192,7 @@ impl Worktree {
             head_age: None,
             dirty: None,
             ahead_behind: None,
+            in_progress,
         }
     }
 
@@ -384,6 +454,7 @@ pub struct EnrichUpdate {
     pub head_age: Option<String>,
     pub dirty: Option<bool>,
     pub ahead_behind: Option<(u32, u32)>,
+    pub in_progress: Option<InProgress>,
 }
 
 /// Enriches worktrees from the listing they were read from: their own
@@ -648,6 +719,7 @@ fn enrich_one(
         head_age,
         dirty,
         ahead_behind,
+        in_progress: in_progress(path),
     }
 }
 
@@ -659,6 +731,7 @@ pub fn apply_update(wt: &mut Worktree, u: EnrichUpdate) {
     wt.head_age = u.head_age;
     wt.dirty = u.dirty;
     wt.ahead_behind = u.ahead_behind;
+    wt.in_progress = u.in_progress;
 }
 
 fn last_commit(path: &Path) -> Result<(String, String, String)> {
@@ -1603,6 +1676,7 @@ bare
             head_age: None,
             dirty: None,
             ahead_behind: None,
+            in_progress: None,
         }];
         enrich_from_git(&mut wts, dir.path()).unwrap();
         assert!(wts[0].dirty.is_none());
