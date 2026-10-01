@@ -84,6 +84,32 @@ nothing is written to your own `~/.pando` either. `--listener` gives the
 fixture a small Python server as its dev process, so `start` has
 something real to start without installing a framework.
 
+### A branch's pando, before it is pushed
+
+`scripts/dev` keeps each branch in a worktree of its own beside the main
+checkout, with its own build, so you can live with a change for a while
+before it goes anywhere. Link it once as `pando-dev`:
+
+```bash
+scripts/dev install                # ~/bin/pando-dev
+pando-dev new my-feature           # branch + worktree, from main
+cd ../pando.worktrees/my-feature   # work there, commit there
+pando-dev try my-feature           # its TUI in a throwaway fixture
+pando-dev run my-feature ls        # its CLI, any verb
+pando-dev use my-feature           # `pando` on your PATH is that build now
+pando-dev use main                 # …and back
+pando-dev ls                       # every worktree, and which one `pando` runs
+pando-dev rm my-feature            # the worktree goes; the branch stays
+```
+
+`try` builds the fixture with that branch's own recipe and gives it a
+`PANDO_HOME` of its own, so neither a real repository nor your `~/.pando`
+is touched; extra arguments go to `scripts/fixture-repo.sh`. `use` only
+ever moves one symlink, `~/bin/pando` (`PANDO_DEV_LINK` changes it), and
+refuses to replace a real file, such as a pando Homebrew installed. Once
+you are happy, merge the branch the usual way; nothing here pushes,
+merges or releases.
+
 ## How the code is laid out
 
 [`src/lib.rs`](src/lib.rs) is the map: the dependency direction between
