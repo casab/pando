@@ -7,6 +7,17 @@ may change behaviour.
 
 ## Unreleased
 
+### Added
+
+- A development build names its branch: `pando --version` adds
+  `(my-feature@1a2b3c4)` after the version, and the TUI's header shows `⎇
+  my-feature@1a2b3c4`, so a branch tried on a real project never passes
+  for the released pando. `scripts/dev` sets it (`PANDO_BUILD_LABEL`); a
+  release reads as before.
+- `scripts/dev`, for contributors: each branch in a worktree of its own
+  with its own build, `use` to make it the `pando` on your PATH and back,
+  `try` for its TUI in a throwaway fixture. See CONTRIBUTING.md.
+
 ## 0.6.3 — 2026-10-04
 
 ### Added

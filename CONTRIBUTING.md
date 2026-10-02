@@ -87,27 +87,46 @@ something real to start without installing a framework.
 ### A branch's pando, before it is pushed
 
 `scripts/dev` keeps each branch in a worktree of its own beside the main
-checkout, with its own build, so you can live with a change for a while
-before it goes anywhere. Link it once as `pando-dev`:
+checkout, with its own build, so you can live with a change on the
+projects you really use pando on before it goes anywhere. Link it once
+as `pando-dev`:
 
 ```bash
 scripts/dev install                # ~/bin/pando-dev
 pando-dev new my-feature           # branch + worktree, from main
 cd ../pando.worktrees/my-feature   # work there, commit there
-pando-dev try my-feature           # its TUI in a throwaway fixture
-pando-dev run my-feature ls        # its CLI, any verb
-pando-dev use my-feature           # `pando` on your PATH is that build now
-pando-dev use main                 # …and back
-pando-dev ls                       # every worktree, and which one `pando` runs
+```
+
+Then use the branch as your pando, on your own projects, with your own
+`~/.pando`:
+
+```bash
+pando-dev use my-feature           # `pando` on your PATH is that branch's build now
+cd ~/code/some-project && pando    # …so this is the branch, on a real project
+pando-dev use main                 # back to the main checkout's build
+pando-dev ls                       # every worktree, and which one `pando` runs (▸)
+```
+
+A branch's build says so: `pando --version` adds `(my-feature@1a2b3c4)`
+after the version, and the TUI's header shows `⎇ my-feature@1a2b3c4`
+(`+wip` when it was built with uncommitted changes). A clean main
+checkout builds unlabelled, as `cargo build --release` does. `use`
+rebuilds before it switches, and only ever moves one symlink,
+`~/bin/pando` (`PANDO_DEV_LINK` changes it); it refuses to replace a real
+file, such as a pando Homebrew installed.
+
+Two more, for when a real project is the wrong place to try something:
+
+```bash
+pando-dev try my-feature           # its TUI in a throwaway fixture repository
+pando-dev run my-feature status    # its CLI once, without switching `pando`
 pando-dev rm my-feature            # the worktree goes; the branch stays
 ```
 
-`try` builds the fixture with that branch's own recipe and gives it a
-`PANDO_HOME` of its own, so neither a real repository nor your `~/.pando`
-is touched; extra arguments go to `scripts/fixture-repo.sh`. `use` only
-ever moves one symlink, `~/bin/pando` (`PANDO_DEV_LINK` changes it), and
-refuses to replace a real file, such as a pando Homebrew installed. Once
-you are happy, merge the branch the usual way; nothing here pushes,
+`try` builds a fixture with that branch's own recipe and gives it a
+`PANDO_HOME` of its own, so neither a real repository nor your
+`~/.pando` is touched; extra arguments go to `scripts/fixture-repo.sh`.
+Once you are happy, merge the branch the usual way: nothing here pushes,
 merges or releases.
 
 ## How the code is laid out

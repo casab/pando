@@ -5045,3 +5045,20 @@ fn a_project_with_no_worktree_still_gets_the_welcome() {
     assert!(text.contains("welcome"), "{text}");
     assert!(!text.contains("main ⌂"), "{text}");
 }
+
+// ---- a development build's label ---------------------------------------
+
+#[test]
+fn a_development_build_names_its_branch_in_the_header_and_a_release_does_not() {
+    let text = |spans: Vec<Span>| {
+        spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect::<String>()
+    };
+    assert_eq!(
+        text(build_label_spans(Some("git-menu@b7bb2b4"))),
+        "⎇ git-menu@b7bb2b4 · "
+    );
+    assert!(build_label_spans(None).is_empty());
+}

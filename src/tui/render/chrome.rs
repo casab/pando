@@ -190,15 +190,16 @@ pub(super) fn render_header(f: &mut Frame, area: Rect, app: &App) {
             None => {}
         }
     }
-    let mut spans = vec![
-        Span::styled(
-            " pando ",
-            Style::new().fg(blue()).add_modifier(Modifier::BOLD),
-        ),
+    let mut spans = vec![Span::styled(
+        " pando ",
+        Style::new().fg(blue()).add_modifier(Modifier::BOLD),
+    )];
+    spans.extend(build_label_spans(crate::version::label()));
+    spans.extend([
         Span::styled(project.clone(), Style::new().fg(text())),
         Span::styled(" · ", Style::new().fg(text_muted())),
         Span::styled(branch, Style::new().fg(blue())),
-    ];
+    ]);
     // Right after the branch, so a narrow header sheds it last: which
     // GitHub account this project's pushes and pull requests go out as.
     spans.extend(gh_account_spans(app.gh_account.as_ref()));
@@ -264,6 +265,22 @@ pub(super) fn render_header(f: &mut Frame, area: Rect, app: &App) {
 /// Asked of `gh` from the project's directory, so a `gh` that picks its
 /// account per directory shows the one this project gets, which is the one
 /// worth checking before a push goes out as somebody else.
+/// A development build's branch, right after the name, so a pando tried
+/// on a real project never passes for the released one. Nothing for a
+/// release.
+pub(super) fn build_label_spans(label: Option<&str>) -> Vec<Span<'static>> {
+    match label {
+        Some(label) => vec![
+            Span::styled(
+                format!("⎇ {label}"),
+                Style::new().fg(yellow()).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" · ", Style::new().fg(text_muted())),
+        ],
+        None => Vec::new(),
+    }
+}
+
 pub(super) fn gh_account_spans(account: Option<&GhAccount>) -> Vec<Span<'static>> {
     let dot = Span::styled(" · ", Style::new().fg(text_muted()));
     let label = Span::styled("gh ", Style::new().fg(text_muted()));

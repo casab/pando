@@ -84,7 +84,7 @@ pando's own recommendation";
 #[derive(Parser, Debug)]
 #[command(
     name = "pando",
-    version,
+    version = crate::version::version(),
     about = "One repo. Every branch alive.",
     after_help = MAIN_AFTER_HELP
 )]

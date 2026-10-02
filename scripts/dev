@@ -6,16 +6,21 @@
 # own build there. Nothing here pushes, merges or releases anything.
 #
 #   scripts/dev new <name> [<from>]      a branch and a worktree for it, from main
+#   scripts/dev use <name>               `pando` everywhere is that branch's build; `use main` goes back
 #   scripts/dev ls                       every worktree, and which build `pando` runs
 #   scripts/dev build [<name>]           cargo build --release in that worktree
-#   scripts/dev run <name> [<args>...]   build it, then run that pando with the args
-#   scripts/dev use <name>               make `pando` on your PATH that build; `use main` goes back
+#   scripts/dev run <name> [<args>...]   build it, then run that pando once, here, with the args
 #   scripts/dev try <name> [<fixture>]   that pando's TUI in a throwaway fixture repo
 #   scripts/dev rm <name>                remove the worktree; the branch stays
 #   scripts/dev install                  link this script as ~/bin/pando-dev
 #
 # <name> is a worktree's directory name or its branch; `main` is the main
 # checkout. With no <name>, `build` takes the worktree you are standing in.
+#
+# `use` is how a branch is lived with: after `pando-dev use my-feature`,
+# `pando` in any project is that build, on your real worktrees and your own
+# ~/.pando, and its header says `⎇ my-feature@<sha>` so it never passes for
+# the released one.
 #
 # `try` builds the fixture from that branch's own recipe
 # (scripts/fixture-repo.sh <fixture> --with-origin --listener, `plain` by
@@ -81,12 +86,29 @@ label() {
   return 0
 }
 
+# What a build names itself in `--version` and the TUI's header:
+# `git-menu@b7bb2b4`, `+wip` with uncommitted changes in it. Nothing for
+# a clean main checkout, which builds as `cargo build --release` would.
+build_label() {
+  local wt=$1 branch dirty
+  dirty=$(git -C "$wt" status --porcelain)
+  [[ $wt == "$main" && -z $dirty ]] && return 0
+  branch=$(git -C "$wt" branch --show-current)
+  printf '%s@%s' "${branch:-detached}" "$(git -C "$wt" rev-parse --short HEAD)"
+  [[ -n $dirty ]] && printf '+wip'
+  return 0
+}
+
 build() {
-  local wt=$1 start
+  local wt=$1 start tag
   start=$(date +%s)
+  tag=$(build_label "$wt")
   say "building $(label "$wt")"
-  cargo build --release --quiet --manifest-path "$wt/Cargo.toml" ||
-    die "the build failed in $wt"
+  if [[ -n $tag ]]; then
+    PANDO_BUILD_LABEL=$tag cargo build --release --quiet --manifest-path "$wt/Cargo.toml"
+  else
+    env -u PANDO_BUILD_LABEL cargo build --release --quiet --manifest-path "$wt/Cargo.toml"
+  fi || die "the build failed in $wt"
   say "built in $(($(date +%s) - start))s: $wt/target/release/pando"
 }
 
@@ -239,7 +261,7 @@ case ${1:-} in
     "cmd_$sub" "$@"
     ;;
   "" | -h | --help | help)
-    sed -n '3,28p' "$script" | sed 's/^# \{0,1\}//'
+    awk 'NR > 2 && /^#/ { sub(/^# ?/, ""); print; next } NR > 2 { exit }' "$script"
     ;;
   *) die "no command $1 — pando-dev help lists them" ;;
 esac

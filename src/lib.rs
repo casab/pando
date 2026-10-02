@@ -3,7 +3,7 @@
 //! The dependency direction is inner to outer, with no upward imports:
 //!
 //! ```text
-//! catalog · paths · term · remedy · theme · art → compose → project · config · ports · process · runtime · state
+//! catalog · paths · term · remedy · theme · art · version → compose → project · config · ports · process · runtime · state
 //!       · env_command · template · recipes
 //!       → detect · hooks · worktree · cache · log_tail · observe · services
 //!         · native · namespace · decisions · setup
@@ -77,4 +77,5 @@ pub(crate) mod testutil;
 pub mod theme;
 pub mod tui;
 pub mod tunnel;
+pub mod version;
 pub mod worktree;
