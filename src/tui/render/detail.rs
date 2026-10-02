@@ -433,10 +433,7 @@ fn git_row(app: &App, wt: &crate::worktree::Worktree, width: usize) -> Line<'sta
         parts.insert(
             0,
             vec![Span::styled(
-                format!(
-                    "a {} is in progress — u to abort, ! to finish it",
-                    op.noun()
-                ),
+                format!("a {} is half-done — space g aborts, ! finishes", op.noun()),
                 Style::new().fg(orange()).add_modifier(Modifier::BOLD),
             )],
         );

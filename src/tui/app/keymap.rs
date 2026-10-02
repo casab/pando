@@ -124,14 +124,14 @@ pub const LIST_KEYS: &[KeyHelp] = &[
         "remove it (never the main checkout)",
     ),
     key(
-        "u",
-        &[KeyCode::Char('u')],
-        "git: fetch, pull, rebase or merge it — shows the commands first",
+        "space g",
+        &[KeyCode::Char(' ')],
+        "the git menu: fetch, pull, rebase or merge it — shows the commands first",
     ),
     key("/", &[KeyCode::Char('/')], "filter by branch or name"),
     key(
-        "b",
-        &[KeyCode::Char('b')],
+        ",",
+        &[KeyCode::Char(',')],
         "sort the list: by PR, newest first, last run first, by name (saved)",
     ),
     key(
@@ -155,6 +155,10 @@ pub const LIST_KEYS: &[KeyHelp] = &[
     key("q esc", &[KeyCode::Char('q'), KeyCode::Esc], "quit"),
     key("ctrl-c", &[], "quit from anywhere"),
 ];
+
+/// What may follow `space`, the list's leader, as in neovim: the footer
+/// lists them while it waits, and a test holds them to the handler.
+pub const LEADER_KEYS: &[KeyHelp] = &[key("g", &[KeyCode::Char('g')], "git")];
 
 /// What the marks in a list row mean, shown under the keys.
 pub const LIST_LEGEND: &[(&str, &str)] = &[

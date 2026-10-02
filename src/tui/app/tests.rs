@@ -3889,7 +3889,7 @@ fn a_list_every_key_can_act_on() -> (tempfile::TempDir, App) {
 /// What a key press can visibly change on the list.
 fn list_fingerprint(app: &App) -> String {
     format!(
-        "{:?}|{:?}|{:?}|{:?}|{}|{}|{:?}|{:?}|{:?}|{}|{}|{}|{:?}",
+        "{:?}|{:?}|{:?}|{:?}|{}|{}|{:?}|{:?}|{:?}|{}|{}|{}|{:?}|{}",
         app.modal.as_ref().map(std::mem::discriminant),
         app.mode,
         app.status.as_ref().map(|s| s.message.clone()),
@@ -3903,6 +3903,7 @@ fn list_fingerprint(app: &App) -> String {
         app.tail_scroll,
         app.filter,
         app.launch,
+        app.leader,
     )
 }
 
@@ -7975,7 +7976,7 @@ fn b_cycles_the_order_keeps_the_cursor_and_says_so() {
     app.select_index(1);
     assert_eq!(app.selected_worktree().unwrap().name, "mid");
 
-    press(&mut app, KeyCode::Char('b'));
+    press(&mut app, KeyCode::Char(','));
     assert_eq!(app.sort, ListSort::Newest);
     assert_eq!(row_names(&app), ["acme-shop", "zeta", "alpha", "mid"]);
     assert_eq!(app.selected_worktree().unwrap().name, "mid");
@@ -7990,7 +7991,7 @@ fn b_cycles_the_order_keeps_the_cursor_and_says_so() {
     app.state = state;
     let state = ran(&app, "zeta", 5);
     app.state = state;
-    press(&mut app, KeyCode::Char('b'));
+    press(&mut app, KeyCode::Char(','));
     assert_eq!(app.sort, ListSort::Run);
     assert_eq!(
         row_names(&app),
@@ -7998,12 +7999,12 @@ fn b_cycles_the_order_keeps_the_cursor_and_says_so() {
         "the one started last first, one never started after"
     );
 
-    press(&mut app, KeyCode::Char('b'));
+    press(&mut app, KeyCode::Char(','));
     assert_eq!(app.sort, ListSort::Name);
     assert_eq!(row_names(&app), ["acme-shop", "alpha", "mid", "zeta"]);
     assert_eq!(app.selected_worktree().unwrap().name, "mid");
 
-    press(&mut app, KeyCode::Char('b'));
+    press(&mut app, KeyCode::Char(','));
     assert_eq!(app.sort, ListSort::Pr);
     assert_eq!(row_names(&app), ["acme-shop", "mid", "zeta", "alpha"]);
 }
@@ -8058,13 +8059,13 @@ fn what_runs_comes_right_after_the_main_checkout_in_every_order() {
         "the cursor goes with it"
     );
     for _ in 1..ListSort::ALL.len() {
-        press(&mut app, KeyCode::Char('b'));
+        press(&mut app, KeyCode::Char(','));
         assert_eq!(row_names(&app)[1], "feat+b", "{:?}", app.sort);
     }
 
     let starting = Phase::Starting { since: Utc::now() };
     refresh_with_process(&mut app, "feat+c", starting);
-    press(&mut app, KeyCode::Char('b'));
+    press(&mut app, KeyCode::Char(','));
     assert_eq!(app.sort, ListSort::Pr);
     assert_eq!(
         row_names(&app),
@@ -8164,9 +8165,11 @@ pub fn a_git_read(main: bool) -> GitRead {
     }
 }
 
-/// `u` on the selected row, and its read landing as the worker sends it.
+/// `space g` on the selected row, and its read landing as the worker
+/// sends it.
 pub fn open_git_menu(app: &mut App, name: &str, read: GitRead) {
-    press(app, KeyCode::Char('u'));
+    press(app, KeyCode::Char(' '));
+    press(app, KeyCode::Char('g'));
     assert!(
         matches!(
             &app.modal,
@@ -8175,7 +8178,7 @@ pub fn open_git_menu(app: &mut App, name: &str, read: GitRead) {
                 ..
             })
         ),
-        "u opens the menu, reading"
+        "space g opens the menu, reading"
     );
     assert!(app.handle_event(AppEvent::GitRead(Box::new((name.to_string(), read)))));
 }
@@ -8226,7 +8229,8 @@ fn u_opens_the_git_menu_on_the_move_the_row_most_likely_wants() {
 #[test]
 fn a_read_for_another_row_is_not_the_menus() {
     let mut app = test_app(&["feat+one", "feat+two"]);
-    press(&mut app, KeyCode::Char('u'));
+    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Char('g'));
     let elsewhere = AppEvent::GitRead(Box::new(("feat+two".to_string(), a_git_read(false))));
     let selected = app.selected_worktree().unwrap().name.clone();
     if selected != "feat+two" {
@@ -8437,8 +8441,84 @@ fn the_git_menu_answers_exactly_its_tables_keys() {
                 .iter()
                 .any(|o| o.action.key() == c);
             // j k move; q and u close.
-            let expected = shown || matches!(c, '!' | 'j' | 'k' | 'q' | 'u');
+            let expected = shown || matches!(c, '!' | 'j' | 'k' | 'q');
             assert_eq!(answered, expected, "{c:?} on {:?}", read.in_progress);
         }
     }
+}
+
+// ---- the leader ----------------------------------------------------------
+
+// `space` waits for one more key, as neovim's leader does: exactly the
+// keys `LEADER_KEYS` lists do something after it, and anything else
+// takes it back without acting as the list's own key would.
+#[test]
+fn after_space_exactly_the_leader_keys_do_something() {
+    let documented: Vec<KeyCode> = LEADER_KEYS
+        .iter()
+        .flat_map(|k| k.codes.iter().copied())
+        .collect();
+    for code in candidate_keys() {
+        let (_dir, mut app) = a_list_every_key_can_act_on();
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.leader, "space waits for the next key");
+        let selected = app.list_state.selected();
+        press(&mut app, code);
+        assert!(!app.leader, "{code:?} leaves the leader waiting");
+        assert_eq!(
+            app.modal.is_some(),
+            documented.contains(&code),
+            "{code:?} after space"
+        );
+        assert_eq!(
+            app.list_state.selected(),
+            selected,
+            "{code:?} moved the cursor"
+        );
+        assert!(!app.should_quit, "{code:?} after space quit");
+    }
+}
+
+// Help shows a leader key as `space <key>`, so every one of them is a
+// row of the list's keys too.
+#[test]
+fn every_leader_key_is_in_help_after_space() {
+    for leader in LEADER_KEYS {
+        assert!(
+            LIST_KEYS
+                .iter()
+                .any(|k| k.keys == format!("space {}", leader.keys)),
+            "help has no `space {}`",
+            leader.keys
+        );
+    }
+}
+
+#[test]
+fn space_g_opens_the_git_menu_and_g_alone_still_goes_to_the_first_row() {
+    let mut app = test_app(&["a", "b", "c"]);
+    press(&mut app, KeyCode::Char('G'));
+    press(&mut app, KeyCode::Char('g'));
+    assert_eq!(
+        app.list_state.selected(),
+        Some(0),
+        "g goes to the first row"
+    );
+    assert!(app.modal.is_none());
+    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Char('g'));
+    assert!(
+        matches!(app.modal, Some(Modal::Git { .. })),
+        "space g opens the git menu"
+    );
+}
+
+#[test]
+fn esc_after_space_takes_it_back() {
+    let mut app = test_app(&["a"]);
+    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Esc);
+    assert!(!app.leader);
+    assert!(!app.should_quit, "esc after space does not quit");
+    assert!(app.modal.is_none());
 }

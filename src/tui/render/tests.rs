@@ -2370,9 +2370,16 @@ fn hint_keys(hint: &str) -> Vec<&str> {
 #[test]
 fn every_footer_hint_is_a_key_help_documents() {
     use crate::tui::app::{LIST_KEYS, LOG_KEYS};
+    // A key's own words, and the whole of a key that takes two presses,
+    // such as `space g`.
     let tokens = |keys: &[crate::tui::app::KeyHelp]| -> Vec<String> {
         keys.iter()
-            .flat_map(|k| k.keys.split(' ').map(str::to_string))
+            .flat_map(|k| {
+                k.keys
+                    .split(' ')
+                    .map(str::to_string)
+                    .chain([k.keys.to_string()])
+            })
             .collect()
     };
     let list = tokens(LIST_KEYS);
@@ -5105,7 +5112,7 @@ fn a_development_build_names_its_branch_in_the_header_and_a_release_does_not() {
 fn the_footer_offers_the_git_menu() {
     let mut app = test_app(&["feat+one"]);
     let rendered = text_of(&draw(&mut app, 200, 12));
-    assert!(rendered.contains("u git"), "{rendered}");
+    assert!(rendered.contains("space g git"), "{rendered}");
 }
 
 // A rebase stopped in a shell: the row says so, and the detail pane says
@@ -5121,7 +5128,7 @@ fn a_rebase_left_half_done_is_on_its_row_and_in_the_detail_pane() {
     );
     assert!(!list_row(&rendered, "feat/two").contains("rebasing"));
     assert!(
-        rendered.contains("a rebase is in progress — u to abort, ! to finish it"),
+        rendered.contains("a rebase is half-done — space g aborts, ! finishes"),
         "{rendered}"
     );
 }
@@ -5192,6 +5199,19 @@ fn a_running_move_is_the_rows_word() {
     assert!(row.contains("rebasing"), "{rendered}");
     assert!(
         rendered.contains("it cannot be stopped halfway"),
+        "{rendered}"
+    );
+}
+
+// After space, the footer says what may follow it, as neovim's which-key
+// does, and how to take it back.
+#[test]
+fn after_space_the_footer_lists_what_may_follow_it() {
+    let mut app = test_app(&["feat+one"]);
+    app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    let rendered = text_of(&draw(&mut app, 120, 12));
+    assert!(
+        rendered.contains("space › g git · esc cancel"),
         "{rendered}"
     );
 }

@@ -9,7 +9,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::state::Aggregate;
 use crate::theme::{blue, green, orange, red, surface, text, text_dim, text_muted, yellow};
-use crate::tui::app::{App, Mode, SetupHint, Status, StatusKind};
+use crate::tui::app::{App, LEADER_KEYS, Mode, SetupHint, Status, StatusKind};
 use crate::worktree::GhAccount;
 
 use super::{text_width, truncate, truncate_line, wrap_text};
@@ -307,7 +307,7 @@ pub(super) const RUNNING_HINTS: [(&str, &str, bool); 16] = [
     ("x", "stop", true),
     ("⏎", "mode", false),
     ("r", "restart", false),
-    ("u", "git", false),
+    ("space g", "git", false),
     ("o", "open", false),
     ("c", "copy url", false),
     ("t", "share", false),
@@ -324,7 +324,7 @@ pub(super) const RUNNING_HINTS: [(&str, &str, bool); 16] = [
 pub(super) const STOPPED_HINTS: [(&str, &str, bool); 12] = [
     ("j/k", "move", true),
     ("⏎", "start", true),
-    ("u", "git", false),
+    ("space g", "git", false),
     ("i", "isolated", false),
     ("l", "logs", false),
     ("!", "shell", false),
@@ -340,7 +340,7 @@ pub(super) const STOPPED_HINTS: [(&str, &str, bool); 12] = [
 /// key is offered, because none would start anything.
 pub(super) const NOTHING_TO_RUN_HINTS: [(&str, &str, bool); 10] = [
     ("j/k", "move", true),
-    ("u", "git", false),
+    ("space g", "git", false),
     ("l", "logs", false),
     ("!", "shell", false),
     ("e", "edit", false),
@@ -377,6 +377,22 @@ pub(super) fn render_footer(f: &mut Frame, area: Rect, app: &App) {
             ),
             Span::styled(" · answer in the dialog", Style::new().fg(text_muted())),
         ]);
+        f.render_widget(
+            Paragraph::new(truncate_line(line, width)).style(Style::new().bg(surface())),
+            area,
+        );
+        return;
+    }
+    // After the leader, what may follow it, as neovim's which-key would.
+    if app.leader {
+        let mut hints: Vec<(&str, &str, bool)> = LEADER_KEYS
+            .iter()
+            .map(|k| (k.keys, k.action, true))
+            .collect();
+        hints.push(("esc", "cancel", true));
+        let mut line = hint_line(&hints, width.saturating_sub(8));
+        line.spans
+            .insert(0, Span::styled(" space ›", Style::new().fg(blue())));
         f.render_widget(
             Paragraph::new(truncate_line(line, width)).style(Style::new().bg(surface())),
             area,

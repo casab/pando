@@ -389,7 +389,7 @@ and the rest are in the detail pane beside it.
 
 The main checkout is always the first row, and the worktrees with
 something up come right after it: a start moves a row up and a stop puts
-it back. `b` changes the order within each, which the list's title
+it back. `,` changes the order within each, which the list's title
 names: by pull request, the highest number first (the default); newest
 first; last run first; or by name.
 The choice is saved as `[ui] sort` in `~/.pando/config.toml`, as `pr`,

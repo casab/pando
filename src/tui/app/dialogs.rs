@@ -85,7 +85,7 @@ pub enum Modal {
         selected: usize,
         before: crate::theme::Palette,
     },
-    /// `u`: the git menu on a checkout, at whichever stage it is.
+    /// `space g`: the git menu on a checkout, at whichever stage it is.
     Git {
         name: String,
         stage: super::GitStage,

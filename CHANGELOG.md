@@ -17,7 +17,8 @@ may change behaviour.
 - `scripts/dev`, for contributors: each branch in a worktree of its own
   with its own build, `use` to make it the `pando` on your PATH and back,
   `try` for its TUI in a throwaway fixture. See CONTRIBUTING.md.
-- The TUI's git menu, `u` ([#7]): on any row, where its branch stands
+- The TUI's git menu, `space g` ([#7]): space is the list's leader, as
+  in neovim, and the footer lists what may follow it. On any row, where its branch stands
   against its base and its own upstream, and what can be done about it
   — fetch, pull (a fast-forward, never a merge), rebase onto the base,
   merge the base in, or abort a rebase or merge left half-done — each
@@ -33,6 +34,12 @@ may change behaviour.
 - `scripts/fixture-repo.sh <kind> --with-origin --drift`: a fixture
   whose origin has moved on and whose worktrees rebase cleanly, conflict,
   or have uncommitted work, for trying the git menu by hand.
+
+### Changed
+
+- Sorting the TUI's list moved from `b` to `,`, yazi's sort key: space
+  is now the list's leader, as in neovim, and `g` and `G` keep their vim
+  meaning.
 
 ## 0.6.3 — 2026-10-04
 

@@ -136,7 +136,9 @@ worktrees with something up sit right after the main checkout in every
 order, a start moving a row up and a stop putting it back.
 
 On 2026-10-01 the TUI gained a git menu, from issue #7, built on the
-branch `git-menu`: `u` on a row reads where its branch stands, offers
+branch `git-menu`: `space g` on a row (space is the list's leader, as
+in neovim; `g` alone still goes to the first row, and sorting moved
+from `b` to `,`) reads where its branch stands, offers
 fetch, pull (fast-forward only), rebase onto its base, merge the base
 in, or the abort of a rebase or merge left half-done, previews the
 exact commands, runs them on the worker every action uses, and aborts a

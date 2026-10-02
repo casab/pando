@@ -37,8 +37,8 @@ pub use dialogs::{
 };
 pub use git_menu::{BY_HAND_KEY, GitStage};
 pub use keymap::{
-    INSPECT_LEGEND, KeyHelp, LIST_KEYS, LIST_LEGEND, LOG_KEYS, OVERLAY_KEYS, SETUP_KEYS,
-    SETUP_LEGEND,
+    INSPECT_LEGEND, KeyHelp, LEADER_KEYS, LIST_KEYS, LIST_LEGEND, LOG_KEYS, OVERLAY_KEYS,
+    SETUP_KEYS, SETUP_LEGEND,
 };
 pub use launch::{
     Launch, LaunchEnv, LaunchRequest, is_terminal_editor, plan_editor, plan_shell, said_after,
@@ -263,7 +263,7 @@ pub struct App {
     /// the first answer is on its way.
     pub gh_account: Option<GhAccount>,
     pub list_state: ListState,
-    /// The order of the list's rows: `[ui] sort`, then whatever `b` chose.
+    /// The order of the list's rows: `[ui] sort`, then whatever `,` chose.
     pub sort: ListSort,
     pub filter: String,
     pub filtered_indices: Vec<usize>,
@@ -271,6 +271,9 @@ pub struct App {
     pub modal: Option<Modal>,
     /// The first press of a key that asks for a second.
     pub armed: Option<Armed>,
+    /// `space` was pressed: the next key is one of `keymap::LEADER_KEYS`,
+    /// as after neovim's leader.
+    pub leader: bool,
     pub help_scroll: usize,
     /// The furthest help or messages can scroll on the screen it was last
     /// painted on. Written by the paint, read by the scroll keys.
@@ -396,6 +399,7 @@ impl App {
             mode: Mode::Normal,
             modal: None,
             armed: None,
+            leader: false,
             help_scroll: 0,
             help_scroll_max: usize::MAX,
             status: None,
@@ -857,6 +861,16 @@ impl App {
             self.handle_filter_key(key);
             return;
         }
+        // After the leader, a key of `keymap::LEADER_KEYS`, which the footer
+        // lists while it waits; anything else takes it back and says so.
+        if std::mem::take(&mut self.leader) {
+            match key.code {
+                KeyCode::Char('g') => self.open_git_menu(),
+                KeyCode::Esc => self.set_status("cancelled"),
+                _ => self.set_status("space, then g: the git menu"),
+            }
+            return;
+        }
         // A key waiting for its second press: esc takes it back and does
         // nothing else, where it would otherwise clear a filter or quit.
         if key.code == KeyCode::Esc && self.armed.take().is_some() {
@@ -883,9 +897,9 @@ impl App {
             KeyCode::Char('n') => self.open_create(),
             KeyCode::Char('p') => self.open_pull_requests(),
             KeyCode::Char('d') => self.open_remove(),
-            // Everything that moves the branch, behind one key: the menu
-            // shows where it stands and the commands before any run.
-            KeyCode::Char('u') => self.open_git_menu(),
+            // The leader, as in neovim: everything that moves the branch
+            // is `space g`, and the menu shows the commands before any run.
+            KeyCode::Char(' ') => self.leader = true,
             KeyCode::Char('y') => self.copy_selected_path(),
             KeyCode::Char('a') => self.copy_setup_prompt(),
             KeyCode::Char('v') => self.test_setup_from_list(),
@@ -921,7 +935,7 @@ impl App {
             KeyCode::PageDown => self.scroll_tail(self.tail_rows.max(1) as isize),
             KeyCode::Tab => self.cycle_tail(),
             KeyCode::Char('T') => self.open_theme_picker(),
-            KeyCode::Char('b') => self.cycle_sort(),
+            KeyCode::Char(',') => self.cycle_sort(),
             KeyCode::Char('R') => {
                 self.spawn_discovery();
                 // An account switched in another terminal shows here too,
@@ -1209,7 +1223,7 @@ impl App {
             })
             .map(|(i, _)| i)
             .collect();
-        // The order `b` chose, below the main checkout and what is up. A
+        // The order `,` chose, below the main checkout and what is up. A
         // row moves only when it starts or stops, or when `run` sees it
         // started; the cursor stays on its worktree either way.
         let mut rows = std::mem::take(&mut self.filtered_indices);
@@ -1591,6 +1605,7 @@ impl App {
             mode: Mode::Normal,
             modal: None,
             armed: None,
+            leader: false,
             help_scroll: 0,
             help_scroll_max: usize::MAX,
             status: None,

@@ -1406,7 +1406,7 @@ fn git_header(read: &GitRead) -> Vec<Line<'static>> {
     ]
 }
 
-/// `u`: the git menu, at whichever stage it is — the same box throughout,
+/// `space g`: the git menu, at whichever stage it is — the same box throughout,
 /// its title saying what it is about.
 fn render_git(f: &mut Frame, area: Rect, app: &App, name: &str, stage: &GitStage) {
     let cap = max_content_width(area);

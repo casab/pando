@@ -1,4 +1,4 @@
-//! The git menu, `u`: where the selected checkout stands, what can be done
+//! The git menu, `space g`: where the selected checkout stands, what can be done
 //! to it and why not where it cannot, a preview of the exact commands,
 //! the run on a worker, and what it did. One modal whose stage changes in
 //! place; esc always goes back one stage.
@@ -78,7 +78,7 @@ impl GitStage {
 }
 
 impl App {
-    /// `u`: the git menu for the selected checkout. The read runs on a
+    /// `space g`: the git menu for the selected checkout. The read runs on a
     /// worker; the menu says so until it lands.
     pub(super) fn open_git_menu(&mut self) {
         let Some(wt) = self.selected_worktree().cloned() else {
@@ -133,13 +133,13 @@ impl App {
         let code = key.code;
         let back = matches!(code, KeyCode::Esc | KeyCode::Char('q'));
         let next = match stage {
-            GitStage::Reading if back || code == KeyCode::Char('u') => None,
+            GitStage::Reading if back => None,
             GitStage::Reading => Some(GitStage::Reading),
             GitStage::Menu { read, selected } => {
                 let offers = actions::git::offers(&read);
                 let rows = offers.len() + 1;
                 match code {
-                    _ if back || code == KeyCode::Char('u') => None,
+                    _ if back => None,
                     KeyCode::Down | KeyCode::Char('j') => Some(GitStage::Menu {
                         read,
                         selected: (selected + 1) % rows,

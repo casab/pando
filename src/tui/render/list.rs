@@ -312,7 +312,7 @@ fn row_cells(app: &App, wt: &Worktree) -> RowCells {
 
 pub(super) fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
     // Worktrees, counted without the main checkout's row: it is not one.
-    // Then their order, which `b` changes.
+    // Then their order, which `,` changes.
     let count = if app.filter.is_empty() {
         app.linked_count().to_string()
     } else {

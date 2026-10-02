@@ -1,4 +1,4 @@
-//! The order of the worktree list: the one `b` cycles, the list's title
+//! The order of the worktree list: the one `,` cycles, the list's title
 //! names, and `[ui] sort` saves.
 //!
 //! The main checkout is the first row in every order, and the worktrees
@@ -25,7 +25,7 @@ pub enum ListSort {
 }
 
 impl ListSort {
-    /// Every order, in the order `b` cycles them.
+    /// Every order, in the order `,` cycles them.
     pub const ALL: [ListSort; 4] = [
         ListSort::Pr,
         ListSort::Newest,
@@ -104,7 +104,7 @@ impl App {
         }
     }
 
-    /// `b`: the next order, the cursor kept on its worktree, and the
+    /// `,`: the next order, the cursor kept on its worktree, and the
     /// choice saved for the next session.
     pub(super) fn cycle_sort(&mut self) {
         self.sort = self.sort.next();
