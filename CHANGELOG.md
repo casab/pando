@@ -7,6 +7,8 @@ may change behaviour.
 
 ## Unreleased
 
+## 0.6.3 — 2026-10-04
+
 ### Added
 
 - The TUI's list can be sorted: `b` cycles it by pull request, the

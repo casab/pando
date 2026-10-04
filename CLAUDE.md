@@ -130,6 +130,11 @@ those); and doctor's fixes for a stale port and a server with no port
 are commands that work. Nothing of it has run on a real simulator or
 emulator; the tests use stand-ins.
 
+On 2026-10-04 0.6.3 was built and tagged: `b` sorts the TUI's list (by
+pull request, newest, last run or name, saved as `[ui] sort`), and the
+worktrees with something up sit right after the main checkout in every
+order, a start moving a row up and a stop putting it back.
+
 What is left is not a phase. `plans/open-follow-ups.md` carries the known
 edges, each with who found it and where it belongs, and the rest of the
 launch checklist in `docs/08-roadmap.md` is open: no published crate, no
