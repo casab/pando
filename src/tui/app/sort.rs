@@ -1,9 +1,11 @@
 //! The order of the worktree list: the one `b` cycles, the list's title
 //! names, and `[ui] sort` saves.
 //!
-//! The main checkout is the first row in every order. Whatever an order
-//! cannot tell apart keeps discovery's order, newest worktree first, so a
-//! row never moves for a reason the title does not give.
+//! The main checkout is the first row in every order, and the worktrees
+//! with something up come next, so what runs is never scrolled out of
+//! sight. Within each, the order chosen; whatever it cannot tell apart
+//! keeps discovery's order, newest worktree first, so a row never moves
+//! for a reason the title or its glyph does not give.
 
 use std::cmp::Reverse;
 
@@ -74,26 +76,30 @@ impl ListSort {
 }
 
 impl App {
-    /// Puts `rows`, indices into `worktrees`, in the order chosen. Stable,
-    /// so ties keep the order they came in.
+    /// Puts `rows`, indices into `worktrees`, in the order chosen: the
+    /// main checkout, then what is up, then the rest. Stable, so ties keep
+    /// the order they came in.
     pub(super) fn sort_rows(&self, rows: &mut [usize]) {
-        let not_main = |i: usize| !self.is_main(&self.worktrees[i].name);
+        let group = |i: usize| {
+            let name = &self.worktrees[i].name;
+            (!self.is_main(name), !self.is_live(name))
+        };
         match self.sort {
             ListSort::Pr => rows.sort_by_key(|&i| {
                 let pr = self.pr_for(&self.worktrees[i]).map(|pr| pr.number);
-                (not_main(i), Reverse(pr))
+                (group(i), Reverse(pr))
             }),
-            ListSort::Newest => rows.sort_by_key(|&i| not_main(i)),
+            ListSort::Newest => rows.sort_by_key(|&i| group(i)),
             ListSort::Run => rows.sort_by_key(|&i| {
                 let ran = self
                     .record_for(&self.worktrees[i].name)
                     .and_then(|record| record.last_run());
-                (not_main(i), Reverse(ran))
+                (group(i), Reverse(ran))
             }),
             ListSort::Name => rows.sort_by_cached_key(|&i| {
                 let wt = &self.worktrees[i];
                 let label = wt.branch.as_deref().unwrap_or(&wt.name).to_lowercase();
-                (not_main(i), label)
+                (group(i), label)
             }),
         }
     }

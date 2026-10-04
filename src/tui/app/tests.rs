@@ -4371,7 +4371,7 @@ fn a_worktree_with_nothing_up_is_stopped_on_one_press() {
 // ---- the list's order ------------------------------------------------
 
 #[test]
-fn the_list_keeps_discovery_order_when_a_worktree_starts() {
+fn a_worktree_that_starts_moves_to_the_top_and_the_cursor_with_it() {
     let mut app = test_app(&["feat+one", "feat+two", "feat+three"]);
     app.select_index(2);
     assert_eq!(app.selected_worktree().unwrap().name, "feat+three");
@@ -4388,15 +4388,15 @@ fn the_list_keeps_discovery_order_when_a_worktree_starts() {
         .collect();
     assert_eq!(
         order,
-        vec!["feat+one", "feat+two", "feat+three"],
-        "the order `pando ls` prints, whatever runs"
+        vec!["feat+three", "feat+one", "feat+two"],
+        "what runs first, the rest in the order `pando ls` prints"
     );
     assert_eq!(
         app.selected_worktree().unwrap().name,
         "feat+three",
         "the cursor stays on its worktree"
     );
-    assert_eq!(app.list_state.selected(), Some(2), "and on its row");
+    assert_eq!(app.list_state.selected(), Some(0), "on its new row");
 }
 
 // ---- messages --------------------------------------------------------
@@ -8020,11 +8020,85 @@ fn a_start_moves_its_row_up_a_list_sorted_by_last_run() {
 }
 
 #[test]
-fn a_list_sorted_otherwise_does_not_move_when_one_starts() {
+fn a_list_sorted_otherwise_does_not_move_for_when_one_last_ran() {
     let mut app = app_with_main(&["feat+a", "feat+b"]);
     app.sort = ListSort::Newest;
     let state = ran(&app, "feat+b", 0);
     app.handle_event(refreshed(state));
+    assert_eq!(row_names(&app), ["acme-shop", "feat+a", "feat+b"]);
+}
+
+/// A refresh that finds `name` with one process in `phase`.
+fn refresh_with_process(app: &mut App, name: &str, phase: Phase) {
+    let before = app.state.clone();
+    with_process(app, name, phase);
+    let after = std::mem::replace(&mut app.state, before);
+    app.handle_event(refreshed(after));
+}
+
+#[test]
+fn what_runs_comes_right_after_the_main_checkout_in_every_order() {
+    use crate::worktree::PrState::Open;
+    let mut app = app_with_main(&["feat+c", "feat+b", "feat+a"]);
+    app.handle_event(AppEvent::PrsReady(Ok(vec![a_pr(9, "feat/a", Open)])));
+    app.select_index(3);
+    assert_eq!(app.selected_worktree().unwrap().name, "feat+b");
+
+    refresh_with_process(&mut app, "feat+b", running_phase());
+    assert_eq!(
+        row_names(&app),
+        ["acme-shop", "feat+b", "feat+a", "feat+c"],
+        "the running one first, then the pull request, then the rest"
+    );
+    assert_eq!(
+        app.selected_worktree().unwrap().name,
+        "feat+b",
+        "the cursor goes with it"
+    );
+    for _ in 1..ListSort::ALL.len() {
+        press(&mut app, KeyCode::Char('b'));
+        assert_eq!(row_names(&app)[1], "feat+b", "{:?}", app.sort);
+    }
+
+    let starting = Phase::Starting { since: Utc::now() };
+    refresh_with_process(&mut app, "feat+c", starting);
+    press(&mut app, KeyCode::Char('b'));
+    assert_eq!(app.sort, ListSort::Pr);
+    assert_eq!(
+        row_names(&app),
+        ["acme-shop", "feat+c", "feat+b", "feat+a"],
+        "starting counts, and what runs keeps the chosen order among itself"
+    );
+}
+
+#[test]
+fn a_stop_puts_the_row_back_where_the_order_has_it() {
+    let mut app = app_with_main(&["feat+a", "feat+b"]);
+    app.sort = ListSort::Newest;
+    refresh_with_process(&mut app, "feat+b", running_phase());
+    assert_eq!(row_names(&app), ["acme-shop", "feat+b", "feat+a"]);
+
+    // A stop keeps the record and clears its processes.
+    let mut stopped = app.state.clone();
+    stopped
+        .worktrees
+        .get_mut("feat+b")
+        .unwrap()
+        .processes
+        .clear();
+    app.handle_event(refreshed(stopped));
+    assert_eq!(row_names(&app), ["acme-shop", "feat+a", "feat+b"]);
+}
+
+#[test]
+fn a_worktree_whose_only_process_failed_is_not_up() {
+    let mut app = app_with_main(&["feat+a", "feat+b"]);
+    app.sort = ListSort::Newest;
+    let failed = Phase::Failed {
+        at: Utc::now(),
+        reason: "exited with 1".into(),
+    };
+    refresh_with_process(&mut app, "feat+b", failed);
     assert_eq!(row_names(&app), ["acme-shop", "feat+a", "feat+b"]);
 }
 

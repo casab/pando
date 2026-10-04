@@ -16,6 +16,10 @@ may change behaviour.
   as `[ui] sort` in `~/.pando/config.toml`. A worktree's last start is
   kept in its state record through a stop, so last run first still
   knows after a stop when a worktree last ran.
+- The TUI's list puts the worktrees with something up right after the
+  main checkout, in every order, so what runs is never scrolled out of
+  sight. A start moves the row up and a stop puts it back, the cursor
+  going with it; below them, the rest keep the order `b` chose.
 
 ### Fixed
 

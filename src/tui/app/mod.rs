@@ -1196,10 +1196,9 @@ impl App {
             })
             .map(|(i, _)| i)
             .collect();
-        // The order `b` chose, and never by what runs now: a list whose
-        // rows jump when one starts or stops is a list nobody can find
-        // anything in by position. The header counts what runs. `run`
-        // moves a row only when it is started, which is what it is for.
+        // The order `b` chose, below the main checkout and what is up. A
+        // row moves only when it starts or stops, or when `run` sees it
+        // started; the cursor stays on its worktree either way.
         let mut rows = std::mem::take(&mut self.filtered_indices);
         self.sort_rows(&mut rows);
         self.filtered_indices = rows;
@@ -1394,7 +1393,8 @@ impl App {
         let before = std::mem::replace(&mut self.state, state);
         // A main checkout started from a shell while the welcome is up gets
         // its row with the state that records it, not a discovery later;
-        // a start reorders a list sorted by what ran last.
+        // a start or a stop moves its row to or from the top, and a start
+        // reorders a list sorted by what ran last.
         let ran = |state: &State| -> Vec<_> {
             state
                 .worktrees
@@ -1402,7 +1402,16 @@ impl App {
                 .map(|(name, record)| (name.clone(), record.last_run()))
                 .collect()
         };
-        let reordered = self.sort == ListSort::Run && ran(&before) != ran(&self.state);
+        let live = |state: &State| -> Vec<_> {
+            state
+                .worktrees
+                .iter()
+                .filter(|(_, record)| record.is_live())
+                .map(|(name, _)| name.clone())
+                .collect()
+        };
+        let reordered = live(&before) != live(&self.state)
+            || self.sort == ListSort::Run && ran(&before) != ran(&self.state);
         if self.main_row_shown() != shown || reordered {
             self.refilter();
         }
