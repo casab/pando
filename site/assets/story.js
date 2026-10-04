@@ -40,13 +40,14 @@
   // Everything a frame needs from layout is measured here, not in the frame:
   // a layout read after the frame's own style writes would lay the page out
   // again, every frame.
-  let tops = [], storyBottom = 0, sizes = new Map();
+  let tops = [], storyBottom = 0, sizes = new Map(), stillKey = '';
   function measure() {
     const y0 = window.scrollY;
     tops = beats.map(b => b.getBoundingClientRect().top + y0);
     tops.push(tops[tops.length - 1] + beats[beats.length - 1].offsetHeight);
     storyBottom = story.getBoundingClientRect().bottom + y0;
     sizes = new Map();
+    stillKey = '';
   }
   // a style is written only when it changes
   const css = (el, k, v) => { const s = el._css || (el._css = {}); v = String(v); if (s[k] !== v) { s[k] = v; el.style[k] = v; } };
@@ -368,7 +369,17 @@
   window.addEventListener('resize', () => { view.resize(); measure(); });
   window.addEventListener('pando:fonts', measure);
   new ResizeObserver(measure).observe(document.body);
-  const lp = P.loop(story.querySelector('.stage'), now => frame(now));
+  // Full rate while the grove grows in; with reduced motion the clock stands
+  // still, so a frame is drawn only when the scroll, the size or the pointer moved.
+  const growing = () => loadT0 == null || performance.now() / 1000 - loadT0 < 3.5;
+  const lp = P.loop(story.querySelector('.stage'), now => {
+    if (P.reduced) {
+      const k = `${window.scrollY}|${innerWidth}|${innerHeight}|${view.pointerScreen}`;
+      if (k === stillKey) return;
+      stillKey = k;
+    }
+    frame(now);
+  }, { idle: true, busy: growing });
   P.fontsReady.then(() => {
     loadT0 = performance.now() / 1000;
     measure();

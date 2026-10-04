@@ -157,6 +157,8 @@
       const size = Math.round(clamp(z * 24, 10, 22));
       grove.X.forEach((x, i) => { const [sx, sy] = view.proj(x, G); if (sx > -100 && sx < w + 100) P.drawLabel(view, sx, sy, BR[i], { size, row: i % 2, green: greenAt(x) }); });
     };
-    P.fontsReady.then(() => P.loop(end, now => frame(now)));
+    // full rate while the green runs across it, then the slow motion at half
+    const sweeping = () => seen != null && performance.now() / 1000 - seen < 3;
+    P.fontsReady.then(() => P.loop(end, now => frame(now), { idle: true, busy: sweeping }));
   }
 })();

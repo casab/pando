@@ -633,18 +633,28 @@
   function bez(x0, y0, x1, y1, x2, y2, x3, y3, u) { const v = 1 - u; return [v * v * v * x0 + 3 * v * v * u * x1 + 3 * v * u * u * x2 + u * u * u * x3, v * v * v * y0 + 3 * v * v * u * y1 + 3 * v * u * u * y2 + u * u * u * y3]; }
 
   /* ---------- a loop that only runs while its canvas is on screen ---------- */
-  function loop(el, frame) {
-    let visible = false, raf = 0, last = 0;
+  // The reader scrolling, pointing or typing: while they do, a loop with an
+  // `idle` option draws every frame; between, the slow motion that is always
+  // there (leaves, dust, the root's particles) reads the same at half the rate,
+  // for half the work. `busy()` keeps the full rate for a loop's own quick motion.
+  let activeAt = -1e9;
+  const touch = () => { activeAt = performance.now(); };
+  ['scroll', 'wheel', 'pointermove', 'pointerdown', 'touchmove', 'keydown', 'resize'].forEach(t => window.addEventListener(t, touch, { passive: true, capture: true }));
+  function loop(el, frame, o) {
+    o = o || {};
+    let visible = false, raf = 0, last = 0, drawn = 0;
     const tick = ts => {
       raf = 0;
       if (!visible || document.hidden) return;
+      if (o.idle && drawn && ts - drawn < 25 && ts - activeAt > 400 && !(o.busy && o.busy())) { raf = requestAnimationFrame(tick); return; }
+      drawn = ts;
       // with reduced motion the clock stands still: nothing drifts, quakes or flows
       const now = reduced ? 0 : ts / 1000;
       frame(now, last ? Math.min(0.1, now - last) : 0);
       last = now;
       raf = requestAnimationFrame(tick);
     };
-    const start = () => { if (!raf) { last = 0; raf = requestAnimationFrame(tick); } };
+    const start = () => { if (!raf) { last = 0; drawn = 0; raf = requestAnimationFrame(tick); } };
     new IntersectionObserver(es => { visible = es[es.length - 1].isIntersecting; if (visible) start(); }, { rootMargin: '120px' }).observe(el);
     document.addEventListener('visibilitychange', () => { if (!document.hidden && visible) start(); });
     return { kick: start, isVisible: () => visible };
