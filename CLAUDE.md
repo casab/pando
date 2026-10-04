@@ -154,6 +154,28 @@ It moves a branch in a checkout, which Invariant 1 does not cover:
 `docs/02-principles.md` says what holds it. `scripts/fixture-repo.sh
 --with-origin --drift` makes a fixture to try it on.
 
+On 2026-10-05 copy-on-write worktrees were merged (#13), from
+`plans/copy-on-write-worktrees.md`, and 0.8.0 was built and tagged with
+them. Where the filesystem clones (APFS; btrfs, XFS, bcachefs), `new`
+runs `git worktree add --no-checkout`, reads the main checkout's commit
+into the index, clones that commit's regular files from the main
+checkout, refreshes the index raw and lets `git reset --hard
+--no-recurse-submodules HEAD` write only what differs, then runs the
+`post-checkout` hook as `worktree add` would (`actions/checkout.rs`, the
+syscalls in `cow.rs`). Files whose checkout converts them (CRLF, filters,
+`ident`) are always git's to write, and every doubtful setting keeps
+git's own checkout; the tests compare each copy-on-write worktree with a
+plain one byte for byte, never through `git status`. `[project] clone`
+clones gitignored paths such as `node_modules` before the install, and
+`copy_on_write = false` turns the checkout off. The target is claimed
+under the state lock before git runs, a failed add removes the branch it
+made, and a CLI `new` stopped mid-checkout unwinds. Writing tracked
+files into a worktree pando just made is outside Invariant 1 as written;
+`docs/02-principles.md` says what holds it. Measured on the origin
+project's shape: about 285 MB of checkout became about 5 MB a worktree.
+CI runs the copy-on-write tests a second time on a loop-mounted reflink
+XFS, since ext4 cannot clone. Not done: no detection proposes `clone`.
+
 What is left is not a phase. `plans/open-follow-ups.md` carries the known
 edges, each with who found it and where it belongs, and the rest of the
 launch checklist in `docs/08-roadmap.md` is open: no published crate, no
