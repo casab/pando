@@ -7,6 +7,8 @@ may change behaviour.
 
 ## Unreleased
 
+## 0.8.0 — 2026-10-05
+
 ### Added
 
 - `new` checks a worktree out by copy-on-write where the filesystem can
