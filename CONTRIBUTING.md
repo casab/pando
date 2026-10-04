@@ -105,6 +105,7 @@ pando-dev use my-feature           # `pando` on your PATH is that branch's build
 cd ~/code/some-project && pando    # …so this is the branch, on a real project
 pando-dev use main                 # back to the main checkout's build
 pando-dev ls                       # every worktree, and which one `pando` runs (▸)
+pando-dev which                    # just that: `main`, or the branch and its label
 ```
 
 A branch's build says so: `pando --version` adds `(my-feature@1a2b3c4)`

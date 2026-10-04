@@ -8,6 +8,8 @@
 #   scripts/dev new <name> [<from>]      a branch and a worktree for it, from main
 #   scripts/dev use <name>               `pando` everywhere is that branch's build; `use main` goes back
 #   scripts/dev ls                       every worktree, and which build `pando` runs
+#   scripts/dev which                    what `pando` runs: `main`, or a branch and its label
+#   scripts/dev path <name>              a worktree's path
 #   scripts/dev build [<name>]           cargo build --release in that worktree
 #   scripts/dev run <name> [<args>...]   build it, then run that pando once, here, with the args
 #   scripts/dev try <name> [<fixture>]   that pando's TUI in a throwaway fixture repo
@@ -114,7 +116,8 @@ build() {
 
 cmd_new() {
   local name=${1:?usage: pando-dev new <name> [<from>]} from=${2:-main}
-  local wt=$worktrees/$name
+  # A branch's slashes become `+`, as pando names its own worktrees.
+  local wt=$worktrees/${name//\//+}
   [[ -e $wt ]] && die "$wt already exists"
   mkdir -p "$worktrees"
   if git -C "$main" show-ref --verify --quiet "refs/heads/$name"; then
@@ -136,7 +139,8 @@ cmd_new() {
     grep -qxF "/$item" "$exclude" 2>/dev/null || echo "/$item" >>"$exclude"
   done
   say "made $wt on branch $name, from $from"
-  say "next: cd $wt, then \`pando-dev try $name\` once it builds"
+  say "next: work and commit there; \`pando-dev use $name\` makes it the \`pando\` on PATH"
+  echo "$wt"
 }
 
 # `5m ago`, `2h ago`, `3d ago`: when a build was made. Whether it is
@@ -170,6 +174,24 @@ cmd_ls() {
   else
     printf '\n%s is not a symlink pando-dev manages; `pando-dev use main` makes it one\n' "$link"
   fi
+}
+
+# The worktree `pando` on PATH runs, as a name `use` takes, and its label.
+cmd_which() {
+  local target path
+  [[ -L $link ]] || die "$link is not a symlink pando-dev manages"
+  target=$(readlink "$link")
+  path=${target%/target/release/pando}
+  [[ $path == "$target" ]] && die "$link points at $target, which no worktree built"
+  if [[ $path == "$main" ]]; then
+    echo "main"
+  else
+    printf '%s\t%s\n' "$(basename "$path")" "$(label "$path")"
+  fi
+}
+
+cmd_path() {
+  resolve "${1:?usage: pando-dev path <name>}"
 }
 
 cmd_build() {
@@ -255,7 +277,7 @@ cmd_install() {
 }
 
 case ${1:-} in
-  new | ls | build | run | use | try | rm | install)
+  new | ls | which | path | build | run | use | try | rm | install)
     sub=$1
     shift
     "cmd_$sub" "$@"
