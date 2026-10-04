@@ -7,6 +7,8 @@ may change behaviour.
 
 ## Unreleased
 
+## 0.7.0 — 2026-10-04
+
 ### Added
 
 - A development build names its branch: `pando --version` adds

@@ -11,7 +11,7 @@
   <a href="https://github.com/mertkaradayi/pando/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/mertkaradayi/pando/ci.yml?branch=main&style=flat-square&label=ci"></a>
   <img alt="Rust 2024 edition" src="https://img.shields.io/badge/rust-2024_edition-e6963c?style=flat-square&logo=rust">
   <img alt="Platform: macOS and Linux" src="https://img.shields.io/badge/platform-macOS_|_Linux-6e9beb?style=flat-square">
-  <img alt="Version 0.6.3, pre-release" src="https://img.shields.io/badge/version-0.6.3_pre--release-b482e6?style=flat-square">
+  <img alt="Version 0.7.0, pre-release" src="https://img.shields.io/badge/version-0.7.0_pre--release-b482e6?style=flat-square">
   <a href="CONTRIBUTING.md"><img alt="PRs welcome" src="https://img.shields.io/badge/PRs-welcome-50c878?style=flat-square"></a>
   <a href="https://github.com/mertkaradayi/pando/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/mertkaradayi/pando?style=flat-square&logo=github&color=ebc34b"></a>
 </p>
@@ -616,7 +616,7 @@ taking part follows the [code of conduct](CODE_OF_CONDUCT.md).
 
 ## Status
 
-Version 0.6.3, released as binaries for macOS and Linux. Every command above is
+Version 0.7.0, released as binaries for macOS and Linux. Every command above is
 implemented and covered by tests, in this order: worktrees and their
 lifecycle; detached dev servers with their own ports, logs and readiness;
 several processes per worktree; the log viewer; private per-worktree
@@ -643,7 +643,9 @@ development build. 0.6.2 opens that app from `pando open` and the TUI's
 `o`, on the simulator or an Android device, gives the build commands
 Expo accepts, and says when the build installed on the simulator is for
 another SDK. 0.6.3 lets `b` sort the TUI's list and keeps what runs at
-its top. What changed in each version is in the [changelog](CHANGELOG.md).
+its top. 0.7.0 adds the TUI's git menu, `space g`: fetch, pull, rebase
+or merge a row, the commands shown first and a conflict aborted; space
+is the list's leader, so sorting moved to `,`. What changed in each version is in the [changelog](CHANGELOG.md).
 
 macOS is what it is developed on. CI runs the whole test suite on macOS
 and on Linux for every change, and both pass — but the suite runs on

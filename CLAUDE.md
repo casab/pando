@@ -135,6 +135,13 @@ pull request, newest, last run or name, saved as `[ui] sort`), and the
 worktrees with something up sit right after the main checkout in every
 order, a start moving a row up and a stop putting it back.
 
+The same day the git menu and `scripts/dev` were merged (#12, #11) and
+0.7.0 was built and tagged with them: `space g` is the git menu, space
+being the list's leader, and sorting moved from `b` to `,`; a branch is
+built in a worktree from `pando-dev new` and tried with `pando-dev use`
+before it is merged, its build naming itself in `--version` and the
+TUI's header.
+
 On 2026-10-01 the TUI gained a git menu, from issue #7, built on the
 branch `git-menu`: `space g` on a row (space is the list's leader, as
 in neovim; `g` alone still goes to the first row, and sorting moved
