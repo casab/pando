@@ -147,6 +147,35 @@ no plan file. The repository is public: push `main` only when the
 maintainer asks, and never change its visibility or settings, open a PR,
 or comment on an issue or a pull request without asking. No attribution lines in commit messages.
 
+## Branches, and trying one before it lands
+
+A feature or a fix is built on a branch of its own, in a worktree
+beside the main checkout, never on `main` in the main checkout:
+`scripts/dev new <branch>` (linked as `pando-dev`) makes both, prints
+the worktree's path, and links the gitignored `docs/`, `plans/` and
+`CLAUDE.local.md` into it. Work and commit there, one conventional
+commit per work item as always; `pando-dev path <branch>` finds it
+again. Use `pando-dev`, not `pando new`, for this repository: the
+`pando` on PATH may be a branch's own build, and a development build is
+never run against a real repository.
+
+The maintainer tries a branch before it is merged, as their real pando
+on their own projects: `pando-dev use <branch>` makes `pando` on PATH
+that branch's build, `pando-dev use main` puts the main checkout's
+back, and `pando-dev which` says which runs now. A branch's build names
+itself — `pando --version` adds `(<branch>@<sha>)` and the TUI's header
+shows `⎇ <branch>@<sha>` — so a session that sees that knows the pando
+it is running is not a release. When a branch is ready, say so and
+give the command that tries it; merge it into `main` only when the
+maintainer says, then `pando-dev rm <branch>`. Never run `pando-dev
+use` unasked: it changes the pando the maintainer runs everywhere.
+
+A session proves a branch the way the testing policy below says, on
+fixtures: `pando-dev try <branch>` opens its TUI in a throwaway
+fixture with a `PANDO_HOME` of its own, and `pando-dev run <branch>
+<verb>` runs its CLI once. Worktrees share one machine, so "never two
+`cargo test`s at once" spans all of them.
+
 ## Code layout
 
 `src/lib.rs` is the map: the dependency direction, and a table of where to
