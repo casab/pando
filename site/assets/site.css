@@ -1,5 +1,10 @@
-/* JetBrains Mono (SIL Open Font License 1.1, see fonts/OFL.txt), self-hosted:
-   no third-party request, and the whole font, box drawing included. */
+/* JetBrains Mono 2.304 (SIL Open Font License 1.1, see fonts/OFL.txt), self-hosted:
+   no third-party request. Subset to what a terminal page draws, hinting kept,
+   from about 93 KB a weight to 55 KB:
+   pyftsubset JetBrainsMono-<Weight>.woff2 --flavor=woff2 \
+     --unicodes=U+0020-007E,U+00A0-017F,U+02C6,U+02DA,U+02DC,U+2000-206F,U+20AC,U+2122,U+2190-21FF,U+2200-22FF,U+2300-23FF,U+2400-243F,U+2500-25FF,U+2600-27BF \
+     --layout-features=calt,ccmp,locl,kern,mark,mkmk,case,zero
+   A character the page starts to use outside those ranges needs its range added. */
 @font-face { font-family: "JetBrains Mono"; font-weight: 400; font-style: normal; font-display: swap; src: url("fonts/JetBrainsMono-Regular.woff2") format("woff2"); }
 @font-face { font-family: "JetBrains Mono"; font-weight: 500; font-style: normal; font-display: swap; src: url("fonts/JetBrainsMono-Medium.woff2") format("woff2"); }
 @font-face { font-family: "JetBrains Mono"; font-weight: 700; font-style: normal; font-display: swap; src: url("fonts/JetBrainsMono-Bold.woff2") format("woff2"); }
