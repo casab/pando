@@ -676,26 +676,44 @@ pre.run-cmd { display: inline-block; padding: 12px 22px; font-size: 15px; margin
 .is-note { color: var(--dim); font-size: 13.5px; margin: -4px 0 10px; }
 .term + .is-note { margin-top: 18px; }
 /* the hero's two steps, in the film's own terminal language */
-.hero-steps { position: relative; margin-top: 22px; width: min(100%, 880px); text-align: left; padding: 4px 8px;
-  background: rgba(8, 7, 5, 0.8); border: 1px solid rgba(242, 184, 75, 0.38); border-radius: 12px;
-  box-shadow: 0 0 0 1px rgba(242, 184, 75, 0.06), 0 22px 70px -34px rgba(242, 184, 75, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.03);
-  -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); }
-.hs-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 12px; padding: 9px 6px; font-size: 14px; }
-.hs-row + .hs-row { border-top: 1px dashed rgba(242, 184, 75, 0.22); }
+/* the numbered step and the copy button of the install section */
 .hs-n { display: inline-flex; align-items: center; justify-content: center; width: 1.75em; height: 1.75em; flex: none;
   font-size: 12.5px; font-weight: 700; color: var(--gold); background: #110e0a; border: 1.5px solid rgba(242, 184, 75, 0.75); border-radius: 6px;
   box-shadow: 0 2px 0 rgba(242, 184, 75, 0.25), 0 0 14px rgba(242, 184, 75, 0.22); }
-.hs-cmd { color: #f2f2f2; white-space: nowrap; overflow-x: auto; scrollbar-width: none; font-size: 14px; }
-.hs-cmd::-webkit-scrollbar { display: none; }
-.hs-cmd .p { color: var(--gold); margin-right: 0.2ch; }
-.hs-cmd .cur { display: inline-block; width: 0.55em; height: 1em; background: var(--gold); vertical-align: -0.15em; margin-left: 0.25ch; animation: blink 1.1s steps(1) infinite; }
-.hs-c { color: var(--dim); font-size: 13px; white-space: nowrap; }
-.hs-c::before { content: "// "; color: var(--faint); }
 .hs-copy { font-size: 12px; color: var(--gold); border: 1.5px solid rgba(242, 184, 75, 0.6); background: #110e0a; box-shadow: 0 2px 0 rgba(242, 184, 75, 0.2); }
 .hs-copy:hover { color: #050505; background: var(--gold); border-color: var(--gold); }
+
+/* ---------- the hero: the name, the promise, one line to install, one way in ---------- */
+.hero { padding-top: clamp(96px, 16vh, 168px); }
+.hero .wordmark { font-size: clamp(64px, 9.5vw, 148px); }
+.hero .tagline { margin: 0.2em 0 0.7em; }
+.hero .hero-what { max-width: 76ch; margin: 0 auto 36px; color: var(--dim); }
+.hero-row { display: flex; gap: 10px; justify-content: center; align-items: stretch; flex-wrap: wrap; }
+.hero-cmd { display: flex; align-items: center; gap: 14px; padding: 0 6px 0 18px; height: 48px; border-radius: 10px;
+  border: 1px solid var(--line); background: rgba(8, 7, 5, 0.72); -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px); transition: border-color .2s; }
+.hero-cmd:hover { border-color: var(--gold-dim); }
+.hero-cmd code { font-size: 14px; color: var(--fg-strong); white-space: nowrap; }
+.hero-cmd .p { color: var(--gold); margin-right: 0.5ch; user-select: none; }
+.hero-copy { font: inherit; font-size: 12px; color: var(--dim); background: transparent; border: 0; border-left: 1px solid var(--line); height: 28px; padding: 0 12px; cursor: pointer; transition: color .15s; }
+.hero-copy:hover, .hero-copy.done { color: var(--gold); }
+.hero-row .btn { height: 48px; padding: 0 22px; }
+.hero-note { margin: 16px 0 0; font-size: 12.5px; color: var(--faint); }
+.hero-note code { color: var(--fg-2); background: none; border: 0; padding: 0; font-size: inherit; }
+.hero-note a { color: var(--dim); }
+.hero-note a:hover { color: var(--gold); }
 @media (max-width: 640px) {
-  .hs-row { grid-template-columns: auto minmax(0, 1fr); row-gap: 6px; }
-  .hs-row .hs-cmd { white-space: normal; overflow-wrap: anywhere; font-size: 12.5px; }
-  .hs-row .hs-copy, .hs-row .hs-c { grid-column: 2; justify-self: start; }
+  .hero { padding-top: calc(var(--hud-h) + 48px); }
+  .hero .hero-what { font-size: 13.5px; margin-bottom: 28px; }
+  .hero-row { flex-direction: column; align-items: stretch; width: 100%; }
+  .hero-cmd { justify-content: space-between; min-width: 0; padding-left: 14px; }
+  .hero-cmd code { font-size: 12px; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .hero-cmd .p { display: none; }
+  .hero-row .btn { justify-content: center; }
+  .hero-note .sep { display: none; }
+  .hero-note a { display: block; width: max-content; margin: 6px auto 0; }
 }
-@media (prefers-reduced-motion: reduce) { .hs-cmd .cur { animation: none; } }
+@media (max-height: 700px) and (min-width: 641px) {
+  .hero { padding-top: calc(var(--hud-h) + 28px); }
+  .hero .wordmark { font-size: clamp(56px, 7vw, 104px); }
+  .hero .hero-what { margin-bottom: 24px; }
+}
