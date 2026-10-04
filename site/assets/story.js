@@ -10,6 +10,9 @@
   const P = window.PANDO;
   const { clamp, lerp, ss, E, prog } = P.m;
   const C = P.C;
+  // 9903 → "9,903"; toLocaleString would load locale data first, a good part
+  // of the page's first script on a phone
+  const commas = n => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 
   const story = document.querySelector('.story');
   if (!story) return;
@@ -31,15 +34,22 @@
   const dust = new P.Dust(160, 33);
   const X = grove.X, G = grove.G;
   const BR = ['main', 'feat/checkout', 'fix/login-loop', 'pr-128', 'feat/search', 'chore/deps'];
-  if (seedHud) seedHud.textContent = `seed 0x5eed · ${grove.segments.toLocaleString('en-US')} segments`;
+  if (seedHud) seedHud.textContent = `seed 0x5eed · ${commas(grove.segments)} segments`;
 
   /* ---------- story time from scroll ---------- */
-  let tops = [];
+  // Everything a frame needs from layout is measured here, not in the frame:
+  // a layout read after the frame's own style writes would lay the page out
+  // again, every frame.
+  let tops = [], storyBottom = 0, sizes = new Map();
   function measure() {
     const y0 = window.scrollY;
     tops = beats.map(b => b.getBoundingClientRect().top + y0);
     tops.push(tops[tops.length - 1] + beats[beats.length - 1].offsetHeight);
+    storyBottom = story.getBoundingClientRect().bottom + y0;
+    sizes = new Map();
   }
+  // a style is written only when it changes
+  const css = (el, k, v) => { const s = el._css || (el._css = {}); v = String(v); if (s[k] !== v) { s[k] = v; el.style[k] = v; } };
   function storyT() {
     const s = window.scrollY;
     if (s <= tops[0]) return 0;
@@ -129,7 +139,11 @@
   const subEl = copyEl.querySelector('.sub');
   const bodyEl = copyEl.querySelector('.beat-body');
   let shown = -1, typing = null;
+  const beatCache = [];
   function beatData(i) {
+    return beatCache[i] || (beatCache[i] = readBeat(i));
+  }
+  function readBeat(i) {
     const b = beats[i];
     const ps = Array.from(b.querySelectorAll('.beat-text p')).filter(p => !p.classList.contains('nojs'));
     return { head: b.dataset.head || '', hi: b.dataset.hi || '', sub: b.dataset.sub || '', body: ps.map(p => p.outerHTML).join(''), chap: b.dataset.chap, name: b.dataset.name, tag: b.dataset.tag, big: b.dataset.big };
@@ -145,14 +159,14 @@
   function showBeat(i) {
     // the marker follows the story every frame, so it is right after scrolling back up into it
     const bd = beats[i].dataset;
-    if (P.hud && story.getBoundingClientRect().bottom > innerHeight * 0.3) P.hud.set(bd.chap, bd.name, bd.tag);
+    if (P.hud && storyBottom - window.scrollY > innerHeight * 0.3) P.hud.set(bd.chap, bd.name, bd.tag);
     if (i === shown) return;
     shown = i;
     const d = beatData(i);
     copyEl.classList.toggle('empty', !d.head);
-    copyEl.style.opacity = d.head ? 1 : 0;
+    css(copyEl, 'opacity', d.head ? 1 : 0);
     subEl.textContent = d.sub;
-    subEl.style.display = d.sub ? '' : 'none';
+    css(subEl, 'display', d.sub ? '' : 'none');
     bodyEl.innerHTML = d.body;
     if (typing) cancelAnimationFrame(typing);
     const final = d.head, full = final.replace('{count}', '000,000');
@@ -172,7 +186,7 @@
   /* ---------- the counter in the facts beat ---------- */
   function counterText(t) {
     const n = Math.round(47000 * E.out(clamp((t - T_COUNT) / 0.45)));
-    return n.toLocaleString('en-US').padStart(6, '0');
+    return commas(n).padStart(6, '0');
   }
 
   /* ---------- one frame ---------- */
@@ -182,7 +196,7 @@
     const bi = clamp(Math.floor(t + 0.5), 0, beats.length - 1);
     showBeat(bi);
     const cnt = copyEl.querySelector('.count');
-    if (cnt) cnt.textContent = counterText(t);
+    if (cnt) { const s = counterText(t); if (cnt.textContent !== s) cnt.textContent = s; }
 
     if (view.resize()) measure();
     const cam = camera(t);
@@ -193,12 +207,12 @@
 
     // hero copy and the scroll hint leave as the story starts
     const heroA = 1 - ss(0.12, 0.55, t);
-    hero.style.opacity = heroA;
-    hero.style.transform = `translateY(${-40 * ss(0.12, 0.7, t)}px)`;
-    hero.style.visibility = heroA <= 0.01 ? 'hidden' : 'visible';
-    if (hint) hint.style.opacity = 1 - ss(0.02, 0.25, t);
-    if (seedHud) seedHud.style.opacity = 1 - ss(beats.length - 1.4, beats.length - 1.1, t);
-    copyEl.style.opacity = bi === 0 || beatData(bi).big ? 0 : ss(0.55, 0.85, t);
+    css(hero, 'opacity', heroA);
+    css(hero, 'transform', `translateY(${-40 * ss(0.12, 0.7, t)}px)`);
+    css(hero, 'visibility', heroA <= 0.01 ? 'hidden' : 'visible');
+    if (hint) css(hint, 'opacity', 1 - ss(0.02, 0.25, t));
+    if (seedHud) css(seedHud, 'opacity', 1 - ss(beats.length - 1.4, beats.length - 1.1, t));
+    css(copyEl, 'opacity', bi === 0 || beatData(bi).big ? 0 : ss(0.55, 0.85, t));
     big.classList.toggle('on', !!beatData(bi).big);
 
     view.clear();
@@ -322,16 +336,17 @@
   function placeCallouts(t, L) {
     const on = (el, a, x, y) => {
       if (!el) return;
-      el.style.opacity = a;
-      el.style.visibility = a <= 0.01 ? 'hidden' : 'visible';
-      if (a > 0.01) el.style.transform = `translate(${Math.round(x)}px, ${Math.round(y)}px)`;
+      css(el, 'opacity', a);
+      css(el, 'visibility', a <= 0.01 ? 'hidden' : 'visible');
+      if (a > 0.01) css(el, 'transform', `translate(${Math.round(x)}px, ${Math.round(y)}px)`);
     };
     const out = 1 - ss(T_BURST - 0.2, T_BURST - 0.05, t);
     if (!L || out <= 0) { Object.values(co).forEach(el => on(el, 0, 0, 0)); return; }
     const [sx, gy] = view.proj(L.x, G);
     const topY = view.proj(L.x, G - 400)[1];
     const narrow = view.w < 760;
-    const W_ = el => el.offsetWidth, H_ = el => el.offsetHeight;
+    const size = el => { let s = sizes.get(el); if (!s) sizes.set(el, (s = [el.offsetWidth, el.offsetHeight])); return s; };
+    const W_ = el => size(el)[0], H_ = el => size(el)[1];
     // EADDRINUSE: left of the trunk, at its middle
     let x = narrow ? 12 : sx - W_(co.err) - Math.max(60, view.w * 0.06);
     let y = narrow ? topY - H_(co.err) - 10 : lerp(topY, gy, 0.55);
@@ -351,6 +366,7 @@
   /* ---------- start ---------- */
   measure();
   window.addEventListener('resize', () => { view.resize(); measure(); });
+  window.addEventListener('pando:fonts', measure);
   new ResizeObserver(measure).observe(document.body);
   const lp = P.loop(story.querySelector('.stage'), now => frame(now));
   P.fontsReady.then(() => {

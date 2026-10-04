@@ -12,6 +12,9 @@
   const N = 10;
   if (bar) for (let k = 0; k < N; k++) bar.appendChild(document.createElement('i'));
   const segs = bar ? Array.from(bar.children) : [];
+  // the marker is written on every scroll frame: only what changed is written
+  const fill = (s, f) => { f = String(f); if (s._f !== f) { s._f = f; s.style.setProperty('--f', f); } };
+  const mark = (a, v) => { if (a._cur !== v) { a._cur = v; if (v == null) a.removeAttribute('aria-current'); else a.setAttribute('aria-current', v); } };
 
   const GL = 'abcdefghijklmnopqrstuvwxyz0123456789/-_#%$&*+=<>{}';
   function scramble(el, text) {
@@ -39,11 +42,11 @@
       if (beat !== current.beat) scramble(beatEl, '// ' + beat);
       current = { n, name, beat };
       const idx = parseInt(n, 10) - 1;
-      segs.forEach((s, k) => s.style.setProperty('--f', k < idx ? 1 : 0));
+      segs.forEach((s, k) => fill(s, k < idx ? 1 : 0));
     },
     progress(n, f) {
       const idx = parseInt(n, 10) - 1;
-      if (segs[idx]) segs[idx].style.setProperty('--f', Math.max(0.04, Math.min(1, f)));
+      if (segs[idx]) fill(segs[idx], Math.max(0.04, Math.min(1, f)));
     },
   };
 
@@ -58,8 +61,8 @@
       if (r.bottom > line) {
         // the story drives the marker itself; fill 01–03 from its progress
         const f = Math.max(0, Math.min(1, -r.top / Math.max(1, r.height - window.innerHeight)));
-        segs.forEach((s, k) => { if (k < 3) s.style.setProperty('--f', Math.max(0, Math.min(1, f * 3 - k))); else s.style.setProperty('--f', 0); });
-        navLinks.forEach(a => a.removeAttribute('aria-current'));
+        segs.forEach((s, k) => fill(s, k < 3 ? Math.max(0, Math.min(1, f * 3 - k)) : 0));
+        navLinks.forEach(a => mark(a, null));
         return;
       }
     }
@@ -68,10 +71,11 @@
     if (!active) return;
     let beat = active.dataset.beat0 || '';
     for (const b of beatsIn.get(active)) if (b.getBoundingClientRect().top <= line) beat = b.dataset.beat;
-    P.hud.set(active.dataset.chapter, active.dataset.name, beat);
+    // read before writing: a read after the marker's writes would lay the page out again
     const r = active.getBoundingClientRect();
+    P.hud.set(active.dataset.chapter, active.dataset.name, beat);
     P.hud.progress(active.dataset.chapter, (line - r.top) / Math.max(1, r.height));
-    navLinks.forEach(a => a.setAttribute('aria-current', a.hash === '#' + active.id ? 'true' : 'false'));
+    navLinks.forEach(a => mark(a, a.hash === '#' + active.id ? 'true' : 'false'));
   }
   const navLinks = Array.from(document.querySelectorAll('.nav a[href^="#"]'));
   let ticking = false;
