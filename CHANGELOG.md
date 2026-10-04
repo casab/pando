@@ -7,6 +7,8 @@ may change behaviour.
 
 ## Unreleased
 
+## 0.8.1 — 2026-10-05
+
 ### Added
 
 - Namespaced mode for Postgres ([#9]): `start --namespaced` gives a
