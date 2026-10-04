@@ -110,6 +110,13 @@ hr { border: 0; border-top: 1px solid var(--line); margin: 3rem 0; }
 .wrap { width: 100%; max-width: calc(var(--wrap) + var(--gutter) * 2); margin: 0 auto; padding: 0 var(--gutter); }
 .chapter { position: relative; padding: clamp(96px, 14vh, 160px) 0 clamp(72px, 10vh, 120px); }
 .chapter + .chapter { border-top: 1px solid rgba(236, 236, 236, 0.06); }
+/* Past the TUI, a chapter is laid out and painted only when it nears the
+   screen: most of the page's elements are down there, and a phone's first
+   layout skips them. Its height is a guess until it has been seen once;
+   `auto` keeps the real one from then on. A jump to an anchor needs the real
+   heights of everything above it, so the first one lays the whole page out. */
+.chapter:not(.try) { content-visibility: auto; contain-intrinsic-block-size: auto 5000px; }
+.laid-out .chapter:not(.try) { content-visibility: visible; }
 .eyebrow { display: flex; align-items: baseline; gap: 0; font-size: 14px; margin-bottom: 18px; white-space: nowrap; flex-wrap: wrap; }
 .eyebrow .n { color: var(--gold); font-weight: 700; text-shadow: 0 0 10px rgba(242, 184, 75, 0.45); }
 .eyebrow .dot { color: var(--gold-dim); padding: 0 0.5ch; }

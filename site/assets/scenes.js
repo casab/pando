@@ -7,11 +7,18 @@
   const { clamp, lerp, ss } = P.m;
   const C = P.C;
 
+  // A scene is built when the reader comes within a screen of it: its grove
+  // costs a phone a good part of a second, and many visits never get this far.
+  function whenNear(el, build) {
+    const io = new IntersectionObserver(es => { if (es.some(e => e.isIntersecting)) { io.disconnect(); build(); } }, { rootMargin: '100% 0px' });
+    io.observe(el);
+  }
+
   /* ---------- 06 · the three modes ---------- */
   // Two trunks over one root: the main checkout (left) with the project's
   // database under it, and a worktree (right). The mode decides what the
   // worktree drinks from.
-  document.querySelectorAll('canvas[data-mode]').forEach((cv, idx) => {
+  document.querySelectorAll('canvas[data-mode]').forEach((cv, idx) => whenNear(cv, () => {
     const mode = cv.dataset.mode;
     const grove = new P.Grove({ trunks: [620, 1300], ghosts: 7, x0: 150, x1: 1800, seed: 11 + idx });
     const view = new P.View(cv, { maxDpr: 2 });
@@ -64,7 +71,7 @@
     let lastDraw = -1;
     P.loop(cv, now => { if (!P.reduced && now - lastDraw < 1 / 30) return; if (P.reduced && lastDraw >= 0 && !view.resize()) return; lastDraw = now; draw(now); });
     P.fontsReady.then(() => draw(performance.now() / 1000));
-  });
+  }));
 
   /* ---------- 08 · the setup screen: waiting, then green ---------- */
   const setup = document.querySelector('.setup');
@@ -115,16 +122,18 @@
       });
       if (html !== lastRow) { art.innerHTML = html; lastRow = html; }
     };
-    fitArt();
-    window.addEventListener('resize', fitArt);
-    P.fontsReady.then(fitArt);
-    window.addEventListener('pando:fonts', fitArt);
+    whenNear(setup, () => {
+      fitArt();
+      window.addEventListener('resize', fitArt);
+      P.fontsReady.then(fitArt);
+      window.addEventListener('pando:fonts', fitArt);
+    });
     P.loop(setup, now => frame(now));
   }
 
   /* ---------- the end card: every branch alive ---------- */
   const end = document.querySelector('.endcard canvas');
-  if (end) {
+  if (end) whenNear(end, () => {
     const grove = new P.Grove({ ghosts: 20 });
     const view = new P.View(end, { maxDpr: 2 });
     view.trackPointer(end.parentElement);
@@ -160,5 +169,5 @@
     // full rate while the green runs across it, then the slow motion at half
     const sweeping = () => seen != null && performance.now() / 1000 - seen < 3;
     P.fontsReady.then(() => P.loop(end, now => frame(now), { idle: true, busy: sweeping }));
-  }
+  });
 })();

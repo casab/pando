@@ -98,6 +98,14 @@
     window.addEventListener('scroll', () => { if (nav.classList.contains('open')) setOpen(false, false); }, { passive: true });
   }
 
+  /* ---------- a jump to an anchor lands where the anchor really is ---------- */
+  // Chapters far down are left unlaid-out until they come near (site.css), so
+  // their heights are guesses; before the first jump, the page is laid out whole.
+  document.addEventListener('click', e => {
+    const a = e.target.closest && e.target.closest('a[href^="#"]');
+    if (a) document.documentElement.classList.add('laid-out');
+  }, true);
+
   /* ---------- copy buttons ---------- */
   document.addEventListener('click', e => {
     const b = e.target.closest('[data-copy]');
@@ -118,12 +126,22 @@
   }
 
   /* ---------- code that scrolls sideways can be reached by keyboard ---------- */
-  const scrollers = () => document.querySelectorAll('pre, .tbl-scroll').forEach(el => {
-    if (el.closest('.tui, .setup')) return;
-    if (el.scrollWidth > el.clientWidth + 1) el.tabIndex = 0; else el.removeAttribute('tabindex');
-  });
-  window.addEventListener('load', scrollers);
-  window.addEventListener('resize', scrollers);
+  // A block is measured when it comes within a screen of view, and again on a
+  // resize or a font change while it is there: measuring them all at once would
+  // lay out the chapters the page leaves unrendered until they come near.
+  const near = new Set();
+  const sideways = el => { if (el.scrollWidth > el.clientWidth + 1) el.tabIndex = 0; else el.removeAttribute('tabindex'); };
+  const sio = new IntersectionObserver(es => es.forEach(e => {
+    if (e.isIntersecting) { near.add(e.target); sideways(e.target); } else near.delete(e.target);
+  }), { rootMargin: '100% 0px' });
+  document.querySelectorAll('pre, .tbl-scroll').forEach(el => { if (!el.closest('.tui, .setup')) sio.observe(el); });
+  const remeasure = () => near.forEach(sideways);
+  window.addEventListener('resize', remeasure);
+  window.addEventListener('pando:fonts', remeasure);
+  // a block inside a closed <details> has no size until it opens
+  document.addEventListener('toggle', e => {
+    if (e.target.open) e.target.querySelectorAll('pre, .tbl-scroll').forEach(el => { if (!el.closest('.tui, .setup')) sideways(el); });
+  }, true);
 
   /* ---------- reveal on scroll ---------- */
   const io = new IntersectionObserver(es => es.forEach(e => { if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); } }), { rootMargin: '0px 0px -8% 0px' });
