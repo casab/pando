@@ -193,8 +193,11 @@ fn layer_report(layer: &'static str, path: &Path, strips: bool) -> LayerReport {
     walk_table(doc.as_table(), "", &mut keys);
     if strips {
         for key in &mut keys {
+            // A login is stripped below pando's own file; the rest of a
+            // `[namespaced.<service>]` table is no secret, and stays.
             key.ignored = STRIPPED_BELOW_PROJECT.contains(&key.key.as_str())
-                || key.key.starts_with("namespaced.");
+                || (key.key.starts_with("namespaced.")
+                    && (key.key.ends_with(".user") || key.key.ends_with(".password")));
         }
     }
     LayerReport {

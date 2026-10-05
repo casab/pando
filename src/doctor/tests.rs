@@ -4059,7 +4059,7 @@ fn a_namespace_login_is_reported_without_its_password() {
     );
     std::fs::write(
         fx.root.join("pando.toml"),
-        "[namespaced.redis]\npassword = \"committed-secret\"\n",
+        "[namespaced.redis]\npassword = \"committed-secret\"\ndb_env = [\"REDIS_DB\"]\n",
     )
     .unwrap();
     let report = report(&fx);
@@ -4078,6 +4078,14 @@ fn a_namespace_login_is_reported_without_its_password() {
         .find(|k| k.key == "namespaced.redis.password")
         .expect("named in the committed layer too");
     assert!(leaked.ignored, "and ignored there");
+    // Only the login goes: which key names the app's slot is no secret,
+    // and the committed file's is used.
+    let db_env = committed
+        .keys
+        .iter()
+        .find(|k| k.key == "namespaced.redis.db_env")
+        .expect("named");
+    assert!(!db_env.ignored, "{db_env:?}");
     let json = serde_json::to_string(&report).unwrap();
     let text = report.render();
     for shown in [&json, &text] {

@@ -35,10 +35,11 @@ pub struct Config {
     /// Namespaced starts, by `[[services]]` name: who pando connects as
     /// to make and drop a worktree's namespaces, for a service the main
     /// checkout's env files give no login for, and the keys that name the
-    /// app's database or slot when pando cannot find them. The login is
-    /// written when a namespaced start asks, and read from pando's own
-    /// project layer only: it is a password. `db_env` is not, and may be
-    /// set in any layer.
+    /// app's database or slot when pando cannot find them, and the recipe
+    /// its engine is when its image does not say. The login is written
+    /// when a namespaced start asks, and read from pando's own project
+    /// layer only: it is a password. The rest is not, and may be set in
+    /// any layer.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub namespaced: BTreeMap<String, LoginConfig>,
 }
@@ -63,6 +64,13 @@ pub struct LoginConfig {
     /// the worktree's own, beside any pando finds itself.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub db_env: Vec<String>,
+    /// The recipe that knows this service's engine, when its image does not
+    /// say: `my-registry/search:3` is an Elasticsearch to nobody but the
+    /// project. A name, never a command: what is run comes from the recipe,
+    /// built in or in pando's own recipes directory, so a file the team
+    /// shares may say it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe: Option<String>,
 }
 
 impl LoginConfig {
@@ -78,6 +86,7 @@ impl std::fmt::Debug for LoginConfig {
             .field("user", &self.user)
             .field("password", &self.password.as_ref().map(|_| "(hidden)"))
             .field("db_env", &self.db_env)
+            .field("recipe", &self.recipe)
             .finish()
     }
 }

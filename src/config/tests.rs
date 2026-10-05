@@ -2268,11 +2268,16 @@ fn a_committed_namespaced_db_env_is_kept_and_its_login_is_not() {
     write_committed(
         &f,
         "[namespaced.redis]\ndb_env = [\"REDIS_DB\"]\npassword = \"hunter2\"\n\n\
-         [namespaced.postgres]\nuser = \"app\"\n",
+         [namespaced.postgres]\nuser = \"app\"\n\n[namespaced.search]\nrecipe = \"elastic\"\n",
     );
     let loaded = load(&f.paths).unwrap();
     let redis = &loaded.config.namespaced["redis"];
     assert_eq!(redis.db_env, vec!["REDIS_DB".to_string()]);
+    // A recipe's name is no secret either: the commands are the recipe's.
+    assert_eq!(
+        loaded.config.namespaced["search"].recipe.as_deref(),
+        Some("elastic")
+    );
     assert!(!redis.has_login(), "{redis:?}");
     assert!(
         !loaded.config.namespaced.contains_key("postgres"),

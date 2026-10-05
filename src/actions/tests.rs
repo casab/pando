@@ -11981,6 +11981,56 @@ fn a_compose_postgres_image_of_another_name_gets_a_namespace_as_postgres() {
     assert_eq!(target.namespace.max_name(), 63);
 }
 
+// An image the catalog does not know — a team's own build of Postgres —
+// says nothing of its engine, and the service stayed shared. The project
+// names the recipe in `[namespaced.<service>]`; a name no recipe has keeps
+// it shared, saying which.
+#[test]
+fn a_project_names_the_recipe_an_unknown_image_is() {
+    let mut fx = compose_fixture(
+        "services:\n  db:\n    image: registry.example/acme-db:7\n    ports: [\"5432:5432\"]\n",
+        "PORT=3000\nDATABASE_URL=postgres://acme:acme@localhost:5432/acme\n",
+    );
+    let config: Config = toml::from_str(
+        "[[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
+         include = [\"db\"]\nenv = { DATABASE_URL = \"db\" }\n",
+    )
+    .unwrap();
+    fx.config.services = config.services;
+    let plan = super::namespaced::plan(&fx.paths, &fx.config);
+    assert!(plan.targets.is_empty());
+    assert_eq!(
+        plan.shared_lines(),
+        ["db: shared — pando has no recipe that knows its engine"]
+    );
+
+    let named = |recipe: &str| crate::config::LoginConfig {
+        recipe: Some(recipe.to_string()),
+        ..Default::default()
+    };
+    fx.config.namespaced.insert("db".into(), named("postgres"));
+    let plan = super::namespaced::plan(&fx.paths, &fx.config);
+    assert!(plan.shared.is_empty(), "{:?}", plan.shared);
+    assert_eq!(
+        (
+            plan.targets[0].recipe.as_str(),
+            plan.targets[0].main.as_str()
+        ),
+        ("postgres", "acme")
+    );
+
+    fx.config.namespaced.insert("db".into(), named("postgress"));
+    let plan = super::namespaced::plan(&fx.paths, &fx.config);
+    assert!(plan.targets.is_empty());
+    let line = &plan.shared_lines()[0];
+    assert!(
+        line.starts_with("db: shared — [namespaced.db] recipe:"),
+        "{line}"
+    );
+    assert!(line.contains("\"postgress\""), "{line}");
+    assert_eq!(plan.shared_data, ["db"]);
+}
+
 /// A recipe for an engine pando never starts, only finds in a container:
 /// what a namespace is there, and nothing about running the server.
 const CLICKHOUSE_NAMESPACE_ONLY: &str = "kind = \"service\"\nname = \"clickhouse\"\n\n\

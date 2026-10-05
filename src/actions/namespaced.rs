@@ -320,7 +320,26 @@ pub(super) fn plan(paths: &PandoPaths, config: &Config) -> Plan {
     let recipes = crate::recipes::Recipes::load(&paths.recipes_dir());
     let env = main_env(paths, config);
     let mut out = Plan::default();
-    for declared in services_with_recipes(paths, config, &recipes) {
+    for mut declared in services_with_recipes(paths, config, &recipes) {
+        // A recipe the project names wins over what the image says: the
+        // image is a guess, and the project's word is not.
+        if let Some(named) = config
+            .namespaced
+            .get(&declared.service)
+            .and_then(|settings| settings.recipe.as_deref())
+        {
+            match recipes.get(named) {
+                Ok(loaded) => declared.recipe = Some(loaded.recipe.clone()),
+                Err(e) => {
+                    out.shared.push((
+                        declared.service.clone(),
+                        format!("[namespaced.{}] recipe: {e:#}", declared.service),
+                    ));
+                    out.shared_data.push(declared.service);
+                    continue;
+                }
+            }
+        }
         let data = !declared.helper
             && !declared
                 .recipe
