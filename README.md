@@ -180,8 +180,8 @@ Your repository works the same way.
 - Keeps them light on disk: where the filesystem can clone (APFS on macOS;
   btrfs, XFS on Linux), a new worktree's files are copy-on-write clones of
   your main checkout's, and git writes only what the branch changed;
-  `clone = ["node_modules"]` does the same for dependencies before the
-  install
+  `clone = ["node_modules"]`, which pando proposes for the dependency trees
+  your main checkout has, does the same for them before the install
 - Starts each worktree's dev server on its own ports, detached, with logs
 - Optionally gives each worktree private copies of its services: Postgres,
   Redis, MariaDB, whatever your compose file declares — or, on a machine

@@ -7,6 +7,17 @@ may change behaviour.
 
 ## Unreleased
 
+### Added
+
+- `clone` is the eleventh question: detection proposes the gitignored
+  `node_modules` the main checkout has, the root's and each app's, so a
+  new worktree clones them copy-on-write before its install instead of
+  installing from nothing. Decided, so `new` takes it in a project set up
+  before it and says so; not offered when the install deletes the tree
+  first (`npm ci`). `--answers` takes it as a list, and `null` writes
+  `clone = []`. The setup brief and `agent/json.md` describe it, and
+  `signals` publishes `dependency_dirs`.
+
 ## 0.8.2 — 2026-10-05
 
 ### Added

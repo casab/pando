@@ -225,6 +225,7 @@ fn reopens(config: &ConfigReport, layer: &LayerReport, key: &str, merged: &Confi
         Slot::VersionFiles => without.runtime.version_files.clear(),
         Slot::Prelude => without.runtime.prelude = None,
         Slot::Provision => without.project.provision = None,
+        Slot::Clone => without.project.clone = None,
         Slot::Base => without.project.base = None,
         Slot::DevCmd => {
             if let Some(dev) = without.processes.get_mut(detect::DEV) {

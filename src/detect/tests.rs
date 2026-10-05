@@ -2662,7 +2662,9 @@ fn seed_fixture(files: &[(&str, &str)]) -> TempDir {
     let dir = tempdir().unwrap();
     crate::testutil::git(dir.path(), &["init", "--quiet", "--initial-branch=main"]);
     for (rel, contents) in files {
-        std::fs::write(dir.path().join(rel), contents).unwrap();
+        let path = dir.path().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
     }
     dir
 }
@@ -2716,6 +2718,90 @@ fn a_packaged_build_or_a_log_is_never_a_provision_file() {
         (".env", "PORT=3000\n"),
     ]);
     assert_eq!(ignored_present(dir.path()), [".env"]);
+}
+
+// The dependency trees `clone` can share: the root's and each app's,
+// named once as git names an ignored directory. Never one inside a
+// hidden directory — a worktree kept in the checkout, under `.claude/` —
+// nor one deeper than an app's, nor a gitignored directory no package
+// manager installs into.
+#[test]
+fn the_ignored_dependency_trees_are_the_ones_clone_can_share() {
+    let dir = seed_fixture(&[
+        (".gitignore", "node_modules/\nvendor/\n.claude/\n"),
+        ("package.json", "{}"),
+        ("apps/web/package.json", "{}"),
+        ("apps/api/package.json", "{}"),
+        ("tools/a/b/package.json", "{}"),
+    ]);
+    crate::testutil::git(dir.path(), &["add", "."]);
+    crate::testutil::git(dir.path(), &["commit", "--quiet", "-m", "apps"]);
+    for rel in [
+        "node_modules/pkg",
+        "apps/web/node_modules/pkg",
+        "apps/api/node_modules/pkg",
+        ".claude/worktrees/x/node_modules/pkg",
+        "tools/a/b/node_modules/pkg",
+        "vendor/lib",
+    ] {
+        std::fs::create_dir_all(dir.path().join(rel)).unwrap();
+        std::fs::write(dir.path().join(rel).join("index.js"), "").unwrap();
+    }
+    assert_eq!(
+        signals(dir.path()).dependency_dirs,
+        [
+            "node_modules",
+            "apps/api/node_modules",
+            "apps/web/node_modules"
+        ]
+    );
+}
+
+// Proposed and decided wherever there is a tree to share — and not for
+// an install that deletes `node_modules` before it installs, where every
+// clone would be thrown away.
+#[test]
+fn clone_is_proposed_unless_the_install_deletes_the_tree_first() {
+    let signals = Signals {
+        dependency_dirs: vec!["node_modules".into(), "apps/api/node_modules".into()],
+        ..Signals::default()
+    };
+    for install in [
+        None,
+        Some("npm install"),
+        Some("pnpm install --frozen-lockfile"),
+    ] {
+        let proposal = clone_proposal(&signals, install).expect("a tree to share");
+        assert_eq!(proposal.slot, Slot::Clone);
+        assert!(proposal.decided, "{install:?}");
+        assert_eq!(
+            proposal.candidates[0].value,
+            "node_modules,apps/api/node_modules"
+        );
+    }
+    assert!(clone_proposal(&signals, Some("npm ci")).is_none());
+    assert!(clone_proposal(&Signals::default(), Some("npm install")).is_none());
+}
+
+// A list, written as one like `provision`; "none" is `clone = []`.
+#[test]
+fn a_clone_answer_is_written_as_a_list() {
+    let mut config = Config::default();
+    let candidate = Candidate {
+        value: "node_modules,apps/api/node_modules".into(),
+        ..Candidate::default()
+    };
+    assert!(still_needed(Slot::Clone, &config));
+    apply(Slot::Clone, &candidate, &mut config);
+    assert_eq!(
+        config.project.clones(),
+        [
+            "node_modules".to_string(),
+            "apps/api/node_modules".to_string()
+        ]
+    );
+    assert!(!still_needed(Slot::Clone, &config));
+    assert!(Slot::Clone.is_list() && Slot::Clone.allows_none());
 }
 
 // The fresh-clone case: `.env` is gitignored so it never arrives, and

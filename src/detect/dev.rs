@@ -925,3 +925,33 @@ pub(super) fn provision_proposal(signals: &Signals) -> Option<Proposal> {
     let decided = seeds.is_empty();
     Some(Proposal::of(Slot::Provision, candidates, decided))
 }
+
+/// Which dependency trees a new worktree clones from the main checkout:
+/// every one the main checkout has, unless `install` deletes it before it
+/// installs, as `npm ci` does `node_modules` — cloning that would be work
+/// thrown away on every `new`.
+///
+/// Decided: nothing a branch has is lost by it. The install still runs on
+/// the clone and rewrites what the branch changed, a filesystem that
+/// cannot clone leaves the tree to the install, and `pando check` never
+/// clones, so a check still proves the install from nothing.
+pub fn clone_proposal(signals: &Signals, install: Option<&str>) -> Option<Proposal> {
+    let cleared = install.and_then(crate::catalog::package_managers::cleared_by);
+    let dirs: Vec<&str> = signals
+        .dependency_dirs
+        .iter()
+        .map(String::as_str)
+        .filter(|dir| cleared.is_none_or(|name| dir.rsplit('/').next() != Some(name)))
+        .collect();
+    if dirs.is_empty() {
+        return None;
+    }
+    let candidate = Candidate {
+        value: dirs.join(","),
+        why: "gitignored dependency trees in the main checkout, cloned copy-on-write before \
+              the install so a worktree shares their blocks"
+            .to_string(),
+        ..Candidate::default()
+    };
+    Some(Proposal::of(Slot::Clone, vec![candidate], true))
+}

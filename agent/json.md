@@ -141,6 +141,8 @@ repository, which is what makes it safe to read before deciding anything.
     "ignored_present": [],      // gitignored files that exist in the checkout
     "provision_seeds": [],      // examples a worktree file could be copied from
     "workspace_env_links": [],  // [app/.env, .env]: the root .env for apps with none
+    "dependency_dirs": [],      // gitignored node_modules in the checkout, the root's
+                                //   and up to two directories down: what `clone` offers
     "app_dirs": [               // only when the root has no manifest, lockfile or marker:
       {                         //   the apps below it, directly or in apps/* and packages/*
         "dir": "backend",
@@ -210,13 +212,13 @@ development one.
 or under-ticked: they are the parts of a compose file this build did not
 follow, published rather than papered over.
 
-### The ten questions
+### The eleven questions
 
 `slots` has one entry per question pando can ask, in the order it asks
 them. The names are frozen — they are the same strings `--answers` takes:
 
 ```
-install  version_files  prelude  processes  dev_cmd  port_env  services  schema_hook  provision  base
+install  version_files  prelude  processes  dev_cmd  port_env  services  schema_hook  provision  clone  base
 ```
 
 ```jsonc
@@ -783,7 +785,7 @@ One JSON object. Keys are the question names above. Values:
 |---|---|
 | `"some text"` | the option whose `value` is exactly that text, **or**, if nothing matches — or there were no options at all — a command of your own (where `allow_custom` is true) |
 | `["a", "b"]` | the set answer, at the one question where `multi` is true; every element must name an option |
-| `["a", "b"]` | the whole list, at `version_files` and `provision`, whose single answer is a list of files |
+| `["a", "b"]` | the whole list, at `version_files`, `provision` and `clone`, whose single answer is a list of paths |
 | `null` | "none of them", where `allow_none` is true. At `schema_hook` it is "no": the step is written with `on = "never"` |
 | `[]` | "none of them" at the set question. A usage error anywhere else — `null` is how you say none |
 | `{"api": {...}, "web": {...}}` | at `processes` only: process tables of your own, one per key, each exactly what `[processes.<name>]` takes — `cmd`, and optionally `cwd`, `ports`, `env`, `ready` and `page` |

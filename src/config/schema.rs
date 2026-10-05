@@ -130,13 +130,22 @@ pub struct ProjectSection {
     /// `node_modules`, and a gitignored lockfile with it. Never written as
     /// a full copy: a filesystem that cannot clone leaves them to the
     /// install. Every entry must be gitignored, like `provision`'s.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub clone: Vec<String>,
+    ///
+    /// Unset, not empty, as for `provision`: `clone = []` is a developer
+    /// having said no worktree should share the main checkout's
+    /// dependencies, and asking again would be asking them to say it twice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clone: Option<Vec<String>>,
 }
 
 impl ProjectSection {
     fn is_empty(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// The paths `clone` names, none when it is unset.
+    pub fn clones(&self) -> &[String] {
+        self.clone.as_deref().unwrap_or_default()
     }
 
     /// The paths to provision, with "nobody has said" and "nothing, on

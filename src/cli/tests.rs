@@ -3441,7 +3441,7 @@ fn every_question_has_one_name_that_round_trips() {
     assert_eq!(slot_names().len(), actions::ALL_SLOTS.len());
 }
 
-/// The ten names, written out.
+/// The eleven names, written out.
 ///
 /// `signals` publishes them and `--answers` takes them, and both get
 /// them from `Slot`'s own serde names — so a rename stays invisible to
@@ -3450,7 +3450,7 @@ fn every_question_has_one_name_that_round_trips() {
 /// assertion a rename has to walk past, and the list is also published
 /// in `agent/json.md`, which the test below holds to the same order.
 #[test]
-fn the_ten_question_names_are_frozen() {
+fn the_eleven_question_names_are_frozen() {
     assert_eq!(
         slot_names(),
         [
@@ -3463,6 +3463,7 @@ fn the_ten_question_names_are_frozen() {
             "services",
             "schema_hook",
             "provision",
+            "clone",
             "base",
         ]
     );
@@ -4150,7 +4151,7 @@ fn the_published_contract_names_every_question_in_order() {
         std::fs::read_to_string(&doc).unwrap_or_else(|e| panic!("read {}: {e}", doc.display()));
     assert!(
         text.contains(&slot_names().join("  ")),
-        "agent/json.md does not list the ten questions in the order pando asks them"
+        "agent/json.md does not list the eleven questions in the order pando asks them"
     );
     for name in slot_names() {
         assert!(text.contains(&name), "agent/json.md never mentions {name}");

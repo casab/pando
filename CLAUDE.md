@@ -174,7 +174,10 @@ files into a worktree pando just made is outside Invariant 1 as written;
 `docs/02-principles.md` says what holds it. Measured on the origin
 project's shape: about 285 MB of checkout became about 5 MB a worktree.
 CI runs the copy-on-write tests a second time on a loop-mounted reflink
-XFS, since ext4 cannot clone. Not done: no detection proposes `clone`.
+XFS, since ext4 cannot clone. Detection proposes `clone` since the
+`propose-clone` branch: the gitignored `node_modules` the main checkout
+has (`signals.dependency_dirs`, from the catalog's `dependency_dir`),
+decided, and not where the install deletes the tree first.
 
 What is left is not a phase. `plans/open-follow-ups.md` carries the known
 edges, each with who found it and where it belongs, and the rest of the

@@ -9059,7 +9059,7 @@ fn clone_skips_node_modules_when_the_install_deletes_it_first() {
     let mut fx = fixture();
     std::fs::create_dir_all(fx.root.join("node_modules/x")).unwrap();
     std::fs::write(fx.root.join("node_modules/x/i.js"), "x\n").unwrap();
-    fx.config.project.clone = vec!["node_modules".into()];
+    fx.config.project.clone = Some(vec!["node_modules".into()]);
     // `true` stands in for npm, which the tests never run; the words that
     // follow are what pando reads.
     fx.config.project.install = Some("true && npm ci || true".into());
@@ -9073,6 +9073,59 @@ fn clone_skips_node_modules_when_the_install_deletes_it_first() {
     assert!(!wt.join("node_modules").exists());
 }
 
+// A project set up before `clone` was a question gets the rules' answer
+// from its next `new`, taken and written down without asking: nobody
+// has to know the setting exists for a worktree to share the main
+// checkout's dependencies.
+#[test]
+fn new_writes_down_the_dependency_trees_to_clone() {
+    let fx = fixture();
+    std::fs::create_dir_all(fx.root.join("node_modules/x")).unwrap();
+    std::fs::write(fx.root.join("node_modules/x/i.js"), "x\n").unwrap();
+    let config = resolve_for_new(&fx.paths, &fx.config, &refuse, &noop).unwrap();
+    assert_eq!(config.project.clones(), ["node_modules".to_string()]);
+    let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+    assert!(
+        written.contains(r#"clone = ["node_modules"]  # detected:"#),
+        "{written}"
+    );
+}
+
+// …and nothing for an install that deletes the tree before it installs:
+// the clone would be thrown away by every `new`.
+#[test]
+fn new_offers_no_clone_to_an_install_that_deletes_the_tree() {
+    let mut fx = fixture();
+    std::fs::create_dir_all(fx.root.join("node_modules/x")).unwrap();
+    std::fs::write(fx.root.join("node_modules/x/i.js"), "x\n").unwrap();
+    fx.config.project.install = Some("true && npm ci || true".into());
+    let config = resolve_for_new(&fx.paths, &fx.config, &refuse, &noop).unwrap();
+    assert_eq!(config.project.clone, None);
+}
+
+// "Install every worktree from nothing" is an answer a program may give,
+// written as an empty list so it is never asked again.
+#[test]
+fn a_program_may_answer_that_no_worktree_clones_anything() {
+    let fx = detectable_fixture(r#"{ "dev": "next dev" }"#, "PORT=3000\n");
+    std::fs::create_dir_all(fx.root.join("node_modules/x")).unwrap();
+    std::fs::write(fx.root.join("node_modules/x/i.js"), "x\n").unwrap();
+    let answers = [(Slot::Clone, Answer::None)];
+    let ask = |q: &Question| {
+        said_by_program(&answers, q)
+            .unwrap_or_else(|| panic!("nothing should have asked about {:?}", q.slot))
+    };
+    let program = |q: &Question| said_by_program(&answers, q);
+    // As `--answers` builds it: the program's answer is put to a slot a
+    // rule decided, because it is the one the program gave.
+    let answering = Answering::by_program(&ask, &program).answered(&[Slot::Clone]);
+    init(&fx.paths, &fx.config, &answering, &noop).unwrap();
+    let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+    assert!(written.contains("clone = []"), "{written}");
+    let config = crate::config::load(&fx.paths).unwrap().config;
+    assert_eq!(config.project.clone, Some(Vec::new()));
+}
+
 #[test]
 fn clone_never_takes_a_virtualenv() {
     let mut fx = fixture();
@@ -9080,7 +9133,7 @@ fn clone_never_takes_a_virtualenv() {
     git(&fx.root, &["commit", "--quiet", "-am", "ignore .venv"]);
     std::fs::create_dir_all(fx.root.join(".venv/bin")).unwrap();
     std::fs::write(fx.root.join(".venv/pyvenv.cfg"), "home = /usr/bin\n").unwrap();
-    fx.config.project.clone = vec![".venv".into()];
+    fx.config.project.clone = Some(vec![".venv".into()]);
     let (made, said) = new_saying(&fx, "feat/py");
     let wt = fx.worktrees_dir().join(made.unwrap());
     assert!(!wt.join(".venv").exists());
@@ -9097,7 +9150,7 @@ fn clone_never_takes_a_virtualenv() {
 fn a_clone_path_that_is_not_ignored_does_not_stop_a_check() {
     let mut fx = fixture();
     std::fs::create_dir_all(fx.root.join("vendor")).unwrap();
-    fx.config.project.clone = vec!["vendor".into()];
+    fx.config.project.clone = Some(vec!["vendor".into()]);
     let head = Command::new("git")
         .arg("-C")
         .arg(&fx.root)
@@ -9214,7 +9267,7 @@ fn a_second_new_of_the_same_branch_at_once_never_removes_the_firsts() {
 #[test]
 fn clone_of_a_path_the_main_checkout_lacks_does_not_stop_new() {
     let mut fx = fixture();
-    fx.config.project.clone = vec!["node_modules".into()];
+    fx.config.project.clone = Some(vec!["node_modules".into()]);
     let (made, said) = new_saying(&fx, "feat/fresh-clone");
     let wt = fx.worktrees_dir().join(made.unwrap());
     assert!(!wt.join("node_modules").exists());
@@ -9528,7 +9581,7 @@ fn clone_gives_a_new_worktree_the_main_checkouts_dependencies_before_the_install
     let mut fx = fixture();
     std::fs::create_dir_all(fx.root.join("node_modules/left-pad")).unwrap();
     std::fs::write(fx.root.join("node_modules/left-pad/index.js"), "pad\n").unwrap();
-    fx.config.project.clone = vec!["node_modules".into()];
+    fx.config.project.clone = Some(vec!["node_modules".into()]);
     // The install sees what was cloned.
     fx.config.project.install =
         Some("test -f node_modules/left-pad/index.js && echo seen > .seen || true".into());
@@ -9565,7 +9618,7 @@ fn clone_gives_a_new_worktree_the_main_checkouts_dependencies_before_the_install
 fn a_clone_path_the_project_does_not_ignore_is_refused_before_anything_is_made() {
     let mut fx = fixture();
     std::fs::create_dir_all(fx.root.join("vendor")).unwrap();
-    fx.config.project.clone = vec!["vendor".into()];
+    fx.config.project.clone = Some(vec!["vendor".into()]);
     let (made, _) = new_saying(&fx, "feat/vendored");
     let msg = format!("{:#}", made.unwrap_err());
     assert!(
@@ -9597,7 +9650,7 @@ fn a_cloned_tree_with_a_link_into_the_main_checkout_is_left_to_the_install() {
         std::fs::Permissions::from_mode(0o555),
     )
     .unwrap();
-    fx.config.project.clone = vec!["node_modules".into()];
+    fx.config.project.clone = Some(vec!["node_modules".into()]);
     let (made, said) = new_saying(&fx, "feat/linked");
     let wt = fx.worktrees_dir().join(made.unwrap());
     assert!(!wt.join("node_modules").exists(), "the clone was kept");
@@ -9616,7 +9669,7 @@ fn the_check_worktree_is_never_given_cloned_dependencies() {
     let mut fx = fixture();
     std::fs::create_dir_all(fx.root.join("node_modules/x")).unwrap();
     std::fs::write(fx.root.join("node_modules/x/i.js"), "x\n").unwrap();
-    fx.config.project.clone = vec!["node_modules".into()];
+    fx.config.project.clone = Some(vec!["node_modules".into()]);
     let head = Command::new("git")
         .arg("-C")
         .arg(&fx.root)

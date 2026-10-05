@@ -77,7 +77,7 @@ pub fn new(
     // ignores.
     for rel in config
         .project
-        .clone
+        .clones()
         .iter()
         .filter(|rel| is_present(&root.join(rel)))
     {
@@ -439,7 +439,7 @@ fn has_install_step(config: &Config) -> bool {
 fn clones_for<'a>(config: &'a Config, source: &CreateSource) -> &'a [String] {
     match source {
         CreateSource::Detached { .. } => &[],
-        _ => &config.project.clone,
+        _ => config.project.clones(),
     }
 }
 
@@ -613,7 +613,7 @@ fn refuse_over_raced_record(
         .iter()
         .filter(|rel| !target.join(rel).exists() && provision_source(paths, config, rel).is_some())
         .chain(
-            config.project.clone.iter().filter(|rel| {
+            config.project.clones().iter().filter(|rel| {
                 !is_present(&target.join(rel)) && is_present(&paths.root().join(rel))
             }),
         )

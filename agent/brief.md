@@ -244,7 +244,7 @@ Four more facts that are not visible in the shape:
   write, so nobody's flag gets to decide it. If you name it, you are
   answering for the developer — be sure they want it.
 
-## 3. The ten questions, and who answers each
+## 3. The eleven questions, and who answers each
 
 | Question | Who | Notes |
 |---|---|---|
@@ -257,6 +257,7 @@ Four more facts that are not visible in the shape:
 | `services` | rules + **human** | which services get a private copy — see §5 for the mechanism |
 | `schema_hook` | rules + **human** | the command that brings a fresh database to the schema. Always a question — it touches data — and only an isolated or namespaced start asks it. The hook runs on those starts only unless its entry says `on = "always"`; `null` answers "no" and writes it with `on = "never"` |
 | `provision` | rules, mostly | which local files a worktree needs. Seeding from an example needs a human |
+| `clone` | rules | which dependency trees (`node_modules`, an app's own) a new worktree clones copy-on-write from the main checkout before its install, so it costs a few MB instead of a full install's. Proposed for every one the main checkout has, unless the install deletes it first (`npm ci`); decided, since the install still fixes what the branch changed and `check` never clones. Leave it to the rules; `null` only if the developer wants every worktree installed from nothing |
 | `base` | rules, then **human** | the branch `new` forks from and `check` tests. Asked only when origin/HEAD is far behind the main checkout's branch; otherwise origin/HEAD, and nothing to answer. A check that fails with `kind: "base"` is the case for it: see step 5 |
 
 ## 4. Writing: `pando init --answers`, and nothing else
@@ -275,7 +276,8 @@ developer's repository — keys are the slot names above, and:
   carries with it: the ports a command owns, the whole process table a
   workspace answer is, a service's env key, the hook entry.
 - a **list of strings** is the set answer at the one question where
-  `multi` is true, and the whole list at `version_files` and `provision`.
+  `multi` is true, and the whole list at `version_files`, `provision` and
+  `clone`.
 - **`null` is the only spelling of "none"**, and only where `allow_none`
   is true. An empty string is a usage error. `[]` means "none of them" at
   the set question and is a usage error anywhere else.
@@ -319,7 +321,7 @@ engine installed on the machine, and it is **machine-wide**. Not
 per-project, not per-worktree: one line, and it governs **every repository
 this developer opens with pando**, including the ones you have never seen
 and the ones they have not written yet. That is why it is not one of the
-ten questions and why `--answers` has no key for it — an answer inferred
+eleven questions and why `--answers` has no key for it — an answer inferred
 from the evidence in front of you would quietly settle a question about
 projects that evidence says nothing about.
 
@@ -481,7 +483,7 @@ Read what came back, not what you expected:
   table** — a service is not running, or the schema step is missing.
   That is the `services` and `schema_hook` questions, not a retry.
 
-A fix that is one of the ten answers goes through `init --answers`, a
+A fix that is one of the eleven answers goes through `init --answers`, a
 variable one process needs included (§9), and you start the scratch
 worktree again. A fix that is not — an app whose own config pins a port —
 is the developer's: name the process, what it did, and the line that

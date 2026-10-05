@@ -89,6 +89,14 @@ pub struct PackageManager {
     /// How a developer gets this manager, as doctor prints it after
     /// "install it with:". pando never runs it.
     pub get: &'static str,
+    /// The gitignored directory this manager installs into, which
+    /// detection proposes for `[project] clone`: cloned from the main
+    /// checkout, the install that follows rewrites only what the branch
+    /// changed. `None` where a clone would not be the worktree's own — a
+    /// virtualenv's scripts name the main checkout's interpreter, and
+    /// Bundler, Composer, Mix, Go and Cargo either install outside the
+    /// repository or build output whose fingerprints carry absolute paths.
+    pub dependency_dir: Option<&'static str>,
 }
 
 /// Every manager pando knows, in detection order. Order is a contract: it
@@ -115,6 +123,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         unlocked_install: Some("pnpm install"),
         unsaved_install: None,
         get: "corepack enable pnpm   (or npm install -g pnpm)",
+        dependency_dir: Some("node_modules"),
     },
     PackageManager {
         program: "npm",
@@ -135,6 +144,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         unlocked_install: Some("npm install"),
         unsaved_install: None,
         get: "brew install node   (npm comes with Node.js)",
+        dependency_dir: Some("node_modules"),
     },
     PackageManager {
         program: "yarn",
@@ -159,6 +169,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         unlocked_install: Some("yarn install"),
         unsaved_install: None,
         get: "corepack enable yarn   (or npm install -g yarn)",
+        dependency_dir: Some("node_modules"),
     },
     PackageManager {
         program: "bun",
@@ -179,6 +190,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         unlocked_install: Some("bun install"),
         unsaved_install: Some("bun install --no-save"),
         get: "brew install oven-sh/bun/bun   (or the install script at bun.sh)",
+        dependency_dir: Some("node_modules"),
     },
     PackageManager {
         program: "uv",
@@ -199,6 +211,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         unlocked_install: None,
         unsaved_install: None,
         get: "brew install uv   (or the install script at astral.sh/uv)",
+        dependency_dir: None,
     },
     PackageManager {
         program: "poetry",
@@ -218,6 +231,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         unlocked_install: None,
         unsaved_install: None,
         get: "pipx install poetry",
+        dependency_dir: None,
     },
     PackageManager {
         program: "pipenv",
@@ -240,6 +254,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         unlocked_install: None,
         unsaved_install: None,
         get: "pipx install pipenv",
+        dependency_dir: None,
     },
     PackageManager {
         program: "bundle",
@@ -262,6 +277,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         unlocked_install: None,
         unsaved_install: None,
         get: "gem install bundler",
+        dependency_dir: None,
     },
     PackageManager {
         program: "composer",
@@ -284,6 +300,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         unlocked_install: None,
         unsaved_install: None,
         get: "brew install composer   (or the installer at getcomposer.org)",
+        dependency_dir: None,
     },
     PackageManager {
         program: "mix",
@@ -301,6 +318,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         unlocked_install: None,
         unsaved_install: None,
         get: "brew install elixir   (mix comes with Elixir)",
+        dependency_dir: None,
     },
     PackageManager {
         program: "go",
@@ -316,6 +334,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         unlocked_install: None,
         unsaved_install: None,
         get: "brew install go   (or your distribution's golang package)",
+        dependency_dir: None,
     },
     PackageManager {
         program: "cargo",
@@ -335,6 +354,7 @@ pub const PACKAGE_MANAGERS: [PackageManager; 12] = [
         unlocked_install: None,
         unsaved_install: None,
         get: "rustup, from https://rustup.rs",
+        dependency_dir: None,
     },
 ];
 
@@ -367,6 +387,18 @@ pub fn is_unlocked_install(cmd: &str) -> bool {
     PACKAGE_MANAGERS.iter().any(|manager| {
         manager.unlocked_install == Some(cmd) || manager.unsaved_install == Some(cmd)
     })
+}
+
+/// Every dependency directory a manager installs into, once each, in
+/// catalog order.
+pub fn dependency_dirs() -> Vec<&'static str> {
+    let mut dirs: Vec<&'static str> = Vec::new();
+    for dir in PACKAGE_MANAGERS.iter().filter_map(|pm| pm.dependency_dir) {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
 }
 
 /// Installs that delete a dependency directory before they install, by
@@ -467,6 +499,24 @@ mod tests {
     }
 
     use super::*;
+
+    // `clone` is offered for the JavaScript managers' tree alone: a
+    // virtualenv names the main checkout's interpreter in its scripts, and
+    // the others install outside the repository or build with absolute
+    // paths in their fingerprints.
+    #[test]
+    fn only_the_javascript_managers_have_a_tree_to_clone() {
+        use super::{Ecosystem, PACKAGE_MANAGERS, dependency_dirs};
+        for manager in PACKAGE_MANAGERS {
+            assert_eq!(
+                manager.dependency_dir.is_some(),
+                manager.ecosystem == Ecosystem::JavaScript,
+                "{}",
+                manager.program
+            );
+        }
+        assert_eq!(dependency_dirs(), ["node_modules"]);
+    }
 
     #[test]
     fn a_lockfile_belongs_to_one_manager() {

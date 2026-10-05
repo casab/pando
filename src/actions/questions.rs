@@ -499,9 +499,16 @@ pub(super) fn answered_by(answer: Answer) -> (Answer, Answerer) {
     (answer, by)
 }
 
-/// The slots `new` fills: what to install, what pins the runtime, and which
-/// local files a worktree needs a copy of.
-pub const NEW_SLOTS: [Slot; 3] = [Slot::Install, Slot::VersionFiles, Slot::Provision];
+/// The slots `new` fills: what to install, what pins the runtime, which
+/// local files a worktree needs a copy of, and which dependency trees it
+/// clones. `Clone` after `Install`, because the install decides it: one
+/// that deletes `node_modules` first is not worth cloning it for.
+pub const NEW_SLOTS: [Slot; 4] = [
+    Slot::Install,
+    Slot::VersionFiles,
+    Slot::Provision,
+    Slot::Clone,
+];
 
 /// The slots `start` fills: how many processes there are, then the dev
 /// process and how it takes its port, then the schema step. `Processes`
@@ -958,6 +965,14 @@ fn resolve_pass(
             prelude_details = details;
             proposals.extend(proposal);
         }
+        // The dependency trees against the install config holds by now,
+        // which an earlier slot may have just written: detection could
+        // only judge them against the install it proposed.
+        if *slot == Slot::Clone {
+            proposals.retain(|p| p.slot != Slot::Clone);
+            let install = config.project.install.as_deref();
+            proposals.extend(detect::clone_proposal(&signals, install));
+        }
         // A replacement is a program saying the answer config has is
         // wrong, so the answer being there is no reason to skip it.
         let replacing = answers.replaces(*slot);
@@ -1172,7 +1187,7 @@ fn resolve_pass(
                 // local file of mine" both have to be tellable from
                 // "nobody has said yet", or the question returns on every
                 // run with nowhere to put the answer but the TOML by hand.
-                Answer::None if matches!(*slot, Slot::PortEnv | Slot::Provision) => {
+                Answer::None if matches!(*slot, Slot::PortEnv | Slot::Provision | Slot::Clone) => {
                     flush(paths, &mut deferred, progress)?;
                     write_empty_answer(
                         paths,
@@ -1402,8 +1417,9 @@ fn write_empty_answer(
     pending: Option<Pending>,
     progress: &dyn Fn(&str),
 ) -> Result<()> {
-    // Only these two have an empty form: one list, under one key.
-    let (Slot::PortEnv | Slot::Provision, Some((table, key))) = (slot, slot.key()) else {
+    // Only these have an empty form: one list, under one key.
+    let (Slot::PortEnv | Slot::Provision | Slot::Clone, Some((table, key))) = (slot, slot.key())
+    else {
         bail!("{} has no \"none\" answer to write", slot_label(slot));
     };
     // Through the same gate every other answer goes through. Nothing
@@ -1488,7 +1504,7 @@ fn volunteer(
             let note = by.note(config::Note::Answered);
             write_answer(paths, config, slot, &candidate, note, pending, progress)?;
         }
-        Answer::None if matches!(slot, Slot::PortEnv | Slot::Provision) => {
+        Answer::None if matches!(slot, Slot::PortEnv | Slot::Provision | Slot::Clone) => {
             write_empty_answer(
                 paths,
                 config,
@@ -1679,6 +1695,7 @@ fn apply_empty(slot: Slot, config: &mut Config) {
                 .ports = Some(config::PortsSpec::List(Vec::new()));
         }
         Slot::Provision => config.project.provision = Some(Vec::new()),
+        Slot::Clone => config.project.clone = Some(Vec::new()),
         // Nothing else has an empty form; `write_empty_answer` refuses
         // every other slot before it gets here.
         _ => {}
@@ -1902,6 +1919,7 @@ pub(super) fn slot_label(slot: Slot) -> &'static str {
         Slot::Services => "service list",
         Slot::SchemaHook => "schema command",
         Slot::Provision => "provision list",
+        Slot::Clone => "clone list",
         Slot::Base => "base branch",
         Slot::Login => "namespace login",
         Slot::FreeSlot => "slot to free",
@@ -1944,6 +1962,9 @@ pub(super) fn already_answered(slot: Slot, config: &Config) -> bool {
         // worktree needs a local file of theirs, and an answer nothing
         // records is asked again on every `new`.
         Slot::Provision => config.project.provision.is_some(),
+        // Likewise `clone = []`: no worktree shares the main checkout's
+        // dependencies.
+        Slot::Clone => config.project.clone.is_some(),
         Slot::Base => config.project.base.is_some(),
         // `[isolation] none` included: it is how the native half records
         // "none of them", and a reader that missed it published the slot

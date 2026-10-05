@@ -82,6 +82,13 @@ pub struct Signals {
     /// pando reads. Defaulted so an older dump still deserialises.
     #[serde(default)]
     pub app_dirs: Vec<AppDir>,
+    /// Dependency trees present in the main checkout and gitignored there —
+    /// `node_modules`, `apps/api/node_modules` — at the root and up to two
+    /// directories below it, outside any hidden directory. What `[project]
+    /// clone` can share with a new worktree. Defaulted so an older dump
+    /// still deserialises.
+    #[serde(default)]
+    pub dependency_dirs: Vec<String>,
 }
 
 /// One app directory below a root that has no manifest: what detection
@@ -134,6 +141,7 @@ pub(super) const COMPOSE_FILES: [&str; 4] = [
 
 /// Reads every tier 1 signal from the main checkout.
 pub fn signals(root: &Path) -> Signals {
+    let ignored = Ignored::read(root);
     let manifest = std::fs::read_to_string(root.join("package.json")).unwrap_or_default();
     let mut signals = Signals {
         scripts: parse_scripts(&manifest),
@@ -145,10 +153,11 @@ pub fn signals(root: &Path) -> Signals {
         env_example: env_example(root),
         markers: present(root, &frameworks::marker_files()),
         compose_files: compose_files(root),
-        ignored_present: ignored_present(root),
+        ignored_present: ignored_files(&ignored),
         provision_seeds: provision_seeds(root),
         workspace_env_links: Vec::new(),
         app_dirs: Vec::new(),
+        dependency_dirs: dependency_dirs(&ignored),
     };
     // Last, because which directories are apps is itself read from the
     // signals above.
@@ -649,31 +658,82 @@ pub(super) fn env_file_value(dir: &Path, key: &str) -> Option<String> {
 /// git name such a directory once, as `name/`, rather than list every file
 /// under `node_modules` or `target` for the filter below to throw away.
 pub(super) fn ignored_present(root: &Path) -> Vec<String> {
-    let out = crate::project::git(
-        root,
-        [
-            "ls-files",
-            "--others",
-            "--ignored",
-            "--exclude-standard",
-            "--directory",
-            "--no-empty-directory",
-            "-z",
-        ],
-    );
-    let Ok(out) = out else { return Vec::new() };
-    if !out.status.success() {
-        return Vec::new();
+    ignored_files(&Ignored::read(root))
+}
+
+/// What `git ls-files --others --ignored --directory` lists under a root:
+/// each gitignored file, and each wholly ignored directory once, with a
+/// trailing slash. Empty when git cannot say.
+struct Ignored {
+    root: std::path::PathBuf,
+    entries: Vec<String>,
+}
+
+impl Ignored {
+    fn read(root: &Path) -> Ignored {
+        let out = crate::project::git(
+            root,
+            [
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "--directory",
+                "--no-empty-directory",
+                "-z",
+            ],
+        );
+        let entries = match out {
+            Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+                .split('\0')
+                .filter(|p| !p.is_empty())
+                .map(str::to_string)
+                .collect(),
+            _ => Vec::new(),
+        };
+        Ignored {
+            root: root.to_path_buf(),
+            entries,
+        }
     }
-    let mut found: Vec<String> = String::from_utf8_lossy(&out.stdout)
-        .split('\0')
-        .filter(|p| !p.is_empty())
+}
+
+/// The root-level files among them, sorted.
+fn ignored_files(ignored: &Ignored) -> Vec<String> {
+    let mut found: Vec<String> = ignored
+        .entries
+        .iter()
         .filter(|p| !p.contains('/'))
         .filter(|p| !artifacts::is_artifact(p))
-        .filter(|p| root.join(p).is_file())
-        .map(str::to_string)
+        .filter(|p| ignored.root.join(p).is_file())
+        .cloned()
         .collect();
     found.sort();
+    found.dedup();
+    found
+}
+
+/// The ignored directories among them that a package manager installs
+/// into, sorted: the root's, then each app's. Three components at most —
+/// `apps/api/node_modules` — and none hidden, so a worktree kept inside
+/// the checkout, under `.claude/` or the like, is never offered.
+fn dependency_dirs(ignored: &Ignored) -> Vec<String> {
+    let names = package_managers::dependency_dirs();
+    let mut found: Vec<String> = ignored
+        .entries
+        .iter()
+        .filter_map(|entry| entry.strip_suffix('/'))
+        .filter(|dir| {
+            let parts: Vec<&str> = dir.split('/').collect();
+            parts.len() <= 3
+                && parts.last().is_some_and(|last| names.contains(last))
+                && !parts.iter().any(|part| part.starts_with('.'))
+        })
+        .filter(|dir| ignored.root.join(dir).is_dir())
+        .map(str::to_string)
+        .collect();
+    // The root's first: it is the one every workspace shares.
+    found.sort_by_key(|dir| (dir.contains('/'), dir.clone()));
     found.dedup();
     found
 }

@@ -1422,7 +1422,7 @@ auth_cmd = "./scripts/dev-cookie.sh"
     let c = &loaded.config;
     assert_eq!(c.project.provision_mode, ProvisionMode::Copy);
     assert!(!c.project.copy_on_write());
-    assert_eq!(c.project.clone, vec!["node_modules".to_string()]);
+    assert_eq!(c.project.clones(), ["node_modules".to_string()]);
     assert_eq!(c.runtime.version_files, vec![".nvmrc".to_string()]);
     assert_eq!(c.services.len(), 2);
     assert!(matches!(c.services[0], ServiceConfig::Compose { .. }));

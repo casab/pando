@@ -153,6 +153,9 @@ fn none_label(slot: crate::detect::Slot) -> &'static str {
             "none — this machine needs no line in front of its commands"
         }
         crate::detect::Slot::Provision => "none — a new worktree needs no local file of yours",
+        crate::detect::Slot::Clone => {
+            "none — every worktree's install builds its dependencies from nothing"
+        }
         crate::detect::Slot::SchemaHook => {
             "no — do not run a schema step (written as on = \"never\")"
         }

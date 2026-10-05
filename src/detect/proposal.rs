@@ -9,7 +9,8 @@ use crate::config::{PortsSpec, ProcessConfig};
 
 use super::base::base_proposal;
 use super::dev::{
-    dev_cmd_proposal, install_proposal, port_proposal, provision_proposal, version_files_proposal,
+    clone_proposal, dev_cmd_proposal, install_proposal, port_proposal, provision_proposal,
+    version_files_proposal,
 };
 use super::frameworks::framework;
 use super::services::{MachineEvidence, ServiceSource, schema_hook_proposal, services_proposal};
@@ -43,6 +44,10 @@ pub enum Slot {
     /// and the files whose change means it has to run again.
     SchemaHook,
     Provision,
+    /// The gitignored dependency trees `new` clones from the main checkout
+    /// before the install: `[project] clone`. Proposed for the ones the
+    /// main checkout has, unless the install deletes them first.
+    Clone,
     /// The branch `new` forks a worktree from, and the commit `check`
     /// tests: `[project] base`. Proposed only when origin/HEAD is far
     /// behind the branch the main checkout is on, which is when "the
@@ -77,7 +82,7 @@ impl Slot {
         // `on = "never"`: switched off, still visible.
         matches!(
             self,
-            Slot::PortEnv | Slot::Prelude | Slot::Provision | Slot::SchemaHook
+            Slot::PortEnv | Slot::Prelude | Slot::Provision | Slot::Clone | Slot::SchemaHook
         ) || self.is_multi()
     }
 
@@ -109,7 +114,7 @@ impl Slot {
     /// `--answers` takes a JSON array here and [`join_list`](super::join_list) turns it
     /// into the form [`edits`](super::edits) splits again.
     pub fn is_list(self) -> bool {
-        matches!(self, Slot::VersionFiles | Slot::Provision)
+        matches!(self, Slot::VersionFiles | Slot::Provision | Slot::Clone)
     }
 
     /// Which file this slot's answer is written to.
@@ -166,6 +171,7 @@ impl Slot {
             Slot::DevCmd => (&["dev"], "cmd"),
             Slot::PortEnv => (&["dev"], "ports"),
             Slot::Provision => (&["project"], "provision"),
+            Slot::Clone => (&["project"], "clone"),
             Slot::Base => (&["project"], "base"),
             // One table per service, which only the question knows — or,
             // for a slot to free, nothing written at all.
@@ -181,6 +187,7 @@ impl Slot {
         match self {
             Slot::PortEnv => "variable names",
             Slot::VersionFiles | Slot::Provision => "file names",
+            Slot::Clone => "paths",
             Slot::Prelude => "shell line",
             Slot::Login => "login, as user:password",
             Slot::Base => "branch",
@@ -205,6 +212,10 @@ impl Slot {
             Slot::Services => "Run private copies of these services for each worktree?",
             Slot::SchemaHook => "Which command brings a fresh database up to the schema?",
             Slot::Provision => "Which local files should each worktree get a copy of?",
+            Slot::Clone => {
+                "Which dependency directories should a new worktree clone from the main \
+                 checkout before its install?"
+            }
             Slot::Base => "Which branch do new worktrees, and the check, start from?",
             Slot::Login => "Which login may create and drop this worktree's own databases?",
             Slot::FreeSlot => "Which stopped worktree gives up its slot?",
@@ -392,8 +403,9 @@ pub fn propose_with(
     prefer: Option<&str>,
 ) -> Vec<Proposal> {
     let rule = framework(root, signals);
+    let install = install_proposal(root, signals);
     [
-        install_proposal(root, signals),
+        install.clone(),
         version_files_proposal(signals),
         // Before the single-process slots: it decides whether there is one
         // process or several, and the slots below only fill a single one.
@@ -406,6 +418,13 @@ pub fn propose_with(
         services_proposal(root, signals, resolve, evidence, prefer),
         schema_hook_proposal(root, signals),
         provision_proposal(signals),
+        clone_proposal(
+            signals,
+            install
+                .as_ref()
+                .and_then(|p| p.candidates.first())
+                .map(|c| c.value.as_str()),
+        ),
         // Last, as it is asked: which commit all of the above is tested
         // on, read from the refs rather than from the files.
         base_proposal(root),
