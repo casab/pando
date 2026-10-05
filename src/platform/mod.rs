@@ -24,6 +24,7 @@ pub mod files;
 pub mod host;
 pub mod process;
 pub mod shell;
+pub mod signals;
 pub mod terminal;
 
 pub use host::{Host, Os};

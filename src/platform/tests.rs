@@ -9,13 +9,7 @@ use super::*;
 /// Files outside this layer that still talk to the OS, while the migration
 /// moves what they do into it. The list only shrinks: a file here that no
 /// longer offends is a stale row, and fails as surely as a new offender.
-const NOT_YET: &[&str] = &[
-    "actions/check/interrupt.rs",
-    "hooks.rs",
-    "observe.rs",
-    "process.rs",
-    "project.rs",
-];
+const NOT_YET: &[&str] = &["hooks.rs", "observe.rs", "process.rs", "project.rs"];
 
 /// Where [`Host::here`] may be read: where pando meets the outside. Every
 /// module below them is handed a `&Host`.
