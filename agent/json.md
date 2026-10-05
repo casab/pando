@@ -493,8 +493,9 @@ started lists its worktrees alone. Its `mode` is always `shared`.
 
 `mode` says which services a worktree's processes talk to, or last
 talked to once it is stopped: `shared` is the main checkout's servers and
-its data, `namespaced` the main checkout's servers with a database and a
-slot of the worktree's own in them, and `isolated` servers of its own. A
+its data, `namespaced` the main checkout's servers with a database, a
+slot or a name prefix of the worktree's own in them, and `isolated`
+servers of its own. A
 worktree never started reads `shared`. `isolated` came first and stays,
 true exactly when `mode` is `isolated`, so a program written against it
 keeps working.
@@ -504,7 +505,8 @@ servers: a `database` of its own, or a `slot` of its own, each on the
 `host` and `port` it was made on. `in_use` is true while the worktree runs
 namespaced, and false for one kept through a switch to another mode —
 kept until `rm`, which drops it. The list is empty for a worktree that
-never started namespaced. No login is ever in this shape.
+never started namespaced. A prefix is never in it: nothing is made for
+one, so nothing is recorded or dropped. No login is ever in this shape.
 
 `phase` is per process; a worktree is only as up as its worst one.
 `reason` is non-null exactly when `phase` is `failed`, and it is the
@@ -712,7 +714,7 @@ fixed through `pando init --answers -`, then checked again; a failed hook
 is `failed_process`, by its name. `machine` is this machine: a shared
 service nothing answers on, found before anything was made, or in a
 namespaced check a server that refuses the login or a login with no grant
-to make a database. `reason` then carries the command that fixes it, and
+to make a database and no administrator pando can find to give it one. `reason` then carries the command that fixes it, and
 no setting changes it. `base` is the commit tested: a step failed on a
 file — one its failure names, or a lockfile of a manager the install
 runs — that the main checkout's branch has and that commit does not.

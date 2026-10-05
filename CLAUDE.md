@@ -210,6 +210,33 @@ and the workspace one passed its check. The first-run section is held
 under the job's 10 KB limit by `init_agent_stays_under_ten_kilobytes_on_every_fixture`,
 which the next-messy fixture sits close to.
 
+On 2026-10-05 the branch `namespaced-agnostic` made namespaced mode
+agnostic of the engine, from `plans/namespaced-agnostic.md`, and 0.9.0
+was built with it. Where an app names its database or slot is a
+recipe's `[namespace.address]`, not Rust; a recipe may carry only a
+`[namespace]` or a `[prefix]`, for an engine pando never starts; built-in
+`[prefix]` recipes (elasticsearch, kafka, meilisearch, memcached, and
+Redis's fallback) tell a worktree a prefix of its own in the key its app
+reads, `<main>…<slug>_<hash>__`, which is never made, recorded or
+dropped, and every process of a namespaced worktree gets
+`PANDO_NAMESPACE`. `[namespaced.<service>] recipe` and `prefix_env` sit
+beside `db_env`, and a table brings in a compose service the project
+does not isolate. Where the host has no client, the commands run through
+`docker exec` in the one container that publishes the port on this
+machine's loopback with nothing else listening there; a recipe's
+`[namespace.container_admin]` and `run_sql` let pando run the grant
+itself as the administrator that container's environment keeps, use it
+as the login where none is written, and drop as it — only once it
+answers a ping, and only for plain names. `namespaced` is the twelfth
+`init --answers` key, `signals` lists what a namespaced start does with
+each service, `init` names the ones it would leave on main's data, and
+the brief's first run answers it, so a first setup leaves namespaced
+mode ready with nobody asked. Proved by agents playing the developer's
+on fixtures and by the gated tests against real Postgres and MariaDB
+behind a stand-in `docker`; no real container has been used, and the
+prefix engines have no real-server test. `docs/02-principles.md` says
+what holds the grant pando now runs.
+
 What is left is not a phase. `plans/open-follow-ups.md` carries the known
 edges, each with who found it and where it belongs, and the rest of the
 launch checklist in `docs/08-roadmap.md` is open: no published crate on
@@ -260,7 +287,8 @@ add each kind of thing. Keep to its shape:
 - **One fact, one row.** What pando knows about the ecosystem is data in
   `src/catalog/` (package managers, frameworks, service images), in
   `runtime/languages.rs` (languages, version managers), or in
-  `recipes/builtin/*.toml` (native services). Never add a second list of
+  `recipes/builtin/*.toml` (native services, and engines namespaced mode
+  knows). Never add a second list of
   the same fact. Where two lists must differ in order because one is
   published or stored, keep both and add a test holding them to one set.
 - **A module with more than one concern is a directory.** Its `mod.rs`
@@ -340,6 +368,11 @@ database, a prod schema dump, and cookie auth."
   `bin`, and `tests/namespaced.rs` (gated by `PANDO_TEST_NATIVE=1`)
   starts its own throwaway Postgres, MariaDB and Redis on free ports in
   temporary directories.
+- Nothing under test reaches a developer's own containers. Under
+  `cfg(test)` only a stand-in `docker` in the test's own pando `bin` is
+  asked for the container that publishes a port, and an integration test
+  whose namespaced start could ask gives its pando `bin` one that knows
+  of none.
 - Nothing under test reaches GitHub. The TUI's `gh` workers
   (`spawn_pr_fetch`, `spawn_gh_account_check`) return early under
   `cfg!(test)`; tests set `pr_list` by hand, and `gh` parsing is tested

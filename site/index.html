@@ -190,7 +190,7 @@
       <div><span class="gl d">○</span><span>stopped: <kbd>s</kbd> starts it</span></div>
       <div><span class="gl g">⌂</span><span>the main checkout, always the first row <span class="tag-new">new in 0.5.0</span></span></div>
       <div><span class="gl or">▣</span><span>isolated: private copies of the services</span></div>
-      <div><span class="gl am">◧</span><span>namespaced: a database and a slot of its own (experimental)</span></div>
+      <div><span class="gl am">◧</span><span>namespaced: a database, a slot or a prefix of its own (experimental)</span></div>
       <div><span class="gl g">◈</span><span>public: shared on the internet</span></div>
       <div><span class="gl gr">◍ #n</span><span>its open pull request: ◌ draft, ✓ merged, ✗ closed</span></div>
       <div><span class="gl d">↓n ↑n</span><span>commits behind / ahead of the base branch</span></div>
@@ -322,7 +322,7 @@ pando: the last lines of the web log:</span>
         <p>One process can learn another's port the same way. Here the web app gets the API's address, whatever port the API was given:</p>
         <ul class="dash">
           <li><code>{port}</code>, <code>{port:api}</code>, <code>{name}</code>, <code>{branch}</code>, <code>{worktree}</code>, <code>{root}</code>, <code>{project}</code>, <code>{log}</code>. An unknown placeholder is a config error, never an empty string.</li>
-          <li>Every process also gets <code>PANDO_NAME</code>, <code>PANDO_BRANCH</code>, <code>PANDO_WORKTREE</code>, <code>PANDO_ROOT</code> and <code>PANDO_PROJECT</code>. What <code>pando check</code> runs also gets <code>PANDO_CHECK=1</code>, so a process that reaches outside its worktree can leave that out of a test.</li>
+          <li>Every process also gets <code>PANDO_NAME</code>, <code>PANDO_BRANCH</code>, <code>PANDO_WORKTREE</code>, <code>PANDO_ROOT</code> and <code>PANDO_PROJECT</code>. What <code>pando check</code> runs also gets <code>PANDO_CHECK=1</code>, so a process that reaches outside its worktree can leave that out of a test. A namespaced worktree's also get <code>PANDO_NAMESPACE</code>, a name of its own to put in front of what the app names by itself. <span class="tag-new">new in 0.9.0</span></li>
           <li><code>eval "$(pando status --env feat/login)"</code> puts that same environment in your own shell.</li>
         </ul>
       </div>
@@ -415,9 +415,9 @@ fingerprint = [<span class="s">"prisma/migrations/**"</span>]</pre>
         <div class="body">
           <div class="name">namespaced <span class="exp">experimental</span></div>
           <div class="how"><code>start --namespaced</code> · <kbd>⏎</kbd> chooser</div>
-          <p>The main checkout's servers, with a database and a Redis slot of the worktree's own inside them: <code>shop__feat_login</code> beside <code>shop</code>, and slot 3 beside slot 0. The database starts empty and is built by the branch's own schema step.</p>
+          <p>The main checkout's servers, with a database, a Redis slot or a name prefix of the worktree's own inside them: <code>shop__feat_login</code> beside <code>shop</code>, slot 3 beside slot 0, indexes under a prefix of the worktree's own in Elasticsearch. The database starts empty and is built by the branch's own schema step.</p>
           <ul class="facts">
-            <li><b>own</b> <span class="own">… + a database, a Redis slot</span></li>
+            <li><b>own</b> <span class="own">… + a database, a Redis slot, a prefix</span></li>
             <li><b>main's</b> <span class="shr">the servers themselves</span></li>
           </ul>
         </div>
@@ -485,7 +485,7 @@ fingerprint = [<span class="s">"prisma/migrations/**"</span>]</pre>
     <h3 class="rv">Isolated, without Docker</h3>
     <div class="split stack">
       <div class="rv">
-        <p>A native service is a recipe: a TOML file that says which binaries it needs, how to start one server on a given port and data directory, and how to tell when it is ready. Four are built in: <code>postgres</code>, <code>mariadb</code>, <code>redis</code>, and <code>mongodb</code>, which is marked untested. A file with the same name in <code>~/.pando/recipes/</code> replaces a built-in outright.</p>
+        <p>A native service is a recipe: a TOML file that says which binaries it needs, how to start one server on a given port and data directory, and how to tell when it is ready. Four are built in: <code>postgres</code>, <code>mariadb</code>, <code>redis</code>, and <code>mongodb</code>, which is marked untested; four more start nothing and only say how a server somebody else runs is namespaced: <code>elasticsearch</code>, <code>kafka</code>, <code>meilisearch</code>, <code>memcached</code>. A file with the same name in <code>~/.pando/recipes/</code> replaces a built-in outright.</p>
         <p>Each server gets <code>~/.pando/projects/&lt;id&gt;/data/&lt;worktree&gt;/&lt;service&gt;</code>, is initialised once, and binds 127.0.0.1 only. The built-in servers have no passwords: nothing off your machine can reach them. pando never installs an engine. If one is missing, it prints the install command.</p>
       </div>
       <div class="rv">
@@ -511,8 +511,10 @@ slots = 16</pre>
     <p class="rv">A namespaced start writes into a server that belongs to you, which pando's rule about your repository does not cover. So the mode has rules of its own:</p>
     <div class="grid-2">
       <ul class="dash rv">
-        <li>It logs in the way your app does, with the user and password in the main checkout's <code>.env</code>, at the root or where a process runs, such as <code>backend/.env</code>. If there are none, it asks once. The answer is kept in pando's own config, with file mode 0600, and passed to the database client in its environment, never on a command line.</li>
-        <li>That login must be allowed to create databases named after the main one. The first start that is not allowed stops with nothing made, and prints the statement to run once as an administrator: a grant of those names and nothing else on MariaDB, <code>ALTER ROLE … CREATEDB</code> on Postgres, which cannot grant by name and lets a role drop only the databases it owns.</li>
+        <li>It logs in the way your app does, with the user and password in the main checkout's <code>.env</code>, at the root or where a process runs, such as <code>backend/.env</code>. If there are none, a server in a container is reached as its own administrator, from the container's environment; anywhere else it asks once. An answer is kept in pando's own config, with file mode 0600, and passed to the database client in its environment, never on a command line.</li>
+        <li>That login must be allowed to create databases named after the main one: a grant of those names and nothing else on MariaDB, <code>ALTER ROLE … CREATEDB</code> on Postgres, which cannot grant by name and lets a role drop only the databases it owns. For a server in a container, pando runs that statement itself as the administrator its environment keeps (<code>POSTGRES_USER</code>, <code>MARIADB_ROOT_PASSWORD</code>), and nobody is asked. <span class="tag-new">new in 0.9.0</span> Anywhere else, the first start that is not allowed stops with nothing made and prints it, to run once as an administrator.</li>
+        <li>Where a server has no namespace pando could make, an Elasticsearch index, a Kafka topic, a Memcached key, the worktree is told a prefix of its own in the key the app already reads one from beside its address (<code>ELASTICSEARCH_INDEX_PREFIX</code>, <code>REDIS_PREFIX</code>). Nothing is made there, so nothing is recorded or dropped, and <code>rm</code> says what it leaves. <span class="tag-new">new in 0.9.0</span></li>
+        <li>A database in Docker usually leaves the host with no <code>psql</code>, <code>mariadb</code> or <code>redis-cli</code>. Then the commands run in the one container that publishes the server's port on this machine's loopback, with the client its image ships, the password passed by name. <span class="tag-new">new in 0.9.0</span></li>
         <li>A Redis slot is given only where the app reads a slot setting (<code>REDIS_DB</code>, or the path of its URL), and only if the slot is empty. Keys pando did not put there belong to someone else. Slot 0 and main's own slots are never given out.</li>
       </ul>
       <div class="rv">
@@ -530,7 +532,7 @@ nothing else. Nothing was made.</span></pre>
         </ul>
       </div>
     </div>
-    <p class="rv d">Today, namespaced mode makes Postgres <span class="tag-new">new in 0.8.1</span>, MariaDB and MySQL databases and Redis slots, in a native server or a container, pgvector, PostGIS and TimescaleDB images included. Every other service stays shared, and the start says so for each one. What a namespace is on an engine is the <code>[namespace]</code> table of its recipe, so another engine is a recipe rather than a release.</p>
+    <p class="rv d">Today, namespaced mode makes Postgres, MariaDB and MySQL databases and Redis slots, in a native server or a container, pgvector, PostGIS and TimescaleDB images included, and gives Elasticsearch, OpenSearch, Kafka, Meilisearch, Memcached and Redis a prefix where the app reads one. Every other service stays shared, and the start says so for each one, with the setting that would change it. What a namespace is on an engine is the <code>[namespace]</code> or <code>[prefix]</code> table of its recipe, so another engine is a recipe file rather than a release; what pando cannot tell about a project, its setup writes into <code>[namespaced.&lt;service&gt;]</code>.</p>
 
     <h3 class="rv" data-beat="stop and rm">What happens to the data</h3>
     <div class="tbl-scroll rv">
@@ -568,7 +570,7 @@ nothing else. Nothing was made.</span></pre>
       <figure class="fig rv" style="margin:0">
 <pre class="code tree-ls"><span class="dir">~/.pando/</span>
 <span class="br">├── </span>config.toml                <span class="note">your choices: theme, appearance</span>
-<span class="br">├── </span><span class="dir">recipes/</span>  <span class="dir">themes/</span>        <span class="note">your native services, colour themes</span>
+<span class="br">├── </span><span class="dir">recipes/</span>  <span class="dir">themes/</span>        <span class="note">your native services and engines, colour themes</span>
 <span class="br">└── </span><span class="dir">projects/acme-shop-2bdf70d7/</span>
 <span class="br">    ├── </span>pando.toml             <span class="note">the whole config for one project</span>
 <span class="br">    ├── </span>state.json             <span class="note">what runs where, on which ports</span>
@@ -612,8 +614,8 @@ nothing else. Nothing was made.</span></pre>
     <div class="split">
       <div class="rv">
         <p class="lede">You do not write a config file to start. Before it asks anything, pando reads the main checkout: <code>package.json</code> scripts, Makefile and justfile targets, lockfiles, workspace markers, version files, the first env example, framework markers, compose files, and the gitignored files at the root. A root with no manifest of its own, such as <code>backend/</code> beside <code>frontend/</code>, is read one directory down and in <code>apps/*</code> and <code>packages/*</code>: each app's scripts, lockfile, version file and env files, each installed and run in its own directory. Nothing starts while it reads.</p>
-        <p>From that it proposes answers to eleven questions, always in the same order, each with the evidence behind it:</p>
-        <p class="slots"><code>install</code> <code>version_files</code> <code>prelude</code> <code>processes</code> <code>dev_cmd</code> <code>port_env</code> <code>services</code> <code>schema_hook</code> <code>provision</code> <code>clone</code> <code>base</code></p>
+        <p>From that it proposes answers to twelve questions, always in the same order, each with the evidence behind it:</p>
+        <p class="slots"><code>install</code> <code>version_files</code> <code>prelude</code> <code>processes</code> <code>dev_cmd</code> <code>port_env</code> <code>services</code> <code>schema_hook</code> <code>provision</code> <code>clone</code> <code>base</code> <code>namespaced</code></p>
         <p>On a terminal, <code>new</code>, <code>start</code> and the TUI take the rules' first choice for anything they have one for, and print what they took:</p>
       </div>
       <div class="rv">
@@ -706,7 +708,7 @@ Pando: one aspen, 47,000 stems, one root. Your repo, every branch alive.
     <div class="split stack">
       <div class="rv">
         <p><code>pando check</code> makes a detached worktree of the commit a new branch would fork from, so there is no branch. It installs it, starts every process, waits until they are ready, and asks the process that owns the URL for <code>/</code>. Then it stops and removes the worktree, keeps its logs, and records the result in <code>check.json</code>.</p>
-        <p>A status of 500 or higher, a refused connection or silence is a failure. Any other answer passes: a login redirect is a working app. It runs on the shared services and skips the hooks that run after them, so it never migrates your own data. When a namespaced login already exists, it proves the schema step in a namespace of its own.</p>
+        <p>A status of 500 or higher, a refused connection or silence is a failure. Any other answer passes: a login redirect is a working app. It runs on the shared services and skips the hooks that run after them, so it never migrates your own data. When a namespaced login already exists, or a container's administrator gives one, it proves the schema step in a namespace of its own.</p>
       </div>
       <div class="term rv">
         <div class="term-bar"><span class="dots"><i></i><i></i><i></i></span><span class="grow">pando check</span></div>
@@ -792,7 +794,7 @@ pando: removed the test worktree; nothing left behind</span>
       <div class="verb"><div class="sig"><span class="name">init</span></div><div class="what"><p>Answer every setup question now, in one pass, instead of taking defaults as you go.</p><div class="flags"><code>--yes</code> · <code>--answers &lt;file|-&gt;</code> · <code>--dry-run</code> · <code>--replace</code>, <code>--agent</code> the job for a coding agent, <code>--reference brief|json|memory</code> <span class="tag-new">new in 0.5.0</span></div></div></div>
       <div class="verb"><div class="sig"><span class="name">check</span></div><div class="what"><p>Test the setup in a throwaway worktree: install, start, ask for the page, remove. <span class="tag-new">new in 0.5.0</span></p><div class="flags"><code>--base &lt;branch&gt;</code> test the commit this branch is at, for this run only · <code>--json</code></div></div></div>
       <div class="verb"><div class="sig"><span class="name">doctor</span></div><div class="what"><p>What pando found and where, and what is missing: project, config, runtime, tools, worktrees, services, hooks. Read-only.</p><div class="flags"><code>--json</code> · <code>--adopt &lt;old-id&gt;</code> after you moved the repository</div></div></div>
-      <div class="verb"><div class="sig"><span class="name">signals</span></div><div class="what">The detection evidence as JSON: what the repository says about how to run itself. Two runs print the same thing.</div></div>
+      <div class="verb"><div class="sig"><span class="name">signals</span></div><div class="what">The detection evidence as JSON: what the repository says about how to run itself, and what a namespaced start would do with each service. Two runs print the same thing.</div></div>
       <div class="verb"><div class="sig"><span class="name">completions</span> &lt;shell&gt;</div><div class="what">A completion script for bash, zsh, fish, elvish or PowerShell; in bash, zsh and fish it completes worktree names too.</div></div>
       <div class="verb"><div class="sig"><span class="name">update</span></div><div class="what"><p><span class="tag-new">new in 0.8.2</span> Update pando to the latest release, the way it was installed: <code>brew upgrade</code> for Homebrew's, <code>cargo install</code> at the release's tag for cargo's, the install script into its own directory for any other.</p><div class="flags"><code>--check</code> whether a newer release is out, and the command that would install it</div></div></div>
     </div>
@@ -892,7 +894,14 @@ rules = [{ match = <span class="s">"*-beta"</span>, base = <span class="s">"beta
 
 <span class="k">[share]</span>
 provider = <span class="s">"cloudflared"</span>
-auth_cmd = <span class="s">"./scripts/dev-cookie.sh"</span>       <span class="c"># its stdout becomes the visitor's Cookie header</span></pre>
+auth_cmd = <span class="s">"./scripts/dev-cookie.sh"</span>       <span class="c"># its stdout becomes the visitor's Cookie header</span>
+
+<span class="k">[namespaced.search]</span>                       <span class="c"># how a namespaced start gives it data of its own</span>
+recipe = <span class="s">"elasticsearch"</span>                  <span class="c"># when the image does not say what it is</span>
+prefix_env = [<span class="s">"SEARCH_INDEX_PREFIX"</span>]      <span class="c"># keys the app reads a prefix from</span>
+
+<span class="k">[namespaced.cache]</span>
+db_env = [<span class="s">"REDIS_DB"</span>]                     <span class="c"># keys naming a database or slot pando missed</span></pre>
     </details>
 
     <h3 id="ref-machine" class="rv">Machine config and themes</h3>
@@ -920,7 +929,7 @@ theme = <span class="s">"catppuccin"</span>
         <tbody>
           <tr><td class="w">worktrees</td><td><code>git</code></td></tr>
           <tr><td class="w">isolated services</td><td>Docker with compose, or the engine a recipe names (<code>postgres</code>, <code>mariadb</code>, <code>redis-server</code>…). pando prints the install command and never runs it.</td></tr>
-          <tr><td class="w">namespaced mode</td><td>a Postgres, MariaDB/MySQL or Redis server your main checkout already uses, and its client (<code>psql</code>, <code>mariadb</code>, <code>redis-cli</code>)</td></tr>
+          <tr><td class="w">namespaced mode</td><td>a server your main checkout already uses: Postgres, MariaDB/MySQL or Redis, with its client (<code>psql</code>, <code>mariadb</code>, <code>redis-cli</code>) on the host or in the container that runs it; or a search, queue or cache engine whose app reads a prefix, which needs nothing</td></tr>
           <tr><td class="w">sharing</td><td><code>cloudflared</code>. No account.</td></tr>
           <tr><td class="w">pull requests</td><td>the GitHub CLI, <code>gh</code>, signed in</td></tr>
         </tbody>
@@ -1029,6 +1038,7 @@ theme = <span class="s">"catppuccin"</span>
             <thead><tr><th>you know…</th><th>your contribution</th></tr></thead>
             <tbody>
               <tr><td>a database or cache it should run natively</td><td>a recipe: <code>src/recipes/builtin/*.toml</code></td></tr>
+              <tr><td>an engine namespaced mode should know</td><td>a recipe with a <code>[namespace]</code> or <code>[prefix]</code> table and no <code>[service]</code></td></tr>
               <tr><td>a framework it misreads</td><td>a rule: <code>src/catalog/frameworks.rs</code></td></tr>
               <tr><td>a package manager or lockfile</td><td>a row: <code>src/catalog/package_managers.rs</code></td></tr>
               <tr><td>a language or version manager</td><td>a row: <code>src/runtime/languages.rs</code></td></tr>

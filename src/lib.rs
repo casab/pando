@@ -32,6 +32,7 @@
 //! | a program pando runs itself, and how to get it | a row in [`catalog::tools::TOOLS`] |
 //! | a language or version manager | `runtime/languages.rs` |
 //! | a native service (postgres, redis…) | a TOML file in `recipes/builtin/`, and a row in [`recipes::BUILT_IN`] |
+//! | an engine namespaced mode should know, that pando never starts | a TOML file in `recipes/builtin/` with a `[namespace]` or `[prefix]` and no `[service]`, a row in [`recipes::BUILT_IN`], and its images' `engine` in [`catalog::images::IMAGES`] |
 //! | a CLI verb | `cli/mod.rs` (`Command`, `dispatch`), its output in a file of its own under `cli/`, the behaviour in `actions/`, and the verb list in `CLAUDE.md`, which a test holds to clap |
 //! | a question pando asks | [`detect::Slot`], its proposal in `detect/`, its config edit in `detect/apply.rs`, and [`actions::ALL_SLOTS`]; the slot names are a published contract with a test that pins them |
 //! | a `doctor` section | [`doctor::Section`], its report type in `doctor/report.rs`, a file under `doctor/`, its renderer in `doctor/render.rs`, and `agent/json.md`, which a test holds to the enum |

@@ -191,13 +191,18 @@ Every change keeps these, and the tests enforce both:
 | a service image a compose file uses | a row in `IMAGES` in `src/catalog/images.rs` |
 | a language or version manager | `src/runtime/languages.rs` |
 | a native service | a TOML file in `src/recipes/builtin/`, and a row in `recipes::BUILT_IN` |
+| an engine namespaced mode should know | a TOML file in `src/recipes/builtin/` with a `[namespace]` or `[prefix]` and no `[service]`, a row in `recipes::BUILT_IN`, and the image's `engine` in `IMAGES` |
 | a colour theme | a TOML file in `src/theme/builtin/`, and a row in `theme::BUILT_IN` |
 | a CLI verb | `src/cli/mod.rs`, its output under `src/cli/`, its behaviour in `src/actions/`, and the README's command list, which a test holds to clap |
 | a TUI key | `src/tui/app/`, with its row in `src/tui/app/keymap.rs`, which a test holds to the handler |
 
 A native service recipe is the same format as one a user drops into
 `~/.pando/recipes/`: read `src/recipes/builtin/postgres.toml` and
-`redis.toml` before writing a new one. A theme is a background, a
+`redis.toml` before writing a new one, and `elasticsearch.toml` for an
+engine pando never starts. A `[namespace]` keeps a contract: `create`
+fails when the name is already there, a slot's commands never fall back
+to slot 0, `size` prints a bare number, and the password reaches the
+client only in `password_env`. A theme is a background, a
 foreground and seven accents for each of a dark and a light half; every
 other colour is derived.
 

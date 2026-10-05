@@ -10,19 +10,23 @@ may change behaviour.
 ### Added
 
 - Namespaced mode for engines whose namespaces are the app's own: an
-  Elasticsearch or OpenSearch index, a Kafka topic, a Meilisearch index,
-  a Memcached or Redis key. Where the app reads a prefix beside the
+  Elasticsearch or OpenSearch index, a Kafka or Redpanda topic, a
+  Meilisearch or Typesense index, a Memcached or Redis key. Where the app reads a prefix beside the
   address (`ELASTICSEARCH_INDEX_PREFIX`, `REDIS_PREFIX`), a namespaced
-  worktree is told one of its own — main's, then `feat_x__` — and the
+  worktree is told one of its own — main's, then the worktree's name and
+  a short hash of it and the project, `feat_x_1f3c4a__` — and the
   service is its data. A prefix is told, never made: nothing is recorded
   or dropped, and `rm` says what it leaves. Every process of a
-  namespaced worktree is told `PANDO_NAMESPACE`, its slug.
+  namespaced worktree is told `PANDO_NAMESPACE`, the same name.
 - A database in a container is set up with nobody asked: where the
   app's login may not make the worktree's database, pando runs the
   grant it used to print as the container's own administrator, read
   from its environment (`POSTGRES_USER`/`POSTGRES_PASSWORD`,
-  `MARIADB_ROOT_PASSWORD`), and where the app's env files carry no login,
-  that administrator is the login. A recipe says where with
+  `MARIADB_ROOT_PASSWORD`, `MYSQL_ROOT_PASSWORD`), and where the app's
+  env files carry no login, that administrator is the login, the one
+  `rm` then drops as. Only a container that alone publishes the port on
+  this machine's loopback, with nothing else listening there, is taken
+  for the server, and an administrator is used only once it answers. A recipe says where with
   `[namespace.container_admin]` and `run_sql`.
 - The setup brief's first run answers `namespaced` when `init` says a
   service would stay on main's data.

@@ -847,12 +847,12 @@ committed `pando.toml` may carry it too.
 A namespaced start that stops with a `GRANT …` or `ALTER ROLE …`
 statement on stderr means the app's login may not make the worktree's
 database, and pando found no administrator to run it — a server in a
-container has one, and pando runs it there itself. Report the statement;
+container usually has one, and pando runs it there itself. Report the statement;
 running it is the human's, as an administrator of their own server. A start that says `psql`, `mariadb` or
 `redis-cli` is not on PATH names what to install: report that too. A
 server in a container that publishes its port is reached through the
 client its image ships, so that line means no such container was
-found either.
+found, or its image lacks the client too.
 
 `--yes` is not a way past exit 3. It takes the rules' own preferred option,
 which is a decision you are making on the developer's behalf with no

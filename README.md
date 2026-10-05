@@ -11,7 +11,7 @@
   <a href="https://github.com/mertkaradayi/pando/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/mertkaradayi/pando/ci.yml?branch=main&style=flat-square&label=ci"></a>
   <img alt="Rust 2024 edition" src="https://img.shields.io/badge/rust-2024_edition-e6963c?style=flat-square&logo=rust">
   <img alt="Platform: macOS and Linux" src="https://img.shields.io/badge/platform-macOS_|_Linux-6e9beb?style=flat-square">
-  <img alt="Version 0.8.3, pre-release" src="https://img.shields.io/badge/version-0.8.3_pre--release-b482e6?style=flat-square">
+  <img alt="Version 0.9.0, pre-release" src="https://img.shields.io/badge/version-0.9.0_pre--release-b482e6?style=flat-square">
   <a href="CONTRIBUTING.md"><img alt="PRs welcome" src="https://img.shields.io/badge/PRs-welcome-50c878?style=flat-square"></a>
   <a href="https://github.com/mertkaradayi/pando/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/mertkaradayi/pando?style=flat-square&logo=github&color=ebc34b"></a>
 </p>
@@ -187,9 +187,9 @@ Your repository works the same way.
   Redis, MariaDB, whatever your compose file declares — or, on a machine
   that would rather not run Docker, the same databases natively from a
   recipe you can override
-- Or, experimentally, a database and a Redis slot of its own inside the
-  servers your main checkout already runs: no server to start, nothing to
-  wait for, and main's data untouched
+- Or, experimentally, a database, a Redis slot or a name prefix of its own
+  inside the servers your main checkout already runs: no server to start,
+  nothing to wait for, and main's data untouched
 - Shares any running worktree through a public tunnel URL
 - Turns an open pull request into a running worktree: pick it from the
   list, press enter — a fork's too
@@ -208,7 +208,7 @@ under `~/.pando`:
 ```text
 ~/.pando/
 ├── config.toml                  your choices: theme, appearance
-├── recipes/  themes/            your own native-service recipes and colour themes
+├── recipes/  themes/            your own service and engine recipes, colour themes
 └── projects/<project>-<id>/
     ├── pando.toml               the whole configuration for one project
     ├── worktrees/feat+checkout/ a stem: the branch's own checkout
@@ -219,9 +219,10 @@ under `~/.pando`:
 
 One mode writes somewhere that is yours all the same: a namespaced
 worktree gets a database of its own in your own database server. That is
-opt-in, named after your main database so it can never be it, limited by a
-grant you give once to that prefix and nothing else, and dropped only by
-`rm`, only when pando's own records say pando made it. See
+opt-in, named after your main database so it can never be it, made by a
+login that may create databases (granted once, by you, or for a server
+in a container by its own administrator), and dropped only by `rm`, only
+when pando's own records say pando made it. See
 [Shared, namespaced, isolated](#shared-namespaced-isolated).
 
 ## Your first run
@@ -389,8 +390,8 @@ worktree nothing asks.
 The list is a table with a header row: `branch`, then `changes`
 (`uncommitted` when there are uncommitted changes), `port`, `public` (`◈`
 while it is shared), `mode` (`isolated` when it runs private copies of
-the services, `namespaced` when it runs on a database and a slot of its
-own in the main checkout's servers, each in its own colour), `git`
+the services, `namespaced` when it runs on a database, a slot or a
+prefix of its own in the main checkout's servers, each in its own colour), `git`
 (commits ahead of and behind the base branch), `PR` and `status`
 (`failed`, or what is being done to it). A column shows only when some
 row has something in it. The glyph before the branch says whether it
@@ -442,7 +443,9 @@ another mode until `rm` drops them.
 
 - It logs in as your app does, with the user and password beside the
   address in the main checkout's `.env` — the root's, or the one in the
-  directory a process runs in, such as `backend/.env`. Where there are none it asks
+  directory a process runs in, such as `backend/.env`. Where there are none,
+  a server in a container is reached as its own administrator, and
+  anywhere else pando asks
   once, keeps the answer in pando's own config for the project (mode
   0600), and hands it to the database client in its environment, never
   on a command line.
@@ -461,7 +464,8 @@ another mode until `rm` drops them.
   neither.
 - A server in a container needs neither the grant nor a question: its
   environment already keeps its administrator (`POSTGRES_USER` and
-  `POSTGRES_PASSWORD`, `MARIADB_ROOT_PASSWORD`), so pando runs that same
+  `POSTGRES_PASSWORD`, `MARIADB_ROOT_PASSWORD` or `MYSQL_ROOT_PASSWORD`),
+  so pando runs that same
   statement itself, as the administrator, and the database is made as
   the app's login, which owns it. Where the app's env files carry no
   login at all, the administrator is the login. Only a server with no
@@ -487,9 +491,11 @@ another mode until `rm` drops them.
   `PANDO_NAMESPACE=feat_x`, for an app that puts it in front of its
   names by itself.
 - A database in Docker usually leaves the host with no `psql`,
-  `mariadb` or `redis-cli`. Then the commands run in the container that
-  publishes the server's port, with the client its image ships
-  (`docker exec`, the password passed by name).
+  `mariadb` or `redis-cli`. Then the commands run in the one container
+  that publishes the server's port on this machine's loopback, with the
+  client its image ships (`docker exec`, the password passed by name). A
+  server elsewhere, or a native one listening on the same port, is never
+  taken for it.
 - What pando cannot tell by itself is written in its own config for the
   project, under `[namespaced.<service>]` — usually by the setup agent,
   through `pando init --answers`. None of it is a secret, so a committed
@@ -510,8 +516,8 @@ another mode until `rm` drops them.
 Postgres, MariaDB and MySQL databases and Redis slots are made, in a
 native server or in a container, Postgres images with an extension built
 in (pgvector, PostGIS, TimescaleDB) included; Elasticsearch, OpenSearch,
-Kafka, Meilisearch, Memcached and Redis get a prefix where the app reads
-one. Every other service stays shared, and a namespaced start says so
+Kafka, Redpanda, Meilisearch, Typesense, Memcached and Redis get a prefix
+where the app reads one. Every other service stays shared, and a namespaced start says so
 for each.
 
 </details>
@@ -674,9 +680,9 @@ missing; pando never installs anything on your machine by itself.
 | `cloudflared` | `pando share`, a public URL for a worktree | `brew install cloudflared` | [Cloudflare's package](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) |
 | `gh` | the TUI's pull request picker (`p`) | `brew install gh` | [the GitHub CLI's package](https://github.com/cli/cli#installation) |
 | Docker with Compose | `start --isolated`, when the project's services are in a compose file | Docker Desktop or OrbStack | Docker Engine and its compose plugin |
-| `redis-server`, `redis-cli` | a private Redis without Docker; `redis-cli` alone for `--namespaced` | `brew install redis` | `redis-server`, `redis-tools` |
-| `mariadbd`, `mariadb` | a private MariaDB without Docker; the `mariadb` client alone for `--namespaced` | `brew install mariadb` | `mariadb-server`, `mariadb-client` |
-| `postgres`, `psql` | a private Postgres without Docker; the `psql` client alone for `--namespaced` | `brew install postgresql@16`, or `brew install libpq` for `psql` alone (keg-only: put `$(brew --prefix libpq)/bin` on PATH) | `postgresql`, `postgresql-client` |
+| `redis-server`, `redis-cli` | a private Redis without Docker; `redis-cli` alone for `--namespaced`, unless the server runs in a container whose image ships it | `brew install redis` | `redis-server`, `redis-tools` |
+| `mariadbd`, `mariadb` | a private MariaDB without Docker; the `mariadb` client alone for `--namespaced`, unless the server runs in a container whose image ships it | `brew install mariadb` | `mariadb-server`, `mariadb-client` |
+| `postgres`, `psql` | a private Postgres without Docker; the `psql` client alone for `--namespaced`, unless the server runs in a container whose image ships it | `brew install postgresql@16`, or `brew install libpq` for `psql` alone (keg-only: put `$(brew --prefix libpq)/bin` on PATH) | `postgresql`, `postgresql-client` |
 | `mongod`, `mongosh` | a private MongoDB without Docker | `brew install mongodb/brew/mongodb-community` | [MongoDB's package](https://www.mongodb.com/docs/manual/administration/install-on-linux/) |
 
 The usual pair on a Mac, for sharing and pull requests:
@@ -700,6 +706,7 @@ TOML file:
 | You know… | Your contribution is | Where |
 |---|---|---|
 | a database or cache pando should run natively | a service recipe | `src/recipes/builtin/*.toml` |
+| an engine namespaced mode should give a worktree its own corner of | a recipe with `[namespace]` or `[prefix]` and no `[service]` | `src/recipes/builtin/*.toml` |
 | a framework pando misreads | a detection rule | `src/catalog/frameworks.rs` |
 | a package manager or lockfile | a row | `src/catalog/package_managers.rs` |
 | a language or version manager | a row | `src/runtime/languages.rs` |
@@ -761,7 +768,15 @@ files where the app keeps them. 0.8.2 adds `pando update`, which updates
 pando the way it was installed. 0.8.3 proposes `clone` for the
 `node_modules` the main checkout has, so a new worktree shares its
 dependencies too, and the setup agent asks nothing: it decides what the
-rules leave open and reports what it set. What changed in each version is in the [changelog](CHANGELOG.md).
+rules leave open and reports what it set. 0.9.0 makes namespaced mode
+agnostic of the engine: a search, queue or cache engine whose app reads
+a prefix gets one of the worktree's own, a database in a container is
+reached through the client its image ships and granted by its own
+administrator, and the setup agent writes what pando cannot tell into
+`[namespaced.<service>]` — so a first setup leaves namespaced mode ready
+with nobody asked. Its container path is tested with a stand-in `docker`
+in front of real servers, not in a real container yet, and the prefix
+engines on fixtures alone. What changed in each version is in the [changelog](CHANGELOG.md).
 
 macOS is what it is developed on. CI runs the whole test suite on macOS
 and on Linux for every change, and both pass — but the suite runs on

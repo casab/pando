@@ -12,7 +12,9 @@
 //! **One loader, two kinds of recipe.** Every recipe shares an envelope —
 //! `kind`, `name`, `aliases`, the binaries it needs on PATH, how to ask one
 //! for its version, how to install it, a note worth printing — and carries
-//! one body table, `[service]` or `[language]`. The language body is the
+//! one body table, `[service]` or `[language]`; a service recipe may carry
+//! only a `[namespace]` or `[prefix]` instead, for an engine pando never
+//! starts but namespaced mode knows. The language body is the
 //! shape of [`crate::runtime::LANGUAGES`], which is a `const` table today
 //! and was deliberately built to be loadable from disk later. Nothing here
 //! migrates it; a round-trip test in this module is the proof that the
@@ -156,8 +158,9 @@ pub struct NamespaceRecipe {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_name: Option<usize>,
     /// What an administrator runs, once, so the login may make and drop
-    /// namespaces under this worktree's prefix and nothing else. Printed,
-    /// never run. Sees `{prefix_like}` — the prefix as an SQL `LIKE`
+    /// namespaces under this worktree's prefix and nothing else. Printed
+    /// for a person, or run by pando itself through `run_sql` as the
+    /// administrator a container's environment keeps. Sees `{prefix_like}` — the prefix as an SQL `LIKE`
     /// pattern — and `{account_user}`, `{account_host}`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grant: Option<String>,
