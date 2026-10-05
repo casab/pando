@@ -7,6 +7,8 @@ may change behaviour.
 
 ## Unreleased
 
+## 0.9.0 — 2026-10-05
+
 ### Added
 
 - Namespaced mode for engines whose namespaces are the app's own: an
