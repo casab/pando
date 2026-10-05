@@ -1028,6 +1028,76 @@ fn a_namespaced_plan_reads_the_env_files_where_the_processes_run() {
     assert_eq!(plan.targets[0].port, 3308);
 }
 
+// Two Redis roles, each with its own slot key beside its own address.
+// Only the first role's key was found, so the queue went on naming
+// main's slot while the cache moved to the worktree's.
+#[test]
+fn every_address_keys_own_slot_key_is_found_and_pointed_at_the_worktrees() {
+    let mut fx = fixture();
+    let services: Config = toml::from_str(
+        "[[services]]\nkind = \"native\"\nname = \"redis\"\n\
+         env = { REDIS_CACHE_PORT = \"redis\", REDIS_QUEUE_PORT = \"redis\" }\n",
+    )
+    .unwrap();
+    fx.config.services = services.services;
+    std::fs::write(
+        fx.root.join(".env"),
+        "REDIS_CACHE_PORT=6379\nREDIS_CACHE_DB=1\nREDIS_QUEUE_PORT=6379\nREDIS_QUEUE_DB=2\n",
+    )
+    .unwrap();
+    let plan = super::namespaced::plan(&fx.paths, &fx.config);
+    let target = &plan.targets[0];
+    assert_eq!(target.mains, ["1", "2"]);
+    assert_eq!(
+        target.tells,
+        vec![
+            super::namespaced::Tell::Key("REDIS_CACHE_DB".to_string()),
+            super::namespaced::Tell::Key("REDIS_QUEUE_DB".to_string()),
+        ]
+    );
+}
+
+// Where an app names its database is the recipe's to say: a recipe whose
+// `[namespace.address]` names a `_SCHEMA` key and no URL path finds main's
+// there, and leaves the URL as it is.
+#[test]
+fn a_recipes_own_address_says_where_the_app_names_its_database() {
+    let mut fx = fixture();
+    let recipes = fx.paths.recipes_dir();
+    std::fs::create_dir_all(&recipes).unwrap();
+    let postgres = crate::recipes::Recipes::built_in()
+        .get("postgres")
+        .unwrap()
+        .recipe
+        .clone();
+    let text = include_str!("../recipes/builtin/postgres.toml").replace(
+        "[namespace.address]\nurl_path = true\nkeys = [\"_NAME\", \"_DATABASE\", \"_DB\"]",
+        "[namespace.address]\nurl_path = false\nkeys = [\"_SCHEMA\"]",
+    );
+    assert_ne!(text, include_str!("../recipes/builtin/postgres.toml"));
+    std::fs::write(recipes.join("postgres.toml"), text).unwrap();
+    let services: Config = toml::from_str(
+        "[[services]]\nkind = \"native\"\nname = \"postgres\"\n\
+         env = { DATABASE_URL = \"postgres\" }\n",
+    )
+    .unwrap();
+    fx.config.services = services.services;
+    std::fs::write(
+        fx.root.join(".env"),
+        "DATABASE_URL=postgres://app@localhost:5432/shop\nDATABASE_SCHEMA=tenant\n",
+    )
+    .unwrap();
+    let plan = super::namespaced::plan(&fx.paths, &fx.config);
+    assert!(plan.shared.is_empty(), "{:?}", plan.shared);
+    let target = &plan.targets[0];
+    assert_eq!(target.recipe, postgres.name);
+    assert_eq!(target.mains, ["tenant"]);
+    assert_eq!(
+        target.tells,
+        vec![super::namespaced::Tell::Key("DATABASE_SCHEMA".to_string())]
+    );
+}
+
 // Three Redis roles at split addresses share one slot key, `REDIS_DB`,
 // beside none of them. pando found no slot, kept Redis shared, and one
 // worktree's worker took the jobs another enqueued. `db_env` names it.

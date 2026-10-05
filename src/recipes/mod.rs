@@ -167,12 +167,86 @@ pub struct NamespaceRecipe {
     /// server does not have.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grant_covers: Option<String>,
+    /// Where an app on this engine names its database or slot, so pando
+    /// finds the main checkout's and points the worktree's at its own.
+    /// [`NamespaceRecipe::address`] gives the kind's own when a recipe
+    /// says nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<AddressRecipe>,
+}
+
+/// Where an app names its database or slot: `[namespace.address]`.
+///
+/// Engine data rather than code: a Postgres URL's path is its database, a
+/// Redis client may read `?db=` before the path, and an app keeping its
+/// database apart from its address calls it `DATABASE_NAME` beside
+/// `DATABASE_PORT`. Every value pando finds here is the main checkout's,
+/// and every one is pointed at the worktree's own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AddressRecipe {
+    /// Whether the path of a URL the app reads names it:
+    /// `mysql://…/shop`, `redis://…/0`.
+    #[serde(default = "yes")]
+    pub url_path: bool,
+    /// The query parameters of that URL that name it besides:
+    /// `redis://…?db=0`, which redis-py reads before the path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub url_query: Vec<String>,
+    /// A key beside the address that names it, by suffix, the first one
+    /// set winning: `DATABASE_NAME` for `DATABASE_PORT` with `_NAME`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<String>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// `_NAME`: what follows an env key's stem, as `[namespace.address]` and
+/// `[prefix]` name the keys an app reads.
+fn is_key_suffix(suffix: &str) -> bool {
+    suffix.len() > 1
+        && suffix.starts_with('_')
+        && suffix
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+impl AddressRecipe {
+    /// What a recipe written before `[namespace.address]` existed means:
+    /// the conventions pando held for each kind then. The built-ins say
+    /// the same in their own tables, and a test holds them together.
+    pub fn of_kind(kind: crate::state::NamespaceKind) -> AddressRecipe {
+        use crate::state::NamespaceKind;
+        let strings = |list: &[&str]| list.iter().map(|s| s.to_string()).collect();
+        match kind {
+            NamespaceKind::Database => AddressRecipe {
+                url_path: true,
+                url_query: Vec::new(),
+                keys: strings(&["_NAME", "_DATABASE", "_DB"]),
+            },
+            NamespaceKind::Slot => AddressRecipe {
+                url_path: true,
+                url_query: strings(&["db"]),
+                keys: strings(&["_DB"]),
+            },
+        }
+    }
 }
 
 impl NamespaceRecipe {
     /// The longest database name this engine keeps as given.
     pub fn max_name(&self) -> usize {
         self.max_name.unwrap_or(crate::namespace::MAX_NAME)
+    }
+
+    /// Where an app names its database or slot: the recipe's own
+    /// `[namespace.address]`, or its kind's.
+    pub fn address(&self) -> AddressRecipe {
+        self.address
+            .clone()
+            .unwrap_or_else(|| AddressRecipe::of_kind(self.kind))
     }
 
     /// The shape a kind needs, or what is missing from it.
@@ -201,6 +275,21 @@ impl NamespaceRecipe {
         }
         if self.ping.trim().is_empty() || self.drop.trim().is_empty() {
             bail!("a [namespace] needs `ping` and `drop`");
+        }
+        if let Some(address) = &self.address {
+            if !address.url_path && address.url_query.is_empty() && address.keys.is_empty() {
+                bail!("a [namespace.address] that names nothing leaves the app nowhere to be told");
+            }
+            if let Some(bad) = address.keys.iter().find(|suffix| !is_key_suffix(suffix)) {
+                bail!(
+                    "[namespace.address] keys are suffixes of an env key, as `_NAME` — not {bad:?}"
+                );
+            }
+            if let Some(bad) = address.url_query.iter().find(|name| {
+                name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            }) {
+                bail!("[namespace.address] url_query names a query parameter, not {bad:?}");
+            }
         }
         // Room for `<main>__`, a hash, and one character of the worktree's
         // name, and no more than the guard on every drop allows.
@@ -822,6 +911,57 @@ mod tests {
             .unwrap_err()
         );
         assert!(e.contains("belongs to a `kind = \"service\"`"), "{e}");
+    }
+
+    /// Where an app names its database or slot is the recipe's to say, and
+    /// a table that would leave the app nowhere to be told, or name a key
+    /// that is no suffix, is refused when the recipe is read.
+    #[test]
+    fn a_namespace_address_is_data_and_held_to_what_it_names() {
+        let head = "kind = \"service\"\nname = \"x\"\n\n[service]\ncmd = \"c\"\n\n\
+                    [namespace]\nkind = \"database\"\nping = \"p\"\ndrop = \"d\"\n\
+                    create = \"c\"\nexists = \"e\"\n\n[namespace.address]\n";
+        let parsed = parse(&format!("{head}url_path = false\nkeys = [\"_SCHEMA\"]\n")).unwrap();
+        let address = parsed.namespace.unwrap().address();
+        assert!(!address.url_path);
+        assert_eq!(address.keys, ["_SCHEMA"]);
+        for (table, says) in [
+            ("url_path = false\n", "names nothing"),
+            ("keys = [\"NAME\"]\n", "suffixes of an env key"),
+            ("keys = [\"_\"]\n", "suffixes of an env key"),
+            ("url_query = [\"a&b\"]\n", "names a query parameter"),
+            ("url_path = true\nport = 1\n", "unknown field"),
+        ] {
+            let e = format!("{:#}", parse(&format!("{head}{table}")).unwrap_err());
+            assert!(e.contains(says), "{table}: {e}");
+        }
+        // A recipe written before the table existed means its kind's.
+        let recipe = parse(
+            "kind = \"service\"\nname = \"x\"\n\n[service]\ncmd = \"c\"\n\n[namespace]\n\
+             kind = \"slot\"\nping = \"p\"\ndrop = \"d\"\nsize = \"s\"\nslots = 4\n",
+        )
+        .unwrap();
+        assert_eq!(
+            recipe.namespace.unwrap().address(),
+            AddressRecipe::of_kind(crate::state::NamespaceKind::Slot)
+        );
+    }
+
+    /// The built-ins say their address in their own files, and what they
+    /// say is what a recipe of their kind with no table means: two lists
+    /// of one fact, held to one.
+    #[test]
+    fn every_built_in_namespace_states_its_kinds_address() {
+        for (name, loaded) in Recipes::built_in().entries() {
+            let Some(namespace) = &loaded.recipe.namespace else {
+                continue;
+            };
+            assert_eq!(
+                namespace.address.as_ref(),
+                Some(&AddressRecipe::of_kind(namespace.kind)),
+                "{name}"
+            );
+        }
     }
 
     /// An engine nobody here could run says so in the one place that is

@@ -104,3 +104,9 @@ drop = "psql -X -w -v ON_ERROR_STOP=1 -h {host} -p {port} -U {user} -d postgres 
 denied = ["permission denied to create database", "must be owner of database", "permission denied to drop database"]
 grant = '''ALTER ROLE "{account_user}" CREATEDB;'''
 grant_covers = "make databases, and drop only the ones it made"
+
+# Where an app names its database: a URL's path, or a key beside the
+# address — `DATABASE_NAME` next to `DATABASE_PORT`.
+[namespace.address]
+url_path = true
+keys = ["_NAME", "_DATABASE", "_DB"]

@@ -71,3 +71,9 @@ drop = "mariadb --protocol=tcp -h {host} -P {port} -u {user} -e 'DROP DATABASE I
 denied = ["ERROR 1044"]
 account = "mariadb --protocol=tcp -h {host} -P {port} -u {user} -N -B -e 'SELECT CURRENT_USER()'"
 grant = '''GRANT ALL ON `{prefix_like}`.* TO '{account_user}'@'{account_host}';'''
+
+# Where an app names its database: a URL's path, or a key beside the
+# address — `DATABASE_NAME` next to `DATABASE_PORT`.
+[namespace.address]
+url_path = true
+keys = ["_NAME", "_DATABASE", "_DB"]

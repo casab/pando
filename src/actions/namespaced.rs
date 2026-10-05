@@ -175,9 +175,10 @@ pub(super) struct Target {
 pub(super) enum Tell {
     /// A key of its own: `DATABASE_NAME=shop`, `REDIS_DB=0`.
     Key(String),
-    /// The path of a URL: `mysql://…/shop`, `redis://…/0` — and for a
-    /// slot, the `db` its query names too, `redis://…?db=0`.
-    UrlPath(String),
+    /// A URL, at the parts its recipe's `[namespace.address]` says name
+    /// it: the path, `mysql://…/shop`, and any query parameter,
+    /// `redis://…?db=0`.
+    Url(String),
 }
 
 /// Every service of the project, as a namespaced start sees it.
@@ -480,10 +481,7 @@ fn target(
             .map_err(|e| e.to_string())?
             .map_or_else(|| "127.0.0.1".to_string(), |(_, host)| host),
     };
-    let found = match namespace.kind {
-        NamespaceKind::Database => database_main(env, &keys, &urls)?,
-        NamespaceKind::Slot => slot_main(env, &keys, &urls)?,
-    };
+    let found = mains_in(env, &keys, &urls, namespace.kind, &namespace.address())?;
     let (mains, tells) =
         with_db_env(env, service, namespace.kind, db_env, found)?.ok_or(match namespace.kind {
             NamespaceKind::Database => {
@@ -504,55 +502,86 @@ fn target(
     })
 }
 
-/// The query parameter a Redis URL can name its slot by instead of its
-/// path, `redis://localhost:6379?db=2`: redis-py, and the clients built on
-/// it, read it before the path.
-const SLOT_PARAMETER: &str = "db";
-
 /// Every name the main checkout's env files give its own database or slot
 /// on one server, the one it is known by first, and every key that tells
 /// the app which one it uses.
 type Mains = (Vec<String>, Vec<Tell>);
 
-/// Every slot the main checkout's env files name, the one it is known by
-/// first, and every key that says which one the app uses: each URL, by
-/// its query's `db` and by its path — none is slot 0 — and a key of its
-/// own beside the address, `REDIS_DB` next to `REDIS_PORT`. An app that
-/// reads neither has nowhere to be told another slot, and stays shared.
+/// Whether a value can be a namespace of this kind: a slot is a number,
+/// and a database is a name — all digits is a slot, never a database.
+fn fits(kind: NamespaceKind, value: &str) -> bool {
+    let numbered = value.chars().all(|c| c.is_ascii_digit());
+    !value.is_empty()
+        && match kind {
+            NamespaceKind::Slot => numbered,
+            NamespaceKind::Database => !numbered,
+        }
+}
+
+/// Every database or slot the main checkout's env files name, the one it
+/// is known by first, and every key that says which one the app uses, at
+/// the places the recipe's `[namespace.address]` says an app names it:
+/// each URL's path and query parameters, and a key beside each address
+/// key — `DATABASE_NAME` next to `DATABASE_PORT`. An app that names it
+/// nowhere has nowhere to be told the worktree's, and stays shared.
 ///
-/// A URL's `db` and its path are both main's: one client reads the one,
-/// another the other. A slot key whose value holds a reference nothing
-/// sets is the error that names it.
-fn slot_main(
+/// A URL counts only when every place it names one fits the kind: a
+/// Redis URL with no path is slot 0, and its `?db=` is main's as much as
+/// its path, since one client reads the one and another the other. A key
+/// whose value holds a reference nothing sets is the error that names it.
+fn mains_in(
     env: &EnvFiles,
     keys: &[String],
     urls: &[&(String, String)],
+    kind: NamespaceKind,
+    address: &crate::recipes::AddressRecipe,
 ) -> std::result::Result<Option<Mains>, String> {
     let mut mains: Vec<String> = Vec::new();
     let mut tells: Vec<Tell> = Vec::new();
     for (key, url) in urls {
-        let (_, path) = crate::services::url_identity(url);
-        let slots: Vec<String> = crate::services::url_query_values(url, SLOT_PARAMETER)
-            .into_iter()
-            .chain(std::iter::once(path.unwrap_or_else(|| "0".to_string())))
-            .collect();
-        if slots
+        let mut named: Vec<String> = address
+            .url_query
             .iter()
-            .all(|slot| !slot.is_empty() && slot.chars().all(|c| c.is_ascii_digit()))
-        {
-            for slot in slots {
-                add_main(&mut mains, slot);
+            .flat_map(|parameter| crate::services::url_query_values(url, parameter))
+            .collect();
+        if address.url_path {
+            match (crate::services::url_identity(url).1, kind) {
+                (Some(path), _) => named.push(path),
+                // No path is a Redis's slot 0; a database it never is.
+                (None, NamespaceKind::Slot) => named.push("0".to_string()),
+                (None, NamespaceKind::Database) => {}
             }
-            tells.push(Tell::UrlPath(key.clone()));
+        }
+        if !named.is_empty() && named.iter().all(|value| fits(kind, value)) {
+            for value in named {
+                add_main(&mut mains, value);
+            }
+            tells.push(Tell::Url(key.clone()));
         }
     }
-    if let Some((key, value)) = env
-        .sibling(keys.iter().map(String::as_str), &["_DB"])
-        .map_err(|e| e.to_string())?
-        && value.chars().all(|c| c.is_ascii_digit())
-    {
-        add_main(&mut mains, value);
-        tells.push(Tell::Key(key));
+    for key in keys {
+        let Some(stem) = ["_PORT", "_HOST", "_URL"]
+            .iter()
+            .find_map(|suffix| key.strip_suffix(suffix))
+        else {
+            continue;
+        };
+        for suffix in &address.keys {
+            let sibling = format!("{stem}{suffix}");
+            let Some(value) = env.value(&sibling).map_err(|e| e.to_string())? else {
+                continue;
+            };
+            let value = value.trim();
+            if !fits(kind, value) {
+                continue;
+            }
+            add_main(&mut mains, value.to_string());
+            let tell = Tell::Key(sibling);
+            if !tells.contains(&tell) {
+                tells.push(tell);
+            }
+            break;
+        }
     }
     Ok((!mains.is_empty()).then_some((mains, tells)))
 }
@@ -620,52 +649,6 @@ fn add_main(mains: &mut Vec<String>, main: String) {
     if !mains.iter().any(|known| same(known, &main)) {
         mains.push(main);
     }
-}
-
-/// Every database the main checkout's env files name, the one it is
-/// known by first, and every key that says which one the app uses: the
-/// path of each URL, and a key of its own beside the address —
-/// `DATABASE_NAME` next to `DATABASE_PORT`. A name key whose value holds
-/// a reference nothing sets is the error that names it.
-fn database_main(
-    env: &EnvFiles,
-    keys: &[String],
-    urls: &[&(String, String)],
-) -> std::result::Result<Option<Mains>, String> {
-    let mut mains: Vec<String> = Vec::new();
-    let mut tells: Vec<Tell> = Vec::new();
-    for (key, url) in urls {
-        if let (_, Some(database)) = crate::services::url_identity(url) {
-            add_main(&mut mains, database);
-            tells.push(Tell::UrlPath(key.clone()));
-        }
-    }
-    for key in keys {
-        let Some(prefix) = ["_PORT", "_HOST", "_URL"]
-            .iter()
-            .find_map(|suffix| key.strip_suffix(suffix))
-        else {
-            continue;
-        };
-        for suffix in ["_NAME", "_DATABASE", "_DB"] {
-            let sibling = format!("{prefix}{suffix}");
-            let Some(value) = env.value(&sibling).map_err(|e| e.to_string())? else {
-                continue;
-            };
-            let value = value.trim();
-            // All digits is a numbered database — a slot — not a name.
-            if value.is_empty() || value.chars().all(|c| c.is_ascii_digit()) {
-                continue;
-            }
-            add_main(&mut mains, value.to_string());
-            let tell = Tell::Key(sibling);
-            if !tells.contains(&tell) {
-                tells.push(tell);
-            }
-            break;
-        }
-    }
-    Ok((!mains.is_empty()).then_some((mains, tells)))
 }
 
 /// What a namespaced start made ready before anything was stopped.
@@ -1970,30 +1953,34 @@ pub(super) fn namespaced_env(
                 Tell::Key(key) => {
                     env.insert(key.clone(), namespace.name.clone());
                 }
-                Tell::UrlPath(key) => {
+                Tell::Url(key) => {
                     let url = match env.get(key) {
                         Some(url) => Some(url.clone()),
                         None => main_env(paths, config).value(key)?,
                     };
-                    let Some(rewritten) = url.and_then(|url| {
-                        crate::services::with_url_path(url.trim(), &namespace.name)
-                    }) else {
+                    let address = target.namespace.address();
+                    let rewritten = url.map(|url| url.trim().to_string()).and_then(|url| {
+                        match address.url_path {
+                            true => crate::services::with_url_path(&url, &namespace.name),
+                            false => Some(url),
+                        }
+                    });
+                    let Some(mut rewritten) = rewritten else {
                         bail!(
                             "{key} is not a URL pando can point at {}, so it would go on naming \
                              the main checkout's",
                             namespace.name
                         );
                     };
-                    // A client that reads the query's `db` before the path
-                    // would go on using main's slot through it.
-                    let rewritten = match namespace.kind {
-                        NamespaceKind::Slot => crate::services::with_url_query_value(
+                    // A client that reads a query parameter before the path
+                    // would go on using main's through it.
+                    for parameter in &address.url_query {
+                        rewritten = crate::services::with_url_query_value(
                             &rewritten,
-                            SLOT_PARAMETER,
+                            parameter,
                             &namespace.name,
-                        ),
-                        NamespaceKind::Database => rewritten,
-                    };
+                        );
+                    }
                     env.insert(key.clone(), rewritten);
                 }
             }
