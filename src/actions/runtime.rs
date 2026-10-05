@@ -637,7 +637,7 @@ pub(super) fn answer_prelude(
         // rather than left unset, so it is never asked again — the shape
         // the port slot already uses for a process with no ports.
         Answer::None => (String::new(), by.note(config::Note::Answered)),
-        Answer::Many(_) | Answer::Processes(_) => bail!(
+        Answer::Many(_) | Answer::Processes(_) | Answer::Namespaced(_) => bail!(
             "{} is one line, not several of them",
             slot_label(Slot::Prelude)
         ),

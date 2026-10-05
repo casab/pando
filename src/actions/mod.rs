@@ -59,8 +59,9 @@ pub use lifecycle::{
     refuse_only_on_a_mode_change, restart, start, stop, stop_all, stop_all_listed, stop_all_with,
 };
 pub use namespaced::{
-    Leftover, PlanRow, Prefixed, login_question, namespace_leftovers, namespace_lines,
-    namespace_login, namespace_plan_rows, namespaced_not_own_data, namespaces_rm_drops,
+    Leftover, NamespacedAnswer, NamespacedService, PlanRow, Prefixed, login_question,
+    namespace_leftovers, namespace_lines, namespace_login, namespace_plan_rows,
+    namespaced_not_own_data, namespaced_report, namespaces_rm_drops,
 };
 pub use opening::{
     BOOT_WAIT, NotOpened, Opener, RETRY_WAIT, Ran, RunCommand, open_app, open_commands, run_command,

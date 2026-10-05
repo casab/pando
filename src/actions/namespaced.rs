@@ -2451,6 +2451,213 @@ pub fn namespace_leftovers(
     out
 }
 
+/// One service's namespaced settings, as a program answers them through
+/// `init --answers`: `{"<service>": {"recipe": …, "db_env": […],
+/// "prefix_env": […]}}`. Never a login: a password is not an answer a
+/// file may carry.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamespacedAnswer {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub db_env: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prefix_env: Vec<String>,
+}
+
+/// Every service config declares, by the name `[namespaced.<service>]`
+/// knows it by.
+fn declared_services(config: &Config) -> Vec<String> {
+    let mut out = Vec::new();
+    for service in &config.services {
+        match service {
+            config::ServiceConfig::Native { .. } => {
+                if let Some(entry) = crate::native::Entry::of(service) {
+                    out.push(entry.name.to_string());
+                }
+            }
+            config::ServiceConfig::Compose { include, .. } => out.extend(include.iter().cloned()),
+        }
+    }
+    out
+}
+
+/// Writes a program's namespaced settings, one `[namespaced.<service>]`
+/// table each, in pando's own file for the project, beside any login
+/// there — which it never touches.
+///
+/// Held, before anything is written, to what each can mean: a service the
+/// project declares, a recipe there is that knows a namespace or a prefix,
+/// and keys that are env keys. `replacing` takes the settings a named
+/// service had away first, its login kept.
+pub(super) fn write_namespaced_answer(
+    paths: &PandoPaths,
+    config: &mut Config,
+    services: &std::collections::BTreeMap<String, NamespacedAnswer>,
+    by: super::questions::Answerer,
+    replacing: bool,
+    progress: &dyn Fn(&str),
+) -> Result<()> {
+    if services.is_empty() {
+        return Err(by.refuse(
+            "namespaced names no service — it takes {\"<service>\": {\"recipe\": …, \
+             \"db_env\": […], \"prefix_env\": […]}}"
+                .to_string(),
+        ));
+    }
+    let declared = declared_services(config);
+    let recipes = crate::recipes::Recipes::load(&paths.recipes_dir());
+    for (service, answer) in services {
+        if !declared.contains(service) {
+            return Err(by.refuse(format!(
+                "namespaced names {service:?}, which is not one of this project's services — \
+                 they are: {}",
+                match declared.is_empty() {
+                    true => "none at all".to_string(),
+                    false => declared.join(", "),
+                }
+            )));
+        }
+        if *answer == NamespacedAnswer::default() {
+            return Err(by.refuse(format!(
+                "namespaced.{service} says nothing — it takes recipe, db_env and prefix_env"
+            )));
+        }
+        if let Some(name) = &answer.recipe {
+            let loaded = recipes
+                .get(name)
+                .map_err(|e| by.refuse(format!("namespaced.{service}.recipe: {e:#}")))?;
+            if loaded.recipe.namespace.is_none() && loaded.recipe.prefix.is_none() {
+                return Err(by.refuse(format!(
+                    "namespaced.{service}.recipe names {name:?}, which says nothing about a \
+                     namespace or a prefix — a recipe with a [namespace] or a [prefix] does"
+                )));
+            }
+        }
+        for (field, keys) in [
+            ("db_env", &answer.db_env),
+            ("prefix_env", &answer.prefix_env),
+        ] {
+            if let Some(bad) = keys.iter().find(|key| !crate::detect::is_env_name(key)) {
+                return Err(by.refuse(format!(
+                    "namespaced.{service}.{field} names {bad:?}, which is not an env key"
+                )));
+            }
+        }
+    }
+    let note = by.note(config::Note::Answered);
+    for (service, answer) in services {
+        if replacing {
+            config::remove_keys(
+                paths,
+                config::Layer::Project,
+                &[
+                    &[NAMESPACED_TABLE, service, "recipe"],
+                    &[NAMESPACED_TABLE, service, "db_env"],
+                    &[NAMESPACED_TABLE, service, "prefix_env"],
+                ],
+            )?;
+        }
+        let list = |keys: &[String]| {
+            toml_edit::Value::Array(toml_edit::Array::from_iter(keys.iter().cloned()))
+        };
+        let mut entries: Vec<(String, toml_edit::Value)> = Vec::new();
+        if let Some(recipe) = &answer.recipe {
+            entries.push((
+                "recipe".to_string(),
+                toml_edit::Value::from(recipe.as_str()),
+            ));
+        }
+        if !answer.db_env.is_empty() {
+            entries.push(("db_env".to_string(), list(&answer.db_env)));
+        }
+        if !answer.prefix_env.is_empty() {
+            entries.push(("prefix_env".to_string(), list(&answer.prefix_env)));
+        }
+        config::set_detected_table(
+            paths,
+            config::Layer::Project,
+            &[NAMESPACED_TABLE, service],
+            entries,
+            note.clone(),
+        )?;
+        let settings = config.namespaced.entry(service.clone()).or_default();
+        settings.recipe = answer.recipe.clone();
+        settings.db_env = answer.db_env.clone();
+        settings.prefix_env = answer.prefix_env.clone();
+        progress(&format!(
+            "namespaced settings for {service}: {}",
+            serde_json::to_string(answer).unwrap_or_default()
+        ));
+    }
+    Ok(())
+}
+
+/// The table namespaced settings live under, `[namespaced.<service>]`.
+const NAMESPACED_TABLE: &str = "namespaced";
+
+/// What a namespaced start would do with one service, for a program to
+/// read before it answers anything: `signals --json`'s `namespaced`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct NamespacedService {
+    pub service: String,
+    /// `database` or `slot`, which the server makes; `prefix`, which the
+    /// app is told; or `shared`, on the main checkout's data.
+    pub how: &'static str,
+    /// The recipe whose `[namespace]` it is, for a database or a slot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipe: Option<String>,
+    /// The env keys pando points at the worktree's own: where the app
+    /// names its database, slot or prefix.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<String>,
+    /// Why it stays shared, and what would change that.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+}
+
+/// [`NamespacedService`] for every service of the project, read from
+/// config, the recipes and the main checkout's env files — nothing asked
+/// of a server, nothing spawned.
+pub fn namespaced_report(paths: &PandoPaths, config: &Config) -> Vec<NamespacedService> {
+    let plan = plan(paths, config);
+    let targets = plan.targets.into_iter().map(|target| NamespacedService {
+        how: match target.namespace.kind {
+            NamespaceKind::Database => "database",
+            NamespaceKind::Slot => "slot",
+        },
+        recipe: Some(target.recipe),
+        keys: target
+            .tells
+            .into_iter()
+            .map(|tell| match tell {
+                Tell::Key(key) | Tell::Url(key) => key,
+            })
+            .collect(),
+        why: None,
+        service: target.service,
+    });
+    let prefixed = plan.prefixed.into_iter().map(|prefixed| NamespacedService {
+        service: prefixed.service,
+        how: "prefix",
+        recipe: None,
+        keys: prefixed.keys.into_iter().map(|(key, _)| key).collect(),
+        why: None,
+    });
+    let shared = plan
+        .shared
+        .into_iter()
+        .map(|(service, why)| NamespacedService {
+            service,
+            how: "shared",
+            recipe: None,
+            keys: Vec::new(),
+            why: Some(why),
+        });
+    targets.chain(prefixed).chain(shared).collect()
+}
+
 /// What a namespaced start does with a service it makes nothing in: a
 /// prefix of the worktree's own, or the main checkout's data, and why.
 /// The same for every worktree of a project, so it can be read once per

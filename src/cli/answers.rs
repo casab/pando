@@ -141,6 +141,13 @@ impl Answers {
 /// rule ends up asking about is still reported.
 fn check_shape(slot: crate::detect::Slot, value: &serde_json::Value) -> Result<()> {
     let name = slot_name(slot);
+    // Settings, never a choice: an object, and nothing else.
+    if slot == crate::detect::Slot::Namespaced && !value.is_object() {
+        return Err(usage(format!(
+            "{name} takes {} — not {value}",
+            accepted(slot)
+        )));
+    }
     match value {
         serde_json::Value::Null if !slot.allows_none() => Err(usage(format!(
             "{name} has no \"none\" answer — it takes {}",
@@ -177,6 +184,9 @@ fn check_shape(slot: crate::detect::Slot, value: &serde_json::Value) -> Result<(
         serde_json::Value::Object(_) if slot == crate::detect::Slot::Processes => {
             process_tables(value).map(|_| ())
         }
+        serde_json::Value::Object(_) if slot == crate::detect::Slot::Namespaced => {
+            namespaced_settings(value).map(|_| ())
+        }
         other => Err(usage(format!(
             "{name} takes {} — not {other}",
             accepted(slot)
@@ -195,6 +205,10 @@ fn accepted(slot: crate::detect::Slot) -> String {
         crate::detect::Slot::Processes => vec![
             "one string — an option's own text, or one command of your own",
             "an object of process tables, {\"<name>\": {\"cmd\": \"…\"}, …}",
+        ],
+        crate::detect::Slot::Namespaced => vec![
+            "an object of services, {\"<service>\": {\"recipe\": \"…\", \"db_env\": [\"…\"], \
+             \"prefix_env\": [\"…\"]}, …}",
         ],
         _ => vec!["one string — an option's own text, or one of your own"],
     };
@@ -260,6 +274,49 @@ fn process_tables(
         tables.insert(process.clone(), parsed);
     }
     Ok(tables)
+}
+
+/// An object at the namespaced settings, as the tables it names: each
+/// value read as a `[namespaced.<service>]` table is, logins aside. A
+/// login is refused by name — a password is never an answer a file
+/// carries — and an unknown key with what the table does take.
+///
+/// Whether each service, recipe and key fits the project is the
+/// resolver's to refuse, with the same exit code.
+fn namespaced_settings(
+    value: &serde_json::Value,
+) -> Result<BTreeMap<String, actions::NamespacedAnswer>> {
+    let slot = crate::detect::Slot::Namespaced;
+    let name = slot_name(slot);
+    let serde_json::Value::Object(object) = value else {
+        return Err(usage(format!("{name} takes {}", accepted(slot))));
+    };
+    if object.is_empty() {
+        return Err(usage(format!(
+            "{name} was answered with an empty object — name at least one service"
+        )));
+    }
+    let mut services = BTreeMap::new();
+    for (service, table) in object {
+        if let Some(login) = ["user", "password"]
+            .into_iter()
+            .find(|key| table.get(key).is_some())
+        {
+            return Err(usage(format!(
+                "{name}.{service} has a {login} — a login is never an answer: a namespaced start \
+                 asks a person for it, and only pando's own file keeps it"
+            )));
+        }
+        let parsed: actions::NamespacedAnswer =
+            serde_json::from_value(table.clone()).map_err(|e| {
+                usage(format!(
+                    "{name}.{service} is not a service's settings: {e} — it takes recipe, \
+                     db_env and prefix_env"
+                ))
+            })?;
+        services.insert(service.clone(), parsed);
+    }
+    Ok(services)
 }
 
 /// Whether a typed command reads as the list pando shows its own per-app
@@ -357,8 +414,11 @@ pub(super) fn answer_from(
                 None => program(actions::Answer::Custom(joined)),
             }
         }
-        // Only ever at the process list: `check_shape` refused it
-        // everywhere else.
+        // Only ever at the process list and the namespaced settings:
+        // `check_shape` refused it everywhere else.
+        serde_json::Value::Object(_) if question.slot == crate::detect::Slot::Namespaced => {
+            program(actions::Answer::Namespaced(namespaced_settings(value)?))
+        }
         serde_json::Value::Object(_) => program(actions::Answer::Processes(process_tables(value)?)),
         other => Err(usage(format!(
             "{name} takes {} — not {other}",

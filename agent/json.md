@@ -212,13 +212,13 @@ development one.
 or under-ticked: they are the parts of a compose file this build did not
 follow, published rather than papered over.
 
-### The eleven questions
+### The twelve questions
 
 `slots` has one entry per question pando can ask, in the order it asks
 them. The names are frozen — they are the same strings `--answers` takes:
 
 ```
-install  version_files  prelude  processes  dev_cmd  port_env  services  schema_hook  provision  clone  base
+install  version_files  prelude  processes  dev_cmd  port_env  services  schema_hook  provision  clone  base  namespaced
 ```
 
 ```jsonc

@@ -25,7 +25,7 @@ use super::questions::resolve;
 /// questions, not a second set of them: one implementation of each
 /// question, or the two drift and a developer gets a different config
 /// depending on which command reached the slot first.
-pub const ALL_SLOTS: [Slot; 11] = [
+pub const ALL_SLOTS: [Slot; 12] = [
     Slot::Install,
     Slot::VersionFiles,
     Slot::Prelude,
@@ -46,6 +46,9 @@ pub const ALL_SLOTS: [Slot; 11] = [
     // `check`, which would otherwise test the commit it doubts: with no
     // base named, `new` forks from origin/HEAD as it always has.
     Slot::Base,
+    // After the services, which it is about. Never a question to a
+    // person: a program that read the project answers it, or nobody does.
+    Slot::Namespaced,
 ];
 
 /// Whether this project would run nothing: no process that config
@@ -504,6 +507,28 @@ pub fn slot_value(config: &Config, slot: Slot) -> Option<String> {
         Slot::Base => config.project.base.clone(),
         // Nothing config holds.
         Slot::FreeSlot => None,
+        // `search: prefix_env ELASTICSEARCH_INDEX_PREFIX; db: recipe
+        // postgres` — what each service's table says beside its login.
+        Slot::Namespaced => {
+            let lines: Vec<String> = config
+                .namespaced
+                .iter()
+                .filter_map(|(service, settings)| {
+                    let mut said = Vec::new();
+                    if let Some(recipe) = &settings.recipe {
+                        said.push(format!("recipe {recipe}"));
+                    }
+                    if !settings.db_env.is_empty() {
+                        said.push(format!("db_env {}", settings.db_env.join(", ")));
+                    }
+                    if !settings.prefix_env.is_empty() {
+                        said.push(format!("prefix_env {}", settings.prefix_env.join(", ")));
+                    }
+                    (!said.is_empty()).then(|| format!("{service}: {}", said.join(", ")))
+                })
+                .collect();
+            (!lines.is_empty()).then(|| lines.join("; "))
+        }
         // Which services have one, and never what it is.
         Slot::Login => {
             let services: Vec<&str> = config

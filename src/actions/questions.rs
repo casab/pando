@@ -99,6 +99,10 @@ pub enum Answer {
     /// own is one process, and a project of three is not one command
     /// without losing each process's log, readiness and port.
     Processes(std::collections::BTreeMap<String, config::ProcessConfig>),
+    /// How each service gets data of a namespaced worktree's own, by
+    /// service: the one answer that is settings rather than a choice, and
+    /// a program's alone.
+    Namespaced(std::collections::BTreeMap<String, super::namespaced::NamespacedAnswer>),
     /// One of the shapes above, from a program rather than a person:
     /// `init --answers`.
     ///
@@ -425,6 +429,10 @@ pub(super) fn pending_decision(
         // The object the answers file sent, so the line replays as one.
         Answer::Processes(tables) => (
             serde_json::to_value(tables).unwrap_or_default(),
+            decisions::Shape::Custom,
+        ),
+        Answer::Namespaced(services) => (
+            serde_json::to_value(services).unwrap_or_default(),
             decisions::Shape::Custom,
         ),
         // `--yes` never reaches here, and every wrapper is peeled before
@@ -1176,6 +1184,11 @@ fn resolve_pass(
                     "{} is not answered with process tables — only the process list is",
                     slot_label(*slot)
                 ),
+                Answer::Namespaced(_) => bail!(
+                    "{} is not answered with services' settings — only the namespaced \
+                     settings are",
+                    slot_label(*slot)
+                ),
                 // Only the multi-select slot has a set for an answer, and
                 // it never reaches here.
                 Answer::Many(_) => bail!(
@@ -1503,6 +1516,12 @@ fn volunteer(
             let candidate = process_tables(paths, config, proposals, tables, by)?;
             let note = by.note(config::Note::Answered);
             write_answer(paths, config, slot, &candidate, note, pending, progress)?;
+        }
+        Answer::Namespaced(services) if slot == Slot::Namespaced => {
+            super::namespaced::write_namespaced_answer(
+                paths, config, &services, by, replacing, progress,
+            )?;
+            record_decision(paths, pending, progress);
         }
         Answer::None if matches!(slot, Slot::PortEnv | Slot::Provision | Slot::Clone) => {
             write_empty_answer(
@@ -1923,6 +1942,7 @@ pub(super) fn slot_label(slot: Slot) -> &'static str {
         Slot::Base => "base branch",
         Slot::Login => "namespace login",
         Slot::FreeSlot => "slot to free",
+        Slot::Namespaced => "namespaced settings",
     }
 }
 
@@ -1980,5 +2000,12 @@ pub(super) fn already_answered(slot: Slot, config: &Config) -> bool {
         Slot::Login => config.namespaced.values().any(|login| login.has_login()),
         // Asked of a server, never of config.
         Slot::FreeSlot => false,
+        // Per service, as the login is: any table that says more than a
+        // login has been answered.
+        Slot::Namespaced => config.namespaced.values().any(|settings| {
+            settings.recipe.is_some()
+                || !settings.db_env.is_empty()
+                || !settings.prefix_env.is_empty()
+        }),
     }
 }

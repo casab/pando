@@ -266,8 +266,9 @@ pub fn apply(slot: Slot, candidate: &Candidate, config: &mut Config) {
         Slot::Services => {}
         // A login is one service's, and only the question that asked for
         // it knows which: `actions::namespace_login` writes it. A slot to
-        // free writes nothing.
-        Slot::Login | Slot::FreeSlot => {}
+        // free writes nothing. Namespaced settings are tables per service,
+        // which `actions` writes from the answer itself.
+        Slot::Login | Slot::FreeSlot | Slot::Namespaced => {}
     }
 }
 
@@ -518,8 +519,9 @@ pub fn edits(slot: Slot, candidate: &Candidate) -> Vec<Edit> {
         // is what knows how to write one.
         Slot::Services | Slot::SchemaHook => Vec::new(),
         // Written by `actions::namespace_login`, into a table named for
-        // the service it was asked about; a slot to free writes nothing.
-        Slot::Login | Slot::FreeSlot => Vec::new(),
+        // the service it was asked about; a slot to free writes nothing;
+        // namespaced settings are a table per service the answer names.
+        Slot::Login | Slot::FreeSlot | Slot::Namespaced => Vec::new(),
     }
 }
 

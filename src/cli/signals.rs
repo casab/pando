@@ -31,6 +31,10 @@ struct SignalsOutput {
     compose: Vec<ComposeOut>,
     /// One entry per question pando can ask, in the order it asks them.
     slots: Vec<SlotOut>,
+    /// What a namespaced start would do with each service: a database or
+    /// a slot of the worktree's own, a prefix its app is told, or the main
+    /// checkout's data and why — what the `namespaced` answer changes.
+    namespaced: Vec<actions::NamespacedService>,
 }
 
 #[derive(Serialize)]
@@ -175,6 +179,7 @@ pub fn signals_json<W: Write>(paths: &PandoPaths, config: &Config, out: &mut W) 
                 proposal: proposals.iter().find(|p| p.slot == *slot).map(proposal_out),
             })
             .collect(),
+        namespaced: actions::namespaced_report(paths, config),
         signals,
     };
     writeln!(out, "{}", serde_json::to_string_pretty(&output)?)?;

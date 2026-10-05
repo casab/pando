@@ -12166,6 +12166,93 @@ fn a_redis_with_no_slot_setting_gets_a_key_prefix_when_the_app_reads_one() {
     assert!(plan.prefixed.is_empty());
 }
 
+/// `init` with a program answering the namespaced settings alone, and
+/// pando's own first option taken for anything else it asks.
+fn init_with_namespaced(fx: &Fx, json: &str) -> Result<InitReport> {
+    let services: BTreeMap<String, super::namespaced::NamespacedAnswer> =
+        serde_json::from_str(json).expect("namespaced settings");
+    let program = program_answering(Slot::Namespaced, Answer::Namespaced(services));
+    let ask = |q: &Question| {
+        program(q).unwrap_or_else(|| match q.options.is_empty() {
+            true => refuse(q),
+            false => Ok(Answer::Auto(q.preselect.unwrap_or(0))),
+        })
+    };
+    init(
+        &fx.paths,
+        &fx.config,
+        &Answering::by_program(&ask, &program),
+        &noop,
+    )
+}
+
+// Setup writes what pando could not tell by itself: the recipe an
+// unknown image is, and the key its app reads a prefix from — into
+// pando's own file, beside the login, noted as a program's answer.
+#[test]
+fn a_setup_writes_namespaced_settings_beside_the_login_it_never_touches() {
+    let mut fx = search_fixture("registry.example/search:3", "SEARCH_NS=shop\n");
+    std::fs::create_dir_all(fx.paths.config_file().parent().unwrap()).unwrap();
+    std::fs::write(
+        fx.paths.config_file(),
+        "[[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
+         include = [\"search\"]\nenv = { ELASTICSEARCH_URL = \"search\" }\n\n\
+         [namespaced.search]\nuser = \"elastic\"\npassword = \"hunter2\"\n",
+    )
+    .unwrap();
+    fx.config = crate::config::load(&fx.paths).unwrap().config;
+    assert!(
+        super::namespaced::plan(&fx.paths, &fx.config)
+            .prefixed
+            .is_empty()
+    );
+
+    init_with_namespaced(
+        &fx,
+        r#"{"search": {"recipe": "elasticsearch", "prefix_env": ["SEARCH_NS"]}}"#,
+    )
+    .unwrap();
+    let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+    assert!(written.contains("# answered: a program"), "{written}");
+    let config = crate::config::load(&fx.paths).unwrap().config;
+    let search = &config.namespaced["search"];
+    assert_eq!(search.recipe.as_deref(), Some("elasticsearch"));
+    assert_eq!(search.prefix_env, ["SEARCH_NS"]);
+    assert_eq!(search.user.as_deref(), Some("elastic"));
+    assert_eq!(search.password.as_deref(), Some("hunter2"));
+    let plan = super::namespaced::plan(&fx.paths, &config);
+    assert_eq!(plan.prefixed[0].values("feat+x")[0].1, "shop_feat_x__");
+}
+
+// What the answer names is held to the project before anything is
+// written: a service it does not declare, a recipe there is not.
+#[test]
+fn a_namespaced_answer_for_a_service_or_recipe_there_is_not_is_refused() {
+    let fx = search_fixture("elasticsearch:8", "");
+    let refused = |json: &str| {
+        let e = init_with_namespaced(&fx, json).unwrap_err();
+        assert!(e.is::<super::questions::RefusedAnswer>(), "{e:#}");
+        assert!(
+            !fx.paths.config_file().exists() || {
+                let written = std::fs::read_to_string(fx.paths.config_file()).unwrap();
+                !written.contains("[namespaced")
+            }
+        );
+        format!("{e:#}")
+    };
+    let e = refused(r#"{"db": {"db_env": ["DB_NAME"]}}"#);
+    assert!(
+        e.contains("not one of this project's services — they are: search"),
+        "{e}"
+    );
+    let e = refused(r#"{"search": {"recipe": "solr"}}"#);
+    assert!(e.contains("namespaced.search.recipe"), "{e}");
+    let e = refused(r#"{"search": {"prefix_env": ["not a key"]}}"#);
+    assert!(e.contains("not an env key"), "{e}");
+    let e = refused(r#"{"search": {}}"#);
+    assert!(e.contains("says nothing"), "{e}");
+}
+
 // `rm` drops only what pando made. Under a prefix pando made nothing, so it
 // drops nothing there, and says what it leaves.
 #[test]
@@ -16534,10 +16621,11 @@ fn trying_on_its_own_settles_the_create_start_and_base_slots_only() {
         .collect();
     assert_eq!(tried, expected);
     assert!(!tried.contains(&Slot::Prelude));
+    // Namespaced settings are a program's answer alone, never a guess.
     assert!(
         ALL_SLOTS
             .iter()
-            .all(|slot| *slot == Slot::Prelude || tried.contains(slot))
+            .all(|slot| matches!(slot, Slot::Prelude | Slot::Namespaced) || tried.contains(slot))
     );
 }
 

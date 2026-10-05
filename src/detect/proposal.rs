@@ -64,6 +64,13 @@ pub enum Slot {
     /// a server has is held. Its answer empties that slot rather than
     /// writing config, so it is never taken on anyone's behalf.
     FreeSlot,
+    /// How each service gets data of a namespaced worktree's own, where
+    /// pando could not tell by itself: the recipe its engine is, and the
+    /// keys the app names its database, slot or prefix by —
+    /// `[namespaced.<service>]`, logins aside. No rule proposes it and
+    /// nothing asks a person: a program that read the project answers it,
+    /// through `init --answers`, as an object of services.
+    Namespaced,
 }
 
 impl Slot {
@@ -175,7 +182,12 @@ impl Slot {
             Slot::Base => (&["project"], "base"),
             // One table per service, which only the question knows — or,
             // for a slot to free, nothing written at all.
-            Slot::Processes | Slot::Services | Slot::SchemaHook | Slot::Login | Slot::FreeSlot => {
+            Slot::Processes
+            | Slot::Services
+            | Slot::SchemaHook
+            | Slot::Login
+            | Slot::FreeSlot
+            | Slot::Namespaced => {
                 return None;
             }
         })
@@ -191,6 +203,7 @@ impl Slot {
             Slot::Prelude => "shell line",
             Slot::Login => "login, as user:password",
             Slot::Base => "branch",
+            Slot::Namespaced => "services' settings",
             _ => "command",
         }
     }
@@ -219,6 +232,10 @@ impl Slot {
             Slot::Base => "Which branch do new worktrees, and the check, start from?",
             Slot::Login => "Which login may create and drop this worktree's own databases?",
             Slot::FreeSlot => "Which stopped worktree gives up its slot?",
+            Slot::Namespaced => {
+                "Which recipe, and which keys of the app, give each service data of a \
+                 namespaced worktree's own?"
+            }
         }
     }
 }

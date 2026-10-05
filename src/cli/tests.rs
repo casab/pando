@@ -3441,7 +3441,7 @@ fn every_question_has_one_name_that_round_trips() {
     assert_eq!(slot_names().len(), actions::ALL_SLOTS.len());
 }
 
-/// The eleven names, written out.
+/// The twelve names, written out.
 ///
 /// `signals` publishes them and `--answers` takes them, and both get
 /// them from `Slot`'s own serde names — so a rename stays invisible to
@@ -3450,7 +3450,7 @@ fn every_question_has_one_name_that_round_trips() {
 /// assertion a rename has to walk past, and the list is also published
 /// in `agent/json.md`, which the test below holds to the same order.
 #[test]
-fn the_eleven_question_names_are_frozen() {
+fn the_twelve_question_names_are_frozen() {
     assert_eq!(
         slot_names(),
         [
@@ -3465,6 +3465,7 @@ fn the_eleven_question_names_are_frozen() {
             "provision",
             "clone",
             "base",
+            "namespaced",
         ]
     );
 }
@@ -4155,7 +4156,7 @@ fn the_published_contract_names_every_question_in_order() {
         std::fs::read_to_string(&doc).unwrap_or_else(|e| panic!("read {}: {e}", doc.display()));
     assert!(
         text.contains(&slot_names().join("  ")),
-        "agent/json.md does not list the eleven questions in the order pando asks them"
+        "agent/json.md does not list the twelve questions in the order pando asks them"
     );
     for name in slot_names() {
         assert!(text.contains(&name), "agent/json.md never mentions {name}");
@@ -4979,6 +4980,44 @@ fn an_answers_file_cannot_answer_the_login_a_namespaced_start_asks_for() {
     let e = format!("{e:#}");
     assert!(e.contains("not a question pando asks"), "{e}");
     assert!(!e.contains("hunter2"), "{e}");
+}
+
+// A setup agent answers how each service gets data of a namespaced
+// worktree's own — an object of services, and never a login in it.
+#[test]
+fn an_answers_file_says_namespaced_settings_as_an_object_and_never_a_login() {
+    let parse = crate::cli::answers::Answers::parse;
+    assert!(
+        parse(
+            r#"{"namespaced": {"search": {"recipe": "elasticsearch",
+                "prefix_env": ["SEARCH_INDEX_PREFIX"]}, "cache": {"db_env": ["REDIS_DB"]}}}"#
+        )
+        .is_ok()
+    );
+    for (json, says) in [
+        (
+            r#"{"namespaced": {"db": {"user": "root", "password": "hunter2"}}}"#,
+            "a login is never an answer",
+        ),
+        (
+            r#"{"namespaced": "elasticsearch"}"#,
+            "an object of services",
+        ),
+        (r#"{"namespaced": null}"#, "an object of services"),
+        (r#"{"namespaced": {}}"#, "name at least one service"),
+        (
+            r#"{"namespaced": {"db": {"db_env": "REDIS_DB"}}}"#,
+            "is not a service's settings",
+        ),
+        (
+            r#"{"namespaced": {"db": {"schema": "x"}}}"#,
+            "is not a service's settings",
+        ),
+    ] {
+        let e = format!("{:#}", parse(json).unwrap_err());
+        assert!(e.contains(says), "{json}: {e}");
+        assert!(!e.contains("hunter2"), "{e}");
+    }
 }
 
 // A slot to free has nothing to write down and nothing `--yes` may take:
