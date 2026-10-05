@@ -91,6 +91,11 @@ impl Server<'_> {
     /// published port, then `docker port` for the side within. `None`
     /// with no Docker, no such container, or an answer it cannot read.
     fn container(&self) -> Option<(String, u16)> {
+        // Nothing under test reaches a developer's own containers: only a
+        // stand-in `docker` in the test's own `bin` is ever asked.
+        if cfg!(test) && !self.bin_dir.join("docker").is_file() {
+            return None;
+        }
         let script = self.with_path(&format!(
             "ids=$(docker ps --filter publish={port} --format '{{{{.ID}}}}') || exit 1\n\
              echo --\n\
