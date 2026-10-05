@@ -241,7 +241,7 @@ impl Plan {
         !self.targets.is_empty() || !self.prefixed.is_empty()
     }
 
-    /// `redis: shared — the app reads no slot setting`, one a service
+    /// `redis: shared — the app reads no slot setting — …`, one a service
     /// that stays on main's data.
     pub fn shared_lines(&self) -> Vec<String> {
         self.shared
@@ -600,7 +600,13 @@ fn target(
     recipe: Option<&crate::recipes::Recipe>,
     keys: Vec<String>,
 ) -> std::result::Result<Target, String> {
-    let recipe = recipe.ok_or("pando has no recipe that knows its engine")?;
+    // Each reason ends with the setting that would change it, so whoever
+    // reads it — a person, or a setup agent — has the way in.
+    let recipe = recipe.ok_or_else(|| {
+        format!(
+            "pando has no recipe that knows its engine — [namespaced.{service}] recipe names one"
+        )
+    })?;
     let namespace = recipe
         .namespace
         .clone()
@@ -633,11 +639,16 @@ fn target(
     };
     let found = mains_in(env, &keys, &urls, namespace.kind, &namespace.address())?;
     let (mains, tells) =
-        with_db_env(env, service, namespace.kind, db_env, found)?.ok_or(match namespace.kind {
-            NamespaceKind::Database => {
-                "nothing in the main checkout's env files names its database"
-            }
-            NamespaceKind::Slot => "the app reads no slot setting",
+        with_db_env(env, service, namespace.kind, db_env, found)?.ok_or_else(|| {
+            format!(
+                "{} — [namespaced.{service}] db_env names the key it reads, if it reads one",
+                match namespace.kind {
+                    NamespaceKind::Database => {
+                        "nothing in the main checkout's env files names its database"
+                    }
+                    NamespaceKind::Slot => "the app reads no slot setting",
+                }
+            )
         })?;
     Ok(Target {
         service: service.to_string(),
@@ -2630,7 +2641,7 @@ pub struct NamespacedService {
 /// of a server, nothing spawned — and for each service of `compose_files`
 /// the project does not declare, which a namespaced start never sees.
 /// A helper the catalog knows the app keeps nothing in, a mail catcher, is
-/// left out.
+/// left out, and so is one the compose file builds: the project's own code.
 pub fn namespaced_report(
     paths: &PandoPaths,
     config: &Config,
@@ -2648,7 +2659,10 @@ pub fn namespaced_report(
                 .as_deref()
                 .and_then(crate::catalog::images::known)
                 .is_some_and(|known| known.role == crate::catalog::images::Role::Utility);
+            // One the compose file builds rather than pulls is the
+            // project's own code, not a store of its data.
             if helper
+                || entry.image.is_none()
                 || declared.contains(service)
                 || undeclared.iter().any(|known| known.service == *service)
             {

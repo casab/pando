@@ -113,7 +113,33 @@ pub fn init(
     progress: &dyn Fn(&str),
 ) -> Result<InitReport> {
     refuse_unreplaceable(paths, config, answers)?;
-    init_slots(paths, config, &ALL_SLOTS, answers, progress)
+    let report = init_slots(paths, config, &ALL_SLOTS, answers, progress)?;
+    if let Ok(loaded) = config::load(paths) {
+        say_what_namespaced_leaves_shared(paths, &loaded.config, progress);
+    }
+    Ok(report)
+}
+
+/// One line, after the answers, when a namespaced start would leave any
+/// service on the main checkout's data: which, and the way in. What
+/// `init` prints is what a setup agent reports, so the services pando
+/// could not tell about reach it without a question being asked.
+fn say_what_namespaced_leaves_shared(paths: &PandoPaths, config: &Config, progress: &dyn Fn(&str)) {
+    let compose = detect::signals(paths.root()).compose_files;
+    let left: Vec<String> = super::namespaced::namespaced_report(paths, config, &compose)
+        .into_iter()
+        .filter(|service| matches!(service.how, "shared" | "undeclared"))
+        .map(|service| service.service)
+        .collect();
+    if left.is_empty() {
+        return;
+    }
+    progress(&format!(
+        "a namespaced start would leave {} on the main checkout's data — `pando signals` says \
+         why for each, and `namespaced` in `pando init --answers` gives one its own where its \
+         app names a database, slot or prefix",
+        left.join(", ")
+    ));
 }
 
 /// What `--replace` may not change, refused before anything is written.

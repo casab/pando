@@ -223,7 +223,7 @@ nothing asked of a server — the input to the `namespaced` answer:
   { "service": "cache", "how": "slot", "recipe": "redis", "keys": ["REDIS_URL"] },
   { "service": "search", "how": "prefix", "keys": ["SEARCH_INDEX_PREFIX"] },
   { "service": "queue", "how": "shared",
-    "why": "pando has no recipe that knows its engine" },
+    "why": "pando has no recipe that knows its engine — [namespaced.queue] recipe names one" },
   { "service": "worker", "how": "undeclared",
     "why": "docker-compose.yml runs it, and the project's [[services]] do not name it, …" }
 ]

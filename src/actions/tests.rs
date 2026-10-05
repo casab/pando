@@ -1122,7 +1122,11 @@ fn a_slot_key_beside_no_address_is_found_through_db_env() {
     assert!(plan.targets.is_empty());
     assert_eq!(
         plan.shared_lines(),
-        vec!["redis: shared — the app reads no slot setting".to_string()]
+        vec![
+            "redis: shared — the app reads no slot setting — [namespaced.redis] db_env names \
+             the key it reads, if it reads one"
+                .to_string()
+        ]
     );
 
     let settings = |db_env: &[&str]| crate::config::LoginConfig {
@@ -12003,7 +12007,9 @@ fn a_project_names_the_recipe_an_unknown_image_is() {
     assert!(plan.targets.is_empty());
     assert_eq!(
         plan.shared_lines(),
-        ["db: shared — pando has no recipe that knows its engine"]
+        [
+            "db: shared — pando has no recipe that knows its engine — [namespaced.db] recipe names one"
+        ]
     );
 
     let named = |recipe: &str| crate::config::LoginConfig {
@@ -12222,6 +12228,56 @@ fn a_setup_writes_namespaced_settings_beside_the_login_it_never_touches() {
     assert_eq!(search.password.as_deref(), Some("hunter2"));
     let plan = super::namespaced::plan(&fx.paths, &config);
     assert_eq!(plan.prefixed[0].values("feat+x")[0].1, "shop_feat_x__");
+}
+
+// What `init` prints is what a setup agent reports: a service a
+// namespaced start would leave on main's data is named there, with the
+// way in, and no longer once the answer gives it its own.
+#[test]
+fn init_says_which_services_a_namespaced_start_would_leave_on_mains_data() {
+    let mut fx = search_fixture("registry.example/search:3", "SEARCH_NS=\n");
+    std::fs::create_dir_all(fx.paths.config_file().parent().unwrap()).unwrap();
+    std::fs::write(
+        fx.paths.config_file(),
+        "[[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
+         include = [\"search\"]\nenv = { ELASTICSEARCH_URL = \"search\" }\n",
+    )
+    .unwrap();
+    fx.config = crate::config::load(&fx.paths).unwrap().config;
+    let said = std::cell::RefCell::new(Vec::<String>::new());
+    let progress = |line: &str| said.borrow_mut().push(line.to_string());
+    let ask = |q: &Question| match q.options.is_empty() {
+        true => refuse(q),
+        false => Ok(Answer::Auto(q.preselect.unwrap_or(0))),
+    };
+    init(&fx.paths, &fx.config, &Answering::asking(&ask), &progress).unwrap();
+    let line = said
+        .borrow()
+        .iter()
+        .find(|l| l.starts_with("a namespaced start would leave"))
+        .cloned()
+        .unwrap_or_else(|| panic!("{:?}", said.borrow()));
+    assert!(
+        line.starts_with("a namespaced start would leave search on"),
+        "{line}"
+    );
+    assert!(
+        line.contains("`namespaced` in `pando init --answers`"),
+        "{line}"
+    );
+
+    init_with_namespaced(&fx, r#"{"search": {"prefix_env": ["SEARCH_NS"]}}"#).unwrap();
+    said.borrow_mut().clear();
+    fx.config = crate::config::load(&fx.paths).unwrap().config;
+    init(&fx.paths, &fx.config, &Answering::asking(&ask), &progress).unwrap();
+    assert!(
+        !said
+            .borrow()
+            .iter()
+            .any(|l| l.starts_with("a namespaced start would leave")),
+        "{:?}",
+        said.borrow()
+    );
 }
 
 // What the answer names is held to the project before anything is
@@ -15507,7 +15563,7 @@ fn a_redis_the_app_reads_no_slot_setting_for_stays_shared_and_says_so() {
     let _guard = guard(&report);
     assert!(
         said.iter()
-            .any(|l| l == "redis: shared — the app reads no slot setting"),
+            .any(|l| l.starts_with("redis: shared — the app reads no slot setting — ")),
         "{said:?}"
     );
     assert_eq!(ns.record().namespaces.len(), 1);
