@@ -28,8 +28,7 @@ own, inside `.git`, removed when it is done.
 2. **Save pando's choices in one step: `pando init --yes`.** It takes
    pando's first choice for every open question and writes it under
    `~/.pando`, never into the repository. pando runs every app it found a
-   command for. The check uses the developer's own services, as the main
-   checkout does. (The last block's "never add `--yes`" is for later
+   command for. (The last block's "never add `--yes`" is for later
    sessions, not this setup.)
 3. **A question with no option is yours to answer.** When
    `pando init --yes` leaves one open (exit 3, the question on stderr),
@@ -56,8 +55,8 @@ own, inside `.git`, removed when it is done.
      skip the check and report what is missing.
    - `prelude`, when the machine does not resolve the pinned runtime:
      the first line `pando doctor --json` lists as the fix, or `null`
-     when it lists none. The report names it: it runs before every
-     command pando spawns here.
+     (run on what the machine has) when it lists none or pando refuses
+     it. The report names it, and the command that would fix the pin.
    - `provision`, when its only option seeds a file from an example
      (`needs_a_human`): that option's text, named in the report.
 4. **Run `pando check`, with a timeout of at least 10 minutes.** It makes a
@@ -68,7 +67,8 @@ own, inside `.git`, removed when it is done.
    `PANDO_CHECK=1`, so a process can skip, say, opening a simulator.
 5. **When the check fails, fix, then rerun; never rerun unchanged.**
    - A settings failure: correct the answer with
-     `pando init --answers - --replace`, then check again.
+     `pando init --answers - --replace`, then check again. With no
+     other answer to give, invent none: report it.
    - A machine failure (`kind: "machine"`: a server not running, Docker
      stopped, a runtime missing): change no setting, install nothing,
      and put pando's command in the report for the developer to run.
@@ -84,7 +84,7 @@ own, inside `.git`, removed when it is done.
    at the end of the job says how the project runs with pando;
    `pando init --agent --reference memory` prints it alone. It belongs in
    your own persistent memory — Claude Code: `~/.claude/CLAUDE.md`;
-   Codex: `~/.codex/AGENTS.md`; any other agent: its own. That file is
+   Codex: `~/.codex/AGENTS.md`. That file is
    the developer's, read in every session, so write nothing to it
    without their yes; the report offers it. When they say to, save the
    block there, replacing an earlier pando block for the same project
@@ -102,8 +102,8 @@ own, inside `.git`, removed when it is done.
    > `pando init --answers - --replace`. I can also save how to run it
    > with pando to `~/.claude/CLAUDE.md`.
 
-   List what `pando init` reported, marking what you decided, and name
-   your memory file. Add a line for each that applies: a machine
+   If the check did not pass, open on what is missing instead. List
+   what `pando init` reported, marking what you decided. Add a line for each that applies: a machine
    failure's command; the schema step untested until the first
    `pando start --namespaced`; the job's phone or tablet line; doctor's
    queue-worker note; pando's `[isolation] prefer` line. Never end on a

@@ -3740,11 +3740,15 @@ fn the_job_says_when_this_machine_needs_a_prelude() {
     assert!(
         job.contains(
             "- prelude: open: node 25 asked (backend/.nvmrc), `bash -lc` resolves 24.21.0. \
-             Answer it with the first line `pando doctor` lists, which pando checked resolves \
-             the pin, or `null` to accept the mismatch when it lists none: it runs in every \
-             project on this machine, so name it in your report\n"
+             Answer it with the first line `pando doctor` lists, or `null` to run on what this \
+             machine has when it lists none or pando refuses the line: it runs in every project \
+             on this machine, so name it in your report\n"
         ),
         "{job}"
+    );
+    assert!(
+        !job.contains("Open questions: none."),
+        "an open prelude is an open question: {job}"
     );
 
     let shell = node_shell("25.8.2", asked.clone());

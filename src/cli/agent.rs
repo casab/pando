@@ -338,6 +338,10 @@ fn project_now(
     // still every worktree's server on the framework's own port. "Covered
     // by processes" there sent an agent past the one thing to fix.
     let portless = crate::doctor::portless_processes(paths, config);
+    // The prelude is raised by a probe, not proposed, so it is never in
+    // `open`: "none" beside an open prelude line sent an agent to a
+    // `--yes` that then stopped on it.
+    let mut prelude_open = false;
     for slot in actions::ALL_SLOTS {
         let name = slot_name(slot);
         let line = match (actions::settled(slot, config), proposal(slot)) {
@@ -377,7 +381,9 @@ fn project_now(
                 chosen => format!("pando's guess: {}", candidates(chosen)),
             },
             (false, None) if slot == Slot::Prelude => {
-                prelude_line(paths, config, proposal(Slot::VersionFiles), machine)
+                let line = prelude_line(paths, config, proposal(Slot::VersionFiles), machine);
+                prelude_open = line.starts_with("open:");
+                line
             }
             // No proposal here is no gap: origin/HEAD is close enough to
             // the main checkout's branch to be where work starts.
@@ -410,6 +416,10 @@ fn project_now(
 
     match open.is_empty() {
         true if passing => out.push('\n'),
+        true if prelude_open => out.push_str(
+            "\nOpen questions: only the prelude above. `pando init --yes` saves pando's \
+             choices and stops on it; answer it, then `pando check`.\n\n",
+        ),
         true => out.push_str(
             "\nOpen questions: none. `pando init --yes` saves pando's choices; then \
              `pando check`.\n\n",
@@ -478,8 +488,8 @@ fn prelude_line(
             offer.line
         ),
         None => format!(
-            "{asked}. Answer it with the first line `pando doctor` lists, which pando checked \
-             resolves the pin, or `null` to accept the mismatch when it lists none: it runs in \
+            "{asked}. Answer it with the first line `pando doctor` lists, or `null` to run on \
+             what this machine has when it lists none or pando refuses the line: it runs in \
              every project on this machine, so name it in your report"
         ),
     }
