@@ -7,6 +7,8 @@ may change behaviour.
 
 ## Unreleased
 
+## 0.8.2 — 2026-10-05
+
 ### Added
 
 - `pando update`: updates pando to the latest release the way it was
