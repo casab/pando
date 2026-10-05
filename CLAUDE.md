@@ -299,6 +299,15 @@ add each kind of thing. Keep to its shape:
 - **Contracts have tests.** A string `agent/json.md` documents, a slot
   name, a CLI verb in the list below: each is held to the code by a test.
   Adding one without its test is not done.
+- **The OS is `platform`'s.** Everything pando asks of the operating
+  system — process groups and signals, locks and permission bits, the
+  shell a command runs in, the boot, the desktop's opener and clipboard —
+  is in `src/platform/`, one file per concern: a facade carrying the
+  contract over a backend per OS. Nothing else names `nix`, `libc`,
+  `std::os` or an OS `cfg`, reads `HOME`, or starts `sh` or `bash` by
+  name, and `platform/tests.rs` fails if anything does. A decision that
+  depends on the OS takes a `platform::Host`, read once where pando meets
+  the outside, so a test can choose it.
 
 ## Releases
 

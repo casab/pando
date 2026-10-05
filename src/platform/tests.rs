@@ -1,15 +1,9 @@
 //! The boundary: nothing outside this layer talks to the OS, and this layer
 //! imports nothing above it. Then what [`Host`] promises.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use super::*;
-
-/// Files outside this layer that still talk to the OS, while the migration
-/// moves what they do into it. The list only shrinks: a file here that no
-/// longer offends is a stale row, and fails as surely as a new offender.
-const NOT_YET: &[&str] = &[];
 
 /// Where [`Host::here`] may be read: where pando meets the outside. Every
 /// module below them is handed a `&Host`.
@@ -120,36 +114,46 @@ fn os_talk(file: &str, line: &str) -> Option<&'static str> {
 
 #[test]
 fn only_the_platform_layer_talks_to_the_os() {
-    let mut offending: BTreeMap<String, String> = BTreeMap::new();
+    let mut offending = Vec::new();
     for file in rust_files() {
         if file.starts_with("platform/") {
             continue;
         }
         let text = std::fs::read_to_string(src().join(&file)).unwrap();
-        if let Some((number, what)) = production_lines(&file, &text)
-            .into_iter()
-            .find_map(|(number, line)| os_talk(&file, line).map(|what| (number, what)))
-        {
-            offending.insert(file, format!("{number}: {what}"));
+        for (number, line) in production_lines(&file, &text) {
+            if let Some(what) = os_talk(&file, line) {
+                offending.push(format!("src/{file}:{number}: {what}"));
+            }
         }
     }
-    let new: Vec<String> = offending
-        .iter()
-        .filter(|(file, _)| !NOT_YET.contains(&file.as_str()))
-        .map(|(file, at)| format!("src/{file}:{at}"))
-        .collect();
-    let stale: Vec<&&str> = NOT_YET
-        .iter()
-        .filter(|file| !offending.contains_key(**file))
-        .collect();
     assert!(
-        new.is_empty(),
-        "only src/platform talks to the OS; move these into it: {new:#?}"
+        offending.is_empty(),
+        "only src/platform talks to the OS; move these into it: {offending:#?}"
     );
-    assert!(
-        stale.is_empty(),
-        "no longer talks to the OS; take it off NOT_YET: {stale:#?}"
-    );
+}
+
+// What a Unix build talks to the OS with is a dependency of Unix builds
+// alone, and of src/platform alone: a crate the rest of pando could reach
+// for on any OS is how the boundary would erode without a line of code
+// naming it here.
+#[test]
+fn the_os_crates_are_dependencies_of_a_unix_build_only() {
+    let manifest: toml::Table =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+    let everywhere = manifest["dependencies"].as_table().unwrap();
+    let unix = manifest["target"]["cfg(unix)"]["dependencies"]
+        .as_table()
+        .expect("a [target.'cfg(unix)'.dependencies] table");
+    for os_crate in ["libc", "nix"] {
+        assert!(
+            !everywhere.contains_key(os_crate),
+            "{os_crate} is in [dependencies]"
+        );
+        assert!(unix.contains_key(os_crate), "{os_crate} is a Unix build's");
+    }
 }
 
 #[test]
