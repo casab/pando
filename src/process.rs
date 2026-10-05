@@ -26,22 +26,6 @@ pub struct SpawnResult {
     pub pgid: i32,
 }
 
-/// `bash -lc <shell_cmd>`: how pando runs every command, so it resolves
-/// the runtimes a login shell does rather than whatever pando was started
-/// with.
-///
-/// Under `cargo test` the shell gets an empty HOME of its own. A login
-/// shell reads the developer's `~/.bash_profile`, which with nvm or conda
-/// in it costs most of a second per shell, and a test that passes only
-/// because of what that profile loads is testing the laptop, not pando.
-pub(crate) fn login_shell(shell_cmd: &str) -> Command {
-    let mut command = Command::new("bash");
-    command.arg("-lc").arg(shell_cmd);
-    #[cfg(test)]
-    command.env("HOME", crate::testutil::shell_home());
-    command
-}
-
 /// Starts the child `command` spawns in a session of its own: the leader of
 /// a new process group, with no controlling terminal.
 ///
@@ -154,7 +138,7 @@ pub fn spawn_detached(opts: SpawnOptions<'_>) -> Result<SpawnResult> {
             opts.shell_cmd
         )
     });
-    let mut cmd = login_shell(recorded.as_deref().unwrap_or(opts.shell_cmd));
+    let mut cmd = crate::platform::shell::login(recorded.as_deref().unwrap_or(opts.shell_cmd))?;
     cmd.current_dir(opts.cwd)
         .stdin(Stdio::null())
         .stdout(out)
@@ -289,7 +273,7 @@ pub fn run_captured(
     env: &[(String, String)],
     timeout: Duration,
 ) -> Result<Captured> {
-    let mut command = login_shell(shell_cmd);
+    let mut command = crate::platform::shell::login(shell_cmd)?;
     command
         .current_dir(cwd)
         .stdin(Stdio::null())

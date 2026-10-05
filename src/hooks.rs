@@ -323,8 +323,13 @@ fn waited<T>(
 
 /// `bash -lc` running `shell_cmd` in `cwd` with `env` added and nothing on
 /// stdin, in a session of its own when `detached`.
-fn shell(shell_cmd: &str, cwd: &Path, env: &[(String, String)], detached: bool) -> Command {
-    let mut command = crate::process::login_shell(shell_cmd);
+fn shell(
+    shell_cmd: &str,
+    cwd: &Path,
+    env: &[(String, String)],
+    detached: bool,
+) -> std::io::Result<Command> {
+    let mut command = crate::platform::shell::login(shell_cmd)?;
     command.current_dir(cwd).stdin(Stdio::null());
     for (key, value) in env {
         command.env(key, value);
@@ -332,7 +337,7 @@ fn shell(shell_cmd: &str, cwd: &Path, env: &[(String, String)], detached: bool) 
     if detached {
         crate::process::new_session(&mut command);
     }
-    command
+    Ok(command)
 }
 
 /// Runs a hook to completion, appending everything it printed to its own
@@ -363,7 +368,8 @@ pub fn run(log_file: &Path, shell_cmd: &str, cwd: &Path, env: &[(String, String)
         .try_clone()
         .context("clone log file handle for stderr")?;
     let detached = DETACHED.load(Ordering::Relaxed);
-    let mut command = shell(shell_cmd, cwd, env, detached);
+    let mut command =
+        shell(shell_cmd, cwd, env, detached).with_context(|| format!("run {shell_cmd:?}"))?;
     command.stdout(out).stderr(err);
     let status = waited(&mut command, detached, |mut child| child.wait())
         .with_context(|| format!("run {shell_cmd:?}"))?;
@@ -416,7 +422,8 @@ fn printed_since(log_file: &Path, start: u64) -> String {
 /// run that mattered.
 pub fn probe(shell_cmd: &str, cwd: &Path, env: &[(String, String)]) -> Result<Option<String>> {
     let detached = DETACHED.load(Ordering::Relaxed);
-    let mut command = shell(shell_cmd, cwd, env, detached);
+    let mut command = shell(shell_cmd, cwd, env, detached)
+        .with_context(|| format!("run the probe {shell_cmd:?}"))?;
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let out = waited(&mut command, detached, Child::wait_with_output)
         .with_context(|| format!("run the probe {shell_cmd:?}"))?;
@@ -866,6 +873,7 @@ mod tests {
     fn where_it_ran(detached: bool) -> (String, String, bool) {
         let dir = tempdir().unwrap();
         let out = shell(WHERE_AM_I, dir.path(), &[], detached)
+            .unwrap()
             .output()
             .unwrap();
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -913,7 +921,7 @@ mod tests {
         let started = Instant::now();
         let cwd = dir.path().to_path_buf();
         let hook = std::thread::spawn(move || {
-            let mut command = shell("sleep 30", &cwd, &[], true);
+            let mut command = shell("sleep 30", &cwd, &[], true).unwrap();
             waited(&mut command, true, |mut child| child.wait()).unwrap()
         });
         let recorded = || {
@@ -944,7 +952,7 @@ mod tests {
             "a hook that ended is off the list"
         );
 
-        let mut fallback = shell("sleep 30", dir.path(), &[], true);
+        let mut fallback = shell("sleep 30", dir.path(), &[], true).unwrap();
         let status = waited(&mut fallback, true, |mut child| child.wait()).unwrap();
         assert_eq!(status.signal(), Some(libc::SIGHUP), "{status:?}");
         assert!(started.elapsed() < Duration::from_secs(10));

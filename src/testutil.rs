@@ -89,7 +89,7 @@ pub fn no_auto_maintenance() {
 }
 
 /// The HOME every login shell pando starts under test is given: empty, and
-/// the same one for the whole run. See `process::login_shell`.
+/// the same one for the whole run. See `platform::shell::login`.
 pub fn shell_home() -> &'static Path {
     static HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
     HOME.get_or_init(|| {

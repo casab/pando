@@ -333,7 +333,8 @@ impl Updater {
                     if !status.success() {
                         bail!("could not download {url} ({status})");
                     }
-                    let status = Command::new("sh")
+                    let status = crate::platform::shell::posix()
+                        .context("could not run sh")?
                         .arg(&script)
                         .envs(env.iter().cloned())
                         .status()

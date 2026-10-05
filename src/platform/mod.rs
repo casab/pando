@@ -18,6 +18,7 @@
 
 pub mod desktop;
 pub mod host;
+pub mod shell;
 
 pub use host::{Host, Os};
 

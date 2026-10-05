@@ -275,7 +275,8 @@ pub fn run_command(paths: &PandoPaths, command: &str) -> Option<Ran> {
         }
         None => bin.into_os_string(),
     };
-    let out = std::process::Command::new("/bin/sh")
+    let out = crate::platform::shell::posix()
+        .ok()?
         .arg("-c")
         .arg(command)
         .env("PATH", path)

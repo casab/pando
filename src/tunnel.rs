@@ -8,7 +8,6 @@
 
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crate::paths::PandoPaths;
@@ -187,8 +186,10 @@ fn program_is_runnable(program: &Path) -> bool {
     if program.components().count() > 1 {
         return is_executable(program);
     }
-    Command::new("sh")
-        .arg("-c")
+    let Ok(mut sh) = crate::platform::shell::posix() else {
+        return false;
+    };
+    sh.arg("-c")
         .arg(format!(
             "command -v {} >/dev/null 2>&1",
             process::shell_quote(&program.to_string_lossy())
