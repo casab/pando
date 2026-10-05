@@ -394,13 +394,77 @@ fn wsl_1_mounts_drvfs_itself_and_a_mount_point_may_be_escaped() {
 
 #[test]
 fn this_boot_has_an_id_that_stays_the_same_and_matches_itself() {
-    let Some(now) = boot::id() else {
+    let Some(now) = boot::now() else {
         return; // A sandbox with no /proc or sysctl cannot say.
     };
-    assert!(!now.is_empty());
-    assert_eq!(boot::id(), Some(now), "read once");
+    assert!(!now.id.is_empty());
+    assert_eq!(boot::now(), Some(now), "read once");
     assert!(boot::same(now, now));
-    assert!(!boot::same("an-earlier-boot", now));
+    let earlier = boot::Boot {
+        id: "an-earlier-boot",
+        ..now
+    };
+    assert!(!boot::same(earlier, now));
+}
+
+#[test]
+fn a_boot_that_does_not_say_when_its_pids_began_is_judged_on_its_id_alone() {
+    let boot = |id, pids_since| boot::Boot { id, pids_since };
+    assert!(
+        !boot::same(boot("kernel-a", Some(100)), boot("kernel-a", Some(250))),
+        "init restarted"
+    );
+    assert!(boot::same(
+        boot("kernel-a", Some(100)),
+        boot("kernel-a", Some(100))
+    ));
+    assert!(
+        boot::same(boot("kernel-a", None), boot("kernel-a", Some(250))),
+        "written before init's start time was recorded"
+    );
+    assert!(
+        boot::same(boot("kernel-a", Some(100)), boot("kernel-a", None)),
+        "a machine where /proc/1 cannot be read now"
+    );
+    assert!(!boot::same(
+        boot("kernel-a", None),
+        boot("kernel-b", Some(250))
+    ));
+    assert!(!boot::same(
+        boot("kernel-a", Some(100)),
+        boot("kernel-b", Some(100))
+    ));
+    assert!(boot::same(boot("kernel-a", None), boot("kernel-a", None)));
+}
+
+#[test]
+fn inits_start_time_is_field_22_counted_after_the_command_name() {
+    let stat = "1 (sys temd) x) S 0 1 1 0 -1 4194560 100 200 3 4 5 6 7 8 20 0 1 0 4242 1000 50";
+    assert_eq!(
+        boot::parse_start_time(stat),
+        Some(4242),
+        "a name with ) and a space"
+    );
+    assert_eq!(
+        boot::parse_start_time("1 (init) S 0 1 1"),
+        None,
+        "cut short"
+    );
+    assert_eq!(boot::parse_start_time("no command name"), None);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_linux_boot_is_the_kernels_with_inits_start_time() {
+    let Some(now) = boot::now() else {
+        return; // A sandbox with no /proc cannot say.
+    };
+    let kernel = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+    assert_eq!(now.id, kernel.trim());
+    let init = std::fs::read_to_string("/proc/1/stat")
+        .ok()
+        .and_then(|stat| boot::parse_start_time(&stat));
+    assert_eq!(now.pids_since, init);
 }
 
 // ---- files -----------------------------------------------------------
