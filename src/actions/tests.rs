@@ -8845,7 +8845,7 @@ fn a_copy_on_write_checkout_is_the_tree_gits_own_checkout_makes() {
 #[test]
 fn a_copy_on_write_checkout_leaves_git_only_the_files_that_differ() {
     let fx = fixture_with_tree();
-    if !crate::cow::can_clone(fx._dir.path()) {
+    if !crate::platform::cow::can_clone(fx._dir.path()) {
         return;
     }
     let (made, said) = new_saying(&fx, "feat/diverged");
@@ -8940,7 +8940,7 @@ fn a_post_checkout_hook_runs_after_a_copy_on_write_checkout_as_git_runs_it() {
             .trim(),
         wt.canonicalize().unwrap().display().to_string()
     );
-    if crate::cow::can_clone(fx._dir.path()) {
+    if crate::platform::cow::can_clone(fx._dir.path()) {
         assert!(said.iter().any(|m| m.starts_with("cloning")), "{said:?}");
     }
 }
@@ -8951,7 +8951,7 @@ fn a_post_checkout_hook_runs_after_a_copy_on_write_checkout_as_git_runs_it() {
 fn a_failing_post_checkout_hook_fails_new_and_leaves_nothing() {
     use std::os::unix::fs::PermissionsExt;
     let fx = fixture_with_tree();
-    if !crate::cow::can_clone(fx._dir.path()) {
+    if !crate::platform::cow::can_clone(fx._dir.path()) {
         return;
     }
     let hook = fx.root.join(".git/hooks/post-checkout");
@@ -9527,7 +9527,7 @@ fn a_remote_branch_checks_out_the_same_by_copy_on_write() {
 #[test]
 fn a_disk_that_cannot_clone_is_said_only_to_who_asked_for_copy_on_write() {
     let mut fx = fixture_with_tree();
-    if crate::cow::can_clone(fx._dir.path()) {
+    if crate::platform::cow::can_clone(fx._dir.path()) {
         return;
     }
     // A git without what a copy-on-write checkout runs never gets as far
@@ -9688,7 +9688,7 @@ fn clone_gives_a_new_worktree_the_main_checkouts_dependencies_before_the_install
 
     let (made, said) = new_saying(&fx, "feat/deps");
     let wt = fx.worktrees_dir().join(made.unwrap());
-    if crate::cow::can_clone(fx._dir.path()) {
+    if crate::platform::cow::can_clone(fx._dir.path()) {
         assert!(
             said.iter()
                 .any(|m| m == "cloned node_modules from the main checkout (copy-on-write)"),
@@ -9730,7 +9730,7 @@ fn a_clone_path_the_project_does_not_ignore_is_refused_before_anything_is_made()
 #[test]
 fn a_cloned_tree_with_a_link_into_the_main_checkout_is_left_to_the_install() {
     let mut fx = fixture();
-    if !crate::cow::can_clone(fx._dir.path()) {
+    if !crate::platform::cow::can_clone(fx._dir.path()) {
         return;
     }
     use std::os::unix::fs::PermissionsExt;

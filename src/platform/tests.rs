@@ -12,7 +12,6 @@ use super::*;
 const NOT_YET: &[&str] = &[
     "actions/check/interrupt.rs",
     "cli/prompt.rs",
-    "cow.rs",
     "hooks.rs",
     "observe.rs",
     "process.rs",

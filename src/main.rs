@@ -20,7 +20,7 @@ pub const EXIT_NEEDS_ANSWER: u8 = 3;
 fn main() -> ExitCode {
     // Read before any thread starts: reading the umask means setting it,
     // process-wide, for a moment.
-    let _ = pando::cow::umask();
+    let _ = pando::platform::cow::umask();
     // Before any thread exists: a fork made while another thread sets up
     // libnotify kills the child on macOS (see the function).
     pando::process::settle_before_fork();
