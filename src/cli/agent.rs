@@ -388,6 +388,11 @@ fn project_now(
             // No proposal here is no gap: origin/HEAD is close enough to
             // the main checkout's branch to be where work starts.
             (false, None) if slot == Slot::Base => "origin/HEAD".to_string(),
+            // Never proposed, and what it is about is only known once
+            // pando's choices are saved: which services stay on main's.
+            (false, None) if slot == Slot::Namespaced => {
+                "answer after `init --yes`, if it names one".to_string()
+            }
             (false, None) => "nothing proposed".to_string(),
         };
         let _ = writeln!(out, "- {name}: {line}");

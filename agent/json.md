@@ -859,6 +859,10 @@ checkout's value with the worktree's slug after it:
     "cache":  { "db_env": ["REDIS_DB"] } } }
 ```
 
+Each key is optional, and one is enough: `prefix_env` alone gives a
+service a prefix whatever its engine; `recipe` is for an image that does
+not say what it is, so its recipe's own keys and commands apply.
+
 Refusals, all exit 2 and all naming the key: a name that is not a question;
 a shape the question cannot take; a value that is not one of the options at
 a question that has them; an empty string; a `prelude` that fails its own
