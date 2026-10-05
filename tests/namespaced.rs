@@ -183,6 +183,60 @@ fn app_server<'a>(recipe: &'a NamespaceRecipe, db: &Throwaway, bin: &Path) -> Se
 // Decision 4, end to end: the app's login is refused until the grant pando
 // prints is run once, and then it may make and drop `shop__…` — and still
 // nothing else, which is the server's own wall behind pando's guard.
+/// A stand-in `docker` in `bin` for a real server on this machine, as if it
+/// ran in a container `c0ffee` publishing its port as itself: `exec` runs
+/// on the host, and the container's environment is `env`.
+fn as_if_in_a_container(bin: &Path, port: u16, env: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(bin).unwrap();
+    let env_file = bin.join("container-env");
+    std::fs::write(&env_file, env).unwrap();
+    let docker = format!(
+        "#!/bin/sh\ncase \"$1\" in\n\
+           ps) echo c0ffee ;;\n\
+           port) echo \"{port}/tcp -> 0.0.0.0:{port}\" ;;\n\
+           exec) shift; while [ \"$1\" = -e ]; do shift 2; done; shift;\n\
+             if [ \"$1\" = env ]; then cat '{}'; exit 0; fi; shift; shift;\n\
+             exec sh -c \"$1\" ;;\n\
+         esac\n",
+        env_file.display()
+    );
+    std::fs::write(bin.join("docker"), docker).unwrap();
+    std::fs::set_permissions(bin.join("docker"), std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+// The same refusal, in a container whose environment keeps root's
+// password: the grant is run as root by pando itself, and nobody is asked.
+#[test]
+fn a_real_mariadb_in_a_container_is_granted_by_its_own_root() {
+    if skip(&["mariadb-install-db", "mariadbd", "mariadb"]) {
+        return;
+    }
+    let db = mariadb();
+    let recipe = recipe("mariadb");
+    let bin = db.dir.path().join("bin");
+    // Root has no password here, as an image made with an empty one.
+    as_if_in_a_container(&bin, db.port, "MARIADB_ROOT_PASSWORD=\nPATH=/usr/bin\n");
+    let server = app_server(&recipe, &db, &bin);
+    let refused = server.create("shop__feat_x", "shop").unwrap_err();
+    assert!(refused.is::<pando::namespace::Denied>(), "{refused:#}");
+    let admin = server.admin().expect("the container's own root");
+    assert_eq!(admin.login.user.as_deref(), Some("root"));
+    let grant = server.grant_as(&admin, "shop").unwrap();
+    assert_eq!(grant, "GRANT ALL ON `shop\\_\\_%`.* TO 'app'@'localhost';");
+    assert_eq!(
+        server.create("shop__feat_x", "shop").unwrap(),
+        Created::Made
+    );
+    assert_eq!(
+        root_sql(&db, "SHOW DATABASES LIKE 'shop\\_\\_%'").unwrap(),
+        "shop__feat_x"
+    );
+    // The grant is the prefix and nothing else, as when a person runs it.
+    let outside = format!("{:#}", server.create("other__feat_x", "shop").unwrap_err());
+    assert!(outside.contains("does not let"), "{outside}");
+}
+
 #[test]
 fn a_real_mariadb_makes_a_worktrees_database_once_the_printed_grant_is_run() {
     if skip(&["mariadb-install-db", "mariadbd", "mariadb"]) {
@@ -753,6 +807,48 @@ fn pg_server<'a>(recipe: &'a NamespaceRecipe, db: &Throwaway, bin: &Path) -> Ser
 
 const PG_SHAPE: &str = "SELECT pg_encoding_to_char(encoding), datcollate, datctype \
                         FROM pg_database WHERE datname = ";
+
+// The same refusal in a container whose environment keeps the cluster's
+// password, as the official image's POSTGRES_PASSWORD does: pando runs the
+// ALTER ROLE as `postgres` itself, the database is made as the app's role,
+// and the role still drops only what it made.
+#[test]
+fn a_real_postgres_in_a_container_is_granted_by_its_own_superuser() {
+    if skip(&["initdb", "postgres", "psql"]) {
+        return;
+    }
+    let db = postgres();
+    let recipe = recipe("postgres");
+    let bin = db.dir.path().join("bin");
+    as_if_in_a_container(
+        &bin,
+        db.port,
+        &format!("POSTGRES_PASSWORD={PG_ADMIN_PASSWORD}\nPATH=/usr/bin\n"),
+    );
+    let server = pg_server(&recipe, &db, &bin);
+    let refused = server.create("shop__feat_x", "shop").unwrap_err();
+    assert!(refused.is::<pando::namespace::Denied>(), "{refused:#}");
+    let admin = server.admin().expect("the image's own superuser");
+    assert_eq!(admin.login.user.as_deref(), Some("postgres"));
+    assert_eq!(
+        server.grant_as(&admin, "shop").unwrap(),
+        "ALTER ROLE \"app\" CREATEDB;"
+    );
+    assert_eq!(
+        server.create("shop__feat_x", "shop").unwrap(),
+        Created::Made
+    );
+    assert_eq!(
+        admin_sql(
+            &db,
+            "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = 'shop__feat_x'"
+        )
+        .unwrap(),
+        "app",
+        "made as the app's role, so the app owns it"
+    );
+    server.drop("shop__feat_x", "shop").unwrap();
+}
 
 // Issue #9, at the engine: the app's role is refused until the printed
 // `ALTER ROLE … CREATEDB` is run, the database is then made in main's

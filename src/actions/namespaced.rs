@@ -320,6 +320,7 @@ pub(super) fn check_stays_shared(paths: &PandoPaths, config: &Config) -> Option<
         ) {
             Ok(Some(_)) => {}
             Ok(None) if !target.namespace.user => {}
+            Ok(None) if container_admin(paths, target).is_some() => {}
             Ok(None) => {
                 return Some(format!(
                     "namespaced mode has no login for {} yet — the first `pando start \
@@ -911,15 +912,20 @@ pub(super) fn server_for<'a>(
     {
         Some(login) => login,
         None if !target.namespace.user => Login::none(),
-        None => bail!(
-            "nothing gives pando a login for {}'s namespaces — the main checkout's env files \
+        // Nothing the developer wrote gives one: the administrator the
+        // container's own environment keeps does, and nobody is asked.
+        None => match admin_server(paths, target) {
+            Some(admin) => return Ok(admin),
+            None => bail!(
+                "nothing gives pando a login for {}'s namespaces — the main checkout's env files \
              have none beside {}. `pando start` on a terminal asks for one; or write \
              [namespaced.{}] with a user and a password in {}",
-            target.service,
-            target.keys.join(", "),
-            target.service,
-            file.display()
-        ),
+                target.service,
+                target.keys.join(", "),
+                target.service,
+                file.display()
+            ),
+        },
     };
     Ok(namespace::Server {
         service: &target.service,
@@ -951,6 +957,20 @@ pub(super) fn ask_for_logins(
                 .get(&target.service)
                 .is_some_and(|login| login.has_login())
         {
+            continue;
+        }
+        // The main checkout's own login, or the container's administrator:
+        // either is a login nobody has to type.
+        let env = main_env(paths, config);
+        let found = namespace::find_login(
+            &env,
+            config,
+            &target.service,
+            &target.keys,
+            true,
+            &paths.config_file(),
+        );
+        if matches!(found, Ok(Some(_))) || container_admin(paths, &target).is_some() {
             continue;
         }
         let login = namespace_login(
@@ -1017,7 +1037,7 @@ fn ensure_database(
             recorded.name,
             server.address()
         ));
-        server.create(&recorded.name, &target.main)?;
+        create(server, &recorded.name, &target.main, progress)?;
         return Ok((record(paths, name, wanted(&recorded.name))?, true));
     }
     let names = namespace::database_names(
@@ -1031,7 +1051,7 @@ fn ensure_database(
         if recorded_elsewhere(&store, name, &wanted(candidate)).is_some() {
             continue;
         }
-        match server.create(candidate, &target.main)? {
+        match create(server, candidate, &target.main, progress)? {
             namespace::Created::Made => {
                 // Recorded only while no other start of this worktree has
                 // recorded one since: with two, the app would run on the
@@ -1085,6 +1105,58 @@ fn ensure_database(
         server.address(),
         names.join(" and ")
     )
+}
+
+/// [`namespace::Server::create`], and when the server refuses the login,
+/// the grant the developer would run by hand run instead by the server's
+/// own administrator — inside the container that runs it, with the login
+/// its environment keeps — and the database made again. With no such
+/// administrator the refusal stands, with its grant to run once.
+fn create(
+    server: &namespace::Server<'_>,
+    name: &str,
+    main: &str,
+    progress: &dyn Fn(&str),
+) -> Result<namespace::Created> {
+    match server.create(name, main) {
+        Err(e) if e.is::<namespace::Denied>() => {
+            let Some(admin) = server.admin() else {
+                return Err(e);
+            };
+            let grant = server
+                .grant_as(&admin, main)
+                .map_err(|grant_failed| e.context(format!("{grant_failed:#}")))?;
+            progress(&format!(
+                "{}: the login from {} may not make databases, so pando gave it the right, as \
+                 {}: {grant}",
+                server.service, server.login.from, admin.login.from
+            ));
+            server.create(name, main)
+        }
+        made => made,
+    }
+}
+
+/// A target's server reached as its own administrator, inside the
+/// container that runs it: what stands in for a login nobody wrote down,
+/// so nobody is asked.
+fn admin_server<'a>(paths: &PandoPaths, target: &'a Target) -> Option<namespace::Server<'a>> {
+    let probe = namespace::Server {
+        service: &target.service,
+        recipe: &target.namespace,
+        host: target.host.clone(),
+        port: target.port,
+        login: Login::none(),
+        bin_dir: paths.home.join("bin"),
+        runner: namespace::Runner::Host,
+    }
+    .reach();
+    probe.admin()
+}
+
+/// Whether [`admin_server`] has one for this target.
+fn container_admin(paths: &PandoPaths, target: &Target) -> Option<Login> {
+    admin_server(paths, target).map(|admin| admin.login)
 }
 
 /// The database a worktree's record names for a target, if it names one:
@@ -2311,7 +2383,17 @@ pub(super) fn drop_namespaces(
             runner: namespace::Runner::Host,
         }
         .reach();
-        match server.drop(&ns.name, &ns.main) {
+        // A login that may not drop it is no reason to leave it: the
+        // server's own administrator, inside its container, may — past
+        // the same guard, which has already passed.
+        let dropped = match server.drop(&ns.name, &ns.main) {
+            Err(e) if e.is::<namespace::Denied>() => match server.admin() {
+                Some(admin) => admin.drop(&ns.name, &ns.main),
+                None => Err(e),
+            },
+            dropped => dropped,
+        };
+        match dropped {
             Ok(()) => progress(
                 &format!(
                     "{}: {}",

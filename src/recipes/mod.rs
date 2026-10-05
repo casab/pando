@@ -173,6 +173,40 @@ pub struct NamespaceRecipe {
     /// says nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<AddressRecipe>,
+    /// Runs the SQL it is handed on stdin, as `{user}`: how pando runs the
+    /// `grant` itself, as the server's own administrator, when it can log
+    /// in as one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_sql: Option<String>,
+    /// Where a container running this engine keeps its administrator's
+    /// login, in its own environment, as its image documents it:
+    /// `POSTGRES_USER`, `MARIADB_ROOT_PASSWORD`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_admin: Option<ContainerAdmin>,
+}
+
+/// The administrator of a server a container runs, read from that
+/// container's own environment: `[namespace.container_admin]`.
+///
+/// A database in Docker is the developer's own, made from their compose
+/// file, whose environment already names its administrator. With it, a
+/// namespaced start needs no question and no grant from them: pando gives
+/// the app's login the right the `grant` names itself, or logs in as the
+/// administrator where the app's env files carry no login at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerAdmin {
+    /// The container's env keys that name the administrator, the first one
+    /// set winning: `POSTGRES_USER`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_from: Vec<String>,
+    /// The administrator when none of those is set: `postgres`, `root`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// The container's env keys that hold the administrator's password, the
+    /// first one set winning, empty counting as none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub password_from: Vec<String>,
 }
 
 /// Where an app names its database or slot: `[namespace.address]`.
@@ -220,6 +254,12 @@ pub struct PrefixRecipe {
 
 fn yes() -> bool {
     true
+}
+
+/// `POSTGRES_USER`: a whole env key.
+fn is_env_key(key: &str) -> bool {
+    key.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// `_NAME`: what follows an env key's stem, as `[namespace.address]` and
@@ -308,6 +348,21 @@ impl NamespaceRecipe {
                 name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
             }) {
                 bail!("[namespace.address] url_query names a query parameter, not {bad:?}");
+            }
+        }
+        if let Some(admin) = &self.container_admin {
+            if admin.user.is_none() && admin.user_from.is_empty() {
+                bail!(
+                    "a [namespace.container_admin] names its administrator: `user` or `user_from`"
+                );
+            }
+            if let Some(bad) = admin
+                .user_from
+                .iter()
+                .chain(&admin.password_from)
+                .find(|key| !is_env_key(key))
+            {
+                bail!("[namespace.container_admin] reads env keys, not {bad:?}");
             }
         }
         // Room for `<main>__`, a hash, and one character of the worktree's

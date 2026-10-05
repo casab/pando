@@ -71,6 +71,15 @@ drop = "mariadb --protocol=tcp -h {host} -P {port} -u {user} -e 'DROP DATABASE I
 denied = ["ERROR 1044"]
 account = "mariadb --protocol=tcp -h {host} -P {port} -u {user} -N -B -e 'SELECT CURRENT_USER()'"
 grant = '''GRANT ALL ON `{prefix_like}`.* TO '{account_user}'@'{account_host}';'''
+# How pando runs that grant itself, as root, where it can log in as root:
+# inside a container, below.
+run_sql = "mariadb --protocol=tcp -h {host} -P {port} -u {user}"
+
+# The official images keep root's password in their environment. One made
+# with a random root password keeps none, and pando prints the grant.
+[namespace.container_admin]
+user = "root"
+password_from = ["MARIADB_ROOT_PASSWORD", "MYSQL_ROOT_PASSWORD"]
 
 # Where an app names its database: a URL's path, or a key beside the
 # address — `DATABASE_NAME` next to `DATABASE_PORT`.

@@ -29,7 +29,7 @@ mod guard;
 mod login;
 mod name;
 
-pub use engine::{Created, Runner, Server, prefix_like};
+pub use engine::{Created, Denied, Runner, Server, prefix_like};
 pub use guard::{describe, may_drop, same_namespace};
 pub use login::{
     Login, find as find_login, from_config as login_from_config,

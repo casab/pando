@@ -4,6 +4,7 @@
 
 use anyhow::{Result, bail};
 use std::path::PathBuf;
+
 use std::time::Duration;
 
 use crate::process::{self as proc, shell_quote};
@@ -47,6 +48,20 @@ pub enum Runner {
     Container { id: String, port: u16 },
 }
 
+/// A refusal from the server: the login may not make or drop this
+/// namespace. Its message carries the grant that would let it, and what
+/// was not done.
+#[derive(Debug)]
+pub struct Denied(pub String);
+
+impl std::fmt::Display for Denied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Denied {}
+
 /// What [`Server::create`] found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Created {
@@ -84,6 +99,58 @@ impl Server<'_> {
                 ..inside
             },
         }
+    }
+
+    /// A container's environment, as `docker exec … env` prints it. Held
+    /// in memory for the one login it gives, never printed.
+    fn container_env(&self, id: &str) -> Option<std::collections::BTreeMap<String, String>> {
+        let script = self.with_path(&format!("docker exec {} env", shell_quote(id)));
+        let out = proc::run_captured(&script, &std::env::temp_dir(), &[], TIMEOUT).ok()?;
+        if !out.success() {
+            return None;
+        }
+        Some(
+            out.stdout
+                .lines()
+                .filter_map(|line| line.split_once('='))
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+        )
+    }
+
+    /// Gives this server's login the right to make and drop this
+    /// worktree's namespaces, by running the recipe's `grant` as `admin`:
+    /// what the developer would otherwise run by hand, once. Returns the
+    /// statement it ran, for a line that says so.
+    pub fn grant_as(&self, admin: &Server<'_>, main: &str) -> Result<String> {
+        let Some(grant) = self.grant(main) else {
+            bail!(
+                "the recipe for {} says no grant pando could run for {main}",
+                self.service
+            );
+        };
+        admin.run_sql(&grant)?;
+        Ok(grant)
+    }
+
+    /// Runs SQL as this server's login, through the recipe's `run_sql`,
+    /// the statement on stdin and never on a command line.
+    fn run_sql(&self, sql: &str) -> Result<()> {
+        let command = self.command(self.recipe.run_sql.as_deref(), "run_sql")?;
+        let rendered = template::render_with(command, &self.vars(None))?;
+        let script = self.wrap(&format!("{rendered} <<'PANDO_SQL'\n{sql}\nPANDO_SQL"));
+        let env = self.login.env(self.recipe.password_env.as_deref());
+        let out = proc::run_captured(&script, &std::env::temp_dir(), &env, TIMEOUT)?;
+        if out.success() {
+            return Ok(());
+        }
+        bail!(
+            "{} on {} did not run the grant as {}: {}",
+            self.service,
+            self.address(),
+            self.login.from,
+            out.last_stderr_line().unwrap_or("no output")
+        )
     }
 
     /// The running container that publishes this server's port on this
@@ -218,7 +285,7 @@ impl Server<'_> {
             return Ok(Created::Made);
         }
         if self.is_denied(&out) {
-            bail!("{}", self.denied(name, main, "made"));
+            return Err(anyhow::Error::new(Denied(self.denied(name, main, "made"))));
         }
         if self.exists(name)? {
             return Ok(Created::AlreadyThere);
@@ -244,7 +311,9 @@ impl Server<'_> {
             return Ok(());
         }
         if self.is_denied(&out) {
-            bail!("{}", self.denied(name, main, "dropped"));
+            return Err(anyhow::Error::new(Denied(
+                self.denied(name, main, "dropped"),
+            )));
         }
         bail!(
             "{} on {} could not drop {name}: {}",
@@ -525,6 +594,46 @@ impl Server<'_> {
             ..self.vars(Some(name))
         };
         Ok(self.wrap(&template::render_with(command, &vars)?))
+    }
+}
+
+impl<'a> Server<'a> {
+    /// This server reached as its own administrator, inside the container
+    /// that runs it, with the login its environment keeps: the recipe's
+    /// `[namespace.container_admin]`. `None` when the recipe names none,
+    /// no container publishes the port, or the container's environment
+    /// names nobody.
+    pub fn admin(&self) -> Option<Server<'a>> {
+        let admin = self.recipe.container_admin.as_ref()?;
+        let (id, port) = match &self.runner {
+            Runner::Container { id, port } => (id.clone(), *port),
+            Runner::Host => self.container()?,
+        };
+        let env = self.container_env(&id)?;
+        let first = |keys: &[String]| {
+            keys.iter()
+                .find_map(|key| env.get(key).map(|value| (key.clone(), value.clone())))
+        };
+        let user = first(&admin.user_from);
+        let password = first(&admin.password_from);
+        let from = match (&user, &password) {
+            (Some((u, _)), Some((p, _))) => format!("{u} and {p} in the container's environment"),
+            (Some((u, _)), None) => format!("{u} in the container's environment"),
+            (None, Some((p, _))) => format!("{p} in the container's environment"),
+            (None, None) => "the image's own administrator".to_string(),
+        };
+        let user = user
+            .map(|(_, value)| value)
+            .or_else(|| admin.user.clone())?;
+        Some(Server {
+            service: self.service,
+            recipe: self.recipe,
+            host: self.host.clone(),
+            port: self.port,
+            login: Login::new(Some(user), password.map(|(_, value)| value), from),
+            bin_dir: self.bin_dir.clone(),
+            runner: Runner::Container { id, port },
+        })
     }
 }
 

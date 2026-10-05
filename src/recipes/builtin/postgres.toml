@@ -104,6 +104,17 @@ drop = "psql -X -w -v ON_ERROR_STOP=1 -h {host} -p {port} -U {user} -d postgres 
 denied = ["permission denied to create database", "must be owner of database", "permission denied to drop database"]
 grant = '''ALTER ROLE "{account_user}" CREATEDB;'''
 grant_covers = "make databases, and drop only the ones it made"
+# How pando runs that grant itself, as the server's administrator, where
+# it can log in as one: inside a container, below.
+run_sql = "psql -X -w -q -v ON_ERROR_STOP=1 -h {host} -p {port} -U {user} -d postgres"
+
+# The official image's administrator is POSTGRES_USER, `postgres` when it
+# is unset, and inside the container a connection to its own loopback is
+# trusted — the password is passed all the same, for an image that is not.
+[namespace.container_admin]
+user_from = ["POSTGRES_USER"]
+user = "postgres"
+password_from = ["POSTGRES_PASSWORD"]
 
 # Where an app names its database: a URL's path, or a key beside the
 # address — `DATABASE_NAME` next to `DATABASE_PORT`.

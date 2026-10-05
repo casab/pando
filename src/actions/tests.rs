@@ -12411,6 +12411,163 @@ fn rm_of_a_prefixed_worktree_leaves_what_the_app_wrote_and_says_so() {
     );
 }
 
+// ---- a database in a container, set up with nobody asked --------------------
+
+/// A recipe whose client no machine has, so only the stand-in container's
+/// answers: a database that refuses a login with no right to make one, and
+/// runs a grant it is handed.
+const BOXED_RECIPE: &str = r#"kind = "service"
+name = "boxed"
+
+[namespace]
+kind = "database"
+binaries = ["pando-boxed-sql"]
+user = true
+password_env = "BOXED_PWD"
+ping = "pando-boxed-sql -U {user} ping"
+exists = "pando-boxed-sql -U {user} exists {namespace}"
+create = "pando-boxed-sql -U {user} create {namespace}"
+drop = "pando-boxed-sql -U {user} drop {namespace}"
+denied = ["permission denied to create database"]
+grant = 'ALTER ROLE "{account_user}" CREATEDB;'
+run_sql = "pando-boxed-sql -U {user} sql"
+
+[namespace.container_admin]
+user_from = ["BOXED_ADMIN"]
+user = "root"
+password_from = ["BOXED_ADMIN_PASSWORD"]
+"#;
+
+/// The stand-in client: `boss` may do anything; anyone else may make a
+/// database only once a grant naming them ran.
+const BOXED_CLIENT: &str = r#"#!/bin/sh
+state="$(dirname "$0")/.."
+printf '%s\n' "$*" >> "$state/argv"
+user=$2
+for last; do :; done
+case "$*" in
+  *" ping") echo ok ;;
+  *" exists "*) [ -f "$state/db-$last" ] && echo "$last" ;;
+  *" create "*)
+    if [ "$user" != boss ] && ! grep -q "ROLE .$user. CREATEDB" "$state/sql" 2>/dev/null; then
+      echo "ERROR: permission denied to create database" >&2; exit 1
+    fi
+    [ -f "$state/db-$last" ] && { echo exists >&2; exit 1; }
+    touch "$state/db-$last" ;;
+  *" drop "*) rm -f "$state/db-$last" ;;
+  *" sql") cat >> "$state/sql" ;;
+  *) echo "unexpected: $*" >&2; exit 9 ;;
+esac
+"#;
+
+/// A compose project whose `db` runs in a container publishing 15432, the
+/// client inside it alone, and the container's environment `env`.
+fn boxed_fixture(url: &str, env: &str) -> (Fx, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut fx = compose_fixture(
+        "services:\n  db:\n    image: boxed:1\n    ports: [\"15432:5432\"]\n",
+        &format!("PORT=3000\nDATABASE_URL={url}\n"),
+    );
+    let config: Config = toml::from_str(
+        "[[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
+         include = [\"db\"]\nenv = { DATABASE_URL = \"db\" }\n",
+    )
+    .unwrap();
+    fx.config.services = config.services;
+    std::fs::create_dir_all(fx.paths.recipes_dir()).unwrap();
+    std::fs::write(fx.paths.recipes_dir().join("boxed.toml"), BOXED_RECIPE).unwrap();
+    let container = fx.paths.home.join("container");
+    std::fs::create_dir_all(container.join("bin")).unwrap();
+    let client = container.join("bin/pando-boxed-sql");
+    std::fs::write(&client, BOXED_CLIENT).unwrap();
+    std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(container.join("env"), env).unwrap();
+    let bin = fx.paths.home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let docker = format!(
+        "#!/bin/sh\ncase \"$1\" in\n\
+           ps) echo c0ffee ;;\n\
+           port) echo \"5432/tcp -> 0.0.0.0:15432\" ;;\n\
+           exec) shift; while [ \"$1\" = -e ]; do shift 2; done; shift;\n\
+             if [ \"$1\" = env ]; then cat '{c}/env'; exit 0; fi; shift; shift;\n\
+             PATH='{c}/bin':\"$PATH\" exec sh -c \"$1\" ;;\n\
+         esac\n",
+        c = container.display()
+    );
+    std::fs::write(bin.join("docker"), docker).unwrap();
+    std::fs::set_permissions(bin.join("docker"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    (fx, container)
+}
+
+// The app's login may not make databases, as an image's own app user may
+// not. The grant the developer would run by hand is run by the container's
+// own administrator instead, and the database is made: nothing asked.
+#[test]
+fn a_container_database_whose_app_login_may_not_make_one_is_granted_by_its_admin() {
+    let (fx, container) = boxed_fixture(
+        "boxed://app:secret@localhost:15432/shop",
+        "BOXED_ADMIN=boss\nBOXED_ADMIN_PASSWORD=hunter2\nPATH=/usr/bin\n",
+    );
+    let name = worktree_named(&fx, "feat/one");
+    let plan = super::namespaced::plan(&fx.paths, &fx.config);
+    let server = super::namespaced::server_for(&fx.paths, &fx.config, &plan.targets[0]).unwrap();
+    assert!(
+        server.admin().is_some(),
+        "runner {:?}, docker log: {:?}",
+        server.runner,
+        std::fs::read_dir(fx.paths.home.join("bin"))
+            .unwrap()
+            .count()
+    );
+    let said = std::cell::RefCell::new(Vec::<String>::new());
+    let progress = |line: &str| said.borrow_mut().push(line.to_string());
+    let ready =
+        super::namespaced::prepare(&fx.paths, &fx.config, &name, &progress).unwrap_or_else(|e| {
+            panic!(
+                "{e:#}\nargv: {}\nsql: {:?}\nsaid: {:?}",
+                std::fs::read_to_string(container.join("argv")).unwrap_or_default(),
+                std::fs::read_to_string(container.join("sql")).ok(),
+                said.borrow()
+            )
+        });
+    assert_eq!(ready.namespaces[0].name, "shop__feat_one");
+    assert!(container.join("db-shop__feat_one").exists());
+    let sql = std::fs::read_to_string(container.join("sql")).unwrap();
+    assert_eq!(sql.trim(), "ALTER ROLE \"app\" CREATEDB;");
+    let argv = std::fs::read_to_string(container.join("argv")).unwrap();
+    assert!(
+        argv.contains("-U boss sql"),
+        "the grant ran as the admin: {argv}"
+    );
+    assert!(argv.contains("-U app create shop__feat_one"), "{argv}");
+    assert!(
+        !argv.contains("hunter2") && !argv.contains("secret"),
+        "{argv}"
+    );
+    assert!(
+        said.borrow()
+            .iter()
+            .any(|l| l.contains("pando gave it the right, as BOXED_ADMIN and BOXED_ADMIN_PASSWORD")),
+        "{:?}",
+        said.borrow()
+    );
+}
+
+// No login anywhere the developer wrote: the container's administrator is
+// the login, and the question a namespaced start would ask is never put.
+#[test]
+fn a_container_database_with_no_login_written_anywhere_asks_nobody() {
+    let (fx, container) = boxed_fixture("boxed://localhost:15432/shop", "BOXED_ADMIN=boss\n");
+    let mut config = fx.config.clone();
+    super::namespaced::ask_for_logins(&fx.paths, &mut config, &refuse, &noop).unwrap();
+    assert!(super::namespaced::check_stays_shared(&fx.paths, &config).is_none());
+    let name = worktree_named(&fx, "feat/one");
+    let ready = super::namespaced::prepare(&fx.paths, &config, &name, &noop).unwrap();
+    assert_eq!(ready.namespaces[0].name, "shop__feat_one");
+    let argv = std::fs::read_to_string(container.join("argv")).unwrap();
+    assert!(argv.contains("-U boss create shop__feat_one"), "{argv}");
+}
+
 /// A recipe for an engine pando never starts, only finds in a container:
 /// what a namespace is there, and nothing about running the server.
 const CLICKHOUSE_NAMESPACE_ONLY: &str = "kind = \"service\"\nname = \"clickhouse\"\n\n\
