@@ -7,6 +7,16 @@ may change behaviour.
 
 ## Unreleased
 
+### Added
+
+- `pando update`: updates pando to the latest release the way it was
+  installed — `brew upgrade` for Homebrew's, `cargo install` at the
+  release's tag for cargo's, and the install script, into the directory
+  the binary is in and with no change to shell files, for any other. A
+  build made in a checkout is updated there, so pando says how and runs
+  nothing. `--check` says whether a newer release is out and what would
+  install it.
+
 ## 0.8.1 — 2026-10-05
 
 ### Added

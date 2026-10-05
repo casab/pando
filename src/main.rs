@@ -98,6 +98,10 @@ fn run(cli: Cli) -> Result<()> {
     if let Some(pando::cli::Command::Completions { shell }) = cli.command {
         return pando::cli::completions(shell, &mut pando::cli::Stdout);
     }
+    // Updating pando is about the binary, not about any repository.
+    if let Some(pando::cli::Command::Update { check }) = cli.command {
+        return pando::cli::update(check, &mut pando::cli::Stdout);
+    }
     let cwd = std::env::current_dir().context(
         "cannot read the current directory — it may have been deleted; cd somewhere that exists",
     )?;

@@ -17,7 +17,7 @@ pub struct Tool {
     pub get: &'static str,
 }
 
-pub const TOOLS: [Tool; 4] = [
+pub const TOOLS: [Tool; 5] = [
     Tool {
         program: "git",
         get: "xcode-select --install   (or your distribution's git package)",
@@ -36,6 +36,12 @@ pub const TOOLS: [Tool; 4] = [
     Tool {
         program: "gh",
         get: "brew install gh   (or the GitHub CLI's gh package)",
+    },
+    // `pando update` asks GitHub for the latest release, and downloads
+    // the install script, with it. macOS has it already.
+    Tool {
+        program: "curl",
+        get: "your distribution's curl package",
     },
 ];
 

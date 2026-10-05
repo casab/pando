@@ -17022,3 +17022,222 @@ mod app_config_literals {
         assert_eq!(slug(source).as_deref(), Some("shop"));
     }
 }
+
+mod update {
+    use super::super::update::{cargo_key_source, release_of};
+    use super::super::{FORMULA, Install, Refusal, Updater, Version, installer_url};
+    use std::path::{Path, PathBuf};
+    use tempfile::tempdir;
+
+    fn v(text: &str) -> Version {
+        Version::parse(text).unwrap_or_else(|| panic!("{text} parses"))
+    }
+
+    #[test]
+    fn a_version_is_read_with_or_without_its_tags_v_and_orders_as_semver() {
+        assert_eq!(v("v0.8.1"), v("0.8.1"));
+        assert_eq!(v("0.8.1 (feat/update@abc1234)"), v("0.8.1"));
+        assert_eq!(v("0.9.0-rc.1").to_string(), "0.9.0-rc.1");
+        assert_eq!(v("0.8.1").tag(), "v0.8.1");
+        assert!(v("0.10.0") > v("0.9.9"), "numbers, not text");
+        assert!(
+            v("0.9.0-rc.1") < v("0.9.0"),
+            "a pre-release leads up to its release"
+        );
+        assert!(v("0.9.0-rc.1") > v("0.8.1"));
+        assert!(v("0.9.0-rc.2") > v("0.9.0-rc.1"));
+        for bad in ["", "0.8", "0.8.1.2", "0.8.x", "0.8.1-", "pando"] {
+            assert_eq!(Version::parse(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_latest_release_is_the_tag_github_redirects_to() {
+        assert_eq!(
+            release_of("https://github.com/mertkaradayi/pando/releases/tag/v0.9.0\n"),
+            Some(v("0.9.0"))
+        );
+        // No release yet: GitHub sends `latest` to the release list.
+        assert_eq!(
+            release_of("https://github.com/mertkaradayi/pando/releases"),
+            None
+        );
+        assert_eq!(release_of(""), None);
+    }
+
+    #[test]
+    fn a_development_build_is_one_whatever_its_path() {
+        let install = Install::of(
+            Path::new("/opt/homebrew/Cellar/pando/0.8.1/bin/pando"),
+            Some("feat/update@abc1234"),
+            Path::new("/nowhere"),
+        );
+        assert_eq!(
+            install,
+            Install::Development {
+                label: "feat/update@abc1234".into()
+            }
+        );
+        assert!(install.updater(Some(&v("9.9.9"))).is_err());
+    }
+
+    #[test]
+    fn a_build_in_a_checkouts_target_is_updated_there() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+        let exe = dir.path().join("target/release/pando");
+        let install = Install::of(&exe, None, Path::new("/nowhere"));
+        assert_eq!(
+            install,
+            Install::Checkout {
+                root: dir.path().to_path_buf()
+            }
+        );
+        let Err(Refusal(why)) = install.updater(Some(&v("9.9.9"))) else {
+            panic!("a checkout's build is not pando's to replace");
+        };
+        assert!(why.contains("git pull"), "{why}");
+        // A `target` with no Cargo.toml beside it is only a name.
+        let elsewhere = tempdir().unwrap();
+        let exe = elsewhere.path().join("target/bin/pando");
+        assert!(matches!(
+            Install::of(&exe, None, Path::new("/nowhere")),
+            Install::Standalone { .. }
+        ));
+    }
+
+    #[test]
+    fn homebrews_is_upgraded_by_its_own_brew_by_the_taps_formula() {
+        for (exe, prefix) in [
+            (
+                "/opt/homebrew/Cellar/pando/0.8.1/bin/pando",
+                "/opt/homebrew",
+            ),
+            (
+                "/home/linuxbrew/.linuxbrew/Cellar/pando/0.8.1/bin/pando",
+                "/home/linuxbrew/.linuxbrew",
+            ),
+        ] {
+            let install = Install::of(Path::new(exe), None, Path::new("/nowhere"));
+            assert_eq!(
+                install,
+                Install::Homebrew {
+                    prefix: prefix.into()
+                }
+            );
+            // Homebrew knows the latest itself.
+            let updater = install.updater(None).unwrap();
+            assert_eq!(
+                updater.command_line(),
+                format!("{prefix}/bin/brew upgrade {FORMULA}")
+            );
+        }
+    }
+
+    fn cargo_root(source: &str) -> tempfile::TempDir {
+        let root = tempdir().unwrap();
+        let installs = serde_json::json!({
+            "installs": {
+                "ripgrep 14.1.0 (registry+https://github.com/rust-lang/crates.io-index)": {},
+                format!("pando-cli 0.8.1 ({source})"): {},
+            }
+        });
+        std::fs::write(root.path().join(".crates2.json"), installs.to_string()).unwrap();
+        root
+    }
+
+    #[test]
+    fn cargos_is_installed_again_at_the_latest_releases_tag() {
+        let root = cargo_root("git+https://github.com/mertkaradayi/pando#8ecd9f2");
+        let exe = root.path().join("bin/pando");
+        let install = Install::of(&exe, None, root.path());
+        assert_eq!(
+            install,
+            Install::CargoGit {
+                root: root.path().to_path_buf(),
+                default_root: true
+            }
+        );
+        assert_eq!(
+            install.updater(Some(&v("0.9.0"))).unwrap().command_line(),
+            "cargo install --locked --git https://github.com/mertkaradayi/pando --tag v0.9.0 \
+             pando-cli"
+        );
+        // Without the latest release there is no tag to install.
+        assert!(install.updater(None).is_err());
+
+        // Somewhere other than cargo's home keeps its `--root`.
+        let install = Install::of(&exe, None, Path::new("/nowhere"));
+        let line = install.updater(Some(&v("0.9.0"))).unwrap().command_line();
+        assert!(
+            line.contains(&format!("--root {} pando-cli", root.path().display())),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn cargos_from_a_local_checkout_is_updated_there() {
+        let root = cargo_root("path+file:///src/pando");
+        let install = Install::of(&root.path().join("bin/pando"), None, root.path());
+        assert_eq!(
+            install,
+            Install::CargoPath {
+                source: "/src/pando".into()
+            }
+        );
+        assert!(install.updater(Some(&v("0.9.0"))).is_err());
+        assert_eq!(
+            cargo_key_source("pando-cli 0.8.1 (git+https://x#1)").as_deref(),
+            Some("git+https://x#1")
+        );
+        assert_eq!(
+            cargo_key_source("pando-cli-extra 0.1.0 (git+https://x#1)"),
+            None
+        );
+    }
+
+    #[test]
+    fn anything_else_is_replaced_in_its_own_directory_by_the_install_script() {
+        // A cargo root that never installed pando is not cargo's pando.
+        let root = tempdir().unwrap();
+        std::fs::write(root.path().join(".crates2.json"), r#"{"installs":{}}"#).unwrap();
+        let exe = root.path().join("bin/pando");
+        assert_eq!(
+            Install::of(&exe, None, root.path()),
+            Install::Standalone {
+                dir: root.path().join("bin")
+            }
+        );
+
+        let install = Install::of(
+            Path::new("/home/dev/.local/bin/pando"),
+            None,
+            Path::new("/home/dev/.cargo"),
+        );
+        let updater = install.updater(None).unwrap();
+        assert_eq!(
+            updater.command_line(),
+            format!(
+                "curl --proto '=https' --tlsv1.2 -LsSf {} | \
+                 PANDO_CLI_INSTALL_DIR=/home/dev/.local/bin PANDO_CLI_NO_MODIFY_PATH=1 sh",
+                installer_url()
+            )
+        );
+        let Updater::Script { env, .. } = updater else {
+            panic!("the install script");
+        };
+        assert!(env.contains(&("PANDO_CLI_NO_MODIFY_PATH".into(), "1".into())));
+    }
+
+    #[test]
+    fn a_directory_with_a_space_is_quoted_in_the_command_line() {
+        let install = Install::Standalone {
+            dir: PathBuf::from("/Users/a b/bin"),
+        };
+        let line = install.updater(None).unwrap().command_line();
+        assert!(
+            line.contains("PANDO_CLI_INSTALL_DIR='/Users/a b/bin' "),
+            "{line}"
+        );
+    }
+}

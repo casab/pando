@@ -236,3 +236,20 @@ fn the_release_smoke_starts_the_test_suites_own_listener() {
         "release-smoke.yml's fixture no longer starts listener_on_port_template():\n{listener}"
     );
 }
+
+/// `pando update` updates each install the way the README made it, so
+/// the formula and the install script's URL it uses are the README's.
+#[test]
+fn pando_update_uses_the_formula_and_the_script_the_readme_installs_with() {
+    let readme = read("README.md");
+    let brew = format!("brew install {}", pando::actions::FORMULA);
+    assert!(readme.contains(&brew), "the README installs with `{brew}`");
+    let script = format!(
+        "curl --proto '=https' --tlsv1.2 -LsSf {} | sh",
+        pando::actions::installer_url()
+    );
+    assert!(
+        readme.contains(&script),
+        "the README installs with `{script}`"
+    );
+}

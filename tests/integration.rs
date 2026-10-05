@@ -25,3 +25,4 @@ mod native;
 mod services;
 mod share;
 mod tunnel;
+mod update;

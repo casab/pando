@@ -13,7 +13,8 @@
 //! the builds installed on the booted simulators, `pando check`,
 //! trying pando's own guess for the setup screen, and the git menu's
 //! moves, which callers name as `actions::git::…` because `read` and
-//! `run` alone would say nothing.
+//! `run` alone would say nothing, and `pando update`, which updates pando
+//! itself the way it was installed.
 
 mod app_config;
 mod check;
@@ -33,6 +34,7 @@ mod runtime;
 mod services;
 mod share;
 mod trying;
+mod update;
 mod worktree;
 
 pub use check::{
@@ -84,6 +86,10 @@ pub use services::{
 };
 pub use share::{ENV_SHARE_PORT, ShareOutcome, SpawnProxy, share, share_with, unshare};
 pub use trying::{OwnGuess, try_on_its_own, try_on_its_own_on};
+pub use update::{
+    FORMULA, Install, REPOSITORY, Refusal, Survey, Updated, Updater, Version, installer_url,
+    latest_release, update,
+};
 pub use worktree::{
     CREATED_BUT_INSTALL_FAILED, KEPT_OVER_RACED_RECORD, MAIN_RUNS_ONLY, Ownership, Unprovisioned,
     created_by_pando, guard_write_locations, ls, ls_all, new, new_for_pr, ownership, path, path_in,

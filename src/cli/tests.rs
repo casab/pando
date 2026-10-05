@@ -5999,3 +5999,82 @@ fn the_check_variable_is_documented_where_the_others_are() {
         .to_string();
     assert!(help.contains(&format!("{var}=1")), "{help}");
 }
+
+mod update {
+    use super::super::update::{check_text, updated_text};
+    use crate::actions::{Install, Survey, Updated, Version};
+
+    fn survey(running: &str, install: Install, latest: Result<&str, &str>) -> Survey {
+        Survey {
+            running: Version::parse(running).unwrap(),
+            install,
+            latest: latest
+                .map(|l| Version::parse(l).unwrap())
+                .map_err(str::to_string),
+        }
+    }
+
+    fn brew() -> Install {
+        Install::Homebrew {
+            prefix: "/opt/homebrew".into(),
+        }
+    }
+
+    #[test]
+    fn check_says_what_is_out_and_the_command_that_would_install_it() {
+        let text = check_text(&survey("0.8.1", brew(), Ok("0.9.0")));
+        assert_eq!(
+            text,
+            "pando 0.8.1, installed with Homebrew\n\
+             0.9.0 is out\n\
+             update with: pando update   (runs /opt/homebrew/bin/brew upgrade \
+             mertkaradayi/tap/pando)\n"
+        );
+        let text = check_text(&survey("0.8.1", brew(), Ok("0.8.1")));
+        assert!(text.ends_with("that is the latest release\n"), "{text}");
+        let text = check_text(&survey("0.9.0", brew(), Ok("0.8.1")));
+        assert!(
+            text.ends_with("newer than the latest release, 0.8.1\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn check_on_a_checkouts_build_says_how_to_update_it_there() {
+        let install = Install::Checkout {
+            root: "/src/pando".into(),
+        };
+        let text = check_text(&survey("0.8.1", install, Ok("0.9.0")));
+        assert!(text.contains("0.9.0 is out\n"), "{text}");
+        assert!(
+            text.contains("built in the checkout at /src/pando"),
+            "{text}"
+        );
+        assert!(!text.contains("update with"), "{text}");
+    }
+
+    #[test]
+    fn an_update_says_where_it_went_or_why_it_went_nowhere() {
+        let s = survey("0.8.1", brew(), Ok("0.9.0"));
+        assert_eq!(
+            updated_text(&s, &Updated::To(Version::parse("0.9.0").unwrap())).unwrap(),
+            "pando 0.8.1 → 0.9.0\n"
+        );
+        let err = updated_text(&s, &Updated::Unchanged)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Homebrew's formula for 0.9.0"), "{err}");
+
+        let s = survey("0.8.1", brew(), Ok("0.8.1"));
+        assert_eq!(
+            updated_text(&s, &Updated::Current).unwrap(),
+            "pando 0.8.1 is the latest release\n"
+        );
+        // Not knowing the latest, brew finding nothing newer is the answer.
+        let s = survey("0.8.1", brew(), Err("offline"));
+        assert_eq!(
+            updated_text(&s, &Updated::Unchanged).unwrap(),
+            "pando 0.8.1: nothing newer to install\n"
+        );
+    }
+}

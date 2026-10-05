@@ -23,6 +23,7 @@ mod prompt;
 mod signals;
 mod status;
 mod tip;
+mod update;
 mod wait;
 
 use self::answers::init_asker;
@@ -42,6 +43,7 @@ pub use logs::logs;
 pub use ls::{Col, LsView, keep_columns, ls_json, ls_text, ls_text_at, ls_text_with};
 pub use signals::signals_json;
 pub use status::{status_json, status_text, status_text_at};
+pub use update::update;
 
 /// Shape version for machine-readable output, bumped independently of the
 /// crate version so agents can pin what they parse.
@@ -546,6 +548,22 @@ Examples:
         /// The shell to complete for.
         shell: clap_complete::Shell,
     },
+    /// Update pando to the latest release, the way it was installed.
+    ///
+    /// Homebrew's pando with `brew upgrade`, cargo's with `cargo install`
+    /// at the release's tag, and any other with the install script, into
+    /// the directory it is in. A build made from a checkout is updated
+    /// there, so pando says how and runs nothing.
+    #[command(after_help = "\
+Examples:
+  pando update            to the latest release, if there is a newer one
+  pando update --check    whether there is, and the command that would install it")]
+    #[command(display_order = 18)]
+    Update {
+        /// Say whether there is a newer release, and run nothing.
+        #[arg(long)]
+        check: bool,
+    },
     /// The share proxy, spawned by `share`.
     ///
     /// Never run by hand: it reads its cookie from the environment and
@@ -1020,6 +1038,9 @@ pub fn dispatch(command: Command, paths: &PandoPaths, config: &Config) -> Result
             logs(paths, &name, &source, tail, follow, json, &mut out, &notice)
         }
         Command::Completions { shell } => completions(shell, &mut out),
+        // Never reached either: `main` runs it before it goes looking for
+        // a repository, because pando updates itself from anywhere.
+        Command::Update { check } => update(check, &mut out),
         // Never reached: `main` runs the proxy before it goes looking for a
         // repository, because the proxy has none.
         Command::ShareProxy { listen, upstream } => run_share_proxy(listen, upstream),

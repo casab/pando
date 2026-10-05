@@ -325,6 +325,7 @@ pando check           test the setup in a throwaway worktree, then remove it
 pando doctor          explain what was detected, why, and what is missing
 pando signals         dump detection signals as JSON, for humans or agents
 pando completions     print a completion script for bash, zsh, fish…
+pando update          update pando to the latest release, the way it was installed
 ```
 
 A worktree is named by its branch (`feat/login`) or by its directory
@@ -548,7 +549,7 @@ these needs Rust.
 **Homebrew**, on macOS or Linux:
 
 ```bash
-brew install mertkaradayi/tap/pando        # later: brew upgrade pando
+brew install mertkaradayi/tap/pando        # later: pando update
 ```
 
 **The install script**, with nothing else installed:
@@ -561,7 +562,9 @@ It puts `pando` in `~/.local/bin` and adds that directory to your PATH in
 your shell's startup files; to leave those alone, run the script with
 `PANDO_CLI_NO_MODIFY_PATH=1`. Every download has a checksum and a GitHub
 attestation, so `gh attestation verify <file> -R mertkaradayi/pando`
-proves it was built here. Rerun the line to update.
+proves it was built here. To update, run `pando update`: it replaces
+pando where it is and leaves your shell's files alone. Rerunning the
+line works too.
 
 **From source**, with Rust 1.88 or newer. With no Rust on the machine,
 rustup installs the current stable toolchain, and a new terminal then has
@@ -573,10 +576,12 @@ cargo install --locked --git https://github.com/mertkaradayi/pando pando-cli
 ```
 
 `--locked` builds with the exact dependency versions CI tested; without
-it cargo may pick newer ones that need a newer Rust. On a new Mac, `git`
+it cargo may pick newer ones that need a newer Rust. `pando update`
+installs it again at the latest release's tag. On a new Mac, `git`
 comes with the Xcode Command Line Tools (`xcode-select --install`).
 
-`pando --version` says which version you have, and `pando completions zsh`
+`pando --version` says which version you have, `pando update --check`
+whether a newer release is out, and `pando completions zsh`
 (or bash, fish…) prints a completion script.
 
 ### What else pando uses
