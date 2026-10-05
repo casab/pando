@@ -179,7 +179,7 @@ pub fn signals_json<W: Write>(paths: &PandoPaths, config: &Config, out: &mut W) 
                 proposal: proposals.iter().find(|p| p.slot == *slot).map(proposal_out),
             })
             .collect(),
-        namespaced: actions::namespaced_report(paths, config),
+        namespaced: actions::namespaced_report(paths, config, &signals.compose_files),
         signals,
     };
     writeln!(out, "{}", serde_json::to_string_pretty(&output)?)?;

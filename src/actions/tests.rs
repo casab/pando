@@ -12253,6 +12253,83 @@ fn a_namespaced_answer_for_a_service_or_recipe_there_is_not_is_refused() {
     assert!(e.contains("says nothing"), "{e}");
 }
 
+// What `signals` says of each service a namespaced start would see — and
+// of a compose service the project does not declare, which it never sees
+// and every worktree shares, with the way in. A mail catcher is no data.
+#[test]
+fn the_namespaced_report_names_what_each_service_gets_and_what_no_start_sees() {
+    let mut fx = compose_fixture(
+        concat!(
+            "services:\n",
+            "  db:\n    image: postgres:16\n    ports: [\"5432:5432\"]\n",
+            "  search:\n    image: registry.example/search:3\n    ports: [\"9200:9200\"]\n",
+            "  mail:\n    image: axllent/mailpit\n",
+        ),
+        "PORT=3000\nDATABASE_URL=postgres://acme:acme@localhost:5432/acme\n",
+    );
+    let config: Config = toml::from_str(
+        "[[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
+         include = [\"db\"]\nenv = { DATABASE_URL = \"db\" }\n",
+    )
+    .unwrap();
+    fx.config.services = config.services;
+    let report =
+        super::namespaced::namespaced_report(&fx.paths, &fx.config, &["docker-compose.yml".into()]);
+    let how: Vec<(&str, &str)> = report.iter().map(|s| (s.service.as_str(), s.how)).collect();
+    assert_eq!(how, [("db", "database"), ("search", "undeclared")]);
+    assert_eq!(report[0].recipe.as_deref(), Some("postgres"));
+    assert_eq!(report[0].keys, ["DATABASE_URL"]);
+    let why = report[1].why.as_deref().unwrap();
+    assert!(why.contains("the `services` answer adds it"), "{why}");
+}
+
+// A project whose only service namespaces by prefix started shared, as one
+// with nothing to namespace: the start asked for database and slot targets
+// alone. It runs namespaced, and its processes are told the prefix.
+#[test]
+fn a_project_namespaced_by_prefix_alone_starts_namespaced() {
+    let mut fx = search_fixture("elasticsearch:8", "ELASTICSEARCH_INDEX_PREFIX=\n");
+    with_dev(&mut fx, dev("sleep 30"));
+    let name = worktree_named(&fx, "feat/one");
+    let said = std::cell::RefCell::new(Vec::<String>::new());
+    let progress = |line: &str| said.borrow_mut().push(line.to_string());
+    let outcome = super::start(
+        &fx.paths,
+        &fx.config,
+        &name,
+        None,
+        Mode::Namespaced,
+        &progress,
+    )
+    .unwrap();
+    let _guard = guard(&outcome);
+    assert!(
+        !said
+            .borrow()
+            .iter()
+            .any(|l| l.contains("starting in shared mode")),
+        "{:?}",
+        said.borrow()
+    );
+    assert_eq!(
+        super::lifecycle::recorded_mode(&fx.paths, &name),
+        crate::state::ServiceMode::Namespaced
+    );
+    let env = super::services::resolved_env(&fx.paths, &fx.config, &name).unwrap();
+    assert_eq!(env["ELASTICSEARCH_INDEX_PREFIX"], "feat_one__");
+    assert_eq!(env["PANDO_NAMESPACE"], "feat_one");
+    let record = fx.state().worktrees[&name].clone();
+    let lines = super::namespaced::namespace_lines(&fx.paths, Some(&fx.config), &name, &record);
+    assert_eq!(
+        lines,
+        [(
+            "search".to_string(),
+            "own",
+            "prefix feat_one__ in ELASTICSEARCH_INDEX_PREFIX".to_string()
+        )]
+    );
+}
+
 // `rm` drops only what pando made. Under a prefix pando made nothing, so it
 // drops nothing there, and says what it leaves.
 #[test]
@@ -12291,7 +12368,7 @@ const CLICKHOUSE_NAMESPACE_ONLY: &str = "kind = \"service\"\nname = \"clickhouse
 #[test]
 fn a_compose_engine_gets_a_namespace_from_a_recipe_that_starts_no_server() {
     let mut fx = compose_fixture(
-        "services:\n  warehouse:\n    image: clickhouse/clickhouse-server:24\n\
+        "services:\n  warehouse:\n    image: clickhouse/clickhouse-server:24\n    \
          ports: [\"9000:9000\"]\n",
         "PORT=3000\nCLICKHOUSE_URL=clickhouse://app@localhost:9000/events\n",
     );

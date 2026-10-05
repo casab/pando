@@ -1926,7 +1926,7 @@ fn can_namespace(paths: &PandoPaths, config: &Config, name: &str, mode: Mode) ->
         Mode::Remembered => recorded_mode(paths, name) == ServiceMode::Namespaced,
         Mode::Shared | Mode::Isolated => false,
     };
-    wants && !namespaced::plan(paths, config).targets.is_empty()
+    wants && namespaced::plan(paths, config).gives_own()
 }
 
 /// Refuses a start of a worktree that runs namespaced, plain or asking for
@@ -1955,7 +1955,7 @@ pub(super) fn refuse_losing_namespaces(
         return Ok(());
     }
     let plan = namespaced::plan(paths, config);
-    if !plan.targets.is_empty() {
+    if plan.gives_own() {
         return Ok(());
     }
     let why = match plan.shared_lines() {

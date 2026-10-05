@@ -235,6 +235,12 @@ pub(super) struct Plan {
 }
 
 impl Plan {
+    /// Whether a namespaced start gives the worktree anything of its own:
+    /// a database or a slot the server makes, or a prefix its app is told.
+    pub fn gives_own(&self) -> bool {
+        !self.targets.is_empty() || !self.prefixed.is_empty()
+    }
+
     /// `redis: shared — the app reads no slot setting`, one a service
     /// that stays on main's data.
     pub fn shared_lines(&self) -> Vec<String> {
@@ -293,7 +299,7 @@ pub fn namespaced_not_own_data(paths: &PandoPaths, config: &Config) -> Option<St
 /// every slot of it is held, which is when a start would ask too.
 pub(super) fn check_stays_shared(paths: &PandoPaths, config: &Config) -> Option<String> {
     let plan = plan(paths, config);
-    if plan.targets.is_empty() && plan.prefixed.is_empty() {
+    if !plan.gives_own() {
         return Some("this project has no server pando can make a database in".to_string());
     }
     if let Some(why) = plan.not_own_data() {
@@ -2603,7 +2609,9 @@ const NAMESPACED_TABLE: &str = "namespaced";
 pub struct NamespacedService {
     pub service: String,
     /// `database` or `slot`, which the server makes; `prefix`, which the
-    /// app is told; or `shared`, on the main checkout's data.
+    /// app is told; `shared`, on the main checkout's data; or
+    /// `undeclared`, a compose service the project's `[[services]]` do not
+    /// name, which every worktree reaches as the main checkout's.
     pub how: &'static str,
     /// The recipe whose `[namespace]` it is, for a database or a slot.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2619,8 +2627,46 @@ pub struct NamespacedService {
 
 /// [`NamespacedService`] for every service of the project, read from
 /// config, the recipes and the main checkout's env files — nothing asked
-/// of a server, nothing spawned.
-pub fn namespaced_report(paths: &PandoPaths, config: &Config) -> Vec<NamespacedService> {
+/// of a server, nothing spawned — and for each service of `compose_files`
+/// the project does not declare, which a namespaced start never sees.
+/// A helper the catalog knows the app keeps nothing in, a mail catcher, is
+/// left out.
+pub fn namespaced_report(
+    paths: &PandoPaths,
+    config: &Config,
+    compose_files: &[String],
+) -> Vec<NamespacedService> {
+    let declared = declared_services(config);
+    let mut undeclared: Vec<NamespacedService> = Vec::new();
+    for file in compose_files {
+        let Ok(parsed) = crate::compose::read(&paths.root().join(file)) else {
+            continue;
+        };
+        for (service, entry) in &parsed.services {
+            let helper = entry
+                .image
+                .as_deref()
+                .and_then(crate::catalog::images::known)
+                .is_some_and(|known| known.role == crate::catalog::images::Role::Utility);
+            if helper
+                || declared.contains(service)
+                || undeclared.iter().any(|known| known.service == *service)
+            {
+                continue;
+            }
+            undeclared.push(NamespacedService {
+                service: service.clone(),
+                how: "undeclared",
+                recipe: None,
+                keys: Vec::new(),
+                why: Some(format!(
+                    "{file} runs it, and the project's [[services]] do not name it, so every \
+                     worktree reaches the main checkout's — the `services` answer adds it, and \
+                     `namespaced` says how it gets data of its own if pando cannot tell"
+                )),
+            });
+        }
+    }
     let plan = plan(paths, config);
     let targets = plan.targets.into_iter().map(|target| NamespacedService {
         how: match target.namespace.kind {
@@ -2655,7 +2701,11 @@ pub fn namespaced_report(paths: &PandoPaths, config: &Config) -> Vec<NamespacedS
             keys: Vec::new(),
             why: Some(why),
         });
-    targets.chain(prefixed).chain(shared).collect()
+    targets
+        .chain(prefixed)
+        .chain(shared)
+        .chain(undeclared)
+        .collect()
 }
 
 /// What a namespaced start does with a service it makes nothing in: a
