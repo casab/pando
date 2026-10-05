@@ -115,7 +115,7 @@ pub(super) fn plan(
 /// Whether this git has what a copy-on-write checkout runs: attributes
 /// read from a given tree, both for one command (`--attr-source`) and for
 /// `check-attr` (`--source`). One harmless question asks for both.
-fn git_can(root: &Path) -> bool {
+pub(super) fn git_can(root: &Path) -> bool {
     let Some(empty_tree) = empty_tree(root) else {
         return false;
     };

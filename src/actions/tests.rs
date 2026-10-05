@@ -9462,10 +9462,26 @@ fn attr_tree_keeps_gits_checkout() {
     );
     git(&fx.root, &["config", "attr.tree", "refs/heads/attrs"]);
     let (cow, _) = same_as_plain(&mut fx, "feat/attr-tree", "feat/attr-tree-plain");
+    // A git that does not read `attr.tree` checks both out with LF, which
+    // is still the same checkout either way: Ubuntu 22.04's 2.34 is one.
+    if !git_reads_attr_tree(&fx.root) {
+        eprintln!("skipping the CRLF check: this git does not read attr.tree");
+        return;
+    }
     assert_eq!(
         std::fs::read(cow.join("notes.txt")).unwrap(),
         b"one\r\ntwo\r\n"
     );
+}
+
+/// Whether this git reads `attr.tree`, asked of git: with it set in `root`
+/// to a tree that makes `*.txt` CRLF, `check-attr` says so.
+fn git_reads_attr_tree(root: &Path) -> bool {
+    Command::new("git")
+        .current_dir(root)
+        .args(["check-attr", "eol", "--", "notes.txt"])
+        .output()
+        .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("eol: crlf"))
 }
 
 // A name with a space and one outside ASCII, and on macOS one committed
@@ -9512,6 +9528,12 @@ fn a_remote_branch_checks_out_the_same_by_copy_on_write() {
 fn a_disk_that_cannot_clone_is_said_only_to_who_asked_for_copy_on_write() {
     let mut fx = fixture_with_tree();
     if crate::cow::can_clone(fx._dir.path()) {
+        return;
+    }
+    // A git without what a copy-on-write checkout runs never gets as far
+    // as asking the disk, and has nothing to say about it.
+    if !super::checkout::git_can(&fx.root) {
+        eprintln!("skipping: this git has no --attr-source, so the disk is never asked");
         return;
     }
     let (_, said) = new_saying(&fx, "feat/quiet");
