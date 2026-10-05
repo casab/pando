@@ -734,7 +734,7 @@ pando: removed the test worktree; nothing left behind</span>
             <tr><td class="g">3</td><td>pando has a question, printed on stderr. It is not a failure. An agent answers it from the project's own evidence, or puts it to the developer, and never adds <code>--yes</code> to make it go away.</td></tr>
           </tbody>
         </table>
-        <p>The repository includes a Claude Code plugin and Codex skills, each a thin wrapper around one brief (<code>agent/brief.md</code>). The binary carries the brief as well: <code>pando init --agent --reference brief</code>. When the check passes, the agent offers to save a short note on how to run this project with pando, in its own memory and never in your repository. It saves the note only if you say yes, and later sessions then start and stop worktrees through pando instead of by hand. <span class="tag-new">new in 0.5.0</span></p>
+        <p>The repository includes a Claude Code plugin and Codex skills, each a thin wrapper around one brief (<code>agent/brief.md</code>). The binary carries the brief as well: <code>pando init --agent --reference brief</code>. It asks you nothing while it works: it decides what the rules leave open, and when the check passes it lists what it set and how to change it. It can also save a short note on how to run this project with pando, in its own memory and never in your repository, but only when you tell it to, and later sessions then start and stop worktrees through pando instead of by hand. <span class="tag-new">new in 0.5.0</span></p>
       </div>
 <pre class="code rv"><span class="p">$</span> pando status feat/login --json   <span class="c"># trimmed</span>
 {

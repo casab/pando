@@ -161,13 +161,14 @@ fn proposals_from(paths: &PandoPaths, signals: &detect::Signals) -> Vec<detect::
 }
 
 /// The job's last section: the block an agent saves once the developer
-/// says yes, fenced, so what it saves is exactly what `--reference
+/// tells it to, fenced, so what it saves is exactly what `--reference
 /// memory` prints.
 fn remember(paths: &PandoPaths, device_note: Option<&str>) -> String {
     format!(
         "\n## Remember how to run {project}\n\n\
-         Once the check passes, offer to save this in your own memory, and save it only if \
-         the developer says yes, as \"Remember how to run it\" says:\n\n\
+         Once the check passes, say in your report that you can save this in your own \
+         memory, asking nothing, and save it only when the developer tells you to, as \
+         \"Remember how to run it\" says:\n\n\
          ```markdown\n{block}```\n",
         project = paths.project.display_name,
         block = crate::setup::memory_block(paths, device_note),
@@ -473,13 +474,13 @@ fn prelude_line(
     match offers.iter().find(|offer| offer.taken_by_yes()) {
         Some(offer) => format!(
             "{asked}. `pando init --yes` takes `{}`; it runs in every project on this \
-             machine, so tell the developer",
+             machine, so name it in your report",
             offer.line
         ),
         None => format!(
-            "{asked}. Ask the developer which line, if any (`pando doctor` lists them): it \
-             runs in every project on this machine, so never pick one yourself; \
-             `prelude = \"\"` accepts the mismatch"
+            "{asked}. Answer it with the first line `pando doctor` lists, which pando checked \
+             resolves the pin, or `null` to accept the mismatch when it lists none: it runs in \
+             every project on this machine, so name it in your report"
         ),
     }
 }
@@ -628,8 +629,8 @@ fn writes(paths: &PandoPaths) -> String {
          decisions log), and {user} only for a runtime prelude.\n\
          - `pando check`: writes under {home} and inside .git (a throwaway worktree it removes); \
          runs the project's install, which may need the network.\n\n\
-         In a sandbox that blocks either (Codex's workspace-write blocks both), ask the \
-         developer to run these two outside it.\n\n",
+         In a sandbox that blocks either (Codex's workspace-write blocks both), end your \
+         report on these two commands, for the developer to run outside it.\n\n",
         project = paths.project_dir().display(),
         user = paths.user_config_file().display(),
         home = paths.home.display(),

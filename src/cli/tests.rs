@@ -3740,9 +3740,9 @@ fn the_job_says_when_this_machine_needs_a_prelude() {
     assert!(
         job.contains(
             "- prelude: open: node 25 asked (backend/.nvmrc), `bash -lc` resolves 24.21.0. \
-             Ask the developer which line, if any (`pando doctor` lists them): it runs in \
-             every project on this machine, so never pick one yourself; `prelude = \"\"` \
-             accepts the mismatch\n"
+             Answer it with the first line `pando doctor` lists, which pando checked resolves \
+             the pin, or `null` to accept the mismatch when it lists none: it runs in every \
+             project on this machine, so name it in your report\n"
         ),
         "{job}"
     );
@@ -3790,8 +3790,8 @@ fn the_job_names_the_managers_line_init_yes_would_take() {
     assert!(
         job.contains(&format!(
             "- prelude: open: node 25 asked (.nvmrc), `bash -lc` resolves 24.21.0. `pando init \
-             --yes` takes `{line}`; it runs in every project on this machine, so tell the \
-             developer\n"
+             --yes` takes `{line}`; it runs in every project on this machine, so name it in \
+             your report\n"
         )),
         "{job}"
     );
@@ -3886,7 +3886,7 @@ fn reference_memory_prints_the_block_the_job_ends_with() {
     );
     assert!(section.contains("\"Remember how to run it\""), "{section}");
     assert!(
-        section.contains("save it only if the developer says yes"),
+        section.contains("save it only when the developer tells you to"),
         "{section}"
     );
 }
@@ -5357,11 +5357,24 @@ fn the_job_carries_the_briefs_first_run_section_and_only_that() {
             "where it starts",
         ),
         ("Do not re-derive", "that the evidence is not re-derived"),
-        // A first run asks the developer nothing: the maintainer's call,
-        // after the first real run asked about apps and services.
+        // A setup asks the developer nothing, start to end: the
+        // maintainer's call, after the first real run asked about apps
+        // and services, and again on 2026-10-05 for every question left.
         (
-            "Ask the developer nothing",
+            "Ask the developer nothing, from the first command to the last",
             "that the developer is not asked",
+        ),
+        (
+            "Never end on a question",
+            "that the done message asks nothing either",
+        ),
+        (
+            "What I set, in `~/.pando/projects/<id>/pando.toml`",
+            "that the report lists what was set",
+        ),
+        (
+            "To change any of it, tell me, or run > `pando init --answers - --replace`",
+            "how the developer changes a setting",
         ),
         ("`pando init --yes`", "pando's choices saved in one step"),
         (
@@ -5380,8 +5393,16 @@ fn the_job_carries_the_briefs_first_run_section_and_only_that() {
         ),
         ("{port:<role>}", "how a process finds another's address"),
         (
-            "Ask the developer only what the docs do not say",
-            "that the docs come before the developer",
+            "What the docs do not say, decide from `signals`",
+            "that the agent decides what the docs leave open",
+        ),
+        (
+            "the first line `pando doctor --json` lists as the fix",
+            "that the agent answers the runtime line itself",
+        ),
+        (
+            "Answer `base` with the main checkout's branch",
+            "that the agent answers the base itself",
         ),
         ("pando init --answers - --dry-run", "the preview"),
         (
@@ -5424,10 +5445,10 @@ fn the_job_carries_the_briefs_first_run_section_and_only_that() {
             "that the block is saved only on a yes",
         ),
         (
-            "Want me to remember how to run it with pando?",
-            "the question the done message ends with",
+            "I can also save how to run it > with pando to `~/.claude/CLAUDE.md`",
+            "the offer the done message makes without asking",
         ),
-        ("On a no, or no answer, write nothing", "what a no means"),
+        ("Until then, write nothing", "that nothing is saved unasked"),
     ] {
         assert!(
             flat.contains(phrase),

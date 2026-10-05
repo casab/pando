@@ -18,6 +18,17 @@ may change behaviour.
   `clone = []`. The setup brief and `agent/json.md` describe it, and
   `signals` publishes `dependency_dirs`.
 
+### Changed
+
+- A setup run by the developer's agent asks them nothing, start to end.
+  The brief has the agent decide every question pando's rules leave
+  open — the apps to run (all of them), the runtime line `doctor`
+  lists, a worktree's `.env` seeded from the example when there is no
+  other, the main checkout's branch as the base when a check fails on
+  it — and end with a report of what it set, why, and how to change it.
+  Saving the run instructions in the agent's memory is offered in that
+  report and done only when the developer says to.
+
 ## 0.8.2 — 2026-10-05
 
 ### Added

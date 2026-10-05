@@ -10,27 +10,27 @@ versioned: `pando init --agent --reference json` prints it (or
 [`json.md`](./json.md) beside this file).
 
 Your job in one sentence: **turn the evidence pando already publishes into
-answers, ask the human only the things that are genuinely theirs, and write
-nothing except through `pando init --answers`.**
+answers, decide every open question yourself without asking the developer
+anything, write nothing except through `pando init --answers`, and end by
+telling them what you set and how to change it.**
 
 ## First run: set pando up, then prove it with `pando check`
 
-The developer pasted one line: run `pando init --agent` and follow what it
-says. You are done when `pando check` passes and you have offered to remember
-how to run the project. Change no file in the developer's repository, and
+You are done when `pando check` passes and you have told the developer
+what you set. Change no file in the developer's repository, and
 none of theirs outside it without a yes: every setting goes through
 `pando init --answers -`, and the worktree `pando check` makes is pando's
 own, inside `.git`, removed when it is done.
 
-1. **Ask the developer nothing that pando or the project's docs answer.**
-   Taking pando's first choices gets them to ready soonest, and they
-   change any of it later. The one question a first run always asks
-   comes at the end, in step 7.
+1. **Ask the developer nothing, from the first command to the last.**
+   Every open question is yours to decide; the report in step 7 says
+   what you decided, and they change any of it later.
 2. **Save pando's choices in one step: `pando init --yes`.** It takes
    pando's first choice for every open question and writes it under
    `~/.pando`, never into the repository. pando runs every app it found a
    command for. The check uses the developer's own services, as the main
-   checkout does, so how private ones would run does not matter to it.
+   checkout does. (The last block's "never add `--yes`" is for later
+   sessions, not this setup.)
 3. **A question with no option is yours to answer.** When
    `pando init --yes` leaves one open (exit 3, the question on stderr),
    answer it from `pando signals` and `pando doctor --json`. Do not
@@ -44,73 +44,77 @@ own, inside `.git`, removed when it is done.
    pando init --yes                    # then pando's choice for the rest
    ```
 
-   When `signals` lists `app_dirs` that no process covers, such as an app
-   with no dev script, pando leaves `processes` open. Answer it with an
-   object of process tables, one per process the project runs, from its
-   README or docs: `{"processes": {"api": {"cmd": "…", "cwd": "backend",
-   "ports": {"API_PORT": "api"}}, "worker": {…, "ports": []}}}`. A
-   process gets its own port through the variable it reads, mapped in
-   `ports`, and another's address in `env` as `{port:<role>}`. Give the
-   role a person opens in a browser the name `web`: the URL and the
-   page the check asks for are its, else the first role by name. Ask the
-   developer only what the docs do not say.
+   - `processes`, open when `signals` lists `app_dirs` that no process
+     covers: an object of process tables, one per process, from the
+     README or docs: `{"processes": {"api": {"cmd": "…", "cwd":
+     "backend", "ports": {"API_PORT": "api"}}}}`. A process gets its
+     port through the variable it reads, mapped in `ports`, and
+     another's address in `env` as `{port:<role>}`; name the role a
+     browser opens `web`. What the docs
+     do not say, decide from `signals`; an app with no command anywhere
+     is left out and named in the report. If none has one, invent none:
+     skip the check and report what is missing.
+   - `prelude`, when the machine does not resolve the pinned runtime:
+     the first line `pando doctor --json` lists as the fix, or `null`
+     when it lists none. The report names it: it runs before every
+     command pando spawns here.
+   - `provision`, when its only option seeds a file from an example
+     (`needs_a_human`): that option's text, named in the report.
 4. **Run `pando check`, with a timeout of at least 10 minutes.** It makes a
    throwaway worktree of the commit a new branch would fork from, runs the
    install, starts every process, checks the one the browser opens really
    answers, and removes it all. The prompt the developer pasted is their
-   consent to this test. Its notes say whether the schema step was tested:
-   only namespaced mode with a login runs it. All it runs sees
+   consent to this test. All it runs sees
    `PANDO_CHECK=1`, so a process can skip, say, opening a simulator.
 5. **When the check fails, fix, then rerun; never rerun unchanged.**
-   - A settings failure is yours: correct the answer with
-     `pando init --answers - --replace`, then run the check again.
+   - A settings failure: correct the answer with
+     `pando init --answers - --replace`, then check again.
    - A machine failure (`kind: "machine"`: a server not running, Docker
-     stopped, a runtime missing) is the developer's: tell them the
-     command pando printed, and change no setting for it.
+     stopped, a runtime missing): change no setting, install nothing,
+     and put pando's command in the report for the developer to run.
    - A base failure (`kind: "base"`): the tested commit lacks a file,
-     often a lockfile, that the main checkout's branch has. Change no
-     setting to get past it, and never drop a frozen install's flag.
-     Which branch work starts from is the developer's: tell them both
-     refs from `reason`, answer `base` with the one they name, and check
-     again. `pando check --base <branch>` tests one without saving it as
-     the base, and without replacing the last result.
-   - Exit 3 is not a failure: a question is still open, and the check
-     started nothing. Answer it, then run the check again.
-   - Stop after three changed attempts, and tell the developer what is
-     wrong in pando's own words.
-6. **Remember how to run it, only if the developer says yes.** The block
+     often a lockfile, that the main checkout's branch has. Never drop a
+     frozen install's flag. Answer `base` with the main checkout's
+     branch, the ref in `reason` that has the file, and check again.
+   - Exit 3: a question is still open and nothing started. Answer it,
+     then check again.
+   - Stop after three changed attempts, and report what is wrong in
+     pando's own words.
+6. **Remember how to run it, when the developer tells you to.** The block
    at the end of the job says how the project runs with pando;
    `pando init --agent --reference memory` prints it alone. It belongs in
    your own persistent memory — Claude Code: `~/.claude/CLAUDE.md`;
    Codex: `~/.codex/AGENTS.md`; any other agent: its own. That file is
-   the developer's, read in every session of every project, so write
-   nothing to it without their yes. On a yes, save the block there,
-   replacing an earlier pando block for the same project root (its
-   heading names the root). On a no, or no answer, write nothing, and
-   give them the block to keep. Never a `CLAUDE.md`, `AGENTS.md` or any
-   other file inside the repository. If a sandbox will not let you write
-   the file, give them the block and its name.
-7. **Tell the developer you're done, in two lines, then ask step 6's
-   question:**
+   the developer's, read in every session, so write nothing to it
+   without their yes; the report offers it. When they say to, save the
+   block there, replacing an earlier pando block for the same project
+   root. Until then, write nothing. Never a `CLAUDE.md`, `AGENTS.md` or
+   any other file inside the repository.
+7. **Tell the developer it is done, what you set, and how to change it:**
 
    > pando is set up and tested for <project>.
    > You're ready: run `pando`.
    >
-   > Want me to remember how to run it with pando? I'd add a short block
-   > to `~/.claude/CLAUDE.md`, which I read in every session.
+   > What I set, in `~/.pando/projects/<id>/pando.toml`:
+   > - <setting>: <value> — <why, in a few words>
+   >
+   > To change any of it, tell me, or run
+   > `pando init --answers - --replace`. I can also save how to run it
+   > with pando to `~/.claude/CLAUDE.md`.
 
-   Name your own memory file in the question. Before it, add one line
-   for each of these that applies: the schema step is untested until the
-   first `pando start --namespaced` asks for its login; the job's line
-   about a phone or tablet; the line `pando doctor` notes about a queue
-   worker on a shared Redis.
+   List what `pando init` reported, marking what you decided, and name
+   your memory file. Add a line for each that applies: a machine
+   failure's command; the schema step untested until the first
+   `pando start --namespaced`; the job's phone or tablet line; doctor's
+   queue-worker note; pando's `[isolation] prefer` line. Never end on a
+   question.
 
 The rest of this brief is for a failure that needs it; a first run that
 passes never does.
 
 ---
 
-## 0. Read before you ask
+## 0. Read before you decide
 
 Two commands, in this order, before you form any opinion:
 
@@ -138,40 +142,38 @@ developer points you at — may become the answer. Even there, read for
 *that* question only, and never to second-guess a proposal `signals`
 already made.
 
-Read the repository's own files, otherwise, only when you are about to
-ask a human something and need one more sentence to make the question
-intelligible. Never as a substitute for `signals`.
+Read the repository's own files, otherwise, only to decide a question
+`signals` leaves open, or to put one more sentence of why in your report.
+Never as a substitute for `signals`.
 
-## 1. The question budget
+## 1. No questions: decide, then report
 
-> On a first run (the section above): **zero** questions the rules or the
-> project's docs answer.
-> On a project the rules fully understand: **zero** questions.
-> On a project they half understand: **one**.
+> On every project, understood fully or half: **zero** questions while
+> you set it up, and none at the end. You decide; the report says what,
+> and how to change it.
 
-Three things, and only three, are genuinely a human's:
+Three things are the developer's preferences rather than facts about the
+repository. You still do not ask about them: you take the default below
+and name it in the report, where changing it is one sentence from them.
 
 1. **Which mechanism runs private services on this laptop** — containers or
-   engines installed on the machine. It is a preference about their
-   computer, not a fact about their repository. See §5.
-2. **Which apps of a monorepo they want running.** It is a preference about
-   their work this week.
+   engines installed on the machine. pando's own evidence decides, and
+   breaks a tie towards the project's compose file; the key that changes
+   it is machine-wide and never yours to write. See §5.
+2. **Which apps of a monorepo they want running.** All of them: pando
+   runs every app it found a command for, and so do you.
 3. **Which branch work starts from**, when origin/HEAD is far behind the
-   branch the main checkout is on. It is how their team works, which the
-   repository does not say: see the `base` row in §3, and step 5 of the
-   first run for the check that fails on it.
+   branch the main checkout is on. origin/HEAD until a check fails on it;
+   then the main checkout's branch, as step 5 of the first run says.
 
 Everything else — the install command, what pins the runtime, the dev
 command, how the port reaches it, the schema step, which local files a
-worktree needs — is *evidence*, and evidence is the rules' job. If you
-find yourself wanting to ask about one of those, you have either not read
-`signals` properly or you have found a genuine gap in the rules. In the
-second case the right move is to answer it from the evidence, let pando
-record it (see §7), and say so in your summary — that record is what makes
-the rule better for everyone who has no agent.
-
-If you must ask, ask **once**, with the options pando published and the
-`why` beside each. Never ask a question whose answer is in `signals`.
+worktree needs, which dependencies it clones — is *evidence*, and evidence
+is the rules' job. Where the rules decided, take it. Where they did not,
+answer from the evidence, let pando record it (see §7), and say so in your
+report — that record is what makes the rule better for everyone who has
+no agent. Never answer a question whose answer is in `signals` with
+anything else.
 
 ## 2. Reading `signals`: three states, three behaviours
 
@@ -182,7 +184,7 @@ asks them. Each has a `proposal`, and its state decides what you do:
 |---|---|---|
 | `"proposal": null` | no rule had anything to say | **nothing to choose from — and the one place your own knowledge is the only thing there is.** No options, no preselection, and nobody is asked. A value you send here is taken as a command of your own, validated and written like any other. Send one only if you know it |
 | `"decided": true` | a rule settled it | **do nothing.** A value you send is reported as unused |
-| `"decided": false` | pando will ask | **this is the one you answer from the options** |
+| `"decided": false` | pando would ask a person | **you answer it, from the options**: the marked first choice, unless the evidence says another. The developer is not asked |
 
 Also check `"answered": true` — config already says, from some layer, and
 the slot is closed.
@@ -212,11 +214,12 @@ Four more facts that are not visible in the shape:
   means `init` can exit 3 on a slot `signals` showed you nothing for.
   `doctor`'s `runtime` section is the evidence: what the project pins,
   what `bash -lc` resolves here, and the exact line that would reconcile
-  them, as the finding's `fix`. That line is the developer's to approve —
-  it runs in front of every command pando spawns for them. Once they have,
-  `{"prelude": "<the line>"}` is how it goes in, and `{"prelude": null}`
-  is "this machine needs nothing". Never install a runtime to make the
-  question go away.
+  them, as the finding's `fix`. It runs in front of every command pando
+  spawns on this machine, so it is the first line your report names:
+  `{"prelude": "<the line>"}` is how it goes in, the first `fix` doctor
+  lists, and `{"prelude": null}` is "this machine needs nothing", which
+  accepts the mismatch when doctor lists none. Never install a runtime to
+  make the question go away.
 - **Answering `processes` with the per-app form, or with an object of
   process tables, settles `dev_cmd` and `port_env` too** — every process
   gets its command and its port. Answers you
@@ -241,8 +244,9 @@ Four more facts that are not visible in the shape:
   answers file naming its exact text *is* an explicit answer and is
   accepted. Seeding a worktree's `.env` from a committed example is the one
   that behaves this way: it creates a file out of contents pando did not
-  write, so nobody's flag gets to decide it. If you name it, you are
-  answering for the developer — be sure they want it.
+  write, so nobody's flag gets to decide it. On a first run you name it
+  when it is the only option, as the first-run section says, and the
+  report says each worktree gets a copy of the example.
 
 ## 3. The eleven questions, and who answers each
 
@@ -250,15 +254,15 @@ Four more facts that are not visible in the shape:
 |---|---|---|
 | `install` | rules, then you | a frozen install; the plain one where the project gitignores its lockfile; or silence — and silence is a slot you may fill from what the project's own docs say. Never a non-frozen one of your own |
 | `version_files` | rules | which file pins the runtime |
-| `prelude` | machine → human | only when the machine does not resolve the pin. `doctor` gives the exact line; the human decides whether to run it |
-| `processes` | **human** | one process, or one per app: of a workspace, or of the app directories below a root with no manifest. When no option runs every app — one has no dev script — answer with an object of process tables (§4, §9) |
-| `dev_cmd` | rules | ask only when several scripts are plausible dev servers. When nothing would run at all, `init` asks it with no options and `--yes` exits 3: answer with the project's own command, or `processes` with an object |
+| `prelude` | machine, then you | only when the machine does not resolve the pin. `doctor` gives the exact line: take it, and name it in the report |
+| `processes` | rules, then you | one process, or one per app: of a workspace, or of the app directories below a root with no manifest. Every app runs. When no option runs every app — one has no dev script — answer with an object of process tables (§4, §9) |
+| `dev_cmd` | rules | open only when several scripts are plausible dev servers. When nothing would run at all, `init` asks it with no options and `--yes` exits 3: answer with the project's own command, or `processes` with an object |
 | `port_env` | rules | which variables carry the ports. The env example beats a framework convention |
-| `services` | rules + **human** | which services get a private copy — see §5 for the mechanism |
-| `schema_hook` | rules + **human** | the command that brings a fresh database to the schema. Always a question — it touches data — and only an isolated or namespaced start asks it. The hook runs on those starts only unless its entry says `on = "always"`; `null` answers "no" and writes it with `on = "never"` |
-| `provision` | rules, mostly | which local files a worktree needs. Seeding from an example needs a human |
-| `clone` | rules | which dependency trees (`node_modules`, an app's own) a new worktree clones copy-on-write from the main checkout before its install, so it costs a few MB instead of a full install's. Proposed for every one the main checkout has, unless the install deletes it first (`npm ci`); decided, since the install still fixes what the branch changed and `check` never clones. Leave it to the rules; `null` only if the developer wants every worktree installed from nothing |
-| `base` | rules, then **human** | the branch `new` forks from and `check` tests. Asked only when origin/HEAD is far behind the main checkout's branch; otherwise origin/HEAD, and nothing to answer. A check that fails with `kind: "base"` is the case for it: see step 5 |
+| `services` | rules, then you | which services get a private copy — every one the project needs; see §5 for the mechanism |
+| `schema_hook` | rules, then you | the command that brings a fresh database to the schema. A question rather than decided — it touches data — but `--yes` takes pando's first option, and what that writes runs on isolated or namespaced starts only, against the worktree's own databases. Take it, and name it in the report. The hook runs on those starts only unless its entry says `on = "always"`; `null` answers "no" and writes it with `on = "never"` |
+| `provision` | rules, then you | which local files a worktree needs. Seeding from an example is never `--yes`'s: you name it when it is the only option |
+| `clone` | rules | which dependency trees (`node_modules`, an app's own) a new worktree clones copy-on-write from the main checkout before its install, so it costs a few MB instead of a full install's. Proposed for every one the main checkout has, unless the install deletes it first (`npm ci`); decided, since the install still fixes what the branch changed and `check` never clones. Leave it to the rules; `null` only when the developer has said they want every worktree installed from nothing |
+| `base` | rules, then you | the branch `new` forks from and `check` tests. Open only when origin/HEAD is far behind the main checkout's branch; otherwise origin/HEAD, and nothing to answer. A check that fails with `kind: "base"` is the case for it: the main checkout's branch, see step 5 |
 
 ## 4. Writing: `pando init --answers`, and nothing else
 
@@ -389,10 +393,10 @@ database; `postgres://` says everything.
 
 Whether that proposal is `decided` depends on the machine: decided when the
 engines are installed, a question when one is not — and the missing engine
-is still offered, because the project plainly wants it. If it is a question
-and you know the human wants those services, answer it by naming them.
+is still offered, because the project plainly wants it. If it is open,
+answer it by naming the services the project needs.
 **Never install an engine.** Not with brew, not with apt, not with a
-container. Report what is missing and let the human decide.
+container. Report what is missing, with what pando said about it.
 
 ### When both are real
 
@@ -406,13 +410,13 @@ set `[isolation] prefer = "native"` in ~/.pando/config.toml to run the
 recipes instead
 ```
 
-Quote that line to the developer, once, and stop. You cannot write it,
+Quote that line in your report, once, and stop. You cannot write it,
 `--answers` has no key for it, and it is not a fact about this repository
 at all: `[isolation] prefer` is machine-wide, so the answer you would be
 inferring from *this* project's evidence would govern every other project
 on their machine too. That asymmetry is the whole reason the key is theirs
-and not yours. Say which project raised it, and let them decide for all of
-them.
+and not yours. Say which project raised it; changing it, for all of them,
+is theirs.
 
 If they have no docker and the engines are there, pando has already chosen
 the recipes on the evidence and there is nothing to ask at all.
@@ -422,7 +426,7 @@ the recipes on the evidence and there is nothing to ask at all.
 A setup ends with proof, not with a summary.
 
 1. `pando init --answers - --dry-run` — stdout is the file as it would
-   be, with the provenance comments. Show it to the developer.
+   be, with the provenance comments. Read it before you write.
 2. `pando init --answers -` — the real write.
 3. `pando doctor` — and **report what it said**, including the notes.
    Exit 0 means nothing found will break a command; exit 1 means something
@@ -432,8 +436,8 @@ If doctor exits 1, read the finding before touching anything. Some are not
 yours to fix:
 
 - **a runtime the machine does not resolve.** The fix is a `prelude` line,
-  and `doctor` prints the exact one. It is about their laptop: offer it,
-  do not run an installer.
+  and `doctor` prints the exact one. Answer it as §2 says and report it;
+  never run an installer.
 - **a non-frozen install in a config somebody wrote by hand.** pando never
   *proposes* one — but it does not overrule one either. What
   `project.install` says is what `pando new` runs, because a developer who
@@ -442,13 +446,13 @@ yours to fix:
   doctor calls it a **problem** rather than a note, and prints the frozen
   form as its fix; and if the command really does rewrite a lockfile, the
   `new` that ran it says *that* out loud too, naming the worktree the file
-  changed in. Show them the finding, let them change it, and do not "fix"
-  it by loosening anything. Never write one yourself — see §8.
+  changed in. Report the finding and its fix, and do not "fix" it by
+  loosening anything. Never write one yourself — see §8.
 
 Do not claim a project starts unless you started it: `pando check` starts
 it, and so does `pando start`. If you ran neither, say so.
 
-### Prove it by running, when the developer agrees
+### Prove it by running, when the developer asked for more
 
 On a first run, `pando check` is this proof and the pasted prompt is the
 agreement: see the first-run section. What follows is for proving more
@@ -458,7 +462,8 @@ Rules read files; only a start meets the project. A config every slot of
 which is `decided` can still describe an environment that does not run —
 an app that reads its port from a variable nobody set, a gateway pointed
 at a sibling's default port, a database with no schema. The only way to
-find those is to start it, so ask once whether you may, and then:
+find those is to start it, so when the developer asked you to prove an
+isolated start:
 
 ```bash
 pando new pando-setup-check              # a scratch worktree, on its own branch
@@ -501,9 +506,10 @@ write that file; pando does.
 This is deliberate and it is in your interest to make it accurate. It is
 the corpus that turns a question the rules could not answer into a rule —
 which is what every developer without an agent gets. So: answer from the
-published evidence, or refuse. **An answer you guessed pollutes a corpus
-somebody will train a rule on.** A question asked is cheap; a wrong config
-written confidently is not.
+published evidence, and where it is silent take pando's first choice and
+say so. **An answer you invented pollutes a corpus somebody will train a
+rule on**: a first choice taken and reported is honest, a command made up
+to fill a slot is not.
 
 There is exactly one thing the log cannot hold, and you are the only one
 who can put it on the record: **`[isolation] prefer`.** It is a question
@@ -549,8 +555,8 @@ Absolute. None of these has an exception worth taking.
 - **Never edit `pando.toml`, and never edit a framework config file.** If
   an app hardcodes its port, that is a one-line change in *their* project
   and their decision to make.
-- **Never take a `needs_a_human` option without a human.** If nobody is
-  there to ask, exit and say which question is open.
+- **Never take a `needs_a_human` option silently.** Name it in your
+  report: what it did, and how to take it back.
 - **Never start a worktree namespaced unless the developer asked for it.**
   It writes into their own database server. It is experimental, it needs
   a grant only they can give, and `rm` of a namespaced worktree drops its
@@ -694,11 +700,10 @@ processes   decided=False
 port_env    decided=False  ['WEB_PORT, API_PORT', 'WEB_PORT', 'API_PORT']
 ```
 
-`processes` is the human question — which apps they want running — and it
-is the *only* one, because taking the per-app form settles the dev command
-and the ports for every app with it.
-
-Ask once, with both options and their `why`. Then:
+`processes` is the open question — which apps run — and it is the *only*
+one, because taking the per-app form settles the dev command and the ports
+for every app with it. Every app runs, so you take the per-app form
+without asking, and the report says so:
 
 ```json
 { "processes": "api: npm run dev in apps/api; web: npm run dev in apps/web" }
@@ -727,10 +732,10 @@ one service is built from the repository: it *is* the application. pando
 records the negative — `include = []` — so the question never comes back on
 an isolated start.
 
-**Questions to ask: none.** Not about services, not about mechanisms. If
-you ask the developer "should I run your services in containers?" here, you
-have asked them about something that does not exist, and you have spent the
-entire question budget doing it.
+**Questions to ask: none.** Not about services, not about mechanisms —
+and on no project, ever, during a setup. "Should I run your services in
+containers?" would be a question here about something that does not even
+exist.
 
 Afterwards, `doctor` says so in its own words, which is what you report:
 
@@ -813,7 +818,7 @@ a `source` key. Pass `--source` when you know which log you want.
 | `1` | read stderr. It is one sentence. **Do not retry** — a failure that repeats is a failure that repeats |
 | `1` from `pando check` | the setup is wrong, or the machine is, or the commit it tested: fix it before trying again. The first-run section says which is yours |
 | `2` | you asked wrongly: a bad flag, or an answers file naming a question pando does not ask. Fix the request |
-| `3` | **a question is unanswered, and it is on stderr** with its options. Answer it through `init --answers`, or put it to the human. Never retry unchanged, and never add `--yes` to make it go away |
+| `3` | **a question is unanswered, and it is on stderr** with its options. Answer it yourself through `init --answers`, and name the answer in your report. Never retry unchanged, and never add `--yes` to make it go away |
 
 Two questions come only from a namespaced start, and `init --answers`
 cannot answer either:

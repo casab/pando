@@ -270,11 +270,13 @@ answer, and the steps. The agent answers through `pando init --answers -`
 on stdin, never a file in your repository, and proves the answers with
 `pando check`: a throwaway worktree of the commit a new branch would fork
 from, installed, started, its page asked for, and removed again, with no
-branch and nothing left behind. When it passes, the agent says so, and
-the setup screen turns green by itself: you're ready. The agent then
-offers to remember how to run this project's worktrees with pando, in its
-own memory and never in your repository, and saves it only if you say
-yes, so a later session starts, stops and reads them through pando rather
+branch and nothing left behind. It asks you nothing along the way: where
+pando's rules leave a question open, the agent decides it. When the check
+passes, the agent says so, lists what it set and how to change it, and
+the setup screen turns green by itself: you're ready. It can also
+remember how to run this project's worktrees with pando, in its own
+memory and never in your repository, and saves that only if you tell it
+to, so a later session starts, stops and reads them through pando rather
 than by hand. From then on,
 `pando` opens the list.
 

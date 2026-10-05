@@ -26,7 +26,7 @@ You do not need either wrapper. An agent that reads `brief.md` and
 `--reference brief` or `--reference json` prints either file whole.
 `--reference memory` prints the block the job ends with: how to run this
 project's worktrees with pando, which the agent offers to save in its own
-memory and saves only if the developer says yes.
+memory, without asking, and saves only when the developer tells it to.
 pando keeps the same block as `CLAUDE.md` and `AGENTS.md` in the project's
 directory under `~/.pando`, above every worktree it makes.
 
