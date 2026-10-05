@@ -14,6 +14,10 @@ mod scan;
 mod unix;
 #[cfg(unix)]
 use unix as imp;
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+use windows as imp;
 
 pub use group::Group;
 
@@ -80,7 +84,7 @@ pub fn output_within(command: Command, timeout: Duration) -> io::Result<Output> 
 /// listening on nothing: readiness falls back to asking the port itself
 /// for the first, and believes the second.
 pub fn ports_by_group(groups: &[Group]) -> BTreeMap<Group, Option<Vec<u16>>> {
-    scan::observed_ports_by_group(groups)
+    imp::ports_by_group(groups)
 }
 
 /// Makes a fork safe in this process before any thread could make one

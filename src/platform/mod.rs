@@ -37,5 +37,21 @@ pub fn init() {
     process::settle_before_fork();
 }
 
+/// Why pando cannot run on this OS yet, or `None` where it can.
+///
+/// A native Windows build compiles, so the layer's Windows backends are
+/// held to compiling by CI, but most of them only say "not yet": it
+/// refuses here, after `--help` and `--version`, rather than failing
+/// halfway through a command.
+pub fn unsupported() -> Option<&'static str> {
+    match Os::HERE {
+        Os::Windows => Some(
+            "a native Windows build runs nothing yet — run pando inside WSL 2, with the \
+             repository in WSL's own filesystem: https://github.com/mertkaradayi/pando#install",
+        ),
+        Os::MacOs | Os::Linux => None,
+    }
+}
+
 #[cfg(test)]
 mod tests;

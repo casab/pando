@@ -164,3 +164,31 @@ mod imp {
             .collect()
     }
 }
+
+/// Not installed yet: a console control handler is the way to both. Until
+/// it is, Ctrl-C ends pando where it lands, and nothing is held.
+#[cfg(windows)]
+mod imp {
+    use super::Group;
+
+    pub(super) fn catch_interrupts() {}
+
+    pub(super) fn interrupted() -> bool {
+        false
+    }
+
+    pub(super) fn hang_up_on_exit() {}
+
+    pub(super) fn hang_up_now() {}
+
+    pub(super) fn hold(_: Group) -> Option<usize> {
+        None
+    }
+
+    pub(super) fn release(_: usize) {}
+
+    #[cfg(test)]
+    pub(super) fn held() -> Vec<Group> {
+        Vec::new()
+    }
+}

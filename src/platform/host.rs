@@ -7,6 +7,7 @@ use std::path::Path;
 pub enum Os {
     MacOs,
     Linux,
+    Windows,
 }
 
 impl Os {
@@ -16,6 +17,9 @@ impl Os {
     /// The OS this build is for.
     #[cfg(target_os = "linux")]
     pub const HERE: Os = Os::Linux;
+    /// The OS this build is for.
+    #[cfg(windows)]
+    pub const HERE: Os = Os::Windows;
 }
 
 /// The machine pando runs on, as far as anything above this layer may

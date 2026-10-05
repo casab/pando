@@ -36,3 +36,14 @@ mod imp {
         read
     }
 }
+
+/// Not done yet: the console's echo mode is the way to it.
+#[cfg(windows)]
+mod imp {
+    pub(super) fn read_line_unechoed(_: &mut String) -> std::io::Result<usize> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "a native Windows build cannot read a line unechoed yet",
+        ))
+    }
+}

@@ -65,3 +65,12 @@ mod imp {
         (!id.is_empty()).then_some(id)
     }
 }
+
+/// Not read yet: the time the system booted is the way to one. Without
+/// one, nothing recorded is taken for another boot's.
+#[cfg(windows)]
+mod imp {
+    pub(super) fn read() -> Option<String> {
+        None
+    }
+}

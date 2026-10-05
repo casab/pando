@@ -25,6 +25,10 @@ fn main() -> ExitCode {
     // Parsed before anything else so `--help` and `--version` work outside a
     // repository, and a usage error exits 2 through clap.
     let cli = Cli::parse();
+    if let Some(why) = pando::platform::unsupported() {
+        eprintln!("pando: {why}");
+        return ExitCode::FAILURE;
+    }
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         // A question is not a failure. It gets its own exit code and its own

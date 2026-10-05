@@ -132,6 +132,26 @@ fn only_the_platform_layer_talks_to_the_os() {
     );
 }
 
+// The Windows backends are held to compiling by a CI job that builds the
+// library and the binary on Windows: without it they rot unseen, since no
+// test here runs there.
+#[test]
+fn ci_builds_the_windows_backends() {
+    let workflow = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/ci.yml"),
+    )
+    .unwrap();
+    let job = workflow
+        .split_once("\n  windows:\n")
+        .map(|(_, rest)| rest)
+        .expect("ci.yml has a windows job");
+    assert!(job.contains("runs-on: windows-latest"), "{job}");
+    assert!(
+        job.contains("cargo clippy --locked --lib --bins -- -D warnings"),
+        "{job}"
+    );
+}
+
 // What a Unix build talks to the OS with is a dependency of Unix builds
 // alone, and of src/platform alone: a crate the rest of pando could reach
 // for on any OS is how the boundary would erode without a line of code
@@ -177,6 +197,11 @@ fn the_platform_layer_imports_nothing_above_it() {
         above.is_empty(),
         "src/platform sits below everything else: {above:#?}"
     );
+}
+
+#[test]
+fn only_a_native_windows_build_refuses_to_run() {
+    assert_eq!(unsupported().is_some(), Os::HERE == Os::Windows);
 }
 
 #[test]
@@ -280,16 +305,40 @@ fn on(os: Os) -> Host {
 
 #[test]
 fn every_desktop_has_one_row() {
-    for desktop in [desktop::Desktop::MacOs, desktop::Desktop::Linux] {
+    for desktop in [
+        desktop::Desktop::MacOs,
+        desktop::Desktop::Linux,
+        desktop::Desktop::Windows,
+    ] {
         let rows = desktop::DESKTOPS
             .iter()
             .filter(|row| row.desktop == desktop)
             .count();
         assert_eq!(rows, 1, "{desktop:?}");
     }
-    for os in [Os::MacOs, Os::Linux] {
+    for os in [Os::MacOs, Os::Linux, Os::Windows] {
         assert_eq!(desktop::row(&on(os)).desktop, desktop::Desktop::of(&on(os)));
     }
+}
+
+// Windows' URL handler takes the URL as one argument; `cmd /c start`
+// would have cut it at the `&`. clip.exe reads the console code page, so
+// it is handed ASCII only.
+#[test]
+fn windows_opens_with_its_url_handler_and_copies_ascii_with_clip() {
+    let windows = on(Os::Windows);
+    let url = "http://localhost:3000/?a=1&b=2";
+    assert_eq!(
+        desktop::url_openers(&windows, url),
+        vec![vec![
+            "rundll32.exe".to_string(),
+            "url.dll,FileProtocolHandler".into(),
+            url.into()
+        ]]
+    );
+    assert_eq!(desktop::clipboard(&windows, url), Some("clip.exe"));
+    assert_eq!(desktop::clipboard(&windows, "C:\\Users\\çalışma"), None);
+    assert!(!desktop::starts_simulators(&windows));
 }
 
 // The URL is one argument, given last: an `&` in it is never a shell's.

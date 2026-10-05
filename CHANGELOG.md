@@ -7,6 +7,17 @@ may change behaviour.
 
 ## Unreleased
 
+### Changed
+
+- Everything pando asks of the operating system is behind one layer,
+  `src/platform`: process groups, signals, locks and permission bits, the
+  shell a command runs in, the boot, copy-on-write, and what the desktop
+  opens and copies with. Nothing else names an OS, and a test holds that.
+  It changes nothing on macOS or Linux.
+- A native Windows build compiles, and stops at once with one line that
+  says to run pando inside WSL 2: its Windows backends are not built yet.
+  CI builds it on Windows so they keep compiling.
+
 ## 0.9.0 — 2026-10-05
 
 ### Added

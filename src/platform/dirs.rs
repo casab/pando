@@ -17,3 +17,12 @@ mod imp {
         std::env::var_os("HOME").map(PathBuf::from)
     }
 }
+
+#[cfg(windows)]
+mod imp {
+    use std::path::PathBuf;
+
+    pub(super) fn home() -> Option<PathBuf> {
+        std::env::var_os("USERPROFILE").map(PathBuf::from)
+    }
+}

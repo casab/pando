@@ -146,3 +146,74 @@ mod imp {
         Cow::Borrowed(path.as_os_str().as_bytes())
     }
 }
+
+#[cfg(windows)]
+mod imp {
+    use super::FileId;
+    use std::borrow::Cow;
+    use std::fs::{File, Metadata};
+    use std::io;
+    use std::path::Path;
+
+    /// Not taken yet: `File::lock` arrives in a later Rust than the oldest
+    /// pando builds with.
+    pub(super) fn lock(_: &File, _: bool) -> io::Result<bool> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "a native Windows build cannot lock a file yet",
+        ))
+    }
+
+    /// No `rwx` bits: who may use a file is its access list's to say.
+    pub(super) fn permission_bits(_: &Metadata) -> Option<u32> {
+        None
+    }
+
+    pub(super) fn set_permission_bits(_: &Path, _: u32) -> io::Result<()> {
+        Ok(())
+    }
+
+    pub(super) fn create_new(path: &Path, _: u32) -> io::Result<File> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+    }
+
+    /// Not asked yet: a profile's files are its user's.
+    pub(super) fn owned_by_current_user(_: &Metadata) -> bool {
+        true
+    }
+
+    /// What `PATHEXT` names, the extensions Windows runs a file by.
+    pub(super) fn runnable(path: &Path, _: &Metadata) -> bool {
+        let Some(extension) = path.extension().and_then(|e| e.to_str()) else {
+            return false;
+        };
+        let known = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+        known.split(';').any(|known| {
+            known
+                .trim_start_matches('.')
+                .eq_ignore_ascii_case(extension)
+        })
+    }
+
+    /// A link to a directory and a link to a file are two kinds here.
+    pub(super) fn symlink(target: &Path, link: &Path) -> io::Result<()> {
+        match target.is_dir() {
+            true => std::os::windows::fs::symlink_dir(target, link),
+            false => std::os::windows::fs::symlink_file(target, link),
+        }
+    }
+
+    /// Not read yet: the file index needs the file open.
+    pub(super) fn file_id(_: &Metadata) -> Option<FileId> {
+        None
+    }
+
+    /// The path as UTF-8: Windows stores UTF-16, which has no bytes of its
+    /// own to hash.
+    pub(super) fn path_bytes(path: &Path) -> Cow<'_, [u8]> {
+        Cow::Owned(path.to_string_lossy().into_owned().into_bytes())
+    }
+}

@@ -8,6 +8,7 @@ use super::host::{Host, Os};
 pub enum Desktop {
     MacOs,
     Linux,
+    Windows,
 }
 
 impl Desktop {
@@ -16,6 +17,7 @@ impl Desktop {
         match host.os {
             Os::MacOs => Desktop::MacOs,
             Os::Linux => Desktop::Linux,
+            Os::Windows => Desktop::Windows,
         }
     }
 }
@@ -56,7 +58,7 @@ pub struct DarkModeProbe {
     pub dark: &'static str,
 }
 
-pub const DESKTOPS: [DesktopRow; 2] = [
+pub const DESKTOPS: [DesktopRow; 3] = [
     DesktopRow {
         desktop: Desktop::MacOs,
         open_url: &[&["open"]],
@@ -80,6 +82,31 @@ pub const DESKTOPS: [DesktopRow; 2] = [
         dark_mode: None,
         starts_simulators: false,
         shell: "/bin/sh",
+    },
+    DesktopRow {
+        desktop: Desktop::Windows,
+        // Windows' own URL handler, with the URL as one argument: not
+        // `explorer.exe`, which exits 1 when it has opened the page, and
+        // not `cmd /c start`, which reads an `&` in the URL as its own.
+        open_url: &[&["rundll32.exe", "url.dll,FileProtocolHandler"]],
+        // It reads its input in the console's code page, not as UTF-8.
+        clipboard: Some(Clipboard {
+            program: "clip.exe",
+            ascii_only: true,
+        }),
+        // `AppsUseLightTheme` is 0 when apps are dark.
+        dark_mode: Some(DarkModeProbe {
+            argv: &[
+                "reg",
+                "query",
+                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+                "/v",
+                "AppsUseLightTheme",
+            ],
+            dark: "0x0",
+        }),
+        starts_simulators: false,
+        shell: "cmd.exe",
     },
 ];
 

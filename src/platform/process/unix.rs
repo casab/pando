@@ -1,6 +1,8 @@
 //! Process groups on Unix: sessions, `killpg`, `waitpid` and `waitid`.
 
 use super::Group;
+use std::collections::BTreeMap;
+
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, killpg};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
@@ -35,6 +37,10 @@ pub(super) fn spawn_group(command: &mut Command) -> io::Result<(Child, Group)> {
     // After `setsid` the child leads a group whose id is its pid.
     let group = Group::from_raw(child.id() as i32);
     Ok((child, group))
+}
+
+pub(super) fn ports_by_group(groups: &[Group]) -> BTreeMap<Group, Option<Vec<u16>>> {
+    super::scan::observed_ports_by_group(groups)
 }
 
 /// Finishes libnotify's one-time set-up in this process before any fork,
