@@ -459,6 +459,13 @@ another mode until `rm` drops them.
   CREATEDB;`, and the role can drop only the databases it owns, which
   are the ones it made. The official image's `POSTGRES_USER` needs
   neither.
+- A server in a container needs neither the grant nor a question: its
+  environment already keeps its administrator (`POSTGRES_USER` and
+  `POSTGRES_PASSWORD`, `MARIADB_ROOT_PASSWORD`), so pando runs that same
+  statement itself, as the administrator, and the database is made as
+  the app's login, which owns it. Where the app's env files carry no
+  login at all, the administrator is the login. Only a server with no
+  administrator pando can find gets the statement printed.
 - The database is made in main's character set or encoding and locale,
   so a schema written for main runs into it the same way.
 - A Redis slot is given out only where the app reads a slot setting

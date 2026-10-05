@@ -23,8 +23,7 @@ none of theirs outside it without a yes: every setting goes through
 own, inside `.git`, removed when it is done.
 
 1. **Ask the developer nothing, from the first command to the last.**
-   Every open question is yours to decide; the report in step 7 says
-   what you decided, and they change any of it later.
+   Every open question is yours; step 7 reports what you decided.
 2. **Save pando's choices in one step: `pando init --yes`.** It takes
    pando's first choice for every open question and writes it under
    `~/.pando`, never into the repository. pando runs every app it found a
@@ -59,10 +58,11 @@ own, inside `.git`, removed when it is done.
      it. The report names it, and the command that would fix the pin.
    - `provision`, when its only option seeds a file from an example
      (`needs_a_human`): that option's text, named in the report.
-4. **Run `pando check`, with a timeout of at least 10 minutes.** It makes a
-   throwaway worktree of the commit a new branch would fork from, runs the
-   install, starts every process, checks the one the browser opens really
-   answers, and removes it all. The prompt the developer pasted is their
+   - `namespaced`, when `init` says a service would stay on main's
+     data: the keys its app reads, from `signals` and its config.
+4. **Run `pando check`, with a timeout of at least 10 minutes.** It
+   installs and starts everything in a throwaway worktree, checks the
+   page answers, and removes it. The prompt the developer pasted is their
    consent to this test. All it runs sees
    `PANDO_CHECK=1`, so a process can skip, say, opening a simulator.
 5. **When the check fails, fix, then rerun; never rerun unchanged.**
@@ -846,8 +846,9 @@ committed `pando.toml` may carry it too.
 
 A namespaced start that stops with a `GRANT …` or `ALTER ROLE …`
 statement on stderr means the app's login may not make the worktree's
-database. Report the statement; running it is the human's, as an
-administrator of their own server. A start that says `psql`, `mariadb` or
+database, and pando found no administrator to run it — a server in a
+container has one, and pando runs it there itself. Report the statement;
+running it is the human's, as an administrator of their own server. A start that says `psql`, `mariadb` or
 `redis-cli` is not on PATH names what to install: report that too. A
 server in a container that publishes its port is reached through the
 client its image ships, so that line means no such container was

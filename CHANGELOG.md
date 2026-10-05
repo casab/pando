@@ -17,6 +17,15 @@ may change behaviour.
   service is its data. A prefix is told, never made: nothing is recorded
   or dropped, and `rm` says what it leaves. Every process of a
   namespaced worktree is told `PANDO_NAMESPACE`, its slug.
+- A database in a container is set up with nobody asked: where the
+  app's login may not make the worktree's database, pando runs the
+  grant it used to print as the container's own administrator, read
+  from its environment (`POSTGRES_USER`/`POSTGRES_PASSWORD`,
+  `MARIADB_ROOT_PASSWORD`), and where the app's env files carry no login,
+  that administrator is the login. A recipe says where with
+  `[namespace.container_admin]` and `run_sql`.
+- The setup brief's first run answers `namespaced` when `init` says a
+  service would stay on main's data.
 - A server in a container is reached through the client its image
   ships: when the host has no `psql`, `mariadb` or `redis-cli` and a
   container publishes the server's port, the recipe's commands run in it
