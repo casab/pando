@@ -15,6 +15,7 @@ use crate::actions::worktree_url;
 use crate::cache;
 use crate::config::Config;
 use crate::paths::PandoPaths;
+use crate::process::Group;
 use crate::project::ProjectRef;
 use crate::state::{Phase, ProcessRecord, WorktreeRecord};
 use crate::testutil::git;
@@ -927,7 +928,7 @@ fn ls_shows_the_ports_and_status_of_a_running_worktree() {
         "dev".to_string(),
         crate::state::ProcessRecord {
             pid: std::process::id(),
-            pgid: std::process::id() as i32,
+            pgid: Group::from_raw(std::process::id() as i32),
             started_at: Utc::now(),
             log_path: fx.paths.log_file(&name, "dev"),
             ready_port: Some(17_342),
@@ -968,7 +969,7 @@ fn a_worktree_with_nothing_running_shows_dashes() {
 fn listening(pgid: i32, observed: &[u16]) -> crate::state::ProcessRecord {
     crate::state::ProcessRecord {
         pid: std::process::id(),
-        pgid,
+        pgid: Group::from_raw(pgid),
         started_at: Utc::now(),
         log_path: PathBuf::from("/does/not/exist/dev.log"),
         ready_port: None,
@@ -1377,7 +1378,7 @@ fn status_json_carries_the_documented_shape() {
         "dev".to_string(),
         crate::state::ProcessRecord {
             pid: std::process::id(),
-            pgid: 999_998,
+            pgid: Group::from_raw(999_998),
             started_at: Utc::now(),
             log_path: fx.paths.log_file(&name, "dev"),
             ready_port: Some(17_342),
@@ -1391,7 +1392,7 @@ fn status_json_carries_the_documented_shape() {
         "worker".to_string(),
         crate::state::ProcessRecord {
             pid: 4242,
-            pgid: 4242,
+            pgid: Group::from_raw(4242),
             started_at: Utc::now(),
             log_path: fx.paths.log_file(&name, "worker"),
             ready_port: None,
@@ -1454,13 +1455,13 @@ fn with_share(fx: &Fx, name: &str, proxy: Option<u16>) {
     record.share_port = proxy;
     record.share = Some(crate::state::ShareRecord {
         tunnel_pid: std::process::id(),
-        tunnel_pgid: 999_998,
+        tunnel_pgid: Group::from_raw(999_998),
         public_url: "https://fake-host.trycloudflare.com".to_string(),
         local_port: 17_342,
         started_at: Utc::now(),
         log_path: fx.paths.log_file(name, "tunnel"),
         proxy_pid: proxy.map(|_| std::process::id()),
-        proxy_pgid: proxy.map(|_| 999_997),
+        proxy_pgid: proxy.map(|_| Group::from_raw(999_997)),
         proxy_port: proxy,
     });
     crate::state::save(&fx.paths.state_file(), &store).unwrap();
@@ -2584,7 +2585,7 @@ fn with_two_processes(fx: &Fx, name: &str, api_phase: Phase) {
         "web".to_string(),
         crate::state::ProcessRecord {
             pid: std::process::id(),
-            pgid: 999_998,
+            pgid: Group::from_raw(999_998),
             started_at: Utc::now(),
             log_path: fx.paths.log_file(name, "web"),
             ready_port: Some(17_342),
@@ -2598,7 +2599,7 @@ fn with_two_processes(fx: &Fx, name: &str, api_phase: Phase) {
         "api".to_string(),
         crate::state::ProcessRecord {
             pid: std::process::id(),
-            pgid: 999_997,
+            pgid: Group::from_raw(999_997),
             started_at: Utc::now(),
             log_path: fx.paths.log_file(name, "api"),
             ready_port: Some(17_343),
@@ -2981,7 +2982,7 @@ fn an_empty_log_carries_the_reason_the_record_knows() {
         "dev".to_string(),
         ProcessRecord {
             pid: 1,
-            pgid: 1,
+            pgid: Group::from_raw(1),
             started_at: Utc::now(),
             log_path: fx.paths.log_file("feat+one", "dev"),
             ready_port: None,

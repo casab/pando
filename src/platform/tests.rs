@@ -99,6 +99,8 @@ fn os_talk(file: &str, line: &str) -> Option<&'static str> {
         "Command::new(\"bash\")",
         "Command::new(\"sh\")",
         "\"/bin/sh\"",
+        "Group::from_raw",
+        ".as_raw()",
     ];
     if let Some(path) = PATHS.iter().find(|path| names(line, path)) {
         return Some(path);

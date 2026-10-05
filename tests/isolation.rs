@@ -323,7 +323,11 @@ fn a_failed_start_of_a_running_worktree_stops_only_what_it_brought_up() {
     let before = pids(&f);
 
     // redis dies, and dies again as soon as it is brought back.
-    process::stop(before["redis"] as i32, Duration::from_secs(2)).unwrap();
+    process::stop(
+        process::Group::from_raw(before["redis"] as i32),
+        Duration::from_secs(2),
+    )
+    .unwrap();
     docker::exits_on_up(&f.home, &project, &["redis"]);
     let err = format!(
         "{:#}",

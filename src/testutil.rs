@@ -172,7 +172,7 @@ pub fn drifted_repo(path: &Path, ahead: u32, days: i64, file: Option<&str>) {
 /// listener behind.
 pub struct Detached {
     pub pid: u32,
-    pub pgid: i32,
+    pub pgid: crate::process::Group,
 }
 
 impl Drop for Detached {

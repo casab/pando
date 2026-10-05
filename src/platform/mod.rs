@@ -22,6 +22,7 @@ pub mod desktop;
 pub mod dirs;
 pub mod files;
 pub mod host;
+pub mod process;
 pub mod shell;
 pub mod terminal;
 

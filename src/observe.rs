@@ -21,6 +21,8 @@ use std::sync::{Mutex, MutexGuard, mpsc};
 use std::thread;
 use std::time::Duration;
 
+use crate::platform::process::Group;
+
 /// Long enough for `lsof` on a busy machine, short enough that a hung scan
 /// never holds up a tick.
 const SCAN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -31,13 +33,14 @@ const SCAN_TIMEOUT: Duration = Duration::from_secs(3);
 /// pando asked it to record an exit status, and otherwise `exec`s away or
 /// exits early — so the interesting pids are not reliably the one pando
 /// recorded, in either case.
-pub fn group_pids(pgid: i32) -> Vec<u32> {
+pub fn group_pids(pgid: Group) -> Vec<u32> {
     group_pids_checked(pgid).unwrap_or_default()
 }
 
 /// [`group_pids`], distinguishing "no processes" from "the scan could not
 /// run". `None` is the second: no `ps`, denied, or timed out.
-pub fn group_pids_checked(pgid: i32) -> Option<Vec<u32>> {
+pub fn group_pids_checked(group: Group) -> Option<Vec<u32>> {
+    let pgid = group.as_raw();
     if pgid <= 0 {
         return Some(Vec::new());
     }
@@ -123,7 +126,7 @@ pub fn listening_ports_checked(pids: &[u32]) -> Option<Vec<(u32, u16)>> {
 
 /// Every port the group listens on, sorted and deduplicated. The one call
 /// the rest of pando makes.
-pub fn observed_ports(pgid: i32) -> Vec<u16> {
+pub fn observed_ports(pgid: Group) -> Vec<u16> {
     observed_ports_checked(pgid).unwrap_or_default()
 }
 
@@ -133,7 +136,7 @@ pub fn observed_ports(pgid: i32) -> Vec<u16> {
 /// The difference decides readiness: an empty answer from a working scan
 /// means "not up yet", while `None` means pando has to fall back to asking
 /// the port itself.
-pub fn observed_ports_checked(pgid: i32) -> Option<Vec<u16>> {
+pub fn observed_ports_checked(pgid: Group) -> Option<Vec<u16>> {
     let pids = group_pids_checked(pgid)?;
     let ports: BTreeSet<u16> = listening_ports_checked(&pids)?
         .into_iter()
@@ -147,11 +150,15 @@ pub fn observed_ports_checked(pgid: i32) -> Option<Vec<u16>> {
 /// two spawns apiece. Each group's answer means what the single-group
 /// call's would: `None` when a scan could not run, an empty list when the
 /// group listens on nothing.
-pub fn observed_ports_by_group(pgids: &[i32]) -> BTreeMap<i32, Option<Vec<u16>>> {
-    let wanted: BTreeSet<i32> = pgids.iter().copied().filter(|g| *g > 0).collect();
-    let mut out: BTreeMap<i32, Option<Vec<u16>>> = pgids
+pub fn observed_ports_by_group(groups: &[Group]) -> BTreeMap<Group, Option<Vec<u16>>> {
+    let wanted: BTreeSet<i32> = groups
         .iter()
-        .map(|g| (*g, (*g <= 0).then(Vec::new)))
+        .map(|g| g.as_raw())
+        .filter(|g| *g > 0)
+        .collect();
+    let mut out: BTreeMap<Group, Option<Vec<u16>>> = groups
+        .iter()
+        .map(|g| (*g, (g.as_raw() <= 0).then(Vec::new)))
         .collect();
     if wanted.is_empty() {
         return out;
@@ -169,7 +176,7 @@ pub fn observed_ports_by_group(pgids: &[i32]) -> BTreeMap<i32, Option<Vec<u16>>>
             .filter(|(pid, _)| group.contains(pid))
             .map(|(_, port)| *port)
             .collect();
-        out.insert(*pgid, Some(ports.into_iter().collect()));
+        out.insert(Group::from_raw(*pgid), Some(ports.into_iter().collect()));
     }
     out
 }
@@ -865,9 +872,12 @@ mod tests {
 
     #[test]
     fn a_dead_group_observes_nothing_rather_than_failing() {
-        assert!(group_pids(999_999).is_empty());
-        assert!(observed_ports(999_999).is_empty());
-        assert!(observed_ports(0).is_empty(), "pgid 0 is never a real group");
+        assert!(group_pids(Group::from_raw(999_999)).is_empty());
+        assert!(observed_ports(Group::from_raw(999_999)).is_empty());
+        assert!(
+            observed_ports(Group::from_raw(0)).is_empty(),
+            "pgid 0 is never a real group"
+        );
         assert!(listening_ports(&[]).is_empty());
     }
 
@@ -923,12 +933,13 @@ mod tests {
             observed_ports(child.pgid).contains(&port)
         }));
         // A pgid nothing holds: an empty answer, not a failed one.
-        let gone = i32::MAX - 7;
-        let scans = observed_ports_by_group(&[child.pgid, gone, 0, child.pgid]);
+        let gone = Group::from_raw(i32::MAX - 7);
+        let zero = Group::from_raw(0);
+        let scans = observed_ports_by_group(&[child.pgid, gone, zero, child.pgid]);
         assert_eq!(scans.len(), 3);
         assert_eq!(scans[&child.pgid], observed_ports_checked(child.pgid));
         assert_eq!(scans[&gone], Some(Vec::new()));
-        assert_eq!(scans[&0], Some(Vec::new()));
+        assert_eq!(scans[&zero], Some(Vec::new()));
     }
 
     // A `ps` that was denied prints nothing to stdout and exits non-zero.

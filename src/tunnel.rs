@@ -65,7 +65,7 @@ no-autoupdate: true
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunnelSpawn {
     pub pid: u32,
-    pub pgid: i32,
+    pub pgid: process::Group,
     pub public_url: String,
     pub log_path: PathBuf,
     /// The tail of its log when the deadline passed before the tunnel had
@@ -101,7 +101,7 @@ pub trait Provider {
         name: &str,
         host: &str,
         local_port: u16,
-        spawned: &dyn Fn(i32),
+        spawned: &dyn Fn(process::Group),
     ) -> Result<TunnelSpawn>;
 }
 
@@ -138,7 +138,7 @@ impl Provider for Cloudflared {
         name: &str,
         host: &str,
         local_port: u16,
-        spawned: &dyn Fn(i32),
+        spawned: &dyn Fn(process::Group),
     ) -> Result<TunnelSpawn> {
         start_tunnel_with(paths, name, host, local_port, spawned)
     }
@@ -213,7 +213,7 @@ fn start_tunnel_with(
     name: &str,
     host: &str,
     local_port: u16,
-    spawned: &dyn Fn(i32),
+    spawned: &dyn Fn(process::Group),
 ) -> Result<TunnelSpawn> {
     let log_path = paths.log_file(name, TUNNEL_LOG);
     // `spawn_detached` opens the log with O_APPEND, so after
@@ -376,7 +376,10 @@ pub fn stop_share(record: &ShareRecord) -> Result<()> {
 
 /// [`stop_share`] with the signal injected, so a test can watch the order
 /// without real process groups.
-pub fn stop_share_with(record: &ShareRecord, stop: impl Fn(i32) -> Result<()>) -> Result<()> {
+pub fn stop_share_with(
+    record: &ShareRecord,
+    stop: impl Fn(process::Group) -> Result<()>,
+) -> Result<()> {
     let tunnel = stop(record.tunnel_pgid);
     let proxy = match record.proxy_pgid {
         Some(pgid) => stop(pgid),
@@ -540,13 +543,13 @@ mod tests {
     fn share_record(tunnel_pgid: i32, proxy_pgid: Option<i32>) -> ShareRecord {
         ShareRecord {
             tunnel_pid: tunnel_pgid as u32,
-            tunnel_pgid,
+            tunnel_pgid: process::Group::from_raw(tunnel_pgid),
             public_url: "https://x.trycloudflare.com".into(),
             local_port: 17000,
             started_at: Utc::now(),
             log_path: PathBuf::from("tunnel.log"),
             proxy_pid: proxy_pgid.map(|p| p as u32),
-            proxy_pgid,
+            proxy_pgid: proxy_pgid.map(process::Group::from_raw),
             proxy_port: proxy_pgid.map(|_| 17001),
         }
     }
@@ -976,7 +979,7 @@ mod tests {
         let order = Mutex::new(Vec::new());
         let record = share_record(4242, Some(8484));
         stop_share_with(&record, |pgid| {
-            order.lock().unwrap().push(pgid);
+            order.lock().unwrap().push(pgid.as_raw());
             Ok(())
         })
         .unwrap();
@@ -992,8 +995,12 @@ mod tests {
         let signalled = Mutex::new(Vec::new());
         let record = share_record(4242, Some(8484));
         let result = stop_share_with(&record, |pgid| {
-            signalled.lock().unwrap().push(pgid);
-            if pgid == 4242 { bail!("stuck") } else { Ok(()) }
+            signalled.lock().unwrap().push(pgid.as_raw());
+            if pgid.as_raw() == 4242 {
+                bail!("stuck")
+            } else {
+                Ok(())
+            }
         });
         assert!(result.is_err(), "the caller still learns the tunnel stuck");
         assert_eq!(
@@ -1008,7 +1015,7 @@ mod tests {
         let signalled = Mutex::new(Vec::new());
         let record = share_record(4242, None);
         stop_share_with(&record, |pgid| {
-            signalled.lock().unwrap().push(pgid);
+            signalled.lock().unwrap().push(pgid.as_raw());
             Ok(())
         })
         .unwrap();

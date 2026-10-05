@@ -10,6 +10,8 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+pub use crate::platform::process::Group;
+
 pub struct SpawnOptions<'a> {
     pub shell_cmd: &'a str,
     pub cwd: &'a Path,
@@ -23,7 +25,7 @@ pub struct SpawnOptions<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpawnResult {
     pub pid: u32,
-    pub pgid: i32,
+    pub pgid: Group,
 }
 
 /// Starts the child `command` spawns in a session of its own: the leader of
@@ -154,7 +156,7 @@ pub fn spawn_detached(opts: SpawnOptions<'_>) -> Result<SpawnResult> {
     let mut child = cmd.spawn().context("spawn detached bash")?;
     let pid = child.id();
     // After setsid() the child's pgid equals its pid (it becomes session leader).
-    let pgid = pid as i32;
+    let pgid = Group::from_raw(pid as i32);
     // Waited on rather than dropped, so that it is reaped when it ends. The
     // status the wait returns goes nowhere: the status file is what says
     // how the process ended.
@@ -208,7 +210,8 @@ pub fn is_alive(pid: u32) -> bool {
 /// a `bash -lc` that very often exits while the server it backgrounded keeps
 /// running and keeps the port. Asking after the leader alone is how a stop
 /// reports success over a process that is still serving.
-pub fn group_alive(pgid: i32) -> bool {
+pub fn group_alive(group: Group) -> bool {
+    let pgid = group.as_raw();
     // 0 is "our own group" and 1 is "every process we may signal". Neither
     // is ever a worktree's process group, and both would be catastrophic to
     // pass to kill(2).
@@ -287,7 +290,7 @@ pub fn run_captured(
         .spawn()
         .with_context(|| format!("run {shell_cmd:?}"))?;
     // After `setsid` the child leads a group whose id is its pid.
-    let pgid = child.id() as i32;
+    let pgid = Group::from_raw(child.id() as i32);
 
     // Shared rather than returned by the threads: when the deadline passes
     // with a pipe still open, what was read so far is still the answer, and
@@ -484,7 +487,8 @@ pub fn shell_word(word: &str) -> String {
 /// written off as failed: a leader that exited is not a group that exited,
 /// and skipping the signal is exactly how a backgrounded child outlives the
 /// tool that started it.
-pub fn stop(pgid: i32, grace: Duration) -> Result<()> {
+pub fn stop(target: Group, grace: Duration) -> Result<()> {
+    let pgid = target.as_raw();
     // Nor the group pando itself runs in. Nothing pando spawns is in it —
     // every spawn leads a session of its own — so a record naming it is a
     // number that has been handed out again, and the shell that ran this
@@ -514,7 +518,7 @@ pub fn stop(pgid: i32, grace: Duration) -> Result<()> {
         // Reap first: a zombie child of ours still counts as a group member
         // to kill(2), so an unreaped leader would look alive forever.
         reap_group(any_in_group);
-        if !group_alive(pgid) {
+        if !group_alive(target) {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -532,7 +536,7 @@ pub fn stop(pgid: i32, grace: Duration) -> Result<()> {
     let hard_deadline = Instant::now() + KILL_SETTLE;
     loop {
         reap_group(any_in_group);
-        if !group_alive(pgid) || Instant::now() >= hard_deadline {
+        if !group_alive(target) || Instant::now() >= hard_deadline {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -825,24 +829,28 @@ mod tests {
 
     #[test]
     fn stop_is_idempotent_when_group_already_gone() {
-        stop(999_999, Duration::from_millis(100)).unwrap();
-        assert!(!group_alive(999_999));
+        stop(Group::from_raw(999_999), Duration::from_millis(100)).unwrap();
+        assert!(!group_alive(Group::from_raw(999_999)));
     }
 
     // `kill(-0, …)` signals our own process group and `kill(-1, …)` signals
     // every process we are allowed to signal. Neither is ever a worktree.
     #[test]
     fn stop_refuses_the_process_group_ids_that_would_signal_ourselves() {
-        assert!(!group_alive(0));
-        assert!(!group_alive(1));
-        assert!(!group_alive(-5));
-        stop(0, Duration::from_millis(10)).unwrap();
-        stop(1, Duration::from_millis(10)).unwrap();
-        stop(-1, Duration::from_millis(10)).unwrap();
+        assert!(!group_alive(Group::from_raw(0)));
+        assert!(!group_alive(Group::from_raw(1)));
+        assert!(!group_alive(Group::from_raw(-5)));
+        stop(Group::from_raw(0), Duration::from_millis(10)).unwrap();
+        stop(Group::from_raw(1), Duration::from_millis(10)).unwrap();
+        stop(Group::from_raw(-1), Duration::from_millis(10)).unwrap();
         // Our own group, which no spawn is ever in: a record naming it
         // is a reused number, and the signal would land on this process
         // and the job that ran it.
-        stop(nix::unistd::getpgrp().as_raw(), Duration::from_millis(10)).unwrap();
+        stop(
+            Group::from_raw(nix::unistd::getpgrp().as_raw()),
+            Duration::from_millis(10),
+        )
+        .unwrap();
         // Still here, and still runnable: we did not signal ourselves.
         assert!(is_alive(std::process::id()));
     }
@@ -1054,7 +1062,7 @@ mod tests {
         })
         .unwrap();
 
-        let our_pgid = nix::unistd::getpgrp().as_raw();
+        let our_pgid = Group::from_raw(nix::unistd::getpgrp().as_raw());
         assert_ne!(
             r.pgid, our_pgid,
             "child pgid ({}) must differ from parent pgid ({})",

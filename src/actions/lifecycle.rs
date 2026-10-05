@@ -374,7 +374,7 @@ fn start_checked(
     let mut inherited: Option<WorktreeRecord> = None;
     if stale {
         let record = store.worktrees.get_mut(name).expect("just read");
-        let groups: Vec<i32> = record
+        let groups: Vec<proc::Group> = record
             .processes
             .values()
             .filter(|p| !p.swept)
@@ -515,7 +515,7 @@ fn start_checked(
     // own among them, closes a URL whose process is coming back on the
     // same port.
     let mut already: Vec<String> = Vec::new();
-    let mut clear: Vec<(String, i32, bool)> = Vec::new();
+    let mut clear: Vec<(String, proc::Group, bool)> = Vec::new();
     let mut kept_serving: Vec<String> = Vec::new();
     if let Some(record) = store.worktrees.get(name) {
         for (process, existing) in &record.processes {
@@ -1053,7 +1053,7 @@ fn start_checked(
         }
     }
     let running = record.mode();
-    let mut replace: Vec<(String, i32)> = Vec::new();
+    let mut replace: Vec<(String, proc::Group)> = Vec::new();
     for (process_name, _) in &selection {
         if already.contains(process_name) {
             continue;
@@ -1362,7 +1362,7 @@ pub fn stop_all_listed(
 pub fn stop_all_with(
     paths: &PandoPaths,
     listed: Option<&[String]>,
-    stop: impl Fn(i32) -> Result<()>,
+    stop: impl Fn(proc::Group) -> Result<()>,
     progress: &dyn Fn(&str),
 ) -> Result<StopAllReport> {
     paths.ensure_home()?;
@@ -1513,7 +1513,7 @@ pub(super) fn stop_recorded_with(
     store: &mut state::State,
     name: &str,
     only: Option<&str>,
-    stop: impl Fn(i32) -> Result<()>,
+    stop: impl Fn(proc::Group) -> Result<()>,
     services_to_stop: &mut Vec<String>,
 ) -> Result<StopOutcome> {
     let Some(record) = store.worktrees.get_mut(name) else {
@@ -1556,7 +1556,7 @@ pub(super) fn stop_recorded_with(
         }
         return Ok(StopOutcome::Stopped(Vec::new()));
     }
-    let groups: Vec<(String, i32, bool)> = record
+    let groups: Vec<(String, proc::Group, bool)> = record
         .processes
         .iter()
         .filter(|(process, _)| only.is_none_or(|wanted| process.as_str() == wanted))
@@ -1634,7 +1634,7 @@ pub(super) fn sweep_orphaned_groups(store: &mut state::State) -> Result<Vec<Stri
 /// which groups it decides to signal without needing real ones.
 pub(super) fn sweep_orphaned_groups_with(
     store: &mut state::State,
-    stop: impl Fn(i32) -> Result<()>,
+    stop: impl Fn(proc::Group) -> Result<()>,
 ) -> Result<Vec<String>> {
     // First, because a share is the one record whose survivor is a public
     // door: a tunnel nobody can name again is worse than a dev server

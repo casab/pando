@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::platform::process::Group;
+
 pub const STATE_VERSION: u32 = 2;
 
 /// How long a process may sit in `Starting` before it is called failed.
@@ -281,7 +283,7 @@ where
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ProcessRecord {
     pub pid: u32,
-    pub pgid: i32,
+    pub pgid: Group,
     pub started_at: DateTime<Utc>,
     pub log_path: PathBuf,
     /// The port `advance_phases` watches for the Starting → Running
@@ -339,7 +341,7 @@ pub struct ServiceRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pgid: Option<i32>,
+    pub pgid: Option<Group>,
     /// Compose services are addressed by their compose project name instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compose_project: Option<String>,
@@ -421,7 +423,7 @@ pub struct HookRecord {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ShareRecord {
     pub tunnel_pid: u32,
-    pub tunnel_pgid: i32,
+    pub tunnel_pgid: Group,
     pub public_url: String,
     pub local_port: u16,
     pub started_at: DateTime<Utc>,
@@ -430,7 +432,7 @@ pub struct ShareRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub proxy_pgid: Option<i32>,
+    pub proxy_pgid: Option<Group>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_port: Option<u16>,
 }
@@ -457,7 +459,7 @@ pub struct PendingShare {
     #[serde(default = "Utc::now")]
     pub since: DateTime<Utc>,
     /// Every process group spawned for it so far.
-    pub pgids: Vec<i32>,
+    pub pgids: Vec<Group>,
 }
 
 impl State {
@@ -609,10 +611,10 @@ pub fn save(path: &Path, state: &State) -> Result<()> {
 /// after that called it dead.
 fn record_alive(
     pid: u32,
-    pgid: i32,
+    pgid: Group,
     ready_port: Option<u16>,
     is_alive: &impl Fn(u32) -> bool,
-    group_alive: &impl Fn(i32) -> bool,
+    group_alive: &impl Fn(Group) -> bool,
 ) -> bool {
     // Reaps a zombie when we are the parent, which is what keeps the group
     // probe below from seeing a corpse as a member.
@@ -631,7 +633,11 @@ impl ProcessRecord {
     /// which calls a portless process whose leader backgrounded it and
     /// returned Running — and a mutation that asked the leader alone
     /// killed that process as an orphan.
-    pub fn alive(&self, is_alive: impl Fn(u32) -> bool, group_alive: impl Fn(i32) -> bool) -> bool {
+    pub fn alive(
+        &self,
+        is_alive: impl Fn(u32) -> bool,
+        group_alive: impl Fn(Group) -> bool,
+    ) -> bool {
         record_alive(
             self.pid,
             self.pgid,
@@ -645,7 +651,7 @@ impl ProcessRecord {
 pub fn reconcile(
     state: &mut State,
     is_alive: impl Fn(u32) -> bool,
-    group_alive: impl Fn(i32) -> bool,
+    group_alive: impl Fn(Group) -> bool,
 ) -> bool {
     let mut changed = false;
     for rec in state.worktrees.values_mut() {
@@ -709,7 +715,7 @@ pub fn reconcile(
 pub fn forget_dead_native_services(
     state: &mut State,
     is_alive: impl Fn(u32) -> bool,
-    group_alive: impl Fn(i32) -> bool,
+    group_alive: impl Fn(Group) -> bool,
 ) -> Vec<(String, String)> {
     let mut forgotten = Vec::new();
     for (name, rec) in state.worktrees.iter_mut() {
@@ -753,8 +759,8 @@ fn sweep_dead_shares(state: &mut State, is_alive: &impl Fn(u32) -> bool) -> bool
 pub fn advance_phases<R: Into<PortCheck>>(
     state: &mut State,
     is_alive: impl Fn(u32) -> bool,
-    group_alive: impl Fn(i32) -> bool,
-    port_bound: impl Fn(i32, u16) -> R,
+    group_alive: impl Fn(Group) -> bool,
+    port_bound: impl Fn(Group, u16) -> R,
 ) -> bool {
     let now = Utc::now();
     let mut changed = false;
@@ -1018,7 +1024,7 @@ mod tests {
     fn process(pid: u32, phase: Phase) -> ProcessRecord {
         ProcessRecord {
             pid,
-            pgid: pid as i32,
+            pgid: Group::from_raw(pid as i32),
             started_at: at(9),
             log_path: PathBuf::from("logs/feat+x/dev.log"),
             ready_port: Some(17_000),
@@ -1217,7 +1223,7 @@ mod tests {
     fn share(tunnel_pid: u32) -> ShareRecord {
         ShareRecord {
             tunnel_pid,
-            tunnel_pgid: tunnel_pid as i32,
+            tunnel_pgid: Group::from_raw(tunnel_pid as i32),
             public_url: "https://x.trycloudflare.com".into(),
             local_port: 17_000,
             started_at: at(9),
@@ -1249,7 +1255,7 @@ mod tests {
                 kind: ServiceKind::Native,
                 port: Some(17_003),
                 pid: Some(5150),
-                pgid: Some(5150),
+                pgid: Some(Group::from_raw(5150)),
                 compose_project: None,
             },
         ];
@@ -1443,6 +1449,126 @@ mod tests {
         assert!(err.contains("version 3"), "{err}");
     }
 
+    // A state file as pando 0.8.3 wrote it, before a process group had a
+    // type of its own: every group a bare number. Typed as `Group`, they
+    // must read from such a file and be written back byte for byte, or an
+    // upgrade loses track of everything running.
+    #[test]
+    fn a_state_file_written_before_groups_had_a_type_reads_and_writes_the_same() {
+        const WRITTEN: &str = r#"{
+  "version": 2,
+  "worktrees": {
+    "feat+x": {
+      "path": "/abs/feat+x",
+      "created_by_pando": true,
+      "processes": {
+        "dev": {
+          "pid": 4242,
+          "pgid": 4242,
+          "started_at": "2026-09-20T09:00:00Z",
+          "log_path": "logs/feat+x/dev.log",
+          "ready_port": 17000,
+          "observed_ports": [
+            17000,
+            17001
+          ],
+          "phase": {
+            "phase": "Running",
+            "since": "2026-09-20T09:00:00Z"
+          }
+        }
+      },
+      "ports": {
+        "web": 17000
+      },
+      "roles": {
+        "dev": [
+          "web"
+        ]
+      },
+      "observed_ports": [
+        17000,
+        17001
+      ],
+      "services": [
+        {
+          "name": "postgres",
+          "kind": "compose",
+          "port": 17002,
+          "compose_project": "pando-acme-feat+x"
+        },
+        {
+          "name": "redis",
+          "kind": "native",
+          "port": 17003,
+          "pid": 5150,
+          "pgid": 5150
+        }
+      ],
+      "namespaces": [
+        {
+          "service": "mariadb",
+          "recipe": "mariadb",
+          "kind": "database",
+          "host": "localhost",
+          "port": 3306,
+          "name": "shop__feat_x",
+          "main": "shop",
+          "mains": [
+            "shop",
+            "shop_jobs"
+          ],
+          "keys": [
+            "DATABASE_PORT"
+          ],
+          "used_at": "2026-09-20T10:00:00Z"
+        }
+      ],
+      "hooks": {
+        "migrate": {
+          "fingerprint": "sha256:abc",
+          "ran_at": "2026-09-20T10:00:00Z"
+        }
+      },
+      "share": {
+        "tunnel_pid": 7000,
+        "tunnel_pgid": 7000,
+        "public_url": "https://x.trycloudflare.com",
+        "local_port": 17000,
+        "started_at": "2026-09-20T09:00:00Z",
+        "log_path": "logs/feat+x/tunnel.log"
+      },
+      "pending_shares": [
+        {
+          "owner_pid": 4343,
+          "since": "2023-11-14T22:13:30Z",
+          "pgids": [
+            7100,
+            7101
+          ]
+        }
+      ]
+    }
+  }
+}"#;
+        let state: State = serde_json::from_str(WRITTEN).unwrap();
+        assert_eq!(serde_json::to_string_pretty(&state).unwrap(), WRITTEN);
+        let rec = &state.worktrees["feat+x"];
+        assert_eq!(rec.processes["dev"].pgid, Group::from_raw(4242));
+        assert_eq!(rec.services[1].pgid, Some(Group::from_raw(5150)));
+        let share = rec.share.as_ref().unwrap();
+        assert_eq!(share.tunnel_pgid, Group::from_raw(7000));
+        assert_eq!(
+            rec.pending_shares[0].pgids,
+            vec![Group::from_raw(7100), Group::from_raw(7101)]
+        );
+        assert_eq!(
+            rec.processes["dev"].pgid.to_string(),
+            "4242",
+            "as messages name it"
+        );
+    }
+
     // After a restart every pid in the file names whatever process the new
     // boot handed that number to. Trusted, `stop` signals a stranger's
     // process group and `start` calls a dead dev server "already running".
@@ -1458,7 +1584,7 @@ mod tests {
             rec.pending_shares.push(PendingShare {
                 owner_pid: 4343,
                 since: at(10),
-                pgids: vec![7100, 7101],
+                pgids: vec![Group::from_raw(7100), Group::from_raw(7101)],
             });
         }
         save(&path, &state).unwrap();
@@ -1589,7 +1715,7 @@ mod tests {
         let mut state = full_state();
         if let Some(rec) = state.worktrees.get_mut("feat+x") {
             rec.services[0].pid = Some(9001);
-            rec.services[0].pgid = Some(9001);
+            rec.services[0].pgid = Some(Group::from_raw(9001));
         }
         assert!(reconcile(&mut state, |pid| pid != 9001, |_| false));
         let services = &state.worktrees.get("feat+x").unwrap().services;
@@ -1649,7 +1775,7 @@ mod tests {
         let mut state = full_state();
         if let Some(share) = state.worktrees.get_mut("feat+x").unwrap().share.as_mut() {
             share.proxy_pid = Some(999_999);
-            share.proxy_pgid = Some(999_999);
+            share.proxy_pgid = Some(Group::from_raw(999_999));
             share.proxy_port = Some(17_500);
         }
         reconcile(&mut state, |pid| pid != 999_999, |_| false);

@@ -25,7 +25,7 @@ struct Harness {
     worktree: PathBuf,
     compose: Compose,
     /// Every log pump this test started, so none of them outlives it.
-    pumps: Vec<i32>,
+    pumps: Vec<process::Group>,
 }
 
 impl Drop for Harness {

@@ -1326,7 +1326,7 @@ fn bring_up_native_services(
 /// spawned first, which this one waits on and never stops.
 struct Brought {
     service: native::Native,
-    spawned: Option<i32>,
+    spawned: Option<proc::Group>,
 }
 
 /// Whether a start built a data directory that was not there before, and
@@ -1366,7 +1366,7 @@ fn start_one_native(
     name: &str,
     service: &native::Native,
     progress: &dyn Fn(&str),
-) -> Result<Option<(native::Init, i32)>> {
+) -> Result<Option<(native::Init, proc::Group)>> {
     let _turn = state::lock(&service_lock_file(&service.datadir))?;
     if recorded_native_pid(paths, name, &service.service)?.is_some_and(proc::is_alive) {
         return Ok(None);
@@ -1607,7 +1607,7 @@ fn pump_service_logs(
 /// of the service record — the port and the compose project — in place.
 pub(super) fn stop_service_pumps(
     record: &mut WorktreeRecord,
-    stop: &impl Fn(i32) -> Result<()>,
+    stop: &impl Fn(proc::Group) -> Result<()>,
 ) -> Vec<String> {
     let mut failures = Vec::new();
     for service in record.services.iter_mut() {

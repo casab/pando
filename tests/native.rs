@@ -152,7 +152,11 @@ fn an_isolated_start_gives_a_native_service_a_port_a_database_and_a_log() {
     // The server is pando's own child, alive, and answering.
     let pid = service.pid.expect("a pid");
     assert!(process::is_alive(pid));
-    assert_eq!(service.pgid, Some(pid as i32), "it leads its own group");
+    assert_eq!(
+        service.pgid,
+        Some(process::Group::from_raw(pid as i32)),
+        "it leads its own group"
+    );
     assert!(pando::ports::something_is_listening(port));
 
     // Initialised exactly once, in pando's home and nowhere near the

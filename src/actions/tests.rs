@@ -3,6 +3,7 @@ use super::{hooks::*, lifecycle::*, questions::*, refresh::*, share::*, worktree
 use crate::config::{Config, ProcessConfig, ProvisionMode};
 use crate::paths::PandoPaths;
 use crate::ports;
+use crate::process::Group;
 use crate::process::{self as proc, SpawnOptions};
 use crate::project::ProjectRef;
 use crate::share_proxy;
@@ -55,7 +56,7 @@ fn stop_all(paths: &PandoPaths) -> Result<Vec<String>> {
     super::stop_all(paths, &noop)
 }
 
-fn stop_all_with(paths: &PandoPaths, stop: impl Fn(i32) -> Result<()>) -> Result<Vec<String>> {
+fn stop_all_with(paths: &PandoPaths, stop: impl Fn(Group) -> Result<()>) -> Result<Vec<String>> {
     super::stop_all_with(paths, None, stop, &noop).map(|report| report.stopped)
 }
 
@@ -1773,7 +1774,7 @@ fn stop_signals_every_process_group_and_keeps_the_ports() {
     let name = workspace_worktree(&fx, "feat/one");
     let report = start(&fx.paths, &fx.config, &name, None, &noop).unwrap();
     let _guard = guard(&report);
-    let groups: Vec<i32> = report.started.iter().map(|p| p.record.pgid).collect();
+    let groups: Vec<Group> = report.started.iter().map(|p| p.record.pgid).collect();
 
     assert_eq!(
         stop(&fx.paths, &name, None).unwrap(),
@@ -2431,7 +2432,7 @@ fn a_crash_no_read_path_has_seen_yet_survives_a_stop_of_its_sibling() {
     // TUI tick. What is on disk still says the api is running.
     let api = fx.state().worktrees[&name].processes["api"].clone();
     nix::sys::signal::killpg(
-        nix::unistd::Pid::from_raw(api.pgid),
+        nix::unistd::Pid::from_raw(api.pgid.as_raw()),
         nix::sys::signal::Signal::SIGKILL,
     )
     .unwrap();
@@ -2568,7 +2569,7 @@ fn stop_all_keeps_a_record_whose_group_it_could_not_signal() {
     state::save(&fx.paths.state_file(), &store).unwrap();
 
     let err = stop_all_with(&fx.paths, |pgid| {
-        if pgid == 4242 {
+        if pgid.as_raw() == 4242 {
             anyhow::bail!("killpg refused");
         }
         Ok(())
@@ -2621,12 +2622,15 @@ fn stop_all_takes_down_a_share_whose_processes_are_all_gone() {
 
     let signalled = std::cell::RefCell::new(Vec::<i32>::new());
     let stopped = stop_all_with(&fx.paths, |pgid| {
-        signalled.borrow_mut().push(pgid);
+        signalled.borrow_mut().push(pgid.as_raw());
         Ok(())
     })
     .unwrap();
     assert_eq!(stopped, vec![name.clone()]);
-    assert!(signalled.borrow().contains(&tunnel.pgid), "{signalled:?}");
+    assert!(
+        signalled.borrow().contains(&tunnel.pgid.as_raw()),
+        "{signalled:?}"
+    );
     assert!(fx.state().worktrees[&name].share.is_none());
 }
 
@@ -2665,7 +2669,7 @@ fn a_stop_all_after_a_list_leaves_running_what_came_up_since() {
         &fx.paths,
         Some(std::slice::from_ref(&listed)),
         |pgid| {
-            signalled.borrow_mut().push(pgid);
+            signalled.borrow_mut().push(pgid.as_raw());
             Ok(())
         },
         &|line| said.borrow_mut().push(line.to_string()),
@@ -2710,8 +2714,8 @@ fn a_dead_groups_pgid_is_signalled_once_and_not_on_every_later_mutation() {
     store.worktrees.insert("feat+one".to_string(), record);
 
     let signalled = std::cell::RefCell::new(Vec::new());
-    let watch = |pgid: i32| {
-        signalled.borrow_mut().push(pgid);
+    let watch = |pgid: Group| {
+        signalled.borrow_mut().push(pgid.as_raw());
         Ok(())
     };
 
@@ -2826,7 +2830,7 @@ fn a_swept_groups_pgid_is_not_signalled_again_by_its_own_worktree() {
         let record = ProcessRecord {
             pid: 4_000_001,
             swept: true,
-            ..failed_record(stranger.pgid)
+            ..failed_record(stranger.pgid.as_raw())
         };
         store
             .worktrees
@@ -2945,7 +2949,7 @@ fn failed_record(pgid: i32) -> ProcessRecord {
 fn fake_record(pgid: i32) -> ProcessRecord {
     ProcessRecord {
         pid: pgid as u32,
-        pgid,
+        pgid: Group::from_raw(pgid),
         started_at: Utc::now(),
         log_path: PathBuf::from("/does/not/exist/dev.log"),
         ready_port: None,
@@ -2980,10 +2984,10 @@ fn a_timeout_names_the_ports_the_process_opened_instead() {
     store.worktrees.insert("feat+one".to_string(), record);
 
     let scans = BTreeMap::from([
-        (999_901, Some(vec![3000, 3000])),
+        (Group::from_raw(999_901), Some(vec![3000, 3000])),
         // Listening only on a port the worktree assigned to a role — its
         // own second role, say — is not listening elsewhere.
-        (999_902, Some(vec![17_000])),
+        (Group::from_raw(999_902), Some(vec![17_000])),
     ]);
     assert!(explain_new_failures(&mut store, &[], &scans));
     let record = &store.worktrees["feat+one"];
@@ -3066,7 +3070,7 @@ fn a_timeout_over_a_process_that_is_still_up_says_how_to_wait_longer() {
         .processes
         .insert("web".to_string(), failed(own_group, None));
     store.worktrees.insert("feat+one".to_string(), record);
-    let scans = BTreeMap::from([(own_group, Some(vec![3000]))]);
+    let scans = BTreeMap::from([(Group::from_raw(own_group), Some(vec![3000]))]);
     assert!(explain_new_failures(&mut store, &[], &scans));
     let Phase::Failed { reason, .. } = &store.worktrees["feat+one"].processes["web"].phase else {
         panic!("still failed");
@@ -3111,8 +3115,8 @@ fn observed_ports_are_recorded_per_process_and_the_worktrees_list_is_their_union
     store.worktrees.insert("feat+one".to_string(), record);
 
     let scans = BTreeMap::from([
-        (101, Some(vec![17_342])),
-        (102, Some(vec![17_343, 9876, 17_343])),
+        (Group::from_raw(101), Some(vec![17_342])),
+        (Group::from_raw(102), Some(vec![17_343, 9876, 17_343])),
     ]);
     assert!(capture_observed_ports(&mut store, &scans));
 
@@ -3131,7 +3135,7 @@ fn observed_ports_are_recorded_per_process_and_the_worktrees_list_is_their_union
 
     // A scan that could not run says nothing at all: the last good
     // answer stands rather than being cleared by a missing `lsof`.
-    let unscannable = BTreeMap::from([(101, None), (102, None)]);
+    let unscannable = BTreeMap::from([(Group::from_raw(101), None), (Group::from_raw(102), None)]);
     assert!(!capture_observed_ports(&mut store, &unscannable));
     assert_eq!(
         store.worktrees["feat+one"].observed_ports,
@@ -3361,7 +3365,7 @@ impl tunnel::Provider for MissingProvider {
         _: &str,
         _: &str,
         _: u16,
-        _: &dyn Fn(i32),
+        _: &dyn Fn(Group),
     ) -> Result<tunnel::TunnelSpawn> {
         panic!("a missing provider must never be asked to start anything")
     }
@@ -3384,7 +3388,7 @@ impl tunnel::Provider for FailingProvider {
         _: &str,
         _: &str,
         _: u16,
-        _: &dyn Fn(i32),
+        _: &dyn Fn(Group),
     ) -> Result<tunnel::TunnelSpawn> {
         bail!("cloudflared published no URL within 30s — tail: 429 Too Many Requests")
     }
@@ -3760,7 +3764,7 @@ impl tunnel::Provider for UnreachedProvider {
         _: &str,
         _: &str,
         _: u16,
-        _: &dyn Fn(i32),
+        _: &dyn Fn(Group),
     ) -> Result<tunnel::TunnelSpawn> {
         panic!("a tunnel was opened onto a proxy that never listened")
     }
@@ -3860,7 +3864,7 @@ impl tunnel::Provider for DiallingProvider {
         name: &str,
         _: &str,
         _: u16,
-        spawned: &dyn Fn(i32),
+        spawned: &dyn Fn(Group),
     ) -> Result<tunnel::TunnelSpawn> {
         let log_path = paths.log_file(name, tunnel::TUNNEL_LOG);
         let spawn = proc::spawn_detached(SpawnOptions {
@@ -4042,7 +4046,7 @@ fn a_share_names_what_it_has_spawned_while_its_tunnel_comes_up() {
         .clone()
         .unwrap()
         .tunnel_pgid;
-    let seen: Vec<(u32, Vec<i32>)> = seen.into_iter().map(|p| (p.owner_pid, p.pgids)).collect();
+    let seen: Vec<(u32, Vec<Group>)> = seen.into_iter().map(|p| (p.owner_pid, p.pgids)).collect();
     assert_eq!(
         seen,
         vec![(
@@ -4077,7 +4081,7 @@ impl tunnel::Provider for PendingWatcher<'_> {
         name: &str,
         _: &str,
         _: u16,
-        spawned: &dyn Fn(i32),
+        spawned: &dyn Fn(Group),
     ) -> Result<tunnel::TunnelSpawn> {
         let log_path = paths.log_file(name, tunnel::TUNNEL_LOG);
         let spawn = proc::spawn_detached(SpawnOptions {
@@ -4140,7 +4144,7 @@ impl tunnel::Provider for GatedProvider {
         name: &str,
         _: &str,
         _: u16,
-        spawned: &dyn Fn(i32),
+        spawned: &dyn Fn(Group),
     ) -> Result<tunnel::TunnelSpawn> {
         let n = self
             .started
@@ -4246,7 +4250,7 @@ fn state_with_a_pending_share(owner: u32, pgids: Vec<i32>) -> state::State {
     record.pending_shares.push(PendingShare {
         owner_pid: owner,
         since: Utc::now(),
-        pgids,
+        pgids: pgids.into_iter().map(Group::from_raw).collect(),
     });
     store.worktrees.insert("feat+one".to_string(), record);
     store
@@ -4261,7 +4265,7 @@ fn a_share_whose_pando_died_before_its_tunnel_was_up_is_stopped_by_the_sweep() {
         |pid| pid != 4_000_001,
         |_| true,
         |pgid| {
-            signalled.lock().unwrap().push(pgid);
+            signalled.lock().unwrap().push(pgid.as_raw());
             Ok(())
         },
     );
@@ -4294,7 +4298,7 @@ fn a_share_pending_for_longer_than_any_share_waits_is_stopped_whoever_has_its_pi
         |_| true,
         |_| true,
         |pgid| {
-            signalled.lock().unwrap().push(pgid);
+            signalled.lock().unwrap().push(pgid.as_raw());
             Ok(())
         },
     );
@@ -4323,9 +4327,9 @@ fn a_pending_share_whose_groups_have_all_exited_is_dropped_without_a_signal() {
     sweep_dead_shares_with(
         &mut store,
         |pid| pid != 4_000_001,
-        |pgid| pgid == 8484,
+        |pgid| pgid.as_raw() == 8484,
         |pgid| {
-            signalled.lock().unwrap().push(pgid);
+            signalled.lock().unwrap().push(pgid.as_raw());
             Ok(())
         },
     );
@@ -4539,13 +4543,13 @@ fn sharing_and_restarting_leave_every_port_where_it_was() {
 fn share_record_of(tunnel_pid: u32, proxy_pid: Option<u32>) -> ShareRecord {
     ShareRecord {
         tunnel_pid,
-        tunnel_pgid: tunnel_pid as i32,
+        tunnel_pgid: Group::from_raw(tunnel_pid as i32),
         public_url: "https://x.trycloudflare.com".into(),
         local_port: 17000,
         started_at: Utc::now(),
         log_path: PathBuf::from("tunnel.log"),
         proxy_pid,
-        proxy_pgid: proxy_pid.map(|p| p as i32),
+        proxy_pgid: proxy_pid.map(|p| Group::from_raw(p as i32)),
         proxy_port: proxy_pid.map(|_| 17005),
     }
 }
@@ -4569,7 +4573,7 @@ fn a_dead_tunnel_closes_the_share_and_signals_the_proxy_that_is_left() {
         |pid| pid == 8484,
         |_| true,
         |pgid| {
-            signalled.lock().unwrap().push(pgid);
+            signalled.lock().unwrap().push(pgid.as_raw());
             Ok(())
         },
     );
@@ -4597,7 +4601,7 @@ fn a_dead_proxy_takes_the_tunnel_in_front_of_it_down() {
         |pid| pid == 4242,
         |_| true,
         |pgid| {
-            signalled.lock().unwrap().push(pgid);
+            signalled.lock().unwrap().push(pgid.as_raw());
             Ok(())
         },
     );
@@ -4619,7 +4623,7 @@ fn a_live_share_is_left_alone() {
         |_| true,
         |_| true,
         |pgid| {
-            signalled.lock().unwrap().push(pgid);
+            signalled.lock().unwrap().push(pgid.as_raw());
             Ok(())
         },
     );
@@ -4677,7 +4681,7 @@ fn a_share_whose_application_crashed_is_closed_and_both_halves_signalled() {
         |pid| pid != 777,
         |_| true,
         |pgid| {
-            signalled.lock().unwrap().push(pgid);
+            signalled.lock().unwrap().push(pgid.as_raw());
             Ok(())
         },
     );
@@ -4796,7 +4800,7 @@ fn a_share_without_a_proxy_is_swept_on_its_tunnel_alone() {
         |_| false,
         |_| true,
         |pgid| {
-            signalled.lock().unwrap().push(pgid);
+            signalled.lock().unwrap().push(pgid.as_raw());
             Ok(())
         },
     );
@@ -4861,7 +4865,7 @@ fn share_with_a_dead_half(fx: &Fx, name: &str, dead: DeadHalf) -> ShareRecord {
     record
 }
 
-fn surviving_pgid(record: &ShareRecord, dead: DeadHalf) -> i32 {
+fn surviving_pgid(record: &ShareRecord, dead: DeadHalf) -> Group {
     match dead {
         DeadHalf::Tunnel => record.proxy_pgid.unwrap(),
         DeadHalf::Proxy => record.tunnel_pgid,
@@ -5057,7 +5061,7 @@ fn stopping_the_last_process_takes_the_share_down_even_with_only() {
         "feat+one",
         Some("web"),
         |pgid| {
-            signalled.lock().unwrap().push(pgid);
+            signalled.lock().unwrap().push(pgid.as_raw());
             Ok(())
         },
         &mut projects,
@@ -5183,7 +5187,7 @@ fn stopping_a_worktree_with_nothing_running_still_closes_its_share() {
         "feat+one",
         None,
         |pgid| {
-            signalled.lock().unwrap().push(pgid);
+            signalled.lock().unwrap().push(pgid.as_raw());
             Ok(())
         },
         &mut projects,
@@ -13016,7 +13020,7 @@ fn a_compose_record_docker_could_not_be_asked_about_is_kept_beside_the_native_on
     // native server it may have running beside the leftover — which is
     // not a service moving to other data: the native one is up on its own.
     record.services[0].pid = Some(4242);
-    record.services[0].pgid = Some(4242);
+    record.services[0].pgid = Some(Group::from_raw(4242));
     assert_eq!(
         super::services::changed_kinds(&fx.config, &record),
         Vec::new(),
@@ -13066,7 +13070,7 @@ fn a_compose_leftover_does_not_hide_a_service_moving_back_to_compose() {
             kind: state::ServiceKind::Native,
             port: Some(15432),
             pid: Some(4242),
-            pgid: Some(4242),
+            pgid: Some(Group::from_raw(4242)),
             compose_project: None,
         },
         state::ServiceRecord {
@@ -13817,7 +13821,7 @@ fn a_failed_switchs_undo_leaves_a_switch_another_start_completed() {
         "dev".to_string(),
         ProcessRecord {
             pid: live.pid,
-            ..fake_record(live.pgid)
+            ..fake_record(live.pgid.as_raw())
         },
     );
     record.services.push(state::ServiceRecord {
@@ -14881,7 +14885,7 @@ fn slot_holder(n: u32, running: bool, hours: i64) -> WorktreeRecord {
             "dev".into(),
             ProcessRecord {
                 pid: std::process::id(),
-                pgid: 999_997,
+                pgid: Group::from_raw(999_997),
                 started_at: Utc::now(),
                 log_path: PathBuf::from("/nowhere"),
                 ready_port: None,
@@ -17069,7 +17073,7 @@ fn a_huge_ready_timeout_makes_a_long_wait_and_not_an_overflow() {
 fn portless_record(started_at: chrono::DateTime<Utc>) -> ProcessRecord {
     ProcessRecord {
         pid: 1,
-        pgid: 1,
+        pgid: Group::from_raw(1),
         started_at,
         log_path: PathBuf::from("/does/not/exist/dev.log"),
         ready_port: None,

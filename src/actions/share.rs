@@ -33,7 +33,7 @@ use super::worktree::find_worktree;
 /// cloudflared nothing can find again.
 pub(super) fn take_share_down(
     record: &mut WorktreeRecord,
-    stop: &impl Fn(i32) -> Result<()>,
+    stop: &impl Fn(proc::Group) -> Result<()>,
     failures: &mut Vec<String>,
 ) -> bool {
     let Some(share) = record.share.clone() else {
@@ -399,7 +399,7 @@ pub(super) fn host_refusal(target_port: u16, public_url: &str) -> Option<String>
 /// Writes down a process group this share has spawned, before anything
 /// waits on it: what a sweep stops if this pando dies before the share is
 /// recorded. Best effort, since the share itself does not depend on it.
-fn note_pending(paths: &PandoPaths, name: &str, pgid: i32) {
+fn note_pending(paths: &PandoPaths, name: &str, pgid: proc::Group) {
     let Ok(_lock) = state::lock(&paths.lock_file()) else {
         return;
     };
@@ -492,8 +492,8 @@ pub(super) fn sweep_dead_shares(store: &mut state::State) -> Vec<String> {
 pub(super) fn sweep_dead_shares_with(
     store: &mut state::State,
     is_alive: impl Fn(u32) -> bool,
-    group_alive: impl Fn(i32) -> bool,
-    stop: impl Fn(i32) -> Result<()>,
+    group_alive: impl Fn(proc::Group) -> bool,
+    stop: impl Fn(proc::Group) -> Result<()>,
 ) -> Vec<String> {
     let mut notices = Vec::new();
     for (name, record) in store.worktrees.iter_mut() {
@@ -560,14 +560,14 @@ fn sweep_interrupted_shares(
     name: &str,
     record: &mut WorktreeRecord,
     is_alive: &impl Fn(u32) -> bool,
-    group_alive: &impl Fn(i32) -> bool,
-    stop: &impl Fn(i32) -> Result<()>,
+    group_alive: &impl Fn(proc::Group) -> bool,
+    stop: &impl Fn(proc::Group) -> Result<()>,
     notices: &mut Vec<String>,
 ) {
     let now = Utc::now();
     let mut kept = Vec::new();
     for pending in std::mem::take(&mut record.pending_shares) {
-        let alive: Vec<i32> = pending
+        let alive: Vec<proc::Group> = pending
             .pgids
             .iter()
             .copied()
