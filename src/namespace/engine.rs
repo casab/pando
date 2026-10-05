@@ -240,7 +240,9 @@ impl Server<'_> {
         })
     }
 
-    /// How many keys a slot holds.
+    /// How many keys a slot holds: the recipe's `size` prints it as a bare
+    /// number on its last line. What an engine's client wraps a number in
+    /// is the recipe's to strip, never this code's.
     pub fn size(&self, slot: u32) -> Result<u64> {
         let command = self.command(self.recipe.size.as_deref(), "size")?;
         let out = self.run(command, Some(&slot.to_string()))?;
@@ -249,7 +251,7 @@ impl Server<'_> {
             .lines()
             .map(str::trim)
             .rfind(|line| !line.is_empty())
-            .and_then(|line| line.trim_start_matches("(integer)").trim().parse().ok());
+            .and_then(|line| line.parse().ok());
         match (out.success(), count) {
             (true, Some(count)) => Ok(count),
             _ => bail!(

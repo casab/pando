@@ -1009,10 +1009,14 @@ fn a_slot_is_sized_and_emptied_by_its_own_number_and_never_by_a_fallback() {
     cache.login = Login::new(None, Some(PASSWORD.into()), "the test's env");
     cache.ping().unwrap();
     fake.write("size-3", "2\n");
-    fake.write("size-4", "(integer) 7\n");
+    fake.write("size-4", "7\n");
     assert_eq!(cache.size(3).unwrap(), 2);
     assert_eq!(cache.size(4).unwrap(), 7);
     assert_eq!(cache.size(5).unwrap(), 0);
+    // A number wrapped in a client's own decoration is not the contract:
+    // the recipe prints a bare one, and anything else is no answer.
+    fake.write("size-6", "(integer) 7\n");
+    assert!(cache.size(6).is_err());
     let e = format!("{:#}", cache.size(16).unwrap_err());
     assert!(e.contains("out of range"), "{e}");
 

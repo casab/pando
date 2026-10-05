@@ -33,7 +33,8 @@ ready = "redis-cli -h 127.0.0.1 -p {port} ping"
 # then empties slot 0 — the main checkout's — exiting 0. Inside a script
 # a SELECT that fails is an error and nothing after it runs, and `-e`
 # makes that error an exit status. The password is read from
-# REDISCLI_AUTH, never passed as `-a`.
+# REDISCLI_AUTH, never passed as `-a`. `size` passes `--raw`, so a count
+# is the bare number a [namespace] `size` prints, whoever runs it.
 [namespace]
 kind = "slot"
 binaries = ["redis-cli"]
@@ -41,6 +42,6 @@ install = "brew install redis, or your distribution's redis-tools"
 password_env = "REDISCLI_AUTH"
 slots = 16
 ping = "redis-cli -e -h {host} -p {port} ping"
-size = "redis-cli -e -h {host} -p {port} EVAL \"redis.call('SELECT', ARGV[1]); return redis.call('DBSIZE')\" 0 {namespace}"
+size = "redis-cli --raw -e -h {host} -p {port} EVAL \"redis.call('SELECT', ARGV[1]); return redis.call('DBSIZE')\" 0 {namespace}"
 drop = "redis-cli -e -h {host} -p {port} EVAL \"redis.call('SELECT', ARGV[1]); return redis.call('FLUSHDB')\" 0 {namespace}"
 denied = ["NOPERM"]

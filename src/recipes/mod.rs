@@ -135,7 +135,9 @@ pub struct NamespaceRecipe {
     /// fall back to another slot when this one cannot be selected —
     /// `redis-cli -n` does fall back, onto slot 0.
     pub drop: String,
-    /// A `slot`'s: prints how many keys it holds, failing the same way.
+    /// A `slot`'s: prints how many keys it holds as a bare number on its
+    /// last line, failing the same way. A client that decorates its
+    /// numbers is told not to here, as `redis-cli --raw` is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<String>,
     /// A `slot`'s: how many the server has. 0 is the main checkout's.
