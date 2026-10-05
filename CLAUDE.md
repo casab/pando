@@ -174,15 +174,47 @@ files into a worktree pando just made is outside Invariant 1 as written;
 `docs/02-principles.md` says what holds it. Measured on the origin
 project's shape: about 285 MB of checkout became about 5 MB a worktree.
 CI runs the copy-on-write tests a second time on a loop-mounted reflink
-XFS, since ext4 cannot clone. Detection proposes `clone` since the
-`propose-clone` branch: the gitignored `node_modules` the main checkout
-has (`signals.dependency_dirs`, from the catalog's `dependency_dir`),
-decided, and not where the install deletes the tree first.
+XFS, since ext4 cannot clone.
+
+The same day 0.8.1 gave namespaced mode Postgres (#9): a worktree's
+own database in the main checkout's Postgres, made in main's encoding
+and locale, a login that may not make databases stopped with the `ALTER
+ROLE … CREATEDB` to run once, and compose images that are Postgres or
+Redis under another name (pgvector, PostGIS, Redis Stack) namespaced as
+the engine they are. Namespaced mode reads the env files where the
+processes run, `[namespaced.<service>] db_env` names the keys of the
+app's database or slot, and a missing client is named with how to
+install it alone. Then 0.8.2 added `pando update` (`actions/update.rs`):
+`brew upgrade` for Homebrew's pando, `cargo install` at the release tag
+for cargo's, the install script into the binary's own directory for
+any other, and a build made in a checkout refused with how to update it
+there; the latest release is read from GitHub's releases/latest redirect
+through `curl`, and `--check` only says. The maintainer runs the
+Homebrew release, so `pando update` (or `brew upgrade pando`) is how a
+release reaches them.
+
+After 0.8.2, the branch `feat/propose-clone` made `clone` the eleventh
+question and the agent's setup ask nothing. Detection proposes `clone`
+for the gitignored `node_modules` the main checkout has, root and up to
+two levels down (`signals.dependency_dirs`, from the catalog's
+`dependency_dir`), decided, and not where the install deletes the tree
+first (`npm ci`); `[project] clone` became an `Option` so `clone = []`
+records "none". The brief's first run has the agent decide every open
+question — all apps, doctor's runtime line or `null` when pando refuses
+it, the seeded `.env` when it is the only option, the main checkout's
+branch as the base on a base failure — and end with a report of what it
+set and how to change it, never a question; the memory block is offered
+there and saved only on the developer's word. Proved by an agent
+playing the developer's coding agent on fixtures: no question on any,
+and the workspace one passed its check. The first-run section is held
+under the job's 10 KB limit by `init_agent_stays_under_ten_kilobytes_on_every_fixture`,
+which the next-messy fixture sits close to.
 
 What is left is not a phase. `plans/open-follow-ups.md` carries the known
 edges, each with who found it and where it belongs, and the rest of the
-launch checklist in `docs/08-roadmap.md` is open: no published crate, no
-release binaries, no Homebrew tap.
+launch checklist in `docs/08-roadmap.md` is open: no published crate on
+crates.io. Binaries, the install script and the Homebrew tap have
+shipped with every release since 0.5.1.
 
 The working rules do not change. One conventional commit per work item, with
 `cargo test`, `cargo clippy --all-targets -- -D warnings` and
@@ -306,8 +338,8 @@ database, a prod schema dump, and cookie auth."
 - Nothing under test reaches a developer's own database server.
   Namespaced mode's tests drive a fake client in the test's own pando
   `bin`, and `tests/namespaced.rs` (gated by `PANDO_TEST_NATIVE=1`)
-  starts its own throwaway MariaDB and Redis on free ports in temporary
-  directories.
+  starts its own throwaway Postgres, MariaDB and Redis on free ports in
+  temporary directories.
 - Nothing under test reaches GitHub. The TUI's `gh` workers
   (`spawn_pr_fetch`, `spawn_gh_account_check`) return early under
   `cfg!(test)`; tests set `pr_list` by hand, and `gh` parsing is tested

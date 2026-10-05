@@ -235,9 +235,9 @@
     <div class="split stack">
       <ol class="num rv">
         <li><strong>Finds the branch.</strong> A local branch is checked out as it is. Otherwise <code>origin/feat/login</code>, fetched if it is missing, never prompting for a password. Otherwise a new branch, forked from the base: <code>--base</code>, then a matching <code>[branches].rules</code> glob, then <code>[project].base</code>, then <code>origin/HEAD</code>, <code>main</code>, <code>master</code>.</li>
-        <li><strong>Checks it out.</strong> <code>git worktree add</code> into <code>~/.pando/projects/&lt;id&gt;/worktrees/feat+login</code>. The project id is the checkout's directory name and eight hex characters of a hash of its path. Where the filesystem can clone (APFS; btrfs, XFS), the main checkout's files are copy-on-write clones that share its disk blocks, and git writes only the files the branch changed, plus any whose checkout converts them (line endings, filters, <code>ident</code>); the files, modes and git state are what git's own checkout makes, and a <code>post-checkout</code> hook runs as it always did. <code>du</code> still counts each worktree whole; free space shows the saving. <code>copy_on_write = false</code> turns it off.</li>
+        <li><strong>Checks it out.</strong> <code>git worktree add</code> into <code>~/.pando/projects/&lt;id&gt;/worktrees/feat+login</code>. The project id is the checkout's directory name and eight hex characters of a hash of its path. Where the filesystem can clone (APFS; btrfs, XFS), the main checkout's files are copy-on-write clones that share its disk blocks, and git writes only the files the branch changed, plus any whose checkout converts them (line endings, filters, <code>ident</code>); the files, modes and git state are what git's own checkout makes, and a <code>post-checkout</code> hook runs as it always did. <code>du</code> still counts each worktree whole; free space shows the saving. <code>copy_on_write = false</code> turns it off. <span class="tag-new">new in 0.8.0</span></li>
         <li><strong>Provisions.</strong> The gitignored files you listed in <code>provision</code>, such as <code>.env</code>, are linked in from the main checkout. They are symlinks by default; <code>provision_mode = "copy"</code> gives each worktree its own copy. A path the project does not gitignore is refused. A worktree made before <code>provision</code> was answered, or one that lost a file since, gets it at its next <code>start</code>, never over a file that is there.</li>
-        <li><strong>Installs.</strong> The project's install step, such as <code>pnpm install --frozen-lockfile</code>, runs in the new worktree, so its dependencies are its own. The gitignored paths in <code>clone</code>, such as <code>node_modules</code>, are cloned from the main checkout first, copy-on-write, so the install only fixes what differs; never as a full copy.</li>
+        <li><strong>Installs.</strong> The project's install step, such as <code>pnpm install --frozen-lockfile</code>, runs in the new worktree, so its dependencies are its own. The gitignored paths in <code>clone</code>, such as <code>node_modules</code>, are cloned from the main checkout first, copy-on-write, so the install only fixes what differs; never as a full copy. pando proposes <code>clone</code> itself for the <code>node_modules</code> your main checkout has, its apps' included, unless the install deletes them first, as <code>npm ci</code> does.</li>
       </ol>
       <div class="rv">
         <div class="term">
@@ -530,7 +530,7 @@ nothing else. Nothing was made.</span></pre>
         </ul>
       </div>
     </div>
-    <p class="rv d">Today, namespaced mode makes Postgres, MariaDB and MySQL databases and Redis slots, in a native server or a container, pgvector, PostGIS and TimescaleDB images included. Every other service stays shared, and the start says so for each one. What a namespace is on an engine is the <code>[namespace]</code> table of its recipe, so another engine is a recipe rather than a release.</p>
+    <p class="rv d">Today, namespaced mode makes Postgres <span class="tag-new">new in 0.8.1</span>, MariaDB and MySQL databases and Redis slots, in a native server or a container, pgvector, PostGIS and TimescaleDB images included. Every other service stays shared, and the start says so for each one. What a namespace is on an engine is the <code>[namespace]</code> table of its recipe, so another engine is a recipe rather than a release.</p>
 
     <h3 class="rv" data-beat="stop and rm">What happens to the data</h3>
     <div class="tbl-scroll rv">
@@ -693,7 +693,7 @@ Pando: one aspen, 47,000 stems, one root. Your repo, every branch alive.
         <p>The first time you run <code>pando</code> in a project with nothing to run, it opens a setup screen instead of the list, drawn over a grove of its own.</p>
         <ol class="rail">
           <li><span class="step">Copy one line</span> with <kbd>a</kbd> and paste it into your own coding agent, opened in the project.</li>
-          <li><span class="step"><code>pando init --agent</code></span> prints the job for this project and this version: what pando already sees, the questions only the project can answer, and the steps.</li>
+          <li><span class="step"><code>pando init --agent</code></span> prints the job for this project and this version: what pando already sees, the questions still open, and the steps. The agent decides those itself and asks you nothing; at the end it lists what it set and how to change it.</li>
           <li><span class="step">The agent answers</span> through <code>pando init --answers -</code> on stdin, never through a file in your repository. <code>--dry-run</code> previews and <code>--replace</code> corrects an answer.</li>
           <li><span class="step"><code>pando check</code> proves it.</span> See below.</li>
           <li class="ok"><span class="step gr">The screen turns green by itself.</span> From then on, <code>pando</code> opens the list.</li>
@@ -794,7 +794,7 @@ pando: removed the test worktree; nothing left behind</span>
       <div class="verb"><div class="sig"><span class="name">doctor</span></div><div class="what"><p>What pando found and where, and what is missing: project, config, runtime, tools, worktrees, services, hooks. Read-only.</p><div class="flags"><code>--json</code> · <code>--adopt &lt;old-id&gt;</code> after you moved the repository</div></div></div>
       <div class="verb"><div class="sig"><span class="name">signals</span></div><div class="what">The detection evidence as JSON: what the repository says about how to run itself. Two runs print the same thing.</div></div>
       <div class="verb"><div class="sig"><span class="name">completions</span> &lt;shell&gt;</div><div class="what">A completion script for bash, zsh, fish, elvish or PowerShell; in bash, zsh and fish it completes worktree names too.</div></div>
-      <div class="verb"><div class="sig"><span class="name">update</span></div><div class="what"><p>Update pando to the latest release, the way it was installed: <code>brew upgrade</code> for Homebrew's, <code>cargo install</code> at the release's tag for cargo's, the install script into its own directory for any other.</p><div class="flags"><code>--check</code> whether a newer release is out, and the command that would install it</div></div></div>
+      <div class="verb"><div class="sig"><span class="name">update</span></div><div class="what"><p><span class="tag-new">new in 0.8.2</span> Update pando to the latest release, the way it was installed: <code>brew upgrade</code> for Homebrew's, <code>cargo install</code> at the release's tag for cargo's, the install script into its own directory for any other.</p><div class="flags"><code>--check</code> whether a newer release is out, and the command that would install it</div></div></div>
     </div>
 
     <h3 id="ref-keys" class="rv" data-beat="keys">TUI keys</h3>
@@ -845,7 +845,7 @@ provision = [<span class="s">".env"</span>, <span class="s">".env.local"</span>]
 provision_mode = <span class="s">"copy"</span>                   <span class="c"># default: a symlink to the main checkout's</span>
 install = <span class="s">"pnpm install --frozen-lockfile"</span>
 copy_on_write = <span class="k">false</span>                     <span class="c"># default: clone the main checkout's files where the disk can</span>
-clone = [<span class="s">"node_modules"</span>]                 <span class="c"># gitignored paths cloned in before the install</span>
+clone = [<span class="s">"node_modules"</span>]                 <span class="c"># gitignored paths cloned in before the install; proposed for you</span>
 
 <span class="k">[runtime]</span>
 prelude = <span class="s">""</span>                              <span class="c"># e.g. a version manager's init, before every command</span>
@@ -933,7 +933,7 @@ theme = <span class="s">"catppuccin"</span>
       <details><summary>How is this different from plain <code>git worktree</code>?</summary>
         <p><code>git worktree add ../x feat/x</code> gives you a second checkout and nothing else. <code>pando new feat/x</code> runs that same git command, but puts the checkout under <code>~/.pando</code> instead of beside your repository. It links in the gitignored files the project needs, such as <code>.env</code>, runs the project's own install inside the checkout, and records it. <code>pando start</code> then adds what makes it run: ports that do not collide, detached processes, logs and readiness. Optionally it adds private or namespaced services and a public URL, all on one screen. Worktrees you made by hand are managed too.</p></details>
       <details><summary>Does every worktree get its own <code>node_modules</code>? Its own <code>.env</code>?</summary>
-        <p>It gets its own dependencies. pando runs the project's frozen install inside each worktree and never links dependency directories. With <code>clone = ["node_modules"]</code> the main checkout's are cloned in first, copy-on-write: each worktree's own copy, sharing disk blocks until it changes, so the install only fixes what differs. A later start runs the install again only when a lockfile, a version file or the prelude changed. Local config works differently: gitignored files like <code>.env</code> are symlinked to the main checkout's copy by default, so editing one edits main's. <code>provision_mode = "copy"</code> gives each worktree its own copy.</p></details>
+        <p>It gets its own dependencies. pando runs the project's frozen install inside each worktree and never links dependency directories. With <code>clone = ["node_modules"]</code>, which pando proposes when your main checkout has them, the main checkout's are cloned in first, copy-on-write: each worktree's own copy, sharing disk blocks until it changes, so the install only fixes what differs. A later start runs the install again only when a lockfile, a version file or the prelude changed. Local config works differently: gitignored files like <code>.env</code> are symlinked to the main checkout's copy by default, so editing one edits main's. <code>provision_mode = "copy"</code> gives each worktree its own copy.</p></details>
       <details><summary>What survives closing the terminal? A reboot?</summary>
         <p>Closing the terminal, killing the tmux pane or quitting the TUI leaves everything running: each process has its own session and no terminal. A reboot stops them, as it stops anything. pando notices the new boot and forgets the old process ids, but keeps each worktree's ports and mode, so the next start comes back on the same URLs. Nothing restarts by itself: there is no daemon and no supervisor.</p></details>
       <details><summary>My Node from nvm (or fnm, rvm…) is not found.</summary>
@@ -976,7 +976,7 @@ theme = <span class="s">"catppuccin"</span>
             <div class="term-bar"><span class="dots"><i></i><i></i><i></i></span><span class="grow">the install script</span><button class="copy hs-copy" type="button" data-copy="curl --proto &#39;=https&#39; --tlsv1.2 -LsSf https://github.com/mertkaradayi/pando/releases/latest/download/pando-cli-installer.sh | sh" aria-label="Copy the install script command">copy</button></div>
 <pre class="wrap-cmd"><span class="p">$</span> curl --proto &#39;=https&#39; --tlsv1.2 -LsSf https://github.com/mertkaradayi/pando/releases/latest/download/pando-cli-installer.sh | sh</pre>
           </div>
-          <p class="demo-hint">The script puts <code>pando</code> in <code>~/.local/bin</code> and adds it to your PATH; run it with <code>PANDO_CLI_NO_MODIFY_PATH=1</code> to leave your shell files alone. Every download has a checksum and a GitHub attestation. <code>pando --version</code> says which version you have.</p>
+          <p class="demo-hint">The script puts <code>pando</code> in <code>~/.local/bin</code> and adds it to your PATH; run it with <code>PANDO_CLI_NO_MODIFY_PATH=1</code> to leave your shell files alone. Every download has a checksum and a GitHub attestation. <code>pando --version</code> says which version you have, and <code>pando update</code> brings the latest, whichever way you installed it. <span class="tag-new">new in 0.8.2</span></p>
         </li>
         <li>
           <div class="is-h"><span class="hs-n">2</span>Run it in your project</div>
@@ -1003,7 +1003,7 @@ theme = <span class="s">"catppuccin"</span>
       <div class="panel rv">
         <h4>What there is</h4>
         <ul class="yes">
-          <li>Every command on this page is implemented on <code>main</code> and covered by tests. 0.7.0 is the last release; what is marked new came in 0.5.0</li>
+          <li>Every command on this page is implemented on <code>main</code> and covered by tests. 0.8.2 is the last release; what is marked new says the version it came in</li>
           <li>Tests that read no developer's shell profile and need none of their tools; databases in the tests are throwaway servers the tests start themselves</li>
           <li>Developed on macOS. For every change, CI checks formatting and runs clippy and the whole test suite on macOS and on Linux, and all of it must pass</li>
         </ul>
@@ -1013,7 +1013,7 @@ theme = <span class="s">"catppuccin"</span>
         <ul class="no">
           <li>No crate on crates.io yet (the binaries, the install script and the Homebrew tap are here)</li>
           <li>Nobody has used pando on Linux for real work yet: the suite that passes there runs on fixtures. Windows is not a target</li>
-          <li>Almost every worktree pando has made was in a generated fixture. The one real project it met found three bugs in an afternoon, all fixed since</li>
+          <li>pando has met only a handful of real projects: the monorepo it was built for, where it is now used daily, and the apps of the people who opened its first issues. Each found something no fixture had, all fixed since</li>
           <li>Namespaced mode is experimental</li>
         </ul>
       </div>

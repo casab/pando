@@ -194,6 +194,8 @@ Your repository works the same way.
 - Turns an open pull request into a running worktree: pick it from the
   list, press enter — a fork's too
 - Shows all of it on one terminal screen, with a real log viewer
+- Keeps itself current: `pando update` upgrades it the way it was
+  installed — Homebrew, cargo, or the install script
 
 Built for people, and for agents, who work on several branches at once.
 
@@ -265,8 +267,8 @@ Set up pando here: run `pando init --agent` and follow what it says.
 ```
 
 `pando init --agent` prints the job for this project and this version of
-pando: what pando already sees, the questions only the project can
-answer, and the steps. The agent answers through `pando init --answers -`
+pando: what pando already sees, the questions still open, and the
+steps. The agent answers through `pando init --answers -`
 on stdin, never a file in your repository, and proves the answers with
 `pando check`: a throwaway worktree of the commit a new branch would fork
 from, installed, started, its page asked for, and removed again, with no
@@ -532,8 +534,9 @@ parsing English, and answers come back through one validated write path.
   versioned, with the exit codes. `3` means pando has a question and the
   question is on stderr.
 - [`agent/brief.md`](agent/brief.md) — the procedure for turning that
-  evidence into answers: read before asking, write only through
-  `pando init --answers`, never a byte in the repository.
+  evidence into answers: decide what the rules leave open without asking
+  the developer, write only through `pando init --answers`, never a byte
+  in the repository, and end by reporting what was set.
 - [`agent/`](agent/README.md) — a Claude Code plugin and Codex skills, both
   thin over that one brief.
 
@@ -596,6 +599,7 @@ missing; pando never installs anything on your machine by itself.
 | Tool | Needed for | macOS | Linux |
 |---|---|---|---|
 | `git` | everything | `xcode-select --install` | your distribution's `git` |
+| `curl` | `pando update`, to find the latest release | comes with macOS | your distribution's `curl` |
 | `cloudflared` | `pando share`, a public URL for a worktree | `brew install cloudflared` | [Cloudflare's package](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) |
 | `gh` | the TUI's pull request picker (`p`) | `brew install gh` | [the GitHub CLI's package](https://github.com/cli/cli#installation) |
 | Docker with Compose | `start --isolated`, when the project's services are in a compose file | Docker Desktop or OrbStack | Docker Engine and its compose plugin |
@@ -657,8 +661,8 @@ services from the project's own compose file; public tunnel URLs; `init`,
 Docker; the JSON contract an agent reads; a worktree from any open
 pull request in the TUI; and, experimentally, namespaced worktrees — a
 database and a Redis slot of their own in the main checkout's servers,
-tested against throwaway MariaDB and Redis servers the tests start
-themselves. 0.4.0 adds no command: it is all of that after a review of
+tested against throwaway Postgres, MariaDB and Redis servers the tests
+start themselves. 0.4.0 adds no command: it is all of that after a review of
 the whole project and the fixes it found, with a test suite that reads
 no developer's shell profile and needs none of their tools. 0.5.0 adds
 the guided first run: the first `pando` in a project with nothing to run
@@ -689,13 +693,14 @@ macOS is what it is developed on. CI runs the whole test suite on macOS
 and on Linux for every change, and both pass — but the suite runs on
 fixtures, and nobody has yet used pando on Linux for real work.
 
-What that does not mean: there is no crate on crates.io yet, and almost
-every worktree pando has created has been inside a generated fixture
-repository. It has been pointed at exactly one
-real project, which found three bugs in an afternoon — a Makefile target
-read down to its first line, a failure that left an empty log and no
-explanation, and a backgrounded server reported as dead. All three are
-fixed, and the count is the point: a tool this heavily tested against
+What that does not mean: there is no crate on crates.io yet, and pando
+has met only a handful of real projects — the monorepo it was built
+for, where it is now used daily, and the apps of the people who opened
+its first issues. The first of them found three bugs in an afternoon —
+a Makefile target read down to its first line, a failure that left an
+empty log and no explanation, and a backgrounded server reported as
+dead — and each one since has found something no fixture had. All of it
+is fixed, and that is the point: a tool this heavily tested against
 situations it invented still breaks on first contact with one it did
 not. If pando breaks on yours, that is the most useful issue you can open.
 

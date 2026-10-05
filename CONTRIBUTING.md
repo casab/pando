@@ -55,7 +55,7 @@ never touch a server of yours:
 | Set | To run | Needs |
 |---|---|---|
 | `PANDO_TEST_DOCKER=1` | the tests against the real Docker | a running Docker daemon |
-| `PANDO_TEST_NATIVE=1` | the real database engines, and namespaced mode against throwaway MariaDB and Redis | the engines installed; skips each one that is missing |
+| `PANDO_TEST_NATIVE=1` | the real database engines, and namespaced mode against throwaway Postgres, MariaDB and Redis | the engines installed; skips each one that is missing |
 | `PANDO_TEST_CLOUDFLARED=1` | one real Cloudflare quick tunnel | `cloudflared`, and the network |
 
 Two things to know about running tests:
