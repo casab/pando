@@ -216,7 +216,7 @@ pub(super) fn scan_groups(store: &state::State) -> BTreeMap<proc::Group, Option<
         .filter(|p| matches!(p.phase, Phase::Starting { .. } | Phase::Running { .. }))
         .map(|p| p.pgid)
         .collect();
-    crate::observe::observed_ports_by_group(&pgids)
+    crate::platform::process::ports_by_group(&pgids)
 }
 
 /// Whether the process group has opened `port` yet.

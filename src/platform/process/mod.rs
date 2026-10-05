@@ -1,12 +1,15 @@
 //! Processes pando starts in groups of their own, and finds again.
 //!
-//! One file per concern: what a group is, and how the OS starts, asks
-//! after and stops one (`unix.rs`). The functions here carry the contract
+//! One file per concern: what a group is, how the OS starts, asks after
+//! and stops one (`unix.rs`), and which ports a group's processes listen
+//! on (`scan.rs`). The functions here carry the contract
 //! every backend keeps; a group is started by one call and handed back
 //! with it, because on some systems that is the only moment it can be
 //! made.
 
 mod group;
+#[cfg(unix)]
+mod scan;
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
@@ -14,6 +17,7 @@ use unix as imp;
 
 pub use group::Group;
 
+use std::collections::BTreeMap;
 use std::io;
 use std::process::{Child, Command, Output};
 use std::time::Duration;
@@ -67,6 +71,16 @@ pub fn stop(group: Group, grace: Duration) -> anyhow::Result<()> {
 /// after that its id can belong to someone else.
 pub fn output_within(command: Command, timeout: Duration) -> io::Result<Output> {
     imp::output_within(command, timeout)
+}
+
+/// The TCP ports each group listens on, from one scan however many groups
+/// there are.
+///
+/// `None` for a group is a scan that could not run, which is not a group
+/// listening on nothing: readiness falls back to asking the port itself
+/// for the first, and believes the second.
+pub fn ports_by_group(groups: &[Group]) -> BTreeMap<Group, Option<Vec<u16>>> {
+    scan::observed_ports_by_group(groups)
 }
 
 /// Makes a fork safe in this process before any thread could make one
