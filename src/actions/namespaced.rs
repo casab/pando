@@ -188,6 +188,8 @@ pub(super) enum Tell {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prefixed {
     pub service: String,
+    /// The recipe whose `[prefix]` named a key, or that the project named.
+    pub recipe: Option<String>,
     pub keys: Vec<(String, String)>,
 }
 
@@ -424,6 +426,7 @@ pub(super) fn plan(paths: &PandoPaths, config: &Config) -> Plan {
             Ok(keys) if !keys.is_empty() => {
                 out.prefixed.push(Prefixed {
                     service: declared.service,
+                    recipe: declared.recipe.as_ref().map(|recipe| recipe.name.clone()),
                     keys,
                 });
                 continue;
@@ -540,6 +543,53 @@ fn services_with_recipes(
                         helper,
                     });
                 }
+            }
+        }
+    }
+    // A compose service the project runs no private copy of is still one
+    // a namespaced start can give data of its own, once the project says
+    // how in `[namespaced.<service>]`: isolation and namespaces are two
+    // choices, and the first should not gate the second.
+    for (service, image) in compose_services(paths) {
+        if out.iter().any(|known| known.service == service)
+            || !config.namespaced.contains_key(&service)
+        {
+            continue;
+        }
+        let recipe = image
+            .as_deref()
+            .map(crate::catalog::images::image_name)
+            .into_iter()
+            .chain(
+                image
+                    .as_deref()
+                    .and_then(crate::catalog::images::known)
+                    .and_then(|known| known.engine),
+            )
+            .chain(std::iter::once(service.as_str()))
+            .find_map(|candidate| recipes.get(candidate).ok())
+            .map(|loaded| loaded.recipe.clone());
+        out.push(Declared {
+            service,
+            recipe,
+            keys: Vec::new(),
+            helper: false,
+        });
+    }
+    out
+}
+
+/// Every service the main checkout's compose files at its root run, with
+/// its image: the root's own, as `signals` lists them.
+fn compose_services(paths: &PandoPaths) -> Vec<(String, Option<String>)> {
+    let mut out: Vec<(String, Option<String>)> = Vec::new();
+    for file in crate::detect::signals(paths.root()).compose_files {
+        let Ok(parsed) = crate::compose::read(&paths.root().join(&file)) else {
+            continue;
+        };
+        for (service, entry) in parsed.services {
+            if !out.iter().any(|(known, _)| *known == service) {
+                out.push((service, entry.image.clone()));
             }
         }
     }
@@ -2605,7 +2655,12 @@ pub(super) fn write_namespaced_answer(
                 .to_string(),
         ));
     }
-    let declared = declared_services(config);
+    let mut declared = declared_services(config);
+    for (service, _) in compose_services(paths) {
+        if !declared.contains(&service) {
+            declared.push(service);
+        }
+    }
     let recipes = crate::recipes::Recipes::load(&paths.recipes_dir());
     for (service, answer) in services {
         if !declared.contains(service) {
@@ -2746,6 +2801,7 @@ pub fn namespaced_report(
             if helper
                 || entry.image.is_none()
                 || declared.contains(service)
+                || config.namespaced.contains_key(service)
                 || undeclared.iter().any(|known| known.service == *service)
             {
                 continue;
@@ -2756,9 +2812,9 @@ pub fn namespaced_report(
                 recipe: None,
                 keys: Vec::new(),
                 why: Some(format!(
-                    "{file} runs it, and the project's [[services]] do not name it, so every \
-                     worktree reaches the main checkout's — the `services` answer adds it, and \
-                     `namespaced` says how it gets data of its own if pando cannot tell"
+                    "{file} runs it, and nothing says how a worktree gets data of its own in it, \
+                     so every worktree reaches the main checkout's — the `namespaced` answer \
+                     says how: the recipe its engine is, and the keys its app reads"
                 )),
             });
         }
@@ -2783,7 +2839,7 @@ pub fn namespaced_report(
     let prefixed = plan.prefixed.into_iter().map(|prefixed| NamespacedService {
         service: prefixed.service,
         how: "prefix",
-        recipe: None,
+        recipe: prefixed.recipe,
         keys: prefixed.keys.into_iter().map(|(key, _)| key).collect(),
         why: None,
     });

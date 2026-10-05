@@ -225,15 +225,17 @@ nothing asked of a server — the input to the `namespaced` answer:
   { "service": "queue", "how": "shared",
     "why": "pando has no recipe that knows its engine — [namespaced.queue] recipe names one" },
   { "service": "worker", "how": "undeclared",
-    "why": "docker-compose.yml runs it, and the project's [[services]] do not name it, …" }
+    "why": "docker-compose.yml runs it, and nothing says how a worktree gets data of its own in it, …" }
 ]
 ```
 
 `how` is `database` or `slot`, which the server makes and `rm` drops;
 `prefix`, a name prefix the app is told in `keys` and nothing is made
 for; `shared`, on the main checkout's data, with `why`; or `undeclared`,
-a compose service the `services` answer has not taken, which every
-worktree reaches as the main checkout's. A mail catcher is never listed.
+a compose service neither `services` nor `namespaced` names, which every
+worktree reaches as the main checkout's. A `namespaced` answer may name
+it as it is: no private copy is needed for data of its own. A mail
+catcher, and a service the compose file builds, are never listed.
 
 ### The twelve questions
 
@@ -843,7 +845,8 @@ text is what brings everything else the option carries — the ports a
 command owns, the whole process table a workspace answer is, a service's
 env key, the hook entry.
 
-`namespaced` names, for each service the project declares, the recipe
+`namespaced` names, for each service the project declares or its compose
+files run, the recipe
 its engine is when its image does not say (`"recipe": "elasticsearch"`),
 the env keys its app names its database or slot by when pando did not
 find them (`"db_env": ["REDIS_DB"]`), and the keys it reads a prefix
@@ -865,7 +868,7 @@ own that is not environment variable names; a string at `processes` or
 process tables with a key a table does not take, no `cmd`, a variable
 that is not a name, a `cwd` that is not a directory of the repository or
 leaves it, a role two processes claim, or a `{…}` nothing will fill; at
-`namespaced`, a service the project does not declare, a recipe there is
+`namespaced`, a service neither the project's config nor its compose files have, a recipe there is
 not or one that knows no namespace or prefix, a key that is not an env
 key, a service with nothing said, or a login. Each refusal says what the
 question does take.

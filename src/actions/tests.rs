@@ -12070,6 +12070,7 @@ fn an_app_that_reads_an_index_prefix_gets_the_worktrees_own() {
         plan.prefixed,
         [super::namespaced::Prefixed {
             service: "search".into(),
+            recipe: Some("elasticsearch".into()),
             keys: vec![("ELASTICSEARCH_INDEX_PREFIX".into(), String::new())],
         }]
     );
@@ -12336,7 +12337,60 @@ fn the_namespaced_report_names_what_each_service_gets_and_what_no_start_sees() {
     assert_eq!(report[0].recipe.as_deref(), Some("postgres"));
     assert_eq!(report[0].keys, ["DATABASE_URL"]);
     let why = report[1].why.as_deref().unwrap();
-    assert!(why.contains("the `services` answer adds it"), "{why}");
+    assert!(why.contains("the `namespaced` answer says how"), "{why}");
+}
+
+// A setup agent had to add a service to the isolation list, with
+// `--replace`, before its namespaced settings were taken: isolation and
+// namespaces are two choices. Settings for a compose service the project
+// runs no private copy of are taken as they are, and it gets its prefix.
+#[test]
+fn namespaced_settings_cover_a_compose_service_the_project_does_not_isolate() {
+    let mut fx = compose_fixture(
+        concat!(
+            "services:\n",
+            "  db:\n    image: postgres:16\n    ports: [\"5432:5432\"]\n",
+            "  search:\n    image: registry.example/search:3\n    ports: [\"9200:9200\"]\n",
+        ),
+        "PORT=3000\nDATABASE_URL=postgres://acme:acme@localhost:5432/acme\nSEARCH_NS=\n",
+    );
+    let config: Config = toml::from_str(
+        "[[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
+         include = [\"db\"]\nenv = { DATABASE_URL = \"db\" }\n",
+    )
+    .unwrap();
+    fx.config.services = config.services;
+    std::fs::create_dir_all(fx.paths.config_file().parent().unwrap()).unwrap();
+    std::fs::write(
+        fx.paths.config_file(),
+        "[[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
+         include = [\"db\"]\nenv = { DATABASE_URL = \"db\" }\n",
+    )
+    .unwrap();
+    init_with_namespaced(
+        &fx,
+        r#"{"search": {"recipe": "elasticsearch", "prefix_env": ["SEARCH_NS"]}}"#,
+    )
+    .unwrap();
+    let config = crate::config::load(&fx.paths).unwrap().config;
+    assert_eq!(
+        super::services::service_roles(&config).len(),
+        1,
+        "db alone isolates"
+    );
+    let report =
+        super::namespaced::namespaced_report(&fx.paths, &config, &["docker-compose.yml".into()]);
+    let how: Vec<(&str, &str, Option<&str>)> = report
+        .iter()
+        .map(|s| (s.service.as_str(), s.how, s.recipe.as_deref()))
+        .collect();
+    assert_eq!(
+        how,
+        [
+            ("db", "database", Some("postgres")),
+            ("search", "prefix", Some("elasticsearch"))
+        ]
+    );
 }
 
 // A project whose only service namespaces by prefix started shared, as one
