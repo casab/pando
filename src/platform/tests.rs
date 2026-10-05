@@ -11,7 +11,6 @@ use super::*;
 /// longer offends is a stale row, and fails as surely as a new offender.
 const NOT_YET: &[&str] = &[
     "actions/check/interrupt.rs",
-    "cli/prompt.rs",
     "hooks.rs",
     "observe.rs",
     "process.rs",

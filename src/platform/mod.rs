@@ -23,6 +23,7 @@ pub mod dirs;
 pub mod files;
 pub mod host;
 pub mod shell;
+pub mod terminal;
 
 pub use host::{Host, Os};
 
