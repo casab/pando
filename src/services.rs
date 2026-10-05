@@ -260,7 +260,7 @@ impl Compose {
             command.current_dir(dir);
         }
         let out = match timeout {
-            Some(timeout) => crate::project::output_within(command, timeout),
+            Some(timeout) => crate::platform::process::output_within(command, timeout),
             None => command.output(),
         };
         if let (Err(e), Some(timeout)) = (&out, timeout)

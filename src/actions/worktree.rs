@@ -1347,7 +1347,7 @@ fn fetch_pr_head(
         .arg(root)
         .args(["fetch", "--quiet", "origin", &refspec])
         .env("GIT_TERMINAL_PROMPT", "0");
-    match crate::project::output_within(command, timeout) {
+    match crate::platform::process::output_within(command, timeout) {
         Ok(out) if out.status.success() => Ok(()),
         Ok(out) => bail!(
             "could not fetch #{number} from origin: {}",
@@ -1469,7 +1469,7 @@ pub(super) fn fetch_branch(
         .arg(root)
         .args(["fetch", "--quiet", "origin", branch])
         .env("GIT_TERMINAL_PROMPT", "0");
-    match crate::project::output_within(command, timeout) {
+    match crate::platform::process::output_within(command, timeout) {
         Ok(out) => Ok(out.status.success()),
         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => bail!(
             "`git fetch origin {branch}` did not answer in {}s, so pando cannot tell whether \

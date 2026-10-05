@@ -18,12 +18,10 @@ const EXIT_USAGE: u8 = 2;
 pub const EXIT_NEEDS_ANSWER: u8 = 3;
 
 fn main() -> ExitCode {
-    // Read before any thread starts: reading the umask means setting it,
-    // process-wide, for a moment.
-    let _ = pando::platform::cow::umask();
-    // Before any thread exists: a fork made while another thread sets up
-    // libnotify kills the child on macOS (see the function).
-    pando::process::settle_before_fork();
+    // Before any thread starts: reading the umask means setting it,
+    // process-wide, for a moment, and a fork made while another thread
+    // sets up libnotify kills the child on macOS.
+    pando::platform::init();
     // Parsed before anything else so `--help` and `--version` work outside a
     // repository, and a usage error exits 2 through clap.
     let cli = Cli::parse();

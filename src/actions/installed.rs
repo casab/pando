@@ -329,7 +329,7 @@ fn simulator_apps(paths: &PandoPaths, timeout: Duration) -> Vec<SimulatorApp> {
     };
     let mut command = Command::new(xcrun);
     command.args(["simctl", "list", "-j", "devices", "booted"]);
-    let listed = crate::project::output_within(command, timeout)
+    let listed = crate::platform::process::output_within(command, timeout)
         .ok()
         .filter(|out| out.status.success())
         .and_then(|out| serde_json::from_slice::<Value>(&out.stdout).ok());

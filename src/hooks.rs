@@ -16,7 +16,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::platform::process::Group;
 use crate::platform::signals::{self, HangUpOnExit};
 
 /// Whether hooks and probes start with no controlling terminal; see
@@ -241,34 +240,29 @@ pub fn hang_up_detached() {
     signals::hang_up_now();
 }
 
-/// Spawns `command` and hands the child to `wait`, its process group held
-/// for a hang-up until `wait` returns when it is `detached`: after
-/// `setsid` the child leads a group whose id is its pid.
+/// Spawns `command` and hands the child to `wait`: when `detached`, as a
+/// group of its own with no terminal, held for a hang-up until `wait`
+/// returns.
 fn waited<T>(
     command: &mut Command,
     detached: bool,
     wait: impl FnOnce(Child) -> std::io::Result<T>,
 ) -> std::io::Result<T> {
-    let child = command.spawn()?;
-    let _held = detached.then(|| HangUpOnExit::hold(Group::from_raw(child.id() as i32)));
+    if !detached {
+        return wait(command.spawn()?);
+    }
+    let (child, group) = crate::platform::process::spawn_group(command)?;
+    let _held = HangUpOnExit::hold(group);
     wait(child)
 }
 
 /// `bash -lc` running `shell_cmd` in `cwd` with `env` added and nothing on
-/// stdin, in a session of its own when `detached`.
-fn shell(
-    shell_cmd: &str,
-    cwd: &Path,
-    env: &[(String, String)],
-    detached: bool,
-) -> std::io::Result<Command> {
+/// stdin. [`waited`] decides whether it gets a terminal.
+fn shell(shell_cmd: &str, cwd: &Path, env: &[(String, String)]) -> std::io::Result<Command> {
     let mut command = crate::platform::shell::login(shell_cmd)?;
     command.current_dir(cwd).stdin(Stdio::null());
     for (key, value) in env {
         command.env(key, value);
-    }
-    if detached {
-        crate::process::new_session(&mut command);
     }
     Ok(command)
 }
@@ -301,8 +295,7 @@ pub fn run(log_file: &Path, shell_cmd: &str, cwd: &Path, env: &[(String, String)
         .try_clone()
         .context("clone log file handle for stderr")?;
     let detached = DETACHED.load(Ordering::Relaxed);
-    let mut command =
-        shell(shell_cmd, cwd, env, detached).with_context(|| format!("run {shell_cmd:?}"))?;
+    let mut command = shell(shell_cmd, cwd, env).with_context(|| format!("run {shell_cmd:?}"))?;
     command.stdout(out).stderr(err);
     let status = waited(&mut command, detached, |mut child| child.wait())
         .with_context(|| format!("run {shell_cmd:?}"))?;
@@ -355,8 +348,8 @@ fn printed_since(log_file: &Path, start: u64) -> String {
 /// run that mattered.
 pub fn probe(shell_cmd: &str, cwd: &Path, env: &[(String, String)]) -> Result<Option<String>> {
     let detached = DETACHED.load(Ordering::Relaxed);
-    let mut command = shell(shell_cmd, cwd, env, detached)
-        .with_context(|| format!("run the probe {shell_cmd:?}"))?;
+    let mut command =
+        shell(shell_cmd, cwd, env).with_context(|| format!("run the probe {shell_cmd:?}"))?;
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let out = waited(&mut command, detached, Child::wait_with_output)
         .with_context(|| format!("run the probe {shell_cmd:?}"))?;
@@ -805,10 +798,19 @@ mod tests {
 
     fn where_it_ran(detached: bool) -> (String, String, bool) {
         let dir = tempdir().unwrap();
-        let out = shell(WHERE_AM_I, dir.path(), &[], detached)
-            .unwrap()
-            .output()
-            .unwrap();
+        let mut command = shell(WHERE_AM_I, dir.path(), &[]).unwrap();
+        command.stdout(Stdio::piped());
+        // Spawned as `waited` would, but not held: the hang-up test leaves
+        // every group held after it hung up, and this one must answer.
+        let child = match detached {
+            true => {
+                crate::platform::process::spawn_group(&mut command)
+                    .unwrap()
+                    .0
+            }
+            false => command.spawn().unwrap(),
+        };
+        let out = child.wait_with_output().unwrap();
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
         let ids = text
             .lines()
@@ -854,7 +856,7 @@ mod tests {
         let started = Instant::now();
         let cwd = dir.path().to_path_buf();
         let hook = std::thread::spawn(move || {
-            let mut command = shell("sleep 30", &cwd, &[], true).unwrap();
+            let mut command = shell("sleep 30", &cwd, &[]).unwrap();
             waited(&mut command, true, |mut child| child.wait()).unwrap()
         });
         let recorded = || signals::held().first().copied();
@@ -878,7 +880,7 @@ mod tests {
             "a hook that ended is off the list"
         );
 
-        let mut fallback = shell("sleep 30", dir.path(), &[], true).unwrap();
+        let mut fallback = shell("sleep 30", dir.path(), &[]).unwrap();
         let status = waited(&mut fallback, true, |mut child| child.wait()).unwrap();
         assert_eq!(status.signal(), Some(libc::SIGHUP), "{status:?}");
         assert!(started.elapsed() < Duration::from_secs(10));

@@ -29,5 +29,13 @@ pub mod terminal;
 
 pub use host::{Host, Os};
 
+/// What pando does first, before any thread starts: reads the umask, which
+/// means setting it process-wide for a moment, and makes a fork safe on a
+/// system where another thread could make it unsafe.
+pub fn init() {
+    let _ = cow::umask();
+    process::settle_before_fork();
+}
+
 #[cfg(test)]
 mod tests;

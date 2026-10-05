@@ -8,8 +8,8 @@
 use anyhow::{Context, Result, bail};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::process::{Command, Output};
+use std::time::Duration;
 
 /// How long one git question may take before pando stops waiting for it.
 ///
@@ -43,153 +43,7 @@ where
 {
     let mut command = Command::new("git");
     command.arg("-C").arg(dir).args(args);
-    output_within(command, timeout)
-}
-
-/// `Command::output`, with a deadline.
-///
-/// The child leads its own process group, so a timeout kills whatever it
-/// started as well; the pipes are read on their own threads, so a child
-/// that fills one cannot deadlock against the wait, and the reads are
-/// bounded too, because anything the child left behind can hold a pipe
-/// open after it exits.
-pub(crate) fn output_within(mut command: Command, timeout: Duration) -> std::io::Result<Output> {
-    use std::io::Read;
-    use std::os::unix::process::CommandExt;
-    use std::sync::mpsc;
-
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
-    let mut child = command.spawn()?;
-    let pgid = nix::unistd::Pid::from_raw(child.id() as i32);
-    let reader = |pipe: Option<Box<dyn Read + Send>>| {
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut buf);
-            }
-            let _ = tx.send(buf);
-        });
-        rx
-    };
-    let stdout = reader(
-        child
-            .stdout
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-    );
-    let stderr = reader(
-        child
-            .stderr
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-    );
-    let kill_group = || {
-        let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
-    };
-
-    // The leader is left unreaped until the group has been dealt with. A
-    // zombie still holds its pid, and so the group id: once it is reaped
-    // and its group is empty, the number can go to an unrelated process
-    // group, and a `killpg` after that point is a signal to a stranger.
-    // So the exit is *seen* here without being collected, and the child is
-    // only reaped below, after the last `killpg`.
-    let pid = child.id() as i32;
-    let deadline = Instant::now() + timeout;
-    let mut reaped: Option<std::process::ExitStatus> = None;
-    loop {
-        match exited_unreaped(pid) {
-            Some(true) => break,
-            Some(false) => {}
-            // `waitid` not available: the old way, reaping to find out.
-            None => {
-                if let Some(status) = child.try_wait()? {
-                    reaped = Some(status);
-                    break;
-                }
-            }
-        }
-        if Instant::now() >= deadline {
-            kill_group();
-            let _ = child.wait();
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("no answer in {}s", timeout.as_secs_f32()),
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    let collect = |rx: &mpsc::Receiver<Vec<u8>>| {
-        let left = deadline.saturating_duration_since(Instant::now());
-        rx.recv_timeout(left.max(Duration::from_millis(100)))
-    };
-    let mut out = collect(&stdout);
-    let mut err = collect(&stderr);
-    if out.is_err() || err.is_err() {
-        // Exited, but something it started is still holding a pipe. That
-        // group is this call's own, so it goes — which closes the pipe, and
-        // what was already written is still the answer. Only while the
-        // leader is unreaped, which is what makes the group still ours.
-        if reaped.is_none() {
-            kill_group();
-        }
-        let settle = Duration::from_millis(500);
-        if out.is_err() {
-            out = stdout.recv_timeout(settle);
-        }
-        if err.is_err() {
-            err = stderr.recv_timeout(settle);
-        }
-    }
-    let (out, err) = (out.unwrap_or_default(), err.unwrap_or_default());
-    // Reaped last: nothing signals the group after this.
-    let status = match reaped {
-        Some(status) => status,
-        None => child.wait()?,
-    };
-    Ok(Output {
-        status,
-        stdout: out,
-        stderr: err,
-    })
-}
-
-/// Whether the child `pid` has exited, *without* reaping it: `Some(true)`
-/// once it has, `Some(false)` while it runs, `None` where `waitid` cannot
-/// say.
-fn exited_unreaped(pid: i32) -> Option<bool> {
-    // SAFETY: `waitid` writes only into `info`, which is zeroed and owned
-    // here; `WNOWAIT` leaves the child waitable for the `wait` that reaps it.
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    let rc = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            pid as libc::id_t,
-            &mut info,
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        )
-    };
-    if rc != 0 {
-        return None;
-    }
-    // With `WNOHANG`, a child that has not changed state leaves `si_pid`
-    // zero.
-    Some(siginfo_pid(&info) != 0)
-}
-
-#[cfg(target_os = "linux")]
-fn siginfo_pid(info: &libc::siginfo_t) -> libc::pid_t {
-    // SAFETY: filled by `waitid`, for which `si_pid` is the valid member.
-    unsafe { info.si_pid() }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn siginfo_pid(info: &libc::siginfo_t) -> libc::pid_t {
-    info.si_pid
+    crate::platform::process::output_within(command, timeout)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -356,65 +210,6 @@ mod tests {
             first.id, second.id,
             "same directory name at different paths must not share a project id"
         );
-    }
-
-    // git is the one external call every command makes first, so a git
-    // that never answers must not be a pando that never answers.
-    #[test]
-    fn a_command_that_does_not_answer_is_killed_at_the_deadline() {
-        let mut command = Command::new("sh");
-        command.args(["-c", "sleep 30 & sleep 30"]);
-        let started = Instant::now();
-        let err = output_within(command, Duration::from_millis(300)).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "bounded, not waited out: {:?}",
-            started.elapsed()
-        );
-
-        // And one that answers is read exactly as `output` would read it.
-        let mut command = Command::new("sh");
-        command.args(["-c", "echo out; echo err >&2; exit 3"]);
-        let out = output_within(command, Duration::from_secs(10)).unwrap();
-        assert_eq!(out.status.code(), Some(3));
-        assert_eq!(String::from_utf8_lossy(&out.stdout), "out\n");
-        assert_eq!(String::from_utf8_lossy(&out.stderr), "err\n");
-    }
-
-    // Exited, with a child it backgrounded still holding stdout: the call
-    // returns rather than waiting on the child.
-    #[test]
-    fn a_background_child_holding_the_pipe_does_not_hold_the_call() {
-        let mut command = Command::new("sh");
-        command.args(["-c", "sleep 30 & echo done"]);
-        let started = Instant::now();
-        let out = output_within(command, Duration::from_secs(1)).unwrap();
-        assert!(out.status.success());
-        assert!(String::from_utf8_lossy(&out.stdout).contains("done"));
-        assert!(started.elapsed() < Duration::from_secs(10));
-    }
-
-    // The group is only signalled while its leader is unreaped: a reaped
-    // leader of an empty group frees the number for a stranger. So the
-    // exit is seen without being collected, and the status still comes
-    // back whole once the child is reaped afterwards.
-    #[test]
-    fn an_exit_is_seen_without_reaping_the_child() {
-        let mut child = Command::new("sh").args(["-c", "exit 7"]).spawn().unwrap();
-        let pid = child.id() as i32;
-        let started = Instant::now();
-        while exited_unreaped(pid) != Some(true) {
-            assert!(started.elapsed() < Duration::from_secs(10), "never seen");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        // Still ours to reap, with its status intact.
-        assert_eq!(child.wait().unwrap().code(), Some(7));
-
-        let mut running = Command::new("sleep").arg("30").spawn().unwrap();
-        assert_eq!(exited_unreaped(running.id() as i32), Some(false));
-        let _ = running.kill();
-        let _ = running.wait();
     }
 
     #[test]

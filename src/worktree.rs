@@ -1071,7 +1071,7 @@ fn gh_pr_list_with(
         ])
         .env("GH_PROMPT_DISABLED", "1")
         .env("GH_NO_UPDATE_NOTIFIER", "1");
-    let out = match crate::project::output_within(command, timeout) {
+    let out = match crate::platform::process::output_within(command, timeout) {
         Ok(out) => out,
         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
             anyhow::bail!("gh pr list did not answer in {}s", timeout.as_secs())
@@ -1154,7 +1154,7 @@ pub fn gh_account_with(program: &Path, root: &Path) -> GhAccount {
         .args(["api", "user", "--jq", ".login"])
         .env("GH_PROMPT_DISABLED", "1")
         .env("GH_NO_UPDATE_NOTIFIER", "1");
-    let out = match crate::project::output_within(command, GH_TIMEOUT) {
+    let out = match crate::platform::process::output_within(command, GH_TIMEOUT) {
         Ok(out) => out,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return GhAccount::Missing,
         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
