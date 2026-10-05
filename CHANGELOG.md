@@ -7,6 +7,43 @@ may change behaviour.
 
 ## Unreleased
 
+### Added
+
+- Namespaced mode for engines whose namespaces are the app's own: an
+  Elasticsearch or OpenSearch index, a Kafka topic, a Meilisearch index,
+  a Memcached or Redis key. Where the app reads a prefix beside the
+  address (`ELASTICSEARCH_INDEX_PREFIX`, `REDIS_PREFIX`), a namespaced
+  worktree is told one of its own — main's, then `feat_x__` — and the
+  service is its data. A prefix is told, never made: nothing is recorded
+  or dropped, and `rm` says what it leaves. Every process of a
+  namespaced worktree is told `PANDO_NAMESPACE`, its slug.
+- A server in a container is reached through the client its image
+  ships: when the host has no `psql`, `mariadb` or `redis-cli` and a
+  container publishes the server's port, the recipe's commands run in it
+  through `docker exec`, the password passed by name.
+- `namespaced`, the twelfth answer `init --answers` takes: per service,
+  the recipe its engine is, the keys its app names its database or slot
+  by, and the keys it reads a prefix from, written to
+  `[namespaced.<service>]` in pando's own file beside any login. Only a
+  program answers it; nothing asks a person. `signals` lists what a
+  namespaced start would do with every service, an undeclared compose
+  service included, and why one stays shared.
+- `[namespaced.<service>] recipe` and `prefix_env`, beside `db_env`; none
+  is a secret, so a committed `pando.toml` may carry them.
+- A recipe may say only how a server somebody else runs is namespaced: a
+  `[namespace]` or `[prefix]` with no `[service]`, for an engine only a
+  compose file runs.
+
+### Changed
+
+- Where an app names its database or slot is a recipe's
+  `[namespace.address]` — a URL's path and query parameters, and the
+  keys beside the address — rather than code; a recipe without one means
+  its kind's conventions, as before. Every address key's own slot key is
+  now found: two Redis roles with their own `_DB` keys both move to the
+  worktree's slot, where the second went on naming main's.
+- A slot's `size` prints a bare number; Redis's recipe passes `--raw`.
+
 ## 0.8.3 — 2026-10-05
 
 ### Added

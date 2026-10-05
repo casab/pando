@@ -212,6 +212,29 @@ development one.
 or under-ticked: they are the parts of a compose file this build did not
 follow, published rather than papered over.
 
+`namespaced` says what a namespaced start would do with each service,
+read from config, the recipes and the main checkout's env files, with
+nothing asked of a server — the input to the `namespaced` answer:
+
+```jsonc
+"namespaced": [
+  { "service": "db", "how": "database", "recipe": "postgres",
+    "keys": ["DATABASE_URL"] },          // the keys pando points at the worktree's own
+  { "service": "cache", "how": "slot", "recipe": "redis", "keys": ["REDIS_URL"] },
+  { "service": "search", "how": "prefix", "keys": ["SEARCH_INDEX_PREFIX"] },
+  { "service": "queue", "how": "shared",
+    "why": "pando has no recipe that knows its engine" },
+  { "service": "worker", "how": "undeclared",
+    "why": "docker-compose.yml runs it, and the project's [[services]] do not name it, …" }
+]
+```
+
+`how` is `database` or `slot`, which the server makes and `rm` drops;
+`prefix`, a name prefix the app is told in `keys` and nothing is made
+for; `shared`, on the main checkout's data, with `why`; or `undeclared`,
+a compose service the `services` answer has not taken, which every
+worktree reaches as the main checkout's. A mail catcher is never listed.
+
 ### The twelve questions
 
 `slots` has one entry per question pando can ask, in the order it asks
@@ -789,6 +812,7 @@ One JSON object. Keys are the question names above. Values:
 | `null` | "none of them", where `allow_none` is true. At `schema_hook` it is "no": the step is written with `on = "never"` |
 | `[]` | "none of them" at the set question. A usage error anywhere else — `null` is how you say none |
 | `{"api": {...}, "web": {...}}` | at `processes` only: process tables of your own, one per key, each exactly what `[processes.<name>]` takes — `cmd`, and optionally `cwd`, `ports`, `env`, `ready` and `page` |
+| `{"db": {...}, "search": {...}}` | at `namespaced`, and only an object there: each service's settings, `recipe`, `db_env` and `prefix_env`, written to `[namespaced.<service>]` beside any login. A `user` or `password` in it is refused: a login is never an answer |
 
 The object is how a project of several processes is answered when no
 option fits it. A string of your own at `processes` is **one** command,
@@ -819,6 +843,19 @@ text is what brings everything else the option carries — the ports a
 command owns, the whole process table a workspace answer is, a service's
 env key, the hook entry.
 
+`namespaced` names, for each service the project declares, the recipe
+its engine is when its image does not say (`"recipe": "elasticsearch"`),
+the env keys its app names its database or slot by when pando did not
+find them (`"db_env": ["REDIS_DB"]`), and the keys it reads a prefix
+from (`"prefix_env": ["SEARCH_INDEX_PREFIX"]`), each set to the main
+checkout's value with the worktree's slug after it:
+
+```jsonc
+{ "namespaced": {
+    "search": { "recipe": "elasticsearch", "prefix_env": ["SEARCH_INDEX_PREFIX"] },
+    "cache":  { "db_env": ["REDIS_DB"] } } }
+```
+
 Refusals, all exit 2 and all naming the key: a name that is not a question;
 a shape the question cannot take; a value that is not one of the options at
 a question that has them; an empty string; a `prelude` that fails its own
@@ -827,8 +864,11 @@ own that is not environment variable names; a string at `processes` or
 `dev_cmd` in the `name: cmd in dir; …` form that is none of the options;
 process tables with a key a table does not take, no `cmd`, a variable
 that is not a name, a `cwd` that is not a directory of the repository or
-leaves it, a role two processes claim, or a `{…}` nothing will fill. Each
-refusal says what the question does take.
+leaves it, a role two processes claim, or a `{…}` nothing will fill; at
+`namespaced`, a service the project does not declare, a recipe there is
+not or one that knows no namespace or prefix, a key that is not an env
+key, a service with nothing said, or a login. Each refusal says what the
+question does take.
 
 A `port_env` of your own may name several variables, as one string
 separated by commas, `"PORT, API_PORT"` — the way the option naming

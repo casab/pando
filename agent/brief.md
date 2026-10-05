@@ -248,7 +248,7 @@ Four more facts that are not visible in the shape:
   when it is the only option, as the first-run section says, and the
   report says each worktree gets a copy of the example.
 
-## 3. The eleven questions, and who answers each
+## 3. The twelve questions, and who answers each
 
 | Question | Who | Notes |
 |---|---|---|
@@ -263,6 +263,7 @@ Four more facts that are not visible in the shape:
 | `provision` | rules, then you | which local files a worktree needs. Seeding from an example is never `--yes`'s: you name it when it is the only option |
 | `clone` | rules | which dependency trees (`node_modules`, an app's own) a new worktree clones copy-on-write from the main checkout before its install, so it costs a few MB instead of a full install's. Proposed for every one the main checkout has, unless the install deletes it first (`npm ci`); decided, since the install still fixes what the branch changed and `check` never clones. Leave it to the rules; `null` only when the developer has said they want every worktree installed from nothing |
 | `base` | rules, then you | the branch `new` forks from and `check` tests. Open only when origin/HEAD is far behind the main checkout's branch; otherwise origin/HEAD, and nothing to answer. A check that fails with `kind: "base"` is the case for it: the main checkout's branch, see step 5 |
+| `namespaced` | you | never asked. How each service gets data of a namespaced worktree's own, where pando could not tell: `signals` lists every service under `namespaced` as `database`, `slot`, `prefix`, `shared` with why, or `undeclared`. For a shared one whose app does name its database, slot or prefix under a key pando missed, or whose image says nothing of its engine, answer `{"namespaced": {"<service>": {"recipe": "…", "db_env": ["…"], "prefix_env": ["…"]}}}` from the project's own config and docs. Settings only: it starts nothing namespaced, and a login is never an answer |
 
 ## 4. Writing: `pando init --answers`, and nothing else
 
@@ -325,7 +326,7 @@ engine installed on the machine, and it is **machine-wide**. Not
 per-project, not per-worktree: one line, and it governs **every repository
 this developer opens with pando**, including the ones you have never seen
 and the ones they have not written yet. That is why it is not one of the
-eleven questions and why `--answers` has no key for it — an answer inferred
+twelve questions and why `--answers` has no key for it — an answer inferred
 from the evidence in front of you would quietly settle a question about
 projects that evidence says nothing about.
 
@@ -488,7 +489,7 @@ Read what came back, not what you expected:
   table** — a service is not running, or the schema step is missing.
   That is the `services` and `schema_hook` questions, not a retry.
 
-A fix that is one of the eleven answers goes through `init --answers`, a
+A fix that is one of the twelve answers goes through `init --answers`, a
 variable one process needs included (§9), and you start the scratch
 worktree again. A fix that is not — an app whose own config pins a port —
 is the developer's: name the process, what it did, and the line that
@@ -835,18 +836,22 @@ cannot answer either:
   a worktree they no longer need.
 
 A namespaced start that says a service stays shared because "the app
-reads no slot setting" or "nothing … names its database", when the app
+reads no slot setting", "nothing … names its database", "the app reads
+no prefix" or "pando has no recipe that knows its engine", when the app
 does read one under a name pando did not guess (one `REDIS_DB` that
-several Redis roles share), is fixed in config, not code:
-`[namespaced.<service>] db_env = ["REDIS_DB"]` in `pando.toml`. It is no
-secret, so the committed file may carry it.
+several Redis roles share, a `SEARCH_INDEX_PREFIX`), or the image is a
+known engine under another name, is fixed in config, not code, through
+`init --answers` with `namespaced` (§3). None of it is a secret, so a
+committed `pando.toml` may carry it too.
 
 A namespaced start that stops with a `GRANT …` or `ALTER ROLE …`
 statement on stderr means the app's login may not make the worktree's
 database. Report the statement; running it is the human's, as an
 administrator of their own server. A start that says `psql`, `mariadb` or
-`redis-cli` is not on PATH names what to install: report that too, since
-a server in Docker leaves the host with no client.
+`redis-cli` is not on PATH names what to install: report that too. A
+server in a container that publishes its port is reached through the
+client its image ships, so that line means no such container was
+found either.
 
 `--yes` is not a way past exit 3. It takes the rules' own preferred option,
 which is a decision you are making on the developer's behalf with no

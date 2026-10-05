@@ -428,7 +428,7 @@ whatever it runs on. Its mode decides what happens to its data:
 | Mode | Its data lives in | Start it with |
 |---|---|---|
 | **shared** | the main checkout's database and cache, data and all. The default, and the way back from the other two | `start --shared`, or `S` |
-| **namespaced** *(experimental)* | the main checkout's servers, with a database and a Redis slot of the worktree's own in them: `shop__feat_x` beside `shop` in Postgres or MariaDB, slot 3 beside slot 0 | `start --namespaced`, or the chooser on enter |
+| **namespaced** *(experimental)* | the main checkout's servers, with a database, a Redis slot or a name prefix of the worktree's own in them: `shop__feat_x` beside `shop` in Postgres or MariaDB, slot 3 beside slot 0, indexes under `feat_x__` in Elasticsearch | `start --namespaced`, or the chooser on enter |
 | **isolated** | servers of its own on ports of its own: containers from your compose file, or native engines from a recipe | `start --isolated`, or `i` |
 
 A namespaced database is built by the branch's own schema step, never
@@ -470,22 +470,86 @@ another mode until `rm` drops them.
   says. `doctor` lists a database named for a worktree that no record
   holds, with the command that drops it, and never drops it itself.
 
-- When the app names its database or slot under a key pando does not
-  guess — one `REDIS_DB` that three Redis roles share — name it in
-  `pando.toml`; it is no secret, so the committed file may carry it:
+- Where a server has no namespace pando could make — an Elasticsearch
+  index, a Kafka topic, a Memcached key is the app's own — a worktree is
+  told a prefix instead, in the key its app already reads one from
+  beside the address: `ELASTICSEARCH_INDEX_PREFIX=feat_x__`, or
+  `laravel_database_feat_x__` after main's `REDIS_PREFIX`. pando makes
+  nothing there, so it records and drops nothing; `rm` says what it
+  leaves. Every process of a namespaced worktree is also told
+  `PANDO_NAMESPACE=feat_x`, for an app that puts it in front of its
+  names by itself.
+- A database in Docker usually leaves the host with no `psql`,
+  `mariadb` or `redis-cli`. Then the commands run in the container that
+  publishes the server's port, with the client its image ships
+  (`docker exec`, the password passed by name).
+- What pando cannot tell by itself is written in its own config for the
+  project, under `[namespaced.<service>]` — usually by the setup agent,
+  through `pando init --answers`. None of it is a secret, so a committed
+  `pando.toml` may carry it too:
 
   ```toml
   [namespaced.redis]
-  db_env = ["REDIS_DB"]
+  db_env = ["REDIS_DB"]          # one REDIS_DB that three Redis roles share
+
+  [namespaced.search]
+  recipe = "elasticsearch"       # an image whose name says nothing
+  prefix_env = ["SEARCH_INDEX_PREFIX"]
   ```
 
-Postgres, MariaDB and MySQL databases and Redis slots are what it makes
-today, in a native server or in a container, Postgres images with an
-extension built in (pgvector, PostGIS, TimescaleDB) included. Every other
-service stays shared, and a namespaced start says so for each. It needs
-only the engine's client on the host: `psql`, `mariadb` or `redis-cli`.
-What a namespace is on an engine is a recipe's `[namespace]` table, so
-another engine is a recipe rather than a release.
+  `pando signals` lists what a namespaced start would do with each
+  service, and why one stays shared.
+
+Postgres, MariaDB and MySQL databases and Redis slots are made, in a
+native server or in a container, Postgres images with an extension built
+in (pgvector, PostGIS, TimescaleDB) included; Elasticsearch, OpenSearch,
+Kafka, Meilisearch, Memcached and Redis get a prefix where the app reads
+one. Every other service stays shared, and a namespaced start says so
+for each.
+
+</details>
+
+<details>
+<summary><b>A namespace for an engine pando does not ship</b></summary>
+
+<br>
+
+What a namespace is on an engine is data, not code: a recipe's
+`[namespace]` or `[prefix]` table. A file in `~/.pando/recipes/` adds an
+engine, or replaces a built-in of the same name, for every project on
+the machine; a compose image finds it by its own name, or by
+`[namespaced.<service>] recipe`. It needs no `[service]` table when
+pando never starts the engine itself. A sketch, not a shipped recipe —
+check the client's own flags before you trust it:
+
+```toml
+# ~/.pando/recipes/clickhouse.toml
+kind = "service"
+name = "clickhouse"
+
+[namespace]
+kind = "database"                    # made and dropped by name; "slot" is a number
+binaries = ["clickhouse-client"]
+password_env = "CLICKHOUSE_PASSWORD"
+ping   = "clickhouse-client --host {host} --port {port} --user {user} -q 'SELECT 1'"
+exists = "clickhouse-client --host {host} --port {port} --user {user} -q \"SELECT name FROM system.databases WHERE name = '{namespace}'\""
+create = "clickhouse-client --host {host} --port {port} --user {user} -q 'CREATE DATABASE {namespace}'"
+drop   = "clickhouse-client --host {host} --port {port} --user {user} -q 'DROP DATABASE IF EXISTS {namespace}'"
+
+[namespace.address]                  # where the app names its database
+url_path = true
+keys = ["_DATABASE", "_DB"]
+```
+
+Each command keeps a contract: `create` fails when the name is already
+there, so pando never takes a database it did not make; a slot's
+commands never fall back to slot 0; `size` prints a bare number; the
+password reaches the client only in `password_env`. pando derives every
+name — `<main>__<worktree>` — and only ever drops one its records say it
+made, whatever the recipe says. An engine whose namespaces are the app's
+own convention needs only `[prefix] keys = ["_INDEX_PREFIX"]`.
+
+</details>
 
 </details>
 
