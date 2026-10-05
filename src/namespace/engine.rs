@@ -30,6 +30,21 @@ pub struct Server<'a> {
     /// as for a service recipe: where a developer puts a client the login
     /// shell does not find, and where a test puts a fake one.
     pub bin_dir: PathBuf,
+    /// Where the recipe's commands run: here, or inside the container that
+    /// publishes the server's port. [`Server::reach`] decides.
+    pub runner: Runner,
+}
+
+/// Where a server's recipe commands run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Runner {
+    /// On this machine, with its own client.
+    Host,
+    /// Inside the container that publishes the server's port, with the
+    /// client its image ships: a database in Docker usually leaves the
+    /// host with none. `{host}` is the container's own loopback there and
+    /// `{port}` the port the server listens on inside it.
+    Container { id: String, port: u16 },
 }
 
 /// What [`Server::create`] found.
@@ -47,7 +62,49 @@ impl Server<'_> {
         format!("{}:{}", self.host, self.port)
     }
 
-    /// The clients the recipe needs that this machine does not have.
+    /// This server, with its commands run where its client is: here when
+    /// this machine has every one the recipe needs, else inside the
+    /// container that publishes its port when that one has them all. With
+    /// neither, it stays here, and [`Server::ping`] says what to install.
+    pub fn reach(self) -> Self {
+        if self.runner != Runner::Host || self.missing_binaries().is_empty() {
+            return self;
+        }
+        let Some((id, port)) = self.container() else {
+            return self;
+        };
+        let inside = Server {
+            runner: Runner::Container { id, port },
+            ..self
+        };
+        match inside.missing_binaries().is_empty() {
+            true => inside,
+            false => Server {
+                runner: Runner::Host,
+                ..inside
+            },
+        }
+    }
+
+    /// The running container that publishes this server's port on this
+    /// machine, and the port it listens on inside: `docker ps` by the
+    /// published port, then `docker port` for the side within. `None`
+    /// with no Docker, no such container, or an answer it cannot read.
+    fn container(&self) -> Option<(String, u16)> {
+        let script = self.with_path(&format!(
+            "ids=$(docker ps --filter publish={port} --format '{{{{.ID}}}}') || exit 1\n\
+             echo --\n\
+             for id in $ids; do echo \"$id\"; docker port \"$id\"; done",
+            port = self.port
+        ));
+        let out = proc::run_captured(&script, &std::env::temp_dir(), &[], TIMEOUT).ok()?;
+        if !out.success() {
+            return None;
+        }
+        container_publishing(&out.stdout, self.port)
+    }
+
+    /// The clients the recipe needs that are not where its commands run.
     pub fn missing_binaries(&self) -> Vec<String> {
         if self.recipe.binaries.is_empty() {
             return Vec::new();
@@ -62,13 +119,17 @@ impl Server<'_> {
             })
             .collect();
         let Ok(out) = proc::run_captured(
-            &self.with_path(&checks.join("\n")),
+            &self.wrap(&checks.join("\n")),
             &std::env::temp_dir(),
             &[],
             TIMEOUT,
         ) else {
             return Vec::new();
         };
+        // A container that went away answers with an error, not a list.
+        if !out.success() {
+            return self.recipe.binaries.clone();
+        }
         out.stdout
             .lines()
             .map(str::trim)
@@ -203,7 +264,7 @@ impl Server<'_> {
             prefix_like: Some(prefix_like(main)),
             ..self.vars(None)
         };
-        let script = self.with_path(&template::render_with(command, &vars)?);
+        let script = self.wrap(&template::render_with(command, &vars)?);
         let env = self.login.env(self.recipe.password_env.as_deref());
         let out = proc::run_captured(&script, &std::env::temp_dir(), &env, TIMEOUT)?;
         if !out.success() {
@@ -232,6 +293,10 @@ impl Server<'_> {
             return None;
         }
         let rendered = template::render_with(&self.recipe.drop, &self.vars(Some(name))).ok()?;
+        let rendered = match &self.runner {
+            Runner::Host => rendered,
+            Runner::Container { id, .. } => self.in_container(id, &rendered),
+        };
         Some(match &self.recipe.password_env {
             Some(var) if self.login.has_password() => {
                 format!("{rendered}   (with the password in {var})")
@@ -374,9 +439,13 @@ impl Server<'_> {
     }
 
     fn vars(&self, namespace: Option<&str>) -> Vars {
+        let (host, port) = match &self.runner {
+            Runner::Host => (self.host.as_str(), self.port),
+            Runner::Container { port, .. } => ("127.0.0.1", *port),
+        };
         Vars {
-            host: Some(shell_quote(&self.host)),
-            port: Some(self.port.to_string()),
+            host: Some(shell_quote(host)),
+            port: Some(port.to_string()),
             user: self.login.user.as_deref().map(shell_quote),
             namespace: namespace.map(str::to_string),
             main: None,
@@ -393,6 +462,30 @@ impl Server<'_> {
         )
     }
 
+    /// The script `bash -lc` runs for one rendered command: the command
+    /// itself here, or `docker exec` of it in the container.
+    fn wrap(&self, rendered: &str) -> String {
+        match &self.runner {
+            Runner::Host => self.with_path(rendered),
+            Runner::Container { id, .. } => self.with_path(&self.in_container(id, rendered)),
+        }
+    }
+
+    /// `docker exec` of one command in a container, its password variable
+    /// passed by name alone: `-e PGPASSWORD` hands the container the value
+    /// `docker` itself was started with, so it is never on a command line.
+    fn in_container(&self, id: &str, rendered: &str) -> String {
+        let pass = match &self.recipe.password_env {
+            Some(var) if self.login.has_password() => format!("-e {} ", shell_quote(var)),
+            _ => String::new(),
+        };
+        format!(
+            "docker exec {pass}{} sh -c {}",
+            shell_quote(id),
+            shell_quote(rendered)
+        )
+    }
+
     /// The script `bash -lc` is handed for one recipe command: what
     /// anyone on the machine can read in `ps` while it runs, so it carries
     /// everything but the password.
@@ -403,7 +496,7 @@ impl Server<'_> {
             bail!("{name:?} is not a plain name, so pando will not put it in a command");
         }
         let rendered = template::render_with(command, &self.vars(namespace))?;
-        Ok(self.with_path(&rendered))
+        Ok(self.wrap(&rendered))
     }
 
     /// One recipe command, run with the password in the environment the
@@ -426,8 +519,30 @@ impl Server<'_> {
             main: Some(if is_plain(main) { main } else { "" }.to_string()),
             ..self.vars(Some(name))
         };
-        Ok(self.with_path(&template::render_with(command, &vars)?))
+        Ok(self.wrap(&template::render_with(command, &vars)?))
     }
+}
+
+/// The container in `docker ps` and `docker port` output that publishes
+/// `published` on this machine, and the port it listens on inside: the
+/// lines after `--` are each container's id followed by its mappings,
+/// `5432/tcp -> 0.0.0.0:15432`. The first that maps it wins.
+fn container_publishing(stdout: &str, published: u16) -> Option<(String, u16)> {
+    let (_, listing) = stdout.split_once("--\n")?;
+    let mut current: Option<&str> = None;
+    for line in listing.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let Some((inside, outside)) = line.split_once(" -> ") else {
+            current = Some(line);
+            continue;
+        };
+        let outside = outside.rsplit_once(':').map(|(_, port)| port)?;
+        if outside.parse::<u16>().ok() != Some(published) {
+            continue;
+        }
+        let inside = inside.split('/').next()?.parse::<u16>().ok()?;
+        return Some((current?.to_string(), inside));
+    }
+    None
 }
 
 /// The prefix every namespace of `main` starts with, as an SQL `LIKE`

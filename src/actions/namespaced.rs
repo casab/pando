@@ -911,7 +911,9 @@ pub(super) fn server_for<'a>(
         port: target.port,
         login,
         bin_dir: paths.home.join("bin"),
-    })
+        runner: namespace::Runner::Host,
+    }
+    .reach())
 }
 
 /// The login each target needs and nothing gives, asked for now: what
@@ -2289,7 +2291,9 @@ pub(super) fn drop_namespaces(
             port: ns.port,
             login,
             bin_dir: paths.home.join("bin"),
-        };
+            runner: namespace::Runner::Host,
+        }
+        .reach();
         match server.drop(&ns.name, &ns.main) {
             Ok(()) => progress(
                 &format!(

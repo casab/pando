@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use pando::namespace::{Created, Login, Server};
+use pando::namespace::{Created, Login, Runner, Server};
 use pando::recipes::{NamespaceRecipe, Recipes};
 use tempfile::TempDir;
 
@@ -176,6 +176,7 @@ fn app_server<'a>(recipe: &'a NamespaceRecipe, db: &Throwaway, bin: &Path) -> Se
             "the test's app login",
         ),
         bin_dir: bin.to_path_buf(),
+        runner: Runner::Host,
     }
 }
 
@@ -347,6 +348,7 @@ fn a_real_redis_empties_one_slot_and_never_falls_back_to_slot_0() {
         port: cache.port,
         login: Login::new(None, Some(REDIS_PASSWORD.into()), "the test's password"),
         bin_dir: bin.clone(),
+        runner: Runner::Host,
     };
     server.ping().unwrap();
     redis_cli(&cache, &["-n", "0", "SET", "main-key", "keep"]).unwrap();

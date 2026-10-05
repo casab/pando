@@ -859,7 +859,135 @@ fn server<'a>(
         port: 3306,
         login: Login::new(Some("app".into()), Some(PASSWORD.into()), "the test's env"),
         bin_dir: fake.bin(),
+        runner: Runner::Host,
     }
+}
+
+// ---- the client in the container ---------------------------------------------
+
+/// A client no machine has, so only the container's can answer.
+const INSIDE_CLIENT: &str = "pando-test-sql";
+
+const FAKE_SQL: &str = r#"case "$*" in
+  *" ping") echo ok ;;
+  *" exists "*) if [ -f "$state/exists" ]; then echo "$last"; fi ;;
+  *" create "*) if [ -f "$state/exists" ]; then echo "exists" >&2; exit 1; fi; touch "$state/exists" ;;
+  *" drop "*) rm -f "$state/exists" ;;
+  *) echo "unexpected: $*" >&2; exit 9 ;;
+esac
+"#;
+
+/// A `[namespace]` whose client is [`INSIDE_CLIENT`].
+fn inside_recipe() -> crate::recipes::NamespaceRecipe {
+    let text = format!(
+        "kind = \"service\"\nname = \"inside\"\n\n[namespace]\nkind = \"database\"\n\
+         binaries = [\"{c}\"]\npassword_env = \"TEST_PWD\"\n\
+         ping = \"{c} -h {{host}} -p {{port}} ping\"\n\
+         exists = \"{c} -h {{host}} -p {{port}} exists {{namespace}}\"\n\
+         create = \"{c} -h {{host}} -p {{port}} create {{namespace}}\"\n\
+         drop = \"{c} -h {{host}} -p {{port}} drop {{namespace}}\"\n",
+        c = INSIDE_CLIENT
+    );
+    crate::recipes::parse(&text).unwrap().namespace.unwrap()
+}
+
+/// The fake client moved out of the host's `bin` into the container's,
+/// and a fake `docker` in the host's that publishes `published` from a
+/// container `c0ffee` listening on 5432 inside — or no container at all.
+fn containerised(published: Option<u16>) -> FakeClient {
+    use std::os::unix::fs::PermissionsExt;
+    let fake = FakeClient::new(INSIDE_CLIENT, "TEST_PWD", FAKE_SQL);
+    let inside = fake.dir.path().join("inside");
+    std::fs::create_dir_all(&inside).unwrap();
+    std::fs::rename(fake.bin().join(INSIDE_CLIENT), inside.join(INSIDE_CLIENT)).unwrap();
+    let state = fake.dir.path().display();
+    let ps = match published {
+        Some(_) => "echo c0ffee",
+        None => ":",
+    };
+    let port = published.unwrap_or(0);
+    let docker = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{state}/docker'\n\
+         case \"$1\" in\n\
+           ps) {ps} ;;\n\
+           port) echo \"5432/tcp -> 0.0.0.0:{port}\"; echo \"5432/tcp -> [::]:{port}\" ;;\n\
+           exec) shift; while [ \"$1\" = -e ]; do shift 2; done; shift; shift; shift;\n\
+             PATH='{state}/inside':\"$PATH\" exec sh -c \"$1\" ;;\n\
+         esac\n"
+    );
+    std::fs::write(fake.bin().join("docker"), docker).unwrap();
+    std::fs::set_permissions(
+        fake.bin().join("docker"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    fake
+}
+
+// A database in Docker leaves the host with no client, and the start
+// stopped saying what to install. The container that publishes the
+// server's port has its own: the commands run there, at its loopback and
+// the port inside, with the password passed by name and never written.
+#[test]
+fn a_server_in_a_container_is_reached_through_the_client_its_image_ships() {
+    let fake = containerised(Some(15432));
+    let recipe = inside_recipe();
+    let db = Server {
+        port: 15432,
+        ..server(&recipe, &fake, "db")
+    }
+    .reach();
+    assert_eq!(
+        db.runner,
+        Runner::Container {
+            id: "c0ffee".into(),
+            port: 5432
+        }
+    );
+    db.ping().unwrap();
+    assert_eq!(db.create("shop__feat_x", "shop").unwrap(), Created::Made);
+    assert!(db.exists("shop__feat_x").unwrap());
+    db.drop("shop__feat_x", "shop").unwrap();
+    assert!(!db.exists("shop__feat_x").unwrap());
+
+    let argv = fake.read("argv");
+    assert!(
+        argv.contains("-h 127.0.0.1 -p 5432 create shop__feat_x"),
+        "{argv}"
+    );
+    assert!(
+        fake.read("env").lines().all(|line| line == PASSWORD),
+        "the client inside read the password: {}",
+        fake.read("env")
+    );
+    let docker = fake.read("docker");
+    assert!(docker.contains("exec -e TEST_PWD c0ffee sh -c"), "{docker}");
+    assert!(!docker.contains("hunter2"), "{docker}");
+    let by_hand = db.by_hand("shop__feat_x").unwrap();
+    assert!(
+        by_hand.starts_with("docker exec -e 'TEST_PWD' 'c0ffee' sh -c "),
+        "{by_hand}"
+    );
+    assert!(!by_hand.contains("hunter2"), "{by_hand}");
+}
+
+// No container publishes the port: the server stays reached from here,
+// and the start says what to install, as before.
+#[test]
+fn with_no_container_the_missing_client_is_still_named() {
+    let fake = containerised(None);
+    let recipe = inside_recipe();
+    let db = Server {
+        port: 15432,
+        ..server(&recipe, &fake, "db")
+    }
+    .reach();
+    assert_eq!(db.runner, Runner::Host);
+    let e = format!("{:#}", db.ping().unwrap_err());
+    assert!(
+        e.contains(INSIDE_CLIENT) && e.contains("not on PATH"),
+        "{e}"
+    );
 }
 
 // The whole round, and the password in exactly one place: the variable the
