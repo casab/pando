@@ -570,6 +570,7 @@ fn every_desktop_has_one_row() {
         desktop::Desktop::MacOs,
         desktop::Desktop::Linux,
         desktop::Desktop::Windows,
+        desktop::Desktop::Wsl,
     ] {
         let rows = desktop::DESKTOPS
             .iter()
@@ -580,6 +581,40 @@ fn every_desktop_has_one_row() {
     for os in [Os::MacOs, Os::Linux, Os::Windows] {
         assert_eq!(desktop::row(&on(os)).desktop, desktop::Desktop::of(&on(os)));
     }
+}
+
+fn wsl_host() -> Host {
+    let system = tempfile::tempdir().unwrap();
+    crate::testutil::wsl_system(
+        system.path(),
+        crate::testutil::WSL_RELEASE,
+        crate::testutil::WSL_MOUNTS,
+    );
+    Host::at(system.path())
+}
+
+// Ubuntu on WSL ships no `xdg-open`, and `pando open` said it could not
+// run it: the browser there is Windows'. clip.exe through interop reads
+// the console's code page, so it is handed ASCII only.
+#[test]
+fn under_wsl_the_browser_and_the_clipboard_are_windows() {
+    let wsl = wsl_host();
+    assert_eq!(desktop::Desktop::of(&wsl), desktop::Desktop::Wsl);
+    let url = "http://localhost:3000/?a=1&b=2";
+    let words = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        desktop::url_openers(&wsl, url),
+        vec![
+            words(&["wslview", url]),
+            words(&["rundll32.exe", "url.dll,FileProtocolHandler", url]),
+            words(&["xdg-open", url]),
+        ]
+    );
+    assert_eq!(desktop::clipboard(&wsl, url), Some("clip.exe"));
+    assert_eq!(desktop::clipboard(&wsl, "/home/me/çalışma"), None);
+    assert!(!desktop::starts_simulators(&wsl));
+    assert_eq!(desktop::is_dark(&wsl), None);
+    assert_eq!(desktop::fallback_shell(&wsl), "/bin/sh");
 }
 
 // Windows' URL handler takes the URL as one argument; `cmd /c start`
