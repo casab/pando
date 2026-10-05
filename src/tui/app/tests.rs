@@ -4574,6 +4574,7 @@ fn env(tmux: bool, shell: Option<&str>, visual: Option<&str>, editor: Option<&st
         visual: visual.map(str::to_string),
         editor: editor.map(str::to_string),
         browser: None,
+        host: crate::platform::Host::default(),
     }
 }
 

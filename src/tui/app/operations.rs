@@ -654,6 +654,7 @@ impl App {
     ) {
         let paths = self.paths.clone();
         let config = self.config.clone();
+        let host = self.launch_env.host.clone();
         let tx = self.event_tx.clone();
         let label = label.to_string();
         thread::spawn(move || {
@@ -663,7 +664,7 @@ impl App {
                 return;
             }
             let run = |command: &str| actions::run_command(&paths, command);
-            let opener = actions::Opener::new(&run);
+            let opener = actions::Opener::new(&run, &host);
             let say = |line: &str| {
                 let _ = tx.send(AppEvent::AppOpening(line.to_string()));
             };
@@ -710,8 +711,11 @@ impl App {
     /// fails says so, rather than leaving `opened …` on screen alone.
     #[cfg(not(test))]
     fn open_url(&mut self, url: &str) {
-        let commands =
-            crate::env_command::browser_commands(self.launch_env.browser.as_deref(), url);
+        let commands = crate::env_command::browser_commands(
+            self.launch_env.browser.as_deref(),
+            url,
+            &self.launch_env.host,
+        );
         let url = url.to_string();
         let tx = self.event_tx.clone();
         thread::spawn(move || {
@@ -808,13 +812,14 @@ impl App {
     }
 
     /// OSC 52 first: it works on Linux and macOS, and through tmux with
-    /// `set-clipboard on`. `pbcopy` is a macOS-only fallback for terminals
-    /// that ignore the sequence; it is spawned with every stdio redirected,
-    /// never inheriting the alternate screen.
+    /// `set-clipboard on`. The desktop's clipboard program, where it has
+    /// one ([`crate::platform::desktop::clipboard`]), is the fallback for
+    /// terminals that ignore the sequence; it is spawned with every stdio
+    /// redirected, never inheriting the alternate screen.
     ///
     /// The escape sequence is written from here — it is one `write` to the
     /// terminal pando already owns — but the child is not. `y` is a key
-    /// handler, and waiting for `pbcopy` to drain its stdin there is a
+    /// handler, and waiting for the program to drain its stdin there is a
     /// blocking wait on a child inside the frame, so it goes to a detached
     /// thread exactly as the browser opener does.
     #[cfg(not(test))]
@@ -824,12 +829,12 @@ impl App {
         let _ = write!(stdout, "\x1b]52;c;{}\x07", base64(text.as_bytes()));
         let _ = stdout.flush();
 
-        if !cfg!(target_os = "macos") {
+        let Some(program) = crate::platform::desktop::clipboard(&self.launch_env.host, text) else {
             return;
-        }
+        };
         let text = text.to_string();
         thread::spawn(move || {
-            let Ok(mut child) = std::process::Command::new("pbcopy")
+            let Ok(mut child) = std::process::Command::new(program)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -841,7 +846,7 @@ impl App {
                 let _ = stdin.write_all(text.as_bytes());
             }
             // Taking the handle above closed pando's end of the pipe, so
-            // `pbcopy` sees EOF; this reaps it rather than leaving a
+            // the program sees EOF; this reaps it rather than leaving a
             // zombie behind every yank. It blocks a worker thread, which
             // is what worker threads are for.
             let _ = child.wait_with_output();

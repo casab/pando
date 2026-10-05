@@ -24,7 +24,6 @@ const NOT_YET: &[&str] = &[
     "config/schema.rs",
     "cow.rs",
     "doctor/config.rs",
-    "env_command.rs",
     "hooks.rs",
     "log_tail.rs",
     "native.rs",
@@ -35,9 +34,6 @@ const NOT_YET: &[&str] = &[
     "services.rs",
     "state.rs",
     "term.rs",
-    "theme/select.rs",
-    "tui/app/launch.rs",
-    "tui/app/operations.rs",
     "tui/render/mod.rs",
     "tunnel.rs",
 ];
@@ -208,4 +204,58 @@ fn the_platform_layer_imports_nothing_above_it() {
 fn no_test_sees_the_machine_it_runs_on() {
     assert_eq!(Host::here(), &Host::default());
     assert_eq!(Host::here().os, Os::HERE);
+}
+
+// ---- desktop ---------------------------------------------------------
+
+fn on(os: Os) -> Host {
+    Host { os }
+}
+
+#[test]
+fn every_desktop_has_one_row() {
+    for desktop in [desktop::Desktop::MacOs, desktop::Desktop::Linux] {
+        let rows = desktop::DESKTOPS
+            .iter()
+            .filter(|row| row.desktop == desktop)
+            .count();
+        assert_eq!(rows, 1, "{desktop:?}");
+    }
+    for os in [Os::MacOs, Os::Linux] {
+        assert_eq!(desktop::row(&on(os)).desktop, desktop::Desktop::of(&on(os)));
+    }
+}
+
+// The URL is one argument, given last: an `&` in it is never a shell's.
+#[test]
+fn a_url_is_opened_with_the_desktops_own_program_as_its_last_argument() {
+    let url = "http://localhost:3000/?a=1&b=2";
+    let opened = |os| desktop::url_openers(&on(os), url);
+    assert_eq!(
+        opened(Os::MacOs),
+        vec![vec!["open".to_string(), url.into()]]
+    );
+    assert_eq!(
+        opened(Os::Linux),
+        vec![vec!["xdg-open".to_string(), url.into()]]
+    );
+}
+
+#[test]
+fn macos_copies_any_text_and_linux_leaves_it_to_osc_52() {
+    for text in ["/tmp/x", "/home/me/çalışma"] {
+        assert_eq!(desktop::clipboard(&on(Os::MacOs), text), Some("pbcopy"));
+        assert_eq!(desktop::clipboard(&on(Os::Linux), text), None);
+    }
+}
+
+#[test]
+fn only_macos_starts_a_simulator_and_says_whether_it_is_dark() {
+    assert!(desktop::starts_simulators(&on(Os::MacOs)));
+    assert!(!desktop::starts_simulators(&on(Os::Linux)));
+    assert!(desktop::row(&on(Os::MacOs)).dark_mode.is_some());
+    assert_eq!(desktop::is_dark(&on(Os::Linux)), None, "nothing to ask");
+    for os in [Os::MacOs, Os::Linux] {
+        assert_eq!(desktop::fallback_shell(&on(os)), "/bin/sh");
+    }
 }

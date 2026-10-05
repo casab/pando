@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use super::App;
 use crate::env_command;
+use crate::platform::{Host, desktop};
 
 /// What the environment says about how to leave pando, read once at
 /// startup rather than in a key handler, and injected by tests.
@@ -23,6 +24,9 @@ pub struct LaunchEnv {
     pub editor: Option<String>,
     /// `$BROWSER`: what `o` and `O` open a URL with, as `pando open` does.
     pub browser: Option<String>,
+    /// The machine: what its desktop opens and copies with, and the shell
+    /// to fall back on.
+    pub host: Host,
 }
 
 impl LaunchEnv {
@@ -34,6 +38,7 @@ impl LaunchEnv {
             visual: var("VISUAL"),
             editor: var("EDITOR"),
             browser: var("BROWSER"),
+            host: Host::here().clone(),
         }
     }
 }
@@ -168,7 +173,10 @@ pub fn plan_shell(env: &LaunchEnv, path: &Path, label: &str) -> LaunchRequest {
             ),
         };
     }
-    let shell = env.shell.clone().unwrap_or_else(|| "/bin/sh".to_string());
+    let shell = env
+        .shell
+        .clone()
+        .unwrap_or_else(|| desktop::fallback_shell(&env.host).to_string());
     LaunchRequest {
         launch: Launch::Suspend {
             program: shell,
