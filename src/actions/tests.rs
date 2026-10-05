@@ -11981,6 +11981,47 @@ fn a_compose_postgres_image_of_another_name_gets_a_namespace_as_postgres() {
     assert_eq!(target.namespace.max_name(), 63);
 }
 
+/// A recipe for an engine pando never starts, only finds in a container:
+/// what a namespace is there, and nothing about running the server.
+const CLICKHOUSE_NAMESPACE_ONLY: &str = "kind = \"service\"\nname = \"clickhouse\"\n\n\
+    [namespace]\nkind = \"database\"\nbinaries = [\"clickhouse-client\"]\n\
+    ping = \"clickhouse-client --host {host} --port {port} -q 'SELECT 1'\"\n\
+    exists = \"e\"\ncreate = \"c\"\ndrop = \"d\"\n";
+
+// An engine only a compose file runs had no way into namespaced mode: a
+// `[namespace]` needed a native `[service]` beside it. A file of the
+// developer's own that says only what a namespace is there is enough now.
+#[test]
+fn a_compose_engine_gets_a_namespace_from_a_recipe_that_starts_no_server() {
+    let mut fx = compose_fixture(
+        "services:\n  warehouse:\n    image: clickhouse/clickhouse-server:24\n\
+         ports: [\"9000:9000\"]\n",
+        "PORT=3000\nCLICKHOUSE_URL=clickhouse://app@localhost:9000/events\n",
+    );
+    let config: Config = toml::from_str(
+        "[[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
+         include = [\"warehouse\"]\nenv = { CLICKHOUSE_URL = \"warehouse\" }\n",
+    )
+    .unwrap();
+    fx.config.services = config.services;
+    let plan = super::namespaced::plan(&fx.paths, &fx.config);
+    assert_eq!(plan.targets.len(), 0, "no recipe yet: {:?}", plan.shared);
+
+    std::fs::create_dir_all(fx.paths.recipes_dir()).unwrap();
+    std::fs::write(
+        fx.paths.recipes_dir().join("clickhouse-server.toml"),
+        CLICKHOUSE_NAMESPACE_ONLY.replace("name = \"clickhouse\"", "name = \"clickhouse-server\""),
+    )
+    .unwrap();
+    let plan = super::namespaced::plan(&fx.paths, &fx.config);
+    assert!(plan.shared.is_empty(), "{:?}", plan.shared);
+    let target = &plan.targets[0];
+    assert_eq!(
+        (target.recipe.as_str(), target.main.as_str(), target.port),
+        ("clickhouse-server", "events", 9000)
+    );
+}
+
 // A start asks compose what is already running first, so a failure after
 // it stops only what the start brought up. A `ps` that failed — a Docker
 // too loaded to answer in time — read as "nothing is running", and the

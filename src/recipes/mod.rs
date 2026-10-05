@@ -337,6 +337,11 @@ pub struct LanguageRecipe {
 pub enum Body {
     Service(ServiceRecipe),
     Language(LanguageRecipe),
+    /// A service recipe with no `[service]`: it knows how a worktree gets
+    /// data of its own in a server somebody else runs — a container the
+    /// main checkout's compose file starts — and nothing about starting
+    /// one. A `[[services]]` entry cannot run it natively.
+    NamespaceOnly,
 }
 
 /// One recipe, envelope and body.
@@ -378,7 +383,7 @@ impl Recipe {
     pub fn service(&self) -> Option<&ServiceRecipe> {
         match &self.body {
             Body::Service(s) => Some(s),
-            Body::Language(_) => None,
+            Body::Language(_) | Body::NamespaceOnly => None,
         }
     }
 
@@ -387,14 +392,29 @@ impl Recipe {
     pub fn service_mut(&mut self) -> Option<&mut ServiceRecipe> {
         match &mut self.body {
             Body::Service(s) => Some(s),
-            Body::Language(_) => None,
+            Body::Language(_) | Body::NamespaceOnly => None,
         }
     }
 
     pub fn language(&self) -> Option<&LanguageRecipe> {
         match &self.body {
             Body::Language(l) => Some(l),
+            Body::Service(_) | Body::NamespaceOnly => None,
+        }
+    }
+
+    /// Why a `[[services]]` entry naming this recipe cannot start a server
+    /// from it, when it cannot: a language recipe, or one that only knows
+    /// how a server somebody else runs is namespaced.
+    pub fn starts_no_server(&self) -> Option<String> {
+        match &self.body {
             Body::Service(_) => None,
+            Body::Language(_) => Some(format!("{:?} is a language recipe", self.name)),
+            Body::NamespaceOnly => Some(format!(
+                "{:?} only says how a worktree gets data of its own in a server somebody else \
+                 runs, not how to start one — run it from the compose file",
+                self.name
+            )),
         }
     }
 
@@ -599,7 +619,7 @@ impl Recipes {
     pub fn service_names(&self) -> Vec<&str> {
         self.entries
             .iter()
-            .filter(|(_, l)| l.recipe.kind == Kind::Service)
+            .filter(|(_, l)| l.recipe.service().is_some())
             .map(|(name, _)| name.as_str())
             .collect()
     }
@@ -658,13 +678,24 @@ pub fn parse(text: &str) -> Result<Recipe> {
             if raw.language.is_some() {
                 bail!("a `kind = \"service\"` recipe may not carry a `[language]` table");
             }
-            let service = raw
-                .service
-                .context("a `kind = \"service\"` recipe needs a `[service]` table")?;
-            if service.cmd.trim().is_empty() {
-                bail!("`[service] cmd` is what starts the server, and it must not be empty");
+            match raw.service {
+                Some(service) => {
+                    if service.cmd.trim().is_empty() {
+                        bail!(
+                            "`[service] cmd` is what starts the server, and it must not be empty"
+                        );
+                    }
+                    Body::Service(service)
+                }
+                // An engine pando never starts, only finds in a container:
+                // what it knows is how a worktree gets data of its own there.
+                None if raw.namespace.is_some() => Body::NamespaceOnly,
+                None => bail!(
+                    "a `kind = \"service\"` recipe needs a `[service]` table that starts the \
+                     server, or a `[namespace]` that says how a worktree gets data of its own \
+                     in one somebody else runs"
+                ),
             }
-            Body::Service(service)
         }
         Kind::Language => {
             if raw.service.is_some() {
@@ -945,6 +976,38 @@ mod tests {
             recipe.namespace.unwrap().address(),
             AddressRecipe::of_kind(crate::state::NamespaceKind::Slot)
         );
+    }
+
+    /// A service recipe may know only how a worktree gets data of its own
+    /// in a server somebody else runs; one that knows neither that nor how
+    /// to start one is refused, and none of it can be run natively.
+    #[test]
+    fn a_recipe_may_know_only_a_namespace_and_never_starts_a_server() {
+        let recipe = parse(
+            "kind = \"service\"\nname = \"ch\"\n\n[namespace]\nkind = \"database\"\n\
+             ping = \"p\"\ndrop = \"d\"\ncreate = \"c\"\nexists = \"e\"\n",
+        )
+        .unwrap();
+        assert_eq!(recipe.body, Body::NamespaceOnly);
+        assert!(recipe.service().is_none());
+        let why = recipe.starts_no_server().unwrap();
+        assert!(why.contains("not how to start one"), "{why}");
+        let e = format!(
+            "{:#}",
+            parse("kind = \"service\"\nname = \"ch\"\n").unwrap_err()
+        );
+        assert!(e.contains("or a `[namespace]`"), "{e}");
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("ch.toml"),
+            "kind = \"service\"\nname = \"ch\"\n\n[namespace]\nkind = \"database\"\n\
+             ping = \"p\"\ndrop = \"d\"\ncreate = \"c\"\nexists = \"e\"\n",
+        )
+        .unwrap();
+        let recipes = Recipes::load(dir.path());
+        assert!(recipes.get("ch").is_ok());
+        assert!(!recipes.service_names().contains(&"ch"));
     }
 
     /// The built-ins say their address in their own files, and what they

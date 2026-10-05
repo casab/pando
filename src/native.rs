@@ -231,12 +231,13 @@ pub fn resolve(recipes: &crate::recipes::Recipes, entry: &Entry<'_>) -> Result<R
             .with_context(|| format!("the service {:?} names the recipe {preset:?}", entry.name))?;
         (loaded.recipe.clone(), Source::Recipe(loaded.origin.clone()))
     };
-    let name = recipe.name.clone();
+    let why = recipe.starts_no_server();
     let service = recipe.service_mut().with_context(|| {
         format!(
-            "the service {:?} names the recipe {name:?}, which is a language recipe — a \
-             [[services]] entry needs one that starts a server",
-            entry.name
+            "the service {:?} names the recipe {}: a [[services]] entry needs one that starts a \
+             server",
+            entry.name,
+            why.unwrap_or_default()
         )
     })?;
     let mut overrides = Vec::new();
@@ -397,9 +398,8 @@ impl Native {
     fn service_recipe(&self) -> Result<&crate::recipes::ServiceRecipe> {
         self.recipe.service().with_context(|| {
             format!(
-                "the recipe {:?} is a language recipe, and a [[services]] entry needs one that \
-                 starts a server",
-                self.recipe.name
+                "the recipe {}, and a [[services]] entry needs one that starts a server",
+                self.recipe.starts_no_server().unwrap_or_default()
             )
         })
     }
@@ -1541,6 +1541,26 @@ mod tests {
         .unwrap();
         let e = format!("{:#}", native.ensure_init(QUIET).unwrap_err());
         assert!(e.contains("language recipe"), "{e}");
+        assert!(e.contains("starts a server"), "{e}");
+    }
+
+    #[test]
+    fn a_recipe_that_only_knows_a_namespace_in_a_services_entry_is_refused_by_name() {
+        let fx = fixture();
+        let native = Native::plan(
+            &fx.paths,
+            "feat+one",
+            "warehouse",
+            recipe(
+                "kind = \"service\"\nname = \"ch\"\n\n[namespace]\nkind = \"database\"\n\
+                 ping = \"p\"\ndrop = \"d\"\ncreate = \"c\"\nexists = \"e\"\n",
+            ),
+            17_400,
+            None,
+        )
+        .unwrap();
+        let e = format!("{:#}", native.ensure_init(QUIET).unwrap_err());
+        assert!(e.contains("run it from the compose file"), "{e}");
         assert!(e.contains("starts a server"), "{e}");
     }
 
