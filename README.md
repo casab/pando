@@ -11,7 +11,7 @@
   <a href="https://github.com/mertkaradayi/pando/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/mertkaradayi/pando/ci.yml?branch=main&style=flat-square&label=ci"></a>
   <img alt="Rust 2024 edition" src="https://img.shields.io/badge/rust-2024_edition-e6963c?style=flat-square&logo=rust">
   <img alt="Platform: macOS and Linux" src="https://img.shields.io/badge/platform-macOS_|_Linux-6e9beb?style=flat-square">
-  <img alt="Version 0.8.2, pre-release" src="https://img.shields.io/badge/version-0.8.2_pre--release-b482e6?style=flat-square">
+  <img alt="Version 0.8.3, pre-release" src="https://img.shields.io/badge/version-0.8.3_pre--release-b482e6?style=flat-square">
   <a href="CONTRIBUTING.md"><img alt="PRs welcome" src="https://img.shields.io/badge/PRs-welcome-50c878?style=flat-square"></a>
   <a href="https://github.com/mertkaradayi/pando/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/mertkaradayi/pando?style=flat-square&logo=github&color=ebc34b"></a>
 </p>
@@ -652,7 +652,7 @@ taking part follows the [code of conduct](CODE_OF_CONDUCT.md).
 
 ## Status
 
-Version 0.8.2, released as binaries for macOS and Linux. Every command above is
+Version 0.8.3, released as binaries for macOS and Linux. Every command above is
 implemented and covered by tests, in this order: worktrees and their
 lifecycle; detached dev servers with their own ports, logs and readiness;
 several processes per worktree; the log viewer; private per-worktree
@@ -687,7 +687,10 @@ its branch changed, and `clone` does the same for dependencies before
 the install. 0.8.1 gives namespaced mode Postgres: a database of the
 worktree's own in the main checkout's server, found through the env
 files where the app keeps them. 0.8.2 adds `pando update`, which updates
-pando the way it was installed. What changed in each version is in the [changelog](CHANGELOG.md).
+pando the way it was installed. 0.8.3 proposes `clone` for the
+`node_modules` the main checkout has, so a new worktree shares its
+dependencies too, and the setup agent asks nothing: it decides what the
+rules leave open and reports what it set. What changed in each version is in the [changelog](CHANGELOG.md).
 
 macOS is what it is developed on. CI runs the whole test suite on macOS
 and on Linux for every change, and both pass — but the suite runs on

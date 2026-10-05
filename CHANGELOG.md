@@ -7,6 +7,8 @@ may change behaviour.
 
 ## Unreleased
 
+## 0.8.3 — 2026-10-05
+
 ### Added
 
 - `clone` is the eleventh question: detection proposes the gitignored
