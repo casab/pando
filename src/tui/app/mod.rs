@@ -191,10 +191,11 @@ impl Status {
 pub struct App {
     pub paths: PandoPaths,
     pub config: Config,
-    /// The services a namespaced start leaves on the main checkout's data,
-    /// and why: read from the env files once per config, not on every
-    /// paint. Emptied wherever `config` is replaced.
-    pub namespace_shared: std::cell::OnceCell<Vec<(String, String)>>,
+    /// What a namespaced start does with each service it makes nothing in
+    /// — a prefix of the worktree's own, or main's data and why: read from
+    /// the env files once per config, not on every paint. Emptied wherever
+    /// `config` is replaced.
+    pub namespace_plan: std::cell::OnceCell<Vec<crate::actions::PlanRow>>,
     /// What each device app's manifests say about opening it, by its
     /// directory: read once per config, not on every paint. Emptied
     /// wherever `config` is replaced.
@@ -365,7 +366,7 @@ impl App {
         let mut app = Self {
             paths,
             config,
-            namespace_shared: std::cell::OnceCell::new(),
+            namespace_plan: std::cell::OnceCell::new(),
             app_manifests: Default::default(),
             main: None,
             default_base: None,
@@ -660,7 +661,7 @@ impl App {
     /// session's config changes while it runs.
     pub(super) fn adopt_config(&mut self, config: Config) {
         self.config = config;
-        self.namespace_shared = std::cell::OnceCell::new();
+        self.namespace_plan = std::cell::OnceCell::new();
         self.app_manifests = Default::default();
         // Only ever cleared here, never concluded: a config file with no
         // process in it is what `new` writes, and a start is what asks for
@@ -1571,7 +1572,7 @@ impl App {
         let mut app = Self {
             paths,
             config,
-            namespace_shared: std::cell::OnceCell::new(),
+            namespace_plan: std::cell::OnceCell::new(),
             app_manifests: Default::default(),
             main: None,
             default_base: Some("main".into()),

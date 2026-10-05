@@ -71,6 +71,13 @@ pub struct LoginConfig {
     /// shares may say it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recipe: Option<String>,
+    /// The env keys the app reads a prefix from, to put on every name it
+    /// makes in this service: `ELASTICSEARCH_INDEX_PREFIX`, `KAFKA_TOPIC_PREFIX`.
+    /// Each is set to the worktree's own, the main checkout's value with
+    /// the worktree's slug after it, whether or not the main checkout's
+    /// env files set it: the project says its app reads it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prefix_env: Vec<String>,
 }
 
 impl LoginConfig {
@@ -87,6 +94,7 @@ impl std::fmt::Debug for LoginConfig {
             .field("password", &self.password.as_ref().map(|_| "(hidden)"))
             .field("db_env", &self.db_env)
             .field("recipe", &self.recipe)
+            .field("prefix_env", &self.prefix_env)
             .finish()
     }
 }

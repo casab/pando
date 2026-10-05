@@ -1152,7 +1152,9 @@ fn a_slot_key_beside_no_address_is_found_through_db_env() {
         keys: target.keys.clone(),
         used_at: Utc::now(),
     };
-    let env = super::namespaced::namespaced_env(&fx.paths, &fx.config, &plan, &[record]).unwrap();
+    let env =
+        super::namespaced::namespaced_env(&fx.paths, &fx.config, &plan, &[record], "feat+one")
+            .unwrap();
     assert_eq!(env.get("REDIS_DB").map(String::as_str), Some("5"));
 
     // What it names has to be there, and be a slot.
@@ -12029,6 +12031,164 @@ fn a_project_names_the_recipe_an_unknown_image_is() {
     );
     assert!(line.contains("\"postgress\""), "{line}");
     assert_eq!(plan.shared_data, ["db"]);
+}
+
+// ---- prefixes -------------------------------------------------------------
+
+/// A compose project with a search engine at `ELASTICSEARCH_URL`, and
+/// whatever else `env` sets beside it.
+fn search_fixture(image: &str, env: &str) -> Fx {
+    let mut fx = compose_fixture(
+        &format!("services:\n  search:\n    image: {image}\n    ports: [\"9200:9200\"]\n"),
+        &format!("PORT=3000\nELASTICSEARCH_URL=http://localhost:9200\n{env}"),
+    );
+    let config: Config = toml::from_str(
+        "[[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
+         include = [\"search\"]\nenv = { ELASTICSEARCH_URL = \"search\" }\n",
+    )
+    .unwrap();
+    fx.config.services = config.services;
+    fx
+}
+
+// Elasticsearch has no namespace pando could make: an index is the app's.
+// An app that reads an index prefix beside the address gets one of the
+// worktree's own, and the search stays its data, not main's.
+#[test]
+fn an_app_that_reads_an_index_prefix_gets_the_worktrees_own() {
+    let fx = search_fixture("elasticsearch:8.15.0", "ELASTICSEARCH_INDEX_PREFIX=\n");
+    let plan = super::namespaced::plan(&fx.paths, &fx.config);
+    assert!(plan.shared.is_empty(), "{:?}", plan.shared);
+    assert!(plan.targets.is_empty());
+    assert_eq!(
+        plan.prefixed,
+        [super::namespaced::Prefixed {
+            service: "search".into(),
+            keys: vec![("ELASTICSEARCH_INDEX_PREFIX".into(), String::new())],
+        }]
+    );
+    assert_eq!(
+        plan.not_own_data(),
+        None,
+        "the search is the worktree's own"
+    );
+    let env =
+        super::namespaced::namespaced_env(&fx.paths, &fx.config, &plan, &[], "feat+one").unwrap();
+    assert_eq!(env["ELASTICSEARCH_INDEX_PREFIX"], "feat_one__");
+    assert_eq!(env["PANDO_NAMESPACE"], "feat_one");
+    assert_eq!(
+        plan.prefixed[0].describe("feat+one"),
+        "prefix feat_one__ in ELASTICSEARCH_INDEX_PREFIX"
+    );
+}
+
+// One that reads none stays shared, and says what it would have to read
+// and how a project names a key of its own.
+#[test]
+fn an_app_that_reads_no_prefix_stays_shared_and_says_which_it_would_read() {
+    let fx = search_fixture("opensearchproject/opensearch:2", "");
+    let plan = super::namespaced::plan(&fx.paths, &fx.config);
+    assert!(plan.prefixed.is_empty());
+    let line = &plan.shared_lines()[0];
+    assert!(
+        line.starts_with("search: shared — the app reads no prefix"),
+        "{line}"
+    );
+    assert!(line.contains("_INDEX_PREFIX or _PREFIX"), "{line}");
+    assert!(line.contains("[namespaced.search] prefix_env"), "{line}");
+    assert_eq!(plan.shared_data, ["search"]);
+}
+
+// A project names the key its app reads a prefix from, for any service —
+// one no recipe knows included — and the worktree's is the main
+// checkout's value with its own slug after it.
+#[test]
+fn a_project_names_the_prefix_key_of_any_service() {
+    let mut fx = search_fixture("registry.example/search:3", "SEARCH_NAMESPACE=shop\n");
+    fx.config.namespaced.insert(
+        "search".into(),
+        crate::config::LoginConfig {
+            prefix_env: vec!["SEARCH_NAMESPACE".into(), "SEARCH_TOPICS".into()],
+            ..Default::default()
+        },
+    );
+    let plan = super::namespaced::plan(&fx.paths, &fx.config);
+    assert!(plan.shared.is_empty(), "{:?}", plan.shared);
+    let env =
+        super::namespaced::namespaced_env(&fx.paths, &fx.config, &plan, &[], "feat+one").unwrap();
+    assert_eq!(env["SEARCH_NAMESPACE"], "shop_feat_one__");
+    // Named by the project, set whether or not main sets it.
+    assert_eq!(env["SEARCH_TOPICS"], "feat_one__");
+
+    fx.config.namespaced.get_mut("search").unwrap().prefix_env = vec!["not a key".into()];
+    let plan = super::namespaced::plan(&fx.paths, &fx.config);
+    assert!(plan.prefixed.is_empty());
+    assert!(
+        plan.shared_lines()[0].contains("prefix_env names \"not a key\""),
+        "{:?}",
+        plan.shared_lines()
+    );
+}
+
+// A Redis the app names no slot for — or a Redis Cluster, which has slot 0
+// alone — keeps a worktree's keys apart by the prefix the app reads, as
+// Laravel reads `REDIS_PREFIX`. A slot, when there is one, still wins.
+#[test]
+fn a_redis_with_no_slot_setting_gets_a_key_prefix_when_the_app_reads_one() {
+    let mut fx = fixture();
+    let services: Config = toml::from_str(
+        "[[services]]\nkind = \"native\"\nname = \"redis\"\n\
+         env = { REDIS_HOST = \"redis\", REDIS_PORT = \"redis\" }\n",
+    )
+    .unwrap();
+    fx.config.services = services.services;
+    std::fs::write(
+        fx.root.join(".env"),
+        "REDIS_HOST=127.0.0.1\nREDIS_PORT=6379\nREDIS_PREFIX=laravel_database_\n",
+    )
+    .unwrap();
+    let plan = super::namespaced::plan(&fx.paths, &fx.config);
+    assert!(
+        plan.targets.is_empty() && plan.shared.is_empty(),
+        "{plan:?}"
+    );
+    let env =
+        super::namespaced::namespaced_env(&fx.paths, &fx.config, &plan, &[], "feat+one").unwrap();
+    assert_eq!(env["REDIS_PREFIX"], "laravel_database_feat_one__");
+
+    std::fs::write(
+        fx.root.join(".env"),
+        "REDIS_HOST=127.0.0.1\nREDIS_PORT=6379\nREDIS_DB=0\nREDIS_PREFIX=laravel_database_\n",
+    )
+    .unwrap();
+    let plan = super::namespaced::plan(&fx.paths, &fx.config);
+    assert_eq!(plan.targets.len(), 1);
+    assert!(plan.prefixed.is_empty());
+}
+
+// `rm` drops only what pando made. Under a prefix pando made nothing, so it
+// drops nothing there, and says what it leaves.
+#[test]
+fn rm_of_a_prefixed_worktree_leaves_what_the_app_wrote_and_says_so() {
+    let fx = search_fixture("elasticsearch:8", "ELASTICSEARCH_INDEX_PREFIX=\n");
+    // `rm` reads the config from pando's own file, not from memory.
+    std::fs::create_dir_all(fx.paths.config_file().parent().unwrap()).unwrap();
+    std::fs::write(
+        fx.paths.config_file(),
+        "[[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
+         include = [\"search\"]\nenv = { ELASTICSEARCH_URL = \"search\" }\n",
+    )
+    .unwrap();
+    let mut record = WorktreeRecord::new("/abs/feat_one".to_string(), true);
+    record.mode = Some(crate::state::ServiceMode::Namespaced);
+    let mut store = crate::state::State::default();
+    store.worktrees.insert("feat+one".into(), record);
+    let left = super::namespaced::drop_namespaces(&fx.paths, &store, "feat+one", &noop);
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert!(
+        left[0].starts_with("search: what the app wrote under feat_one__ is left"),
+        "{left:?}"
+    );
 }
 
 /// A recipe for an engine pando never starts, only finds in a container:

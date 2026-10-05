@@ -1,0 +1,13 @@
+# Meilisearch and Typesense.
+#
+# pando never starts one; this recipe says only how a namespaced worktree
+# gets data of its own in the main checkout's: an index prefix, beside the
+# address the app reads — `MEILISEARCH_INDEX_PREFIX` next to
+# `MEILISEARCH_URL`. The indexes are the app's; pando makes and drops none.
+kind = "service"
+name = "meilisearch"
+aliases = ["typesense"]
+summary = "Meilisearch / Typesense: an index prefix of the worktree's own in the main checkout's"
+
+[prefix]
+keys = ["_INDEX_PREFIX", "_PREFIX"]

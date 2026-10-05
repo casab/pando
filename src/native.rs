@@ -220,6 +220,7 @@ pub fn resolve(recipes: &crate::recipes::Recipes, entry: &Entry<'_>) -> Result<R
                 install: None,
                 notes: None,
                 namespace: None,
+                prefix: None,
                 untested: false,
                 body: crate::recipes::Body::Service(crate::recipes::ServiceRecipe::default()),
             },
@@ -1571,7 +1572,11 @@ mod tests {
         // *placeholder* to pando's own lexer, so a recipe that writes it
         // unescaped fails at the readiness check of an engine nobody
         // here can run — which is to say, in front of a user.
-        for (name, _) in Recipes::built_in().entries() {
+        for (name, loaded) in Recipes::built_in().entries() {
+            // One that starts no server has no command of its own to render.
+            if loaded.recipe.service().is_none() {
+                continue;
+            }
             let recipe = Recipes::built_in().get(name).unwrap().recipe.clone();
             let native = Native::plan(
                 &fx.paths,

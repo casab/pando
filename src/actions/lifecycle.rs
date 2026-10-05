@@ -857,7 +857,7 @@ fn start_checked(
             resolve_service_env(paths, config, &canonical, &assignment.ports).map_err(undo)?
         }
         (Some(ready), false) => {
-            namespaced::namespaced_env(paths, config, &ready.plan, &ready.namespaces)?
+            namespaced::namespaced_env(paths, config, &ready.plan, &ready.namespaces, name)?
         }
         (None, false) => shared_service_env(paths, config),
     };

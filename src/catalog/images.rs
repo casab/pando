@@ -91,7 +91,7 @@ const fn utility(name: &'static str, ports: &'static [u16]) -> Image {
 
 const POSTGRES: &[&str] = &["DATABASE", "DB", "POSTGRES", "PG", "POSTGRESQL"];
 
-pub const IMAGES: [Image; 21] = [
+pub const IMAGES: [Image; 24] = [
     engine("postgres", "postgres", POSTGRES, &[5432]),
     engine(
         "postgis",
@@ -122,17 +122,36 @@ pub const IMAGES: [Image; 21] = [
         &["MONGO", "MONGODB", "DATABASE"],
         &[27017],
     ),
-    app(
+    engine(
+        "elasticsearch",
         "elasticsearch",
         &["ELASTIC", "ELASTICSEARCH", "SEARCH"],
         &[9200],
+    ),
+    engine(
+        "opensearch",
+        "elasticsearch",
+        &["OPENSEARCH", "ELASTIC", "SEARCH"],
+        &[9200],
+    ),
+    engine(
+        "meilisearch",
+        "meilisearch",
+        &["MEILI", "MEILISEARCH", "SEARCH"],
+        &[7700],
+    ),
+    engine(
+        "memcached",
+        "memcached",
+        &["MEMCACHED", "MEMCACHE", "CACHE"],
+        &[11211],
     ),
     app(
         "rabbitmq",
         &["RABBITMQ", "AMQP", "QUEUE", "BROKER"],
         &[5672, 15672],
     ),
-    app("kafka", &["KAFKA", "BROKER"], &[]),
+    engine("kafka", "kafka", &["KAFKA", "BROKER"], &[]),
     app("minio", &["MINIO", "S3", "STORAGE"], &[9000, 9001]),
     app("clickhouse", &["CLICKHOUSE"], &[]),
     utility("mailpit", &[8025, 1025]),

@@ -1,0 +1,14 @@
+# Kafka, and what speaks its protocol (Redpanda).
+#
+# pando never starts one; this recipe says only how a namespaced worktree
+# gets data of its own in the main checkout's broker: a topic prefix,
+# beside the address the app reads — `KAFKA_TOPIC_PREFIX` next to
+# `KAFKA_URL`. Topics, and the consumer groups an app names the same way,
+# are the app's; pando makes and drops none of them.
+kind = "service"
+name = "kafka"
+aliases = ["redpanda"]
+summary = "Kafka: a topic prefix of the worktree's own in the main checkout's broker"
+
+[prefix]
+keys = ["_TOPIC_PREFIX", "_PREFIX"]

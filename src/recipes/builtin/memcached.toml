@@ -1,0 +1,14 @@
+# Memcached.
+#
+# One flat keyspace, with nothing to list or select, so the only way a
+# worktree's keys stay its own is a prefix the app puts on every key:
+# `MEMCACHED_PREFIX` next to `MEMCACHED_HOST`. pando starts none and
+# empties none; an app that reads no prefix stays shared, and the start
+# says so.
+kind = "service"
+name = "memcached"
+aliases = ["memcache"]
+summary = "Memcached: a key prefix of the worktree's own in the main checkout's"
+
+[prefix]
+keys = ["_PREFIX", "_KEY_PREFIX"]

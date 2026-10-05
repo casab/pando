@@ -772,16 +772,10 @@ fn namespace_rows<'a>(app: &App, name: &str, width: usize) -> Vec<Line<'a>> {
         })
         .collect();
     if namespaced_now {
-        let shared = app.namespace_shared.get_or_init(|| {
-            crate::actions::namespace_lines(&app.paths, Some(&app.config), record)
-                .into_iter()
-                .filter(|(_, word, _)| *word == "shared")
-                .map(|(service, _, why)| (service, why))
-                .collect()
-        });
-        for (service, why) in shared {
-            rows.push((service.clone(), "shared", why.clone()));
-        }
+        let plan = app
+            .namespace_plan
+            .get_or_init(|| crate::actions::namespace_plan_rows(&app.paths, &app.config));
+        rows.extend(plan.iter().map(|row| row.line(name)));
     }
     let label_width = rows
         .iter()

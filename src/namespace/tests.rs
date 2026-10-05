@@ -20,6 +20,22 @@ fn the_checks_database_is_a_plain_name_under_the_marker() {
     assert!(hashed.starts_with("shop__pando_check_"), "{hashed}");
 }
 
+// A prefix is the worktree's slug with the marker after it, joined to the
+// main checkout's own so the app's names still read as the project's:
+// one worktree's can be told from main's and from another's by name.
+#[test]
+fn a_worktrees_prefix_is_its_slug_and_the_marker_after_main_s() {
+    assert_eq!(worktree_prefix("", "feat+x"), "feat_x__");
+    assert_eq!(worktree_prefix("shop", "feat+x"), "shop_feat_x__");
+    assert_eq!(worktree_prefix("laravel_", "feat+x"), "laravel_feat_x__");
+    assert_eq!(worktree_prefix("app-", "Fix/Login"), "app-fix_login__");
+    assert_eq!(worktree_slug(crate::paths::CHECK_WORKTREE), "pando_check");
+    // Never empty, so a prefix always tells the worktree apart.
+    let odd = worktree_slug("+++");
+    assert_eq!(odd.len(), 8, "{odd}");
+    assert_eq!(odd, worktree_slug("+++"));
+}
+
 #[test]
 fn a_worktrees_database_is_the_main_one_the_marker_and_its_own_name() {
     let [readable, hashed] = names("northwind_traders", "feat+x");

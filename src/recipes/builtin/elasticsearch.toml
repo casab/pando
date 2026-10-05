@@ -1,0 +1,17 @@
+# Elasticsearch and OpenSearch.
+#
+# pando never starts one: a project runs it from its compose file, and
+# this recipe says only how a namespaced worktree gets data of its own in
+# the main checkout's. The server has nothing pando could make or drop —
+# an index is the app's — so the worktree is told a prefix to put in
+# front of every index it names, beside the address the app already
+# reads: `ELASTICSEARCH_INDEX_PREFIX` next to `ELASTICSEARCH_URL`. Only an
+# app that reads one can be given one; otherwise the service stays
+# shared, and the start says so.
+kind = "service"
+name = "elasticsearch"
+aliases = ["opensearch"]
+summary = "Elasticsearch / OpenSearch: an index prefix of the worktree's own in the main checkout's"
+
+[prefix]
+keys = ["_INDEX_PREFIX", "_PREFIX"]

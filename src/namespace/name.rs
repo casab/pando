@@ -89,6 +89,32 @@ pub fn database_names(
     Ok([readable, hashed(cut)])
 }
 
+/// What a worktree is called inside every namespace of its own: the tail
+/// of its database's name, and `PANDO_NAMESPACE` to its processes, for an
+/// app that puts it in front of what it names by itself. A name with no
+/// letter or digit in it is a short hash of itself, never empty.
+pub fn worktree_slug(worktree: &str) -> String {
+    match slug(worktree) {
+        slug if slug.is_empty() => format!("{:x}", md5::compute(worktree))[..HASH_LEN].to_string(),
+        slug => slug,
+    }
+}
+
+/// The prefix a worktree's app puts on every name it makes in a service
+/// whose namespaces are its own convention, from the main checkout's:
+/// `feat_x__` in front of nothing, `shop_feat_x__` in front of `shop`,
+/// `laravel_feat_x__` in front of `laravel_`. Always the worktree's slug
+/// with [`MARKER`] after it, so what one worktree's app wrote can be told
+/// from main's, and from another worktree's, by its name alone.
+pub fn worktree_prefix(main: &str, worktree: &str) -> String {
+    let slug = worktree_slug(worktree);
+    match main.chars().last() {
+        None => format!("{slug}{MARKER}"),
+        Some(c) if c.is_ascii_alphanumeric() => format!("{main}_{slug}{MARKER}"),
+        Some(_) => format!("{main}{slug}{MARKER}"),
+    }
+}
+
 /// A worktree's name as the tail of a database name: lowercase letters and
 /// digits, every run of anything else one `_`, none at either end.
 fn slug(worktree: &str) -> String {

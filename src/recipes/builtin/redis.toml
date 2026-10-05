@@ -52,3 +52,9 @@ denied = ["NOPERM"]
 url_path = true
 url_query = ["db"]
 keys = ["_DB"]
+
+# An app that names no slot — or a Redis Cluster, which has only slot 0 —
+# can still keep a worktree's keys apart by a prefix it reads beside the
+# address: Laravel's `REDIS_PREFIX`. Used only when no slot can be.
+[prefix]
+keys = ["_PREFIX", "_KEY_PREFIX"]

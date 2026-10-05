@@ -181,11 +181,48 @@ pub(super) enum Tell {
     Url(String),
 }
 
+/// A service whose app puts a prefix of the worktree's own on every name
+/// it makes there — an index, a topic, a key — because the server has no
+/// namespace pando can make: the keys it reads one from, each with the
+/// main checkout's value, which may be empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prefixed {
+    pub service: String,
+    pub keys: Vec<(String, String)>,
+}
+
+impl Prefixed {
+    /// Each key with the worktree's value: the main checkout's, then the
+    /// worktree's slug and the marker.
+    pub fn values(&self, worktree: &str) -> Vec<(String, String)> {
+        self.keys
+            .iter()
+            .map(|(key, main)| (key.clone(), namespace::worktree_prefix(main, worktree)))
+            .collect()
+    }
+
+    /// `prefix feat_x__ in ELASTICSEARCH_INDEX_PREFIX`, as `status` says it.
+    pub fn describe(&self, worktree: &str) -> String {
+        let values = self.values(worktree);
+        let mut shown: Vec<String> = Vec::new();
+        for (_, value) in &values {
+            if !shown.contains(value) {
+                shown.push(value.clone());
+            }
+        }
+        let keys: Vec<&str> = values.iter().map(|(key, _)| key.as_str()).collect();
+        format!("prefix {} in {}", shown.join(", "), keys.join(", "))
+    }
+}
+
 /// Every service of the project, as a namespaced start sees it.
 #[derive(Debug, Clone, Default)]
 pub(super) struct Plan {
     /// The ones that get a namespace.
     pub targets: Vec<Target>,
+    /// The ones that get a prefix of the worktree's own instead: told,
+    /// never made, recorded or dropped.
+    pub prefixed: Vec<Prefixed>,
     /// Each one that stays on the main checkout's own data, and why —
     /// said at every namespaced start, because an app half on its own data
     /// and half on main's is only safe when somebody knows.
@@ -226,7 +263,8 @@ impl Plan {
         (!self
             .targets
             .iter()
-            .any(|target| target.namespace.kind == NamespaceKind::Database))
+            .any(|target| target.namespace.kind == NamespaceKind::Database)
+            && self.prefixed.is_empty())
         .then(|| "no database here is this worktree's own, only a slot".to_string())
     }
 }
@@ -255,7 +293,7 @@ pub fn namespaced_not_own_data(paths: &PandoPaths, config: &Config) -> Option<St
 /// every slot of it is held, which is when a start would ask too.
 pub(super) fn check_stays_shared(paths: &PandoPaths, config: &Config) -> Option<String> {
     let plan = plan(paths, config);
-    if plan.targets.is_empty() {
+    if plan.targets.is_empty() && plan.prefixed.is_empty() {
         return Some("this project has no server pando can make a database in".to_string());
     }
     if let Some(why) = plan.not_own_data() {
@@ -346,26 +384,66 @@ pub(super) fn plan(paths: &PandoPaths, config: &Config) -> Plan {
                 .as_ref()
                 .and_then(|recipe| recipe.namespace.as_ref())
                 .is_some_and(|namespace| namespace.kind == NamespaceKind::Slot);
-        let db_env = config
-            .namespaced
-            .get(&declared.service)
+        let settings = config.namespaced.get(&declared.service);
+        let db_env = settings
             .map(|settings| settings.db_env.as_slice())
             .unwrap_or_default();
-        match target(
+        let prefix_env = settings
+            .map(|settings| settings.prefix_env.as_slice())
+            .unwrap_or_default();
+        let prefixes = prefix_keys(
+            &env,
+            &declared.service,
+            &declared.keys,
+            declared.recipe.as_ref().and_then(|r| r.prefix.as_ref()),
+            prefix_env,
+        );
+        let why = match target(
             &env,
             db_env,
             &declared.service,
             declared.recipe.as_ref(),
             declared.keys,
         ) {
-            Ok(target) => out.targets.push(target),
-            Err(why) => {
-                if data {
-                    out.shared_data.push(declared.service.clone());
-                }
-                out.shared.push((declared.service, why));
+            Ok(target) => {
+                out.targets.push(target);
+                continue;
             }
+            Err(why) => why,
+        };
+        // No namespace the server makes: a prefix the app puts on its own
+        // names, when it reads one, is the worktree's data all the same.
+        let why = match prefixes {
+            Ok(keys) if !keys.is_empty() => {
+                out.prefixed.push(Prefixed {
+                    service: declared.service,
+                    keys,
+                });
+                continue;
+            }
+            // An engine whose namespaces are the app's own says what the
+            // app would have to read, and how to name a key of its own.
+            Ok(_) => match declared.recipe.as_ref() {
+                Some(recipe) if recipe.namespace.is_none() && recipe.prefix.is_some() => {
+                    let suffixes = recipe
+                        .prefix
+                        .as_ref()
+                        .map(|prefix| prefix.keys.join(" or "))
+                        .unwrap_or_default();
+                    format!(
+                        "the app reads no prefix for it ({suffixes} beside its address) — \
+                         [namespaced.{}] prefix_env names one it reads under another name",
+                        declared.service
+                    )
+                }
+                _ => why,
+            },
+            Err(e) => e,
+        };
+        if data {
+            out.shared_data.push(declared.service.clone());
         }
+        out.shared.push((declared.service, why));
     }
     out
 }
@@ -459,6 +537,53 @@ fn services_with_recipes(
         }
     }
     out
+}
+
+/// The keys a service's app reads a prefix from, each with the main
+/// checkout's value: every one `[namespaced.<service>] prefix_env` names,
+/// set or not — the project says its app reads it — and, beside each
+/// address key, the first of its recipe's `[prefix]` keys the main
+/// checkout's env files set, empty counting.
+fn prefix_keys(
+    env: &EnvFiles,
+    service: &str,
+    keys: &[String],
+    recipe: Option<&crate::recipes::PrefixRecipe>,
+    prefix_env: &[String],
+) -> std::result::Result<Vec<(String, String)>, String> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut add = |key: String, value: Option<String>| {
+        if !out.iter().any(|(known, _)| *known == key) {
+            out.push((key, value.unwrap_or_default().trim().to_string()));
+        }
+    };
+    for key in prefix_env {
+        if !crate::detect::is_env_name(key) {
+            return Err(format!(
+                "[namespaced.{service}] prefix_env names {key:?}, which is not an env key"
+            ));
+        }
+        add(key.clone(), env.value(key).map_err(|e| e.to_string())?);
+    }
+    let Some(recipe) = recipe else {
+        return Ok(out);
+    };
+    for key in keys {
+        let Some(stem) = ["_PORT", "_HOST", "_URL"]
+            .iter()
+            .find_map(|suffix| key.strip_suffix(suffix))
+        else {
+            continue;
+        };
+        for suffix in &recipe.keys {
+            let sibling = format!("{stem}{suffix}");
+            if let Some(value) = env.value(&sibling).map_err(|e| e.to_string())? {
+                add(sibling, Some(value));
+                break;
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// One service as a namespaced start would reach it, or why it cannot.
@@ -1950,8 +2075,19 @@ pub(super) fn namespaced_env(
     config: &Config,
     plan: &Plan,
     namespaces: &[crate::state::NamespaceRecord],
+    worktree: &str,
 ) -> Result<std::collections::BTreeMap<String, String>> {
     let mut env = super::services::shared_service_env(paths, config);
+    // The worktree's own name for itself, to every process and hook: an
+    // app that puts it in front of its index, topic or key names gets
+    // data of its own on any service, with nothing for pando to make.
+    env.insert(
+        namespace::NAMESPACE_ENV.to_string(),
+        namespace::worktree_slug(worktree),
+    );
+    for prefixed in &plan.prefixed {
+        env.extend(prefixed.values(worktree));
+    }
     for target in &plan.targets {
         let Some(namespace) = namespaces.iter().find(|ns| {
             ns.service == target.service
@@ -2047,7 +2183,8 @@ pub(super) fn drop_namespaces(
     let Some(record) = store.worktrees.get(name) else {
         return left;
     };
-    if record.namespaces.is_empty() {
+    let ran_namespaced = record.mode() == crate::state::ServiceMode::Namespaced;
+    if record.namespaces.is_empty() && !ran_namespaced {
         return left;
     }
     let mut progress = |line: &str, dropped: bool| {
@@ -2061,6 +2198,26 @@ pub(super) fn drop_namespaces(
     let config = config::load(paths)
         .map(|loaded| loaded.config)
         .unwrap_or_else(|_| config::load_without_home(paths).config);
+    // A prefix is the app's: pando made nothing under it, so it drops
+    // nothing, and says what it leaves.
+    if ran_namespaced {
+        for prefixed in plan(paths, &config).prefixed {
+            progress(
+                &format!(
+                    "{}: what the app wrote under {} is left as it is — a prefix is the app's, \
+                     and pando made nothing there to drop",
+                    prefixed.service,
+                    prefixed
+                        .values(name)
+                        .into_iter()
+                        .map(|(_, value)| value)
+                        .next()
+                        .unwrap_or_default()
+                ),
+                false,
+            );
+        }
+    }
     let recipes = crate::recipes::Recipes::load(&paths.recipes_dir());
     let targets = plan(paths, &config).targets;
     let others = other_projects(paths);
@@ -2290,17 +2447,56 @@ pub fn namespace_leftovers(
     out
 }
 
+/// What a namespaced start does with a service it makes nothing in: a
+/// prefix of the worktree's own, or the main checkout's data, and why.
+/// The same for every worktree of a project, so it can be read once per
+/// config and said for each worktree by [`PlanRow::line`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanRow {
+    Prefix(Prefixed),
+    Shared { service: String, why: String },
+}
+
+impl PlanRow {
+    /// The service, a word, and the rest of the line, for this worktree.
+    pub fn line(&self, worktree: &str) -> (String, &'static str, String) {
+        match self {
+            PlanRow::Prefix(prefixed) => {
+                (prefixed.service.clone(), "own", prefixed.describe(worktree))
+            }
+            PlanRow::Shared { service, why } => (service.clone(), "shared", why.clone()),
+        }
+    }
+}
+
+/// [`PlanRow`]s of a project's namespaced starts: the prefixed services
+/// first, then the shared ones.
+pub fn namespace_plan_rows(paths: &PandoPaths, config: &Config) -> Vec<PlanRow> {
+    let plan = plan(paths, config);
+    plan.prefixed
+        .into_iter()
+        .map(PlanRow::Prefix)
+        .chain(
+            plan.shared
+                .into_iter()
+                .map(|(service, why)| PlanRow::Shared { service, why }),
+        )
+        .collect()
+}
+
 /// What a worktree holds in each service, as `status` says it: the
 /// service, a word, and the rest of the line.
 ///
-/// `own` for a namespace it runs on; `kept` for one it holds while running
-/// in another mode, which waits for the way back until `rm`; and, for a
-/// namespaced worktree, `shared` for a service that stays on the main
-/// checkout's data, with why. `config` is `None` when it does not load,
-/// and then the shared ones go unsaid.
+/// `own` for a namespace it runs on, or a prefix its app is told; `kept`
+/// for one it holds while running in another mode, which waits for the
+/// way back until `rm`; and, for a namespaced worktree, `shared` for a
+/// service that stays on the main checkout's data, with why. `config` is
+/// `None` when it does not load, and then the prefixed and shared ones go
+/// unsaid.
 pub fn namespace_lines(
     paths: &PandoPaths,
     config: Option<&Config>,
+    name: &str,
     record: &crate::state::WorktreeRecord,
 ) -> Vec<(String, &'static str, String)> {
     let running_on_them = record.mode() == crate::state::ServiceMode::Namespaced;
@@ -2324,9 +2520,11 @@ pub fn namespace_lines(
         })
         .collect();
     if running_on_them && let Some(config) = config {
-        for (service, why) in plan(paths, config).shared {
-            out.push((service, "shared", why));
-        }
+        out.extend(
+            namespace_plan_rows(paths, config)
+                .iter()
+                .map(|row| row.line(name)),
+        );
     }
     out
 }

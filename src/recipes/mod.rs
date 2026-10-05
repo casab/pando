@@ -199,6 +199,25 @@ pub struct AddressRecipe {
     pub keys: Vec<String>,
 }
 
+/// How an app on this engine is told a prefix to put on every name it
+/// makes there: `[prefix]`. For an engine whose namespaces are the app's
+/// own convention — an index prefix, a topic prefix, a key prefix — where
+/// the server has nothing pando could make or drop.
+///
+/// A prefix is told, never made: pando writes nothing to the server, so
+/// nothing is recorded and nothing is dropped. What the app wrote under
+/// it stays where it is when the worktree goes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrefixRecipe {
+    /// A key beside the address that holds the prefix, by suffix, the
+    /// first one the main checkout's env files set winning:
+    /// `ELASTICSEARCH_INDEX_PREFIX` for `ELASTICSEARCH_URL` with
+    /// `_INDEX_PREFIX`. Set to an empty value counts: the app reads it,
+    /// and the main checkout puts nothing in front.
+    pub keys: Vec<String>,
+}
+
 fn yes() -> bool {
     true
 }
@@ -368,6 +387,9 @@ pub struct Recipe {
     /// How a worktree gets a namespace of its own in the main checkout's
     /// server of this kind, when it can. A service recipe's only.
     pub namespace: Option<NamespaceRecipe>,
+    /// How the app is told a prefix of the worktree's own, when the
+    /// server has no namespace pando can make. A service recipe's only.
+    pub prefix: Option<PrefixRecipe>,
     /// Whether this recipe has ever been run against a real server.
     ///
     /// pando ships recipes for engines nobody on the project had
@@ -673,6 +695,17 @@ pub fn parse(text: &str) -> Result<Recipe> {
         }
         namespace.check()?;
     }
+    if let Some(prefix) = &raw.prefix {
+        if raw.kind != Kind::Service {
+            bail!("a [prefix] belongs to a `kind = \"service\"` recipe");
+        }
+        if prefix.keys.is_empty() {
+            bail!("a [prefix] names the keys an app reads its prefix from, and it names none");
+        }
+        if let Some(bad) = prefix.keys.iter().find(|suffix| !is_key_suffix(suffix)) {
+            bail!("[prefix] keys are suffixes of an env key, as `_INDEX_PREFIX` — not {bad:?}");
+        }
+    }
     let body = match raw.kind {
         Kind::Service => {
             if raw.language.is_some() {
@@ -689,11 +722,11 @@ pub fn parse(text: &str) -> Result<Recipe> {
                 }
                 // An engine pando never starts, only finds in a container:
                 // what it knows is how a worktree gets data of its own there.
-                None if raw.namespace.is_some() => Body::NamespaceOnly,
+                None if raw.namespace.is_some() || raw.prefix.is_some() => Body::NamespaceOnly,
                 None => bail!(
                     "a `kind = \"service\"` recipe needs a `[service]` table that starts the \
-                     server, or a `[namespace]` that says how a worktree gets data of its own \
-                     in one somebody else runs"
+                     server, or a `[namespace]` or `[prefix]` that says how a worktree gets data \
+                     of its own in one somebody else runs"
                 ),
             }
         }
@@ -717,6 +750,7 @@ pub fn parse(text: &str) -> Result<Recipe> {
         install: raw.install,
         notes: raw.notes,
         namespace: raw.namespace,
+        prefix: raw.prefix,
         untested: raw.untested,
         body,
     })
@@ -747,6 +781,8 @@ struct RawRecipe {
     language: Option<LanguageRecipe>,
     #[serde(default)]
     namespace: Option<NamespaceRecipe>,
+    #[serde(default)]
+    prefix: Option<PrefixRecipe>,
 }
 
 /// The recipes this build ships, as `(file name, TOML text)`.
@@ -756,11 +792,17 @@ struct RawRecipe {
 /// the top of each says what in it is deliberate. Adding a built-in is a
 /// file there and a row here.
 ///
-/// Three of the four were run against a real server while they were
-/// written; MongoDB was not, because no machine here has `mongod`, and
-/// it says so in its own `untested` field rather than in a comment.
-pub const BUILT_IN: [(&str, &str); 4] = [
+/// Of the four that start a server, three were run against a real one
+/// while they were written; MongoDB was not, because no machine here has
+/// `mongod`, and it says so in its own `untested` field rather than in a
+/// comment. The other four start nothing and run nothing: each says only
+/// which key an app reads a prefix from on its engine.
+pub const BUILT_IN: [(&str, &str); 8] = [
+    ("elasticsearch", include_str!("builtin/elasticsearch.toml")),
+    ("kafka", include_str!("builtin/kafka.toml")),
     ("mariadb", include_str!("builtin/mariadb.toml")),
+    ("meilisearch", include_str!("builtin/meilisearch.toml")),
+    ("memcached", include_str!("builtin/memcached.toml")),
     ("mongodb", include_str!("builtin/mongodb.toml")),
     ("postgres", include_str!("builtin/postgres.toml")),
     ("redis", include_str!("builtin/redis.toml")),
@@ -791,10 +833,24 @@ mod tests {
         for expected in ["mariadb", "mongodb", "postgres", "redis"] {
             assert!(names.contains(&expected), "{names:?} has no {expected}");
         }
-        // Every one of them starts a server; a language recipe that got
-        // into this list would be a build that ships something no
-        // `[[services]]` entry could ever run.
-        assert_eq!(recipes.service_names(), names);
+        // Every one of them is about a service: one that starts a server,
+        // or one that only knows how a worktree gets data of its own in a
+        // server somebody else runs. A language recipe that got into this
+        // list would be a build that ships something no `[[services]]`
+        // entry could ever use.
+        for (name, loaded) in recipes.entries() {
+            let recipe = &loaded.recipe;
+            assert_eq!(recipe.kind, Kind::Service, "{name}");
+            assert!(
+                recipe.service().is_some() || recipe.namespace.is_some() || recipe.prefix.is_some(),
+                "{name} says nothing a service could use"
+            );
+        }
+        assert_eq!(
+            recipes.service_names(),
+            ["mariadb", "mongodb", "postgres", "redis"],
+            "which built-ins start a server changed"
+        );
     }
 
     /// Rules every shipped service recipe is held to, whichever engine it
@@ -805,9 +861,11 @@ mod tests {
     fn every_built_in_service_recipe_is_private_to_this_machine() {
         for (name, text) in BUILT_IN {
             let recipe = parse(text).unwrap();
-            let service = recipe
-                .service()
-                .unwrap_or_else(|| panic!("{name} is not a service"));
+            // One that starts nothing binds nothing.
+            let Some(service) = recipe.service() else {
+                assert_eq!(recipe.body, Body::NamespaceOnly, "{name}");
+                continue;
+            };
             let cmd = &service.cmd;
             // Loopback, spelled out. A default is not good enough: most
             // engines default to every interface, and one that does not
@@ -1276,6 +1334,7 @@ files = [{ file = "rust-toolchain.toml", toml_key = ["toolchain", "channel"] }]
             install: None,
             notes: None,
             namespace: None,
+            prefix: None,
             untested: false,
             body: Body::Language(LanguageRecipe {
                 files: entry

@@ -597,7 +597,7 @@ fn status_lines<W: Write>(
         // And one per private service, so a worktree whose database is
         // down says which one rather than only that its app failed.
         let services = actions::service_statuses(record);
-        let namespaces = actions::namespace_lines(paths, config.as_ref(), record);
+        let namespaces = actions::namespace_lines(paths, config.as_ref(), &w.name, record);
         let service_width = services
             .iter()
             .map(|s| text_width(&s.name))

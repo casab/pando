@@ -35,7 +35,12 @@ pub use login::{
     Login, find as find_login, from_config as login_from_config,
     from_env_files as login_from_env_files,
 };
-pub use name::{MARKER, MAX_NAME, database_names, is_plain};
+pub use name::{MARKER, MAX_NAME, database_names, is_plain, worktree_prefix, worktree_slug};
+
+/// What every process and hook of a namespaced worktree is told its own
+/// name is: [`worktree_slug`], the tail of its database names, for an app
+/// that puts it in front of what it names by itself.
+pub const NAMESPACE_ENV: &str = "PANDO_NAMESPACE";
 
 #[cfg(test)]
 mod tests;

@@ -1933,6 +1933,7 @@ pub fn resolved_env(
             config,
             &super::namespaced::plan(paths, config),
             &record.namespaces,
+            name,
         )?),
         // The main checkout's values, which a shared start hands its
         // processes over whatever the worktree's own env file says.
