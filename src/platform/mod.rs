@@ -16,6 +16,7 @@
 //! What the OS is, and what pando finds at run time, is [`Host`]: read once
 //! for this machine, or from files under a root a test chooses.
 
+pub mod boot;
 pub mod cow;
 pub mod desktop;
 pub mod dirs;

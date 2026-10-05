@@ -16,7 +16,6 @@ const NOT_YET: &[&str] = &[
     "observe.rs",
     "process.rs",
     "project.rs",
-    "state.rs",
 ];
 
 /// Where [`Host::here`] may be read: where pando meets the outside. Every
@@ -185,6 +184,17 @@ fn the_platform_layer_imports_nothing_above_it() {
 fn no_test_sees_the_machine_it_runs_on() {
     assert_eq!(Host::here(), &Host::default());
     assert_eq!(Host::here().os, Os::HERE);
+}
+
+// ---- boot ------------------------------------------------------------
+
+#[test]
+fn this_boot_has_an_id_that_stays_the_same_and_matches_itself() {
+    let now = boot::id().expect("macOS and Linux both say which boot this is");
+    assert!(!now.is_empty());
+    assert_eq!(boot::id(), Some(now), "read once");
+    assert!(boot::same(now, now));
+    assert!(!boot::same("an-earlier-boot", now));
 }
 
 // ---- files -----------------------------------------------------------

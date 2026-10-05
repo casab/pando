@@ -504,7 +504,7 @@ pub fn load(path: &Path) -> Result<State> {
     }
     let OnDisk { mut state, boot } = serde_json::from_str(&text)
         .with_context(|| format!("parse state file {}", path.display()))?;
-    forget_previous_boot(&mut state, boot.as_deref(), boot_id());
+    forget_previous_boot(&mut state, boot.as_deref(), crate::platform::boot::id());
     Ok(state)
 }
 
@@ -526,65 +526,6 @@ struct Saving<'a> {
     boot: Option<&'a str>,
 }
 
-/// An identifier of this boot of the machine: the same for every process
-/// until it restarts, and different after. `None` where the system does
-/// not say.
-pub fn boot_id() -> Option<&'static str> {
-    static BOOT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    BOOT.get_or_init(read_boot_id).as_deref()
-}
-
-#[cfg(target_os = "macos")]
-fn read_boot_id() -> Option<String> {
-    let name = c"kern.bootsessionuuid";
-    let mut len: libc::size_t = 0;
-    // SAFETY: a null buffer asks for the length only.
-    let rc = unsafe {
-        libc::sysctlbyname(
-            name.as_ptr(),
-            std::ptr::null_mut(),
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc != 0 || len == 0 {
-        return None;
-    }
-    let mut buf = vec![0u8; len];
-    // SAFETY: `buf` is `len` bytes long, which is what the kernel is told.
-    let rc = unsafe {
-        libc::sysctlbyname(
-            name.as_ptr(),
-            buf.as_mut_ptr().cast(),
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc != 0 {
-        return None;
-    }
-    buf.truncate(len);
-    let id = String::from_utf8_lossy(&buf)
-        .trim_end_matches('\0')
-        .trim()
-        .to_string();
-    (!id.is_empty()).then_some(id)
-}
-
-#[cfg(target_os = "linux")]
-fn read_boot_id() -> Option<String> {
-    let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
-    let id = id.trim().to_string();
-    (!id.is_empty()).then_some(id)
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn read_boot_id() -> Option<String> {
-    None
-}
-
 /// Forgets every pid a state file recorded during an earlier boot.
 ///
 /// Nothing pando started survives a restart of the machine, but the file
@@ -604,7 +545,7 @@ fn forget_previous_boot(state: &mut State, written: Option<&str>, now: Option<&s
     let (Some(written), Some(now)) = (written, now) else {
         return;
     };
-    if written == now {
+    if crate::platform::boot::same(written, now) {
         return;
     }
     for record in state.worktrees.values_mut() {
@@ -626,7 +567,7 @@ pub fn save(path: &Path, state: &State) -> Result<()> {
     let tmp = path.with_extension("json.tmp");
     let json = serde_json::to_string_pretty(&Saving {
         state,
-        boot: boot_id(),
+        boot: crate::platform::boot::id(),
     })
     .context("serialize state")?;
     std::fs::write(&tmp, json).with_context(|| format!("write tmp state {}", tmp.display()))?;
@@ -1507,7 +1448,7 @@ mod tests {
     // process group and `start` calls a dead dev server "already running".
     #[test]
     fn a_state_file_from_an_earlier_boot_keeps_what_outlives_a_restart_and_no_pid() {
-        let Some(now) = boot_id() else {
+        let Some(now) = crate::platform::boot::id() else {
             return; // A system that cannot say which boot this is.
         };
         let dir = tempdir().unwrap();
