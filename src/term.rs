@@ -84,9 +84,7 @@ impl Style {
         let dumb = term == Some("dumb");
         Self {
             color: is_terminal && !no_color && !dumb,
-            home: std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .filter(|h| h.is_absolute() && h != Path::new("/")),
+            home: crate::platform::dirs::home().filter(|h| h.is_absolute() && h != Path::new("/")),
         }
     }
 

@@ -684,9 +684,7 @@ pub(super) fn expand_tilde(path: &Path) -> PathBuf {
     let Ok(rest) = path.strip_prefix("~") else {
         return path.to_path_buf();
     };
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"));
+    let home = crate::platform::dirs::home().unwrap_or_else(|| PathBuf::from("/"));
     home.join(rest)
 }
 

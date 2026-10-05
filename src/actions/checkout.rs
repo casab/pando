@@ -536,10 +536,7 @@ fn post_checkout_hook(root: &Path) -> Option<PathBuf> {
             "hooks/post-checkout",
         ],
     )?);
-    use std::os::unix::fs::PermissionsExt;
-    hook.metadata()
-        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .then_some(hook)
+    crate::platform::files::is_executable(&hook).then_some(hook)
 }
 
 /// Whether `$GIT_DIR/info/attributes` says anything. The raw refresh

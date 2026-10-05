@@ -1601,7 +1601,7 @@ fn provision_path(
     };
     match mode {
         ProvisionMode::Link => {
-            std::os::unix::fs::symlink(&src, &dst)
+            crate::platform::files::symlink(&src, &dst)
                 .with_context(|| format!("symlink {} → {}", src.display(), dst.display()))?;
             // Said per file, and said to be a link: an edit in the worktree
             // edits the main checkout's file.

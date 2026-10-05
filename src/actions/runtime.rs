@@ -102,9 +102,7 @@ pub fn runtime_shell(cwd: &Path) -> impl Fn(&str) -> Option<String> {
 /// Not pando's home: `~/.pando` is where pando writes, `~/.nvm` is where
 /// nvm is.
 pub fn user_home() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"))
+    crate::platform::dirs::home().unwrap_or_else(|| PathBuf::from("/"))
 }
 
 /// What the probe found, and what there is to do about it.

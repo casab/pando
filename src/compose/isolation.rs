@@ -301,7 +301,7 @@ fn expand_home(source: &str) -> PathBuf {
     let Some(rest) = source.strip_prefix('~') else {
         return PathBuf::from(source);
     };
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    let Some(home) = crate::platform::dirs::home() else {
         return PathBuf::from(source);
     };
     match rest.strip_prefix('/') {

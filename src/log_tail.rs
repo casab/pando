@@ -856,17 +856,14 @@ const ANCHOR_BYTES: usize = 64;
 /// where the platform records one) is a different file behind one path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileIdentity {
-    dev: u64,
-    ino: u64,
+    file: Option<crate::platform::files::FileId>,
     created: Option<std::time::SystemTime>,
 }
 
 impl FileIdentity {
     fn of(meta: &std::fs::Metadata) -> Self {
-        use std::os::unix::fs::MetadataExt;
         Self {
-            dev: meta.dev(),
-            ino: meta.ino(),
+            file: crate::platform::files::FileId::of(meta),
             created: meta.created().ok(),
         }
     }

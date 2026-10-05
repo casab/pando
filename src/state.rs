@@ -1040,29 +1040,16 @@ pub struct StateLock {
 
 pub fn lock(lock_path: &Path) -> Result<StateLock> {
     let file = open_lock_file(lock_path)?;
-    let ret = unsafe { libc::flock(fd(&file), libc::LOCK_EX) };
-    if ret != 0 {
-        anyhow::bail!(
-            "flock on {}: {}",
-            lock_path.display(),
-            std::io::Error::last_os_error()
-        );
-    }
+    crate::platform::files::lock_exclusive(&file)
+        .with_context(|| format!("flock on {}", lock_path.display()))?;
     Ok(StateLock { _file: file })
 }
 
 pub fn try_lock(lock_path: &Path) -> Result<Option<StateLock>> {
     let file = open_lock_file(lock_path)?;
-    let ret = unsafe { libc::flock(fd(&file), libc::LOCK_EX | libc::LOCK_NB) };
-    if ret == 0 {
-        return Ok(Some(StateLock { _file: file }));
-    }
-    let err = std::io::Error::last_os_error();
-    match err.raw_os_error() {
-        // EWOULDBLOCK and EAGAIN are the same value on this platform.
-        Some(libc::EWOULDBLOCK) => Ok(None),
-        _ => anyhow::bail!("flock (try) on {}: {}", lock_path.display(), err),
-    }
+    let held = crate::platform::files::try_lock_exclusive(&file)
+        .with_context(|| format!("flock (try) on {}", lock_path.display()))?;
+    Ok(held.then_some(StateLock { _file: file }))
 }
 
 fn open_lock_file(lock_path: &Path) -> Result<std::fs::File> {
@@ -1075,11 +1062,6 @@ fn open_lock_file(lock_path: &Path) -> Result<std::fs::File> {
         .write(true)
         .open(lock_path)
         .with_context(|| format!("open lock {}", lock_path.display()))
-}
-
-fn fd(file: &std::fs::File) -> i32 {
-    use std::os::unix::io::AsRawFd;
-    file.as_raw_fd()
 }
 
 #[cfg(test)]

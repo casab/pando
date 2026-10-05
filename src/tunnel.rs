@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::paths::PandoPaths;
+use crate::platform::files::is_executable;
 use crate::process::{self, SpawnOptions};
 use crate::state::ShareRecord;
 
@@ -156,13 +157,6 @@ pub fn cloudflared_program(paths: &PandoPaths) -> PathBuf {
         return shim;
     }
     PathBuf::from(DEFAULT_PROVIDER)
-}
-
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
 }
 
 /// Refuses when the provider cannot be run, naming both ways of fixing it.

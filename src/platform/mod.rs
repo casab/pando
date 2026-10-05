@@ -17,6 +17,8 @@
 //! for this machine, or from files under a root a test chooses.
 
 pub mod desktop;
+pub mod dirs;
+pub mod files;
 pub mod host;
 pub mod shell;
 

@@ -585,13 +585,12 @@ impl Native {
         }
         std::fs::create_dir_all(&self.socket_dir)
             .with_context(|| format!("create {}", self.socket_dir.display()))?;
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let meta = std::fs::metadata(&self.socket_dir)
             .with_context(|| format!("stat {}", self.socket_dir.display()))?;
         // The temporary directory is world-writable, so a directory that
         // is already there and is not ours is not one to put a database
         // socket in.
-        if meta.uid() != unsafe { libc::geteuid() } {
+        if !crate::platform::files::owned_by_current_user(&meta) {
             bail!(
                 "{} already exists and belongs to someone else — pando will not put {:?}'s \
                  socket there",
@@ -599,7 +598,7 @@ impl Native {
                 self.service
             );
         }
-        std::fs::set_permissions(&self.socket_dir, std::fs::Permissions::from_mode(0o700))
+        crate::platform::files::set_permission_bits(&self.socket_dir, 0o700)
             .with_context(|| format!("make {} private", self.socket_dir.display()))
     }
 

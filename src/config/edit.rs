@@ -648,7 +648,6 @@ fn written_through(path: &Path, root: &Path) -> Result<PathBuf> {
 /// and a command failed on a config nothing was wrong with.
 fn write_private_atomic(path: &Path, text: &str) -> Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let name = path
@@ -660,16 +659,8 @@ fn write_private_atomic(path: &Path, text: &str) -> Result<()> {
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
-    let written = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(CONFIG_MODE)
-        .open(&tmp)
-        .and_then(|mut file| {
-            // Exactly 0600 whatever the umask made of the mode above.
-            file.set_permissions(std::fs::Permissions::from_mode(CONFIG_MODE))?;
-            file.write_all(text.as_bytes())
-        })
+    let written = crate::platform::files::create_new(&tmp, CONFIG_MODE)
+        .and_then(|mut file| file.write_all(text.as_bytes()))
         .with_context(|| format!("write {}", tmp.display()))
         .and_then(|()| {
             std::fs::rename(&tmp, path)

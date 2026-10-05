@@ -403,7 +403,7 @@ impl Scratch {
                 continue;
             }
             let link = scratch.dir.join(relative);
-            std::os::unix::fs::symlink(&target, &link)
+            crate::platform::files::symlink(&target, &link)
                 .with_context(|| format!("link {} → {}", link.display(), target.display()))?;
         }
         Ok(scratch)

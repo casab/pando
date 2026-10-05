@@ -11,29 +11,13 @@ use super::*;
 /// longer offends is a stale row, and fails as surely as a new offender.
 const NOT_YET: &[&str] = &[
     "actions/check/interrupt.rs",
-    "actions/checkout.rs",
-    "actions/init.rs",
-    "actions/installed.rs",
-    "actions/runtime.rs",
-    "actions/worktree.rs",
     "cli/prompt.rs",
-    "compose/isolation.rs",
-    "config/edit.rs",
-    "config/schema.rs",
     "cow.rs",
-    "doctor/config.rs",
     "hooks.rs",
-    "log_tail.rs",
-    "native.rs",
     "observe.rs",
-    "paths.rs",
     "process.rs",
     "project.rs",
-    "services.rs",
     "state.rs",
-    "term.rs",
-    "tui/render/mod.rs",
-    "tunnel.rs",
 ];
 
 /// Where [`Host::here`] may be read: where pando meets the outside. Every
@@ -202,6 +186,82 @@ fn the_platform_layer_imports_nothing_above_it() {
 fn no_test_sees_the_machine_it_runs_on() {
     assert_eq!(Host::here(), &Host::default());
     assert_eq!(Host::here().os, Os::HERE);
+}
+
+// ---- files -----------------------------------------------------------
+
+#[test]
+fn a_lock_held_is_refused_to_a_second_asker_until_it_is_let_go() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("x.lock");
+    let open = || {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .unwrap()
+    };
+    let first = open();
+    files::lock_exclusive(&first).unwrap();
+    assert!(!files::try_lock_exclusive(&open()).unwrap(), "held");
+    drop(first);
+    assert!(files::try_lock_exclusive(&open()).unwrap(), "let go");
+}
+
+#[test]
+fn a_new_file_has_exactly_the_bits_asked_for_whatever_the_umask() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("private");
+    files::create_new(&path, 0o600).unwrap();
+    let meta = std::fs::metadata(&path).unwrap();
+    if let Some(bits) = files::permission_bits(&meta) {
+        assert_eq!(bits, 0o600);
+    }
+    assert!(files::create_new(&path, 0o600).is_err(), "never over one");
+    assert!(files::owned_by_current_user(&meta));
+}
+
+#[test]
+fn a_file_is_executable_once_the_os_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tool");
+    std::fs::write(&path, "#!/bin/sh\n").unwrap();
+    if files::permission_bits(&std::fs::metadata(&path).unwrap()).is_some() {
+        files::set_permission_bits(&path, 0o644).unwrap();
+        assert!(!files::is_executable(&path));
+        files::set_permission_bits(&path, 0o755).unwrap();
+    }
+    assert!(files::is_executable(&path));
+    assert!(!files::is_executable(dir.path()), "a directory is not run");
+    assert!(!files::is_executable(&dir.path().join("missing")));
+}
+
+#[test]
+fn a_file_put_in_anothers_place_is_another_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("log");
+    std::fs::write(&path, "a").unwrap();
+    let id = |p: &Path| files::FileId::of(&std::fs::metadata(p).unwrap());
+    let first = id(&path);
+    std::fs::write(&path, "ab").unwrap();
+    assert_eq!(id(&path), first, "written to, the same file");
+    let other = dir.path().join("other");
+    std::fs::write(&other, "c").unwrap();
+    std::fs::rename(&other, &path).unwrap();
+    if first.is_some() {
+        assert_ne!(id(&path), first, "replaced, another");
+    }
+}
+
+#[test]
+fn a_link_points_at_its_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target");
+    std::fs::write(&target, "t").unwrap();
+    let link = dir.path().join("link");
+    files::symlink(&target, &link).unwrap();
+    assert_eq!(std::fs::read_link(&link).unwrap(), target);
 }
 
 // ---- desktop ---------------------------------------------------------

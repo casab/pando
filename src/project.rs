@@ -280,8 +280,7 @@ fn canonicalize(path: &Path) -> PathBuf {
 /// security — just a short, stable discriminator so two checkouts of the same
 /// repository name do not share a project directory.
 fn path_hash8(root: &Path) -> String {
-    use std::os::unix::ffi::OsStrExt;
-    let digest = md5::compute(root.as_os_str().as_bytes());
+    let digest = md5::compute(crate::platform::files::path_bytes(root));
     format!("{digest:x}")[..8].to_string()
 }
 
@@ -290,6 +289,18 @@ mod tests {
     use super::*;
     use crate::testutil::{git, init_repo};
     use tempfile::tempdir;
+
+    // A project's id names its directory under the pando home: a hash that
+    // changed with a refactor would orphan every project's state, config
+    // and logs. Pinned to the bytes of the path as the OS stores them.
+    #[test]
+    fn the_path_hash_of_a_project_never_changes() {
+        assert_eq!(path_hash8(Path::new("/home/me/code/app")), "1fb718a9");
+        assert_eq!(
+            path_hash8(Path::new("/Users/me/Code/ünïcode app")),
+            "30d92acf"
+        );
+    }
 
     #[test]
     fn discovers_the_root_from_the_repository_root() {
