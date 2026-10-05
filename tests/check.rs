@@ -890,6 +890,15 @@ fn with_db_running(cmd: &str, login: bool, hooks: &str) -> WithDb {
     }
     std::fs::write(e.root.join(".env"), dotenv).unwrap();
     let fake = common::fake_mariadb(&e.home);
+    // A refused login, or none, asks for the container that publishes the
+    // port: a stand-in `docker` that knows of none, so no test of these
+    // reaches the developer's own containers.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let docker = e.home.join("bin").join("docker");
+        std::fs::write(&docker, "#!/bin/sh\n[ \"$1\" = ps ] && exit 0\nexit 1\n").unwrap();
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     WithDb {
         e,
         fake,

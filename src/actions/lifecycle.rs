@@ -1955,8 +1955,38 @@ pub(super) fn refuse_losing_namespaces(
         return Ok(());
     }
     let plan = namespaced::plan(paths, config);
-    if plan.gives_own() {
+    // Every service the worktree has a namespace of its own in has to
+    // keep one: a prefix elsewhere is no reason to run a branch's app on
+    // the main checkout's database.
+    let lost: Vec<String> = crate::state::load(&paths.state_file())
+        .ok()
+        .and_then(|store| store.worktrees.get(name).cloned())
+        .map(|record| record.namespaces)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|ns| ns.service)
+        .filter(|service| !plan.targets.iter().any(|t| t.service == *service))
+        .collect();
+    if plan.gives_own() && lost.is_empty() {
         return Ok(());
+    }
+    if !lost.is_empty() && plan.gives_own() {
+        let why: Vec<String> = plan
+            .shared_lines()
+            .into_iter()
+            .filter(|line| lost.iter().any(|s| line.starts_with(&format!("{s}:"))))
+            .collect();
+        bail!(
+            "{name} runs on a namespace of its own in {}, which can have none now{}, so nothing \
+             was started: it does not move onto the main checkout's data unless that is asked \
+             for, and its namespaces are kept. Fix that, or {}",
+            lost.join(", "),
+            match why.is_empty() {
+                true => String::new(),
+                false => format!(" ({})", why.join("; ")),
+            },
+            crate::remedy::SHARED_ON_PURPOSE
+        );
     }
     let why = match plan.shared_lines() {
         lines if lines.is_empty() => "no service is configured".to_string(),

@@ -196,13 +196,16 @@ fn as_if_in_a_container(bin: &Path, port: u16, env: &str) {
            ps) echo c0ffee ;;\n\
            port) echo \"{port}/tcp -> 0.0.0.0:{port}\" ;;\n\
            exec) shift; while [ \"$1\" = -e ]; do shift 2; done; shift;\n\
-             if [ \"$1\" = env ]; then cat '{}'; exit 0; fi; shift; shift;\n\
+             if [ \"$1\" = printenv ]; then v=$(grep \"^$2=\" '{}') || exit 1;\n\
+               printf '%s\\n' \"${{v#*=}}\"; exit 0; fi; shift; shift;\n\
              exec sh -c \"$1\" ;;\n\
          esac\n",
         env_file.display()
     );
     std::fs::write(bin.join("docker"), docker).unwrap();
     std::fs::set_permissions(bin.join("docker"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(bin.join("lsof"), "#!/bin/sh\necho p1\necho cvpnkit\n").unwrap();
+    std::fs::set_permissions(bin.join("lsof"), std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 // The same refusal, in a container whose environment keeps root's

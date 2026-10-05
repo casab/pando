@@ -100,18 +100,32 @@ pub fn worktree_slug(worktree: &str) -> String {
     }
 }
 
+/// What a worktree is called in a name nothing else checks: its slug and
+/// a short hash of the project and its own name, `feat_x_1f3c4a`. A
+/// database name is checked against the server before it is taken; a
+/// prefix and `PANDO_NAMESPACE` are not, and `feat/x` and `feat-x`, or the
+/// same branch in a second clone, must not share one.
+pub fn worktree_tag(project: &str, worktree: &str) -> String {
+    let digest = format!("{:x}", md5::compute(format!("{project}/{worktree}")));
+    format!("{}_{}", worktree_slug(worktree), &digest[..TAG_HASH_LEN])
+}
+
+/// How many hex digits of a hash a [`worktree_tag`] carries.
+const TAG_HASH_LEN: usize = 6;
+
 /// The prefix a worktree's app puts on every name it makes in a service
 /// whose namespaces are its own convention, from the main checkout's:
-/// `feat_x__` in front of nothing, `shop_feat_x__` in front of `shop`,
-/// `laravel_feat_x__` in front of `laravel_`. Always the worktree's slug
-/// with [`MARKER`] after it, so what one worktree's app wrote can be told
-/// from main's, and from another worktree's, by its name alone.
-pub fn worktree_prefix(main: &str, worktree: &str) -> String {
-    let slug = worktree_slug(worktree);
+/// `feat_x_1f3c4a__` in front of nothing, `shop_feat_x_1f3c4a__` in front
+/// of `shop`, `laravel_feat_x_1f3c4a__` in front of `laravel_`. Always the
+/// worktree's [`worktree_tag`] with [`MARKER`] after it, so what one
+/// worktree's app wrote can be told from main's, and from another
+/// worktree's, by its name alone.
+pub fn worktree_prefix(main: &str, project: &str, worktree: &str) -> String {
+    let tag = worktree_tag(project, worktree);
     match main.chars().last() {
-        None => format!("{slug}{MARKER}"),
-        Some(c) if c.is_ascii_alphanumeric() => format!("{main}_{slug}{MARKER}"),
-        Some(_) => format!("{main}{slug}{MARKER}"),
+        None => format!("{tag}{MARKER}"),
+        Some(c) if c.is_ascii_alphanumeric() => format!("{main}_{tag}{MARKER}"),
+        Some(_) => format!("{main}{tag}{MARKER}"),
     }
 }
 

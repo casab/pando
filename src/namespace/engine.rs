@@ -101,21 +101,30 @@ impl Server<'_> {
         }
     }
 
-    /// A container's environment, as `docker exec … env` prints it. Held
-    /// in memory for the one login it gives, never printed.
-    fn container_env(&self, id: &str) -> Option<std::collections::BTreeMap<String, String>> {
-        let script = self.with_path(&format!("docker exec {} env", shell_quote(id)));
-        let out = proc::run_captured(&script, &std::env::temp_dir(), &[], TIMEOUT).ok()?;
-        if !out.success() {
-            return None;
+    /// The keys of a container's environment the recipe names, each one
+    /// asked for alone with `printenv`: nothing else the container keeps is
+    /// read. Held in memory for the one login they give, never printed.
+    fn container_env(
+        &self,
+        id: &str,
+        keys: &[&String],
+    ) -> std::collections::BTreeMap<String, String> {
+        let mut out = std::collections::BTreeMap::new();
+        for key in keys {
+            let script = self.with_path(&format!(
+                "docker exec {} printenv {}",
+                shell_quote(id),
+                shell_quote(key)
+            ));
+            let Ok(read) = proc::run_captured(&script, &std::env::temp_dir(), &[], TIMEOUT) else {
+                continue;
+            };
+            if read.success() {
+                let value = read.stdout.strip_suffix('\n').unwrap_or(&read.stdout);
+                out.insert(key.to_string(), value.to_string());
+            }
         }
-        Some(
-            out.stdout
-                .lines()
-                .filter_map(|line| line.split_once('='))
-                .map(|(key, value)| (key.to_string(), value.to_string()))
-                .collect(),
-        )
+        out
     }
 
     /// Gives this server's login the right to make and drop this
@@ -123,6 +132,19 @@ impl Server<'_> {
     /// what the developer would otherwise run by hand, once. Returns the
     /// statement it ran, for a line that says so.
     pub fn grant_as(&self, admin: &Server<'_>, main: &str) -> Result<String> {
+        // Run, not printed, so only for a login whose names cannot end a
+        // quoted name in the statement: anything else is a person's to read.
+        let (user, host) = self.account();
+        let plain = |name: &str| {
+            name.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_-.%@:".contains(c))
+        };
+        if user.is_empty() || !plain(&user) || !plain(&host) {
+            bail!(
+                "the login's name {user:?} is not a plain one, so pando will not run a grant for \
+                 it"
+            );
+        }
         let Some(grant) = self.grant(main) else {
             bail!(
                 "the recipe for {} says no grant pando could run for {main}",
@@ -137,6 +159,9 @@ impl Server<'_> {
     /// the statement on stdin and never on a command line.
     fn run_sql(&self, sql: &str) -> Result<()> {
         let command = self.command(self.recipe.run_sql.as_deref(), "run_sql")?;
+        if sql.lines().any(|line| line.trim() == "PANDO_SQL") {
+            bail!("a statement with a line `PANDO_SQL` would end its own here-document");
+        }
         let rendered = template::render_with(command, &self.vars(None))?;
         let script = self.wrap(&format!("{rendered} <<'PANDO_SQL'\n{sql}\nPANDO_SQL"));
         let env = self.login.env(self.recipe.password_env.as_deref());
@@ -157,23 +182,44 @@ impl Server<'_> {
     /// machine, and the port it listens on inside: `docker ps` by the
     /// published port, then `docker port` for the side within. `None`
     /// with no Docker, no such container, or an answer it cannot read.
+    ///
+    /// Only for a server the app reaches on this machine's own loopback,
+    /// only when exactly one container publishes the port there, and only
+    /// when nothing but a container runtime's port forwarder listens on it
+    /// here: a native server beside a container on the same port, or a
+    /// server elsewhere, is never mistaken for the container.
     fn container(&self) -> Option<(String, u16)> {
         // Nothing under test reaches a developer's own containers: only a
         // stand-in `docker` in the test's own `bin` is ever asked.
         if cfg!(test) && !self.bin_dir.join("docker").is_file() {
             return None;
         }
+        if !is_loopback(&self.host) {
+            return None;
+        }
         let script = self.with_path(&format!(
             "ids=$(docker ps --filter publish={port} --format '{{{{.ID}}}}') || exit 1\n\
              echo --\n\
-             for id in $ids; do echo \"$id\"; docker port \"$id\"; done",
+             for id in $ids; do echo \"$id\"; docker port \"$id\"; done\n\
+             echo ==\n\
+             if command -v lsof >/dev/null 2>&1; then \
+             lsof -nP -iTCP:{port} -sTCP:LISTEN -Fc 2>/dev/null; fi\n\
+             exit 0",
             port = self.port
         ));
         let out = proc::run_captured(&script, &std::env::temp_dir(), &[], TIMEOUT).ok()?;
         if !out.success() {
             return None;
         }
-        container_publishing(&out.stdout, self.port)
+        let (published, listeners) = out.stdout.split_once("==\n").unwrap_or((&out.stdout, ""));
+        let native = listeners
+            .lines()
+            .filter_map(|line| line.strip_prefix('c'))
+            .any(|command| !is_forwarder(command));
+        if native {
+            return None;
+        }
+        container_publishing(published, self.port)
     }
 
     /// The clients the recipe needs that are not where its commands run.
@@ -412,8 +458,20 @@ impl Server<'_> {
         if !is_plain(main) {
             return None;
         }
-        let account = self
-            .recipe
+        let (user, host) = self.account();
+        let vars = Vars {
+            prefix_like: Some(prefix_like(main)),
+            account_user: Some(user),
+            account_host: Some(host),
+            ..self.vars(None)
+        };
+        template::render_with(grant, &vars).ok()
+    }
+
+    /// Who the server knows this login as, `user` and `host`: the recipe's
+    /// `account` answer, else the login's user at `localhost`.
+    fn account(&self) -> (String, String) {
+        self.recipe
             .account
             .as_deref()
             .and_then(|command| self.run(command, None).ok())
@@ -422,20 +480,13 @@ impl Server<'_> {
                 let line = out.stdout.lines().map(str::trim).find(|l| !l.is_empty())?;
                 let (user, host) = line.rsplit_once('@')?;
                 Some((user.to_string(), host.to_string()))
-            });
-        let (user, host) = account.unwrap_or_else(|| {
-            (
-                self.login.user.clone().unwrap_or_default(),
-                "localhost".to_string(),
-            )
-        });
-        let vars = Vars {
-            prefix_like: Some(prefix_like(main)),
-            account_user: Some(user),
-            account_host: Some(host),
-            ..self.vars(None)
-        };
-        template::render_with(grant, &vars).ok()
+            })
+            .unwrap_or_else(|| {
+                (
+                    self.login.user.clone().unwrap_or_default(),
+                    "localhost".to_string(),
+                )
+            })
     }
 
     /// The refusal a login that may not make or drop namespaces earns: who
@@ -609,7 +660,8 @@ impl<'a> Server<'a> {
             Runner::Container { id, port } => (id.clone(), *port),
             Runner::Host => self.container()?,
         };
-        let env = self.container_env(&id)?;
+        let wanted: Vec<&String> = admin.user_from.iter().chain(&admin.password_from).collect();
+        let env = self.container_env(&id, &wanted);
         let first = |keys: &[String]| {
             keys.iter()
                 .find_map(|key| env.get(key).map(|value| (key.clone(), value.clone())))
@@ -625,7 +677,7 @@ impl<'a> Server<'a> {
         let user = user
             .map(|(_, value)| value)
             .or_else(|| admin.user.clone())?;
-        Some(Server {
+        let server = Server {
             service: self.service,
             recipe: self.recipe,
             host: self.host.clone(),
@@ -633,30 +685,80 @@ impl<'a> Server<'a> {
             login: Login::new(Some(user), password.map(|(_, value)| value), from),
             bin_dir: self.bin_dir.clone(),
             runner: Runner::Container { id, port },
-        })
+        };
+        // An image made with a random password, or one kept in a file,
+        // names an administrator pando cannot log in as: none, then, and
+        // whatever would have been asked is asked.
+        server.ping().ok()?;
+        Some(server)
     }
+}
+
+/// Whether a host is this machine's own loopback, as an app's env names it.
+fn is_loopback(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified())
+}
+
+/// Whether a process listening on a published port is a container
+/// runtime forwarding it, by the command name `lsof` gives: Docker
+/// Desktop, OrbStack, Colima and Lima, Podman, rootless Docker.
+fn is_forwarder(command: &str) -> bool {
+    const FORWARDERS: [&str; 10] = [
+        "com.docke",
+        "docker",
+        "vpnkit",
+        "orbstack",
+        "rootlessk",
+        "gvproxy",
+        "podman",
+        "limactl",
+        "colima",
+        "ssh",
+    ];
+    let command = command.to_ascii_lowercase();
+    FORWARDERS.iter().any(|name| command.starts_with(name))
 }
 
 /// The container in `docker ps` and `docker port` output that publishes
 /// `published` on this machine, and the port it listens on inside: the
 /// lines after `--` are each container's id followed by its mappings,
 /// `5432/tcp -> 0.0.0.0:15432`. The first that maps it wins.
-fn container_publishing(stdout: &str, published: u16) -> Option<(String, u16)> {
+pub(super) fn container_publishing(stdout: &str, published: u16) -> Option<(String, u16)> {
     let (_, listing) = stdout.split_once("--\n")?;
     let mut current: Option<&str> = None;
+    let mut found: Vec<(String, u16)> = Vec::new();
     for line in listing.lines().map(str::trim).filter(|l| !l.is_empty()) {
         let Some((inside, outside)) = line.split_once(" -> ") else {
             current = Some(line);
             continue;
         };
-        let outside = outside.rsplit_once(':').map(|(_, port)| port)?;
-        if outside.parse::<u16>().ok() != Some(published) {
+        let Some((ip, port)) = outside.rsplit_once(':') else {
+            continue;
+        };
+        // Published where this machine's loopback reaches it: every
+        // address, or loopback itself.
+        if port.parse::<u16>().ok() != Some(published) || !is_loopback(ip) {
             continue;
         }
-        let inside = inside.split('/').next()?.parse::<u16>().ok()?;
-        return Some((current?.to_string(), inside));
+        let Some(id) = current else {
+            continue;
+        };
+        let Some(inside) = inside.split('/').next().and_then(|p| p.parse::<u16>().ok()) else {
+            continue;
+        };
+        if !found.iter().any(|(known, _)| known == id) {
+            found.push((id.to_string(), inside));
+        }
     }
-    None
+    // Two containers on one port are a choice pando does not make.
+    match found.as_slice() {
+        [one] => Some(one.clone()),
+        _ => None,
+    }
 }
 
 /// The prefix every namespace of `main` starts with, as an SQL `LIKE`

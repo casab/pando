@@ -20,15 +20,37 @@ fn the_checks_database_is_a_plain_name_under_the_marker() {
     assert!(hashed.starts_with("shop__pando_check_"), "{hashed}");
 }
 
-// A prefix is the worktree's slug with the marker after it, joined to the
+// A prefix is the worktree's tag with the marker after it, joined to the
 // main checkout's own so the app's names still read as the project's:
 // one worktree's can be told from main's and from another's by name.
 #[test]
-fn a_worktrees_prefix_is_its_slug_and_the_marker_after_main_s() {
-    assert_eq!(worktree_prefix("", "feat+x"), "feat_x__");
-    assert_eq!(worktree_prefix("shop", "feat+x"), "shop_feat_x__");
-    assert_eq!(worktree_prefix("laravel_", "feat+x"), "laravel_feat_x__");
-    assert_eq!(worktree_prefix("app-", "Fix/Login"), "app-fix_login__");
+fn a_worktrees_prefix_is_its_tag_and_the_marker_after_main_s() {
+    let tag = worktree_tag("acme-0000beef", "feat+x");
+    assert!(
+        tag.starts_with("feat_x_") && tag.len() == "feat_x_".len() + 6,
+        "{tag}"
+    );
+    assert_eq!(
+        worktree_prefix("", "acme-0000beef", "feat+x"),
+        format!("{tag}__")
+    );
+    assert_eq!(
+        worktree_prefix("shop", "acme-0000beef", "feat+x"),
+        format!("shop_{tag}__")
+    );
+    assert_eq!(
+        worktree_prefix("laravel_", "acme-0000beef", "feat+x"),
+        format!("laravel_{tag}__")
+    );
+    // Nothing checks a prefix before it is used, so names that slug the
+    // same, and the same branch in a second clone, never share one.
+    for (project, worktree) in [
+        ("acme-0000beef", "feat-x"),
+        ("acme-0000beef", "Feat+X"),
+        ("acme-1111cafe", "feat+x"),
+    ] {
+        assert_ne!(worktree_tag(project, worktree), tag, "{project} {worktree}");
+    }
     assert_eq!(worktree_slug(crate::paths::CHECK_WORKTREE), "pando_check");
     // Never empty, so a prefix always tells the worktree apart.
     let odd = worktree_slug("+++");
@@ -969,6 +991,54 @@ fn a_server_in_a_container_is_reached_through_the_client_its_image_ships() {
         "{by_hand}"
     );
     assert!(!by_hand.contains("hunter2"), "{by_hand}");
+}
+
+// The container is the server only when it alone publishes the port where
+// this machine's loopback reaches it: two of them, or one published on
+// another address, is a choice pando does not make.
+#[test]
+fn a_container_is_taken_for_the_server_only_when_it_alone_publishes_the_port_here() {
+    let pick = |listing: &str| super::engine::container_publishing(listing, 15432);
+    assert_eq!(
+        pick("--\nc0ffee\n5432/tcp -> 0.0.0.0:15432\n5432/tcp -> [::]:15432\n"),
+        Some(("c0ffee".into(), 5432))
+    );
+    assert_eq!(
+        pick("--\nc0ffee\n5432/tcp -> 127.0.0.1:15432\n"),
+        Some(("c0ffee".into(), 5432))
+    );
+    assert_eq!(
+        pick("--\nc0ffee\n5432/tcp -> 0.0.0.0:15432\nbeef\n5432/tcp -> 0.0.0.0:15432\n"),
+        None
+    );
+    assert_eq!(pick("--\nc0ffee\n5432/tcp -> 192.168.1.5:15432\n"), None);
+    assert_eq!(pick("--\nc0ffee\n5432/tcp -> 0.0.0.0:25432\n"), None);
+}
+
+// A server the app reaches somewhere else, or a native one listening on
+// the same port beside a container, is never mistaken for the container.
+#[test]
+fn a_remote_server_or_a_native_listener_keeps_the_commands_here() {
+    let fake = containerised(Some(15432));
+    let recipe = inside_recipe();
+    let remote = Server {
+        port: 15432,
+        host: "db.internal".into(),
+        ..server(&recipe, &fake, "db")
+    }
+    .reach();
+    assert_eq!(remote.runner, Runner::Host);
+
+    use std::os::unix::fs::PermissionsExt;
+    let lsof = fake.bin().join("lsof");
+    std::fs::write(&lsof, "#!/bin/sh\necho p1\necho cpostgres\n").unwrap();
+    std::fs::set_permissions(&lsof, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let native = Server {
+        port: 15432,
+        ..server(&recipe, &fake, "db")
+    }
+    .reach();
+    assert_eq!(native.runner, Runner::Host);
 }
 
 // No container publishes the port: the server stays reached from here,

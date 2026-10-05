@@ -2000,12 +2000,8 @@ pub(super) fn already_answered(slot: Slot, config: &Config) -> bool {
         Slot::Login => config.namespaced.values().any(|login| login.has_login()),
         // Asked of a server, never of config.
         Slot::FreeSlot => false,
-        // Per service, as the login is: any table that says more than a
-        // login has been answered.
-        Slot::Namespaced => config.namespaced.values().any(|settings| {
-            settings.recipe.is_some()
-                || !settings.db_env.is_empty()
-                || !settings.prefix_env.is_empty()
-        }),
+        // Per service: an answer for one service is never refused because
+        // another has one. The writer refuses one already answered.
+        Slot::Namespaced => false,
     }
 }

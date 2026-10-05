@@ -12041,6 +12041,11 @@ fn a_project_names_the_recipe_an_unknown_image_is() {
 
 // ---- prefixes -------------------------------------------------------------
 
+/// What a worktree of this fixture's project is called in a prefix.
+fn tag(fx: &Fx, worktree: &str) -> String {
+    crate::namespace::worktree_tag(fx.paths.project_id(), worktree)
+}
+
 /// A compose project with a search engine at `ELASTICSEARCH_URL`, and
 /// whatever else `env` sets beside it.
 fn search_fixture(image: &str, env: &str) -> Fx {
@@ -12081,11 +12086,12 @@ fn an_app_that_reads_an_index_prefix_gets_the_worktrees_own() {
     );
     let env =
         super::namespaced::namespaced_env(&fx.paths, &fx.config, &plan, &[], "feat+one").unwrap();
-    assert_eq!(env["ELASTICSEARCH_INDEX_PREFIX"], "feat_one__");
-    assert_eq!(env["PANDO_NAMESPACE"], "feat_one");
+    let one = tag(&fx, "feat+one");
+    assert_eq!(env["ELASTICSEARCH_INDEX_PREFIX"], format!("{one}__"));
+    assert_eq!(env["PANDO_NAMESPACE"], one);
     assert_eq!(
-        plan.prefixed[0].describe("feat+one"),
-        "prefix feat_one__ in ELASTICSEARCH_INDEX_PREFIX"
+        plan.prefixed[0].describe(fx.paths.project_id(), "feat+one"),
+        format!("prefix {one}__ in ELASTICSEARCH_INDEX_PREFIX")
     );
 }
 
@@ -12123,9 +12129,12 @@ fn a_project_names_the_prefix_key_of_any_service() {
     assert!(plan.shared.is_empty(), "{:?}", plan.shared);
     let env =
         super::namespaced::namespaced_env(&fx.paths, &fx.config, &plan, &[], "feat+one").unwrap();
-    assert_eq!(env["SEARCH_NAMESPACE"], "shop_feat_one__");
+    assert_eq!(
+        env["SEARCH_NAMESPACE"],
+        format!("shop_{}__", tag(&fx, "feat+one"))
+    );
     // Named by the project, set whether or not main sets it.
-    assert_eq!(env["SEARCH_TOPICS"], "feat_one__");
+    assert_eq!(env["SEARCH_TOPICS"], format!("{}__", tag(&fx, "feat+one")));
 
     fx.config.namespaced.get_mut("search").unwrap().prefix_env = vec!["not a key".into()];
     let plan = super::namespaced::plan(&fx.paths, &fx.config);
@@ -12161,7 +12170,10 @@ fn a_redis_with_no_slot_setting_gets_a_key_prefix_when_the_app_reads_one() {
     );
     let env =
         super::namespaced::namespaced_env(&fx.paths, &fx.config, &plan, &[], "feat+one").unwrap();
-    assert_eq!(env["REDIS_PREFIX"], "laravel_database_feat_one__");
+    assert_eq!(
+        env["REDIS_PREFIX"],
+        format!("laravel_database_{}__", tag(&fx, "feat+one"))
+    );
 
     std::fs::write(
         fx.root.join(".env"),
@@ -12228,7 +12240,10 @@ fn a_setup_writes_namespaced_settings_beside_the_login_it_never_touches() {
     assert_eq!(search.user.as_deref(), Some("elastic"));
     assert_eq!(search.password.as_deref(), Some("hunter2"));
     let plan = super::namespaced::plan(&fx.paths, &config);
-    assert_eq!(plan.prefixed[0].values("feat+x")[0].1, "shop_feat_x__");
+    assert_eq!(
+        plan.prefixed[0].values(fx.paths.project_id(), "feat+x")[0].1,
+        format!("shop_{}__", tag(&fx, "feat+x"))
+    );
 }
 
 // What `init` prints is what a setup agent reports: a service a
@@ -12308,6 +12323,46 @@ fn a_namespaced_answer_for_a_service_or_recipe_there_is_not_is_refused() {
     assert!(e.contains("not an env key"), "{e}");
     let e = refused(r#"{"search": {}}"#);
     assert!(e.contains("says nothing"), "{e}");
+    // A database or a slot needs a recipe that makes one.
+    let e = refused(r#"{"search": {"recipe": "elasticsearch", "db_env": ["SEARCH_DB"]}}"#);
+    assert!(e.contains("knows no [namespace]"), "{e}");
+}
+
+// Answered per service: an answer for a second service is taken, and one
+// for a service already answered needs `--replace`. A `db_env` for a
+// service only a compose file names has no address to point, and is
+// refused rather than written and never used.
+#[test]
+fn a_namespaced_answer_is_per_service_and_db_env_needs_a_mapped_address() {
+    let mut fx = compose_fixture(
+        concat!(
+            "services:\n",
+            "  db:\n    image: postgres:16\n    ports: [\"5432:5432\"]\n",
+            "  search:\n    image: registry.example/search:3\n",
+            "  cache:\n    image: redis:7\n",
+        ),
+        "PORT=3000\nDATABASE_URL=postgres://acme:acme@localhost:5432/acme\nSEARCH_NS=\n",
+    );
+    let services = "[[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
+                    include = [\"db\"]\nenv = { DATABASE_URL = \"db\" }\n";
+    std::fs::create_dir_all(fx.paths.config_file().parent().unwrap()).unwrap();
+    std::fs::write(fx.paths.config_file(), services).unwrap();
+    fx.config = crate::config::load(&fx.paths).unwrap().config;
+    init_with_namespaced(&fx, r#"{"search": {"prefix_env": ["SEARCH_NS"]}}"#).unwrap();
+    fx.config = crate::config::load(&fx.paths).unwrap().config;
+    init_with_namespaced(&fx, r#"{"db": {"db_env": ["DATABASE_URL"]}}"#).unwrap();
+    fx.config = crate::config::load(&fx.paths).unwrap().config;
+    let again =
+        init_with_namespaced(&fx, r#"{"search": {"prefix_env": ["SEARCH_NS"]}}"#).unwrap_err();
+    assert!(
+        format!("{again:#}").contains("already answered"),
+        "{again:#}"
+    );
+    let cache = init_with_namespaced(&fx, r#"{"cache": {"db_env": ["REDIS_DB"]}}"#).unwrap_err();
+    assert!(
+        format!("{cache:#}").contains("needs the service in `services`"),
+        "{cache:#}"
+    );
 }
 
 // What `signals` says of each service a namespaced start would see — and
@@ -12426,8 +12481,11 @@ fn a_project_namespaced_by_prefix_alone_starts_namespaced() {
         crate::state::ServiceMode::Namespaced
     );
     let env = super::services::resolved_env(&fx.paths, &fx.config, &name).unwrap();
-    assert_eq!(env["ELASTICSEARCH_INDEX_PREFIX"], "feat_one__");
-    assert_eq!(env["PANDO_NAMESPACE"], "feat_one");
+    assert_eq!(
+        env["ELASTICSEARCH_INDEX_PREFIX"],
+        format!("{}__", tag(&fx, &name))
+    );
+    assert_eq!(env["PANDO_NAMESPACE"], tag(&fx, &name));
     let record = fx.state().worktrees[&name].clone();
     let lines = super::namespaced::namespace_lines(&fx.paths, Some(&fx.config), &name, &record);
     assert_eq!(
@@ -12435,7 +12493,7 @@ fn a_project_namespaced_by_prefix_alone_starts_namespaced() {
         [(
             "search".to_string(),
             "own",
-            "prefix feat_one__ in ELASTICSEARCH_INDEX_PREFIX".to_string()
+            format!("prefix {}__ in ELASTICSEARCH_INDEX_PREFIX", tag(&fx, &name))
         )]
     );
 }
@@ -12460,7 +12518,10 @@ fn rm_of_a_prefixed_worktree_leaves_what_the_app_wrote_and_says_so() {
     let left = super::namespaced::drop_namespaces(&fx.paths, &store, "feat+one", &noop);
     assert_eq!(left.len(), 1, "{left:?}");
     assert!(
-        left[0].starts_with("search: what the app wrote under feat_one__ is left"),
+        left[0].starts_with(&format!(
+            "search: what the app wrote under {}__ is left",
+            tag(&fx, "feat+one")
+        )),
         "{left:?}"
     );
 }
@@ -12543,13 +12604,16 @@ fn boxed_fixture(url: &str, env: &str) -> (Fx, PathBuf) {
            ps) echo c0ffee ;;\n\
            port) echo \"5432/tcp -> 0.0.0.0:15432\" ;;\n\
            exec) shift; while [ \"$1\" = -e ]; do shift 2; done; shift;\n\
-             if [ \"$1\" = env ]; then cat '{c}/env'; exit 0; fi; shift; shift;\n\
+             if [ \"$1\" = printenv ]; then v=$(grep \"^$2=\" '{c}/env') || exit 1;\n\
+               printf '%s\\n' \"${{v#*=}}\"; exit 0; fi; shift; shift;\n\
              PATH='{c}/bin':\"$PATH\" exec sh -c \"$1\" ;;\n\
          esac\n",
         c = container.display()
     );
     std::fs::write(bin.join("docker"), docker).unwrap();
     std::fs::set_permissions(bin.join("docker"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(bin.join("lsof"), "#!/bin/sh\necho p1\necho cvpnkit\n").unwrap();
+    std::fs::set_permissions(bin.join("lsof"), std::fs::Permissions::from_mode(0o755)).unwrap();
     (fx, container)
 }
 
@@ -12620,6 +12684,67 @@ fn a_container_database_with_no_login_written_anywhere_asks_nobody() {
     assert_eq!(ready.namespaces[0].name, "shop__feat_one");
     let argv = std::fs::read_to_string(container.join("argv")).unwrap();
     assert!(argv.contains("-U boss create shop__feat_one"), "{argv}");
+
+    // Made as the administrator, and dropped as the same one: with no login
+    // written anywhere, `rm` left it behind with no command to drop it.
+    let mut store = fx.state();
+    store.worktrees.get_mut(&name).unwrap().namespaces = ready.namespaces.clone();
+    crate::state::save(&fx.paths.state_file(), &store).unwrap();
+    let left = super::namespaced::drop_namespaces(&fx.paths, &store, &name, &noop);
+    assert!(left.is_empty(), "{left:?}");
+    assert!(!container.join("db-shop__feat_one").exists());
+    let argv = std::fs::read_to_string(container.join("argv")).unwrap();
+    assert!(argv.contains("-U boss drop shop__feat_one"), "{argv}");
+}
+
+// A worktree running on a database of its own did not start when that
+// database could no longer be given; a prefix for another service let it
+// start, on the main checkout's database. Every namespace it holds has to
+// stay its own.
+#[test]
+fn a_prefix_elsewhere_does_not_start_a_worktree_that_lost_its_database() {
+    let mut fx = compose_fixture(
+        concat!(
+            "services:\n",
+            "  db:\n    image: postgres:16\n    ports: [\"5432:5432\"]\n",
+            "  search:\n    image: elasticsearch:8\n    ports: [\"9200:9200\"]\n",
+        ),
+        "PORT=3000\nDATABASE_URL=${NOTHING_SETS_THIS}\n\
+         ELASTICSEARCH_URL=http://localhost:9200\nELASTICSEARCH_INDEX_PREFIX=\n",
+    );
+    let config: Config = toml::from_str(
+        "[[services]]\nkind = \"compose\"\nfile = \"docker-compose.yml\"\n\
+         include = [\"db\", \"search\"]\n\
+         env = { DATABASE_URL = \"db\", ELASTICSEARCH_URL = \"search\" }\n",
+    )
+    .unwrap();
+    fx.config.services = config.services;
+    let name = worktree_named(&fx, "feat/one");
+    let mut store = fx.state();
+    let record = store.worktrees.get_mut(&name).unwrap();
+    record.mode = Some(crate::state::ServiceMode::Namespaced);
+    record.namespaces.push(crate::state::NamespaceRecord {
+        service: "db".into(),
+        recipe: "postgres".into(),
+        kind: crate::state::NamespaceKind::Database,
+        host: "localhost".into(),
+        port: 5432,
+        name: "acme__feat_one".into(),
+        main: "acme".into(),
+        mains: Vec::new(),
+        keys: vec!["DATABASE_URL".into()],
+        used_at: Utc::now(),
+    });
+    crate::state::save(&fx.paths.state_file(), &store).unwrap();
+    let plan = super::namespaced::plan(&fx.paths, &fx.config);
+    assert!(plan.gives_own() && plan.targets.is_empty(), "{plan:?}");
+    let e =
+        super::lifecycle::refuse_losing_namespaces(&fx.paths, &fx.config, &name, Mode::Remembered)
+            .unwrap_err();
+    assert!(
+        format!("{e:#}").contains("a namespace of its own in db"),
+        "{e:#}"
+    );
 }
 
 /// A recipe for an engine pando never starts, only finds in a container:

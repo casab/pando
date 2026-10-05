@@ -196,16 +196,21 @@ pub struct Prefixed {
 impl Prefixed {
     /// Each key with the worktree's value: the main checkout's, then the
     /// worktree's slug and the marker.
-    pub fn values(&self, worktree: &str) -> Vec<(String, String)> {
+    pub fn values(&self, project: &str, worktree: &str) -> Vec<(String, String)> {
         self.keys
             .iter()
-            .map(|(key, main)| (key.clone(), namespace::worktree_prefix(main, worktree)))
+            .map(|(key, main)| {
+                (
+                    key.clone(),
+                    namespace::worktree_prefix(main, project, worktree),
+                )
+            })
             .collect()
     }
 
     /// `prefix feat_x__ in ELASTICSEARCH_INDEX_PREFIX`, as `status` says it.
-    pub fn describe(&self, worktree: &str) -> String {
-        let values = self.values(worktree);
+    pub fn describe(&self, project: &str, worktree: &str) -> String {
+        let values = self.values(project, worktree);
         let mut shown: Vec<String> = Vec::new();
         for (_, value) in &values {
             if !shown.contains(value) {
@@ -550,7 +555,17 @@ fn services_with_recipes(
     // a namespaced start can give data of its own, once the project says
     // how in `[namespaced.<service>]`: isolation and namespaces are two
     // choices, and the first should not gate the second.
-    for (service, image) in compose_services(paths) {
+    // Read only for a table that names a service config does not: the
+    // plan is asked for on every start and every `status`.
+    let undeclared = config
+        .namespaced
+        .keys()
+        .any(|service| !out.iter().any(|known| known.service == *service));
+    let compose = match undeclared {
+        true => compose_services(paths),
+        false => Vec::new(),
+    };
+    for (service, image) in compose {
         if out.iter().any(|known| known.service == service)
             || !config.namespaced.contains_key(&service)
         {
@@ -2222,12 +2237,13 @@ pub(super) fn namespaced_env(
     // The worktree's own name for itself, to every process and hook: an
     // app that puts it in front of its index, topic or key names gets
     // data of its own on any service, with nothing for pando to make.
+    let project = paths.project_id();
     env.insert(
         namespace::NAMESPACE_ENV.to_string(),
-        namespace::worktree_slug(worktree),
+        namespace::worktree_tag(project, worktree),
     );
     for prefixed in &plan.prefixed {
-        env.extend(prefixed.values(worktree));
+        env.extend(prefixed.values(project, worktree));
     }
     for target in &plan.targets {
         let Some(namespace) = namespaces.iter().find(|ns| {
@@ -2349,7 +2365,7 @@ pub(super) fn drop_namespaces(
                      and pando made nothing there to drop",
                     prefixed.service,
                     prefixed
-                        .values(name)
+                        .values(paths.project_id(), name)
                         .into_iter()
                         .map(|(_, value)| value)
                         .next()
@@ -2433,6 +2449,12 @@ pub(super) fn drop_namespaces(
             runner: namespace::Runner::Host,
         }
         .reach();
+        // Made as the container's administrator, with no login written
+        // anywhere: dropped as the same one.
+        let admin = (recipe.user && server.login.user.is_none())
+            .then(|| server.admin())
+            .flatten();
+        let server = admin.unwrap_or(server);
         // A login that may not drop it is no reason to leave it: the
         // server's own administrator, inside its container, may — past
         // the same guard, which has already passed.
@@ -2655,7 +2677,8 @@ pub(super) fn write_namespaced_answer(
                 .to_string(),
         ));
     }
-    let mut declared = declared_services(config);
+    let isolated = declared_services(config);
+    let mut declared = isolated.clone();
     for (service, _) in compose_services(paths) {
         if !declared.contains(&service) {
             declared.push(service);
@@ -2663,6 +2686,17 @@ pub(super) fn write_namespaced_answer(
     }
     let recipes = crate::recipes::Recipes::load(&paths.recipes_dir());
     for (service, answer) in services {
+        let answered = config.namespaced.get(service).is_some_and(|settings| {
+            settings.recipe.is_some()
+                || !settings.db_env.is_empty()
+                || !settings.prefix_env.is_empty()
+        });
+        if answered && !replacing {
+            return Err(by.refuse(format!(
+                "namespaced.{service} is already answered, so your answer was not applied — add \
+                 --replace to replace it"
+            )));
+        }
         if !declared.contains(service) {
             return Err(by.refuse(format!(
                 "namespaced names {service:?}, which is not one of this project's services — \
@@ -2671,6 +2705,14 @@ pub(super) fn write_namespaced_answer(
                     true => "none at all".to_string(),
                     false => declared.join(", "),
                 }
+            )));
+        }
+        // A database or a slot is reached at the address config maps for
+        // the service; one only a compose file names has none.
+        if !answer.db_env.is_empty() && !isolated.contains(service) {
+            return Err(by.refuse(format!(
+                "namespaced.{service}.db_env needs the service in `services`, where its address \
+                 is mapped — `prefix_env` needs nothing more"
             )));
         }
         if *answer == NamespacedAnswer::default() {
@@ -2682,6 +2724,12 @@ pub(super) fn write_namespaced_answer(
             let loaded = recipes
                 .get(name)
                 .map_err(|e| by.refuse(format!("namespaced.{service}.recipe: {e:#}")))?;
+            if !answer.db_env.is_empty() && loaded.recipe.namespace.is_none() {
+                return Err(by.refuse(format!(
+                    "namespaced.{service}.db_env names a database or slot, and the recipe \
+                     {name:?} knows no [namespace] to make one"
+                )));
+            }
             if loaded.recipe.namespace.is_none() && loaded.recipe.prefix.is_none() {
                 return Err(by.refuse(format!(
                     "namespaced.{service}.recipe names {name:?}, which says nothing about a \
@@ -2872,11 +2920,13 @@ pub enum PlanRow {
 
 impl PlanRow {
     /// The service, a word, and the rest of the line, for this worktree.
-    pub fn line(&self, worktree: &str) -> (String, &'static str, String) {
+    pub fn line(&self, project: &str, worktree: &str) -> (String, &'static str, String) {
         match self {
-            PlanRow::Prefix(prefixed) => {
-                (prefixed.service.clone(), "own", prefixed.describe(worktree))
-            }
+            PlanRow::Prefix(prefixed) => (
+                prefixed.service.clone(),
+                "own",
+                prefixed.describe(project, worktree),
+            ),
             PlanRow::Shared { service, why } => (service.clone(), "shared", why.clone()),
         }
     }
@@ -2936,7 +2986,7 @@ pub fn namespace_lines(
         out.extend(
             namespace_plan_rows(paths, config)
                 .iter()
-                .map(|row| row.line(name)),
+                .map(|row| row.line(paths.project_id(), name)),
         );
     }
     out

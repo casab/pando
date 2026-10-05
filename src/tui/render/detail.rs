@@ -775,7 +775,10 @@ fn namespace_rows<'a>(app: &App, name: &str, width: usize) -> Vec<Line<'a>> {
         let plan = app
             .namespace_plan
             .get_or_init(|| crate::actions::namespace_plan_rows(&app.paths, &app.config));
-        rows.extend(plan.iter().map(|row| row.line(name)));
+        rows.extend(
+            plan.iter()
+                .map(|row| row.line(app.paths.project_id(), name)),
+        );
     }
     let label_width = rows
         .iter()
