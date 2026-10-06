@@ -48,9 +48,9 @@ impl Host {
     /// copies as the build's own desktop does. A test that wants WSL
     /// describes it with [`Host::at`].
     ///
-    /// Read only where pando meets the outside: the TUI's launch
-    /// environment, `pando open`, and the theme. Everything below them is
-    /// handed a `&Host`, which `tests.rs` holds them to.
+    /// Read only where pando meets the outside: [`crate::actions::Machine`],
+    /// the TUI's launch environment, `pando open`, and the theme. Everything
+    /// below them is handed a `&Host`, which `tests.rs` holds them to.
     pub fn here() -> &'static Host {
         static HERE: std::sync::OnceLock<Host> = std::sync::OnceLock::new();
         HERE.get_or_init(|| {

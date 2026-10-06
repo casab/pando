@@ -7,7 +7,12 @@ use super::*;
 
 /// Where [`Host::here`] may be read: where pando meets the outside. Every
 /// module below them is handed a `&Host`.
-const HOST_EDGES: &[&str] = &["tui/app/launch.rs", "cli/open.rs", "theme/select.rs"];
+const HOST_EDGES: &[&str] = &[
+    "actions/runtime.rs",
+    "tui/app/launch.rs",
+    "cli/open.rs",
+    "theme/select.rs",
+];
 
 fn src() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
