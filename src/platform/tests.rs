@@ -394,6 +394,21 @@ fn a_link_points_at_its_target() {
     assert_eq!(std::fs::read_link(&link).unwrap(), target);
 }
 
+// Windows makes a link to a directory and a link to a file differently,
+// so it asks what the target is: a relative one from the link's own
+// directory, where the link will look, not from pando's.
+#[test]
+fn a_relative_target_is_seen_from_the_links_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("a/shared")).unwrap();
+    let link = dir.path().join("a/link");
+    let seen = files::as_seen_from(&link, Path::new("shared"));
+    assert_eq!(seen, dir.path().join("a/shared"));
+    assert!(seen.is_dir());
+    let absolute = dir.path().join("elsewhere");
+    assert_eq!(files::as_seen_from(&link, &absolute), absolute);
+}
+
 // ---- desktop ---------------------------------------------------------
 
 fn on(os: Os) -> Host {

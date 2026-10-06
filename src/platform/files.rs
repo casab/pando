@@ -50,6 +50,19 @@ pub fn symlink(target: &Path, link: &Path) -> io::Result<()> {
     imp::symlink(target, link)
 }
 
+/// `target` as the link at `link` will resolve it: a relative target from
+/// the link's own directory, not from pando's.
+///
+/// Compiled everywhere so its tests run everywhere; only Windows, where a
+/// link to a directory is another kind, asks.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn as_seen_from(link: &Path, target: &Path) -> std::path::PathBuf {
+    match target.is_relative() {
+        true => link.parent().unwrap_or(Path::new("")).join(target),
+        false => target.to_path_buf(),
+    }
+}
+
 /// Which file a path names right now: a file put in another's place behind
 /// the same path has another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,9 +211,10 @@ mod imp {
         })
     }
 
-    /// A link to a directory and a link to a file are two kinds here.
+    /// A link to a directory and a link to a file are two kinds here, told
+    /// apart by what the target is as the link will see it.
     pub(super) fn symlink(target: &Path, link: &Path) -> io::Result<()> {
-        match target.is_dir() {
+        match super::as_seen_from(link, target).is_dir() {
             true => std::os::windows::fs::symlink_dir(target, link),
             false => std::os::windows::fs::symlink_file(target, link),
         }
