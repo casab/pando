@@ -16,9 +16,10 @@ may change behaviour.
   On macOS and Linux one thing changes: `pando update`'s install script,
   and `share`'s check that `cloudflared` is on PATH, run in `/bin/sh`
   rather than the first `sh` on PATH, as `open`'s commands already did.
-- A native Windows build compiles, and stops at once with one line that
-  says to run pando inside WSL 2: its Windows backends are not built yet.
-  CI builds it on Windows so they keep compiling.
+- A native Windows build compiles, and every command but `completions`
+  stops at once with one line that says to run pando inside WSL 2: its
+  Windows backends are not built yet. CI builds it on Windows so they
+  keep compiling.
 
 ## 0.9.0 — 2026-10-05
 

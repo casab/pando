@@ -42,7 +42,8 @@ pub fn init() {
 /// A native Windows build compiles, so the layer's Windows backends are
 /// held to compiling by CI, but most of them only say "not yet": it
 /// refuses here, after `--help` and `--version`, rather than failing
-/// halfway through a command.
+/// halfway through a command. `completions` only prints, so `main` lets
+/// it through.
 pub fn unsupported() -> Option<&'static str> {
     match Os::HERE {
         Os::Windows => Some(

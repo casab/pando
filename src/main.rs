@@ -25,7 +25,10 @@ fn main() -> ExitCode {
     // Parsed before anything else so `--help` and `--version` work outside a
     // repository, and a usage error exits 2 through clap.
     let cli = Cli::parse();
-    if let Some(why) = pando::platform::unsupported() {
+    // A completion script is only pando's own arguments, printed: it asks
+    // the OS for nothing, so it is written wherever pando builds.
+    let prints_only = matches!(cli.command, Some(pando::cli::Command::Completions { .. }));
+    if !prints_only && let Some(why) = pando::platform::unsupported() {
         eprintln!("pando: {why}");
         return ExitCode::FAILURE;
     }
