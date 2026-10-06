@@ -1,6 +1,4 @@
-//! What pando runs on: the OS it was built for, and what it finds at run time.
-
-use std::path::Path;
+//! What pando runs on: the OS it was built for.
 
 /// The operating system pando was built for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,7 +21,8 @@ impl Os {
 }
 
 /// The machine pando runs on, as far as anything above this layer may
-/// know it: decided by the build, and by what pando reads at run time.
+/// know it. Today that is the OS of the build alone; a fact pando reads
+/// about the machine at run time joins it as a field of its own.
 ///
 /// A field rather than a `cfg`, so a decision that depends on the OS is
 /// made from a value a test can choose, and both of its branches run on
@@ -34,38 +33,21 @@ pub struct Host {
 }
 
 impl Host {
-    /// This machine, read once.
+    /// This machine. A test sees the OS it was built for, as the
+    /// developer's machine does: one built on macOS asks the macOS row of
+    /// the desktop table.
     ///
-    /// Under `cargo test`, a neutral host: the OS of the build and nothing
-    /// read from the machine the tests run on, so no unit test opens,
-    /// copies or advises the way the developer's own machine would.
-    ///
-    /// Read only where pando meets the outside: [`crate::actions::Machine`],
-    /// the TUI's launch environment, `pando open`, and the theme. Everything
-    /// below them is handed a `&Host`, which `tests.rs` holds them to.
+    /// Read only where pando meets the outside: the TUI's launch
+    /// environment, `pando open`, and the theme. Everything below them is
+    /// handed a `&Host`, which `tests.rs` holds them to.
     pub fn here() -> &'static Host {
-        static HERE: std::sync::OnceLock<Host> = std::sync::OnceLock::new();
-        HERE.get_or_init(|| {
-            #[cfg(test)]
-            {
-                Host::default()
-            }
-            #[cfg(not(test))]
-            {
-                Host::at(Path::new("/"))
-            }
-        })
-    }
-
-    /// A machine whose run-time facts are read from files under `system`:
-    /// `/` on a real one, a directory of a test's own in a test.
-    pub fn at(_system: &Path) -> Host {
-        Host { os: Os::HERE }
+        static HERE: Host = Host { os: Os::HERE };
+        &HERE
     }
 }
 
 impl Default for Host {
-    /// This build's OS, with nothing read at run time.
+    /// This build's OS.
     fn default() -> Host {
         Host { os: Os::HERE }
     }

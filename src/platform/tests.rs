@@ -7,12 +7,7 @@ use super::*;
 
 /// Where [`Host::here`] may be read: where pando meets the outside. Every
 /// module below them is handed a `&Host`.
-const HOST_EDGES: &[&str] = &[
-    "actions/runtime.rs",
-    "tui/app/launch.rs",
-    "cli/open.rs",
-    "theme/select.rs",
-];
+const HOST_EDGES: &[&str] = &["tui/app/launch.rs", "cli/open.rs", "theme/select.rs"];
 
 fn src() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
@@ -202,12 +197,6 @@ fn the_platform_layer_imports_nothing_above_it() {
 #[test]
 fn only_a_native_windows_build_refuses_to_run() {
     assert_eq!(unsupported().is_some(), Os::HERE == Os::Windows);
-}
-
-#[test]
-fn no_test_sees_the_machine_it_runs_on() {
-    assert_eq!(Host::here(), &Host::default());
-    assert_eq!(Host::here().os, Os::HERE);
 }
 
 // ---- boot ------------------------------------------------------------

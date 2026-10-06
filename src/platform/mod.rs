@@ -13,8 +13,8 @@
 //! a small `#[cfg(target_os)]` item; a pure parser is compiled on every OS
 //! so its tests run everywhere.
 //!
-//! What the OS is, and what pando finds at run time, is [`Host`]: read once
-//! for this machine, or from files under a root a test chooses.
+//! What the OS is, is [`Host`]: a value handed down from where pando meets
+//! the outside, so a test can choose it.
 
 pub mod boot;
 pub mod cow;
