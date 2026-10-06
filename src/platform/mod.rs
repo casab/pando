@@ -10,8 +10,11 @@
 //! contract every backend keeps, and call `imp`: an inline
 //! `#[cfg(…)] mod imp` when the backend is short, a file per OS when it is
 //! long. A difference between macOS and Linux inside a Unix backend stays
-//! a small `#[cfg(target_os)]` item; a pure parser is compiled on every OS
-//! so its tests run everywhere.
+//! a small `#[cfg(target_os)]` item, and a pure parser is compiled on every
+//! OS its backend builds for, so its tests run on every runner that has
+//! tests: `ss`'s on macOS, `lsof`'s on Linux. Tests run on macOS and Linux
+//! alone until a native port, so a parser a Windows backend asks for sits
+//! in the facade, where they run too (`files::as_seen_from`).
 //!
 //! What the OS is, is [`Host`]: a value handed down from where pando meets
 //! the outside, so a test can choose it.
