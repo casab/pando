@@ -61,32 +61,94 @@ fn production_lines<'t>(file: &str, text: &'t str) -> Vec<(usize, &'t str)> {
     out
 }
 
+/// The production lines joined where one item spans several, numbered by
+/// its first: a `use` until its `;`, and a `cfg` until its parentheses
+/// close, so a grouped import or a split `cfg(any(…))` is read whole.
+fn statements(lines: &[(usize, &str)]) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    let mut open: Option<(usize, String)> = None;
+    for &(number, line) in lines {
+        let (first, mut text) = open.take().unwrap_or((number, String::new()));
+        text.push_str(line.trim());
+        text.push(' ');
+        match unfinished(&text) {
+            true => open = Some((first, text)),
+            false => out.push((first, text)),
+        }
+    }
+    out.extend(open);
+    out
+}
+
+/// Whether `text` is a `use` without its `;` yet, or a `cfg` whose
+/// parentheses are still open.
+fn unfinished(text: &str) -> bool {
+    let mut words = text.split_whitespace();
+    let is_use = match words.next() {
+        Some("use") => true,
+        Some(word) if word.starts_with("pub") => words.next() == Some("use"),
+        _ => false,
+    };
+    if is_use {
+        return !text.contains(';');
+    }
+    let Some(at) = ["cfg(", "cfg!(", "cfg_attr("]
+        .iter()
+        .filter_map(|cfg| text.find(cfg))
+        .min()
+    else {
+        return false;
+    };
+    let depth: i32 = text[at..]
+        .chars()
+        .map(|c| match c {
+            '(' => 1,
+            ')' => -1,
+            _ => 0,
+        })
+        .sum();
+    depth > 0
+}
+
 /// Whether `line` names `path` as a path of its own: `nix::` is the crate,
-/// not the end of `std::os::unix::`.
+/// not the end of `std::os::unix::`, and `::libc::` is the crate too,
+/// where `foo::libc::` is a module of `foo`.
 fn names(line: &str, path: &str) -> bool {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
     line.match_indices(path).any(|(at, _)| {
-        !line[..at]
-            .chars()
-            .next_back()
-            .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == ':')
+        let before = &line[..at];
+        match before.strip_suffix("::") {
+            Some(rest) => !rest.chars().next_back().is_some_and(ident),
+            None => !before
+                .chars()
+                .next_back()
+                .is_some_and(|c| ident(c) || c == ':'),
+        }
     })
 }
 
-/// What in one production line outside this layer talks to the OS.
+/// What in one production statement outside this layer talks to the OS.
 fn os_talk(file: &str, line: &str) -> Option<&'static str> {
     const PATHS: &[&str] = &["std::os::", "nix::", "libc::", "windows_sys::"];
     const CALLS: &[&str] = &[
-        "extern \"C\"",
+        "extern \"",
         "var_os(\"HOME\")",
         "var(\"HOME\")",
         "Command::new(\"bash\")",
         "Command::new(\"sh\")",
         "\"/bin/sh\"",
+        "\"/bin/bash\"",
         "Group::from_raw",
         ".as_raw()",
     ];
     if let Some(path) = PATHS.iter().find(|path| names(line, path)) {
         return Some(path);
+    }
+    // `use std::{fs, os::unix::…}`: `std::os` with a group between.
+    if let Some(at) = line.find("std::{")
+        && names(&line[at..], "os::")
+    {
+        return Some("std::os::");
     }
     if let Some(call) = CALLS.iter().find(|call| line.contains(*call)) {
         return Some(call);
@@ -107,6 +169,13 @@ fn os_talk(file: &str, line: &str) -> Option<&'static str> {
     None
 }
 
+/// Best effort: it reads lines, not Rust. It sees a path to the OS however
+/// it is spelt (`::libc::`, `std::{fs, os::…}`), a `use` or a `cfg` split
+/// over lines, any foreign ABI, and the shells by name; not a renamed
+/// import, or a shell's name held in a const. What it misses, CI's
+/// Windows build catches: a Unix API named outside a `cfg` does not
+/// compile there. `tests/` and `examples/` are not read, since test code
+/// stays Unix-only until a native port.
 #[test]
 fn only_the_platform_layer_talks_to_the_os() {
     let mut offending = Vec::new();
@@ -115,8 +184,8 @@ fn only_the_platform_layer_talks_to_the_os() {
             continue;
         }
         let text = std::fs::read_to_string(src().join(&file)).unwrap();
-        for (number, line) in production_lines(&file, &text) {
-            if let Some(what) = os_talk(&file, line) {
+        for (number, statement) in statements(&production_lines(&file, &text)) {
+            if let Some(what) = os_talk(&file, &statement) {
                 offending.push(format!("src/{file}:{number}: {what}"));
             }
         }
@@ -125,6 +194,45 @@ fn only_the_platform_layer_talks_to_the_os() {
         offending.is_empty(),
         "only src/platform talks to the OS; move these into it: {offending:#?}"
     );
+}
+
+/// What the boundary finds in `code`, as a file outside this layer.
+fn talk_in(code: &str) -> Vec<&'static str> {
+    let lines: Vec<(usize, &str)> = code
+        .lines()
+        .enumerate()
+        .map(|(index, line)| (index + 1, line))
+        .collect();
+    statements(&lines)
+        .iter()
+        .filter_map(|(_, statement)| os_talk("cli/x.rs", statement))
+        .collect()
+}
+
+// Each of these slipped past the first version of the boundary.
+#[test]
+fn the_boundary_sees_a_path_however_it_is_spelt_and_split() {
+    for code in [
+        "let pid = unsafe { ::libc::getpid() };",
+        "use ::std::os::unix::fs::PermissionsExt;",
+        "use std::{fs, os::unix::fs::PermissionsExt};",
+        "use std::{\n    fs,\n    os::unix::fs::PermissionsExt,\n};",
+        "#[cfg(any(\n    target_os = \"linux\",\n    target_os = \"macos\",\n))]\nfn f() {}",
+        "unsafe extern \"system\" {\n    fn GetTickCount() -> u32;\n}",
+        "Command::new(\"/bin/bash\")",
+    ] {
+        assert!(!talk_in(code).is_empty(), "not seen:\n{code}");
+    }
+    for code in [
+        "use crate::platform::files;",
+        "use std::{fs, io::Write};",
+        "let unix_time = 0;",
+        "let parsed = toml::libc::Value::new();",
+        "#[cfg(test)]\nfn f() {}",
+        "#[cfg(any(\n    test,\n    feature = \"extra\",\n))]\nfn f() {}",
+    ] {
+        assert!(talk_in(code).is_empty(), "seen in:\n{code}");
+    }
 }
 
 // The Windows backends are held to compiling by a CI job that builds the
