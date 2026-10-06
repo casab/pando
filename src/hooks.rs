@@ -799,7 +799,7 @@ mod tests {
     fn where_it_ran(detached: bool) -> (String, String, bool) {
         let dir = tempdir().unwrap();
         let mut command = shell(WHERE_AM_I, dir.path(), &[]).unwrap();
-        command.stdout(Stdio::piped());
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
         // Spawned as `waited` would, but not held: the hang-up test leaves
         // every group held after it hung up, and this one must answer.
         let child = match detached {
