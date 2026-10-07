@@ -172,17 +172,10 @@ pub fn is_docker_missing(e: &anyhow::Error) -> bool {
 /// program lookup uses.
 pub fn docker_program(paths: &PandoPaths) -> PathBuf {
     let shim = paths.home.join("bin").join("docker");
-    if is_executable(&shim) {
+    if crate::platform::files::is_executable(&shim) {
         return shim;
     }
     PathBuf::from("docker")
-}
-
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
 }
 
 /// One worktree's compose project.
@@ -267,7 +260,7 @@ impl Compose {
             command.current_dir(dir);
         }
         let out = match timeout {
-            Some(timeout) => crate::project::output_within(command, timeout),
+            Some(timeout) => crate::platform::process::output_within(command, timeout),
             None => command.output(),
         };
         if let (Err(e), Some(timeout)) = (&out, timeout)

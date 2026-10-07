@@ -204,7 +204,7 @@ pub(super) fn open_apps(
     say: &dyn Fn(&str),
 ) -> Result<()> {
     let run = |command: &str| actions::run_command(paths, command);
-    let opener = actions::Opener::new(&run);
+    let opener = actions::Opener::new(&run, crate::platform::Host::here());
     for (process, links) in apps {
         say(&format!("opening {process}'s app in {}", links.client));
         match actions::open_app(links, &opener, say) {
@@ -236,11 +236,12 @@ pub(super) fn open_apps(
 }
 
 /// Hands `url` to the browser: `$BROWSER` when it is set, the desktop's
-/// own opener otherwise — `open` on macOS, `xdg-open` elsewhere.
+/// own opener otherwise ([`crate::platform::desktop::url_openers`]).
 pub(super) fn launch(url: &str) -> Result<()> {
     let browser = std::env::var("BROWSER").ok();
+    let host = crate::platform::Host::here();
     let mut failure = String::new();
-    for command in crate::env_command::browser_commands(browser.as_deref(), url) {
+    for command in crate::env_command::browser_commands(browser.as_deref(), url, host) {
         let Some((program, args)) = command.split_first() else {
             continue;
         };

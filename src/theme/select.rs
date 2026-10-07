@@ -109,23 +109,12 @@ pub fn appearance(settings: &Settings) -> (Appearance, AppearanceOrigin) {
     (system_appearance(), AppearanceOrigin::System)
 }
 
-/// macOS says `Dark` for `AppleInterfaceStyle` in dark mode and has no
-/// value in light mode. Anything that cannot answer — another system, a
-/// failed spawn — is dark, which is what most terminals are.
+/// What the desktop says ([`crate::platform::desktop::is_dark`]).
+/// Anything that cannot answer — a desktop with nothing to ask, a failed
+/// spawn — is dark, which is what most terminals are.
 fn system_appearance() -> Appearance {
-    if !cfg!(target_os = "macos") {
-        return Appearance::Dark;
-    }
-    let light = std::process::Command::new("defaults")
-        .args(["read", "-g", "AppleInterfaceStyle"])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .map(|o| !(o.status.success() && String::from_utf8_lossy(&o.stdout).contains("Dark")))
-        .unwrap_or(false);
-    if light {
-        Appearance::Light
-    } else {
-        Appearance::Dark
+    match crate::platform::desktop::is_dark(crate::platform::Host::here()) {
+        Some(false) => Appearance::Light,
+        Some(true) | None => Appearance::Dark,
     }
 }

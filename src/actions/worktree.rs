@@ -511,8 +511,8 @@ fn clone_ignored_paths(
             continue;
         }
         let cloned = match (meta.is_dir(), meta.is_file()) {
-            (true, _) => crate::cow::clone_tree(&src, &dst),
-            (_, true) => crate::cow::clone_file(&src, &dst),
+            (true, _) => crate::platform::cow::clone_tree(&src, &dst),
+            (_, true) => crate::platform::cow::clone_file(&src, &dst),
             _ => {
                 progress(&format!(
                     "not cloning {rel}: in the main checkout it is neither a file nor a directory"
@@ -522,7 +522,7 @@ fn clone_ignored_paths(
         };
         match cloned {
             Ok(()) => {}
-            Err(e) if crate::cow::is_unsupported(&e) => {
+            Err(e) if crate::platform::cow::is_unsupported(&e) => {
                 progress(&format!(
                     "this filesystem cannot clone {rel}, so the install builds it"
                 ));
@@ -536,10 +536,10 @@ fn clone_ignored_paths(
             }
         }
         if meta.is_dir() {
-            match crate::cow::link_out_of(&dst, worktree, root) {
+            match crate::platform::cow::link_out_of(&dst, worktree, root) {
                 Ok(None) => {}
                 Ok(Some(link)) => {
-                    if let Err(e) = crate::cow::remove_tree(&dst) {
+                    if let Err(e) = crate::platform::cow::remove_tree(&dst) {
                         progress(&format!(
                             "the clone of {rel} links out of the worktree and could not be \
                              removed ({e}); remove {} before the install runs",
@@ -555,7 +555,7 @@ fn clone_ignored_paths(
                     continue;
                 }
                 Err(e) => {
-                    let removed = crate::cow::remove_tree(&dst).is_ok();
+                    let removed = crate::platform::cow::remove_tree(&dst).is_ok();
                     progress(&format!(
                         "could not read the clone of {rel} ({e}), so the install builds it{}",
                         match removed {
@@ -1347,7 +1347,7 @@ fn fetch_pr_head(
         .arg(root)
         .args(["fetch", "--quiet", "origin", &refspec])
         .env("GIT_TERMINAL_PROMPT", "0");
-    match crate::project::output_within(command, timeout) {
+    match crate::platform::process::output_within(command, timeout) {
         Ok(out) if out.status.success() => Ok(()),
         Ok(out) => bail!(
             "could not fetch #{number} from origin: {}",
@@ -1469,7 +1469,7 @@ pub(super) fn fetch_branch(
         .arg(root)
         .args(["fetch", "--quiet", "origin", branch])
         .env("GIT_TERMINAL_PROMPT", "0");
-    match crate::project::output_within(command, timeout) {
+    match crate::platform::process::output_within(command, timeout) {
         Ok(out) => Ok(out.status.success()),
         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => bail!(
             "`git fetch origin {branch}` did not answer in {}s, so pando cannot tell whether \
@@ -1601,7 +1601,7 @@ fn provision_path(
     };
     match mode {
         ProvisionMode::Link => {
-            std::os::unix::fs::symlink(&src, &dst)
+            crate::platform::files::symlink(&src, &dst)
                 .with_context(|| format!("symlink {} → {}", src.display(), dst.display()))?;
             // Said per file, and said to be a link: an edit in the worktree
             // edits the main checkout's file.

@@ -6,6 +6,7 @@ use tempfile::TempDir;
 
 use crate::actions::Machine;
 use crate::paths::PandoPaths;
+use crate::process::Group;
 use crate::project::ProjectRef;
 use crate::testutil::{git, init_repo};
 use crate::{ports, state};
@@ -2996,7 +2997,7 @@ fn a_failed_process_is_a_problem_carrying_its_reason_and_a_hint_from_the_log() {
         "dev".to_string(),
         state::ProcessRecord {
             pid: 999_999,
-            pgid: 999_999,
+            pgid: Group::from_raw(999_999),
             started_at: chrono::Utc::now(),
             log_path: log.clone(),
             ready_port: None,
@@ -3042,7 +3043,7 @@ fn a_failure_with_an_empty_log_is_not_sent_to_read_it() {
         "dev".to_string(),
         state::ProcessRecord {
             pid: 999_999,
-            pgid: 999_999,
+            pgid: Group::from_raw(999_999),
             started_at: chrono::Utc::now(),
             log_path: log.clone(),
             ready_port: None,
@@ -3453,7 +3454,7 @@ fn a_folder_that_names_no_repository_and_still_runs_something_is_not_moved() {
         state::ProcessRecord {
             // This test's own process: one that is certainly running.
             pid: std::process::id(),
-            pgid: 999_999,
+            pgid: Group::from_raw(999_999),
             started_at: chrono::Utc::now(),
             log_path: dir.join("dev.log"),
             ready_port: None,
@@ -3504,7 +3505,7 @@ fn a_folder_whose_recorded_worktree_names_this_repository_is_adopted() {
         "dev".to_string(),
         state::ProcessRecord {
             pid: std::process::id(),
-            pgid: 999_999,
+            pgid: Group::from_raw(999_999),
             started_at: chrono::Utc::now(),
             log_path: dir.join("dev.log"),
             ready_port: None,

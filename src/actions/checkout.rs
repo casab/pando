@@ -115,7 +115,7 @@ pub(super) fn plan(
 /// Whether this git has what a copy-on-write checkout runs: attributes
 /// read from a given tree, both for one command (`--attr-source`) and for
 /// `check-attr` (`--source`). One harmless question asks for both.
-fn git_can(root: &Path) -> bool {
+pub(super) fn git_can(root: &Path) -> bool {
     let Some(empty_tree) = empty_tree(root) else {
         return false;
     };
@@ -188,15 +188,15 @@ pub(super) mod test_seam {
 fn probe(root: &Path, files: &[(String, bool)], worktrees_dir: &Path) -> Option<bool> {
     let sample = files.iter().map(|(f, _)| root.join(f)).find(|p| {
         p.symlink_metadata()
-            .is_ok_and(|m| m.is_file() && !crate::cow::must_not_clone(&m))
+            .is_ok_and(|m| m.is_file() && !crate::platform::cow::must_not_clone(&m))
     })?;
     let dst = worktrees_dir.join(format!(".pando-clone-probe-{}", std::process::id()));
     let _ = std::fs::remove_file(&dst);
-    let result = crate::cow::clone_file(&sample, &dst);
+    let result = crate::platform::cow::clone_file(&sample, &dst);
     let _ = std::fs::remove_file(&dst);
     match result {
         Ok(()) => Some(true),
-        Err(e) if crate::cow::is_unsupported(&e) => Some(false),
+        Err(e) if crate::platform::cow::is_unsupported(&e) => Some(false),
         Err(_) => None,
     }
 }
@@ -344,7 +344,7 @@ fn clone_all(worktree: &Path, root: &Path, files: &[(String, bool)]) -> Vec<Stri
     for dir in &dirs {
         let _ = std::fs::create_dir_all(dir);
     }
-    let umask = crate::cow::umask();
+    let umask = crate::platform::cow::umask();
     let workers = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
         .clamp(1, 8);
@@ -378,13 +378,13 @@ fn clone_one(src: &Path, dst: &Path, executable: bool, umask: u32) -> bool {
     let Ok(meta) = src.symlink_metadata() else {
         return false;
     };
-    if !meta.is_file() || crate::cow::must_not_clone(&meta) {
+    if !meta.is_file() || crate::platform::cow::must_not_clone(&meta) {
         return false;
     }
-    if crate::cow::clone_file(src, dst).is_err() {
+    if crate::platform::cow::clone_file(src, dst).is_err() {
         return false;
     }
-    match crate::cow::as_git_writes(dst, executable, umask) {
+    match crate::platform::cow::as_git_writes(dst, executable, umask) {
         Ok(()) => true,
         // A clone that cannot be made to look git-written is not kept:
         // git writes it instead.
@@ -536,10 +536,7 @@ fn post_checkout_hook(root: &Path) -> Option<PathBuf> {
             "hooks/post-checkout",
         ],
     )?);
-    use std::os::unix::fs::PermissionsExt;
-    hook.metadata()
-        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .then_some(hook)
+    crate::platform::files::is_executable(&hook).then_some(hook)
 }
 
 /// Whether `$GIT_DIR/info/attributes` says anything. The raw refresh

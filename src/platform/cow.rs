@@ -36,14 +36,14 @@ pub fn clone_tree(src: &Path, dst: &Path) -> io::Result<()> {
 /// directory. Never follows a symlink, so a link in the tree cannot take
 /// its target with it.
 pub fn remove_tree(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
     let meta = path.symlink_metadata()?;
     if !meta.is_dir() {
         return std::fs::remove_file(path);
     }
-    let mode = meta.permissions().mode();
-    if mode & 0o700 != 0o700 {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode | 0o700))?;
+    if let Some(mode) = super::files::permission_bits(&meta)
+        && mode & 0o700 != 0o700
+    {
+        super::files::set_permission_bits(path, mode | 0o700)?;
     }
     for entry in std::fs::read_dir(path)? {
         remove_tree(&entry?.path())?;
@@ -73,12 +73,11 @@ pub fn is_unsupported(e: &io::Error) -> bool {
 /// file or a quarantined download would otherwise pass into the worktree
 /// unseen.
 pub fn as_git_writes(path: &Path, executable: bool, umask: u32) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
     let mode = match executable {
         true => 0o777,
         false => 0o666,
     } & !umask;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    super::files::set_permission_bits(path, mode)?;
     imp::drop_quarantine(path)
 }
 
@@ -102,15 +101,24 @@ static UMASK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 /// thread makes in that moment would get the wrong mode. So it is read
 /// once, and `main` reads it first, before any thread starts.
 pub fn umask() -> u32 {
-    *UMASK.get_or_init(|| {
-        // SAFETY: umask only swaps an integer in the process; it is read
-        // and put back at once, the only way the call offers to read it.
-        let old = unsafe { libc::umask(0o022) };
-        unsafe { libc::umask(old) };
-        // `mode_t` is a `u16` on macOS and already a `u32` on Linux.
-        #[allow(clippy::useless_conversion)]
-        u32::from(old)
-    })
+    *UMASK.get_or_init(read_umask)
+}
+
+#[cfg(unix)]
+fn read_umask() -> u32 {
+    // SAFETY: umask only swaps an integer in the process; it is read and
+    // put back at once, the only way the call offers to read it.
+    let old = unsafe { libc::umask(0o022) };
+    unsafe { libc::umask(old) };
+    // `mode_t` is a `u16` on macOS and already a `u32` on Linux.
+    #[allow(clippy::useless_conversion)]
+    u32::from(old)
+}
+
+/// No umask: nothing masks the permission bits a file is made with.
+#[cfg(windows)]
+fn read_umask() -> u32 {
+    0
 }
 
 /// The first symlink under `tree` that would make a worktree use files that
@@ -433,6 +441,34 @@ mod imp {
             .set_modified(meta.modified()?);
         File::open(dst)?.set_times(times)?;
         fs::set_permissions(dst, meta.permissions())
+    }
+}
+
+/// No clone asked for yet: ReFS block cloning is the way to one. Every
+/// clone reports "cannot clone here", so git checks the worktree out and
+/// the install fills its dependencies, as on any disk that cannot clone.
+#[cfg(windows)]
+mod imp {
+    use std::io;
+    use std::path::Path;
+
+    /// `ERROR_NOT_SUPPORTED`.
+    pub(super) const UNSUPPORTED: [i32; 1] = [50];
+
+    pub(super) fn clone_file(_: &Path, _: &Path) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(UNSUPPORTED[0]))
+    }
+
+    pub(super) fn clone_tree(_: &Path, _: &Path) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(UNSUPPORTED[0]))
+    }
+
+    pub(super) fn drop_quarantine(_: &Path) -> io::Result<()> {
+        Ok(())
+    }
+
+    pub(super) fn must_not_clone(_: &std::fs::Metadata) -> bool {
+        false
     }
 }
 

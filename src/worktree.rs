@@ -1071,7 +1071,7 @@ fn gh_pr_list_with(
         ])
         .env("GH_PROMPT_DISABLED", "1")
         .env("GH_NO_UPDATE_NOTIFIER", "1");
-    let out = match crate::project::output_within(command, timeout) {
+    let out = match crate::platform::process::output_within(command, timeout) {
         Ok(out) => out,
         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
             anyhow::bail!("gh pr list did not answer in {}s", timeout.as_secs())
@@ -1154,7 +1154,7 @@ pub fn gh_account_with(program: &Path, root: &Path) -> GhAccount {
         .args(["api", "user", "--jq", ".login"])
         .env("GH_PROMPT_DISABLED", "1")
         .env("GH_NO_UPDATE_NOTIFIER", "1");
-    let out = match crate::project::output_within(command, GH_TIMEOUT) {
+    let out = match crate::platform::process::output_within(command, GH_TIMEOUT) {
         Ok(out) => out,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return GhAccount::Missing,
         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
@@ -1643,15 +1643,36 @@ bare
         assert_eq!(known["feat+a"].ahead_behind, Some((1, 2)), "against feat/b");
     }
 
+    /// Whether this machine's git has `%(ahead-behind:…)` (2.41 and later).
+    /// An older one sends [`batch_ahead_behind`] to its empty map on
+    /// purpose, which is the fallback working, not the batch failing.
+    fn git_counts_ahead_behind(repo: &Path) -> bool {
+        Command::new("git")
+            .current_dir(repo)
+            .args([
+                "for-each-ref",
+                "--format=%(ahead-behind:main)",
+                "refs/heads/main",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
     #[test]
     fn the_batched_ahead_behind_walks_only_the_branches_asked_about() {
         let (_dir, repo) = repo_with_worktrees(&[("feat+a", "feat/a"), ("feat+b", "feat/b")]);
         git(&repo, &["branch", "feat/idle"]);
         git(&repo, &["branch", "feat/a-sibling"]);
 
+        assert!(batch_ahead_behind(&repo, Some("main"), &[]).is_empty());
+        if !git_counts_ahead_behind(&repo) {
+            eprintln!("skipping: this git has no %(ahead-behind:…), which needs 2.41");
+            return;
+        }
         let counts = batch_ahead_behind(&repo, Some("main"), &["feat/a"]);
         assert_eq!(counts.keys().collect::<Vec<_>>(), vec!["feat/a"]);
-        assert!(batch_ahead_behind(&repo, Some("main"), &[]).is_empty());
     }
 
     #[test]

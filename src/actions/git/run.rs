@@ -130,7 +130,7 @@ fn git(dir: &Path, args: &[&str], timeout: Duration) -> std::io::Result<Output> 
         .env("GIT_EDITOR", "true")
         .env("GIT_SEQUENCE_EDITOR", "true")
         .env("GIT_MERGE_AUTOEDIT", "no");
-    crate::project::output_within(command, timeout)
+    crate::platform::process::output_within(command, timeout)
 }
 
 /// The last line git gave as its reason: stderr's, else stdout's, where

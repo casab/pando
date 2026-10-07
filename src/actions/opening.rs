@@ -44,11 +44,11 @@ pub struct Opener<'a> {
 }
 
 impl<'a> Opener<'a> {
-    /// This machine's opener, running its commands with `run`.
-    pub fn new(run: RunCommand<'a>) -> Opener<'a> {
+    /// The opener of `host`, running its commands with `run`.
+    pub fn new(run: RunCommand<'a>, host: &crate::platform::Host) -> Opener<'a> {
         Opener {
             run,
-            may_start_simulator: cfg!(target_os = "macos"),
+            may_start_simulator: crate::platform::desktop::starts_simulators(host),
             boot_wait: BOOT_WAIT,
             retry_wait: RETRY_WAIT,
             every: EVERY,
@@ -275,7 +275,8 @@ pub fn run_command(paths: &PandoPaths, command: &str) -> Option<Ran> {
         }
         None => bin.into_os_string(),
     };
-    let out = std::process::Command::new("/bin/sh")
+    let out = crate::platform::shell::posix()
+        .ok()?
         .arg("-c")
         .arg(command)
         .env("PATH", path)

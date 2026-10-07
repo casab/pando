@@ -14,26 +14,13 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::platform::signals::{self, HangUpOnExit};
 
 /// Whether hooks and probes start with no controlling terminal; see
 /// [`detach_from_terminal`].
 static DETACHED: AtomicBool = AtomicBool::new(false);
-
-/// How many detached hooks and probes can be hung up on at once. One runs
-/// at a time per worktree action, so this is far more than the TUI ever
-/// has in flight; one past it runs, and is only not hung up on.
-const RUNNING_SLOTS: usize = 64;
-
-/// The process group of every detached hook and probe running now, 0 in
-/// a free slot. Atomics rather than a locked list, because a signal
-/// handler reads them: [`hang_up_detached`].
-static RUNNING: [AtomicI32; RUNNING_SLOTS] = [const { AtomicI32::new(0) }; RUNNING_SLOTS];
-
-/// Set once [`hang_up_detached`] has run: a detached hook that starts
-/// after it, as a fallback does when the command before it was hung up
-/// on, is hung up on as soon as it is recorded.
-static HUNG_UP: AtomicBool = AtomicBool::new(false);
 
 /// Directories never walked when matching a fingerprint glob. Dependency
 /// trees and build output are enormous and are never what a hook is keyed
@@ -238,101 +225,46 @@ fn match_one(pattern: &str, value: &str) -> bool {
 /// So from here on pando hangs up on them itself before a SIGHUP or a
 /// SIGTERM ends it: [`hang_up_detached`].
 pub fn detach_from_terminal() {
-    use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
     DETACHED.store(true, Ordering::Relaxed);
-    let action = SigAction::new(
-        SigHandler::Handler(hang_up_and_die),
-        SaFlags::SA_RESETHAND,
-        SigSet::empty(),
-    );
-    for signal in [Signal::SIGHUP, Signal::SIGTERM] {
-        // The handler only touches atomics and calls `killpg` and `raise`,
-        // which are safe in one.
-        let _ = unsafe { sigaction(signal, &action) };
-    }
+    signals::hang_up_on_exit();
 }
 
-/// Hangs up on the detached hooks, then dies of the signal as pando would
-/// have with no handler: `SA_RESETHAND` put the default action back on
-/// the way in.
-extern "C" fn hang_up_and_die(signal: libc::c_int) {
-    hang_up_detached();
-    unsafe { libc::raise(signal) };
-}
-
-/// Sends SIGHUP to the process group of every detached hook and probe
-/// still running, and to any that starts after this: what each would have
-/// had from the terminal had it shared the TUI's.
+/// Hangs up on the process group of every detached hook and probe still
+/// running, and on any that starts after this: what each would have had
+/// from the terminal had it shared the TUI's.
 ///
 /// For the TUI when it goes. Nothing waits for a hook once it has, and an
 /// install left running would go on writing into the worktree beside the
 /// one the next start runs.
 pub fn hang_up_detached() {
-    HUNG_UP.store(true, Ordering::SeqCst);
-    for slot in &RUNNING {
-        hang_up(slot.load(Ordering::SeqCst));
-    }
+    signals::hang_up_now();
 }
 
-fn hang_up(pgid: i32) {
-    use nix::sys::signal::{Signal, killpg};
-    if pgid > 0 {
-        let _ = killpg(nix::unistd::Pid::from_raw(pgid), Signal::SIGHUP);
-    }
-}
-
-/// A detached child's process group on [`RUNNING`] for as long as this
-/// lives. `None` when every slot was taken.
-struct Running(Option<usize>);
-
-impl Running {
-    fn record(pgid: i32) -> Self {
-        let slot = RUNNING.iter().position(|slot| {
-            slot.compare_exchange(0, pgid, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-        });
-        // After the slot is written, so that either this sees the flag or
-        // `hang_up_detached` sees the slot.
-        if HUNG_UP.load(Ordering::SeqCst) {
-            hang_up(pgid);
-        }
-        Running(slot)
-    }
-}
-
-impl Drop for Running {
-    fn drop(&mut self) {
-        if let Some(slot) = self.0 {
-            RUNNING[slot].store(0, Ordering::SeqCst);
-        }
-    }
-}
-
-/// Spawns `command` and hands the child to `wait`, its process group on
-/// [`RUNNING`] until `wait` returns when it is `detached`: after `setsid`
-/// the child leads a group whose id is its pid.
+/// Spawns `command` and hands the child to `wait`: when `detached`, as a
+/// group of its own with no terminal, held for a hang-up until `wait`
+/// returns.
 fn waited<T>(
     command: &mut Command,
     detached: bool,
     wait: impl FnOnce(Child) -> std::io::Result<T>,
 ) -> std::io::Result<T> {
-    let child = command.spawn()?;
-    let _running = detached.then(|| Running::record(child.id() as i32));
+    if !detached {
+        return wait(command.spawn()?);
+    }
+    let (child, group) = crate::platform::process::spawn_group(command)?;
+    let _held = HangUpOnExit::hold(group);
     wait(child)
 }
 
 /// `bash -lc` running `shell_cmd` in `cwd` with `env` added and nothing on
-/// stdin, in a session of its own when `detached`.
-fn shell(shell_cmd: &str, cwd: &Path, env: &[(String, String)], detached: bool) -> Command {
-    let mut command = crate::process::login_shell(shell_cmd);
+/// stdin. [`waited`] decides whether it gets a terminal.
+fn shell(shell_cmd: &str, cwd: &Path, env: &[(String, String)]) -> std::io::Result<Command> {
+    let mut command = crate::platform::shell::login(shell_cmd)?;
     command.current_dir(cwd).stdin(Stdio::null());
     for (key, value) in env {
         command.env(key, value);
     }
-    if detached {
-        crate::process::new_session(&mut command);
-    }
-    command
+    Ok(command)
 }
 
 /// Runs a hook to completion, appending everything it printed to its own
@@ -363,7 +295,7 @@ pub fn run(log_file: &Path, shell_cmd: &str, cwd: &Path, env: &[(String, String)
         .try_clone()
         .context("clone log file handle for stderr")?;
     let detached = DETACHED.load(Ordering::Relaxed);
-    let mut command = shell(shell_cmd, cwd, env, detached);
+    let mut command = shell(shell_cmd, cwd, env).with_context(|| format!("run {shell_cmd:?}"))?;
     command.stdout(out).stderr(err);
     let status = waited(&mut command, detached, |mut child| child.wait())
         .with_context(|| format!("run {shell_cmd:?}"))?;
@@ -416,7 +348,8 @@ fn printed_since(log_file: &Path, start: u64) -> String {
 /// run that mattered.
 pub fn probe(shell_cmd: &str, cwd: &Path, env: &[(String, String)]) -> Result<Option<String>> {
     let detached = DETACHED.load(Ordering::Relaxed);
-    let mut command = shell(shell_cmd, cwd, env, detached);
+    let mut command =
+        shell(shell_cmd, cwd, env).with_context(|| format!("run the probe {shell_cmd:?}"))?;
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let out = waited(&mut command, detached, Child::wait_with_output)
         .with_context(|| format!("run the probe {shell_cmd:?}"))?;
@@ -865,9 +798,19 @@ mod tests {
 
     fn where_it_ran(detached: bool) -> (String, String, bool) {
         let dir = tempdir().unwrap();
-        let out = shell(WHERE_AM_I, dir.path(), &[], detached)
-            .output()
-            .unwrap();
+        let mut command = shell(WHERE_AM_I, dir.path(), &[]).unwrap();
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        // Spawned as `waited` would, but not held: the hang-up test leaves
+        // every group held after it hung up, and this one must answer.
+        let child = match detached {
+            true => {
+                crate::platform::process::spawn_group(&mut command)
+                    .unwrap()
+                    .0
+            }
+            false => command.spawn().unwrap(),
+        };
+        let out = child.wait_with_output().unwrap();
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
         let ids = text
             .lines()
@@ -913,15 +856,10 @@ mod tests {
         let started = Instant::now();
         let cwd = dir.path().to_path_buf();
         let hook = std::thread::spawn(move || {
-            let mut command = shell("sleep 30", &cwd, &[], true);
+            let mut command = shell("sleep 30", &cwd, &[]).unwrap();
             waited(&mut command, true, |mut child| child.wait()).unwrap()
         });
-        let recorded = || {
-            RUNNING
-                .iter()
-                .map(|slot| slot.load(Ordering::SeqCst))
-                .find(|pgid| *pgid != 0)
-        };
+        let recorded = || signals::held().first().copied();
         let pgid = loop {
             if let Some(pgid) = recorded() {
                 break pgid;
@@ -938,13 +876,11 @@ mod tests {
         assert_eq!(status.signal(), Some(libc::SIGHUP), "{status:?}");
         assert!(started.elapsed() < Duration::from_secs(10));
         assert!(
-            RUNNING
-                .iter()
-                .all(|slot| slot.load(Ordering::SeqCst) != pgid),
+            !signals::held().contains(&pgid),
             "a hook that ended is off the list"
         );
 
-        let mut fallback = shell("sleep 30", dir.path(), &[], true);
+        let mut fallback = shell("sleep 30", dir.path(), &[]).unwrap();
         let status = waited(&mut fallback, true, |mut child| child.wait()).unwrap();
         assert_eq!(status.signal(), Some(libc::SIGHUP), "{status:?}");
         assert!(started.elapsed() < Duration::from_secs(10));

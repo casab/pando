@@ -56,7 +56,7 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxySpawn {
     pub pid: u32,
-    pub pgid: i32,
+    pub pgid: process::Group,
     pub listen_port: u16,
     pub log_path: PathBuf,
 }

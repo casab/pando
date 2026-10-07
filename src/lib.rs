@@ -3,7 +3,7 @@
 //! The dependency direction is inner to outer, with no upward imports:
 //!
 //! ```text
-//! catalog · paths · term · remedy · theme · art · version · cow → compose → project · config · ports · process · runtime · state
+//! platform → catalog · paths · term · remedy · theme · art · version → compose → project · config · ports · process · runtime · state
 //!       · env_command · template · recipes
 //!       → detect · hooks · worktree · cache · log_tail · observe · services
 //!         · native · namespace · decisions · setup
@@ -30,6 +30,8 @@
 //! | a tool cache or artifact `provision` must never offer | a row in [`catalog::artifacts::ARTIFACTS`] |
 //! | a job queue whose worker `doctor` recognises | a row in [`catalog::queue_workers::QUEUE_WORKERS`] |
 //! | a program pando runs itself, and how to get it | a row in [`catalog::tools::TOOLS`] |
+//! | anything pando asks of the operating system | a function in its concern under `platform/`, a facade over a backend per OS; nothing outside `platform` names an OS, `nix`, `libc` or `std::os`, which `platform/tests.rs` holds |
+//! | what a desktop opens a URL or copies with, or calls dark mode | a field in [`platform::desktop::DESKTOPS`] |
 //! | a language or version manager | `runtime/languages.rs` |
 //! | a native service (postgres, redis…) | a TOML file in `recipes/builtin/`, and a row in [`recipes::BUILT_IN`] |
 //! | an engine namespaced mode should know, that pando never starts | a TOML file in `recipes/builtin/` with a `[namespace]` or `[prefix]` and no `[service]`, a row in [`recipes::BUILT_IN`], and its images' `engine` in [`catalog::images::IMAGES`] |
@@ -51,7 +53,6 @@ pub mod catalog;
 pub mod cli;
 pub mod compose;
 pub mod config;
-pub mod cow;
 pub mod decisions;
 pub mod detect;
 pub mod doctor;
@@ -62,6 +63,7 @@ pub mod namespace;
 pub mod native;
 pub mod observe;
 pub mod paths;
+pub mod platform;
 pub mod ports;
 pub mod process;
 pub mod project;

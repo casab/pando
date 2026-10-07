@@ -4,6 +4,8 @@
 //! `pando open` and the TUI's `o`, `O` and `e` all go through here, so a
 //! key and the command it mirrors never read the same variable two ways.
 
+use crate::platform::{Host, desktop};
+
 /// A command with a quote that is never closed, or a `\` with nothing
 /// after it: there is no telling where its words end.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,9 +81,8 @@ pub fn words(command: &str) -> Result<Vec<String>, Unclosed> {
 /// that is a file as written is one program, even with a space in its
 /// path; otherwise it is split into [`words`], and one that cannot be is
 /// split on whitespace, as it was before quotes were read. Unset or
-/// empty, the desktop's own opener: `open` on macOS, `xdg-open`
-/// elsewhere.
-pub fn browser_commands(browser: Option<&str>, url: &str) -> Vec<Vec<String>> {
+/// empty, the desktop's own: [`desktop::url_openers`].
+pub fn browser_commands(browser: Option<&str>, url: &str, host: &Host) -> Vec<Vec<String>> {
     let entries: Vec<&str> = browser
         .unwrap_or_default()
         .split(':')
@@ -89,12 +90,7 @@ pub fn browser_commands(browser: Option<&str>, url: &str) -> Vec<Vec<String>> {
         .filter(|entry| !entry.is_empty())
         .collect();
     if entries.is_empty() {
-        let opener = if cfg!(target_os = "macos") {
-            "open"
-        } else {
-            "xdg-open"
-        };
-        return vec![vec![opener.to_string(), url.to_string()]];
+        return desktop::url_openers(host, url);
     }
     entries
         .into_iter()
@@ -165,17 +161,18 @@ mod tests {
     #[test]
     fn browser_is_a_list_of_commands_with_arguments() {
         let url = "http://localhost:3000";
+        let host = Host::default();
         assert_eq!(
-            browser_commands(Some("firefox --new-window"), url),
+            browser_commands(Some("firefox --new-window"), url, &host),
             vec![owned(&["firefox", "--new-window", url])]
         );
         assert_eq!(
-            browser_commands(Some("w3m:lynx -dump %s"), url),
+            browser_commands(Some("w3m:lynx -dump %s"), url, &host),
             vec![owned(&["w3m", url]), owned(&["lynx", "-dump", url])],
             "a list, tried in order, with %s standing for the URL"
         );
         assert_eq!(
-            browser_commands(Some(r#""/opt/My Browser/run" --private"#), url),
+            browser_commands(Some(r#""/opt/My Browser/run" --private"#), url, &host),
             vec![owned(&["/opt/My Browser/run", "--private", url])],
             "a quoted path with a space in it"
         );
@@ -184,21 +181,22 @@ mod tests {
         std::fs::write(&spaced, "").unwrap();
         let spaced = spaced.to_str().unwrap();
         assert_eq!(
-            browser_commands(Some(spaced), url),
+            browser_commands(Some(spaced), url, &host),
             vec![owned(&[spaced, url])],
             "a file as written is one program, space and all"
         );
-        let opener = if cfg!(target_os = "macos") {
-            "open"
-        } else {
-            "xdg-open"
-        };
-        for unset in [None, Some(""), Some(" : ")] {
-            assert_eq!(
-                browser_commands(unset, url),
-                vec![owned(&[opener, url])],
-                "{unset:?}"
-            );
+        for (os, opener) in [
+            (crate::platform::Os::MacOs, "open"),
+            (crate::platform::Os::Linux, "xdg-open"),
+        ] {
+            let host = Host { os };
+            for unset in [None, Some(""), Some(" : ")] {
+                assert_eq!(
+                    browser_commands(unset, url, &host),
+                    vec![owned(&[opener, url])],
+                    "{os:?} {unset:?}"
+                );
+            }
         }
     }
 }

@@ -1,14 +1,12 @@
 use anyhow::{Context, Result, bail};
-use nix::errno::Errno;
-use nix::sys::signal::{Signal, killpg};
-use nix::sys::wait::{WaitPidFlag, waitpid};
-use nix::unistd::Pid;
 use std::fs::OpenOptions;
-use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use crate::platform::process::spawn_group;
+pub use crate::platform::process::{Group, group_alive, is_alive, stop};
 
 pub struct SpawnOptions<'a> {
     pub shell_cmd: &'a str,
@@ -23,82 +21,8 @@ pub struct SpawnOptions<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpawnResult {
     pub pid: u32,
-    pub pgid: i32,
+    pub pgid: Group,
 }
-
-/// `bash -lc <shell_cmd>`: how pando runs every command, so it resolves
-/// the runtimes a login shell does rather than whatever pando was started
-/// with.
-///
-/// Under `cargo test` the shell gets an empty HOME of its own. A login
-/// shell reads the developer's `~/.bash_profile`, which with nvm or conda
-/// in it costs most of a second per shell, and a test that passes only
-/// because of what that profile loads is testing the laptop, not pando.
-pub(crate) fn login_shell(shell_cmd: &str) -> Command {
-    let mut command = Command::new("bash");
-    command.arg("-lc").arg(shell_cmd);
-    #[cfg(test)]
-    command.env("HOME", crate::testutil::shell_home());
-    command
-}
-
-/// Starts the child `command` spawns in a session of its own: the leader of
-/// a new process group, with no controlling terminal.
-///
-/// The one place pando asks for that, because it is `setsid` in the child
-/// between fork and exec, so the child is forked rather than spawned, and
-/// a fork has to be made safe first: [`settle_before_fork`].
-pub(crate) fn new_session(command: &mut Command) -> &mut Command {
-    settle_before_fork();
-    // SAFETY: `setsid` is async-signal-safe, and it is all the closure does.
-    unsafe {
-        command.pre_exec(|| {
-            nix::unistd::setsid()
-                .map(|_| ())
-                .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
-        });
-    }
-    command
-}
-
-/// Finishes libnotify's one-time set-up in this process before any fork,
-/// so no fork can land in the middle of it.
-///
-/// On macOS a forked child runs libSystem's fork handlers before it execs,
-/// and libnotify's reaches its globals through a once-gate. When another
-/// thread is setting them up at the moment of the fork — the first FSEvents
-/// watcher in a process does, the TUI's among them — the child finds the
-/// gate held by a thread it does not have and is killed before `exec`
-/// ("os_once_t is corrupt", in its crash report): a dev server, a tunnel or
-/// a hook that never ran, with nothing in its log. The set-up happens once
-/// per process, so finishing it here, on the thread about to fork, closes
-/// the window for every fork after. Any libnotify call does it; this one
-/// asks nothing of the daemon.
-///
-/// `main` calls it first, before the TUI or anything else starts a thread,
-/// so a fork std makes for any reason finds it settled, not only the ones
-/// [`new_session`] asks for. `new_session` calls it as well, for the test
-/// binaries, which never run `main`.
-#[cfg(target_os = "macos")]
-pub fn settle_before_fork() {
-    LIBNOTIFY_SETTLED.call_once(|| {
-        unsafe extern "C" {
-            fn notify_is_valid_token(token: libc::c_int) -> bool;
-        }
-        // SAFETY: it takes any integer, and reads nothing but its argument
-        // and libnotify's own globals.
-        unsafe { notify_is_valid_token(0) };
-    });
-}
-
-/// Done once [`settle_before_fork`] has run in this process.
-#[cfg(target_os = "macos")]
-static LIBNOTIFY_SETTLED: std::sync::Once = std::sync::Once::new();
-
-/// Nothing to settle: the handlers that make a fork unsafe mid-set-up are
-/// macOS's.
-#[cfg(not(target_os = "macos"))]
-pub fn settle_before_fork() {}
 
 /// Starts a command in its own session, writing its output to a log file.
 ///
@@ -154,7 +78,7 @@ pub fn spawn_detached(opts: SpawnOptions<'_>) -> Result<SpawnResult> {
             opts.shell_cmd
         )
     });
-    let mut cmd = login_shell(recorded.as_deref().unwrap_or(opts.shell_cmd));
+    let mut cmd = crate::platform::shell::login(recorded.as_deref().unwrap_or(opts.shell_cmd))?;
     cmd.current_dir(opts.cwd)
         .stdin(Stdio::null())
         .stdout(out)
@@ -164,13 +88,9 @@ pub fn spawn_detached(opts: SpawnOptions<'_>) -> Result<SpawnResult> {
         cmd.env(k, v);
     }
 
-    // Full detachment: new session, new process group, no controlling tty.
-    new_session(&mut cmd);
-
-    let mut child = cmd.spawn().context("spawn detached bash")?;
+    // Full detachment: a group of its own, no controlling tty.
+    let (mut child, pgid) = spawn_group(&mut cmd).context("spawn detached bash")?;
     let pid = child.id();
-    // After setsid() the child's pgid equals its pid (it becomes session leader).
-    let pgid = pid as i32;
     // Waited on rather than dropped, so that it is reaped when it ends. The
     // status the wait returns goes nowhere: the status file is what says
     // how the process ended.
@@ -199,45 +119,6 @@ pub fn recorded_exit_status(status_file: &Path) -> Option<i32> {
         .trim()
         .parse()
         .ok()
-}
-
-pub fn is_alive(pid: u32) -> bool {
-    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-    // Reap zombie first if we're the parent (TUI session). Returns
-    // ECHILD when pid isn't our child — fall through to signal probe.
-    match waitpid(Pid::from_raw(pid as i32), Some(WaitPidFlag::WNOHANG)) {
-        Ok(WaitStatus::Exited(..)) | Ok(WaitStatus::Signaled(..)) => return false,
-        Ok(WaitStatus::StillAlive) => return true,
-        _ => {}
-    }
-    match nix::sys::signal::kill(Pid::from_raw(pid as i32), None) {
-        Ok(()) => true,
-        Err(Errno::ESRCH) => false,
-        Err(_) => false,
-    }
-}
-
-/// Whether any process is still in the group — the leader, a child it
-/// forked, or a grandchild.
-///
-/// `kill(-pgid, 0)` and not `kill(leader, 0)`: a dev server's group leader is
-/// a `bash -lc` that very often exits while the server it backgrounded keeps
-/// running and keeps the port. Asking after the leader alone is how a stop
-/// reports success over a process that is still serving.
-pub fn group_alive(pgid: i32) -> bool {
-    // 0 is "our own group" and 1 is "every process we may signal". Neither
-    // is ever a worktree's process group, and both would be catastrophic to
-    // pass to kill(2).
-    if pgid <= 1 {
-        return false;
-    }
-    match nix::sys::signal::kill(Pid::from_raw(-pgid), None) {
-        Ok(()) => true,
-        Err(Errno::ESRCH) => false,
-        // The group exists but holds something we may not signal.
-        Err(Errno::EPERM) => true,
-        Err(_) => false,
-    }
 }
 
 /// What a captured command printed, and how it ended.
@@ -289,7 +170,7 @@ pub fn run_captured(
     env: &[(String, String)],
     timeout: Duration,
 ) -> Result<Captured> {
-    let mut command = login_shell(shell_cmd);
+    let mut command = crate::platform::shell::login(shell_cmd)?;
     command
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -298,12 +179,8 @@ pub fn run_captured(
     for (key, value) in env {
         command.env(key, value);
     }
-    new_session(&mut command);
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("run {shell_cmd:?}"))?;
-    // After `setsid` the child leads a group whose id is its pid.
-    let pgid = child.id() as i32;
+    let (mut child, pgid) =
+        spawn_group(&mut command).with_context(|| format!("run {shell_cmd:?}"))?;
 
     // Shared rather than returned by the threads: when the deadline passes
     // with a pipe still open, what was read so far is still the answer, and
@@ -493,84 +370,10 @@ pub fn shell_word(word: &str) -> String {
     }
 }
 
-/// SIGTERM to the whole group, then SIGKILL to whatever is left after
-/// `grace`. Returns once the group is empty, or once it has been SIGKILLed.
-///
-/// Signalling is unconditional, including for a process pando has already
-/// written off as failed: a leader that exited is not a group that exited,
-/// and skipping the signal is exactly how a backgrounded child outlives the
-/// tool that started it.
-pub fn stop(pgid: i32, grace: Duration) -> Result<()> {
-    // Nor the group pando itself runs in. Nothing pando spawns is in it —
-    // every spawn leads a session of its own — so a record naming it is a
-    // number that has been handed out again, and the shell that ran this
-    // pando leads its job's group: signalling it is pando killing itself,
-    // and its terminal's job with it, halfway through a mutation.
-    if pgid <= 1 || pgid == nix::unistd::getpgrp().as_raw() {
-        return Ok(());
-    }
-    let group = Pid::from_raw(pgid);
-    let any_in_group = Pid::from_raw(-pgid);
-
-    match killpg(group, Signal::SIGTERM) {
-        Ok(()) => {}
-        // Nothing left in the group; there is nothing to wait for.
-        Err(Errno::ESRCH) => {
-            reap_group(any_in_group);
-            return Ok(());
-        }
-        // macOS returns EPERM for a group whose only member is a zombie
-        // leader. Falling through reaps it.
-        Err(Errno::EPERM) => {}
-        Err(e) => return Err(anyhow::Error::from(e).context("killpg SIGTERM")),
-    }
-
-    let deadline = Instant::now() + grace;
-    loop {
-        // Reap first: a zombie child of ours still counts as a group member
-        // to kill(2), so an unreaped leader would look alive forever.
-        reap_group(any_in_group);
-        if !group_alive(pgid) {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-
-    match killpg(group, Signal::SIGKILL) {
-        Ok(()) | Err(Errno::ESRCH) | Err(Errno::EPERM) => {}
-        Err(e) => return Err(anyhow::Error::from(e).context("killpg SIGKILL")),
-    }
-    // SIGKILL is not instantaneous; the caller is about to reuse this
-    // worktree's ports, so it is worth the few milliseconds to see it land.
-    let hard_deadline = Instant::now() + KILL_SETTLE;
-    loop {
-        reap_group(any_in_group);
-        if !group_alive(pgid) || Instant::now() >= hard_deadline {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
-/// How long to wait for SIGKILL to be delivered before giving up and
-/// returning anyway.
-const KILL_SETTLE: Duration = Duration::from_millis(500);
-
-fn reap_group(any_in_group: Pid) {
-    loop {
-        match waitpid(Some(any_in_group), Some(WaitPidFlag::WNOHANG)) {
-            Ok(nix::sys::wait::WaitStatus::StillAlive) | Err(_) => break,
-            Ok(_) => continue,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use tempfile::tempdir;
 
     /// How long a test waits for a login shell to get somewhere, before it
@@ -841,24 +644,28 @@ mod tests {
 
     #[test]
     fn stop_is_idempotent_when_group_already_gone() {
-        stop(999_999, Duration::from_millis(100)).unwrap();
-        assert!(!group_alive(999_999));
+        stop(Group::from_raw(999_999), Duration::from_millis(100)).unwrap();
+        assert!(!group_alive(Group::from_raw(999_999)));
     }
 
     // `kill(-0, …)` signals our own process group and `kill(-1, …)` signals
     // every process we are allowed to signal. Neither is ever a worktree.
     #[test]
     fn stop_refuses_the_process_group_ids_that_would_signal_ourselves() {
-        assert!(!group_alive(0));
-        assert!(!group_alive(1));
-        assert!(!group_alive(-5));
-        stop(0, Duration::from_millis(10)).unwrap();
-        stop(1, Duration::from_millis(10)).unwrap();
-        stop(-1, Duration::from_millis(10)).unwrap();
+        assert!(!group_alive(Group::from_raw(0)));
+        assert!(!group_alive(Group::from_raw(1)));
+        assert!(!group_alive(Group::from_raw(-5)));
+        stop(Group::from_raw(0), Duration::from_millis(10)).unwrap();
+        stop(Group::from_raw(1), Duration::from_millis(10)).unwrap();
+        stop(Group::from_raw(-1), Duration::from_millis(10)).unwrap();
         // Our own group, which no spawn is ever in: a record naming it
         // is a reused number, and the signal would land on this process
         // and the job that ran it.
-        stop(nix::unistd::getpgrp().as_raw(), Duration::from_millis(10)).unwrap();
+        stop(
+            Group::from_raw(nix::unistd::getpgrp().as_raw()),
+            Duration::from_millis(10),
+        )
+        .unwrap();
         // Still here, and still runnable: we did not signal ourselves.
         assert!(is_alive(std::process::id()));
     }
@@ -1070,7 +877,7 @@ mod tests {
         })
         .unwrap();
 
-        let our_pgid = nix::unistd::getpgrp().as_raw();
+        let our_pgid = Group::from_raw(nix::unistd::getpgrp().as_raw());
         assert_ne!(
             r.pgid, our_pgid,
             "child pgid ({}) must differ from parent pgid ({})",
@@ -1081,52 +888,6 @@ mod tests {
         stop(r.pgid, Duration::from_secs(5)).unwrap();
         std::thread::sleep(Duration::from_millis(100));
         assert!(!is_alive(r.pid), "child should be dead after stop");
-    }
-
-    // The TUI's first FSEvents watcher sets libnotify up on a thread of its
-    // own, and a fork made while it did was killed before `exec`: a tunnel
-    // whose log stayed empty, one full run in fifteen. Settled before the
-    // command can be spawned, the set-up is over before any fork starts.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_command_given_its_own_session_forks_only_once_libnotify_is_settled() {
-        let mut command = Command::new("true");
-        new_session(&mut command);
-        assert!(LIBNOTIFY_SETTLED.is_completed());
-    }
-
-    // `pre_exec` is the fork trigger pando has reason to use: std also forks
-    // rather than spawns for a changed PATH with a bare program, a uid or
-    // gid, or a relative program with a cwd, none of which pando does, and
-    // `main` settles libnotify before any of them could. Within the tests,
-    // which never run `main`, a fork that skipped `new_session` would skip
-    // the settling, so the one `pre_exec` in pando is the one there.
-    #[test]
-    fn every_session_pando_starts_is_started_by_new_session() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        // Built rather than written out, so this file's own needle is not
-        // one of the uses it finds.
-        let needle = [".pre", "_exec("].concat();
-        let mut uses = Vec::new();
-        let mut dirs = vec![root.join("src")];
-        while let Some(dir) = dirs.pop() {
-            for entry in std::fs::read_dir(&dir).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    dirs.push(path);
-                } else if path.extension().is_some_and(|e| e == "rs") {
-                    let text = std::fs::read_to_string(&path).unwrap();
-                    let rel = path.strip_prefix(root).unwrap().display().to_string();
-                    for (n, line) in text.lines().enumerate() {
-                        if line.contains(&needle) {
-                            uses.push(format!("{rel}:{}", n + 1));
-                        }
-                    }
-                }
-            }
-        }
-        assert_eq!(uses.len(), 1, "{uses:?}");
-        assert!(uses[0].starts_with("src/process.rs:"), "{uses:?}");
     }
 
     #[test]

@@ -310,10 +310,8 @@ fn major(version: &str) -> Option<u32> {
 /// PATH. Under test, only the stand-in: no test reaches a real
 /// simulator.
 fn xcrun_program(paths: &PandoPaths) -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
     let shim = paths.home.join("bin").join("xcrun");
-    let runnable = std::fs::metadata(&shim)
-        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0);
+    let runnable = crate::platform::files::is_executable(&shim);
     match (runnable, cfg!(test)) {
         (true, _) => Some(shim),
         (false, false) => Some(PathBuf::from("xcrun")),
@@ -331,7 +329,7 @@ fn simulator_apps(paths: &PandoPaths, timeout: Duration) -> Vec<SimulatorApp> {
     };
     let mut command = Command::new(xcrun);
     command.args(["simctl", "list", "-j", "devices", "booted"]);
-    let listed = crate::project::output_within(command, timeout)
+    let listed = crate::platform::process::output_within(command, timeout)
         .ok()
         .filter(|out| out.status.success())
         .and_then(|out| serde_json::from_slice::<Value>(&out.stdout).ok());

@@ -247,7 +247,7 @@ pub(super) fn refresh_if_needed(paths: &PandoPaths) -> QuickRefresh {
 pub(super) fn needs_advance(
     store: &State,
     is_alive: impl Fn(u32) -> bool,
-    group_alive: impl Fn(i32) -> bool,
+    group_alive: impl Fn(crate::process::Group) -> bool,
 ) -> bool {
     store.worktrees.values().any(|record| {
         let process = record.processes.values().any(|p| match p.phase {

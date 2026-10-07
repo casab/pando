@@ -226,7 +226,7 @@ pub fn truncate_middle(s: &str, max: usize) -> String {
 /// A path as a person writes it: `~` for the home directory.
 pub fn home_relative(path: &std::path::Path) -> String {
     let shown = path.display().to_string();
-    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+    let Some(home) = crate::platform::dirs::home() else {
         return shown;
     };
     match path.strip_prefix(&home) {

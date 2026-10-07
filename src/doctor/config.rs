@@ -98,8 +98,8 @@ const DEFAULT_USER_CONFIG: &str = "~/.pando/config.toml";
 /// developer's home written as `~`.
 pub(super) fn user_config_shown(paths: &PandoPaths) -> String {
     let file = paths.user_config_file().display().to_string();
-    match std::env::var("HOME") {
-        Ok(home) if !home.is_empty() => {
+    match crate::platform::dirs::home().and_then(|home| home.to_str().map(str::to_string)) {
+        Some(home) if !home.is_empty() => {
             let home = home.trim_end_matches('/');
             match file.strip_prefix(home) {
                 Some(rest) if rest.starts_with('/') => format!("~{rest}"),
@@ -119,9 +119,8 @@ pub(super) fn with_real_user_config(paths: &PandoPaths, text: &str) -> String {
 }
 
 fn mode_of(path: &Path) -> Option<String> {
-    use std::os::unix::fs::PermissionsExt;
     let meta = std::fs::metadata(path).ok()?;
-    Some(format!("{:o}", meta.permissions().mode() & 0o777))
+    crate::platform::files::permission_bits(&meta).map(|bits| format!("{bits:o}"))
 }
 
 pub(super) fn config_report(

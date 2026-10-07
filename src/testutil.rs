@@ -89,7 +89,7 @@ pub fn no_auto_maintenance() {
 }
 
 /// The HOME every login shell pando starts under test is given: empty, and
-/// the same one for the whole run. See `process::login_shell`.
+/// the same one for the whole run. See `platform::shell::login`.
 pub fn shell_home() -> &'static Path {
     static HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
     HOME.get_or_init(|| {
@@ -172,7 +172,7 @@ pub fn drifted_repo(path: &Path, ahead: u32, days: i64, file: Option<&str>) {
 /// listener behind.
 pub struct Detached {
     pub pid: u32,
-    pub pgid: i32,
+    pub pgid: crate::process::Group,
 }
 
 impl Drop for Detached {

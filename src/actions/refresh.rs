@@ -159,7 +159,7 @@ pub fn inspect(paths: &PandoPaths) -> Refreshed {
 /// Moves every process to the phase it is really in, and writes the reason
 /// for each failure that is new. The one implementation of "advance", used
 /// by the read path and by every mutation that is about to `reconcile`.
-fn advance_with(store: &mut state::State, scans: &BTreeMap<i32, Option<Vec<u16>>>) -> bool {
+fn advance_with(store: &mut state::State, scans: &BTreeMap<proc::Group, Option<Vec<u16>>>) -> bool {
     let failed_before = failed_processes(store);
     let mut changed =
         state::advance_phases(store, proc::is_alive, proc::group_alive, |pgid, port| {
@@ -208,15 +208,15 @@ fn failed_processes(store: &state::State) -> Vec<(String, String)> {
 /// running is a deadlock. `None` against a pgid means the scan itself could
 /// not run — no `lsof`, denied, or timed out — which is a different answer
 /// from "listening on nothing".
-pub(super) fn scan_groups(store: &state::State) -> BTreeMap<i32, Option<Vec<u16>>> {
-    let pgids: Vec<i32> = store
+pub(super) fn scan_groups(store: &state::State) -> BTreeMap<proc::Group, Option<Vec<u16>>> {
+    let pgids: Vec<proc::Group> = store
         .worktrees
         .values()
         .flat_map(|record| record.processes.values())
         .filter(|p| matches!(p.phase, Phase::Starting { .. } | Phase::Running { .. }))
         .map(|p| p.pgid)
         .collect();
-    crate::observe::observed_ports_by_group(&pgids)
+    crate::platform::process::ports_by_group(&pgids)
 }
 
 /// Whether the process group has opened `port` yet.
@@ -232,8 +232,8 @@ pub(super) fn scan_groups(store: &state::State) -> BTreeMap<i32, Option<Vec<u16>
 /// [`PortCheck::Unknown`], which keeps the process waiting rather than
 /// failing it with "nothing bound" — see [`state::PortCheck`].
 pub(super) fn port_is_bound(
-    scans: &BTreeMap<i32, Option<Vec<u16>>>,
-    pgid: i32,
+    scans: &BTreeMap<proc::Group, Option<Vec<u16>>>,
+    pgid: proc::Group,
     port: u16,
 ) -> PortCheck {
     match scans.get(&pgid) {
@@ -256,7 +256,7 @@ pub(super) fn port_is_bound(
 /// `status --json` publishes.
 pub(super) fn capture_observed_ports(
     store: &mut state::State,
-    scans: &BTreeMap<i32, Option<Vec<u16>>>,
+    scans: &BTreeMap<proc::Group, Option<Vec<u16>>>,
 ) -> bool {
     let mut changed = false;
     for record in store.worktrees.values_mut() {
@@ -312,7 +312,7 @@ pub(super) fn capture_observed_ports(
 pub(super) fn explain_new_failures(
     store: &mut state::State,
     failed_before: &[(String, String)],
-    scans: &BTreeMap<i32, Option<Vec<u16>>>,
+    scans: &BTreeMap<proc::Group, Option<Vec<u16>>>,
 ) -> bool {
     let mut changed = false;
     for (name, record) in store.worktrees.iter_mut() {

@@ -434,14 +434,11 @@ pub fn resolve_for_compare(path: &Path) -> PathBuf {
 }
 
 fn ensure_dir_private(dir: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use crate::platform::files;
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    let mut perms = std::fs::metadata(dir)
-        .with_context(|| format!("stat {}", dir.display()))?
-        .permissions();
-    if perms.mode() & 0o777 != HOME_MODE {
-        perms.set_mode(HOME_MODE);
-        std::fs::set_permissions(dir, perms)
+    let meta = std::fs::metadata(dir).with_context(|| format!("stat {}", dir.display()))?;
+    if files::permission_bits(&meta).is_some_and(|bits| bits != HOME_MODE) {
+        files::set_permission_bits(dir, HOME_MODE)
             .with_context(|| format!("chmod 0700 {}", dir.display()))?;
     }
     Ok(())
@@ -456,9 +453,7 @@ pub fn default_home() -> PathBuf {
     {
         return PathBuf::from(v);
     }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"));
+    let home = crate::platform::dirs::home().unwrap_or_else(|| PathBuf::from("/"));
     home.join(".pando")
 }
 

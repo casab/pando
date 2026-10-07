@@ -636,8 +636,8 @@ fn spawn_check(paths: &PandoPaths) -> anyhow::Result<()> {
         .stdin(Stdio::null())
         .stdout(log.try_clone().context("share the check's log")?)
         .stderr(log);
-    crate::process::new_session(&mut command);
-    let mut child = command.spawn().context("start pando check")?;
+    let (mut child, _) =
+        crate::platform::process::spawn_group(&mut command).context("start pando check")?;
     thread::spawn(move || {
         let _ = child.wait();
     });

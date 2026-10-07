@@ -102,3 +102,19 @@ jobs:
           toolchain: ${{ steps.msrv.outputs.version }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --locked --lib --bins
+
+  windows:
+    # A native Windows build compiles, and refuses to run: the platform
+    # layer's Windows backends are stubs until the port. Built here so they
+    # keep compiling, and so nothing outside src/platform can reach for a
+    # Unix call without this job saying so. Only the library and the
+    # binary: the tests are Unix's until the port.
+    name: windows build (clippy)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --locked --lib --bins -- -D warnings

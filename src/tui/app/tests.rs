@@ -4,6 +4,7 @@ use crate::actions;
 use crate::config::Config;
 use crate::log_tail::{LogLevel, LogTail};
 use crate::paths::PandoPaths;
+use crate::process::Group;
 use crate::project::ProjectRef;
 use crate::state::State;
 use crate::state::{Phase, ServiceMode};
@@ -98,7 +99,7 @@ pub fn with_process(app: &mut App, name: &str, phase: Phase) {
         "dev".to_string(),
         ProcessRecord {
             pid: 4242,
-            pgid: 4242,
+            pgid: Group::from_raw(4242),
             started_at: Utc::now(),
             log_path: PathBuf::from("/does/not/exist/dev.log"),
             ready_port: Some(17_342),
@@ -127,7 +128,7 @@ pub fn with_second_process(app: &mut App, name: &str, process: &str, phase: Phas
         process.to_string(),
         ProcessRecord {
             pid: 4343,
-            pgid: 4343,
+            pgid: Group::from_raw(4343),
             started_at: Utc::now(),
             log_path: PathBuf::from(format!("/does/not/exist/{process}.log")),
             ready_port: Some(port),
@@ -149,13 +150,13 @@ pub fn with_share(app: &mut App, name: &str, proxy_port: Option<u16>) {
     record.share_port = proxy_port;
     record.share = Some(crate::state::ShareRecord {
         tunnel_pid: 5151,
-        tunnel_pgid: 5151,
+        tunnel_pgid: Group::from_raw(5151),
         public_url: "https://fake-host.trycloudflare.com".to_string(),
         local_port: 17_342,
         started_at: Utc::now(),
         log_path: PathBuf::from("/does/not/exist/tunnel.log"),
         proxy_pid: proxy_port.map(|_| 5252),
-        proxy_pgid: proxy_port.map(|_| 5252),
+        proxy_pgid: proxy_port.map(|_| Group::from_raw(5252)),
         proxy_port,
     });
 }
@@ -2075,7 +2076,7 @@ fn open_uses_the_same_url_rule_as_status() {
         "alpha".to_string(),
         ProcessRecord {
             pid: 4242,
-            pgid: 4242,
+            pgid: Group::from_raw(4242),
             started_at: Utc::now(),
             log_path: PathBuf::from("/does/not/exist/alpha.log"),
             ready_port: Some(19_056),
@@ -4574,6 +4575,7 @@ fn env(tmux: bool, shell: Option<&str>, visual: Option<&str>, editor: Option<&st
         visual: visual.map(str::to_string),
         editor: editor.map(str::to_string),
         browser: None,
+        host: crate::platform::Host::default(),
     }
 }
 
@@ -6473,7 +6475,7 @@ fn x_leaves_out_worktrees_with_nothing_up() {
         kind: crate::state::ServiceKind::Native,
         port: Some(17_004),
         pid: Some(1),
-        pgid: Some(1),
+        pgid: Some(Group::from_raw(1)),
         compose_project: None,
     });
     app.state.worktrees.insert("feat+db".to_string(), record);
@@ -6652,7 +6654,7 @@ fn a_silent_port_is_announced_once() {
         "dev".to_string(),
         ProcessRecord {
             pid: 4242,
-            pgid: 4242,
+            pgid: Group::from_raw(4242),
             started_at: since,
             log_path: PathBuf::from("/does/not/exist/dev.log"),
             ready_port: Some(17_342),
@@ -6751,7 +6753,7 @@ fn any_dead_pid_the_state_vouches_for_takes_the_full_refresh() {
         kind: crate::state::ServiceKind::Native,
         port: Some(15_432),
         pid: Some(6161),
-        pgid: Some(6161),
+        pgid: Some(Group::from_raw(6161)),
         compose_project: None,
     });
     assert!(!background::needs_advance(&app.state, |_| true, |_| false));
@@ -6796,7 +6798,7 @@ fn a_dead_compose_log_pump_is_not_a_reason_to_scan() {
         kind: crate::state::ServiceKind::Compose,
         port: Some(15_432),
         pid: Some(7171),
-        pgid: Some(7171),
+        pgid: Some(Group::from_raw(7171)),
         compose_project: Some("pando-feat-a".into()),
     });
     assert!(!background::needs_advance(
@@ -6835,7 +6837,7 @@ fn the_gated_refresh_reads_a_quiet_state_as_is_and_advances_a_death() {
     process.pid = alive;
     // No group of that id: were the full refresh taken, nothing would
     // answer for it, which is what makes the skip visible.
-    process.pgid = i32::MAX - 11;
+    process.pgid = Group::from_raw(i32::MAX - 11);
     std::fs::create_dir_all(app.paths.state_file().parent().unwrap()).unwrap();
     crate::state::save(&app.paths.state_file(), &app.state).unwrap();
     let quiet = background::refresh_if_needed(&app.paths);
